@@ -8,9 +8,19 @@ use ratatui::{
 
 use crate::theme::Theme;
 
+mod syntax;
+
 pub(super) fn render(content: &str, theme: &Theme) -> Vec<Line<'static>> {
+    render_prose(content, theme, false)
+}
+
+pub(super) fn render_reasoning(content: &str, theme: &Theme) -> Vec<Line<'static>> {
+    render_prose(content, theme, true)
+}
+
+fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<Line<'static>> {
     let parser = Parser::new_ext(content, Options::empty());
-    let mut renderer = Renderer::new(theme);
+    let mut renderer = Renderer::new(theme, subdued);
     for event in parser {
         renderer.event(event);
     }
@@ -19,24 +29,31 @@ pub(super) fn render(content: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 struct Renderer<'a> {
     theme: &'a Theme,
+    subdued: bool,
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
     links: Vec<String>,
-    in_code_block: bool,
+    code_block: Option<CodeBlock>,
+}
+
+struct CodeBlock {
+    info: String,
+    content: String,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(theme: &'a Theme) -> Self {
+    fn new(theme: &'a Theme, subdued: bool) -> Self {
         Self {
             theme,
+            subdued,
             lines: Vec::new(),
             current: Vec::new(),
             styles: vec![theme.text.primary],
             lists: Vec::new(),
             links: Vec::new(),
-            in_code_block: false,
+            code_block: None,
         }
     }
 
@@ -56,8 +73,8 @@ impl<'a> Renderer<'a> {
                 self.push(format!("[{label}]"), self.theme.text.subdued);
             }
             Event::SoftBreak => {
-                if self.in_code_block {
-                    self.flush_code_line();
+                if let Some(block) = &mut self.code_block {
+                    block.content.push('\n');
                 } else {
                     self.push(" ", self.current_style());
                 }
@@ -82,7 +99,13 @@ impl<'a> Renderer<'a> {
             Tag::Heading { .. } => self.push_style(self.theme.markdown.heading),
             Tag::CodeBlock(kind) => {
                 self.flush_line();
-                self.in_code_block = true;
+                self.code_block = Some(CodeBlock {
+                    info: match &kind {
+                        CodeBlockKind::Fenced(info) => info.to_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    },
+                    content: String::new(),
+                });
                 if let CodeBlockKind::Fenced(language) = kind
                     && !language.is_empty()
                 {
@@ -149,8 +172,14 @@ impl<'a> Renderer<'a> {
                 self.blank_line();
             }
             TagEnd::CodeBlock => {
-                self.flush_line();
-                self.in_code_block = false;
+                if let Some(block) = self.code_block.take() {
+                    self.lines.extend(syntax::render(
+                        &block.content,
+                        &block.info,
+                        self.theme,
+                        self.prose_style(self.theme.markdown.code_block),
+                    ));
+                }
                 self.blank_line();
             }
             TagEnd::List(_) => {
@@ -188,19 +217,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn text(&mut self, text: &str) {
-        if !self.in_code_block {
+        if let Some(block) = &mut self.code_block {
+            block.content.push_str(text);
+        } else {
             self.push(text, self.current_style());
-            return;
-        }
-
-        let mut remaining = text;
-        while let Some((line, rest)) = remaining.split_once('\n') {
-            self.push(line, self.theme.markdown.code_block);
-            self.flush_code_line();
-            remaining = rest;
-        }
-        if !remaining.is_empty() {
-            self.push(remaining, self.theme.markdown.code_block);
         }
     }
 
@@ -221,10 +241,19 @@ impl<'a> Renderer<'a> {
             .expect("Markdown style stack is non-empty")
     }
 
+    fn prose_style(&self, style: Style) -> Style {
+        if self.subdued {
+            self.theme.text.subdued.add_modifier(style.add_modifier)
+        } else {
+            style
+        }
+    }
+
     fn push(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            self.current.push(Span::styled(content, style));
+            self.current
+                .push(Span::styled(content, self.prose_style(style)));
         }
     }
 
@@ -233,11 +262,6 @@ impl<'a> Renderer<'a> {
             self.lines
                 .push(Line::from(std::mem::take(&mut self.current)));
         }
-    }
-
-    fn flush_code_line(&mut self) {
-        self.lines
-            .push(Line::from(std::mem::take(&mut self.current)));
     }
 
     fn blank_line(&mut self) {
@@ -253,5 +277,149 @@ impl<'a> Renderer<'a> {
             self.lines.pop();
         }
         self.lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn fence_snippets_use_their_grammar() {
+        let theme = Theme::system();
+        for (language, content, token, style) in [
+            (
+                "typescript",
+                "interface Widget { name: string; }",
+                "Widget",
+                theme.syntax.r#type.add_modifier(Modifier::BOLD),
+            ),
+            (
+                "python",
+                "def greet():\n    return \"hello\"",
+                "return",
+                theme.syntax.keyword.add_modifier(Modifier::ITALIC),
+            ),
+            (
+                "sh",
+                "if true; then echo \"hello\"; fi",
+                "if",
+                theme.syntax.keyword.add_modifier(Modifier::ITALIC),
+            ),
+            (
+                "toml",
+                "[package]\nname = \"hello\"",
+                "hello",
+                theme.syntax.string,
+            ),
+            (
+                "json",
+                "{\"name\": \"hello\", \"count\": 42}",
+                "42",
+                theme.syntax.number,
+            ),
+        ] {
+            let lines = render(&format!("```{language}\n{content}\n```"), &theme);
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains(token) && span.style == style),
+                "{language}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_and_unknown_fences_keep_flat_output_and_inline_code_is_unchanged() {
+        let theme = Theme::system();
+        for info in ["", "not-a-language"] {
+            for (render, style) in [
+                (
+                    render as fn(&str, &Theme) -> Vec<Line<'static>>,
+                    theme.markdown.code_block,
+                ),
+                (render_reasoning, theme.text.subdued),
+            ] {
+                let mut expected = Vec::new();
+                if !info.is_empty() {
+                    expected.push(Line::from(Span::styled(info, theme.text.subdued)));
+                }
+                expected.extend([
+                    Line::from(Span::styled("let n = 42;", style)),
+                    Line::default(),
+                    Line::from(Span::styled("  # still literal", style)),
+                ]);
+                assert_eq!(
+                    render(
+                        &format!("```{info}\nlet n = 42;\n\n  # still literal\n```"),
+                        &theme
+                    ),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            render("`let n = 42;`", &theme),
+            vec![Line::from(Span::styled(
+                "let n = 42;",
+                theme.markdown.inline_code
+            ))]
+        );
+    }
+
+    #[test]
+    fn multiline_grammar_state_and_unicode_content_survive_projection() {
+        let theme = Theme::system();
+        let lines = render(
+            "```rust\n/* start\nstill 注釈 */\nlet café = \"☕\";\n```",
+            &theme,
+        );
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("still 注釈")
+                    && span.style == theme.syntax.comment.add_modifier(Modifier::ITALIC))
+        );
+        assert_eq!(
+            lines[3]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "let café = \"☕\";"
+        );
+    }
+
+    #[test]
+    fn rust_fence_paints_keywords_strings_comments_and_types() {
+        let theme = Theme::system();
+        let lines = render(
+            "```rust\nstruct Widget;\nlet name = \"hello\"; // note\n```",
+            &theme,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        for (text, style) in [
+            (
+                "struct",
+                theme.syntax.keyword.add_modifier(Modifier::ITALIC),
+            ),
+            ("Widget", theme.syntax.r#type.add_modifier(Modifier::BOLD)),
+            ("hello", theme.syntax.string),
+            ("//", theme.syntax.comment.add_modifier(Modifier::ITALIC)),
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.content.contains(text) && span.style == style),
+                "missing {text:?} with {style:?}: {spans:?}"
+            );
+        }
+        assert_eq!(
+            lines[0],
+            Line::from(Span::styled("rust", theme.text.subdued))
+        );
     }
 }

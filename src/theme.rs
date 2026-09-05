@@ -28,7 +28,6 @@ pub(crate) struct Theme {
     pub(crate) feedback: FeedbackRoles,
     pub(crate) border: BorderRoles,
     pub(crate) markdown: MarkdownRoles,
-    #[allow(dead_code)] // Painted once the Code Block renderer highlights by fence language.
     pub(crate) syntax: SyntaxRoles,
     #[allow(dead_code)] // Reserved by the required semantic contract for selectable UI.
     pub(crate) selection: SelectionRoles,
@@ -134,7 +133,6 @@ pub(crate) struct MarkdownRoles {
 /// them with the `syntax*` keys; a role the document leaves out takes the
 /// code block color so the block reads as it did before highlighting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Painted once the Code Block renderer highlights by fence language.
 pub(crate) struct SyntaxRoles {
     pub(crate) comment: Style,
     pub(crate) keyword: Style,
@@ -148,6 +146,7 @@ pub(crate) struct SyntaxRoles {
 }
 
 /// The document keys a Theme document spells [`SyntaxRoles`] with.
+#[cfg(test)]
 const SYNTAX_KEYS: [&str; 9] = [
     "syntaxComment",
     "syntaxKeyword",

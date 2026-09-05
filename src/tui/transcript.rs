@@ -3000,15 +3000,14 @@ fn reasoning_header_text(label: &str, title: Option<&str>) -> String {
 }
 
 /// The lines a Reasoning block's stored content projects: the summary the
-/// Provider wrote, rendered as the Markdown it is but drained of colour so
-/// Reasoning never competes with the answer it led to, followed by the
-/// truncation marker when the cap cut it short. A lone block's Fold and a
+/// Provider wrote, with subdued Markdown prose and syntax-colored Code Blocks,
+/// followed by the truncation marker when the cap cut it short. A lone block's Fold and a
 /// Group's expansion both open onto exactly this.
 fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec<Line<'static>> {
     let content = sanitize_content(reasoning.content);
-    let mut body = markdown::render(&content, theme)
+    let mut body = markdown::render_reasoning(&content, theme)
         .into_iter()
-        .map(|line| subdued_line(line, OUTPUT_INDENT, theme))
+        .map(|line| indented_reasoning_line(line, OUTPUT_INDENT, theme))
         .collect::<Vec<_>>();
     if reasoning.content_truncated {
         push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
@@ -3099,21 +3098,13 @@ fn push_subagent_activity(
     UnitAnchor::binary(lines.len() - start, false)
 }
 
-/// Re-styles a rendered Markdown line as subdued prose in the Activity gutter.
-/// The Markdown renderer's own emphasis survives as modifiers; only its colours
-/// are dropped, which is what makes the body read as an aside rather than as a
-/// second Message.
-fn subdued_line(line: Line<'static>, indent: &str, theme: &Theme) -> Line<'static> {
-    if line.spans.is_empty() {
-        return line;
+/// Places already-styled Reasoning content in the Activity gutter.
+fn indented_reasoning_line(mut line: Line<'static>, indent: &str, theme: &Theme) -> Line<'static> {
+    if !line.spans.is_empty() {
+        line.spans
+            .insert(0, Span::styled(indent.to_owned(), theme.text.subdued));
     }
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::styled(indent.to_owned(), theme.text.subdued));
-    spans.extend(line.spans.into_iter().map(|span| {
-        let modifiers = span.style.add_modifier;
-        Span::styled(span.content, theme.text.subdued.add_modifier(modifiers))
-    }));
-    Line::from(spans)
+    line
 }
 
 /// Renders a duration at the coarsest precision that still says something: a
@@ -4435,6 +4426,33 @@ mod tests {
                 .any(|span| span.content == "kept output"),
             "output before the marker still renders: {lines:?}"
         );
+    }
+
+    #[test]
+    fn expanded_reasoning_preserves_code_colors_and_subdues_prose() {
+        let activity = reasoning(
+            ActivityStatus::Completed,
+            None,
+            "Read **this**.\n\n```rust\nstruct Widget;\n```",
+        );
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+        render_activity(
+            &mut lines,
+            &mut Vec::new(),
+            &activity,
+            FoldStep::Expanded,
+            &theme,
+            80,
+        );
+        let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "struct" && span.style.fg == theme.syntax.keyword.fg)
+        );
+        assert!(spans.iter().any(|span| span.content == "this"
+            && span.style == theme.text.subdued.add_modifier(Modifier::BOLD)));
     }
 
     #[test]
