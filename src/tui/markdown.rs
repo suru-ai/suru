@@ -445,6 +445,21 @@ mod tests {
     }
 
     #[test]
+    fn csharp_fence_paints_keywords() {
+        let theme = Theme::system();
+        for info in ["csharp", "CSharp title=demo", "cs", "c#"] {
+            let lines = render(&format!("```{info}\npublic class Widget {{}}\n```"), &theme);
+            assert!(
+                lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.contains("public")
+                        && span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
+                }),
+                "C# keyword should be highlighted for {info:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rust_fence_paints_keywords_strings_comments_and_types() {
         let theme = Theme::system();
         let lines = render(

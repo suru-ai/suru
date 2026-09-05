@@ -29,6 +29,7 @@ fn language<'a>(info: &str, syntaxes: &'a SyntaxSet) -> Option<&'a SyntaxReferen
         "sh" | "shell" | "bash" | "zsh" => "sh",
         "py" | "python" => "py",
         "rs" | "rust" => "rs",
+        "csharp" => "cs",
         "yml" | "yaml" => "yaml",
         "docker" | "dockerfile" => "Dockerfile",
         other => other,
@@ -260,6 +261,9 @@ mod tests {
             ("sh", "Bourne Again Shell (bash)"),
             ("py", "Python"),
             ("rs", "Rust"),
+            ("csharp", "C#"),
+            ("cs", "C#"),
+            ("c#", "C#"),
             ("yml", "YAML"),
             ("dockerfile", "Dockerfile"),
         ] {
