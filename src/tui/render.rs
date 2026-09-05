@@ -1146,7 +1146,7 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         .model_options
         .model()
         .expect("an open options screen has a Model");
-    if content_height >= 2 {
+    if content_height >= 3 || (state.model_options.is_choice_picker_open() && content_height >= 2) {
         let unavailable = if model.availability == ModelAvailability::Unavailable {
             " · unavailable"
         } else {
@@ -1206,10 +1206,18 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         return;
     }
 
-    let footer_rows = usize::from(content_height >= 3);
-    let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+    let footer_rows = usize::from(content_height >= 4);
+    // With only one content row, show whichever action owns the focus.
+    let confirm_rows = usize::from(
+        content_height > lines.len()
+            && (content_height > 1 || state.model_options.is_confirm_selected()),
+    );
+    let capacity = content_height.saturating_sub(lines.len() + footer_rows + confirm_rows);
     let rows = state.model_options.rows();
-    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    let selected = rows
+        .iter()
+        .position(|row| row.selected)
+        .unwrap_or(rows.len().saturating_sub(1));
     for row in visible_window(rows, selected, capacity) {
         let marker = if row.selected { "› " } else { "  " };
         let unavailable = if row.available { "" } else { " [unavailable]" };
@@ -1233,9 +1241,36 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             },
         ));
     }
+    if confirm_rows > 0 {
+        while lines.len() < content_height.saturating_sub(footer_rows + confirm_rows) {
+            lines.push(Line::default());
+        }
+        let selected = state.model_options.is_confirm_selected();
+        let valid = state.model_options.is_valid();
+        let marker = if selected { "› " } else { "  " };
+        let label = if valid {
+            "Confirm"
+        } else {
+            "Confirm [unavailable]"
+        };
+        lines.push(Line::styled(
+            truncate_to_width(&format!("{marker}{label}"), content_width),
+            if selected {
+                theme.selection.focused
+            } else if valid {
+                theme.text.primary
+            } else {
+                theme.text.subdued
+            },
+        ));
+    }
     if footer_rows > 0 && lines.len() < content_height {
         let controls = if state.model_options.is_valid() {
-            "Enter configure · Ctrl+Enter apply · Esc cancel"
+            if state.model_options.is_confirm_selected() {
+                "Enter confirm · Ctrl+Enter apply · Esc cancel"
+            } else {
+                "Enter configure · Ctrl+Enter apply · Esc cancel"
+            }
         } else {
             "Enter configure · Apply unavailable · Esc cancel"
         };

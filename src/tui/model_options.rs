@@ -73,7 +73,11 @@ impl ModelOptions {
             return;
         }
         self.staged = Some(selection_preserving_current_values(&model, staged));
-        self.selected = self.selected.min(model.options.len().saturating_sub(1));
+        self.selected = if self.is_confirm_selected() {
+            model.options.len()
+        } else {
+            self.selected.min(model.options.len().saturating_sub(1))
+        };
         if self.choices.as_ref().is_some_and(|picker| {
             !model
                 .options
@@ -97,6 +101,14 @@ impl ModelOptions {
 
     pub(super) fn is_choice_picker_open(&self) -> bool {
         self.choices.is_some()
+    }
+
+    pub(super) fn is_confirm_selected(&self) -> bool {
+        self.choices.is_none()
+            && self
+                .model
+                .as_ref()
+                .is_some_and(|model| self.selected == model.options.len())
     }
 
     pub(super) fn model(&self) -> Option<&ModelDescriptor> {
@@ -209,7 +221,10 @@ impl ModelOptions {
     }
 
     fn move_option(&mut self, distance: isize) {
-        let count = self.model.as_ref().map_or(0, |model| model.options.len());
+        let count = self
+            .model
+            .as_ref()
+            .map_or(0, |model| model.options.len() + 1);
         if count > 0 {
             self.selected = (self.selected as isize + distance).rem_euclid(count as isize) as usize;
         }

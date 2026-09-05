@@ -4599,7 +4599,12 @@ impl Application {
             SemanticCommandId::ModelOptions => return Ok(self.open_model_options()),
             SemanticCommandId::ModelOptionsPrevious => self.state.model_options.select_previous(),
             SemanticCommandId::ModelOptionsNext => self.state.model_options.select_next(),
-            SemanticCommandId::ModelOptionsSelect => self.state.model_options.choose(),
+            SemanticCommandId::ModelOptionsSelect => {
+                if self.state.model_options.is_confirm_selected() {
+                    return self.apply_model_options();
+                }
+                self.state.model_options.choose();
+            }
             SemanticCommandId::ModelOptionsCancel => self.state.model_options.close(),
             SemanticCommandId::ModelOptionsApply => return self.apply_model_options(),
             SemanticCommandId::ModelOptionReasoningCycle => {

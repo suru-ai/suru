@@ -699,6 +699,32 @@ fn refreshed_options_keep_invalidated_choice_visible_and_disable_apply() {
     assert!(invalid.contains("Reasoning · high (unavailable) [unavailable]"));
     assert!(invalid.contains("Fast · On"));
     assert!(invalid.contains("Apply unavailable"));
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus disabled Confirm");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("› Confirm [unavailable]")
+    );
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            )))
+            .expect("refuse invalid confirmation"),
+        ApplicationTransition::Continue
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("return to Fast");
     assert_eq!(
         application
             .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -898,10 +924,21 @@ fn context_tier_is_configurable_and_surfaces_once_it_leaves_its_default() {
             .contains("Context · Long context")
     );
 
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus Confirm after the last option");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("› Confirm")
+    );
     let ApplicationTransition::ConfirmLandingAgentSelection(confirmed) = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
-            KeyModifiers::CONTROL,
+            KeyModifiers::NONE,
         )))
         .expect("apply the staged context tier")
     else {
@@ -1051,4 +1088,114 @@ fn selection_summary_orders_unlabelled_provider_model_and_supported_options() {
     assert!(!screen.contains("Reasoning effort High"));
     assert!(!screen.contains("Context Long context"));
     assert!(!screen.contains("Speed On"));
+}
+
+#[test]
+fn confirm_stays_pinned_and_focused_across_navigation_and_catalog_refresh() {
+    let mut application = landing_on_the_tiered_model();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelOptions,
+        )))
+        .expect("refresh options")
+    else {
+        panic!("options should refresh the catalog");
+    };
+    let key = |code| InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    let screen = rendered_application_rows_at(&application, 80, 12);
+    let confirm_line = screen
+        .iter()
+        .position(|row| row.contains("  Confirm"))
+        .expect("pinned Confirm");
+    assert!(screen.iter().any(|row| row.contains("› Reasoning effort")));
+    application
+        .handle_terminal_event(key(KeyCode::Up))
+        .expect("wrap to Confirm");
+    assert!(rendered_application_rows_at(&application, 80, 12)[confirm_line].contains("› Confirm"));
+    application
+        .handle_terminal_event(key(KeyCode::Down))
+        .expect("wrap to first option");
+    assert!(
+        rendered_application_rows_at(&application, 80, 12)
+            .join("\n")
+            .contains("› Reasoning effort")
+    );
+    application
+        .handle_terminal_event(key(KeyCode::Up))
+        .expect("return to Confirm");
+
+    let mut model = tiered_model();
+    for index in 0..12 {
+        model.options.push(ModelOptionDescriptor {
+            id: ModelOptionId::new(format!("extra_{index}")),
+            label: format!("Extra {index}"),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        });
+    }
+    let expected = model.default_agent_selection();
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("copilot"),
+                    display_name: "copilot".to_owned(),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("refresh with more options while Confirm is focused");
+    let refreshed = rendered_application_rows_at(&application, 80, 12);
+    assert!(refreshed[confirm_line].contains("› Confirm"));
+    assert!(refreshed.iter().any(|row| row.contains("Extra 11")));
+    application
+        .handle_terminal_event(key(KeyCode::Up))
+        .expect("move to last option");
+    let scrolled = rendered_application_rows_at(&application, 80, 12);
+    assert!(scrolled[confirm_line].contains("  Confirm"));
+    assert!(scrolled.iter().any(|row| row.contains("› Extra 11")));
+    application
+        .handle_terminal_event(key(KeyCode::Down))
+        .expect("move to Confirm");
+    assert_eq!(
+        application
+            .handle_terminal_event(key(KeyCode::Enter))
+            .expect("confirm refreshed selection"),
+        ApplicationTransition::ConfirmLandingAgentSelection(expected)
+    );
+}
+
+#[test]
+fn short_options_panel_keeps_focused_option_above_confirm() {
+    let mut application = landing_on_the_tiered_model();
+    for height in [6, 7, 8, 9] {
+        let screen = rendered_application_rows_at(&application, 80, height).join("\n");
+        assert!(
+            screen.contains("› Reasoning effort"),
+            "focused option at height {height}: {screen}"
+        );
+        assert!(
+            screen.contains("  Confirm"),
+            "Confirm at height {height}: {screen}"
+        );
+    }
+    assert!(
+        rendered_application_rows_at(&application, 80, 5)
+            .join("\n")
+            .contains("› Reasoning effort")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )))
+        .expect("focus Confirm in a one-row panel");
+    assert!(
+        rendered_application_rows_at(&application, 80, 5)
+            .join("\n")
+            .contains("› Confirm")
+    );
 }
