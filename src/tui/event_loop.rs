@@ -39,10 +39,11 @@ use termina::Terminal as _;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
+use super::commands::SemanticCommandId;
 use super::shimmer;
 use super::state::{
-    Application, ApplicationEvent, ApplicationTransition, EverywhereListRequest, ModelListRequest,
-    SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
+    Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
+    ModelListRequest, SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
 };
 use crate::terminal::{
     DEFAULT_TERMINAL_PROBE_BUDGET, TerminalEvents, TerminalFacts, TerminalInput,
@@ -1215,6 +1216,14 @@ impl RunLoop {
                     return Ok(ControlFlow::Continue(()));
                 }
             }
+            SubmissionResult::SessionSettled(session) => {
+                if self.application.session_reference().as_ref() == Some(&session) {
+                    let transition = self.application.handle_event(ApplicationEvent::Command(
+                        CommandId::InvokeSemantic(SemanticCommandId::SessionNew),
+                    ))?;
+                    return Ok(self.dispatch_transition(transition));
+                }
+            }
             SubmissionResult::OperationFailed { session, error } => {
                 if self.application.outlook() != &session.origin {
                     return Ok(ControlFlow::Continue(()));
@@ -1925,6 +1934,7 @@ enum SubmissionResult {
         error: String,
     },
     OperationSucceeded(SessionReference),
+    SessionSettled(SessionReference),
     OperationFailed {
         session: SessionReference,
         error: String,
@@ -2237,19 +2247,15 @@ impl SessionOperation {
                     error: error.to_string(),
                 },
             },
-            // Nothing but the failure needs reporting: the summary the server
-            // answers with reaches every client on the catalog stream, this one
-            // included.
+            // The catalog carries the updated summary to every client. Only
+            // the client that settled the Session should start a new one.
             Self::SettleSession {
                 session_id,
                 settled,
-            } => operation_result(
-                session,
-                commands
-                    .settle_session(session_id, settled)
-                    .await
-                    .map(|_| ()),
-            ),
+            } => match commands.settle_session(session_id, settled).await {
+                Ok(_) if settled => SubmissionResult::SessionSettled(session),
+                result => operation_result(session, result.map(|_| ())),
+            },
             Self::PromotePrompt {
                 session_id,
                 prompt_id,
