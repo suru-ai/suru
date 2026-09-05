@@ -55,11 +55,8 @@ impl CodexSkills {
         let result =
             result.map_err(|error| codex_error_context("Codex Skill discovery failed", error))?;
         stopped?;
-        let listed: NativeSkillsList = serde_json::from_value(result).map_err(|error| {
-            codex_error(format!(
-                "Codex returned an invalid skills/list response: {error}"
-            ))
-        })?;
+        let listed: NativeSkillsList = serde_json::from_value(result)
+            .map_err(|_| codex_error("Codex returned an invalid skills/list response"))?;
         let mut entries = listed.data.into_iter();
         let entry = entries.next().ok_or_else(|| {
             codex_error("Codex returned no Workspace entry in its skills/list response")

@@ -19,6 +19,52 @@ use crate::{
     provider::{ProviderError, exclusive_count, humanized_wire_id, reported_count},
 };
 
+// Native user-input requests preserve both JSON-RPC and thread/Turn/item correlation.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UserInputParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
+    pub(super) questions: Vec<UserInputQuestion>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UserInputQuestion {
+    pub(super) id: String,
+    pub(super) header: String,
+    pub(super) question: String,
+    #[serde(default)]
+    pub(super) is_other: bool,
+    #[serde(default)]
+    pub(super) is_secret: bool,
+    pub(super) options: Option<Vec<UserInputOption>>,
+}
+#[derive(Deserialize)]
+pub(super) struct UserInputOption {
+    pub(super) label: String,
+    pub(super) description: String,
+}
+#[derive(Serialize)]
+pub(super) struct UserInputResponse {
+    pub(super) answers: BTreeMap<String, UserInputAnswer>,
+}
+#[derive(Serialize)]
+pub(super) struct UserInputAnswer {
+    pub(super) answers: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ServerRequestResolvedParams {
+    pub(super) thread_id: String,
+    pub(super) request_id: RequestId,
+}
+#[derive(Serialize)]
+pub(super) struct ClientResponse<T> {
+    pub(super) id: RequestId,
+    pub(super) result: T,
+}
+
 // JSON-RPC envelope.
 
 #[derive(Serialize)]
@@ -33,7 +79,7 @@ pub(super) struct ClientNotification<'a> {
     pub(super) method: &'a str,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(super) enum RequestId {
     String(String),
@@ -634,6 +680,18 @@ pub(super) struct NativeFileChange {
     kind: NativeFileChangeKind,
 }
 
+impl NativeFileChange {
+    pub(super) fn redact_paths(&mut self, redact: impl Fn(&mut PathBuf)) {
+        redact(&mut self.path);
+        if let NativeFileChangeKind::Update {
+            move_path: Some(path),
+        } = &mut self.kind
+        {
+            redact(path);
+        }
+    }
+}
+
 impl From<NativeFileChange> for FileChange {
     fn from(change: NativeFileChange) -> Self {
         match change.kind {
@@ -903,6 +961,14 @@ pub(super) struct CompletedNativeAgentMessage {
 
 /// A Codex notification Suru understands, decoded out of its wire params.
 pub(super) enum NativeNotification {
+    QuestionnaireRequested {
+        id: RequestId,
+        params: UserInputParams,
+    },
+    QuestionnaireResolved {
+        thread_id: String,
+        request_id: RequestId,
+    },
     SkillsChanged,
     AgentSelectionChanged {
         thread_id: String,

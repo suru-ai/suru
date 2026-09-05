@@ -266,8 +266,8 @@ fn launch_failure(name: &str, spec: &HarnessSpec, error: &std::io::Error) -> Pro
     failure
 }
 
-/// Launches the harness server `spec` names in its own process tree, forwarding its stderr to
-/// the Log.
+/// Launches the harness server `spec` names in its own process tree, draining its stderr.
+/// Native diagnostics may contain conversation input, so only byte counts reach the Log.
 pub(crate) fn spawn_harness_process(
     spec: &HarnessSpec,
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
@@ -294,7 +294,7 @@ pub(crate) fn spawn_harness_process(
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "suru::provider::harness::stderr", harness = %stderr_name, "{line}");
+            tracing::debug!(target: "suru::provider::harness::stderr", harness = %stderr_name, bytes = line.len(), "drained native stderr");
         }
     });
 
@@ -312,8 +312,7 @@ pub(crate) fn spawn_harness_process(
 pub(crate) struct HarnessRun {
     pub(crate) status: std::process::ExitStatus,
     pub(crate) stdout: String,
-    /// Everything the harness said on its stderr. Kept rather than forwarded to
-    /// the Log as [`spawn_harness_process`] does, because a one-shot run says
+    /// Everything the harness said on its stderr. Kept because a one-shot run says
     /// here — and only here — why it would not do what it was asked.
     pub(crate) stderr: String,
 }

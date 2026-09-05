@@ -9,6 +9,8 @@
 
 mod errand;
 mod projection;
+mod questionnaire;
+mod redaction;
 mod session;
 mod skills;
 mod transport;

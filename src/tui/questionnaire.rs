@@ -510,7 +510,7 @@ impl QuestionnairePanels {
             }
             lines.push(Line::from(question.text.clone()));
             for (index, choice) in question.choices.iter().enumerate() {
-                let selected = draft.choices.contains(&choice.id);
+                let selected = !question.secret && draft.choices.contains(&choice.id);
                 let recommendation = if choice.recommended
                     && !choice.label.to_ascii_lowercase().ends_with("(recommended)")
                 {
@@ -539,6 +539,9 @@ impl QuestionnairePanels {
                         theme.text.subdued,
                     ));
                 }
+            }
+            if question.secret && !draft.choices.is_empty() {
+                lines.push(Line::from("Selection: ••••••••"));
             }
             if question.freeform {
                 let value = if question.secret && !draft.text.is_empty() {

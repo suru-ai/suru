@@ -56,6 +56,7 @@ type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 
 struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
+    questionnaires: super::questionnaire::CodexQuestionnaires,
     events: mpsc::UnboundedSender<Result<NativeNotification, ProviderError>>,
     terminated: AtomicBool,
 }
@@ -100,6 +101,7 @@ impl JsonRpcTransport {
         let (events, notifications) = mpsc::unbounded_channel();
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
+            questionnaires: super::questionnaire::CodexQuestionnaires::default(),
             events,
             terminated: AtomicBool::new(false),
         });
@@ -216,6 +218,24 @@ impl JsonRpcTransport {
         .await
     }
 
+    pub(super) fn questionnaires(&self) -> super::questionnaire::CodexQuestionnaires {
+        self.state.questionnaires.clone()
+    }
+
+    pub(super) async fn submit_questionnaire(
+        &self,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> Result<(), ProviderError> {
+        let (id, result) = self.state.questionnaires.take_response(id, submission)?;
+        write_json_line(
+            &self.writer,
+            &super::wire::ClientResponse { id, result },
+            "answer Codex user-input request",
+        )
+        .await
+    }
+
     pub(super) async fn close(&self) {
         close_transport(
             &self.state,
@@ -306,11 +326,8 @@ async fn read_stdout(
         }
         let message: IncomingMessage = match serde_json::from_str(&line) {
             Ok(message) => message,
-            Err(error) => {
-                terminate_transport(
-                    &state,
-                    codex_error(format!("Codex app-server sent malformed JSON: {error}")),
-                );
+            Err(_) => {
+                terminate_transport(&state, codex_error("Codex app-server sent malformed JSON"));
                 return;
             }
         };
@@ -341,35 +358,51 @@ async fn await_exit_error(
 }
 
 async fn route_message(
-    message: IncomingMessage,
+    mut message: IncomingMessage,
     writer: &Arc<Mutex<Option<ChildStdin>>>,
     state: &Arc<TransportState>,
 ) -> Result<(), ProviderError> {
+    if let Some(error) = &mut message.error {
+        error.message = state.questionnaires.redact_text(&error.message);
+    }
     if let Some(method) = message.method.as_deref() {
+        let display_method = state.questionnaires.redact_text(method);
         if let Some(id) = message.id {
+            if method == "item/tool/requestUserInput" {
+                let params = decode_notification_params(method, message.params.as_ref())?;
+                for event in state
+                    .questionnaires
+                    .redact_notification(NativeNotification::QuestionnaireRequested { id, params })
+                {
+                    let _ = state.events.send(Ok(event));
+                }
+                return Ok(());
+            }
             if is_unsupported_interaction(method) {
                 reject_server_request(
                     writer,
                     id,
                     UNSUPPORTED_INTERACTION_ERROR_CODE,
-                    format!("Suru does not support interactive request `{method}`"),
+                    format!("Suru does not support interactive request `{display_method}`"),
                 )
                 .await?;
                 return Err(codex_error(format!(
-                    "Codex app-server requested unsupported interaction `{method}`"
+                    "Codex app-server requested unsupported interaction `{display_method}`"
                 )));
             }
             reject_server_request(
                 writer,
                 id,
                 METHOD_NOT_FOUND_ERROR_CODE,
-                format!("Suru does not recognize server request `{method}`"),
+                format!("Suru does not recognize server request `{display_method}`"),
             )
             .await?;
             return Ok(());
         }
         if let Some(event) = decode_notification(method, message.params.as_ref())? {
-            let _ = state.events.send(Ok(event));
+            for event in state.questionnaires.redact_notification(event) {
+                let _ = state.events.send(Ok(event));
+            }
         }
         return Ok(());
     }
@@ -425,7 +458,6 @@ fn is_unsupported_interaction(method: &str) -> bool {
         "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
-            | "item/tool/requestUserInput"
             | "mcpServer/elicitation/request"
             | "item/tool/call"
     )
@@ -436,6 +468,14 @@ fn decode_notification(
     params: Option<&Value>,
 ) -> Result<Option<NativeNotification>, ProviderError> {
     match method {
+        "serverRequest/resolved" => {
+            let params: super::wire::ServerRequestResolvedParams =
+                decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::QuestionnaireResolved {
+                thread_id: params.thread_id,
+                request_id: params.request_id,
+            }))
+        }
         "skills/changed" => Ok(Some(NativeNotification::SkillsChanged)),
         "thread/settings/updated" => {
             let params: ThreadSettingsUpdatedParams = decode_notification_params(method, params)?;
@@ -632,15 +672,12 @@ fn decode_notification(
                 NativeTurnStatus::Completed => NativeTurnOutcome::Completed,
                 NativeTurnStatus::Interrupted => NativeTurnOutcome::Interrupted,
                 NativeTurnStatus::Failed => NativeTurnOutcome::Failed {
-                    message: concise_remote_message(
-                        params
-                            .turn
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.as_str())
-                            .unwrap_or("Codex Turn failed"),
-                        "Codex Turn failed",
-                    ),
+                    message: params
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.clone())
+                        .unwrap_or_else(|| "Codex Turn failed".into()),
                     kind: match params
                         .turn
                         .error
@@ -680,9 +717,9 @@ fn decode_notification_params<T: for<'de> serde::Deserialize<'de>>(
             "Codex app-server notification `{method}` omitted params"
         ))
     })?;
-    serde_json::from_value(params.clone()).map_err(|error| {
+    serde_json::from_value(params.clone()).map_err(|_| {
         codex_error(format!(
-            "Codex app-server notification `{method}` had invalid params: {error}"
+            "Codex app-server notification `{method}` had invalid params"
         ))
     })
 }
@@ -696,6 +733,7 @@ fn close_transport(state: &TransportState, error: ProviderError) {
 }
 
 fn finish_transport(state: &TransportState, error: ProviderError, publish_error: bool) {
+    state.questionnaires.clear();
     if state.terminated.swap(true, Ordering::AcqRel) {
         return;
     }

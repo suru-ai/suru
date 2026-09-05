@@ -138,7 +138,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
-      printf '%s\n' '{"id":"abandoned-interaction","method":"item/tool/requestUserInput","params":{"fixture":true}}'
+      printf '%s\n' '{"id":"abandoned-interaction","method":"item/commandExecution/requestApproval","params":{"fixture":true}}'
       exit 17
       ;;
   esac
@@ -226,10 +226,6 @@ async fn unsupported_server_interactions_are_rejected_and_fail_the_active_turn()
         (
             "item/commandExecution/requestApproval",
             "codex-unsupported-approval",
-        ),
-        (
-            "item/tool/requestUserInput",
-            "codex-unsupported-structured-input",
         ),
         (
             "mcpServer/elicitation/request",

@@ -1377,3 +1377,91 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
     drop(client);
     restarted.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn secret_questionnaire_answer_is_private_in_client_updates_and_persisted_history() {
+    use suru::managed_client::SessionEvent;
+    use suru::protocol::SessionChange;
+    const SECRET: &str = "private-cross-platform-credential";
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "questionnaire-secret";
+    let mut live = working_turn(directory.path(), channel).await;
+    let mut question = questionnaire();
+    question.questions[0].secret = true;
+    let client =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    live.provider_session
+        .emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: question.clone(),
+        });
+    read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "secret Questionnaire is pending",
+        |snapshot| outcome(snapshot, QuestionnaireOutcome::Pending),
+    )
+    .await;
+    let mut observer = client.subscribe_session(live.session_id).await.unwrap();
+    observer.next().await.unwrap().unwrap();
+    let submission = QuestionnaireSubmission::Answer {
+        answer: Answer {
+            questions: vec![QuestionAnswer::Freeform {
+                text: SECRET.into(),
+            }],
+        },
+    };
+    assert!(!format!("{submission:?}").contains(SECRET));
+    client
+        .submit_questionnaire(live.session_id, question.id, submission.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        live.provider_session.next_questionnaire_submission().await,
+        (question.id, submission)
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let SessionEvent::Updated(update) = observer.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            assert!(!serde_json::to_string(&update).unwrap().contains(SECRET));
+            if update.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    SessionChange::QuestionnaireSettled {
+                        outcome: QuestionnaireOutcome::Answered,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = client.read_session(live.session_id).await.unwrap();
+    assert!(!serde_json::to_string(&snapshot).unwrap().contains(SECRET));
+    assert!(snapshot.activities.iter().any(|activity| matches!(activity, Activity::Questionnaire { answer: Some(answer), .. } if answer.questions == vec![QuestionAnswer::SecretAnswered])));
+    drop(observer);
+    drop(client);
+    live.server.shutdown().await.unwrap();
+    let server = suru::server::spawn_with_provider(
+        suru::server::ServerConfig::new(directory.path(), channel).unwrap(),
+        live.runtime,
+    )
+    .await
+    .unwrap();
+    let client =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    let restored = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(restored.activities, snapshot.activities);
+    assert!(!serde_json::to_string(&restored).unwrap().contains(SECRET));
+    drop(client);
+    server.shutdown().await.unwrap();
+}

@@ -268,11 +268,8 @@ async fn discover_codex_models(
             )
             .await
             .map_err(|error| codex_error_context("Codex Model discovery failed", error))?;
-        let page: NativeModelList = serde_json::from_value(result).map_err(|error| {
-            codex_error(format!(
-                "Codex returned an invalid model/list response: {error}"
-            ))
-        })?;
+        let page: NativeModelList = serde_json::from_value(result)
+            .map_err(|_| codex_error("Codex returned an invalid model/list response"))?;
         let next_cursor = page.next_cursor.clone();
         models.extend(page.visible_models());
         match next_cursor {
@@ -380,11 +377,8 @@ async fn start_codex_thread(
             .map_err(|error| codex_error_context("Codex Session startup failed", error))?;
         ("thread/start", result)
     };
-    let started: ThreadConnectionResult = serde_json::from_value(result).map_err(|error| {
-        codex_error(format!(
-            "Codex returned an invalid {method} response: {error}"
-        ))
-    })?;
+    let started: ThreadConnectionResult = serde_json::from_value(result)
+        .map_err(|_| codex_error(format!("Codex returned an invalid {method} response")))?;
     if started.thread.id.is_empty() {
         return Err(codex_error(format!(
             "Codex returned an invalid {method} response: Provider Session ID was empty"
@@ -432,6 +426,7 @@ async fn start_codex_thread(
     let correlation = Arc::new(StdMutex::new(NativeCorrelation::new(
         started.thread.id.clone(),
         ModelId::new(started.model.clone()),
+        transport.questionnaires(),
     )));
     let turn_start_changed = Arc::new(Notify::new());
     let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
@@ -504,6 +499,7 @@ impl CodexSession {
             .child_interrupt_targets();
         let interrupts = targets.into_iter().filter_map(|(thread_id, turn_id)| {
             let turn_id = turn_id?;
+            self.transport.questionnaires().end_thread(&thread_id);
             let transport = self.transport.clone();
             let bound = self.context.timeouts.interrupt_request;
             Some(async move {
@@ -524,6 +520,14 @@ impl CodexSession {
 }
 
 impl ProviderSession for CodexSession {
+    fn submit_questionnaire(
+        &self,
+        id: crate::protocol::QuestionnaireId,
+        submission: crate::protocol::QuestionnaireSubmission,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move { self.transport.submit_questionnaire(id, submission).await })
+    }
+
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             {
@@ -585,11 +589,8 @@ impl ProviderSession for CodexSession {
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn steering failed", error))?;
-            let steered: TurnSteerResult = serde_json::from_value(result).map_err(|error| {
-                codex_error(format!(
-                    "Codex returned an invalid turn/steer response: {error}"
-                ))
-            })?;
+            let steered: TurnSteerResult = serde_json::from_value(result)
+                .map_err(|_| codex_error("Codex returned an invalid turn/steer response"))?;
             if steered.turn_id != turn_id {
                 return Err(codex_error(
                     "Codex returned an invalid turn/steer response: Turn ID did not match the active Turn",
@@ -607,6 +608,7 @@ impl ProviderSession for CodexSession {
                 .expect("Codex native correlation lock is not poisoned")
                 .active_turn_id()
                 .ok_or_else(|| codex_error("Codex has no active Turn to interrupt"))?;
+            self.transport.questionnaires().clear();
             // The interrupt ends the Session's own turn and leaves the child
             // threads it spawned running, so the children go first — the
             // established ordering every Provider keeps.
@@ -655,6 +657,7 @@ impl ProviderSession for CodexSession {
                     "Codex Subagent stop failed: the Subagent has not begun a turn to interrupt yet",
                 ));
             };
+            self.transport.questionnaires().end_thread(&thread_id);
             self.transport
                 .request_with_timeout(
                     "turn/interrupt",
@@ -672,6 +675,7 @@ impl ProviderSession for CodexSession {
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            self.transport.questionnaires().clear();
             if self.shutdown_started.swap(true, Ordering::AcqRel) {
                 return self.process.wait_until_stopped().await;
             }
@@ -754,11 +758,8 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
             )
             .await
             .map_err(|error| codex_error_context("Codex Turn startup failed", error))?;
-        let started: TurnStartResult = serde_json::from_value(result).map_err(|error| {
-            codex_error(format!(
-                "Codex returned an invalid turn/start response: {error}"
-            ))
-        })?;
+        let started: TurnStartResult = serde_json::from_value(result)
+            .map_err(|_| codex_error("Codex returned an invalid turn/start response"))?;
         if started.turn.id.is_empty() {
             return Err(codex_error(
                 "Codex returned an invalid turn/start response: Turn ID was empty",

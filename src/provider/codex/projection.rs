@@ -62,6 +62,7 @@ const CHILD_THREAD_TURN: &str = "";
 
 /// Everything the projection must remember between notifications for one Codex connection.
 pub(super) struct NativeCorrelation {
+    questionnaires: super::questionnaire::CodexQuestionnaires,
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
@@ -206,9 +207,14 @@ impl ActiveNativeReasoning {
 }
 
 impl NativeCorrelation {
-    pub(super) fn new(thread_id: String, metered_model: ModelId) -> Self {
+    pub(super) fn new(
+        thread_id: String,
+        metered_model: ModelId,
+        questionnaires: super::questionnaire::CodexQuestionnaires,
+    ) -> Self {
         Self {
             thread_id,
+            questionnaires,
             turn_starting: false,
             active_turn_id: None,
             active_selection: None,
@@ -427,6 +433,7 @@ impl NativeCorrelation {
         if self.children.remove(child_thread_id).is_none() {
             return Vec::new();
         }
+        self.questionnaires.end_thread(child_thread_id);
         self.settled_children.insert(child_thread_id.to_owned());
         vec![AttributedProviderEvent {
             attribution: ProviderEventAttribution::OwningSession,
@@ -622,6 +629,31 @@ fn project_native_notification(
     notification: NativeNotification,
 ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
     match notification {
+        NativeNotification::QuestionnaireRequested { id, params } => {
+            let Some((_, attribution)) =
+                correlation.item_thread(&params.thread_id, &params.turn_id)
+            else {
+                return Ok(Vec::new());
+            };
+            let questionnaire = correlation.questionnaires.register(id, params)?;
+            Ok(attributed(
+                &attribution,
+                vec![ProviderEvent::QuestionnaireRequested { questionnaire }],
+            ))
+        }
+        NativeNotification::QuestionnaireResolved {
+            thread_id,
+            request_id,
+        } => {
+            let id = correlation.questionnaires.resolve(&thread_id, &request_id);
+            Ok(match (id, correlation.spawner_attribution(&thread_id)) {
+                (Some(id), Some(attribution)) => attributed(
+                    &attribution,
+                    vec![ProviderEvent::QuestionnaireWithdrawn { id }],
+                ),
+                _ => Vec::new(),
+            })
+        }
         NativeNotification::SkillsChanged => Ok(Vec::new()),
         NativeNotification::AgentSelectionChanged {
             thread_id,
@@ -766,14 +798,32 @@ fn project_native_notification(
             turn_id,
             outcome,
             final_agent_message,
-        } => project_turn_completed(
-            correlation,
-            &thread_id,
-            &turn_id,
-            outcome,
-            final_agent_message,
-        )
-        .map(owning),
+        } => {
+            let withdrawn = correlation.questionnaires.end_turn(&thread_id, &turn_id);
+            if thread_id == correlation.thread_id {
+                project_turn_completed(
+                    correlation,
+                    &thread_id,
+                    &turn_id,
+                    outcome,
+                    final_agent_message,
+                )
+                .map(owning)
+            } else {
+                Ok(correlation
+                    .spawner_attribution(&thread_id)
+                    .map(|attribution| {
+                        attributed(
+                            &attribution,
+                            withdrawn
+                                .into_iter()
+                                .map(|id| ProviderEvent::QuestionnaireWithdrawn { id })
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or_default())
+            }
+        }
         NativeNotification::CollabCallCompleted {
             thread_id,
             tool,
@@ -1691,8 +1741,11 @@ mod tests {
     const ITEM: &str = "item-fixture";
 
     fn reasoning_turn() -> NativeCorrelation {
-        let mut correlation =
-            NativeCorrelation::new(THREAD.to_owned(), ModelId::new("gpt-fixture"));
+        let mut correlation = NativeCorrelation::new(
+            THREAD.to_owned(),
+            ModelId::new("gpt-fixture"),
+            Default::default(),
+        );
         correlation.begin_turn_start().expect("claim the Turn slot");
         correlation
             .finish_turn_start(

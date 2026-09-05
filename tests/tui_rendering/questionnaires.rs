@@ -1049,3 +1049,89 @@ fn submission_reconciliation_preserves_rejected_drafts_and_disables_unconfirmed_
         }
     }
 }
+
+#[test]
+fn secret_questionnaire_masks_editing_and_review_but_submits_the_original_value_then_discards_it() {
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    type_terminal_text(&mut app, "Ordinary composer draft");
+    let activity_id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id: activity_id,
+        turn_id,
+        questionnaire: Questionnaire {
+            id: QuestionnaireId::new(),
+            questions: vec![Question {
+                id: "token".into(),
+                title: Some("Credential".into()),
+                text: "Access token?".into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: true,
+                secret: true,
+                required: false,
+            }],
+        },
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    const SECRET: &str = "private credential value";
+    type_terminal_text(&mut app, SECRET);
+    let editing = rendered_application_rows(&app).join("\n");
+    assert!(
+        !editing.contains(SECRET) && editing.contains("••••••••"),
+        "{editing}"
+    );
+    key(&mut app, KeyCode::Enter);
+    let review = rendered_application_rows(&app).join("\n");
+    assert!(
+        !review.contains(SECRET) && review.contains("••••••••"),
+        "{review}"
+    );
+    let transition = invoke(&mut app, SemanticCommandId::QuestionnaireSubmit);
+    assert!(!format!("{transition:?}").contains(SECRET));
+    let ApplicationTransition::SubmitQuestionnaire {
+        submission: QuestionnaireSubmission::Answer { answer },
+        ..
+    } = transition
+    else {
+        panic!("secret is explicitly submitted after review")
+    };
+    assert_eq!(
+        answer.questions,
+        vec![QuestionAnswer::Freeform {
+            text: SECRET.into()
+        }]
+    );
+    let Activity::Questionnaire {
+        outcome, answer, ..
+    } = snapshot.activities.last_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    *outcome = QuestionnaireOutcome::Answered;
+    *answer = Some(Answer {
+        questions: vec![QuestionAnswer::SecretAnswered],
+    });
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .unwrap();
+    let screen = rendered_application_rows(&app).join("\n");
+    assert!(
+        screen.contains("Ordinary composer draft") && !screen.contains(SECRET),
+        "{screen}"
+    );
+    assert!(matches!(
+        invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+        ApplicationTransition::Continue
+    ));
+}
