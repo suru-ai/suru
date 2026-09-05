@@ -245,7 +245,13 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
-        "standing_inputs": { "latest_turn": null, "viewed_at": null, "pending_questionnaires": [], "pending_questionnaires_revision": 0 },
+        "standing_inputs": {
+            "subagent_questionnaires": [],
+            "pending_questionnaires": [],
+            "pending_questionnaires_revision": 0,
+            "latest_turn": null,
+            "viewed_at": null
+        },
         "working_since": 1_755_497_600_100_u64,
         "total_usage": {
             "fresh_input_tokens": 1_200,
@@ -391,6 +397,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 )),
             },
         ],
+        subagent_questionnaires: Vec::new(),
         subagent_usage: Some(UsageTotal {
             fresh_input_tokens: Some(2_000),
             output_tokens: Some(500),
@@ -478,6 +485,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
             }
         ],
+        "subagent_questionnaires": [],
         "subagent_usage": {
             "fresh_input_tokens": 2_000,
             "cache_read_tokens": null,

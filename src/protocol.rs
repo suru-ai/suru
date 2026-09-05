@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
@@ -1592,6 +1592,8 @@ pub struct LatestTurnStatus {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStandingInputs {
+    #[serde(default)]
+    pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
     /// Live Questionnaires awaiting an Answer in this Session.
     #[serde(default)]
     pub pending_questionnaires: Vec<QuestionnaireId>,
@@ -1607,8 +1609,18 @@ pub struct SessionStandingInputs {
 }
 
 impl SessionStandingInputs {
+    pub fn pending_questionnaire_count(&self) -> usize {
+        self.pending_questionnaires.len()
+            + self
+                .subagent_questionnaires
+                .iter()
+                .map(|entry| entry.pending_questionnaires.len())
+                .sum::<usize>()
+    }
+
     pub(crate) fn from_turns(turns: &[Turn]) -> Self {
         Self {
+            subagent_questionnaires: Vec::new(),
             pending_questionnaires: Vec::new(),
             pending_questionnaires_revision: SessionRevision(0),
             latest_turn: turns.last().map(|turn| LatestTurnStatus {
@@ -2213,6 +2225,18 @@ pub enum TranscriptItem {
     Activity { activity_id: ActivityId },
 }
 
+/// Live Questionnaire availability from one descendant, without its Questions
+/// or Answers. Every ancestor names the immediate child through which it is
+/// reached; the revision belongs to the owning descendant Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentQuestionnaires {
+    pub session_id: SessionId,
+    pub via_session_id: SessionId,
+    pub revision: SessionRevision,
+    pub pending_questionnaires: Vec<QuestionnaireId>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
@@ -2231,9 +2255,25 @@ pub struct SessionSnapshot {
     /// states the whole of what its work cost.
     #[serde(default)]
     pub subagent_usage: Option<UsageTotal>,
+    #[serde(default)]
+    pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
 }
 
 impl SessionSnapshot {
+    pub fn subagent_questionnaire_count(&self) -> usize {
+        self.subagent_questionnaires
+            .iter()
+            .map(|entry| entry.pending_questionnaires.len())
+            .sum()
+    }
+    pub fn pending_questionnaires_in_subagent(&self, session_id: SessionId) -> usize {
+        self.subagent_questionnaires
+            .iter()
+            .filter(|entry| entry.via_session_id == session_id)
+            .map(|entry| entry.pending_questionnaires.len())
+            .sum()
+    }
+
     /// When this Session's uninterrupted Working interval began, using the
     /// server-derived subtree reading carried by the Session itself.
     pub const fn working_since(&self) -> Option<SessionTimestamp> {
@@ -2298,6 +2338,9 @@ pub enum SessionChange {
     /// the server. It carries the new reading entire rather than a delta,
     /// because a client holding it must never have to add a change to a total
     /// it may have joined the stream too late to hold.
+    SubagentQuestionnairesChanged {
+        subagent_questionnaires: Vec<SubagentQuestionnaires>,
+    },
     SubagentUsageChanged {
         subagent_usage: Option<UsageTotal>,
     },

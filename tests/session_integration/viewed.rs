@@ -258,6 +258,7 @@ async fn viewing_a_session_stamps_its_summary_and_announces_the_reading() {
             inputs: SessionStandingInputs {
                 pending_questionnaires: Vec::new(),
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
+                subagent_questionnaires: Vec::new(),
                 latest_turn: viewed.standing_inputs.latest_turn,
                 viewed_at: Some(viewed_at),
             },

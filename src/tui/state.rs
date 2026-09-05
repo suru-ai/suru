@@ -907,6 +907,10 @@ impl TuiState {
     fn reconcile_questionnaire_catalog(&mut self, origin: &Outlook, event: &ManagedEvent) {
         match event {
             ManagedEvent::SessionStandingInputsChanged(changed) => {
+                self.questionnaires.reconcile_subagents(
+                    &SessionReference::new(origin.clone(), changed.session_id),
+                    &changed.inputs.subagent_questionnaires,
+                );
                 self.questionnaires.reconcile_available(
                     &SessionReference::new(origin.clone(), changed.session_id),
                     changed.inputs.pending_questionnaires_revision,

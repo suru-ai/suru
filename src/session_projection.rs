@@ -129,6 +129,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 turn.cost = *cost;
                 turn.cost_basis = *cost_basis;
             }
+            SessionChange::SubagentQuestionnairesChanged {
+                subagent_questionnaires,
+            } => {
+                next.subagent_questionnaires
+                    .clone_from(subagent_questionnaires);
+            }
             SessionChange::SubagentUsageChanged { subagent_usage } => {
                 // The reading arrives whole, derived by the one party that
                 // can see across Sessions, so applying it is taking it as
@@ -656,6 +662,7 @@ mod tests {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
+            subagent_questionnaires: Vec::new(),
             subagent_usage: None,
         };
 

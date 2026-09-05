@@ -168,6 +168,27 @@ pub(super) fn render_with_slots(
             area,
         );
     }
+    let subagent_questions = state.session.as_ref().map_or(0, |session| {
+        session.snapshot().subagent_questionnaire_count()
+    });
+    if subagent_questions > 0 && state.open_questionnaire().is_none() {
+        let area = Rect::new(
+            composer.area.x,
+            composer
+                .area
+                .y
+                .saturating_sub(if pending.is_empty() { 1 } else { 2 }),
+            composer.area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{subagent_questions} Subagent questionnaires pending · ↓ browse Subagents"
+            ))
+            .style(theme.feedback.warning),
+            area,
+        );
+    }
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, theme);
     }
@@ -1798,9 +1819,14 @@ fn render_subagent_picker(
         };
         let content = truncate_to_width(
             &format!(
-                "{guide} {} {}: {}",
+                "{guide} {} {}{}: {}",
                 spinner::frame(state.spinner_frame / 3),
                 entry.name,
+                if entry.pending_questionnaires > 0 {
+                    format!(" · {} pending questions", entry.pending_questionnaires)
+                } else {
+                    String::new()
+                },
                 entry.description
             ),
             usize::from(content_width),
@@ -4064,6 +4090,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
+                    subagent_questionnaires: Vec::new(),
                     subagent_usage: None,
                 },
             )))
@@ -4126,6 +4153,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
+                    subagent_questionnaires: Vec::new(),
                     subagent_usage: None,
                 },
             )))

@@ -133,6 +133,7 @@ fn child_with_working_subagent(
             session_id: grandchild_id,
             duration_ms: None,
         }],
+        subagent_questionnaires: Vec::new(),
         subagent_usage: None,
         transcript: vec![
             TranscriptItem::Message { message_id },

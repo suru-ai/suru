@@ -4948,6 +4948,7 @@ mod tests {
             messages,
             activities,
             transcript,
+            subagent_questionnaires: Vec::new(),
             subagent_usage: None,
         }
     }

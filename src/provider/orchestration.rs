@@ -166,6 +166,7 @@ impl ProviderUpdateGate {
 
 enum ProviderCommand {
     SubmitQuestionnaire {
+        target: SessionId,
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
         response: oneshot::Sender<Result<(), String>>,
@@ -337,6 +338,13 @@ struct SubagentRow {
 }
 
 impl SubagentRoutes {
+    fn live_questionnaires(&mut self, session_id: SessionId) -> Option<&mut LiveQuestionnaires> {
+        self.routes
+            .values_mut()
+            .find(|route| route.session_id == session_id)
+            .map(|route| &mut route.turn.questionnaires)
+    }
+
     /// Whether output arriving with no Turn active is owed a Continuation
     /// rather than being stray: some Subagent is still working, or one just
     /// settled and its provoked output is still to come.
@@ -822,10 +830,15 @@ impl ProviderOrchestrator {
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
     ) -> Result<(), String> {
+        let actor_id = match self.sessions.interrupt_target(session_id) {
+            Ok(InterruptTarget::Subagent { root }) => root,
+            _ => session_id,
+        };
         let (response, received) = oneshot::channel();
         self.schedule(
-            session_id,
+            actor_id,
             ProviderCommand::SubmitQuestionnaire {
+                target: session_id,
                 id,
                 submission,
                 response,
@@ -1127,8 +1140,28 @@ async fn run_provider_session(
             };
             let Some(command) = command else { break };
             let prompt_id = match command {
-                ProviderCommand::SubmitQuestionnaire { response, .. } => {
-                    let _ = response.send(Err("The owning Turn has ended".into()));
+                ProviderCommand::SubmitQuestionnaire {
+                    target,
+                    id,
+                    submission,
+                    response,
+                } => {
+                    if let (Some(connected), Some(live)) =
+                        (provider.as_ref(), subagents.live_questionnaires(target))
+                    {
+                        deliveries.submit(
+                            &sessions,
+                            &updates,
+                            target,
+                            live,
+                            connected.session.clone(),
+                            id,
+                            submission,
+                            response,
+                        );
+                    } else {
+                        let _ = response.send(Err("Questionnaire is unavailable".into()));
+                    }
                     continue;
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
@@ -1406,22 +1439,32 @@ async fn run_provider_session(
                 // stays pending until that Turn's settle delivers the queue.
             }
             ProviderInput::Command(Some(ProviderCommand::SubmitQuestionnaire {
+                target,
                 id,
                 submission,
                 response,
             })) => {
-                let current = active.as_mut().expect("submission has an active Turn");
-                deliveries.submit(
-                    &sessions,
-                    &updates,
-                    session_id,
-                    &mut current.questionnaires,
-                    provider_session,
-                    id,
-                    submission,
-                    response,
-                );
+                let live = if target == session_id {
+                    active.as_mut().map(|turn| &mut turn.questionnaires)
+                } else {
+                    subagents.live_questionnaires(target)
+                };
+                if let Some(live) = live {
+                    deliveries.submit(
+                        &sessions,
+                        &updates,
+                        target,
+                        live,
+                        provider_session,
+                        id,
+                        submission,
+                        response,
+                    );
+                } else {
+                    let _ = response.send(Err("Questionnaire is unavailable".into()));
+                }
             }
+
             ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
                     .as_ref()

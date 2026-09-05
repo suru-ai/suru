@@ -2053,7 +2053,7 @@ impl Sidebar {
                     open,
                     session_standing(StandingInputs {
                         needs_intervention: session.readable().is_some_and(|summary| {
-                            !summary.standing_inputs.pending_questionnaires.is_empty()
+                            summary.standing_inputs.pending_questionnaire_count() > 0
                         }),
                         working: session.working_since().is_some(),
                         failed: session.readable().is_some_and(|summary| {

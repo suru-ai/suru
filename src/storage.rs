@@ -419,6 +419,7 @@ fn load_session(
         // A child's Usage lives in the child's own stored Turns, so the
         // roll-up is re-derived across the subtree once every Session is
         // loaded rather than stored twice.
+        subagent_questionnaires: Vec::new(),
         subagent_usage: None,
     };
     // Working is reconstructed across the complete Session tree after every

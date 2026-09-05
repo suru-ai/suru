@@ -484,6 +484,7 @@ mod tests {
                 cost: None,
                 cost_basis: None,
             }],
+            subagent_questionnaires: Vec::new(),
             subagent_usage: None,
             transcript: messages
                 .iter()

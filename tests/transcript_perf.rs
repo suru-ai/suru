@@ -55,6 +55,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         messages: Vec::new(),
         activities: Vec::new(),
         transcript: Vec::new(),
+        subagent_questionnaires: Vec::new(),
         subagent_usage: None,
     };
     for section in 1..=sections {

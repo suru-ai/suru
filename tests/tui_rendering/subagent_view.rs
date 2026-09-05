@@ -105,6 +105,7 @@ fn child_session_snapshot(
         }],
         activities: Vec::new(),
         transcript: vec![TranscriptItem::Message { message_id }],
+        subagent_questionnaires: Vec::new(),
         subagent_usage: None,
     }
 }

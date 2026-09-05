@@ -21,6 +21,7 @@ pub(super) struct QuestionnairePanels {
     drafts: HashMap<(SessionReference, QuestionnaireId), Panel>,
     availability:
         HashMap<SessionReference, (crate::protocol::SessionRevision, Vec<QuestionnaireId>)>,
+    descendants: HashMap<SessionReference, Vec<SessionReference>>,
     unlisted_sessions: HashSet<SessionReference>,
     pub(super) visible: Option<(SessionReference, QuestionnaireId)>,
 }
@@ -151,6 +152,11 @@ impl QuestionnairePanels {
         }
     }
     pub(super) fn discard_session(&mut self, session: &SessionReference) {
+        if let Some(descendants) = self.descendants.remove(session) {
+            for child in descendants {
+                self.discard_session(&child);
+            }
+        }
         self.availability.remove(session);
         self.unlisted_sessions.remove(session);
         self.drafts.retain(|(owner, _), _| owner != session);
@@ -168,11 +174,28 @@ impl QuestionnairePanels {
             self.unlisted_sessions.insert(session.clone());
         }
 
+        self.reconcile_subagents(session, &snapshot.subagent_questionnaires);
         self.reconcile_available(
             session,
             snapshot.revision,
             &pending(snapshot).map(|q| q.id).collect::<Vec<_>>(),
         );
+    }
+
+    pub(super) fn reconcile_subagents(
+        &mut self,
+        owner: &SessionReference,
+        entries: &[crate::protocol::SubagentQuestionnaires],
+    ) {
+        for entry in entries {
+            let session = SessionReference::new(owner.origin.clone(), entry.session_id);
+            self.unlisted_sessions.insert(session.clone());
+            self.reconcile_available(&session, entry.revision, &entry.pending_questionnaires);
+            let descendants = self.descendants.entry(owner.clone()).or_default();
+            if !descendants.contains(&session) {
+                descendants.push(session);
+            }
+        }
     }
 
     pub(super) fn reconcile_available(

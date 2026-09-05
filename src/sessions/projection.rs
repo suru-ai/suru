@@ -90,7 +90,73 @@ impl SessionStoreState {
         }
         self.reconcile_working(storage, session_id);
         self.reconcile_usage(storage, session_id);
+        self.reconcile_questionnaires(storage, session_id);
         Ok(update)
+    }
+
+    /// Carries descendant availability to each ancestor without copying child
+    /// Transcript content or making a child a catalog entry.
+    fn reconcile_questionnaires(&mut self, storage: &StorageSink, session_id: SessionId) {
+        let ancestry = self.ancestry(session_id);
+        for current in &ancestry.sessions {
+            let mut reading = Vec::new();
+            for child in self.subtree(*current).into_iter().skip(1) {
+                let child_record = &self.sessions[&child];
+                if child_record
+                    .summary
+                    .standing_inputs
+                    .pending_questionnaires_revision
+                    .0
+                    == 0
+                {
+                    continue;
+                }
+                let mut via = child;
+                while let Some(parent) = self.sessions[&via].snapshot.session.parent {
+                    if parent == *current {
+                        break;
+                    }
+                    via = parent;
+                }
+                reading.push(crate::protocol::SubagentQuestionnaires {
+                    session_id: child,
+                    via_session_id: via,
+                    revision: child_record
+                        .summary
+                        .standing_inputs
+                        .pending_questionnaires_revision,
+                    pending_questionnaires: child_record
+                        .summary
+                        .standing_inputs
+                        .pending_questionnaires
+                        .clone(),
+                });
+            }
+            reading.sort_by_key(|entry| entry.session_id.as_uuid());
+            let Some(record) = self.sessions.get_mut(current) else {
+                continue;
+            };
+            if record.snapshot.subagent_questionnaires == reading {
+                continue;
+            }
+            if let Err(error) = record.commit_derived(
+                storage,
+                *current,
+                vec![SessionChange::SubagentQuestionnairesChanged {
+                    subagent_questionnaires: reading,
+                }],
+            ) {
+                tracing::warn!(session_id = %current, "Subagent Questionnaire availability did not roll up: {error}");
+                continue;
+            }
+            if ancestry.announces(*current) {
+                let inputs = record.summary.standing_inputs.clone();
+                self.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
+                    session_id: *current,
+                    inputs,
+                });
+            }
+        }
     }
 
     /// Re-derives [`crate::protocol::Session::working_since`] for the Session
@@ -438,6 +504,10 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
+        self.summary
+            .standing_inputs
+            .subagent_questionnaires
+            .clone_from(&self.snapshot.subagent_questionnaires);
         self.summary.standing_inputs.latest_turn =
             SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
         let pending = self

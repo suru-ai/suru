@@ -501,7 +501,7 @@ impl SessionPicker {
                 let readable = summary.readable();
                 SessionPickerRow {
                     pending_questionnaires: readable.map_or(0, |summary| {
-                        summary.standing_inputs.pending_questionnaires.len()
+                        summary.standing_inputs.pending_questionnaire_count()
                     }),
                     title: summary.title(),
                     emoji: self.emoji.drawn_emoji(summary.emoji()),

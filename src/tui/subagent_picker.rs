@@ -20,6 +20,7 @@ use crate::protocol::{Activity, ActivityStatus, SessionId, SessionSnapshot};
 pub(super) struct WorkingSubagent<'a> {
     pub(super) session_id: SessionId,
     pub(super) name: &'a str,
+    pub(super) pending_questionnaires: usize,
     pub(super) description: &'a str,
 }
 
@@ -38,6 +39,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 session_id,
                 ..
             } => Some(WorkingSubagent {
+                pending_questionnaires: snapshot.pending_questionnaires_in_subagent(*session_id),
                 session_id: *session_id,
                 name,
                 description,

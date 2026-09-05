@@ -2097,6 +2097,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
             inputs: SessionStandingInputs {
                 pending_questionnaires: Vec::new(),
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
+                subagent_questionnaires: Vec::new(),
                 latest_turn: Some(LatestTurnStatus {
                     status: TurnStatus::Completed,
                     settled_at: Some(settled_at),

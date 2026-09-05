@@ -228,6 +228,7 @@ impl SessionStore {
             transcript: Vec::new(),
             // A Session begins having delegated nothing, so there is nothing
             // below it to roll up.
+            subagent_questionnaires: Vec::new(),
             subagent_usage: None,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);

@@ -77,6 +77,7 @@ impl SessionStore {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
+            subagent_questionnaires: Vec::new(),
             subagent_usage: None,
         };
         let title = match description.trim() {
