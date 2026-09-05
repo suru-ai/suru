@@ -245,7 +245,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
-        "standing_inputs": { "latest_turn": null, "viewed_at": null },
+        "standing_inputs": { "latest_turn": null, "viewed_at": null, "pending_questionnaires": [], "pending_questionnaires_revision": 0 },
         "working_since": 1_755_497_600_100_u64,
         "total_usage": {
             "fresh_input_tokens": 1_200,
