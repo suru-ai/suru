@@ -104,6 +104,18 @@ _Avoid_: Message, notification
 A provider-operated capability that performs work for an agent. User-visible Tool execution is represented as Activity.
 _Avoid_: Function, action
 
+**Questionnaire**:
+A Provider-native request for structured user input during a Turn, containing one or more Questions. Distinct from a permission approval or a question written in an Agent's ordinary prose.
+_Avoid_: Question tool, input request
+
+**Question**:
+One item in a Questionnaire asking the user for input.
+_Avoid_: Prompt, field
+
+**Answer**:
+The user's submitted response to a Questionnaire, distinct from a Prompt.
+_Avoid_: Reply, response message
+
 **Subagent**:
 An agent to which a Turn's Agent delegates work through its Provider, running its own conversation in its own Session — a child of the Session whose Turn spawned it. The parent's Transcript records each Subagent as an Activity of its own kind: one row naming the Subagent and what it was asked to do, wearing the usual Marker while it works and its outcome and duration once it settles, and standing — live or settled — as the way into the Subagent's Session. That row is all the parent's Transcript carries of it: the Subagent's work belongs to its own Transcript, never interleaved into the parent's. A Subagent may outlive the Turn that spawned it; while any Subagent still works the Session is still Working, and output one provokes after its Turn Settled lands in whatever Turn is active or begins a Continuation. Subagents may spawn Subagents, each recorded the same way one level down. Interrupting a Session whose Subagents still work stops them along with whatever else the Session is doing, and a single Subagent may be stopped on its own where its Provider allows it; neither asks before acting, as interrupting never does.
 _Avoid_: Task, child agent, background agent, worker
