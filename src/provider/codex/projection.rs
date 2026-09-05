@@ -583,8 +583,7 @@ async fn next_provider_event(
                                 events.pricing.as_deref(),
                                 &model,
                                 event,
-                            )
-                            .await));
+                            )));
                         }
                         events.pending.extend(priced);
                     }
@@ -606,7 +605,7 @@ async fn next_provider_event(
 /// sees, and a child ordinarily runs the Model its spawner does — so the
 /// Session's Model is the closest honest rate, and the Estimated Basis is
 /// already what says not to read the figure as exact.
-async fn estimate_cost(
+fn estimate_cost(
     pricing: Option<&PricingSource>,
     model: &ModelId,
     mut event: AttributedProviderEvent,
@@ -614,12 +613,10 @@ async fn estimate_cost(
     let (Some(pricing), ProviderEvent::Usage { usage, cost }) = (pricing, &mut event.event) else {
         return event;
     };
-    let estimated = pricing
-        .estimate(
-            &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model.clone()),
-            usage,
-        )
-        .await;
+    let estimated = pricing.estimate_cached(
+        &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model.clone()),
+        usage,
+    );
     *cost = estimated.map(MeteredCost::from);
     event
 }

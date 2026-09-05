@@ -430,14 +430,9 @@ async fn start_codex_thread(
     )));
     let turn_start_changed = Arc::new(Notify::new());
     let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
-    // Codex meters mid-Turn, and the lookup that prices a reading runs on the
-    // event pump, so the rate table is warmed here instead: a Session opening
-    // waits on nothing, and by the time a Turn meters anything the fetch has
-    // long since settled one way or the other.
+    // Refresh belongs to the Session lifetime, outside the event pump.
     let pricing = context.pricing.clone();
-    if let Some(pricing) = pricing.clone() {
-        tokio::spawn(async move { pricing.prime().await });
-    }
+    let pricing_refresh = pricing.as_ref().map(PricingSource::keep_fresh);
     let attachment = ChildThreadAttachment {
         transport: transport.clone(),
         cwd: cwd.to_owned(),
@@ -450,6 +445,7 @@ async fn start_codex_thread(
         turn_start_changed,
         process: process.clone(),
         shutdown_started: AtomicBool::new(false),
+        pricing_refresh,
     });
     let events = provider_events(
         notifications,
@@ -482,6 +478,7 @@ struct CodexSession {
     turn_start_changed: Arc<Notify>,
     process: Arc<ProcessGuard>,
     shutdown_started: AtomicBool,
+    pricing_refresh: Option<crate::pricing::PricingRefresh>,
 }
 
 impl CodexSession {
@@ -675,6 +672,9 @@ impl ProviderSession for CodexSession {
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(refresh) = &self.pricing_refresh {
+                refresh.stop();
+            }
             self.transport.questionnaires().clear();
             if self.shutdown_started.swap(true, Ordering::AcqRel) {
                 return self.process.wait_until_stopped().await;

@@ -66,6 +66,20 @@ pub struct PricingSource {
     state: Mutex<PricingState>,
 }
 
+pub(crate) struct PricingRefresh(tokio::task::JoinHandle<()>);
+
+impl PricingRefresh {
+    pub(crate) fn stop(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for PricingRefresh {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[derive(Debug, Default)]
 struct PricingState {
     cache_loaded: bool,
@@ -135,18 +149,50 @@ impl PricingSource {
         let _ = self.fetch_catalog().await;
     }
 
+    /// Reads only fresh in-memory rates. Never waits for a fetch or its lock,
+    /// loads a disk cache, or starts I/O. Cold, busy, and overdue tables yield
+    /// absence so streaming Provider output can always keep moving.
+    pub fn estimate_cached(&self, model: &ModelsDevModel, usage: &Usage) -> Option<EstimatedCost> {
+        let state = self.state.try_lock().ok()?;
+        let document = state.document.as_ref()?;
+        if !within_refresh_interval(
+            document.last_attempted_at_millis,
+            now_millis(),
+            self.refresh_interval,
+        ) {
+            return None;
+        }
+        document.catalog.estimate(model, usage)
+    }
+
+    /// Keeps rates current while a consumer is alive. Multiple consumers share
+    /// the fetch throttle; dropping the guard cancels this consumer's task.
+    pub(crate) fn keep_fresh(self: &std::sync::Arc<Self>) -> PricingRefresh {
+        let source = self.clone();
+        PricingRefresh(tokio::spawn(async move {
+            loop {
+                source.prime().await;
+                let delay = {
+                    let state = source.state.lock().await;
+                    let elapsed = now_millis()
+                        .saturating_sub(state.last_attempted_at_millis.unwrap_or_default());
+                    source
+                        .refresh_interval
+                        .saturating_sub(Duration::from_millis(elapsed))
+                };
+                tokio::time::sleep(delay.max(Duration::from_millis(1))).await;
+            }
+        }))
+    }
+
     /// Prices every reported token part at the Model's own catalog rates;
     /// Reasoning uses the output rate. Unknown Models, missing rates needed by
     /// the Usage, malformed entries, and unavailable first-run catalogs all
-    /// yield absence without surfacing a lookup error.
+    /// yield absence without surfacing a lookup error. May fetch and wait;
+    /// streaming callers must use `estimate_cached` instead.
     pub async fn estimate(&self, model: &ModelsDevModel, usage: &Usage) -> Option<EstimatedCost> {
         let catalog = self.fetch_catalog().await?;
-        let cost = catalog
-            .providers
-            .get(&model.provider)?
-            .get(model.model.as_str())?
-            .price(usage)?;
-        Some(EstimatedCost { cost })
+        catalog.estimate(model, usage)
     }
 
     async fn fetch_catalog(&self) -> Option<RateCatalog> {
@@ -170,8 +216,11 @@ impl PricingSource {
                 .map(|document| document.catalog.clone());
         }
 
+        let fetched = self.fetch_source().await;
+        // The lock already serializes fetches. Record only completed attempts
+        // so cancelling a consumer cannot throttle its replacement for a day.
         state.last_attempted_at_millis = Some(attempted_at_millis);
-        let source = match self.fetch_source().await {
+        let source = match fetched {
             Some(source) => source,
             None => return self.retain_cache_after_failure(&mut state, attempted_at_millis),
         };
@@ -235,6 +284,15 @@ impl PricingSource {
 }
 
 impl RateCatalog {
+    fn estimate(&self, model: &ModelsDevModel, usage: &Usage) -> Option<EstimatedCost> {
+        let cost = self
+            .providers
+            .get(&model.provider)?
+            .get(model.model.as_str())?
+            .price(usage)?;
+        Some(EstimatedCost { cost })
+    }
+
     fn from_models_dev(source: &Value) -> Option<Self> {
         let source = source.as_object()?;
         let mut providers = HashMap::new();
@@ -388,6 +446,55 @@ mod tests {
                 .expect("serve pricing fixture");
         });
         (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_fetch_leaves_cached_reads_free_and_a_new_fetch_possible() {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handler_entered = entered.clone();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/api.json",
+            get(move || {
+                let entered = handler_entered.clone();
+                let requests = requests.clone();
+                async move {
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Json(json!({"openai":{"models":{"fixture":{"cost":{"input":2,"output":4}}}}}))
+                }
+            }),
+        );
+        let (endpoint, server) = serve_fixture(app).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let pricing = std::sync::Arc::new(
+            PricingSource::new(data_dir.path())
+                .with_source_endpoint(endpoint)
+                .with_fetch_timeout(Duration::from_millis(500)),
+        );
+        let source = pricing.clone();
+        let prime = tokio::spawn(async move { source.prime().await });
+        tokio::time::timeout(Duration::from_millis(200), entered.notified())
+            .await
+            .unwrap();
+        let model = openai_model("fixture");
+        let usage = Usage {
+            fresh_input_tokens: Some(500_000),
+            ..Usage::default()
+        };
+        assert_eq!(pricing.estimate_cached(&model, &usage), None);
+        prime.abort();
+        assert!(prime.await.unwrap_err().is_cancelled());
+        pricing.prime().await;
+        assert_eq!(
+            pricing
+                .estimate_cached(&model, &usage)
+                .map(EstimatedCost::cost),
+            Cost::from_usd(1.0)
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -614,10 +721,19 @@ mod tests {
             ..Usage::default()
         };
 
+        assert_eq!(pricing.estimate_cached(&model, &usage), None);
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "cold reads never fetch");
+
         assert_eq!(
             pricing
                 .estimate(&model, &usage)
                 .await
+                .map(EstimatedCost::cost),
+            Cost::from_usd(1.0)
+        );
+        assert_eq!(
+            pricing
+                .estimate_cached(&model, &usage)
                 .map(EstimatedCost::cost),
             Cost::from_usd(1.0)
         );
@@ -632,6 +748,12 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
         tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(pricing.estimate_cached(&model, &usage), None);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "overdue reads never refresh"
+        );
         assert_eq!(
             pricing
                 .estimate(&model, &usage)

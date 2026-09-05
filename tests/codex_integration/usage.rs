@@ -210,9 +210,8 @@ fn first_turn_usage() -> Usage {
 }
 
 /// A models.dev catalog serving one priced Model, and the Suru rate lookup
-/// pointed at it. The refresh interval is millisecond-scale so no test waits
-/// out the daily cadence, and the cache lives in its own directory so no two
-/// tests share one.
+/// pointed at it. Tests asserting exact Costs begin with warm rates; cold and
+/// refreshing rates have separate fixtures. Each cache has its own directory.
 async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
     let app = Router::new().route(
         "/api.json",
@@ -244,8 +243,9 @@ async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
     let cache_dir = tempfile::tempdir().expect("create pricing cache directory");
     let pricing = PricingSource::new(cache_dir.path())
         .with_source_endpoint(endpoint)
-        .with_refresh_interval(Duration::from_millis(1))
+        .with_refresh_interval(Duration::from_secs(60))
         .with_fetch_timeout(Duration::from_secs(5));
+    pricing.prime().await;
     (Arc::new(pricing), cache_dir)
 }
 
@@ -267,6 +267,16 @@ async fn metered_session(
     prompt: &str,
 ) -> MeteredSession {
     let (pricing, pricing_cache) = priced_lookup().await;
+    metered_session_with_pricing(codex, name, prompt, pricing, pricing_cache).await
+}
+
+async fn metered_session_with_pricing(
+    codex: &ScriptedCodex,
+    name: &'static str,
+    prompt: &str,
+    pricing: Arc<PricingSource>,
+    pricing_cache: tempfile::TempDir,
+) -> MeteredSession {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
@@ -717,4 +727,203 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
         .shutdown()
         .await
         .expect("stop replacement server");
+}
+
+#[tokio::test]
+async fn a_stalled_pricing_fetch_does_not_delay_codex_usage_or_settlement() {
+    stalled_pricing_does_not_delay_turn(false).await;
+}
+
+#[tokio::test]
+async fn a_stalled_overdue_refresh_does_not_delay_codex_usage_or_settlement() {
+    stalled_pricing_does_not_delay_turn(true).await;
+}
+
+async fn stalled_pricing_does_not_delay_turn(initially_warm: bool) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered = entered.clone();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/api.json",
+        get(move || {
+            let entered = handler_entered.clone();
+            let requests = requests.clone();
+            async move {
+                if initially_warm && requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    return Json(json!({"openai":{"models":{"priced-fixture":{"cost":{
+                        "input":2,"output":4,"cache_read":0.5,"cache_write":0.25
+                    }}}}}));
+                }
+                entered.notify_one();
+                std::future::pending::<Json<serde_json::Value>>().await
+            }
+        }),
+    );
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}/api.json", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cache = tempfile::tempdir().unwrap();
+    let pricing = Arc::new(
+        PricingSource::new(cache.path())
+            .with_source_endpoint(endpoint)
+            .with_refresh_interval(Duration::from_millis(20))
+            .with_fetch_timeout(Duration::from_millis(1500)),
+    );
+    if initially_warm {
+        pricing.prime().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let warming = pricing.clone();
+    let prime = tokio::spawn(async move { warming.prime().await });
+    timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let fixture = ScriptedCodex::new(&METERED_TURNS_CODEX.replace("__MODEL__", "priced-fixture"));
+    let opened = metered_session_with_pricing(
+        &fixture,
+        "codex-stalled-pricing",
+        "Meter while pricing hangs",
+        pricing,
+        cache,
+    )
+    .await;
+    let settled = timeout(
+        Duration::from_millis(500),
+        settled_turn(&opened.client, opened.session_id, 0),
+    )
+    .await
+    .expect("pricing must not hold up the Turn");
+    assert_eq!(settled.turns[0].usage, Some(first_turn_usage()));
+    assert_eq!(settled.turns[0].cost, None);
+    assert_eq!(settled.turns[0].cost_basis, None);
+    opened.server.shutdown().await.unwrap();
+    prime.abort();
+    http.abort();
+}
+
+#[tokio::test]
+async fn a_cold_table_warming_mid_turn_prices_a_later_reading() {
+    pricing_recovers_during_turn(false).await;
+}
+
+#[tokio::test]
+async fn a_long_lived_session_refreshes_rates_without_waiting_for_an_event() {
+    pricing_recovers_during_turn(true).await;
+}
+
+async fn pricing_recovers_during_turn(refresh: bool) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_entered = entered.clone();
+    let handler_release = release.clone();
+    let app = Router::new().route(
+        "/api.json",
+        get(move || {
+            let entered = handler_entered.clone();
+            let release = handler_release.clone();
+            async move {
+                entered.notify_one();
+                release.acquire().await.unwrap().forget();
+                Json(json!({"openai":{"models":{"priced-fixture":{"cost":{
+                    "input":2,"output":4,"cache_read":0.5,"cache_write":0.25
+                }}}}}))
+            }
+        }),
+    );
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}/api.json", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cache = tempfile::tempdir().unwrap();
+    let pricing = Arc::new(
+        PricingSource::new(cache.path())
+            .with_source_endpoint(endpoint)
+            .with_refresh_interval(Duration::from_millis(800))
+            .with_fetch_timeout(Duration::from_millis(1500)),
+    );
+    if refresh {
+        release.add_permits(1);
+        pricing.prime().await;
+        entered.notified().await;
+    }
+    // Restate Usage at interruption, giving the test control over the next
+    // reading without sleeping in the scripted Provider.
+    let reading = INTERRUPTED_METERING_CODEX
+        .lines()
+        .find(|line| line.contains("thread/tokenUsage/updated"))
+        .unwrap();
+    let script = INTERRUPTED_METERING_CODEX.replace(
+        "    *'\"method\":\"turn/interrupt\"'*)",
+        &format!("    *'\"method\":\"turn/interrupt\"'*)\n{reading}"),
+    );
+    let fixture = ScriptedCodex::new(&script);
+    let opened = metered_session_with_pricing(
+        &fixture,
+        "codex-pricing-recovers",
+        "Meter as rates warm",
+        pricing.clone(),
+        cache,
+    )
+    .await;
+    let first = timeout(Duration::from_millis(500), async {
+        loop {
+            let snapshot = opened.client.read_session(opened.session_id).await.unwrap();
+            if snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.usage.is_some())
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Usage flows before the pricing response");
+    assert_eq!(first.turns[0].usage, Some(first_turn_usage()));
+    if !refresh {
+        assert_eq!(first.turns[0].cost, None);
+    }
+    timeout(Duration::from_millis(1200), entered.notified())
+        .await
+        .expect("Session starts the fetch without another Provider event");
+    release.add_permits(1);
+    timeout(Duration::from_millis(500), async {
+        loop {
+            if pricing
+                .estimate_cached(
+                    &suru::pricing::ModelsDevModel::new(
+                        "openai",
+                        suru::protocol::ModelId::new("priced-fixture"),
+                    ),
+                    &first_turn_usage(),
+                )
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rates become readable");
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .unwrap();
+    let settled = settled_turn(&opened.client, opened.session_id, 0).await;
+    assert_eq!(settled.turns[0].cost, Cost::from_usd(0.0029625));
+    assert_eq!(settled.turns[0].cost_basis, Some(CostBasis::Estimated));
+    if refresh {
+        timeout(Duration::from_millis(1200), entered.notified())
+            .await
+            .expect("interrupting a Turn leaves the Session's refresh cadence alive");
+    }
+    opened.server.shutdown().await.unwrap();
+    http.abort();
 }
