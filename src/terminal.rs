@@ -221,7 +221,11 @@ impl TerminalInputParser {
                     ordinary.append(raw);
                     self.state = RawInputState::Ground;
                 }
-                RawInputState::Osc { payload, .. } if !self.expecting_colors => {
+                // Only ambiguous Alt-] input expires. Once an OSC color prefix
+                // is recognized, read through its terminator even if it is late.
+                RawInputState::Osc { payload, .. }
+                    if !self.expecting_colors && !is_confirmed_color_response(payload) =>
+                {
                     push_alt_bracket(&mut output);
                     ordinary.extend_from_slice(payload);
                     self.state = RawInputState::Ground;
@@ -247,18 +251,9 @@ impl TerminalInputParser {
     }
 
     fn stop_expecting_colors(&mut self) {
+        // The query window only governs ambiguous prefixes. A recognized
+        // reply may still finish later and must retain its accumulated colors.
         self.expecting_colors = false;
-        if let RawInputState::Osc {
-            payload,
-            escape_terminator,
-            ..
-        } = &self.state
-            && is_confirmed_color_response(payload)
-        {
-            self.state = RawInputState::DiscardOsc {
-                escape_terminator: *escape_terminator,
-            };
-        }
     }
 }
 
@@ -1213,6 +1208,22 @@ mod tests {
     }
 
     #[test]
+    fn late_color_reply_survives_idle_boundaries_without_becoming_keys() {
+        let mut parser = TerminalInputParser::default();
+
+        assert!(parser.parse(b"\x1b]11;", false).is_empty());
+        assert!(parser.parse(b"rgb:ffff/ffff/ffff\x1b", false).is_empty());
+        assert_eq!(
+            parser.parse(b"\\", false),
+            vec![TerminalInput::Colors(TerminalColorProbe::new(
+                [None; 16],
+                None,
+                Some(TerminalColor::new(255, 255, 255)),
+            ))]
+        );
+    }
+
+    #[test]
     fn owned_input_parser_routes_theme_reports_to_a_reprobe() {
         let mut parser = TerminalInputParser::default();
         let mut observed = Vec::new();
@@ -1434,12 +1445,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_timeout_replays_a_color_prefix_when_no_query_is_outstanding() {
+    async fn idle_timeout_replays_an_ambiguous_color_prefix_when_no_query_is_outstanding() {
         use futures_util::StreamExt as _;
 
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         sender
-            .send(TerminalSourceInput::Bytes(b"\x1b]10;".to_vec()))
+            .send(TerminalSourceInput::Bytes(b"\x1b]10".to_vec()))
             .unwrap();
         let mut events = TerminalEvents::from_source(source).unwrap();
 
@@ -1450,7 +1461,7 @@ mod tests {
                 KeyModifiers::ALT,
             )))
         );
-        for expected in ['1', '0', ';'] {
+        for expected in ['1', '0'] {
             assert_eq!(
                 events.next().await.unwrap().unwrap(),
                 TerminalInput::Event(InputEvent::Key(KeyEvent::new(
@@ -1459,6 +1470,54 @@ mod tests {
                 )))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn color_reply_completes_after_the_response_window_expires() {
+        use futures_util::StreamExt as _;
+
+        let (sender, source) = tokio::sync::mpsc::unbounded_channel();
+        let mut events = TerminalEvents::from_source(source).unwrap();
+        assert_eq!(
+            events
+                .probe_colors(&mut Vec::new(), Duration::ZERO)
+                .await
+                .unwrap(),
+            None
+        );
+        sender
+            .send(TerminalSourceInput::Bytes(
+                b"\x1b]11;rgb:ffff/ffff".to_vec(),
+            ))
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.next())
+                .await
+                .is_err(),
+            "an incomplete protocol reply became reader input"
+        );
+        sender
+            .send(TerminalSourceInput::Bytes(b"/ffff\x07x".to_vec()))
+            .unwrap();
+        drop(sender);
+
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Colors(TerminalColorProbe::new(
+                [None; 16],
+                None,
+                Some(TerminalColor::new(255, 255, 255)),
+            ))
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+        );
+        assert!(events.next().await.is_none());
     }
 
     #[tokio::test]
