@@ -82,6 +82,39 @@ fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_
             .contains("requires a supported answer")
     );
     type_terminal_text(&mut app, "Use the staging machine");
+    let edited = rendered_application_rows(&app).join("\n");
+    for kind in [
+        crossterm::event::KeyEventKind::Release,
+        crossterm::event::KeyEventKind::Repeat,
+    ] {
+        for (code, modifiers) in [
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::NONE),
+            (KeyCode::Char(' '), KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            let event = Event::Key(KeyEvent::new_with_kind(code, modifiers, kind));
+            assert_eq!(
+                app.command_for_terminal_input(event.clone()),
+                None,
+                "{kind:?} must not dispatch {code:?}"
+            );
+            assert!(matches!(
+                app.handle_terminal_event(event).unwrap(),
+                ApplicationTransition::Continue
+            ));
+        }
+    }
+    assert_eq!(
+        rendered_application_rows(&app).join("\n"),
+        edited,
+        "release and repeat events leave the edited Answer and panel untouched"
+    );
+
     assert!(matches!(
         key(&mut app, KeyCode::Esc),
         ApplicationTransition::Continue

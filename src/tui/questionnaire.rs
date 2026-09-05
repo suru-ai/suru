@@ -330,6 +330,9 @@ pub(super) fn key(event: &Event) -> Option<CommandId> {
     let Event::Key(key) = event else {
         return None;
     };
+    if key.kind != crossterm::event::KeyEventKind::Press {
+        return None;
+    }
     let semantic = match (key.code, key.modifiers) {
         (KeyCode::Up, KeyModifiers::ALT) => QuestionnaireScrollUp,
         (KeyCode::Down, KeyModifiers::ALT) => QuestionnaireScrollDown,
