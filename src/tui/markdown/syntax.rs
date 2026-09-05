@@ -16,6 +16,9 @@ use syntect::{
 
 use crate::theme::Theme;
 
+// Bound per-delta parsing work; oversized blocks retain the flat code style.
+const MAX_HIGHLIGHT_BYTES: usize = 32 * 1024;
+
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
 fn language<'a>(info: &str, syntaxes: &'a SyntaxSet) -> Option<&'a SyntaxReference> {
@@ -39,6 +42,9 @@ pub(super) fn render(
     theme: &Theme,
     flat_style: Style,
 ) -> Vec<Line<'static>> {
+    if content.len() > MAX_HIGHLIGHT_BYTES {
+        return flat_lines(content, flat_style);
+    }
     render_with_syntaxes(content, info, theme, &SYNTAXES, flat_style)
 }
 
@@ -59,18 +65,20 @@ fn render_with_syntaxes(
             .ok()
             .and_then(Result::ok)
         })
-        .unwrap_or_else(|| {
-            content
-                .split_terminator('\n')
-                .map(|line| {
-                    if line.is_empty() {
-                        Line::default()
-                    } else {
-                        Line::from(Span::styled(line.to_owned(), flat_style))
-                    }
-                })
-                .collect()
+        .unwrap_or_else(|| flat_lines(content, flat_style))
+}
+
+fn flat_lines(content: &str, style: Style) -> Vec<Line<'static>> {
+    content
+        .split_terminator('\n')
+        .map(|line| {
+            if line.is_empty() {
+                Line::default()
+            } else {
+                Line::from(Span::styled(line.to_owned(), style))
+            }
         })
+        .collect()
 }
 
 fn highlight(

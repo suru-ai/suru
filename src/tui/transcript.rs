@@ -4215,6 +4215,70 @@ mod tests {
     }
 
     #[test]
+    fn transcript_cache_recolors_code_blocks_when_only_syntax_colors_change() {
+        let content = "```rust\nlet value = 42;\n```";
+        let activity = reasoning(ActivityStatus::Completed, None, content);
+        let snapshot = transcript_snapshot(vec![
+            Entry::Message(agent_message(content)),
+            Entry::Activity(activity.clone()),
+        ]);
+        let cache = TranscriptCache::default();
+        let mut folds = TranscriptFolds::default();
+        folds.expand(activity.id());
+        let mut first_theme = Theme::system();
+        first_theme.syntax.keyword.fg = Some(Color::Rgb(1, 2, 3));
+        let first = cache.view(
+            0,
+            &snapshot,
+            &[],
+            TranscriptDisclosure {
+                folds: &folds,
+                groups: &TranscriptGroups::default(),
+                turns: &TranscriptTurnFolds::default(),
+                reasoning_visibility: ReasoningVisibility::Shown,
+            },
+            &first_theme,
+            80,
+        );
+        let first_lines = first.window(0, 40).lines;
+        drop(first);
+        let mut second_theme = first_theme;
+        second_theme.syntax.keyword.fg = Some(Color::Rgb(4, 5, 6));
+
+        let second = cache.view(
+            0,
+            &snapshot,
+            &[],
+            TranscriptDisclosure {
+                folds: &folds,
+                groups: &TranscriptGroups::default(),
+                turns: &TranscriptTurnFolds::default(),
+                reasoning_visibility: ReasoningVisibility::Shown,
+            },
+            &second_theme,
+            80,
+        );
+        let second_lines = second.window(0, 40).lines;
+
+        let keyword_colors = |lines: &[Line<'static>]| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.content == "let")
+                .map(|span| span.style.fg)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keyword_colors(&first_lines),
+            vec![Some(Color::Rgb(1, 2, 3)); 2]
+        );
+        assert_eq!(
+            keyword_colors(&second_lines),
+            vec![Some(Color::Rgb(4, 5, 6)); 2]
+        );
+    }
+
+    #[test]
     fn transcript_cache_rebuilds_when_only_the_theme_changes() {
         let activity = Activity::Command {
             id: ActivityId::new(),

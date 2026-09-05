@@ -36,7 +36,7 @@ fn command_output() -> String {
         .join("\n")
 }
 
-fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
+fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
         session: Session {
             id: SessionId::new(),
@@ -57,7 +57,7 @@ fn large_session_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
         transcript: Vec::new(),
         subagent_usage: None,
     };
-    for section in 1..=SECTIONS {
+    for section in 1..=sections {
         let prompt_id = PromptId::new();
         let turn_id = TurnId::new();
         let user_message_id = MessageId::new();
@@ -160,7 +160,7 @@ fn timed(label: &str, iterations: u32, mut body: impl FnMut()) {
 fn transcript_render_timings() {
     let workspace = tempfile::tempdir().expect("create Workspace");
     let mut application = Application::new(workspace.path(), Default::default());
-    let mut snapshot = large_session_snapshot(workspace.path());
+    let mut snapshot = session_snapshot(workspace.path(), SECTIONS);
     // Streaming appends must target a streaming message.
     snapshot
         .messages
@@ -207,4 +207,60 @@ fn transcript_render_timings() {
             .draw(|frame| application.render(frame))
             .expect("render frame");
     });
+}
+
+/// Includes applying each delta, Markdown parsing/highlighting/wrapping, and drawing.
+/// Warm the grammar first: its one-time initialization is not per-delta work.
+#[test]
+#[ignore = "timing harness, run manually with --release"]
+fn streaming_code_block_render_timings() {
+    let workspace = tempfile::tempdir().expect("create Workspace");
+    let mut application = Application::new(workspace.path(), Default::default());
+    let mut snapshot = session_snapshot(workspace.path(), 1);
+    let message = snapshot.messages.last_mut().expect("Agent message");
+    message.status = MessageStatus::Streaming;
+    message.content = "Here is the implementation:\n\n```rust\nfn example() {\n".to_owned();
+    let message_id = message.id;
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("attach Session");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("create terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("warm grammar");
+
+    let deltas: Vec<_> = (0..24)
+        .map(|n| format!("    let value_{n} = \"hello\"; // streamed line\n"))
+        .chain(["}\n".to_owned(), "```".to_owned()])
+        .collect();
+    let mut elapsed = std::time::Duration::ZERO;
+    for (index, delta) in deltas.iter().enumerate() {
+        let start = Instant::now();
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id: snapshot.session.id,
+                    revision: SessionRevision(snapshot.revision.0 + index as u64 + 1),
+                    changes: vec![SessionChange::MessageContentAppended {
+                        message_id,
+                        content: delta.clone(),
+                    }],
+                },
+            )))
+            .expect("apply code delta");
+        terminal
+            .draw(|frame| application.render(frame))
+            .expect("render code delta");
+        elapsed += start.elapsed();
+    }
+    let average_ms = elapsed.as_secs_f64() * 1000.0 / deltas.len() as f64;
+    println!(
+        "streaming Code Block: {average_ms:.3} ms/delta ({} deltas, {} appended bytes, 120x40)",
+        deltas.len(),
+        deltas.iter().map(String::len).sum::<usize>()
+    );
+    assert!(
+        average_ms < 4.0,
+        "per-delta rendering should use under a quarter of a 60 Hz frame: {average_ms:.3} ms"
+    );
 }
