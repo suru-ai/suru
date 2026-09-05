@@ -30,6 +30,7 @@ use std::{
     cell::{Ref, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
+    path::{Component, Path},
 };
 
 use ratatui::{
@@ -925,6 +926,7 @@ impl RenderUnit<'_> {
         folds: &TranscriptFolds,
         theme: &Theme,
         width: u16,
+        workspace: &Path,
     ) -> Option<UnitAnchor> {
         match self {
             Self::Message(message) => {
@@ -938,6 +940,7 @@ impl RenderUnit<'_> {
                 resolved_fold_step(folds, activity),
                 theme,
                 width,
+                workspace,
             ),
             Self::Group {
                 kind,
@@ -953,6 +956,7 @@ impl RenderUnit<'_> {
                     resolved_fold_step(folds, activity),
                     theme,
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
+                    workspace,
                 );
                 for line in &mut lines[start..] {
                     line.spans.insert(0, Span::raw(MEMBER_INDENT));
@@ -967,6 +971,7 @@ impl RenderUnit<'_> {
                     folds,
                     theme,
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
+                    workspace,
                 );
                 for line in &mut lines[start..] {
                     line.spans.insert(0, Span::raw(MEMBER_INDENT));
@@ -1814,7 +1819,16 @@ fn rebuild(
     );
     let mut units = planned
         .iter()
-        .map(|unit| reuse_or_render(&mut reusable, unit, disclosure.folds, theme, width))
+        .map(|unit| {
+            reuse_or_render(
+                &mut reusable,
+                unit,
+                disclosure.folds,
+                theme,
+                width,
+                &snapshot.session.workspace.path,
+            )
+        })
         .collect::<Vec<_>>();
     assign_separators(&planned, &mut units);
 
@@ -1911,6 +1925,7 @@ fn reuse_or_render(
     folds: &TranscriptFolds,
     theme: &Theme,
     width: u16,
+    workspace: &Path,
 ) -> UnitView {
     let key = unit.key();
     let fingerprint = unit.fingerprint(folds);
@@ -1921,7 +1936,7 @@ fn reuse_or_render(
     }
     let mut rendered = Vec::new();
     let mut links = Vec::new();
-    let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width);
+    let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width, workspace);
     let source_lines = rendered.len();
     let mut measured = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
@@ -2205,6 +2220,7 @@ fn render_activity(
     step: FoldStep,
     theme: &Theme,
     width: u16,
+    workspace: &Path,
 ) -> Option<UnitAnchor> {
     let mut projection = ActivityProjection { lines, links };
     match activity {
@@ -2247,7 +2263,7 @@ fn render_activity(
             CommandActivity {
                 status: *status,
                 command,
-                cwd: cwd.as_deref(),
+                cwd: cwd.as_deref().map(|path| transcript_path(path, workspace)),
                 output,
                 output_truncated: *output_truncated,
                 exit_status: *exit_status,
@@ -2265,6 +2281,7 @@ fn render_activity(
             step != FoldStep::Expanded,
             theme,
             width,
+            workspace,
         )),
         Activity::Reasoning { .. } => ReasoningActivity::of(activity).map(|reasoning| {
             push_reasoning_activity(
@@ -2818,6 +2835,59 @@ struct FileChangeActions {
     edit: &'static str,
 }
 
+/// Shortens only paths spelled inside the Session's Workspace. No filesystem
+/// reads: deleted files and symlink spellings retain the same presentation.
+fn transcript_path<'a>(path: &'a Path, workspace: &Path) -> &'a Path {
+    if !path.is_absolute() || !workspace.is_absolute() {
+        return path;
+    }
+    let mut components = path.components();
+    for base in workspace.components() {
+        if !components
+            .next()
+            .is_some_and(|part| same_path_component(part, base))
+        {
+            return path;
+        }
+    }
+    let relative = components.as_path();
+    let mut depth = 0_usize;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                let Some(parent_depth) = depth.checked_sub(1) else {
+                    return path;
+                };
+                depth = parent_depth;
+            }
+            _ => {}
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    }
+}
+
+/// Windows canonical roots use verbatim prefixes even when a Provider spells
+/// the same drive or share ordinarily. Compare that prefix without filesystem IO.
+fn same_path_component(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    if let (Component::Prefix(left), Component::Prefix(right)) = (left, right) {
+        use std::path::Prefix;
+
+        let ordinary = |prefix| match prefix {
+            Prefix::VerbatimDisk(drive) => Prefix::Disk(drive),
+            Prefix::VerbatimUNC(server, share) => Prefix::UNC(server, share),
+            other => other,
+        };
+        return ordinary(left.kind()) == ordinary(right.kind());
+    }
+    left == right
+}
+
 /// Projects a FileChange Activity as one compact row per changed file. A
 /// folded entry lists the first few rows and reports the rest through the same
 /// fold marker and the same per-entry Fold state a command Activity uses,
@@ -2829,6 +2899,7 @@ fn push_file_change_activity(
     folded: bool,
     theme: &Theme,
     width: u16,
+    workspace: &Path,
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
@@ -2872,8 +2943,18 @@ fn push_file_change_activity(
     };
     for change in &changes[..listed] {
         let (action, path) = match change {
-            FileChange::Add { path } => (actions.create, path.to_string_lossy().into_owned()),
-            FileChange::Delete { path } => (actions.delete, path.to_string_lossy().into_owned()),
+            FileChange::Add { path } => (
+                actions.create,
+                transcript_path(path, workspace)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            FileChange::Delete { path } => (
+                actions.delete,
+                transcript_path(path, workspace)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             FileChange::Update {
                 path,
                 moved_to: Some(moved_to),
@@ -2881,14 +2962,19 @@ fn push_file_change_activity(
                 actions.rename,
                 format!(
                     "{} → {}",
-                    path.to_string_lossy(),
-                    moved_to.to_string_lossy()
+                    transcript_path(path, workspace).to_string_lossy(),
+                    transcript_path(moved_to, workspace).to_string_lossy()
                 ),
             ),
             FileChange::Update {
                 path,
                 moved_to: None,
-            } => (actions.edit, path.to_string_lossy().into_owned()),
+            } => (
+                actions.edit,
+                transcript_path(path, workspace)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         };
         let lead = format!("  {marker}{action} ");
         let path = sanitize_content(&path).replace('\n', " ");
@@ -4147,6 +4233,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            std::path::Path::new(""),
         );
 
         let spans = &lines.last().expect("render command output").spans;
@@ -4196,6 +4283,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            std::path::Path::new(""),
         );
 
         let spans = &lines.last().expect("render command output").spans;
@@ -4475,6 +4563,7 @@ mod tests {
             FoldStep::Peek,
             &theme,
             80,
+            std::path::Path::new(""),
         );
 
         let marker = lines.last().expect("render the truncation marker");
@@ -4508,6 +4597,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            std::path::Path::new(""),
         );
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
         assert!(
@@ -4541,6 +4631,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            std::path::Path::new(""),
         );
 
         assert_eq!(
@@ -4626,6 +4717,7 @@ mod tests {
             FoldStep::Peek,
             &theme,
             80,
+            std::path::Path::new(""),
         );
 
         let marker_lines = lines
@@ -4699,6 +4791,7 @@ mod tests {
             FoldStep::Folded,
             &Theme::system(),
             80,
+            std::path::Path::new(""),
         );
 
         assert_eq!(
@@ -6037,6 +6130,167 @@ mod tests {
     }
 
     #[test]
+    fn transcript_file_paths_are_relative_only_inside_the_sessions_workspace() {
+        let workspace = if cfg!(windows) {
+            PathBuf::from(r"C:\w")
+        } else {
+            PathBuf::from("/w")
+        };
+        let outside = workspace.with_file_name("other").join("external.rs");
+        let sibling = workspace.with_file_name("w-other").join("sibling.rs");
+        let escape = workspace.join("..").join("escaped.rs");
+        let activity = Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            changes: vec![
+                FileChange::Add {
+                    path: workspace.join("new.rs"),
+                },
+                FileChange::Delete {
+                    path: workspace.join("deleted.rs"),
+                },
+                FileChange::Update {
+                    path: workspace.join("edited.rs"),
+                    moved_to: None,
+                },
+                FileChange::Update {
+                    path: workspace.join("old.rs"),
+                    moved_to: Some(workspace.join("renamed.rs")),
+                },
+                FileChange::Update {
+                    path: workspace.join("export.rs"),
+                    moved_to: Some(outside.clone()),
+                },
+                FileChange::Add {
+                    path: sibling.clone(),
+                },
+                FileChange::Add {
+                    path: escape.clone(),
+                },
+                FileChange::Add {
+                    path: PathBuf::from("relative.rs"),
+                },
+            ],
+        };
+        let mut folds = TranscriptFolds::default();
+        folds.expand(activity.id());
+        let mut snapshot = transcript_snapshot(vec![Entry::Activity(activity)]);
+        snapshot.session.workspace.path = workspace;
+        let stored = snapshot.clone();
+        let cache = TranscriptCache::default();
+        let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
+        let rows: Vec<_> = view
+            .window(0, view.row_count())
+            .lines
+            .iter()
+            .map(rendered_text)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "  ✓ Created new.rs".to_owned(),
+                "  ✓ Deleted deleted.rs".to_owned(),
+                "  ✓ Edited edited.rs".to_owned(),
+                "  ✓ Renamed old.rs → renamed.rs".to_owned(),
+                format!("  ✓ Renamed export.rs → {}", outside.display()),
+                format!("  ✓ Created {}", sibling.display()),
+                format!("  ✓ Created {}", escape.display()),
+                "  ✓ Created relative.rs".to_owned(),
+            ]
+        );
+        assert_eq!(snapshot, stored, "display must preserve stored paths");
+    }
+
+    #[test]
+    fn transcript_command_directories_are_relative_without_rewriting_content() {
+        let workspace = if cfg!(windows) {
+            PathBuf::from(r"C:\w")
+        } else {
+            PathBuf::from("/w")
+        };
+        let outside = workspace.with_file_name("other");
+        for (cwd, expected) in [
+            (workspace.clone(), ".".to_owned()),
+            (workspace.join("src"), "src".to_owned()),
+            (outside.clone(), outside.to_string_lossy().into_owned()),
+            (PathBuf::from("relative"), "relative".to_owned()),
+        ] {
+            let text = workspace.join("file.rs").to_string_lossy().into_owned();
+            let mut activity = command(&text, &text);
+            if let Activity::Command { cwd: directory, .. } = &mut activity {
+                *directory = Some(cwd);
+            }
+            let mut folds = TranscriptFolds::default();
+            folds.expand(activity.id());
+            let mut snapshot = transcript_snapshot(vec![
+                Entry::Activity(activity),
+                Entry::Message(agent_message(&text)),
+            ]);
+            snapshot.session.workspace.path = workspace.clone();
+            let cache = TranscriptCache::default();
+            let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
+            let rows: Vec<_> = view
+                .window(0, view.row_count())
+                .lines
+                .iter()
+                .map(rendered_text)
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.trim() == format!("in {expected}")),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(&text)).count(),
+                3,
+                "command, output, and prose retain their paths: {rows:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transcript_paths_match_canonical_windows_workspace_prefixes() {
+        for (workspace, path) in [
+            (r"\\?\C:\w", r"C:\w\edited.rs"),
+            (r"C:\w", r"\\?\C:\w\edited.rs"),
+            (r"\\?\UNC\server\share\w", r"\\server\share\w\edited.rs"),
+            (r"\\server\share\w", r"\\?\UNC\server\share\w\edited.rs"),
+        ] {
+            let activity = Activity::FileChange {
+                id: ActivityId::new(),
+                turn_id: TurnId::new(),
+                status: ActivityStatus::Completed,
+                changes: vec![FileChange::Update {
+                    path: path.into(),
+                    moved_to: None,
+                }],
+            };
+            let mut snapshot = transcript_snapshot(vec![Entry::Activity(activity)]);
+            snapshot.session.workspace.path = workspace.into();
+            let cache = TranscriptCache::default();
+            let view = projected_view(
+                &cache,
+                &snapshot,
+                &TranscriptFolds::default(),
+                &TranscriptGroups::default(),
+            );
+            let rows: Vec<_> = view
+                .window(0, view.row_count())
+                .lines
+                .iter()
+                .map(rendered_text)
+                .collect();
+            assert_eq!(
+                rows,
+                ["  ✓ Edited edited.rs"],
+                "Workspace {workspace}, file {path}"
+            );
+        }
+    }
+
+    #[test]
     fn an_active_file_change_records_every_visible_row_for_spinner_animation() {
         let activity = Activity::FileChange {
             id: ActivityId::new(),
@@ -6093,6 +6347,7 @@ mod tests {
                 FoldStep::Folded,
                 &Theme::system(),
                 width,
+                std::path::Path::new(""),
             );
 
             assert_eq!(lines.len(), 1, "one File Change stays one source line");
