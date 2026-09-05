@@ -860,6 +860,7 @@ impl TuiState {
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
+        self.reconcile_questionnaire_catalog(&Outlook::Local, &event);
         // The managed catalog stream belongs to the local Server. A Remote
         // Outlook has its own main view and pickers, but Everywhere still
         // keeps the local Origin's Sidebar rows live in the background.
@@ -881,6 +882,7 @@ impl TuiState {
     }
 
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+        self.reconcile_questionnaire_catalog(outlook, &event);
         if self.sidebar.includes_origin(outlook) {
             match &event {
                 ManagedEvent::Recovering(_) => self.sidebar.mark_origin_recovering(outlook.clone()),
@@ -899,6 +901,25 @@ impl TuiState {
             if self.session_picker.includes_origin(outlook) {
                 self.apply_session_picker_catalog_event(outlook, &event);
             }
+        }
+    }
+
+    fn reconcile_questionnaire_catalog(&mut self, origin: &Outlook, event: &ManagedEvent) {
+        match event {
+            ManagedEvent::SessionStandingInputsChanged(changed) => {
+                self.questionnaires.reconcile_available(
+                    &SessionReference::new(origin.clone(), changed.session_id),
+                    changed.inputs.pending_questionnaires_revision,
+                    &changed.inputs.pending_questionnaires,
+                )
+            }
+            ManagedEvent::SessionDeleted(deleted) => self
+                .questionnaires
+                .discard_session(&SessionReference::new(origin.clone(), deleted.session_id)),
+            ManagedEvent::SessionCatalogReconciled(snapshot) => self
+                .questionnaires
+                .retain_origin(origin, &snapshot.session_ids),
+            _ => {}
         }
     }
 
@@ -937,6 +958,7 @@ impl TuiState {
                     .as_ref()
                     .is_some_and(|identity| identity.instance_id != health.instance_id);
                 if replaced_server {
+                    self.questionnaires.discard_origin(&self.outlook);
                     if let Some(reference) = self.session_reference.clone() {
                         self.composers.recover_session_to_landing(reference.clone());
                         self.session_interactions.remove(&reference);
@@ -1015,11 +1037,16 @@ impl TuiState {
                 self.session_picker
                     .settle(settled.session_id, settled.settled_at);
             }
-            // The picker takes nothing in place: it draws no Working label, so
-            // what the change carries is nothing it shows — and it asks for a
-            // fresh listing every time it opens.
-            ManagedEvent::SessionWorkingChanged(_)
-            | ManagedEvent::SessionStandingInputsChanged(_) => {}
+            // Pending Questionnaires update the open picker immediately, just
+            // as they update the Sidebar, without moving its selection.
+            ManagedEvent::SessionStandingInputsChanged(changed) => {
+                self.session_picker.set_standing_inputs(
+                    self.outlook.clone(),
+                    changed.session_id,
+                    changed.inputs.clone(),
+                );
+            }
+            ManagedEvent::SessionWorkingChanged(_) => {}
             // Neither listing surface states a Session's total yet — the
             // footer of the Session in view reads its own — so the roll-up
             // the catalog announces moves nothing this client draws.
@@ -1067,9 +1094,13 @@ impl TuiState {
                 working.session_id,
                 working.working_since,
             ),
-            ManagedEvent::SessionStandingInputsChanged(changed) => self
-                .sidebar
-                .set_standing_inputs_origin(outlook.clone(), changed.session_id, changed.inputs),
+            ManagedEvent::SessionStandingInputsChanged(changed) => {
+                self.sidebar.set_standing_inputs_origin(
+                    outlook.clone(),
+                    changed.session_id,
+                    changed.inputs.clone(),
+                )
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => self
                 .sidebar
                 .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
@@ -1095,8 +1126,14 @@ impl TuiState {
         match event {
             ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionWorkingChanged(_)
-            | ManagedEvent::SessionStandingInputsChanged(_)
             | ManagedEvent::SessionUsageChanged(_) => {}
+            ManagedEvent::SessionStandingInputsChanged(changed) => {
+                self.session_picker.set_standing_inputs(
+                    outlook.clone(),
+                    changed.session_id,
+                    changed.inputs.clone(),
+                );
+            }
             ManagedEvent::SessionDeleted(deleted) => self
                 .session_picker
                 .remove_origin(outlook.clone(), deleted.session_id),
@@ -1168,6 +1205,10 @@ impl TuiState {
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
+        self.questionnaires.discard_session(&SessionReference {
+            origin: self.outlook.clone(),
+            session_id: deleted_session_id,
+        });
         let Some(reference) = self
             .session_reference
             .as_ref()
@@ -1657,6 +1698,29 @@ impl TuiState {
             .borrow()
             .as_ref()
             .and_then(|viewport| viewport.unit_at(position))?;
+        if let UnitKey::Activity(activity_id) = start.key
+            && let Some(id) = self.session.as_ref().and_then(|session| {
+                session
+                    .snapshot()
+                    .activities
+                    .iter()
+                    .find_map(|activity| match activity {
+                        crate::protocol::Activity::Questionnaire {
+                            id, questionnaire, ..
+                        } if *id == activity_id
+                            && self
+                                .pending_questionnaires()
+                                .any(|q| q.id == questionnaire.id) =>
+                        {
+                            Some(questionnaire.id)
+                        }
+                        _ => None,
+                    })
+            })
+        {
+            return Some(SemanticCommandId::QuestionnaireOpen.on_questionnaire(id));
+        }
+        let interaction = self.current_interaction()?;
         match start.key {
             UnitKey::Activity(activity_id) => {
                 let mut folds = interaction.folds.borrow_mut();
@@ -4350,15 +4414,40 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(Self::session_picker_listing_transition(listing))
             }
+            SemanticCommandId::QuestionnaireRequestPrevious
+            | SemanticCommandId::QuestionnaireRequestNext => {
+                if let Some(session) = self.state.session_reference.clone() {
+                    let requests: Vec<_> = self.state.pending_questionnaires().cloned().collect();
+                    if !requests.is_empty() {
+                        let current = requests
+                            .iter()
+                            .position(|q| Some(q.id) == self.state.questionnaires.id());
+                        let index = match current {
+                            None => 0,
+                            Some(index)
+                                if command == SemanticCommandId::QuestionnaireRequestNext =>
+                            {
+                                (index + 1) % requests.len()
+                            }
+                            Some(index) => (index + requests.len() - 1) % requests.len(),
+                        };
+                        self.state.questionnaires.open(session, &requests[index]);
+                    }
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::QuestionnaireOpen => {
-                if let (Some(session), Some(questionnaire)) = (
-                    self.state.session_reference.clone(),
-                    self.state
-                        .session
-                        .as_ref()
-                        .and_then(|s| super::questionnaire::pending(s.snapshot()).next())
-                        .cloned(),
-                ) {
+                let questionnaire = self
+                    .state
+                    .pending_questionnaires()
+                    .find(|q| match invocation.subject {
+                        SemanticSubject::Questionnaire(id) => q.id == id,
+                        _ => true,
+                    })
+                    .cloned();
+                if let (Some(session), Some(questionnaire)) =
+                    (self.state.session_reference.clone(), questionnaire)
+                {
                     self.state.questionnaires.open(session, &questionnaire);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -4431,6 +4520,7 @@ impl Application {
                 SemanticSubject::View
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
+                | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
@@ -4442,6 +4532,7 @@ impl Application {
                 SemanticSubject::View
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
+                | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
@@ -4477,6 +4568,7 @@ impl Application {
                     SemanticSubject::View
                     | SemanticSubject::ComposerCursor(_)
                     | SemanticSubject::Turn(_)
+                    | SemanticSubject::Questionnaire(_)
                     | SemanticSubject::Origin(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
@@ -4515,7 +4607,8 @@ impl Application {
                 SemanticSubject::View
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
-                | SemanticSubject::Session(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Session(_)
+                | SemanticSubject::Questionnaire(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
@@ -5155,12 +5248,24 @@ fn is_reader_interaction(event: &InputEvent) -> bool {
 }
 
 impl TuiState {
+    pub(super) fn pending_questionnaires(
+        &self,
+    ) -> impl Iterator<Item = &crate::protocol::Questionnaire> {
+        self.session.as_ref().into_iter().flat_map(|session| {
+            super::questionnaire::pending(session.snapshot()).filter(|q| {
+                self.session_reference
+                    .as_ref()
+                    .is_some_and(|owner| self.questionnaires.available(owner, q.id))
+            })
+        })
+    }
+
     pub(super) fn open_questionnaire(&self) -> Option<&crate::protocol::Questionnaire> {
         if !self.questionnaires.is_open(self.session_reference.as_ref()) {
             return None;
         }
         let id = self.questionnaires.id()?;
-        super::questionnaire::pending(self.session.as_ref()?.snapshot())
+        self.pending_questionnaires()
             .find(|questionnaire| questionnaire.id == id)
     }
 }

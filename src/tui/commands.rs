@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::text_layout::CursorTarget;
 
-use crate::protocol::{Outlook, SessionReference, TurnId};
+use crate::protocol::{Outlook, QuestionnaireId, SessionReference, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
@@ -12,6 +12,8 @@ pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 pub enum SemanticCommandId {
     QuestionnaireScrollUp,
     QuestionnaireScrollDown,
+    QuestionnaireRequestPrevious,
+    QuestionnaireRequestNext,
     QuestionnaireOpen,
     QuestionnaireHide,
     QuestionnairePrevious,
@@ -163,6 +165,7 @@ pub(super) enum SemanticSubject {
     View,
     ComposerCursor(CursorTarget),
     Turn(TurnId),
+    Questionnaire(QuestionnaireId),
     Origin(Outlook),
     /// One Session, which is what a reader names by acting on its row rather
     /// than on the Session they have open.
@@ -188,6 +191,13 @@ impl From<SemanticCommandId> for SemanticInvocation {
 }
 
 impl SemanticCommandId {
+    pub(super) const fn on_questionnaire(self, id: QuestionnaireId) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Questionnaire(id),
+        }
+    }
+
     /// This command invoked against one Turn, which is what a reader asks for
     /// by clicking that Turn's Fold marker.
     pub(super) const fn on_turn(self, turn_id: TurnId) -> SemanticInvocation {
@@ -219,6 +229,8 @@ impl SemanticCommandId {
         match self {
             Self::QuestionnaireScrollUp => "questionnaire.scroll.up",
             Self::QuestionnaireScrollDown => "questionnaire.scroll.down",
+            Self::QuestionnaireRequestPrevious => "questionnaire.request.previous",
+            Self::QuestionnaireRequestNext => "questionnaire.request.next",
             Self::QuestionnaireOpen => "questionnaire.open",
             Self::QuestionnaireHide => "questionnaire.hide",
             Self::QuestionnairePrevious => "questionnaire.previous",
@@ -357,6 +369,20 @@ const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
 const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireRequestNext,
+        title: "Next pending Questionnaire",
+        description: "Switch pending Questionnaires without losing the Answer draft",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::QuestionnaireRequestPrevious,
+        title: "Previous pending Questionnaire",
+        description: "Switch pending Questionnaires without losing the Answer draft",
+        slash: None,
+        keybinding: None,
+    },
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireScrollUp,
         title: "Scroll Questionnaire Up",

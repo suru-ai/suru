@@ -2052,6 +2052,9 @@ impl Sidebar {
                     session,
                     open,
                     session_standing(StandingInputs {
+                        needs_intervention: session.readable().is_some_and(|summary| {
+                            !summary.standing_inputs.pending_questionnaires.is_empty()
+                        }),
                         working: session.working_since().is_some(),
                         failed: session.readable().is_some_and(|summary| {
                             summary
@@ -2063,7 +2066,6 @@ impl Sidebar {
                                 .standing_inputs
                                 .latest_turn_settled_as(crate::protocol::TurnStatus::Completed)
                         }),
-                        ..StandingInputs::default()
                     }),
                     SidebarShelf::Active {
                         workspace: session

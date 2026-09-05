@@ -42,7 +42,7 @@ impl SessionStore {
         self.storage.summary_changed(summary.clone());
         state.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
             session_id,
-            inputs: summary.standing_inputs,
+            inputs: summary.standing_inputs.clone(),
         });
         Ok(summary)
     }

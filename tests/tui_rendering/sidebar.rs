@@ -467,6 +467,8 @@ fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
             ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
                 session_id,
                 inputs: SessionStandingInputs {
+                    pending_questionnaires: Vec::new(),
+                    pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status: TurnStatus::Completed,
                         settled_at: Some(settled_at),
@@ -3017,6 +3019,8 @@ fn standing_elsewhere(
             ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
                 session_id,
                 inputs: SessionStandingInputs {
+                    pending_questionnaires: Vec::new(),
+                    pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status,
                         settled_at: Some(settled_at),
@@ -3111,6 +3115,8 @@ fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) ->
         unreachable!("the fixture builds a readable Session");
     };
     summary.standing_inputs = SessionStandingInputs {
+        pending_questionnaires: Vec::new(),
+        pending_questionnaires_revision: suru::protocol::SessionRevision(0),
         latest_turn: Some(LatestTurnStatus {
             status,
             settled_at: Some(SessionTimestamp(settled_at)),
@@ -5220,6 +5226,8 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
             event: ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
                 session_id: shared_id,
                 inputs: SessionStandingInputs {
+                    pending_questionnaires: Vec::new(),
+                    pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status: TurnStatus::Failed,
                         settled_at: Some(SessionTimestamp(now())),
@@ -7955,5 +7963,52 @@ fn the_session_left_behind_is_never_drawn_under_the_one_being_opened() {
     assert!(
         !main.contains("Still answering the reader"),
         "the Session left behind is drawn under the Session being opened: {main}"
+    );
+}
+
+#[test]
+fn pending_questionnaires_mark_both_session_listings_and_clear_when_unavailable() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut row = listed_as(session_id, "Needs an answer", workspace.path(), 1);
+    let SessionListItem::Readable(summary) = &mut row else {
+        unreachable!()
+    };
+    summary.session.status = SessionStatus::Active;
+    summary.session.working_since = Some(SessionTimestamp(now()));
+    summary.standing_inputs.pending_questionnaires = vec![suru::protocol::QuestionnaireId::new()];
+    summary.standing_inputs.pending_questionnaires_revision = SessionRevision(3);
+    let mut app = sidebar_showing(workspace.path(), vec![row.clone()]);
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(screen.contains("Questions"), "{screen}");
+    let ApplicationTransition::ListSessions(request) = app
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionList,
+        )))
+        .unwrap()
+    else {
+        panic!("list Sessions")
+    };
+    app.handle_event(ApplicationEvent::SessionsListed {
+        request,
+        sessions: vec![row],
+    })
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(screen.contains("1 pending questions"), "{screen}");
+    app.handle_event(ApplicationEvent::Managed(
+        ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                pending_questionnaires_revision: SessionRevision(4),
+                ..Default::default()
+            },
+        }),
+    ))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(
+        !screen.contains("Questions") && !screen.contains("pending questions"),
+        "{screen}"
     );
 }

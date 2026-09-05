@@ -370,3 +370,227 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
         "{expanded}"
     );
 }
+
+fn add_request(
+    snapshot: &mut suru::protocol::SessionSnapshot,
+    turn_id: suru::protocol::TurnId,
+    text: &str,
+) -> QuestionnaireId {
+    let id = QuestionnaireId::new();
+    let activity_id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id: activity_id,
+        turn_id,
+        questionnaire: Questionnaire {
+            id,
+            questions: vec![Question {
+                id: "question".into(),
+                title: None,
+                text: text.into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                secret: false,
+                required: true,
+            }],
+        },
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    snapshot.revision.0 += 1;
+    id
+}
+
+#[test]
+fn concurrent_questionnaires_keep_individual_drafts_and_never_take_focus_on_arrival() {
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    type_terminal_text(&mut app, "Composer draft");
+    let first = add_request(&mut snapshot, turn_id, "First request");
+    add_request(&mut snapshot, turn_id, "Second request");
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    type_terminal_text(&mut app, "First answer");
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Questionnaire 1 of 2")
+    );
+    invoke(&mut app, SemanticCommandId::QuestionnaireRequestNext);
+    type_terminal_text(&mut app, "Second answer");
+    add_request(&mut snapshot, turn_id, "Third request");
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    type_terminal_text(&mut app, " remains");
+    let screen = rendered_application_rows(&app).join("\n");
+    assert!(
+        screen.contains("Questionnaire 2 of 3") && screen.contains("Second answer remains"),
+        "{screen}"
+    );
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)))
+        .unwrap();
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(invoke(&mut app, SemanticCommandId::QuestionnaireSubmit),
+        ApplicationTransition::SubmitQuestionnaire { id, submission: QuestionnaireSubmission::Answer { answer }, .. }
+        if id == first && answer.questions == vec![QuestionAnswer::Freeform { text: "First answer".into() }])
+    );
+    invoke(&mut app, SemanticCommandId::QuestionnaireHide);
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Composer draft")
+    );
+    // Session switching preserves each Answer and the separate composer.
+    let mut other_app = connected_application(workspace.path());
+    let (_, other, _) = enter_active_session(&mut other_app, workspace.path());
+    app.handle_event(ApplicationEvent::SessionAttached(other.clone()))
+        .unwrap();
+    app.handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    invoke(&mut app, SemanticCommandId::QuestionnaireRequestNext);
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Second answer remains")
+    );
+    app.handle_event(ApplicationEvent::SessionAttached(other))
+        .unwrap();
+    type_terminal_text(&mut app, "Other composer");
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Other composer")
+    );
+}
+
+#[test]
+fn pending_transcript_activity_opens_its_own_request() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    add_request(&mut snapshot, turn_id, "First request");
+    add_request(&mut snapshot, turn_id, "Second request");
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .unwrap();
+    let rows = rendered_application_rows(&app);
+    let row = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.contains("Questionnaire · Pending"))
+        .nth(1)
+        .unwrap()
+        .0;
+    app.handle_terminal_event(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rows[row].find("Questionnaire").unwrap() as u16,
+        row: row as u16,
+        modifiers: KeyModifiers::NONE,
+    }))
+    .unwrap();
+    let screen = rendered_application_rows(&app).join("\n");
+    assert!(
+        screen.contains("Second request") && screen.contains("Questionnaire 2 of 2"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availability() {
+    use suru::{
+        managed_client::ManagedEvent,
+        protocol::{SessionRevision, SessionStandingInputs, SessionStandingInputsChanged},
+    };
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (session_id, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    let first = add_request(&mut snapshot, turn_id, "First request");
+    let second = add_request(&mut snapshot, turn_id, "Second request");
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    type_terminal_text(&mut app, "Obsolete answer");
+    invoke(&mut app, SemanticCommandId::QuestionnaireRequestNext);
+    type_terminal_text(&mut app, "Retained answer");
+    let mut other_app = connected_application(workspace.path());
+    let (_, other, _) = enter_active_session(&mut other_app, workspace.path());
+    app.handle_event(ApplicationEvent::SessionAttached(other.clone()))
+        .unwrap();
+    let newer_revision = SessionRevision(snapshot.revision.0 + 1);
+    app.handle_event(ApplicationEvent::Managed(
+        ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                pending_questionnaires: vec![second],
+                pending_questionnaires_revision: newer_revision,
+                ..Default::default()
+            },
+        }),
+    ))
+    .unwrap();
+    // Reopen a stale snapshot to prove the catalog, not merely reattachment, removed Q1.
+    app.handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    assert!(
+        !rendered_application_rows(&app)
+            .join("\n")
+            .contains("Obsolete answer")
+    );
+    invoke(&mut app, SemanticCommandId::QuestionnaireRequestNext);
+    // Cycling offers only the remaining live request, even while the snapshot catches up.
+    invoke(&mut app, SemanticCommandId::QuestionnaireRequestNext);
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Retained answer")
+    );
+
+    snapshot.revision = newer_revision;
+    for activity in &mut snapshot.activities {
+        if let Activity::Questionnaire {
+            questionnaire,
+            outcome,
+            ..
+        } = activity
+            && questionnaire.id == first
+        {
+            *outcome = QuestionnaireOutcome::Withdrawn;
+        }
+    }
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+        snapshot.clone(),
+    )))
+    .unwrap();
+    app.handle_event(ApplicationEvent::Managed(
+        ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                pending_questionnaires: vec![],
+                pending_questionnaires_revision: SessionRevision(0),
+                ..Default::default()
+            },
+        }),
+    ))
+    .unwrap();
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Retained answer")
+    );
+    app.handle_event(ApplicationEvent::SessionAttached(other))
+        .unwrap();
+}

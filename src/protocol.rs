@@ -377,7 +377,7 @@ pub struct ModelCatalog {
     pub providers: Vec<ProviderModelCatalog>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SessionRevision(pub u64);
 
@@ -1587,9 +1587,15 @@ pub struct LatestTurnStatus {
 /// The server facts from which a listed Session's Standing is derived. Kept as
 /// one value so every catalog change replaces the reading whole and Viewed
 /// can be compared with the matching latest Turn.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStandingInputs {
+    /// Live Questionnaires awaiting an Answer in this Session.
+    #[serde(default)]
+    pub pending_questionnaires: Vec<QuestionnaireId>,
+    /// Session revision at which live Questionnaire availability last changed.
+    #[serde(default)]
+    pub pending_questionnaires_revision: SessionRevision,
     #[serde(default)]
     pub latest_turn: Option<LatestTurnStatus>,
     /// When any Client last reported this Session open in its main view.
@@ -1601,6 +1607,8 @@ pub struct SessionStandingInputs {
 impl SessionStandingInputs {
     pub(crate) fn from_turns(turns: &[Turn]) -> Self {
         Self {
+            pending_questionnaires: Vec::new(),
+            pending_questionnaires_revision: SessionRevision(0),
             latest_turn: turns.last().map(|turn| LatestTurnStatus {
                 status: turn.status,
                 settled_at: turn.settled_at,
@@ -1609,7 +1617,7 @@ impl SessionStandingInputs {
         }
     }
 
-    pub(crate) fn latest_turn_settled_as(self, status: TurnStatus) -> bool {
+    pub(crate) fn latest_turn_settled_as(&self, status: TurnStatus) -> bool {
         self.latest_turn.is_some_and(|latest| {
             latest.status == status
                 && latest.settled_at.is_some_and(|settled_at| {
@@ -1802,7 +1810,8 @@ pub enum SessionCatalogChange {
         working_since: Option<SessionTimestamp>,
     },
     /// The inputs from which a listed Session's Standing is read changed when
-    /// its latest Turn Settled. It carries the reading whole so every client
+    /// its latest Turn Settled or its live Questionnaires changed. It carries
+    /// the reading whole so every client
     /// can revise its listing in place without asking for it again first.
     StandingInputsChanged {
         session_id: SessionId,
@@ -2684,7 +2693,7 @@ pub struct SessionWorkingChanged {
 
 /// A Session's complete Standing input, carried to a client that may be
 /// listing that Session without having it open.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStandingInputsChanged {
     pub session_id: SessionId,

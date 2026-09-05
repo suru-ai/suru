@@ -87,6 +87,7 @@ pub(super) struct SessionPickerRow<'a> {
     pub(super) selected: bool,
     pub(super) current: bool,
     pub(super) active: bool,
+    pub(super) pending_questionnaires: usize,
     pub(super) unreadable: bool,
     pub(super) updated_at: SessionTimestamp,
     pub(super) workspace: Option<&'a Path>,
@@ -200,6 +201,16 @@ impl SessionPicker {
             .filter(|current| self.visible_references().contains(current))
             .cloned()
             .or_else(|| self.visible_references().first().cloned());
+    }
+
+    pub(super) fn set_standing_inputs(
+        &mut self,
+        origin: crate::protocol::Outlook,
+        session_id: SessionId,
+        inputs: crate::protocol::SessionStandingInputs,
+    ) {
+        self.listing
+            .set_standing_inputs_origin(origin, session_id, inputs);
     }
 
     pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
@@ -489,6 +500,9 @@ impl SessionPicker {
             .map(move |summary| {
                 let readable = summary.readable();
                 SessionPickerRow {
+                    pending_questionnaires: readable.map_or(0, |summary| {
+                        summary.standing_inputs.pending_questionnaires.len()
+                    }),
                     title: summary.title(),
                     emoji: self.emoji.drawn_emoji(summary.emoji()),
                     selected: self.selected.as_ref() == Some(summary.reference()),

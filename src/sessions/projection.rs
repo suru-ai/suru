@@ -67,9 +67,16 @@ impl SessionStoreState {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        let previous_pending = record
+            .summary
+            .standing_inputs
+            .pending_questionnaires
+            .clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
-        let standing_inputs = record.summary.standing_inputs;
-        if turn_settled && self.ancestry(session_id).announces(session_id) {
+        let standing_inputs = record.summary.standing_inputs.clone();
+        if (turn_settled || previous_pending != standing_inputs.pending_questionnaires)
+            && self.ancestry(session_id).announces(session_id)
+        {
             self.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
                 session_id,
                 inputs: standing_inputs,
@@ -433,6 +440,31 @@ impl SessionRecord {
         self.summary.session = self.snapshot.session.clone();
         self.summary.standing_inputs.latest_turn =
             SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
+        let pending = self
+            .snapshot
+            .activities
+            .iter()
+            .filter_map(|activity| match activity {
+                crate::protocol::Activity::Questionnaire {
+                    questionnaire,
+                    outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                    turn_id,
+                    ..
+                } if self
+                    .snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
+                {
+                    Some(questionnaire.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if self.summary.standing_inputs.pending_questionnaires != pending {
+            self.summary.standing_inputs.pending_questionnaires = pending;
+            self.summary.standing_inputs.pending_questionnaires_revision = self.snapshot.revision;
+        }
         // `session.working_since` is deliberately left alone here: it carries
         // the whole subtree's reading, which only the state can derive, so
         // [`SessionStoreState::reconcile_working`] maintains it after every

@@ -332,6 +332,8 @@ impl SessionRow {
                 .transpose()?
                 .map(SessionTimestamp),
             standing_inputs: SessionStandingInputs {
+                pending_questionnaires: Vec::new(),
+                pending_questionnaires_revision: crate::protocol::SessionRevision(0),
                 latest_turn: None,
                 viewed_at: self
                     .viewed_at

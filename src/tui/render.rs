@@ -136,15 +136,23 @@ pub(super) fn render_with_slots(
     } else {
         render_landing(frame, state, main, slots, theme)
     };
+    let pending: Vec<_> = state.pending_questionnaires().collect();
     if let Some(questionnaire) = state.open_questionnaire() {
-        state
-            .questionnaires
-            .render(frame, composer.area, questionnaire, theme);
-    } else if state.session.as_ref().is_some_and(|session| {
-        super::questionnaire::pending(session.snapshot())
-            .next()
-            .is_some()
-    }) {
+        state.questionnaires.render(
+            frame,
+            composer.area,
+            questionnaire,
+            theme,
+            (
+                pending
+                    .iter()
+                    .position(|q| q.id == questionnaire.id)
+                    .unwrap_or(0)
+                    + 1,
+                pending.len(),
+            ),
+        );
+    } else if !pending.is_empty() {
         let area = Rect::new(
             composer.area.x,
             composer.area.y.saturating_sub(1),
@@ -152,7 +160,11 @@ pub(super) fn render_with_slots(
             1,
         );
         frame.render_widget(
-            Paragraph::new("Questionnaire pending · Ctrl+Q answer").style(theme.feedback.warning),
+            Paragraph::new(format!(
+                "Questionnaire pending ({}) · Ctrl+Q answer",
+                pending.len()
+            ))
+            .style(theme.feedback.warning),
             area,
         );
     }
@@ -1503,6 +1515,9 @@ fn session_picker_row_text(
     let available = width
         .saturating_sub(marker_width)
         .saturating_sub(emoji.width());
+    if row.pending_questionnaires > 0 {
+        metadata.push(format!("{} pending questions", row.pending_questionnaires));
+    }
     let fixed_metadata_width = metadata.join(separator).width();
     if let Some(workspace) = row.workspace {
         let minimum_title_width = usize::from(available > 0);
@@ -1936,7 +1951,6 @@ impl StandingFeedback {
 
 #[derive(Clone, Copy)]
 enum StandingSlot {
-    CompactTime,
     WorkingDuration,
     Word(&'static str),
 }
@@ -1946,7 +1960,7 @@ impl SessionStanding {
         match self {
             Self::NeedsIntervention => StandingPresentation {
                 feedback: StandingFeedback::Warning,
-                slot: StandingSlot::CompactTime,
+                slot: StandingSlot::Word("Questions"),
             },
             Self::Working => StandingPresentation {
                 feedback: StandingFeedback::Info,
@@ -2469,7 +2483,7 @@ fn sidebar_active_slot(
             |since| format!("Working {}", working_duration(since, now)),
         ),
         Some(StandingSlot::Word(word)) => word.to_owned(),
-        Some(StandingSlot::CompactTime) | None => relative_update_time_compact(updated_at, now),
+        None => relative_update_time_compact(updated_at, now),
     }
 }
 

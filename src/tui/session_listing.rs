@@ -359,9 +359,18 @@ impl SessionListing {
         &mut self,
         outlook: Outlook,
         session_id: SessionId,
-        standing_inputs: SessionStandingInputs,
+        mut standing_inputs: SessionStandingInputs,
     ) {
         if let Some(summary) = self.readable_mut(&outlook, session_id) {
+            if standing_inputs.pending_questionnaires_revision.0
+                < summary.standing_inputs.pending_questionnaires_revision.0
+            {
+                standing_inputs
+                    .pending_questionnaires
+                    .clone_from(&summary.standing_inputs.pending_questionnaires);
+                standing_inputs.pending_questionnaires_revision =
+                    summary.standing_inputs.pending_questionnaires_revision;
+            }
             summary.standing_inputs = standing_inputs;
         }
     }

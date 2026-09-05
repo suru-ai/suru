@@ -14,11 +14,14 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct QuestionnairePanels {
     drafts: HashMap<(SessionReference, QuestionnaireId), Panel>,
+    availability:
+        HashMap<SessionReference, (crate::protocol::SessionRevision, Vec<QuestionnaireId>)>,
+    unlisted_sessions: HashSet<SessionReference>,
     pub(super) visible: Option<(SessionReference, QuestionnaireId)>,
 }
 #[derive(Clone, Debug, Default)]
@@ -53,13 +56,83 @@ pub(super) fn pending(snapshot: &SessionSnapshot) -> impl Iterator<Item = &Quest
 }
 
 impl QuestionnairePanels {
-    pub(super) fn reconcile(&mut self, session: &SessionReference, snapshot: &SessionSnapshot) {
-        self.drafts
-            .retain(|(owner, id), _| owner != session || pending(snapshot).any(|q| q.id == *id));
+    pub(super) fn discard_origin(&mut self, origin: &crate::protocol::Outlook) {
+        let sessions: Vec<_> = self
+            .availability
+            .keys()
+            .filter(|session| &session.origin == origin)
+            .cloned()
+            .collect();
+        for session in sessions {
+            self.discard_session(&session);
+        }
+    }
+
+    pub(super) fn retain_origin(
+        &mut self,
+        origin: &crate::protocol::Outlook,
+        sessions: &[crate::protocol::SessionId],
+    ) {
+        let removed: Vec<_> = self
+            .availability
+            .keys()
+            .filter(|session| {
+                &session.origin == origin
+                    && !self.unlisted_sessions.contains(*session)
+                    && !sessions.contains(&session.session_id)
+            })
+            .cloned()
+            .collect();
+        for session in removed {
+            self.discard_session(&session);
+        }
+    }
+    pub(super) fn discard_session(&mut self, session: &SessionReference) {
+        self.availability.remove(session);
+        self.unlisted_sessions.remove(session);
+        self.drafts.retain(|(owner, _), _| owner != session);
         if self
             .visible
             .as_ref()
-            .is_some_and(|(owner, id)| owner == session && !pending(snapshot).any(|q| q.id == *id))
+            .is_some_and(|(owner, _)| owner == session)
+        {
+            self.visible = None;
+        }
+    }
+
+    pub(super) fn reconcile(&mut self, session: &SessionReference, snapshot: &SessionSnapshot) {
+        if snapshot.session.parent.is_some() {
+            self.unlisted_sessions.insert(session.clone());
+        }
+
+        self.reconcile_available(
+            session,
+            snapshot.revision,
+            &pending(snapshot).map(|q| q.id).collect::<Vec<_>>(),
+        );
+    }
+
+    pub(super) fn reconcile_available(
+        &mut self,
+        session: &SessionReference,
+        revision: crate::protocol::SessionRevision,
+        available: &[QuestionnaireId],
+    ) {
+        if self
+            .availability
+            .get(session)
+            .is_some_and(|(known, _)| known.0 > revision.0)
+        {
+            return;
+        }
+        self.availability
+            .insert(session.clone(), (revision, available.to_vec()));
+        self.drafts
+            .retain(|(owner, id), _| owner != session || available.contains(id));
+        if self
+            .visible
+            .as_ref()
+            .is_some_and(|(owner, id)| owner == session && !available.contains(id))
         {
             self.visible = None;
         }
@@ -69,7 +142,15 @@ impl QuestionnairePanels {
             .as_ref()
             .is_some_and(|(owner, _)| Some(owner) == session)
     }
+    pub(super) fn available(&self, session: &SessionReference, id: QuestionnaireId) -> bool {
+        self.availability
+            .get(session)
+            .is_none_or(|(_, ids)| ids.contains(&id))
+    }
     pub(super) fn open(&mut self, session: SessionReference, questionnaire: &Questionnaire) {
+        if !self.available(&session, questionnaire.id) {
+            return;
+        }
         let key = (session, questionnaire.id);
         self.drafts.entry(key.clone()).or_default();
         self.visible = Some(key);
@@ -196,6 +277,7 @@ impl QuestionnairePanels {
         composer: Rect,
         questionnaire: &Questionnaire,
         theme: &Theme,
+        position: (usize, usize),
     ) {
         let Some(panel) = self.visible.as_ref().and_then(|key| self.drafts.get(key)) else {
             return;
@@ -279,9 +361,10 @@ impl QuestionnairePanels {
             height,
         );
         frame.render_widget(ratatui::widgets::Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Questionnaire ");
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            " Questionnaire {} of {} · Alt+←/→ switch ",
+            position.0, position.1
+        ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let content = Rect::new(
@@ -334,6 +417,8 @@ pub(super) fn key(event: &Event) -> Option<CommandId> {
         return None;
     }
     let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Left, KeyModifiers::ALT) => QuestionnaireRequestPrevious,
+        (KeyCode::Right, KeyModifiers::ALT) => QuestionnaireRequestNext,
         (KeyCode::Up, KeyModifiers::ALT) => QuestionnaireScrollUp,
         (KeyCode::Down, KeyModifiers::ALT) => QuestionnaireScrollDown,
         (KeyCode::Esc, _) => QuestionnaireHide,
