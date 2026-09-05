@@ -454,6 +454,10 @@ impl ControlledProviderSession {
         self.gate_questionnaires.store(true, Ordering::SeqCst);
     }
 
+    pub fn ungate_questionnaire_deliveries(&self) {
+        self.gate_questionnaires.store(false, Ordering::SeqCst);
+    }
+
     pub async fn next_questionnaire_delivery(&mut self) -> QuestionnaireDelivery {
         self.questionnaires
             .recv()

@@ -6,13 +6,15 @@
 //! https://code.claude.com/docs/en/agent-sdk/user-input
 //! Selected labels and additional custom text use its comma-separated answer
 //! encoding. The untouched native input travels back beside those answers.
+//! Child callbacks use the SDK control contract's tool_use_id and agent_id:
+//! https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
 use super::{claude_error, transport::StreamJsonTransport};
 use crate::{
     protocol::{
         Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireId,
         QuestionnaireSubmission,
     },
-    provider::{ProviderError, ProviderEvent},
+    provider::{AttributedProviderEvent, ProviderError, ProviderEvent, ProviderEventAttribution},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ pub(super) struct ClaudeQuestionnaires {
     transport: Mutex<Option<StreamJsonTransport>>,
 }
 struct NativeQuestionnaire {
+    attribution: ProviderEventAttribution,
     request_id: String,
     input: Value,
     questionnaire: Questionnaire,
@@ -56,10 +59,18 @@ impl ClaudeQuestionnaires {
             .expect("Claude Questionnaire lock is not poisoned")
             .clear();
     }
+    pub(super) fn settle(&self, attribution: &ProviderEventAttribution) {
+        self.pending
+            .lock()
+            .expect("Claude Questionnaire lock is not poisoned")
+            .retain(|_, request| &request.attribution != attribution);
+    }
+
     pub(super) async fn receive(
         &self,
         message: &Value,
-    ) -> Result<Option<Vec<ProviderEvent>>, ProviderError> {
+        attribution: Option<ProviderEventAttribution>,
+    ) -> Result<Option<Vec<AttributedProviderEvent>>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("control_cancel_request") => {
                 let Some(request_id) = message.get("request_id").and_then(Value::as_str) else {
@@ -75,8 +86,11 @@ impl ClaudeQuestionnaires {
                 Ok(Some(
                     id.into_iter()
                         .map(|id| {
-                            pending.remove(&id);
-                            ProviderEvent::QuestionnaireWithdrawn { id }
+                            let native = pending.remove(&id).expect("pending correlation exists");
+                            AttributedProviderEvent {
+                                attribution: native.attribution,
+                                event: ProviderEvent::QuestionnaireWithdrawn { id },
+                            }
                         })
                         .collect(),
                 ))
@@ -103,6 +117,10 @@ impl ClaudeQuestionnaires {
                     .await?;
                     return Ok(Some(vec![]));
                 }
+                let Some(attribution) = attribution else {
+                    self.respond(request_id, json!({"behavior":"deny", "message":"The owning Subagent could not be identified", "interrupt":false})).await?;
+                    return Ok(Some(vec![]));
+                };
                 let native: Vec<NativeQuestion> =
                     serde_json::from_value(input["questions"].clone()).map_err(|_| {
                         claude_error("Claude sent malformed Questionnaire Questions")
@@ -171,13 +189,15 @@ impl ClaudeQuestionnaires {
                 pending.insert(
                     questionnaire.id,
                     NativeQuestionnaire {
+                        attribution: attribution.clone(),
                         request_id: request_id.to_owned(),
                         input,
                         questionnaire: questionnaire.clone(),
                     },
                 );
-                Ok(Some(vec![ProviderEvent::QuestionnaireRequested {
-                    questionnaire,
+                Ok(Some(vec![AttributedProviderEvent {
+                    attribution,
+                    event: ProviderEvent::QuestionnaireRequested { questionnaire },
                 }]))
             }
             _ => Ok(None),

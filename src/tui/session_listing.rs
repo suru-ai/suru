@@ -371,6 +371,19 @@ impl SessionListing {
                 standing_inputs.pending_questionnaires_revision =
                     summary.standing_inputs.pending_questionnaires_revision;
             }
+            for known in &summary.standing_inputs.subagent_questionnaires {
+                match standing_inputs
+                    .subagent_questionnaires
+                    .iter_mut()
+                    .find(|entry| entry.session_id == known.session_id)
+                {
+                    Some(incoming) if incoming.revision.0 < known.revision.0 => {
+                        *incoming = known.clone()
+                    }
+                    None => standing_inputs.subagent_questionnaires.push(known.clone()),
+                    _ => {}
+                }
+            }
             summary.standing_inputs = standing_inputs;
         }
     }

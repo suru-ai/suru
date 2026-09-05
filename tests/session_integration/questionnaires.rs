@@ -752,3 +752,232 @@ async fn gated_delivery_does_not_block_withdrawal_or_interruption_and_cannot_ove
         live.server.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_the_child_after_parent_settles()
+ {
+    use suru::protocol::{SessionChange, SessionId, SessionSnapshot, TurnStatus};
+    use suru::provider::{ProviderEventAttribution, ProviderSubagentId};
+    let directory = tempfile::tempdir().unwrap();
+    let mut live = working_turn(directory.path(), "nested-questionnaires").await;
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(directory.path(), "nested-questionnaires").unwrap(),
+    )
+    .await
+    .unwrap();
+    async fn spawn(
+        live: &crate::support::WorkingTurn,
+        client: &ManagedClient,
+        parent: SessionId,
+        attribution: ProviderEventAttribution,
+        name: &str,
+    ) -> SessionId {
+        live.provider_session
+            .emit_attributed_and_wait_until_observed(
+                attribution,
+                ProviderEvent::SubagentStarted {
+                    subagent_id: ProviderSubagentId::new(name),
+                    name: name.into(),
+                    description: name.into(),
+                },
+            )
+            .await;
+        let snapshot = client.read_session(parent).await.unwrap();
+        snapshot
+            .activities
+            .iter()
+            .find_map(|a| match a {
+                Activity::Subagent {
+                    name: found,
+                    session_id,
+                    ..
+                } if found == name => Some(*session_id),
+                _ => None,
+            })
+            .unwrap()
+    }
+    let child = spawn(
+        &live,
+        &client,
+        live.session_id,
+        ProviderEventAttribution::OwningSession,
+        "child",
+    )
+    .await;
+    let grandchild = spawn(
+        &live,
+        &client,
+        child,
+        ProviderEventAttribution::Subagent(ProviderSubagentId::new("child")),
+        "grandchild",
+    )
+    .await;
+    let first = questionnaire();
+    let second = questionnaire();
+    for (name, request) in [("child", &first), ("grandchild", &second)] {
+        live.provider_session
+            .emit_attributed_and_wait_until_observed(
+                ProviderEventAttribution::Subagent(ProviderSubagentId::new(name)),
+                ProviderEvent::QuestionnaireRequested {
+                    questionnaire: request.clone(),
+                },
+            )
+            .await;
+    }
+    let mut feed = client.subscribe_session(live.session_id).await.unwrap();
+    let suru::managed_client::SessionEvent::Snapshot(parent) = feed.next().await.unwrap().unwrap()
+    else {
+        panic!("snapshot")
+    };
+    assert_eq!(parent.subagent_questionnaire_count(), 2);
+    assert_eq!(parent.pending_questionnaires_in_subagent(child), 2);
+    assert!(
+        !parent
+            .activities
+            .iter()
+            .any(|a| matches!(a, Activity::Questionnaire { .. }))
+    );
+    let nested = client.read_session(child).await.unwrap();
+    assert_eq!(nested.subagent_questionnaire_count(), 1);
+    assert_eq!(nested.pending_questionnaires_in_subagent(grandchild), 1);
+    let listed = client.list_sessions(None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]
+            .readable()
+            .unwrap()
+            .standing_inputs
+            .pending_questionnaire_count(),
+        2
+    );
+
+    live.provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let parent = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(parent.turns[0].status, TurnStatus::Completed);
+    assert_eq!(parent.subagent_questionnaire_count(), 2);
+    let answer = Answer {
+        questions: vec![QuestionAnswer::Freeform {
+            text: "Child answer".into(),
+        }],
+    };
+    live.provider_session.gate_questionnaire_deliveries();
+    let submission = QuestionnaireSubmission::Answer {
+        answer: answer.clone(),
+    };
+    let (submitted, ()) = tokio::join!(
+        client.submit_questionnaire(child, first.id, submission.clone()),
+        async {
+            let delivery = timeout(
+                Duration::from_secs(2),
+                live.provider_session.next_questionnaire_delivery(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(delivery.id, first.id);
+            assert_eq!(delivery.submission, submission);
+            // A settled parent still arbitrates its child's live request while
+            // delivery is waiting, without blocking the actor on that delivery.
+            assert!(
+                timeout(
+                    Duration::from_secs(2),
+                    client.submit_questionnaire(child, first.id, QuestionnaireSubmission::Decline)
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert!(outcome(
+                &client.read_session(child).await.unwrap(),
+                QuestionnaireOutcome::Submitting
+            ));
+            delivery.succeed();
+        }
+    );
+    submitted.unwrap();
+    live.provider_session.ungate_questionnaire_deliveries();
+    let parent = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(parent.subagent_questionnaire_count(), 1);
+    assert_eq!(
+        parent.turns.len(),
+        1,
+        "answer does not create a Continuation"
+    );
+    assert!(
+        !parent
+            .activities
+            .iter()
+            .any(|a| matches!(a, Activity::Questionnaire { .. }))
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let suru::managed_client::SessionEvent::Updated(update) = feed.next().await.unwrap().unwrap()
+                && update.changes.iter().any(|c| matches!(c, SessionChange::SubagentQuestionnairesChanged { subagent_questionnaires } if subagent_questionnaires.iter().map(|q| q.pending_questionnaires.len()).sum::<usize>() == 1)) { break; }
+        }
+    }).await.unwrap();
+    client
+        .submit_questionnaire(grandchild, second.id, QuestionnaireSubmission::Decline)
+        .await
+        .unwrap();
+    assert_eq!(
+        live.provider_session.next_questionnaire_submission().await,
+        (second.id, QuestionnaireSubmission::Decline)
+    );
+    assert_eq!(
+        client
+            .read_session(live.session_id)
+            .await
+            .unwrap()
+            .subagent_questionnaire_count(),
+        0
+    );
+
+    let withdrawn = questionnaire();
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("grandchild")),
+            ProviderEvent::QuestionnaireRequested {
+                questionnaire: withdrawn.clone(),
+            },
+        )
+        .await;
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("grandchild")),
+            ProviderEvent::QuestionnaireWithdrawn { id: withdrawn.id },
+        )
+        .await;
+    assert_eq!(
+        client
+            .read_session(live.session_id)
+            .await
+            .unwrap()
+            .subagent_questionnaire_count(),
+        0
+    );
+    let interrupted = questionnaire();
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("grandchild")),
+            ProviderEvent::QuestionnaireRequested {
+                questionnaire: interrupted.clone(),
+            },
+        )
+        .await;
+    let (interrupted_result, ()) = tokio::join!(client.interrupt_session(live.session_id), async {
+        live.provider_session.next_subagents_stop().await.succeed();
+    });
+    interrupted_result.unwrap();
+    let parent: SessionSnapshot = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(parent.subagent_questionnaire_count(), 0);
+    assert!(
+        client
+            .submit_questionnaire(grandchild, interrupted.id, QuestionnaireSubmission::Decline)
+            .await
+            .is_err()
+    );
+    drop(feed);
+    drop(client);
+    live.server.shutdown().await.unwrap();
+}

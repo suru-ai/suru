@@ -314,3 +314,126 @@ async fn interrupting_claude_while_a_questionnaire_is_pending_stops_the_turn_wit
     );
     live.shutdown().await;
 }
+
+#[tokio::test]
+async fn native_child_questionnaire_is_correlated_to_its_tool_call_and_survives_parent_result() {
+    let question_input = input();
+    let child_message = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"child-question-tool","name":"AskUserQuestion","input":question_input}]},"parent_tool_use_id":"spawn-child","session_id":"prov-session"});
+    let request = json!({"type":"control_request","request_id":"child-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"child-question-tool","agent_id":"native-agent-42","input":question_input}});
+    let native = format!(
+        r#"      emit '{{"type":"system","subtype":"task_started","task_id":"task-child","tool_use_id":"spawn-child","task_type":"local_agent","description":"Choose child settings"}}'
+      emit '{child_message}'
+      emit '{request}'
+      (
+        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        emit '{{"type":"result","subtype":"success","is_error":false,"result":"Delegated","session_id":"prov-session"}}'
+      ) &
+"#
+    );
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&native),
+        crate::support::stop_task_arm()
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-child-question",
+        "Ask in a Subagent",
+    )
+    .await;
+    fixture.release();
+    let parent = live
+        .wait_for("child question survives owning result", |s| {
+            s.turns[0].status == TurnStatus::Completed && s.subagent_questionnaire_count() == 1
+        })
+        .await;
+    assert!(
+        !parent
+            .activities
+            .iter()
+            .any(|a| matches!(a, Activity::Questionnaire { .. }))
+    );
+    let child_id = parent.subagent_questionnaires[0].session_id;
+    let child = live.client.read_session(child_id).await.unwrap();
+    let question = child
+        .activities
+        .iter()
+        .find_map(|a| match a {
+            Activity::Questionnaire { questionnaire, .. } => Some(questionnaire),
+            _ => None,
+        })
+        .unwrap();
+    let answer = suru::protocol::Answer {
+        questions: vec![
+            QuestionAnswer::Freeform {
+                text: "Child environment".into(),
+            },
+            QuestionAnswer::Selected {
+                choices: vec!["Unit".into()],
+            },
+        ],
+    };
+    live.client
+        .submit_questionnaire(
+            child_id,
+            question.id,
+            QuestionnaireSubmission::Answer { answer },
+        )
+        .await
+        .unwrap();
+    let response = native_response(&fixture, "child-question").await;
+    assert_eq!(
+        response["updatedInput"]["answers"]["Which environment?"],
+        "Child environment"
+    );
+    assert_eq!(
+        live.client
+            .read_session(live.session_id)
+            .await
+            .unwrap()
+            .subagent_questionnaire_count(),
+        0
+    );
+    assert_eq!(live.client.list_sessions(None).await.unwrap().len(), 1);
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unidentified_native_child_question_is_declined_without_entering_parent_history() {
+    let request = json!({"type":"control_request","request_id":"unknown-child","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"unobserved-tool","agent_id":"unknown-native-agent","input":input()}});
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&format!(
+            r#"      (
+        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        emit '{request}'
+      ) &
+"#
+        )),
+        COMPLETED
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-unidentified-question",
+        "Use a Subagent",
+    )
+    .await;
+    fixture.release();
+    let response = native_response(&fixture, "unknown-child").await;
+    assert_eq!(response["behavior"], "deny");
+    assert_eq!(response["interrupt"], false);
+    let settled = live
+        .wait_for("parent completes normally", |s| {
+            s.turns[0].status == TurnStatus::Completed
+        })
+        .await;
+    assert!(
+        !settled
+            .activities
+            .iter()
+            .any(|a| matches!(a, Activity::Questionnaire { .. }))
+    );
+    live.shutdown().await;
+}

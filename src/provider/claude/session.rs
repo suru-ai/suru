@@ -291,12 +291,7 @@ impl ProviderSession for ClaudeSession {
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
     ) -> ProviderFuture<'_, ()> {
-        Box::pin(async move {
-            if !self.turn.is_running() {
-                return Err(no_live_turn("answer"));
-            }
-            self.questionnaires.submit(id, submission).await
-        })
+        Box::pin(async move { self.questionnaires.submit(id, submission).await })
     }
 
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
@@ -471,6 +466,10 @@ impl ProviderSession for ClaudeSession {
             let Some(task_id) = self.turn.subagent_task(subagent_id.as_str()) else {
                 return Ok(());
             };
+            self.questionnaires
+                .settle(&crate::provider::ProviderEventAttribution::Subagent(
+                    subagent_id.clone(),
+                ));
             transport
                 .control_request(
                     &ControlRequest::StopTask {

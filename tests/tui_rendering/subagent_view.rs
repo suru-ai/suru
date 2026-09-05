@@ -413,3 +413,141 @@ fn a_subagent_session_streams_live_while_attached() {
         "the child's Transcript streams live while the Subagent works: {rows}"
     );
 }
+
+#[test]
+fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_child_drafts() {
+    use suru::protocol::{
+        Question, Questionnaire, QuestionnaireId, QuestionnaireOutcome, SubagentQuestionnaires,
+    };
+    let workspace = workspace_dir();
+    let (mut parent, child_id) =
+        parent_with_subagent_row(workspace.path(), ActivityStatus::Active, None, false);
+    let mut child = child_session_snapshot(child_id, parent.session.id, workspace.path());
+    let questionnaire_id = QuestionnaireId::new();
+    let activity_id = suru::protocol::ActivityId::new();
+    child.activities.push(Activity::Questionnaire {
+        id: activity_id,
+        turn_id: child.turns[0].id,
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+        questionnaire: Questionnaire {
+            id: questionnaire_id,
+            questions: vec![Question {
+                id: "child-input".into(),
+                title: None,
+                text: "Which child setting?".into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            }],
+        },
+    });
+    child
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    child.revision.0 += 1;
+    parent.subagent_questionnaires.push(SubagentQuestionnaires {
+        session_id: child_id,
+        via_session_id: child_id,
+        revision: child.revision,
+        pending_questionnaires: vec![questionnaire_id],
+    });
+    let mut app = connected_application(workspace.path());
+    app.handle_event(ApplicationEvent::SessionAttached(parent.clone()))
+        .unwrap();
+    type_terminal_text(&mut app, "Parent composer draft");
+    let screen = rendered_application_rows_at(&app, 100, 26).join("\n");
+    assert!(
+        screen.contains("1 Subagent questionnaires pending")
+            && !screen.contains("Which child setting?"),
+        "{screen}"
+    );
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::SubagentBrowse,
+    )))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, 100, 26).join("\n");
+    assert!(screen.contains("1 pending questions"), "{screen}");
+    assert!(
+        matches!(press_key(&mut app, KeyCode::Enter), ApplicationTransition::AttachSession(reference) if reference.session_id == child_id)
+    );
+    app.handle_event(ApplicationEvent::SessionAttached(child.clone()))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::QuestionnaireOpen,
+    )))
+    .unwrap();
+    type_terminal_text(&mut app, "Child answer draft");
+    press_key(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(press_key(&mut app, KeyCode::Esc), ApplicationTransition::ViewAndAttachSession(reference) if reference.session_id == parent.session.id)
+    );
+    app.handle_event(ApplicationEvent::SessionAttached(parent.clone()))
+        .unwrap();
+    assert!(
+        rendered_application_rows_at(&app, 100, 26)
+            .join("\n")
+            .contains("Parent composer draft")
+    );
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::SubagentBrowse,
+    )))
+    .unwrap();
+    press_key(&mut app, KeyCode::Enter);
+    app.handle_event(ApplicationEvent::SessionAttached(child.clone()))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::QuestionnaireOpen,
+    )))
+    .unwrap();
+    assert!(
+        rendered_application_rows_at(&app, 100, 26)
+            .join("\n")
+            .contains("Child answer draft")
+    );
+    press_key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(SemanticCommandId::QuestionnaireSubmit))).unwrap(),
+        ApplicationTransition::SubmitQuestionnaire { session, id, .. } if session.session_id == child_id && id == questionnaire_id)
+    );
+    // A root catalog update also discards a hidden child's now-unavailable draft.
+    press_key(&mut app, KeyCode::Esc);
+    press_key(&mut app, KeyCode::Esc);
+    app.handle_event(ApplicationEvent::SessionAttached(parent.clone()))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Managed(
+        suru::managed_client::ManagedEvent::SessionStandingInputsChanged(
+            suru::protocol::SessionStandingInputsChanged {
+                session_id: parent.session.id,
+                inputs: suru::protocol::SessionStandingInputs {
+                    subagent_questionnaires: vec![SubagentQuestionnaires {
+                        session_id: child_id,
+                        via_session_id: child_id,
+                        revision: SessionRevision(child.revision.0 + 1),
+                        pending_questionnaires: vec![],
+                    }],
+                    ..Default::default()
+                },
+            },
+        ),
+    ))
+    .unwrap();
+    app.handle_event(ApplicationEvent::SessionAttached(child))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::QuestionnaireOpen,
+    )))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, 100, 26).join("\n");
+    assert!(!screen.contains("Child answer draft"));
+    assert!(matches!(
+        app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::QuestionnaireSubmit
+        )))
+        .unwrap(),
+        ApplicationTransition::Continue
+    ));
+}
