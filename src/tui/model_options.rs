@@ -2,11 +2,14 @@
 
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelDescriptor, ModelOptionChoiceId, ModelOptionDescriptor,
-    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue,
+    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
 };
+
+use super::model_picker::ModelPickerPurpose;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ChoiceValue {
+    ProviderDefault,
     Select(ModelOptionChoiceId),
     Toggle(bool),
 }
@@ -19,6 +22,7 @@ struct ChoicePicker {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ModelOptions {
+    purpose: ModelPickerPurpose,
     model: Option<ModelDescriptor>,
     staged: Option<AgentSelection>,
     selected: usize,
@@ -45,20 +49,29 @@ pub(super) struct ModelOptionChoiceRow {
 
 impl ModelOptions {
     pub(super) fn open(&mut self, model: ModelDescriptor, current: Option<&AgentSelection>) {
-        let staged = if current.is_some_and(|selection| {
-            selection.provider == model.provider && selection.model == model.id
-        }) {
-            selection_preserving_current_values(&model, current.expect("same Model was checked"))
-        } else {
-            model.default_agent_selection()
-        };
+        self.open_for(model, current, ModelPickerPurpose::AgentSelection);
+    }
+
+    pub(super) fn open_for(
+        &mut self,
+        model: ModelDescriptor,
+        current: Option<&AgentSelection>,
+        purpose: ModelPickerPurpose,
+    ) {
+        let staged = stage_selection(&model, current, purpose);
+        self.purpose = purpose;
         self.model = Some(model);
         self.staged = Some(staged);
         self.selected = 0;
         self.choices = None;
     }
 
+    pub(super) fn purpose(&self) -> ModelPickerPurpose {
+        self.purpose
+    }
+
     pub(super) fn close(&mut self) {
+        self.purpose = ModelPickerPurpose::default();
         self.model = None;
         self.staged = None;
         self.selected = 0;
@@ -72,7 +85,7 @@ impl ModelOptions {
         if staged.provider != model.provider || staged.model != model.id {
             return;
         }
-        self.staged = Some(selection_preserving_current_values(&model, staged));
+        self.staged = Some(stage_selection(&model, Some(staged), self.purpose));
         self.selected = if self.is_confirm_selected() {
             model.options.len()
         } else {
@@ -151,8 +164,9 @@ impl ModelOptions {
         let (Some(model), Some(staged)) = (&self.model, &self.staged) else {
             return false;
         };
+        let effective = selection_preserving_current_values(model, staged);
         model.availability == ModelAvailability::Available
-            && model.materialize_agent_selection(Some(staged)).is_ok()
+            && model.materialize_agent_selection(Some(&effective)).is_ok()
     }
 
     pub(super) fn rows(&self) -> Vec<ModelOptionRow> {
@@ -170,10 +184,10 @@ impl ModelOptions {
                     description: descriptor.description.clone(),
                     value: value
                         .map(|value| option_value_label(descriptor, value))
-                        .unwrap_or_else(|| "Unavailable".to_owned()),
+                        .unwrap_or_else(|| "Provider default".to_owned()),
                     selected: self.choices.is_none() && index == self.selected,
                     available: value
-                        .is_some_and(|value| option_value_is_available(descriptor, value)),
+                        .is_none_or(|value| option_value_is_available(descriptor, value)),
                 }
             })
             .collect()
@@ -192,7 +206,7 @@ impl ModelOptions {
             return Vec::new();
         };
         let current = selected_value(staged, &descriptor.id);
-        choice_values(descriptor, current)
+        choice_values(descriptor, current, self.purpose)
             .into_iter()
             .map(|candidate| {
                 let (label, description, available) = choice_details(descriptor, &candidate);
@@ -200,7 +214,9 @@ impl ModelOptions {
                     label,
                     description,
                     selected: picker.selected == candidate,
-                    current: current.is_some_and(|value| choice_matches_value(&candidate, value)),
+                    current: current.map_or(candidate == ChoiceValue::ProviderDefault, |value| {
+                        choice_matches_value(&candidate, value)
+                    }),
                     available,
                 }
             })
@@ -237,12 +253,10 @@ impl ModelOptions {
         let Some(descriptor) = model.options.get(self.selected) else {
             return;
         };
-        let Some(value) = selected_value(staged, &descriptor.id) else {
-            return;
-        };
+        let value = selected_value(staged, &descriptor.id);
         self.choices = Some(ChoicePicker {
             option: descriptor.id.clone(),
-            selected: ChoiceValue::from(value),
+            selected: value.map_or(ChoiceValue::ProviderDefault, ChoiceValue::from),
         });
     }
 
@@ -259,7 +273,11 @@ impl ModelOptions {
         else {
             return;
         };
-        let values = choice_values(descriptor, selected_value(staged, &descriptor.id));
+        let values = choice_values(
+            descriptor,
+            selected_value(staged, &descriptor.id),
+            self.purpose,
+        );
         if values.is_empty() {
             return;
         }
@@ -288,14 +306,20 @@ impl ModelOptions {
         if !available {
             return;
         }
-        let Some(selection) = staged
-            .options
-            .iter_mut()
-            .find(|selection| selection.id == descriptor.id)
-        else {
-            return;
-        };
-        selection.value = picker.selected.clone().into();
+        if let Some(value) = picker.selected.clone().into_value() {
+            if let Some(selection) = staged.options.iter_mut().find(|s| s.id == descriptor.id) {
+                selection.value = value;
+            } else {
+                staged.options.push(ModelOptionSelection {
+                    id: descriptor.id.clone(),
+                    value,
+                });
+            }
+        } else {
+            staged
+                .options
+                .retain(|selection| selection.id != descriptor.id);
+        }
         self.choices = None;
     }
 }
@@ -378,13 +402,34 @@ impl From<&ModelOptionValue> for ChoiceValue {
     }
 }
 
-impl From<ChoiceValue> for ModelOptionValue {
-    fn from(value: ChoiceValue) -> Self {
-        match value {
-            ChoiceValue::Select(choice) => Self::Select { choice },
-            ChoiceValue::Toggle(enabled) => Self::Toggle { enabled },
+impl ChoiceValue {
+    fn into_value(self) -> Option<ModelOptionValue> {
+        match self {
+            Self::ProviderDefault => None,
+            Self::Select(choice) => Some(ModelOptionValue::Select { choice }),
+            Self::Toggle(enabled) => Some(ModelOptionValue::Toggle { enabled }),
         }
     }
+}
+
+/// Settings retain only explicit overrides; ordinary Agent Selections remain complete.
+fn stage_selection(
+    model: &ModelDescriptor,
+    current: Option<&AgentSelection>,
+    purpose: ModelPickerPurpose,
+) -> AgentSelection {
+    let current = current
+        .filter(|selection| selection.provider == model.provider && selection.model == model.id);
+    let mut staged = current.map_or_else(
+        || model.default_agent_selection(),
+        |current| selection_preserving_current_values(model, current),
+    );
+    if matches!(purpose, ModelPickerPurpose::Setting(_)) {
+        staged.options.retain(|option| {
+            current.is_some_and(|current| current.options.iter().any(|old| old.id == option.id))
+        });
+    }
+    staged
 }
 
 fn selection_preserving_current_values(
@@ -453,8 +498,9 @@ fn option_value_is_available(descriptor: &ModelOptionDescriptor, value: &ModelOp
 fn choice_values(
     descriptor: &ModelOptionDescriptor,
     current: Option<&ModelOptionValue>,
+    purpose: ModelPickerPurpose,
 ) -> Vec<ChoiceValue> {
-    match &descriptor.kind {
+    let mut values = match &descriptor.kind {
         ModelOptionKind::Select { choices, .. } => {
             let mut values = choices
                 .iter()
@@ -470,7 +516,11 @@ fn choice_values(
         ModelOptionKind::Toggle { .. } => {
             vec![ChoiceValue::Toggle(false), ChoiceValue::Toggle(true)]
         }
+    };
+    if matches!(purpose, ModelPickerPurpose::Setting(_)) {
+        values.insert(0, ChoiceValue::ProviderDefault);
     }
+    values
 }
 
 fn choice_details(
@@ -478,6 +528,11 @@ fn choice_details(
     value: &ChoiceValue,
 ) -> (String, Option<String>, bool) {
     match (&descriptor.kind, value) {
+        (_, ChoiceValue::ProviderDefault) => (
+            "Provider default".to_owned(),
+            Some("Follow this Model's current default without pinning a value".to_owned()),
+            true,
+        ),
         (ModelOptionKind::Select { choices, .. }, ChoiceValue::Select(selected)) => choices
             .iter()
             .find(|choice| choice.id == *selected)

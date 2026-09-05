@@ -157,9 +157,6 @@ pub(super) fn render_with_slots(
     if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
         render_workspace_picker(frame, state, main, theme);
     }
-    if state.model_options.is_open() && !state.reconnect_overlay_visible {
-        render_model_options(frame, state, main, theme);
-    }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
         render_settings_panel(frame, state, main, theme);
         if state.settings_panel.numeric_editor().is_some() {
@@ -168,6 +165,9 @@ pub(super) fn render_with_slots(
     }
     // Choice pickers can be opened by a settings row, so they are drawn over
     // the panel that asked and take the reader's answer first.
+    if state.model_options.is_open() && !state.reconnect_overlay_visible {
+        render_model_options(frame, state, main, theme);
+    }
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
         render_model_picker(frame, state, main, theme);
     }

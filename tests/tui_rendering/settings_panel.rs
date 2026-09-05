@@ -22,11 +22,11 @@ use suru::{
         AgentSelection, AppearanceMode, AppearanceSettings, AutoSettle, CodexSettings,
         CopilotSettings, EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability,
         ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
-        ModelOptionId, ModelOptionKind, ModelOptionRole, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail,
-        ReasoningVisibility, SessionContentWidth, SessionId, SessionSettings, SettingMutation,
-        SettingScope, SettingsSnapshot, SidebarScope, SidebarSettings, TitleErrand, TitleSettings,
-        TranscriptSettings,
+        ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
+        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
+        SidebarSettings, TitleErrand, TitleSettings, TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -2494,6 +2494,17 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
     press(&mut application, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "choosing a configurable Model stages its options before saving"
+    );
+    let options = rendered_application_rows(&application).join("\n");
+    assert!(options.contains("Model Options"), "{options}");
+    assert!(
+        options.contains("Reasoning · Provider default"),
+        "{options}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
         ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
             value: Some(TitleErrand::Pinned(pinned_selection())),
         }),
@@ -2602,4 +2613,177 @@ fn cancelling_the_picker_leaves_the_settings_panel_where_it_was() {
         "session.title.errand",
         "and the panel is still focused on the row that opened it"
     );
+}
+
+fn open_title_options(application: &mut Application, catalog: ModelCatalog) {
+    open_panel(application);
+    focus_setting(application, "session.title.errand");
+    let ApplicationTransition::ListModels(request) =
+        press(application, KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("title selection should request Models");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed { request, catalog })
+        .expect("load title Models");
+    assert_eq!(
+        press(application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(application)
+            .join("\n")
+            .contains("Model Options")
+    );
+}
+
+fn configurable_title_catalog(provider: &str) -> ModelCatalog {
+    let mut catalog = two_model_catalog();
+    let entry = &mut catalog.providers[0];
+    entry.provider = ProviderId::new(provider);
+    entry.display_name = provider.to_owned();
+    entry.models.truncate(1);
+    let model = &mut entry.models[0];
+    model.provider = ProviderId::new(provider);
+    model.is_default = true;
+    model.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("fast"),
+        label: "Speed".to_owned(),
+        description: None,
+        role: ModelOptionRole::Speed,
+        kind: ModelOptionKind::Toggle { default: false },
+    });
+    catalog
+}
+
+#[test]
+fn title_options_pin_explicit_choices_even_equal_to_defaults_across_providers() {
+    for provider in ["codex", "copilot", "claude"] {
+        let workspace = workspace_dir();
+        let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+        open_title_options(&mut application, configurable_title_catalog(provider));
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+        let choices = rendered_application_rows(&application).join("\n");
+        assert!(choices.contains("Provider default [current]"), "{choices}");
+        press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+        let mut expected = pinned_selection();
+        expected.provider = ProviderId::new(provider);
+        expected.options.push(ModelOptionSelection {
+            id: ModelOptionId::new("reasoning_effort"),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new("low"),
+            },
+        });
+        assert_eq!(
+            press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
+            ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+                value: Some(TitleErrand::Pinned(expected)),
+            }),
+            "explicit Low is pinned while untouched Speed follows defaults for {provider}"
+        );
+    }
+}
+
+#[test]
+fn title_options_reopen_own_overrides_and_can_restore_provider_defaults() {
+    let workspace = workspace_dir();
+    let mut selection = pinned_selection();
+    selection.options.push(ModelOptionSelection {
+        id: ModelOptionId::new("fast"),
+        value: ModelOptionValue::Toggle { enabled: true },
+    });
+    let mut application = client_showing(
+        workspace.path(),
+        deriving_titles_with(TitleErrand::Pinned(selection)),
+        &["session.title.errand"],
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-5"),
+                    options: Vec::new(),
+                },
+            ),
+        ))
+        .expect("attach a Session with a different Agent Selection");
+    open_title_options(&mut application, configurable_title_catalog("codex"));
+    let options = rendered_application_rows(&application).join("\n");
+    assert!(options.contains("Speed · On"), "{options}");
+    assert!(
+        options.contains("Reasoning · Provider default"),
+        "{options}"
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    // On -> Provider default wraps past the last explicit choice.
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
+        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+            value: Some(TitleErrand::Pinned(pinned_selection())),
+        })
+    );
+}
+
+#[test]
+fn cancelling_title_options_discards_staged_changes_and_preserves_the_setting() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_title_options(&mut application, configurable_title_catalog("codex"));
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Speed · On")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(focused_key(&application), "session.title.errand");
+    assert!(row(&application, "Title derivation").contains("· session"));
+}
+
+#[test]
+fn choosing_another_title_model_or_provider_starts_with_inherited_options() {
+    for (provider, model) in [("codex", "another-model"), ("claude", "gpt-5-mini")] {
+        let workspace = workspace_dir();
+        let mut original = pinned_selection();
+        original.options.push(ModelOptionSelection {
+            id: ModelOptionId::new("fast"),
+            value: ModelOptionValue::Toggle { enabled: true },
+        });
+        let mut application = client_showing(
+            workspace.path(),
+            deriving_titles_with(TitleErrand::Pinned(original)),
+            &["session.title.errand"],
+        );
+        let mut catalog = configurable_title_catalog(provider);
+        catalog.providers[0].models[0].id = ModelId::new(model);
+        open_title_options(&mut application, catalog);
+        assert!(
+            rendered_application_rows(&application)
+                .join("\n")
+                .contains("Speed · Provider default")
+        );
+        assert_eq!(
+            press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
+            ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
+                value: Some(TitleErrand::Pinned(AgentSelection {
+                    provider: ProviderId::new(provider),
+                    model: ModelId::new(model),
+                    options: Vec::new(),
+                })),
+            })
+        );
+    }
 }

@@ -3659,26 +3659,17 @@ impl Application {
                 ApplicationTransition::ListModels,
             )),
             Some(ModelPickerAction::Select(model)) => {
+                let current = self
+                    .state
+                    .model_picker
+                    .selection_in_force(self.state.agent_selection());
                 self.state.model_picker.close();
-                // A Model chosen for a Setting pins the Provider and Model the
-                // reader picked and nothing else, and no Options editor opens
-                // over it. The picker asked them for a Model, so the pin claims
-                // a Model: the Options are filled in from whatever that Model
-                // defaults to wherever the Selection is resolved, which keeps
-                // the pin following a Model that changes its own defaults
-                // rather than freezing today's.
-                if let ModelPickerPurpose::Setting(pin) = purpose {
-                    return Ok(ApplicationTransition::MutateSetting(pin(AgentSelection {
-                        provider: model.provider,
-                        model: model.id,
-                        options: Vec::new(),
-                    })));
-                }
                 if model.options.is_empty() {
-                    return self.apply_agent_selection(model.default_agent_selection());
+                    return self.apply_chosen_selection(model.default_agent_selection(), purpose);
                 }
-                let current = self.state.agent_selection().cloned();
-                self.state.model_options.open(model, current.as_ref());
+                self.state
+                    .model_options
+                    .open_for(model, current.as_ref(), purpose);
                 Ok(ApplicationTransition::Continue)
             }
             None => Ok(ApplicationTransition::Continue),
@@ -4633,8 +4624,22 @@ impl Application {
         let Some(selection) = self.state.model_options.apply() else {
             return Ok(ApplicationTransition::Continue);
         };
+        let purpose = self.state.model_options.purpose();
         self.state.model_options.close();
-        self.apply_agent_selection(selection)
+        self.apply_chosen_selection(selection, purpose)
+    }
+
+    fn apply_chosen_selection(
+        &mut self,
+        selection: AgentSelection,
+        purpose: ModelPickerPurpose,
+    ) -> Result<ApplicationTransition> {
+        match purpose {
+            ModelPickerPurpose::AgentSelection => self.apply_agent_selection(selection),
+            ModelPickerPurpose::Setting(pin) => {
+                Ok(ApplicationTransition::MutateSetting(pin(selection)))
+            }
+        }
     }
 
     /// Advances the current Model's reasoning effort one step, refreshing the
@@ -4887,14 +4892,14 @@ impl Application {
         if self.state.serve_overlay.is_open() {
             return command_for_serve_overlay_event(event);
         }
+        if self.state.model_options.is_open() {
+            return command_for_model_options_event(event);
+        }
         if self.state.settings_panel.numeric_editor_is_open() {
             return command_for_numeric_editor_event(event);
         }
         if self.state.settings_panel.is_open() {
             return command_for_settings_panel_event(event);
-        }
-        if self.state.model_options.is_open() {
-            return command_for_model_options_event(event);
         }
         if self.state.session_picker.is_open() {
             return command_for_session_picker_event(event);

@@ -219,7 +219,10 @@ impl ModelPicker {
     /// Session's Model is not what this picker is asking about, and letting it
     /// in would move the focus off the reader's pin the moment a catalog
     /// listing came back.
-    fn selection_in_force(&self, current: Option<&AgentSelection>) -> Option<AgentSelection> {
+    pub(super) fn selection_in_force(
+        &self,
+        current: Option<&AgentSelection>,
+    ) -> Option<AgentSelection> {
         match self.purpose {
             ModelPickerPurpose::AgentSelection => current.cloned(),
             ModelPickerPurpose::Setting(_) => self.opened_on.clone(),
