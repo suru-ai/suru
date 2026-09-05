@@ -445,6 +445,31 @@ mod tests {
     }
 
     #[test]
+    fn jsx_fences_paint_tags_attributes_and_expressions() {
+        let theme = Theme::system();
+        for info in ["jsx", "javascriptreact"] {
+            let lines = render(
+                &format!("```{info}\nconst view = <div title=\"hello\">{{1 + 2}}</div>;\n```"),
+                &theme,
+            );
+            for (token, style) in [
+                ("div", theme.feedback.error),
+                ("title", theme.feedback.warning),
+                ("hello", theme.syntax.string),
+                ("1", theme.syntax.number),
+            ] {
+                assert!(
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| { span.content.contains(token) && span.style == style }),
+                    "missing {token:?} highlighting for {info:?}: {lines:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn csharp_fence_paints_keywords() {
         let theme = Theme::system();
         for info in ["csharp", "CSharp title=demo", "cs", "c#"] {
