@@ -769,3 +769,126 @@ fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availabilit
     app.handle_event(ApplicationEvent::SessionAttached(other))
         .unwrap();
 }
+
+#[test]
+fn another_clients_acceptance_discards_private_drafts_and_shows_the_authoritative_outcome() {
+    use suru::protocol::{SessionChange, SessionRevision, SessionUpdate};
+    let workspace = workspace_dir();
+    let mut first = connected_application(workspace.path());
+    let mut second = connected_application(workspace.path());
+    let (session_id, mut snapshot, turn_id) = enter_active_session(&mut first, workspace.path());
+    enter_active_session(&mut second, workspace.path());
+    let activity_id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id: activity_id,
+        turn_id,
+        questionnaire: Questionnaire {
+            id: QuestionnaireId::new(),
+            questions: vec![Question {
+                id: "target".into(),
+                title: None,
+                text: "Which target?".into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            }],
+        },
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    for (app, draft) in [
+        (&mut first, "First private draft"),
+        (&mut second, "Second private draft"),
+    ] {
+        app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            snapshot.clone(),
+        )))
+        .unwrap();
+        type_terminal_text(app, "Keep composer");
+        invoke(app, SemanticCommandId::QuestionnaireOpen);
+        type_terminal_text(app, draft);
+        assert!(rendered_application_rows(app).join("\n").contains(draft));
+    }
+    assert!(
+        !rendered_application_rows(&second)
+            .join("\n")
+            .contains("First private draft")
+    );
+    assert!(
+        !rendered_application_rows(&first)
+            .join("\n")
+            .contains("Second private draft")
+    );
+    let accepted = SessionUpdate {
+        session_id,
+        revision: SessionRevision(snapshot.revision.0 + 1),
+        changes: vec![SessionChange::QuestionnaireAccepted { activity_id }],
+    };
+    for app in [&mut first, &mut second] {
+        app.handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            accepted.clone(),
+        )))
+        .unwrap();
+        assert!(matches!(
+            invoke(app, SemanticCommandId::QuestionnaireSubmit),
+            ApplicationTransition::Continue
+        ));
+        let screen = rendered_application_rows(app).join("\n");
+        assert!(
+            screen.contains("Submitting") && screen.contains("Keep composer"),
+            "{screen}"
+        );
+        assert!(!screen.contains("private draft"), "{screen}");
+        invoke(app, SemanticCommandId::QuestionnaireOpen);
+        assert!(
+            !rendered_application_rows(app)
+                .join("\n")
+                .contains("private draft")
+        );
+    }
+    let settled = SessionUpdate {
+        session_id,
+        revision: SessionRevision(snapshot.revision.0 + 2),
+        changes: vec![SessionChange::QuestionnaireSettled {
+            activity_id,
+            outcome: QuestionnaireOutcome::Answered,
+            answer: Some(Answer {
+                questions: vec![QuestionAnswer::Freeform {
+                    text: "First private draft".into(),
+                }],
+            }),
+        }],
+    };
+    for app in [&mut first, &mut second] {
+        app.handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            settled.clone(),
+        )))
+        .unwrap();
+        assert!(
+            rendered_application_rows(app)
+                .join("\n")
+                .contains("Answered")
+        );
+    }
+    // Exiting a Client drops unsent edits. A fresh Client viewing the same live
+    // snapshot starts an empty local Answer while the server request stays pending.
+    drop(first);
+    let mut reconnected = connected_application(workspace.path());
+    enter_active_session(&mut reconnected, workspace.path());
+    reconnected
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .unwrap();
+    invoke(&mut reconnected, SemanticCommandId::QuestionnaireOpen);
+    let screen = rendered_application_rows(&reconnected).join("\n");
+    assert!(!screen.contains("private draft"), "{screen}");
+    assert!(matches!(
+        invoke(&mut reconnected, SemanticCommandId::QuestionnaireSubmit),
+        ApplicationTransition::Continue
+    ));
+}

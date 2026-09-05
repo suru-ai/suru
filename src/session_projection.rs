@@ -208,6 +208,22 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 message.status = MessageStatus::Completed;
             }
+            SessionChange::QuestionnaireAccepted { activity_id } => {
+                let Some(Activity::Questionnaire {
+                    outcome, turn_id, ..
+                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                else {
+                    bail!("Unknown Questionnaire Activity");
+                };
+                if *outcome != crate::protocol::QuestionnaireOutcome::Pending
+                    || !next.turns.iter().any(|t| {
+                        t.id == *turn_id && t.status == crate::protocol::TurnStatus::Active
+                    })
+                {
+                    bail!("Questionnaire is unavailable");
+                }
+                *outcome = crate::protocol::QuestionnaireOutcome::Submitting;
+            }
             SessionChange::QuestionnaireSettled {
                 activity_id,
                 outcome,
@@ -221,7 +237,15 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
-                if *current != crate::protocol::QuestionnaireOutcome::Pending {
+                if !matches!(
+                    current,
+                    crate::protocol::QuestionnaireOutcome::Pending
+                        | crate::protocol::QuestionnaireOutcome::Submitting
+                ) || matches!(
+                    outcome,
+                    crate::protocol::QuestionnaireOutcome::Pending
+                        | crate::protocol::QuestionnaireOutcome::Submitting
+                ) {
                     bail!("Questionnaire is already unavailable");
                 }
                 *current = *outcome;

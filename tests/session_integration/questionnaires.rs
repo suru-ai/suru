@@ -410,3 +410,345 @@ async fn concurrent_questionnaires_keep_ids_order_and_catalog_attention_through_
     drop(client);
     live.server.shutdown().await.unwrap();
 }
+
+async fn streamed_outcome(
+    feed: &mut suru::managed_client::SessionSubscription,
+    expected: QuestionnaireOutcome,
+) {
+    use suru::{managed_client::SessionEvent, protocol::SessionChange};
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match feed.next().await.unwrap().unwrap() {
+                SessionEvent::Updated(update)
+                    if update.changes.iter().any(|change| match change {
+                        SessionChange::QuestionnaireAccepted { .. } => {
+                            expected == QuestionnaireOutcome::Submitting
+                        }
+                        SessionChange::QuestionnaireSettled { outcome, .. } => *outcome == expected,
+                        _ => false,
+                    }) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("viewing Client receives authoritative Questionnaire state");
+}
+
+#[tokio::test]
+async fn racing_clients_publish_acceptance_and_one_outcome_without_duplicate_provider_delivery() {
+    use std::sync::Arc;
+    for competing_decline in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let channel = "questionnaire-race";
+        let mut live = working_turn(directory.path(), channel).await;
+        live.provider_session.gate_questionnaire_deliveries();
+        let mut clients = Vec::new();
+        let mut feeds = Vec::new();
+        for _ in 0..2 {
+            let client = Arc::new(
+                ManagedClient::connect(
+                    ManagedClientConfig::new(directory.path(), channel).unwrap(),
+                )
+                .await
+                .unwrap(),
+            );
+            let mut feed = client.subscribe_session(live.session_id).await.unwrap();
+            feed.next().await.unwrap().unwrap();
+            clients.push(client);
+            feeds.push(feed);
+        }
+        let question = questionnaire();
+        live.provider_session
+            .emit(ProviderEvent::QuestionnaireRequested {
+                questionnaire: question.clone(),
+            });
+        read_session_until(
+            &live.client,
+            live.server.descriptor(),
+            live.session_id,
+            "question is live",
+            |s| outcome(s, QuestionnaireOutcome::Pending),
+        )
+        .await;
+        let answers = [
+            QuestionnaireSubmission::Answer {
+                answer: Answer {
+                    questions: vec![QuestionAnswer::Freeform {
+                        text: "First Client's answer".into(),
+                    }],
+                },
+            },
+            if competing_decline {
+                QuestionnaireSubmission::Decline
+            } else {
+                QuestionnaireSubmission::Answer {
+                    answer: Answer {
+                        questions: vec![QuestionAnswer::Freeform {
+                            text: "Second Client's answer".into(),
+                        }],
+                    },
+                }
+            },
+        ];
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut submissions = tokio::task::JoinSet::new();
+        for (client, submission) in clients.iter().zip(&answers) {
+            let client = client.clone();
+            let submission = submission.clone();
+            let barrier = barrier.clone();
+            let session_id = live.session_id;
+            let id = question.id;
+            submissions.spawn(async move {
+                barrier.wait().await;
+                client
+                    .submit_questionnaire(session_id, id, submission)
+                    .await
+            });
+        }
+        let delivery = timeout(
+            Duration::from_secs(2),
+            live.provider_session.next_questionnaire_delivery(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivery.id, question.id);
+        assert!(answers.contains(&delivery.submission));
+        // The winner is still waiting at the Provider. The losing request must
+        // already be rejected; an actor blocked on delivery would time out here.
+        assert!(
+            timeout(Duration::from_secs(2), submissions.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        for feed in &mut feeds {
+            streamed_outcome(feed, QuestionnaireOutcome::Submitting).await;
+        }
+        for client in &clients {
+            let snapshot = client.read_session(live.session_id).await.unwrap();
+            assert!(snapshot.activities.iter().any(|a| matches!(
+                a,
+                Activity::Questionnaire {
+                    outcome: QuestionnaireOutcome::Submitting,
+                    answer: None,
+                    ..
+                }
+            )));
+            assert!(
+                client
+                    .submit_questionnaire(
+                        live.session_id,
+                        question.id,
+                        QuestionnaireSubmission::Decline
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let (expected, stored) = match &delivery.submission {
+            QuestionnaireSubmission::Answer { answer } => {
+                (QuestionnaireOutcome::Answered, Some(answer.clone()))
+            }
+            QuestionnaireSubmission::Decline => (QuestionnaireOutcome::Declined, None),
+        };
+        delivery.succeed();
+        timeout(Duration::from_secs(2), submissions.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for feed in &mut feeds {
+            streamed_outcome(feed, expected).await;
+        }
+        for client in &clients {
+            let snapshot = client.read_session(live.session_id).await.unwrap();
+            assert!(snapshot.activities.iter().any(|a| matches!(a, Activity::Questionnaire { outcome, answer, .. } if *outcome == expected && *answer == stored)));
+            assert!(
+                client
+                    .submit_questionnaire(live.session_id, question.id, answers[0].clone())
+                    .await
+                    .is_err()
+            );
+        }
+        // Duplicate native arrivals cannot resurrect the already consumed ID.
+        live.provider_session
+            .emit(ProviderEvent::QuestionnaireRequested {
+                questionnaire: question.clone(),
+            });
+        live.provider_session
+            .emit_and_wait_until_observed(ProviderEvent::AgentMessageDelta {
+                content: "Continued".into(),
+            })
+            .await;
+        assert!(
+            clients[0]
+                .submit_questionnaire(
+                    live.session_id,
+                    question.id,
+                    QuestionnaireSubmission::Decline
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                live.provider_session.next_questionnaire_delivery()
+            )
+            .await
+            .is_err()
+        );
+        drop(feeds);
+        drop(clients);
+        live.server.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn closing_and_reconnecting_clients_preserves_the_live_provider_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "questionnaire-reconnect";
+    let mut live = working_turn(directory.path(), channel).await;
+    let first =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    let question = questionnaire();
+    live.provider_session
+        .emit(ProviderEvent::QuestionnaireRequested {
+            questionnaire: question.clone(),
+        });
+    read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "question is live",
+        |s| outcome(s, QuestionnaireOutcome::Pending),
+    )
+    .await;
+    assert!(outcome(
+        &first.read_session(live.session_id).await.unwrap(),
+        QuestionnaireOutcome::Pending
+    ));
+    drop(first);
+    let second =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    let snapshot = second.read_session(live.session_id).await.unwrap();
+    assert!(snapshot.activities.iter().any(|a| matches!(a, Activity::Questionnaire { questionnaire: found, outcome: QuestionnaireOutcome::Pending, answer: None, .. } if found.id == question.id)));
+    second
+        .submit_questionnaire(
+            live.session_id,
+            question.id,
+            QuestionnaireSubmission::Decline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live.provider_session.next_questionnaire_submission().await,
+        (question.id, QuestionnaireSubmission::Decline)
+    );
+    drop(second);
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn gated_delivery_does_not_block_withdrawal_or_interruption_and_cannot_overwrite_them() {
+    use std::sync::Arc;
+    for interrupt in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let channel = "questionnaire-delivery-lifecycle";
+        let mut live = working_turn(directory.path(), channel).await;
+        live.provider_session.gate_questionnaire_deliveries();
+        let client = Arc::new(
+            ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+                .await
+                .unwrap(),
+        );
+        let question = questionnaire();
+        live.provider_session
+            .emit(ProviderEvent::QuestionnaireRequested {
+                questionnaire: question.clone(),
+            });
+        read_session_until(
+            &live.client,
+            live.server.descriptor(),
+            live.session_id,
+            "question is live",
+            |s| outcome(s, QuestionnaireOutcome::Pending),
+        )
+        .await;
+        let submitter = client.clone();
+        let session_id = live.session_id;
+        let submission = tokio::spawn(async move {
+            submitter
+                .submit_questionnaire(session_id, question.id, QuestionnaireSubmission::Decline)
+                .await
+        });
+        let delivery = timeout(
+            Duration::from_secs(2),
+            live.provider_session.next_questionnaire_delivery(),
+        )
+        .await
+        .unwrap();
+        let expected = if interrupt {
+            let interrupter = client.clone();
+            let interruption =
+                tokio::spawn(async move { interrupter.interrupt_session(session_id).await });
+            timeout(
+                Duration::from_secs(2),
+                live.provider_session.next_interrupt(),
+            )
+            .await
+            .unwrap()
+            .succeed();
+            live.provider_session.emit(ProviderEvent::TurnInterrupted);
+            timeout(Duration::from_secs(2), interruption)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            QuestionnaireOutcome::TurnEnded
+        } else {
+            live.provider_session
+                .emit(ProviderEvent::QuestionnaireWithdrawn { id: question.id });
+            QuestionnaireOutcome::Withdrawn
+        };
+        read_session_until(
+            &live.client,
+            live.server.descriptor(),
+            live.session_id,
+            "inflight question is unavailable",
+            |s| outcome(s, expected),
+        )
+        .await;
+        delivery.succeed();
+        assert!(
+            timeout(Duration::from_secs(2), submission)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(outcome(
+            &client.read_session(session_id).await.unwrap(),
+            expected
+        ));
+        assert!(
+            client
+                .submit_questionnaire(session_id, question.id, QuestionnaireSubmission::Decline)
+                .await
+                .is_err()
+        );
+        drop(client);
+        live.server.shutdown().await.unwrap();
+    }
+}

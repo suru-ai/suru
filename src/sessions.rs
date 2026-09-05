@@ -144,7 +144,11 @@ impl SessionStore {
             } = persisted;
             for activity in &mut snapshot.activities {
                 if let crate::protocol::Activity::Questionnaire { outcome, .. } = activity
-                    && *outcome == crate::protocol::QuestionnaireOutcome::Pending
+                    && matches!(
+                        outcome,
+                        crate::protocol::QuestionnaireOutcome::Pending
+                            | crate::protocol::QuestionnaireOutcome::Submitting
+                    )
                 {
                     *outcome = crate::protocol::QuestionnaireOutcome::Unavailable;
                 }

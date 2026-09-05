@@ -83,11 +83,24 @@ pub struct ErrandRequest {
     response: oneshot::Sender<Result<Value, ProviderError>>,
 }
 
+/// Holding a gated delivery exposes arbitration while Provider acknowledgement waits.
+pub struct QuestionnaireDelivery {
+    pub id: suru::protocol::QuestionnaireId,
+    pub submission: suru::protocol::QuestionnaireSubmission,
+    response: Option<oneshot::Sender<Result<(), ProviderError>>>,
+}
+
+impl QuestionnaireDelivery {
+    pub fn succeed(self) {
+        if let Some(response) = self.response {
+            let _ = response.send(Ok(()));
+        }
+    }
+}
+
 pub struct ControlledProviderSession {
-    questionnaires: mpsc::UnboundedReceiver<(
-        suru::protocol::QuestionnaireId,
-        suru::protocol::QuestionnaireSubmission,
-    )>,
+    questionnaires: mpsc::UnboundedReceiver<QuestionnaireDelivery>,
+    gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedReceiver<TurnStart>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
@@ -131,10 +144,8 @@ pub struct SubagentStop {
 }
 
 struct ControlledSessionHandle {
-    questionnaires: mpsc::UnboundedSender<(
-        suru::protocol::QuestionnaireId,
-        suru::protocol::QuestionnaireSubmission,
-    )>,
+    questionnaires: mpsc::UnboundedSender<QuestionnaireDelivery>,
+    gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedSender<TurnStart>,
     steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
@@ -368,6 +379,7 @@ impl StartRequest {
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
         let (questionnaires_tx, questionnaires_rx) = mpsc::unbounded_channel();
+        let gate_questionnaires = Arc::new(AtomicBool::new(false));
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
@@ -388,6 +400,7 @@ impl StartRequest {
                 None,
                 Arc::new(ControlledSessionHandle {
                     questionnaires: questionnaires_tx,
+                    gate_questionnaires: gate_questionnaires.clone(),
                     turns: turns_tx,
                     steers: steers_tx,
                     interruptions: interruptions_tx,
@@ -399,6 +412,7 @@ impl StartRequest {
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
         ControlledProviderSession {
             questionnaires: questionnaires_rx,
+            gate_questionnaires,
             turns: turns_rx,
             steers: steers_rx,
             interruptions: interruptions_rx,
@@ -430,6 +444,17 @@ impl ControlledProviderSession {
         suru::protocol::QuestionnaireId,
         suru::protocol::QuestionnaireSubmission,
     ) {
+        let delivery = self.next_questionnaire_delivery().await;
+        let result = (delivery.id, delivery.submission.clone());
+        delivery.succeed();
+        result
+    }
+
+    pub fn gate_questionnaire_deliveries(&self) {
+        self.gate_questionnaires.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn next_questionnaire_delivery(&mut self) -> QuestionnaireDelivery {
         self.questionnaires
             .recv()
             .await
@@ -854,9 +879,22 @@ impl ProviderSession for ControlledSessionHandle {
         submission: suru::protocol::QuestionnaireSubmission,
     ) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            let (response, delivered) = oneshot::channel();
+            let gated = self.gate_questionnaires.load(Ordering::SeqCst);
             self.questionnaires
-                .send((id, submission))
-                .map_err(|_| ProviderError::new("test controller disconnected"))
+                .send(QuestionnaireDelivery {
+                    id,
+                    submission,
+                    response: gated.then_some(response),
+                })
+                .map_err(|_| ProviderError::new("test controller disconnected"))?;
+            if gated {
+                delivered
+                    .await
+                    .map_err(|_| ProviderError::new("test delivery abandoned"))?
+            } else {
+                Ok(())
+            }
         })
     }
 

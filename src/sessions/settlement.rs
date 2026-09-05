@@ -389,7 +389,9 @@ pub(super) fn settle_in_flight_changes(
         match activity {
             Activity::Questionnaire {
                 id,
-                outcome: crate::protocol::QuestionnaireOutcome::Pending,
+                outcome:
+                    crate::protocol::QuestionnaireOutcome::Pending
+                    | crate::protocol::QuestionnaireOutcome::Submitting,
                 ..
             } => changes.push(SessionChange::QuestionnaireSettled {
                 activity_id: *id,

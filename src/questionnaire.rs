@@ -75,6 +75,8 @@ pub enum QuestionnaireSubmission {
 #[serde(rename_all = "snake_case")]
 pub enum QuestionnaireOutcome {
     Pending,
+    /// A Client won arbitration; Provider delivery is still in progress.
+    Submitting,
     Answered,
     Declined,
     Withdrawn,
