@@ -1,24 +1,23 @@
 //! Practical Markdown projection for Agent-authored transcript content.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use ratatui::style::Style;
 
 use crate::theme::Theme;
 
+use super::text_layout::{StyledLine, StyledSpan};
+
 mod syntax;
 
-pub(super) fn render(content: &str, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn render(content: &str, theme: &Theme) -> Vec<StyledLine> {
     render_prose(content, theme, false)
 }
 
-pub(super) fn render_reasoning(content: &str, theme: &Theme) -> Vec<Line<'static>> {
+pub(super) fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> {
     render_prose(content, theme, true)
 }
 
-fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<Line<'static>> {
+fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<StyledLine> {
     let parser = Parser::new_ext(content, Options::empty());
     let mut renderer = Renderer::new(theme, subdued);
     for event in parser {
@@ -30,8 +29,8 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<Line<'static
 struct Renderer<'a> {
     theme: &'a Theme,
     subdued: bool,
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
+    lines: Vec<StyledLine>,
+    current: Vec<StyledSpan>,
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
     links: Vec<String>,
@@ -109,7 +108,9 @@ impl<'a> Renderer<'a> {
                 if let CodeBlockKind::Fenced(language) = kind
                     && !language.is_empty()
                 {
-                    self.push(language.as_ref(), self.theme.text.subdued);
+                    // The label names the fence rather than belonging to the
+                    // code, so a copy of the Code Block leaves it out.
+                    self.push_chrome(language.as_ref(), self.theme.text.subdued);
                     self.flush_line();
                 }
             }
@@ -173,12 +174,16 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::CodeBlock => {
                 if let Some(block) = self.code_block.take() {
-                    self.lines.extend(syntax::render(
-                        &block.content,
-                        &block.info,
-                        self.theme,
-                        self.prose_style(self.theme.markdown.code_block),
-                    ));
+                    self.lines.extend(
+                        syntax::render(
+                            &block.content,
+                            &block.info,
+                            self.theme,
+                            self.prose_style(self.theme.markdown.code_block),
+                        )
+                        .into_iter()
+                        .map(StyledLine::from),
+                    );
                 }
                 self.blank_line();
             }
@@ -253,25 +258,33 @@ impl<'a> Renderer<'a> {
         let content = content.into();
         if !content.is_empty() {
             self.current
-                .push(Span::styled(content, self.prose_style(style)));
+                .push(StyledSpan::text(content, self.prose_style(style)));
+        }
+    }
+
+    fn push_chrome(&mut self, content: impl Into<String>, style: Style) {
+        let content = content.into();
+        if !content.is_empty() {
+            self.current
+                .push(StyledSpan::chrome(content, self.prose_style(style)));
         }
     }
 
     fn flush_line(&mut self) {
         if !self.current.is_empty() {
             self.lines
-                .push(Line::from(std::mem::take(&mut self.current)));
+                .push(StyledLine::from(std::mem::take(&mut self.current)));
         }
     }
 
     fn blank_line(&mut self) {
         self.flush_line();
         if !self.lines.last().is_some_and(|line| line.spans.is_empty()) {
-            self.lines.push(Line::default());
+            self.lines.push(StyledLine::default());
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> Vec<StyledLine> {
         self.flush_line();
         while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
             self.lines.pop();
@@ -321,7 +334,7 @@ mod tests {
                 let lines = render(&format!("```rust\n{content}```"), &theme);
                 if bytes > 32_768 {
                     let mut flat = render(&format!("```unknown\n{content}```"), &theme);
-                    flat[0] = Line::from(Span::styled("rust", theme.text.subdued));
+                    flat[0] = StyledLine::chrome("rust", theme.text.subdued);
                     assert_eq!(lines, flat);
                 } else {
                     assert!(
@@ -388,19 +401,19 @@ mod tests {
         for info in ["", "not-a-language"] {
             for (render, style) in [
                 (
-                    render as fn(&str, &Theme) -> Vec<Line<'static>>,
+                    render as fn(&str, &Theme) -> Vec<StyledLine>,
                     theme.markdown.code_block,
                 ),
                 (render_reasoning, theme.text.subdued),
             ] {
                 let mut expected = Vec::new();
                 if !info.is_empty() {
-                    expected.push(Line::from(Span::styled(info, theme.text.subdued)));
+                    expected.push(StyledLine::chrome(info, theme.text.subdued));
                 }
                 expected.extend([
-                    Line::from(Span::styled("let n = 42;", style)),
-                    Line::default(),
-                    Line::from(Span::styled("  # still literal", style)),
+                    StyledLine::text("let n = 42;", style),
+                    StyledLine::default(),
+                    StyledLine::text("  # still literal", style),
                 ]);
                 assert_eq!(
                     render(
@@ -413,10 +426,7 @@ mod tests {
         }
         assert_eq!(
             render("`let n = 42;`", &theme),
-            vec![Line::from(Span::styled(
-                "let n = 42;",
-                theme.markdown.inline_code
-            ))]
+            vec![StyledLine::text("let n = 42;", theme.markdown.inline_code)]
         );
     }
 
@@ -438,7 +448,7 @@ mod tests {
             lines[3]
                 .spans
                 .iter()
-                .map(|span| span.content.as_ref())
+                .map(|span| span.content.as_str())
                 .collect::<String>(),
             "let café = \"☕\";"
         );
@@ -508,9 +518,6 @@ mod tests {
                 "missing {text:?} with {style:?}: {spans:?}"
             );
         }
-        assert_eq!(
-            lines[0],
-            Line::from(Span::styled("rust", theme.text.subdued))
-        );
+        assert_eq!(lines[0], StyledLine::chrome("rust", theme.text.subdued));
     }
 }

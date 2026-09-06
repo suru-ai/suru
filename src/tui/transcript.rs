@@ -28,17 +28,15 @@
 
 use std::{
     cell::{Ref, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::{Component, Path},
 };
 
 use ratatui::{
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    text::Line,
 };
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -55,14 +53,14 @@ use super::{
     markdown,
     slots::{SlotText, truncate_slot_text},
     spinner,
-    text_layout::TextLayout,
+    text_layout::{StyledLayout, StyledLine, StyledRow, StyledSpan, TextLayout},
     usage::{compact_cost, compact_count},
 };
 
-/// Source lines wrapping to more rows than this are split. The cap serves two
-/// bounds: ratatui's u16-based scroll arithmetic stays in range, and the draw
-/// re-wraps the first visible source line every frame, so the cap also limits
-/// how much text that per-frame wrap can touch.
+/// Source lines wrapping to more rows than this are split, so no one line's
+/// wrap runs unbounded when a stream hands the projection an enormous line.
+/// Every piece after the first is flagged as a continuation of the line it
+/// was cut from, so a copy can join what the cap split.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
 /// Wrapped rows of output tail a settled command Activity's Peek shows below
@@ -619,9 +617,23 @@ pub(super) struct TranscriptView {
     row_count: usize,
     message_starts: Vec<MessageStart>,
     unit_starts: Vec<UnitStart>,
-    /// Row offset of every source line across all units, for scroll math.
-    line_starts: Vec<usize>,
 }
+
+/// A place in the Transcript's projected text: which projected line, counted
+/// across the whole view with separators as lines of their own, and a byte
+/// offset into that line's text (see [`StyledLine::written_text`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(super) struct TextPosition {
+    pub(super) line: usize,
+    pub(super) offset: usize,
+}
+
+/// The line a separator row projects: nothing, continuing nothing.
+static SEPARATOR_LINE: StyledLine = StyledLine {
+    spans: Vec::new(),
+    continuation: false,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptLink {
@@ -635,6 +647,57 @@ impl TranscriptView {
 
     pub(super) fn row_count_with_tail(&self, tail: &[Line<'static>]) -> usize {
         self.row_count.saturating_add(tail.len())
+    }
+
+    /// The projected line and byte offset behind a Transcript cell, resolved
+    /// through the same wrap that put the cell there, or `None` for a row
+    /// past the Transcript. A separator row resolves to its own empty line.
+    /// Recorded for the Text Selection (ADR 0020); nothing outside the
+    /// projection's tests reads it yet.
+    #[allow(dead_code)]
+    pub(super) fn position_at(&self, row: usize, column: usize) -> Option<TextPosition> {
+        if row >= self.row_count {
+            return None;
+        }
+        let unit = &self.units[self
+            .units
+            .partition_point(|unit| unit.start_row <= row)
+            .checked_sub(1)?];
+        let mut local_row = row - unit.start_row;
+        let mut line = unit.start_line;
+        if unit.leading_separator {
+            if local_row == 0 {
+                return Some(TextPosition { line, offset: 0 });
+            }
+            local_row -= 1;
+            line += 1;
+        }
+        let wrapped = unit.rows.get(local_row)?;
+        let offset = wrapped
+            .row
+            .offset_at(&unit.lines[wrapped.line], self.key.width, column);
+        Some(TextPosition {
+            line: line + wrapped.line,
+            offset,
+        })
+    }
+
+    /// A projected line by the index [`Self::position_at`] reports, or `None`
+    /// past the last one. Recorded for the same reader as `position_at`.
+    #[allow(dead_code)]
+    pub(super) fn projected_line(&self, line: usize) -> Option<&StyledLine> {
+        let unit = &self.units[self
+            .units
+            .partition_point(|unit| unit.start_line <= line)
+            .checked_sub(1)?];
+        let mut local = line - unit.start_line;
+        if unit.leading_separator {
+            if local == 0 {
+                return Some(&SEPARATOR_LINE);
+            }
+            local -= 1;
+        }
+        unit.lines.get(local)
     }
 
     pub(super) fn message_starts(&self) -> &[MessageStart] {
@@ -652,63 +715,47 @@ impl TranscriptView {
         self.units.iter().flat_map(|unit| unit.links.iter())
     }
 
-    /// Extracts the lines needed to render `viewport_rows` rows starting at
-    /// `scroll_position`, along with the residual scroll offset into the first
-    /// returned line. The result is bounded by the viewport, not the
+    /// Extracts the rows needed to draw `viewport_rows` rows starting at
+    /// `scroll_position`. Every row is already wrapped, so a window opening
+    /// partway through a wrapped line starts on that row rather than at the
+    /// line's beginning. The result is bounded by the viewport, not the
     /// transcript.
     pub(super) fn window(&self, scroll_position: usize, viewport_rows: usize) -> TranscriptWindow {
-        let first_line = self
-            .line_starts
-            .partition_point(|row| *row <= scroll_position)
-            .saturating_sub(1);
-        let window_start = self.line_starts.get(first_line).copied().unwrap_or(0);
-        let local_scroll = scroll_position.saturating_sub(window_start);
-        let rows_needed = local_scroll.saturating_add(viewport_rows);
-        let mut lines = Vec::new();
-        let mut spinner_lines = Vec::new();
-        let mut rows = 0;
+        let mut rows = Vec::with_capacity(viewport_rows.min(self.row_count));
+        let mut spinner_rows = Vec::new();
+        if viewport_rows == 0 {
+            return TranscriptWindow { rows, spinner_rows };
+        }
         let first_unit = self
             .units
-            .partition_point(|unit| unit.start_line <= first_line)
+            .partition_point(|unit| unit.start_row <= scroll_position)
             .saturating_sub(1);
         'units: for unit in &self.units[first_unit.min(self.units.len())..] {
-            let mut skip = first_line.saturating_sub(unit.start_line);
+            let mut skip = scroll_position.saturating_sub(unit.start_row);
             if unit.leading_separator {
-                // The separator is the unit's first line for indexing, so a
+                // The separator is the unit's first row for indexing, so a
                 // window opening on it draws it and one opening past it skips
-                // it along with the lines before `first_line`.
+                // it along with the rows before `scroll_position`.
                 if skip == 0 {
-                    lines.push(Line::default());
-                    rows += 1;
-                    if rows >= rows_needed {
+                    rows.push(Line::default());
+                    if rows.len() >= viewport_rows {
                         break 'units;
                     }
                 } else {
                     skip -= 1;
                 }
             }
-            for (index, (line, rows_of_line)) in unit
-                .lines
-                .iter()
-                .zip(&unit.rows_per_line)
-                .enumerate()
-                .skip(skip)
-            {
-                if unit.spinner_lines.binary_search(&index).is_ok() {
-                    spinner_lines.push(lines.len());
+            for (index, wrapped) in unit.rows.iter().enumerate().skip(skip) {
+                if unit.spinner_rows.binary_search(&index).is_ok() {
+                    spinner_rows.push(rows.len());
                 }
-                lines.push(line.clone());
-                rows += rows_of_line;
-                if rows >= rows_needed {
+                rows.push(wrapped.row.line.clone());
+                if rows.len() >= viewport_rows {
                     break 'units;
                 }
             }
         }
-        TranscriptWindow {
-            lines,
-            local_scroll,
-            spinner_lines,
-        }
+        TranscriptWindow { rows, spinner_rows }
     }
 
     /// Draws the memoized Transcript followed by transient, one-row tail
@@ -729,28 +776,26 @@ impl TranscriptView {
             self.window(scroll_position, transcript_rows)
         } else {
             TranscriptWindow {
-                lines: Vec::new(),
-                local_scroll: 0,
-                spinner_lines: Vec::new(),
+                rows: Vec::new(),
+                spinner_rows: Vec::new(),
             }
         };
         let first_tail = scroll_position.saturating_sub(self.row_count);
         let tail_rows = viewport_rows.saturating_sub(transcript_rows);
         window
-            .lines
+            .rows
             .extend(tail.iter().skip(first_tail).take(tail_rows).cloned());
         window
     }
 }
 
 /// The viewport-sized slice of a [`TranscriptView`] one frame draws: its
-/// lines, the residual scroll into the first one, and which of them carry a
+/// rows, each already wrapped to the view width, and which of them carry a
 /// Spinner for the draw-time overlay (ADR 0009) to patch.
 pub(super) struct TranscriptWindow {
-    pub(super) lines: Vec<Line<'static>>,
-    pub(super) local_scroll: usize,
-    /// Indices into `lines` whose Marker cell holds a Spinner.
-    pub(super) spinner_lines: Vec<usize>,
+    pub(super) rows: Vec<Line<'static>>,
+    /// Indices into `rows` whose Marker cell holds a Spinner.
+    pub(super) spinner_rows: Vec<usize>,
 }
 
 /// One block of the Transcript the projection renders as a whole: the entries
@@ -921,7 +966,7 @@ impl RenderUnit<'_> {
     /// the unit has one.
     fn render(
         &self,
-        lines: &mut Vec<Line<'static>>,
+        lines: &mut Vec<StyledLine>,
         links: &mut Vec<TranscriptLink>,
         folds: &TranscriptFolds,
         theme: &Theme,
@@ -958,9 +1003,7 @@ impl RenderUnit<'_> {
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
                     workspace,
                 );
-                for line in &mut lines[start..] {
-                    line.spans.insert(0, Span::raw(MEMBER_INDENT));
-                }
+                indent_members(&mut lines[start..]);
                 anchor
             }
             Self::TurnMember(unit) => {
@@ -973,9 +1016,7 @@ impl RenderUnit<'_> {
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
                     workspace,
                 );
-                for line in &mut lines[start..] {
-                    line.spans.insert(0, Span::raw(MEMBER_INDENT));
-                }
+                indent_members(&mut lines[start..]);
                 anchor
             }
             Self::TurnFold(marker) => Some(render_turn_fold(lines, *marker, theme)),
@@ -984,6 +1025,14 @@ impl RenderUnit<'_> {
                 None
             }
         }
+    }
+}
+
+/// Seats a member's lines in the gutter beneath the header they fold into.
+fn indent_members(lines: &mut [StyledLine]) {
+    for line in lines {
+        line.spans
+            .insert(0, StyledSpan::chrome(MEMBER_INDENT, Style::default()));
     }
 }
 
@@ -1750,10 +1799,14 @@ pub(super) enum UnitKey {
 struct UnitView {
     key: UnitKey,
     fingerprint: u64,
-    lines: Vec<Line<'static>>,
+    /// The unit's projected lines, after layout split any oversized one.
+    lines: Vec<StyledLine>,
+    /// Every row those lines wrap to at the view width, in order: what a
+    /// frame draws, and what a cell resolves back through to its line.
+    rows: Vec<WrappedRow>,
     links: Vec<TranscriptLink>,
-    /// Wrapped row count per line at the view width, so layout is a prefix sum
-    /// instead of a re-wrap.
+    /// Wrapped row count per line at the view width, so an anchor's row is a
+    /// prefix sum.
     rows_per_line: Vec<usize>,
     /// Lines the unit projected before layout split any oversized one, which
     /// is what the separator rule measures compactness in.
@@ -1764,15 +1817,25 @@ struct UnitView {
     /// reused unchanged can still take a separator it did not take last frame.
     leading_separator: bool,
     /// Index of the unit's first line across the view, counting its own
-    /// separator as that first line so a window opening mid-unit lands by
-    /// simple subtraction.
+    /// separator as that first line so a lookup mid-unit lands by simple
+    /// subtraction.
     start_line: usize,
-    /// The unit-local lines whose Marker cells carry Spinners, recorded so the
+    /// Index of the unit's first row across the view, counting its separator
+    /// the same way.
+    start_row: usize,
+    /// The unit-local rows whose Marker cells carry Spinners, recorded so the
     /// draw-time overlay (ADR 0009) can patch the current frame without the
     /// projection ever depending on it.
-    spinner_lines: Vec<usize>,
+    spinner_rows: Vec<usize>,
     message_id: Option<MessageId>,
     anchor: Option<LaidOutAnchor>,
+}
+
+/// One row of a unit: which of the unit's lines it wraps, and the row itself.
+#[derive(Clone, Debug)]
+struct WrappedRow {
+    line: usize,
+    row: StyledRow,
 }
 
 /// A unit's anchor once layout resolved it: how many of the unit's laid-out
@@ -1836,11 +1899,10 @@ fn rebuild(
     let mut line_count = 0;
     let mut message_starts = Vec::new();
     let mut unit_starts = Vec::new();
-    let mut line_starts = Vec::new();
     for unit in &mut units {
         unit.start_line = line_count;
+        unit.start_row = row_count;
         if unit.leading_separator {
-            line_starts.push(row_count);
             row_count += 1;
             line_count += 1;
         }
@@ -1854,10 +1916,7 @@ fn rebuild(
                 row: unit_start_row,
             });
         }
-        for rows_of_line in &unit.rows_per_line {
-            line_starts.push(row_count);
-            row_count += rows_of_line;
-        }
+        row_count += unit.rows.len();
         line_count += unit.lines.len();
         if let Some(anchor) = unit.anchor {
             unit_starts.push(UnitStart {
@@ -1879,7 +1938,6 @@ fn rebuild(
         row_count,
         message_starts,
         unit_starts,
-        line_starts,
     }
 }
 
@@ -1938,29 +1996,47 @@ fn reuse_or_render(
     let mut links = Vec::new();
     let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width, workspace);
     let source_lines = rendered.len();
-    let mut measured = Vec::with_capacity(rendered.len());
+    let mut lines = Vec::with_capacity(rendered.len());
+    let mut rows = Vec::with_capacity(rendered.len());
+    let mut rows_per_line = Vec::with_capacity(rendered.len());
+    let mut first_row_of_source_line = Vec::with_capacity(rendered.len());
     let mut header_lines = 0;
     let mut marker_line = None;
     for (index, line) in rendered.into_iter().enumerate() {
         if rendered_anchor.is_some_and(|anchor| anchor.marker_source_line == Some(index)) {
-            marker_line = Some(measured.len());
+            marker_line = Some(lines.len());
         }
-        layout_line(line, width, &mut measured);
+        first_row_of_source_line.push(rows.len());
+        for (line, layout) in layout_line(line, width) {
+            let line_index = lines.len();
+            rows_per_line.push(layout.row_count());
+            rows.extend(layout.into_rows().into_iter().map(|row| WrappedRow {
+                line: line_index,
+                row,
+            }));
+            lines.push(line);
+        }
         if rendered_anchor.is_some_and(|anchor| index + 1 == anchor.header_source_lines) {
-            header_lines = measured.len();
+            header_lines = lines.len();
         }
     }
-    let (lines, rows_per_line): (Vec<_>, Vec<_>) = measured.into_iter().unzip();
+    let spinner_rows = unit
+        .spinner_lines(folds)
+        .into_iter()
+        .filter_map(|line| first_row_of_source_line.get(line).copied())
+        .collect();
     UnitView {
         key,
         fingerprint,
         lines,
+        rows,
         links,
         rows_per_line,
         source_lines,
         leading_separator: false,
         start_line: 0,
-        spinner_lines: unit.spinner_lines(folds),
+        start_row: 0,
+        spinner_rows,
         message_id: unit.message_id(),
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
@@ -2196,7 +2272,7 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &Theme, width: u16) {
+fn render_message(lines: &mut Vec<StyledLine>, message: &Message, theme: &Theme, width: u16) {
     match message.role {
         MessageRole::User => push_user_message(
             lines,
@@ -2215,7 +2291,7 @@ fn render_message(lines: &mut Vec<Line<'static>>, message: &Message, theme: &The
 /// Each kind projects through its own renderer, so what one kind shows never
 /// depends on how another renders.
 fn render_activity(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     links: &mut Vec<TranscriptLink>,
     activity: &Activity,
     step: FoldStep,
@@ -2232,45 +2308,54 @@ fn render_activity(
             ..
         } => {
             let folded = step != FoldStep::Expanded;
-            projection.lines.push(Line::styled(
-                format!(
-                    "  {} Questionnaire · {} · {} question(s){}",
-                    if folded { "▸" } else { "▾" },
-                    match outcome {
-                        crate::protocol::QuestionnaireOutcome::SubmissionRejected =>
-                            "Answer not delivered; review and retry",
-                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain =>
-                            "Delivery uncertain; Answer will not be resent",
-                        crate::protocol::QuestionnaireOutcome::Unavailable =>
-                            "Unavailable; previous Provider request is no longer live",
-                        crate::protocol::QuestionnaireOutcome::Pending => "Pending",
-                        crate::protocol::QuestionnaireOutcome::Submitting => "Submitting",
-                        crate::protocol::QuestionnaireOutcome::Answered => "Answered",
-                        crate::protocol::QuestionnaireOutcome::Declined => "Declined",
-                        crate::protocol::QuestionnaireOutcome::Withdrawn => "Withdrawn",
-                        crate::protocol::QuestionnaireOutcome::TurnEnded => "TurnEnded",
-                    },
-                    questionnaire.questions.len(),
-                    if outcome.is_answerable() {
-                        " · Ctrl+Q answer"
-                    } else {
-                        ""
-                    }
+            projection.lines.push(StyledLine::from(vec![
+                StyledSpan::chrome(
+                    format!("  {} ", if folded { "▸" } else { "▾" }),
+                    theme.accent.primary,
                 ),
-                theme.accent.primary,
-            ));
+                StyledSpan::text(
+                    format!(
+                        "Questionnaire · {} · {} question(s){}",
+                        match outcome {
+                            crate::protocol::QuestionnaireOutcome::SubmissionRejected =>
+                                "Answer not delivered; review and retry",
+                            crate::protocol::QuestionnaireOutcome::DeliveryUncertain =>
+                                "Delivery uncertain; Answer will not be resent",
+                            crate::protocol::QuestionnaireOutcome::Unavailable =>
+                                "Unavailable; previous Provider request is no longer live",
+                            crate::protocol::QuestionnaireOutcome::Pending => "Pending",
+                            crate::protocol::QuestionnaireOutcome::Submitting => "Submitting",
+                            crate::protocol::QuestionnaireOutcome::Answered => "Answered",
+                            crate::protocol::QuestionnaireOutcome::Declined => "Declined",
+                            crate::protocol::QuestionnaireOutcome::Withdrawn => "Withdrawn",
+                            crate::protocol::QuestionnaireOutcome::TurnEnded => "TurnEnded",
+                        },
+                        questionnaire.questions.len(),
+                        if outcome.is_answerable() {
+                            " · Ctrl+Q answer"
+                        } else {
+                            ""
+                        }
+                    ),
+                    theme.accent.primary,
+                ),
+            ]));
             if !folded {
                 for (index, question) in questionnaire.questions.iter().enumerate() {
-                    projection
-                        .lines
-                        .push(Line::from(format!("    {}", question.text)));
+                    projection.lines.push(StyledLine::from(vec![
+                        StyledSpan::chrome(OUTPUT_INDENT, Style::default()),
+                        StyledSpan::text(question.text.clone(), Style::default()),
+                    ]));
                     let value = answer
                         .as_ref()
                         .and_then(|answer| answer.questions.get(index));
-                    projection.lines.push(Line::from(format!(
-                        "    {}",
-                        super::questionnaire::answer_text(question, value)
-                    )));
+                    projection.lines.push(StyledLine::from(vec![
+                        StyledSpan::chrome(OUTPUT_INDENT, Style::default()),
+                        StyledSpan::text(
+                            super::questionnaire::answer_text(question, value),
+                            Style::default(),
+                        ),
+                    ]));
                 }
             }
             Some(UnitAnchor::binary(1, folded))
@@ -2363,7 +2448,7 @@ fn render_activity(
 /// Activity without manufacturing one. The caller owns where these lines
 /// live; this function contributes presentation only.
 pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut lines: Vec<StyledLine> = Vec::new();
     let mut links = Vec::new();
     let mut projection = ActivityProjection {
         lines: &mut lines,
@@ -2379,7 +2464,7 @@ pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>
         theme.feedback.error,
         theme,
     );
-    lines
+    lines.iter().map(StyledLine::to_line).collect()
 }
 
 /// Projects a Group, which each groupable kind words and opens in its own way.
@@ -2387,7 +2472,7 @@ pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>
 /// run while collapsed and heads it while expanded, being the one row the
 /// Group re-collapses from. `members` always holds at least two.
 fn render_group(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     kind: GroupableKind,
     members: &[&Activity],
     expanded: bool,
@@ -2413,14 +2498,14 @@ fn render_group(
 /// the hidden-ness indicator, so no fold-marker line follows; expanded, the
 /// same header leads the member units.
 fn render_command_group(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     member_count: usize,
     expanded: bool,
     theme: &Theme,
 ) -> UnitAnchor {
-    lines.push(Line::from(vec![
-        Span::styled("  ✓ ", theme.feedback.success),
-        Span::styled(format!("Ran {member_count} commands"), theme.action.primary),
+    lines.push(StyledLine::from(vec![
+        StyledSpan::chrome("  ✓ ", theme.feedback.success),
+        StyledSpan::text(format!("Ran {member_count} commands"), theme.action.primary),
     ]));
     UnitAnchor::binary(1, !expanded)
 }
@@ -2449,7 +2534,7 @@ fn render_command_group(
 ///
 /// Expanded, the same row heads the sections it opened onto, live or settled.
 fn render_reasoning_group(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     members: &[&Activity],
     expanded: bool,
     theme: &Theme,
@@ -2478,13 +2563,13 @@ fn render_reasoning_group(
         let header_line = lines
             .last_mut()
             .expect("a Reasoning Group always projects a header line");
-        header_line.spans.push(Span::styled(" · ", style));
-        header_line.spans.push(Span::styled(
+        header_line.spans.push(StyledSpan::text(" · ", style));
+        header_line.spans.push(StyledSpan::text(
             format!("{} steps", members.len()),
             theme.action.primary,
         ));
         if let Some(duration_ms) = summed_reasoning_duration(members) {
-            header_line.spans.push(Span::styled(
+            header_line.spans.push(StyledSpan::text(
                 format!(" · {}", humanized_duration(duration_ms)),
                 style,
             ));
@@ -2505,7 +2590,7 @@ fn render_reasoning_group(
             continue;
         }
         if opened_a_section {
-            lines.push(Line::default());
+            lines.push(StyledLine::default());
         }
         lines.append(&mut section);
         opened_a_section = true;
@@ -2534,7 +2619,7 @@ fn reasoning_group_is_live(members: &[&Activity]) -> bool {
 /// everything its members hold in one step, so nothing here is holding
 /// anything back.
 fn push_reasoning_section(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     reasoning: ReasoningActivity<'_>,
     theme: &Theme,
 ) {
@@ -2593,25 +2678,21 @@ fn summed_reasoning_duration(members: &[&Activity]) -> Option<u64> {
 /// affordance it is. The marker only exists when its fold covers something, so
 /// closed it reports as holding content back; open it is the header the Turn
 /// folds back from, exactly as a Group's header is.
-fn render_turn_fold(
-    lines: &mut Vec<Line<'static>>,
-    marker: TurnMarker,
-    theme: &Theme,
-) -> UnitAnchor {
+fn render_turn_fold(lines: &mut Vec<StyledLine>, marker: TurnMarker, theme: &Theme) -> UnitAnchor {
     let (glyph, style) = match marker.outcome {
         SettledTurn::Completed => ("✓ ", theme.feedback.success),
         SettledTurn::Interrupted => ("× ", theme.feedback.warning),
         SettledTurn::Failed => ("× ", theme.feedback.error),
     };
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {glyph}"), style),
-        Span::styled(marker.label(), theme.action.primary),
+    lines.push(StyledLine::from(vec![
+        StyledSpan::chrome(format!("  {glyph}"), style),
+        StyledSpan::text(marker.label(), theme.action.primary),
     ]));
     UnitAnchor::binary(1, marker.folded)
 }
 
 struct ActivityProjection<'a> {
-    lines: &'a mut Vec<Line<'static>>,
+    lines: &'a mut Vec<StyledLine>,
     links: &'a mut Vec<TranscriptLink>,
 }
 
@@ -2698,7 +2779,6 @@ fn push_command_activity(
         (_, FoldStep::Peek) => Some(FOLDED_COMMAND_OUTPUT_ROWS),
         (_, FoldStep::Folded) => unreachable!("a folded command returned above"),
     };
-    let command = format!("{command}{exit_suffix}");
     let header_start = projection.lines.len();
     let header_prefix = format!("  {marker}");
     let header_indent = " ".repeat(header_prefix.width());
@@ -2706,9 +2786,16 @@ fn push_command_activity(
         projection.lines,
         &header_prefix,
         &header_indent,
-        &command,
+        command,
         style,
     );
+    if !exit_suffix.is_empty()
+        && let Some(header_line) = projection.lines.last_mut()
+    {
+        header_line
+            .spans
+            .push(StyledSpan::chrome(exit_suffix.clone(), style));
+    }
     let header_source_lines = projection.lines.len() - header_start;
     if let Some(cwd) = cwd {
         let cwd_prefix = format!("{COMMAND_DETAIL_INDENT}in ");
@@ -2763,7 +2850,7 @@ fn push_command_activity(
 /// clamp is presentation only — the Peek brings the full header back — so it
 /// reports as hidden content like everything else the Fold holds.
 fn push_folded_command_row(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     prefix: &str,
     command: &str,
     suffix: &str,
@@ -2792,7 +2879,14 @@ fn push_folded_command_row(
     } else {
         first_line.to_owned()
     };
-    lines.push(Line::styled(format!("{prefix}{text}{suffix}"), style));
+    let mut row = vec![
+        StyledSpan::chrome(prefix, style),
+        StyledSpan::text(text, style),
+    ];
+    if !suffix.is_empty() {
+        row.push(StyledSpan::chrome(suffix, style));
+    }
+    lines.push(StyledLine::from(row));
     UnitAnchor {
         header_source_lines: 1,
         hides_content: hides_more || clamped,
@@ -2807,14 +2901,14 @@ fn push_folded_command_row(
 /// the marker counts source lines, so the number a reader sees does not shift
 /// when the terminal is resized. Reports whether a marker was drawn.
 fn fold_output_to_tail(
-    mut lines: Vec<Line<'static>>,
+    mut lines: Vec<StyledLine>,
     tail_rows: usize,
     theme: &Theme,
     width: u16,
-) -> (Vec<Line<'static>>, bool) {
+) -> (Vec<StyledLine>, bool) {
     let rows_per_line = lines
         .iter()
-        .map(|line| laid_out_line_count(line, width).max(1))
+        .map(|line| StyledLayout::new(line, width).row_count().max(1))
         .collect::<Vec<_>>();
     if rows_per_line.iter().sum::<usize>() <= tail_rows {
         return (lines, false);
@@ -2827,9 +2921,13 @@ fn fold_output_to_tail(
     }
     let remaining_rows = tail_rows.saturating_sub(tail_used);
     let boundary_tail = if remaining_rows > 0 && tail_start > 0 {
-        let mut rows = laid_out_line_rows(lines[tail_start - 1].clone(), width);
+        let source = &lines[tail_start - 1];
+        let rows = StyledLayout::new(source, width).into_rows();
         let keep_from = rows.len().saturating_sub(remaining_rows);
-        rows.split_off(keep_from)
+        rows[keep_from..]
+            .iter()
+            .map(|row| row_as_line(source, row))
+            .collect()
     } else {
         Vec::new()
     };
@@ -2847,6 +2945,23 @@ fn fold_output_to_tail(
     (lines, true)
 }
 
+/// One wrapped row of `source` as a projected line of its own, for the rows
+/// a Peek keeps of a wrapped line whose beginning it hides. The hanging
+/// indent the row was drawn with becomes chrome, in the style of the leading
+/// span it was copied from, and the row's text keeps its spans and chrome.
+fn row_as_line(source: &StyledLine, row: &StyledRow) -> StyledLine {
+    let mut spans = Vec::new();
+    if row.indent > 0 {
+        let style = source
+            .spans
+            .first()
+            .map_or_else(Style::default, |span| span.style);
+        spans.push(StyledSpan::chrome(" ".repeat(row.indent), style));
+    }
+    spans.extend(source.slice(row.start..row.end).spans);
+    StyledLine::from(spans)
+}
+
 /// What a fold marker counts: how much this entry's Fold is holding back. Kept
 /// apart from [`fold_marker_line`] so an entry whose Fold hides its whole body,
 /// and so reports the count on its own header, still says it the one way.
@@ -2857,8 +2972,10 @@ fn fold_marker_text(hidden: usize, unit: &str) -> String {
 /// Renders the fold marker: how much this entry's Fold hides, styled as the
 /// affordance it is so a reader never reads it as the truncation marker, which
 /// reports content Suru's storage cap dropped for good.
-fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> Line<'static> {
-    Line::styled(
+fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> StyledLine {
+    // The whole marker is the Fold's affordance, indent included: nothing on
+    // the row is text the reader would copy.
+    StyledLine::chrome(
         format!("{indent}… {}", fold_marker_text(hidden, unit)),
         theme.action.primary,
     )
@@ -2868,15 +2985,16 @@ fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> L
 /// signal rather than from anything the stream carried, so a reader can tell
 /// Suru dropped the rest rather than the Provider ending there.
 fn push_truncation_marker(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     stream: CappedStream,
     indent: &str,
     theme: &Theme,
 ) {
-    lines.push(Line::styled(
-        format!("{indent}{}", stream.truncation_marker()),
-        theme.text.subdued.add_modifier(Modifier::ITALIC),
-    ));
+    let style = theme.text.subdued.add_modifier(Modifier::ITALIC);
+    lines.push(StyledLine::from(vec![
+        StyledSpan::chrome(indent, style),
+        StyledSpan::text(stream.truncation_marker(), style),
+    ]));
 }
 
 struct FileChangeActions {
@@ -2944,7 +3062,7 @@ fn same_path_component(left: Component<'_>, right: Component<'_>) -> bool {
 /// fold marker and the same per-entry Fold state a command Activity uses,
 /// which is what makes those generic rather than specific to command output.
 fn push_file_change_activity(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     status: crate::protocol::ActivityStatus,
     changes: &[FileChange],
     folded: bool,
@@ -3027,13 +3145,12 @@ fn push_file_change_activity(
                     .into_owned(),
             ),
         };
-        let lead = format!("  {marker}{action} ");
+        let marker_lead = format!("  {marker}");
         let path = sanitize_content(&path).replace('\n', " ");
-        let marker_lead_width = format!("  {marker}").width();
         let row_width = usize::from(width);
         let row = if row_width == 0 {
             Vec::new()
-        } else if row_width < marker_lead_width {
+        } else if row_width < marker_lead.width() {
             let mut compact = marker.trim_end().to_owned();
             if row_width > 1 {
                 compact.push_str(&" ".repeat(row_width.saturating_sub(2)));
@@ -3043,15 +3160,25 @@ fn push_file_change_activity(
         } else {
             truncate_slot_text(
                 vec![
-                    SlotText::new(lead, style),
+                    SlotText::new(marker_lead.clone(), style),
+                    SlotText::new(format!("{action} "), style),
                     SlotText::new(path, theme.text.subdued),
                 ],
                 row_width,
             )
         };
-        lines.push(Line::from(
+        // The Marker leads the row, so whatever the clamp left of it is the
+        // row's first item and the only chrome on it.
+        lines.push(StyledLine::from(
             row.into_iter()
-                .map(|item| Span::styled(item.text, item.style))
+                .enumerate()
+                .map(|(index, item)| {
+                    if index == 0 && (item.text == marker_lead || row_width < marker_lead.width()) {
+                        StyledSpan::chrome(item.text, item.style)
+                    } else {
+                        StyledSpan::text(item.text, item.style)
+                    }
+                })
                 .collect::<Vec<_>>(),
         ));
     }
@@ -3140,7 +3267,7 @@ fn reasoning_header_text(label: &str, title: Option<&str>) -> String {
 /// Provider wrote, with subdued Markdown prose and syntax-colored Code Blocks,
 /// followed by the truncation marker when the cap cut it short. A lone block's Fold and a
 /// Group's expansion both open onto exactly this.
-fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec<Line<'static>> {
+fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec<StyledLine> {
     let content = sanitize_content(reasoning.content);
     let mut body = markdown::render_reasoning(&content, theme)
         .into_iter()
@@ -3157,7 +3284,7 @@ fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec
 /// the summary the Provider wrote, rendered as the Markdown it is but drained of
 /// colour so Reasoning never competes with the answer it led to.
 fn push_reasoning_activity(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     activity: ReasoningActivity<'_>,
     folded: bool,
     theme: &Theme,
@@ -3181,8 +3308,8 @@ fn push_reasoning_activity(
         let header_line = lines
             .last_mut()
             .expect("a Reasoning Activity always projects a header line");
-        header_line.spans.push(Span::styled(" · ", style));
-        header_line.spans.push(Span::styled(
+        header_line.spans.push(StyledSpan::chrome(" · ", style));
+        header_line.spans.push(StyledSpan::chrome(
             fold_marker_text(body.len(), "lines"),
             theme.action.primary,
         ));
@@ -3202,7 +3329,7 @@ fn push_reasoning_activity(
 /// nothing to fold, because the Subagent's work lives in the child Session
 /// the row stands for rather than behind it.
 fn push_subagent_activity(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     status: crate::protocol::ActivityStatus,
     name: &str,
     description: &str,
@@ -3236,10 +3363,10 @@ fn push_subagent_activity(
 }
 
 /// Places already-styled Reasoning content in the Activity gutter.
-fn indented_reasoning_line(mut line: Line<'static>, indent: &str, theme: &Theme) -> Line<'static> {
+fn indented_reasoning_line(mut line: StyledLine, indent: &str, theme: &Theme) -> StyledLine {
     if !line.spans.is_empty() {
         line.spans
-            .insert(0, Span::styled(indent.to_owned(), theme.text.subdued));
+            .insert(0, StyledSpan::chrome(indent, theme.text.subdued));
     }
     line
 }
@@ -3265,7 +3392,7 @@ fn humanized_duration(duration_ms: u64) -> String {
 }
 
 fn push_user_message(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     content: &str,
     skill_invocations: &[SkillInvocation],
     theme: &Theme,
@@ -3317,7 +3444,7 @@ fn recognized_skill_ranges(
 }
 
 fn push_user_message_row(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     segments: Vec<(Style, String)>,
     row_width: usize,
     available_width: usize,
@@ -3326,26 +3453,22 @@ fn push_user_message_row(
 ) {
     let padding = available_width.saturating_sub(USER_MESSAGE_GUTTER.width() + row_width);
     let mut spans = Vec::with_capacity(segments.len() + 2);
-    spans.push(Span::styled(USER_MESSAGE_GUTTER, accent));
+    spans.push(StyledSpan::chrome(USER_MESSAGE_GUTTER, accent));
     spans.extend(
         segments
             .into_iter()
-            .map(|(style, text)| Span::styled(text, style)),
+            .map(|(style, text)| StyledSpan::text(text, style)),
     );
-    spans.push(Span::styled(" ".repeat(padding), surface));
-    lines.push(Line::from(spans));
+    spans.push(StyledSpan::chrome(" ".repeat(padding), surface));
+    lines.push(StyledLine::from(spans));
 }
 
-fn push_agent_message(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    truncated: bool,
-    theme: &Theme,
-) {
+fn push_agent_message(lines: &mut Vec<StyledLine>, content: &str, truncated: bool, theme: &Theme) {
     let content = sanitize_content(content);
     for mut line in markdown::render(&content, theme) {
         if !line.spans.is_empty() {
-            line.spans.insert(0, Span::styled("  ", theme.text.primary));
+            line.spans
+                .insert(0, StyledSpan::chrome("  ", theme.text.primary));
         }
         lines.push(line);
     }
@@ -3354,12 +3477,14 @@ fn push_agent_message(
     }
 }
 
-fn push_prefixed_lines(lines: &mut Vec<Line<'static>>, prefix: &str, content: &str, style: Style) {
+/// Projects `content` one line per source line, each opening with chrome:
+/// `prefix` — a Marker or a gutter — on the first and `indent` on the rest.
+fn push_prefixed_lines(lines: &mut Vec<StyledLine>, prefix: &str, content: &str, style: Style) {
     push_prefixed_lines_with_indent(lines, prefix, "  ", content, style);
 }
 
 fn push_prefixed_lines_with_indent(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<StyledLine>,
     prefix: &str,
     indent: &str,
     content: &str,
@@ -3367,10 +3492,14 @@ fn push_prefixed_lines_with_indent(
 ) {
     let content = sanitize_content(content);
     for (index, line) in content.lines().enumerate() {
-        lines.push(Line::styled(
-            format!("{}{line}", if index == 0 { prefix } else { indent }),
+        let mut spans = vec![StyledSpan::chrome(
+            if index == 0 { prefix } else { indent },
             style,
-        ));
+        )];
+        if !line.is_empty() {
+            spans.push(StyledSpan::text(line, style));
+        }
+        lines.push(StyledLine::from(spans));
     }
 }
 
@@ -3393,13 +3522,13 @@ fn push_styled_prefixed_lines(
 ) {
     let mut style = SgrStyle::new(base_style);
     let mut hyperlink_active = false;
-    let mut spans = vec![Span::styled(gutter.lead.to_owned(), base_style)];
+    let mut spans = vec![StyledSpan::chrome(gutter.lead, base_style)];
     let mut line_has_content = false;
 
     for token in content_tokens(content) {
         match token {
             ContentToken::Text(text) if !text.is_empty() => {
-                spans.push(Span::styled(
+                spans.push(StyledSpan::text(
                     text,
                     activity_content_style(style.rendered, hyperlink_active, theme),
                 ));
@@ -3412,7 +3541,7 @@ fn push_styled_prefixed_lines(
             }
             ContentToken::LinkEnd => hyperlink_active = false,
             ContentToken::Tab => {
-                spans.push(Span::styled(
+                spans.push(StyledSpan::text(
                     "    ",
                     activity_content_style(style.rendered, hyperlink_active, theme),
                 ));
@@ -3421,15 +3550,15 @@ fn push_styled_prefixed_lines(
             ContentToken::LineBreak => {
                 projection
                     .lines
-                    .push(Line::from(std::mem::take(&mut spans)));
-                spans.push(Span::styled(gutter.indent.to_owned(), base_style));
+                    .push(StyledLine::from(std::mem::take(&mut spans)));
+                spans.push(StyledSpan::chrome(gutter.indent, base_style));
                 line_has_content = false;
             }
             ContentToken::Text(_) => {}
         }
     }
     if line_has_content {
-        projection.lines.push(Line::from(spans));
+        projection.lines.push(StyledLine::from(spans));
     }
 }
 
@@ -3644,389 +3773,108 @@ fn sgr_byte(parameter: &str) -> Option<u8> {
     parameter.parse().ok()
 }
 
-fn wrapped_line_count(line: &Line<'static>, width: u16) -> usize {
-    // A line whose display width fits the wrap width renders as exactly one
-    // row, so the Paragraph wrap machinery only runs for lines that actually
-    // wrap. The width sum uses the same unicode-width tables ratatui's reflow
-    // does; a span-embedded newline would break a line the sum cannot see, so
-    // it falls back to the measured count. Whitespace-only content also falls
-    // back because ratatui's reflow counts a trailing row after its whitespace.
-    if width > 0
-        && line.width() <= usize::from(width)
-        && line.spans.iter().all(|span| !span.content.contains('\n'))
-        && (line.width() == 0
-            || line.spans.iter().any(|span| {
-                span.content
-                    .chars()
-                    .any(|character| !character.is_whitespace())
-            }))
-    {
-        return 1;
+/// Lays out one projected source line at the view width. A line the cap
+/// allows is one projected line with its rows; one wrapping past the cap is
+/// split into pieces each within it, every piece after the first flagged as
+/// the continuation it is.
+fn layout_line(line: StyledLine, width: u16) -> Vec<(StyledLine, StyledLayout)> {
+    let layout = StyledLayout::new(&line, width);
+    if layout.row_count() <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        return vec![(line, layout)];
     }
-    Paragraph::new(line.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
-#[derive(Clone, Debug)]
-struct StyledSymbol {
-    symbol: String,
-    style: Style,
-}
-
-impl StyledSymbol {
-    fn width(&self) -> usize {
-        self.symbol.width()
+    let continuation = line.continuation;
+    let mut pieces = split_oversized_line(line, width);
+    for (index, (piece, _)) in pieces.iter_mut().enumerate() {
+        piece.continuation = continuation || index > 0;
     }
-
-    fn is_whitespace(&self) -> bool {
-        self.symbol == "\u{200b}"
-            || (self.symbol != "\u{00a0}" && self.symbol.chars().all(char::is_whitespace))
-    }
-}
-
-fn styled_symbols(line: &Line<'static>) -> Vec<StyledSymbol> {
-    line.spans
-        .iter()
-        .flat_map(|span| {
-            UnicodeSegmentation::graphemes(span.content.as_ref(), true).map(|symbol| StyledSymbol {
-                symbol: symbol.to_owned(),
-                style: span.style,
-            })
-        })
-        .collect()
-}
-
-/// The whitespace repeated before every wrapped continuation of a projected
-/// line. Ordinary leading whitespace repeats verbatim. Markdown structural
-/// markers become same-width spaces as well, giving list items and quotes a
-/// hanging indent beneath the text rather than beneath the marker.
-fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol> {
-    let leading_end = symbols
-        .iter()
-        .position(|symbol| !symbol.is_whitespace())
-        .unwrap_or(symbols.len());
-    let mut prefix_end = leading_end;
-    while let Some(marker_end) = structural_marker_end(symbols, prefix_end) {
-        prefix_end = marker_end;
-    }
-    if prefix_end == 0 || width <= 1 {
-        return Vec::new();
-    }
-
-    let maximum = usize::from(width.saturating_sub(1));
-    let mut used = 0;
-    let mut prefix = Vec::new();
-    for symbol in &symbols[..prefix_end] {
-        let symbol_width = symbol.width();
-        if used + symbol_width > maximum {
-            break;
-        }
-        used += symbol_width;
-        prefix.push(StyledSymbol {
-            symbol: if symbol.is_whitespace() {
-                symbol.symbol.clone()
-            } else {
-                " ".repeat(symbol_width)
-            },
-            style: symbol.style,
-        });
-    }
-    prefix
-}
-
-fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
-    let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol.as_str());
-    if matches!(symbol(start), Some("•" | "│" | "✓" | "×" | "⠋"))
-        && symbols
-            .get(start + 1)
-            .is_some_and(StyledSymbol::is_whitespace)
-    {
-        return Some(start + 2);
-    }
-    if symbol(start) == Some("[")
-        && matches!(symbol(start + 1), Some(" " | "x" | "X"))
-        && symbol(start + 2) == Some("]")
-        && symbols
-            .get(start + 3)
-            .is_some_and(StyledSymbol::is_whitespace)
-    {
-        return Some(start + 4);
-    }
-
-    let digits_end = symbols[start..]
-        .iter()
-        .take_while(|symbol| {
-            symbol.symbol.len() == 1
-                && symbol
-                    .symbol
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_digit())
-        })
-        .count()
-        + start;
-    (digits_end > start
-        && symbol(digits_end) == Some(".")
-        && symbols
-            .get(digits_end + 1)
-            .is_some_and(StyledSymbol::is_whitespace))
-    .then_some(digits_end + 2)
-}
-
-fn symbols_to_line(
-    symbols: Vec<StyledSymbol>,
-    style: Style,
-    alignment: Option<ratatui::layout::Alignment>,
-) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for symbol in symbols {
-        if let Some(span) = spans.last_mut()
-            && span.style == symbol.style
-        {
-            span.content.to_mut().push_str(&symbol.symbol);
-        } else {
-            spans.push(Span::styled(symbol.symbol, symbol.style));
-        }
-    }
-    Line {
-        style,
-        alignment,
-        spans,
-    }
-}
-
-/// Ratatui's word-wrapper with one deliberate extension: once the first row
-/// fills, every later row starts with `prefix`. Keeping the wrapper here makes
-/// cached row counts, viewport slicing, and the final rendered rows agree.
-fn wrap_with_continuation_indent(
-    line: Line<'static>,
-    width: u16,
-    prefix: &[StyledSymbol],
-) -> Vec<Line<'static>> {
-    let Line {
-        style,
-        alignment,
-        spans: _,
-    } = &line;
-    let (style, alignment) = (*style, *alignment);
-    let symbols = styled_symbols(&line);
-    let prefix_width = prefix.iter().map(StyledSymbol::width).sum::<usize>();
-    let maximum = usize::from(width);
-    let mut wrapped = Vec::new();
-    let mut pending_line = Vec::new();
-    let mut pending_word = Vec::new();
-    let mut pending_whitespace = VecDeque::new();
-    let mut line_width = 0usize;
-    let mut word_width = 0usize;
-    let mut whitespace_width = 0usize;
-    let mut non_whitespace_previous = false;
-
-    for symbol in symbols {
-        let is_whitespace = symbol.is_whitespace();
-        let symbol_width = symbol.width();
-        if symbol_width > maximum {
-            continue;
-        }
-
-        let word_found = non_whitespace_previous && is_whitespace;
-        let current_prefix_symbols = if wrapped.is_empty() { 0 } else { prefix.len() };
-        let untrimmed_overflow = pending_line.len() == current_prefix_symbols
-            && word_width + whitespace_width + line_width + symbol_width > maximum;
-        if word_found || untrimmed_overflow {
-            pending_line.extend(pending_whitespace.drain(..));
-            line_width += whitespace_width;
-            pending_line.append(&mut pending_word);
-            line_width += word_width;
-            whitespace_width = 0;
-            word_width = 0;
-        }
-
-        let line_full = line_width >= maximum;
-        let pending_word_overflow =
-            symbol_width > 0 && line_width + whitespace_width + word_width >= maximum;
-        if line_full || pending_word_overflow {
-            let mut remaining_width = maximum.saturating_sub(line_width);
-            wrapped.push(symbols_to_line(
-                std::mem::take(&mut pending_line),
-                style,
-                alignment,
-            ));
-            pending_line.extend(prefix.iter().cloned());
-            line_width = prefix_width;
-
-            while let Some(whitespace) = pending_whitespace.front() {
-                let whitespace_symbol_width = whitespace.width();
-                if whitespace_symbol_width > remaining_width {
-                    break;
-                }
-                whitespace_width -= whitespace_symbol_width;
-                remaining_width -= whitespace_symbol_width;
-                pending_whitespace.pop_front();
-            }
-            if is_whitespace && pending_whitespace.is_empty() {
-                continue;
-            }
-        }
-
-        if is_whitespace {
-            whitespace_width += symbol_width;
-            pending_whitespace.push_back(symbol);
-        } else {
-            word_width += symbol_width;
-            pending_word.push(symbol);
-        }
-        non_whitespace_previous = !is_whitespace;
-    }
-
-    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
-        wrapped.push(Line {
-            style,
-            alignment,
-            spans: Vec::new(),
-        });
-    }
-    pending_line.extend(pending_whitespace);
-    pending_line.append(&mut pending_word);
-    if !pending_line.is_empty() && (wrapped.is_empty() || pending_line.len() != prefix.len()) {
-        wrapped.push(symbols_to_line(pending_line, style, alignment));
-    }
-    if wrapped.is_empty() {
-        wrapped.push(Line {
-            style,
-            alignment,
-            spans: Vec::new(),
-        });
-    }
-    wrapped
-}
-
-/// Lays out a projected source line. Lines with a continuation indent become
-/// physical cached rows, because Ratatui's final generic wrapper cannot express
-/// hanging indents. Zero-indent lines keep the bounded source-line path.
-fn layout_line(line: Line<'static>, width: u16, output: &mut Vec<(Line<'static>, usize)>) {
-    let rows = wrapped_line_count(&line, width);
-    if rows <= 1 {
-        output.push((line, rows));
-        return;
-    }
-    let symbols = styled_symbols(&line);
-    let prefix = continuation_prefix(&symbols, width);
-    if prefix.is_empty() {
-        split_oversized_line(line, width, output);
-        return;
-    }
-    output.extend(
-        wrap_with_continuation_indent(line, width, &prefix)
-            .into_iter()
-            .map(|line| (line, 1)),
-    );
-}
-
-fn laid_out_line_count(line: &Line<'static>, width: u16) -> usize {
-    laid_out_line_rows(line.clone(), width).len()
-}
-
-/// Resolves one projected source line to the physical rows layout will draw.
-/// Tail clamping uses these rows when its boundary cuts through a wrapped
-/// source line, so the visible tail can fill its budget without retaining the
-/// whole source line that crossed it.
-fn laid_out_line_rows(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-    let rows = wrapped_line_count(&line, width);
-    if rows <= 1 {
-        return vec![line];
-    }
-    let symbols = styled_symbols(&line);
-    let prefix = continuation_prefix(&symbols, width);
-    wrap_with_continuation_indent(line, width, &prefix)
+    pieces
 }
 
 /// Splits `line` into pieces each wrapping to at most
-/// [`MAX_TRANSCRIPT_SOURCE_LINE_ROWS`] rows, pushing every piece with its
-/// measured row count so layout does not have to measure again.
-fn split_oversized_line(line: Line<'static>, width: u16, output: &mut Vec<(Line<'static>, usize)>) {
-    let rows = wrapped_line_count(&line, width);
-    if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-        output.push((line, rows));
-        return;
+/// [`MAX_TRANSCRIPT_SOURCE_LINE_ROWS`] rows, each with its layout so nothing
+/// has to be laid out again.
+fn split_oversized_line(line: StyledLine, width: u16) -> Vec<(StyledLine, StyledLayout)> {
+    let layout = StyledLayout::new(&line, width);
+    if layout.row_count() <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        return vec![(line, layout)];
     }
     // Cut by column arithmetic in one pass, targeting half the row cap so
     // ordinary word-wrap waste still leaves each chunk under the cap. The
     // arithmetic is an estimate, so each chunk is verified once; a chunk a
     // pathological wrap pattern pushes past the cap falls back to bisection.
+    let mut output = Vec::new();
     for chunk in split_line_at_column_budget(line, width) {
-        let rows = wrapped_line_count(&chunk, width);
-        if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-            output.push((chunk, rows));
+        let layout = StyledLayout::new(&chunk, width);
+        if layout.row_count() <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+            output.push((chunk, layout));
         } else {
-            bisect_oversized_line(chunk, width, output);
+            bisect_oversized_line(chunk, width, &mut output);
         }
     }
+    output
 }
 
 /// Splits a line at character boundaries whenever the running display width
 /// reaches half the row cap's worth of columns. One pass over the content, so
 /// the split stays linear in the line's length.
-fn split_line_at_column_budget(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+fn split_line_at_column_budget(line: StyledLine, width: u16) -> Vec<StyledLine> {
     let column_budget = (MAX_TRANSCRIPT_SOURCE_LINE_ROWS / 2)
         .saturating_mul(usize::from(width.max(1)))
         .max(1);
-    let Line {
-        style,
-        alignment,
-        spans,
-    } = line;
     let mut chunks = Vec::new();
-    let mut chunk_spans: Vec<Span<'static>> = Vec::new();
+    let mut chunk_spans: Vec<StyledSpan> = Vec::new();
     let mut chunk_columns = 0usize;
-    for span in spans {
-        let span_columns = span.content.width();
+    for span in line.spans {
+        let span_columns = span.width();
         if chunk_columns + span_columns <= column_budget {
             chunk_columns += span_columns;
             chunk_spans.push(span);
             continue;
         }
-        let span_style = span.style;
-        let content = span.content.into_owned();
+        let StyledSpan {
+            content,
+            style,
+            chrome,
+        } = span;
         let mut piece = String::new();
         for character in content.chars() {
             let character_columns = character.width().unwrap_or(0);
             if chunk_columns + character_columns > column_budget && chunk_columns > 0 {
                 if !piece.is_empty() {
-                    chunk_spans.push(Span::styled(std::mem::take(&mut piece), span_style));
+                    chunk_spans.push(StyledSpan {
+                        content: std::mem::take(&mut piece),
+                        style,
+                        chrome,
+                    });
                 }
-                chunks.push(Line {
-                    style,
-                    alignment,
-                    spans: std::mem::take(&mut chunk_spans),
-                });
+                chunks.push(StyledLine::from(std::mem::take(&mut chunk_spans)));
                 chunk_columns = 0;
             }
             piece.push(character);
             chunk_columns += character_columns;
         }
         if !piece.is_empty() {
-            chunk_spans.push(Span::styled(piece, span_style));
+            chunk_spans.push(StyledSpan {
+                content: piece,
+                style,
+                chrome,
+            });
         }
     }
     if !chunk_spans.is_empty() || chunks.is_empty() {
-        chunks.push(Line {
-            style,
-            alignment,
-            spans: chunk_spans,
-        });
+        chunks.push(StyledLine::from(chunk_spans));
     }
     chunks
 }
 
 fn bisect_oversized_line(
-    line: Line<'static>,
+    line: StyledLine,
     width: u16,
-    output: &mut Vec<(Line<'static>, usize)>,
+    output: &mut Vec<(StyledLine, StyledLayout)>,
 ) {
-    let rows = wrapped_line_count(&line, width);
-    if rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
-        output.push((line, rows));
+    let layout = StyledLayout::new(&line, width);
+    if layout.row_count() <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS {
+        output.push((line, layout));
         return;
     }
     let character_count = line
@@ -4035,7 +3883,7 @@ fn bisect_oversized_line(
         .map(|span| span.content.chars().count())
         .sum::<usize>();
     if character_count < 2 {
-        output.push((line, rows));
+        output.push((line, layout));
         return;
     }
     let (left, right) = split_line_at_character_midpoint(line, character_count);
@@ -4044,18 +3892,13 @@ fn bisect_oversized_line(
 }
 
 fn split_line_at_character_midpoint(
-    line: Line<'static>,
+    line: StyledLine,
     character_count: usize,
-) -> (Line<'static>, Line<'static>) {
-    let Line {
-        style,
-        alignment,
-        spans,
-    } = line;
+) -> (StyledLine, StyledLine) {
     let mut remaining_left = character_count / 2;
     let mut left_spans = Vec::new();
     let mut right_spans = Vec::new();
-    for span in spans {
+    for span in line.spans {
         if remaining_left == 0 {
             right_spans.push(span);
             continue;
@@ -4067,33 +3910,34 @@ fn split_line_at_character_midpoint(
             continue;
         }
 
-        let content = span.content.into_owned();
+        let StyledSpan {
+            content,
+            style,
+            chrome,
+        } = span;
         let split_byte = content
             .char_indices()
             .nth(remaining_left)
             .map_or(content.len(), |(index, _)| index);
         let (left, right) = content.split_at(split_byte);
         if !left.is_empty() {
-            left_spans.push(Span::styled(left.to_owned(), span.style));
+            left_spans.push(StyledSpan {
+                content: left.to_owned(),
+                style,
+                chrome,
+            });
         }
         if !right.is_empty() {
-            right_spans.push(Span::styled(right.to_owned(), span.style));
+            right_spans.push(StyledSpan {
+                content: right.to_owned(),
+                style,
+                chrome,
+            });
         }
         remaining_left = 0;
     }
 
-    (
-        Line {
-            style,
-            alignment,
-            spans: left_spans,
-        },
-        Line {
-            style,
-            alignment,
-            spans: right_spans,
-        },
-    )
+    (StyledLine::from(left_spans), StyledLine::from(right_spans))
 }
 
 #[cfg(test)]
@@ -4102,7 +3946,7 @@ mod tests {
 
     use ratatui::{
         style::{Color, Modifier, Style},
-        text::{Line, Span},
+        text::Line,
     };
     use unicode_width::UnicodeWidthStr;
 
@@ -4117,143 +3961,153 @@ mod tests {
     };
 
     use super::{
-        CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, TranscriptCache,
-        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, UnitStart, layout_line, push_user_message, render_activity,
-        render_message, split_oversized_line, wrapped_line_count,
+        CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan,
+        TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
+        TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
+        render_activity, render_message, split_oversized_line,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|span| &*span.content).collect()
     }
 
-    fn paragraph_line_count(line: &Line<'static>, width: u16) -> usize {
-        use ratatui::widgets::{Paragraph, Wrap};
-        Paragraph::new(line.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(width)
+    /// Everything a projected line draws, chrome and text alike.
+    fn projected_text(line: &StyledLine) -> String {
+        line.written_text()
     }
 
-    fn split_and_check(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-        let original = rendered_text(&line);
-        let mut measured = Vec::new();
-        split_oversized_line(line, width, &mut measured);
-        for (chunk, rows) in &measured {
+    /// The style a projected line's text is drawn in.
+    fn line_style(line: &StyledLine) -> Style {
+        line.spans
+            .last()
+            .map_or_else(Style::default, |span| span.style)
+    }
+
+    fn split_and_check(line: StyledLine, width: u16) -> Vec<StyledLine> {
+        let original = projected_text(&line);
+        let pieces = split_oversized_line(line, width);
+        for (chunk, layout) in &pieces {
             assert!(
-                *rows <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
+                layout.row_count() <= MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
                 "a split chunk exceeds the row cap"
             );
             assert_eq!(
-                *rows,
-                paragraph_line_count(chunk, width),
-                "a chunk's reported row count must match ratatui's wrapping"
+                layout.row_count(),
+                super::StyledLayout::new(chunk, width).row_count(),
+                "a chunk's layout is the layout of the chunk"
             );
         }
-        let chunks: Vec<_> = measured.into_iter().map(|(chunk, _)| chunk).collect();
-        let reassembled = chunks.iter().map(rendered_text).collect::<String>();
+        let chunks: Vec<_> = pieces.into_iter().map(|(chunk, _)| chunk).collect();
+        let reassembled = chunks.iter().map(projected_text).collect::<String>();
         assert_eq!(reassembled, original, "splitting must not lose content");
         chunks
     }
 
     #[test]
-    fn wrapped_line_count_fast_path_matches_paragraph_wrapping() {
-        let corpus = vec![
-            Line::from(""),
-            Line::from("  "),
-            Line::from("      "),
-            Line::from("x"),
-            Line::from("word"),
-            Line::from("exactly-tw"),
-            Line::from("just-over-w"),
-            Line::from("\u{5b57}".repeat(6)),
-            Line::from("\t\tindented content"),
-            Line::from("word ".repeat(40)),
-            Line::from(vec![
-                Span::raw("styled "),
-                Span::styled("span pieces", Style::default().fg(Color::Rgb(9, 8, 7))),
-            ]),
-            Line::from("a \u{5b57}\u{5b57} mixed width content line"),
-        ];
-        for width in [1u16, 2, 5, 10, 11, 26, 80] {
-            for line in &corpus {
-                assert_eq!(
-                    wrapped_line_count(line, width),
-                    paragraph_line_count(line, width),
-                    "fast path diverged for {:?} at width {width}",
-                    rendered_text(line)
-                );
-            }
-        }
-    }
-
-    #[test]
     fn hanging_indent_does_not_add_prefix_only_rows_to_a_long_word() {
-        let mut laid_out = Vec::new();
-        layout_line(
-            Line::from(format!("      line 4 {}", "x".repeat(200))),
+        let laid_out = layout_line(
+            StyledLine::text(
+                format!("      line 4 {}", "x".repeat(200)),
+                Style::default(),
+            ),
             56,
-            &mut laid_out,
         );
-
         assert_eq!(
             laid_out.len(),
+            1,
+            "a line within the row cap stays one line"
+        );
+        let rows = laid_out[0].1.rows();
+        assert_eq!(
+            rows.len(),
             5,
             "the first row has 56 columns and continuations have 50"
         );
-        assert!(laid_out.iter().all(|(line, rows)| {
-            *rows == 1 && line.width() <= 56 && !rendered_text(line).trim().is_empty()
-        }));
+        assert!(
+            rows.iter().all(|row| {
+                row.line.width() <= 56 && !rendered_text(&row.line).trim().is_empty()
+            })
+        );
     }
 
     #[test]
     fn oversized_unbroken_line_splits_into_chunks_under_the_row_cap() {
         let width = 26u16;
         let content = "x".repeat(usize::from(width) * (MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 4));
-        let chunks = split_and_check(Line::from(content), width);
+        let chunks = split_and_check(StyledLine::text(content, Style::default()), width);
         assert!(chunks.len() > 1, "an oversized line must split");
     }
 
     #[test]
     fn oversized_line_with_pathological_word_wrap_stays_under_the_row_cap() {
         // Alternating one-character and width-filling words maximize the rows
-        // ratatui produces per column of content, stressing the arithmetic
+        // the wrap produces per column of content, stressing the arithmetic
         // estimate's margin.
         let width = 12u16;
         let word = "b".repeat(usize::from(width) - 1);
         let content = format!("a {word} ").repeat(MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 4);
-        split_and_check(Line::from(content), width);
+        split_and_check(StyledLine::text(content, Style::default()), width);
     }
 
     #[test]
     fn oversized_wide_character_line_splits_at_character_boundaries() {
         let width = 13u16;
         let content = "\u{5b57}".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 2);
-        split_and_check(Line::from(content), width);
+        split_and_check(StyledLine::text(content, Style::default()), width);
     }
 
     #[test]
-    fn splitting_a_styled_oversized_line_preserves_span_styles() {
+    fn splitting_a_styled_oversized_line_preserves_span_styles_and_chrome() {
         let width = 20u16;
         let styled = Style::default().fg(Color::Rgb(1, 2, 3));
         let plain = "p".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS);
         let emphasized = "e".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS);
-        let line = Line::from(vec![Span::raw(plain), Span::styled(emphasized, styled)]);
+        let line = StyledLine::from(vec![
+            StyledSpan::chrome("  ", Style::default()),
+            StyledSpan::text(plain, Style::default()),
+            StyledSpan::text(emphasized, styled),
+        ]);
         let chunks = split_and_check(line, width);
         for chunk in &chunks {
             for span in &chunk.spans {
                 if span.content.contains('p') {
-                    assert_eq!(span.style, Style::default());
+                    assert_eq!((span.style, span.chrome), (Style::default(), false));
                 }
                 if span.content.contains('e') {
-                    assert_eq!(span.style, styled);
+                    assert_eq!((span.style, span.chrome), (styled, false));
                 }
             }
         }
+        assert!(
+            chunks[0].spans[0].chrome,
+            "the indent the line opened with is still chrome after the split"
+        );
+    }
+
+    #[test]
+    fn pieces_the_cap_split_are_flagged_as_continuations_of_the_first() {
+        let width = 26u16;
+        let content = "x".repeat(usize::from(width) * (MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 4));
+        let pieces = layout_line(StyledLine::text(content, Style::default()), width);
+        assert!(pieces.len() > 1, "an oversized line must split");
+        assert!(
+            !pieces[0].0.continuation,
+            "the first piece is the line's own beginning"
+        );
+        assert!(
+            pieces[1..].iter().all(|(piece, _)| piece.continuation),
+            "every later piece continues the line the cap split"
+        );
+        let unsplit = layout_line(StyledLine::text("short line", Style::default()), 80);
+        assert!(
+            unsplit.len() == 1 && !unsplit[0].0.continuation,
+            "a line within the cap is not a continuation of anything"
+        );
     }
 
     #[test]
     fn a_line_within_the_row_cap_is_not_split() {
-        let chunks = split_and_check(Line::from("short line"), 80);
+        let chunks = split_and_check(StyledLine::text("short line", Style::default()), 80);
         assert_eq!(chunks.len(), 1);
     }
 
@@ -4379,7 +4233,7 @@ mod tests {
             &first_theme,
             80,
         );
-        let first_lines = first.window(0, 40).lines;
+        let first_lines = first.window(0, 40).rows;
         drop(first);
         let mut second_theme = first_theme;
         second_theme.syntax.keyword.fg = Some(Color::Rgb(4, 5, 6));
@@ -4397,7 +4251,7 @@ mod tests {
             &second_theme,
             80,
         );
-        let second_lines = second.window(0, 40).lines;
+        let second_lines = second.window(0, 40).rows;
 
         let keyword_colors = |lines: &[Line<'static>]| {
             lines
@@ -4448,7 +4302,7 @@ mod tests {
             &first_theme,
             80,
         );
-        let first_lines = first.window(0, 10).lines;
+        let first_lines = first.window(0, 10).rows;
         drop(first);
         let mut second_theme = first_theme;
         second_theme.ansi.normal.red = Color::Rgb(4, 5, 6);
@@ -4466,7 +4320,7 @@ mod tests {
             &second_theme,
             80,
         );
-        let second_lines = second.window(0, 10).lines;
+        let second_lines = second.window(0, 10).rows;
 
         let themed_color = |lines: &[Line<'static>]| {
             lines
@@ -4618,9 +4472,9 @@ mod tests {
         );
 
         let marker = lines.last().expect("render the truncation marker");
-        assert_eq!(rendered_text(marker), "      [output truncated]");
+        assert_eq!(projected_text(marker), "      [output truncated]");
         assert!(
-            marker.style.add_modifier.contains(Modifier::ITALIC),
+            line_style(marker).add_modifier.contains(Modifier::ITALIC),
             "the marker carries a style command output cannot: {marker:?}"
         );
         assert!(
@@ -4686,14 +4540,14 @@ mod tests {
         );
 
         assert_eq!(
-            rendered_text(&lines[0]),
+            projected_text(&lines[0]),
             "  ✓ Thought: Inspecting the seam · 4s"
         );
         let marker = lines.last().expect("render the truncation marker");
-        assert_eq!(rendered_text(marker), "    [Reasoning truncated]");
+        assert_eq!(projected_text(marker), "    [Reasoning truncated]");
         let body = lines[1..lines.len() - 1]
             .iter()
-            .map(rendered_text)
+            .map(projected_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(body, "    Reading the projection.");
@@ -4725,15 +4579,15 @@ mod tests {
 
         let marker = lines
             .iter()
-            .find(|line| rendered_text(line).contains("truncated]"))
+            .find(|line| projected_text(line).contains("truncated]"))
             .expect("render the truncation marker");
         assert_eq!(
-            rendered_text(marker),
+            projected_text(marker),
             "  [Message truncated]",
             "a capped Message ends with a marker that names a Message"
         );
         assert!(
-            marker.style.add_modifier.contains(Modifier::ITALIC),
+            line_style(marker).add_modifier.contains(Modifier::ITALIC),
             "the marker keeps its own style outside the rendered Markdown: {marker:?}"
         );
         assert!(
@@ -4774,17 +4628,17 @@ mod tests {
         let marker_lines = lines
             .iter()
             .filter(|line| {
-                rendered_text(line).contains(CappedStream::CommandOutput.truncation_marker())
+                projected_text(line).contains(CappedStream::CommandOutput.truncation_marker())
             })
             .collect::<Vec<_>>();
         let [marker] = marker_lines.as_slice() else {
             panic!("output that reads like the marker renders once: {lines:?}");
         };
         assert!(
-            !marker.style.add_modifier.contains(Modifier::ITALIC),
+            !line_style(marker).add_modifier.contains(Modifier::ITALIC),
             "output the Provider sent keeps the style of command output: {marker:?}"
         );
-        assert_eq!(rendered_text(marker), "      [output truncated]");
+        assert_eq!(projected_text(marker), "      [output truncated]");
     }
 
     #[test]
@@ -4805,13 +4659,13 @@ mod tests {
 
         let marker_lines = lines
             .iter()
-            .filter(|line| rendered_text(line).contains(CappedStream::Message.truncation_marker()))
+            .filter(|line| projected_text(line).contains(CappedStream::Message.truncation_marker()))
             .collect::<Vec<_>>();
         let [marker] = marker_lines.as_slice() else {
             panic!("content that reads like the marker renders once: {lines:?}");
         };
         assert!(
-            !marker.style.add_modifier.contains(Modifier::ITALIC),
+            !line_style(marker).add_modifier.contains(Modifier::ITALIC),
             "content the Provider sent renders as Markdown: {marker:?}"
         );
     }
@@ -4997,7 +4851,7 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view_through(&cache, snapshot, folds, groups, turns);
         let row_count = view.row_count();
-        row_text(&view.window(0, row_count).lines)
+        row_text(&view.window(0, row_count).rows)
     }
 
     #[test]
@@ -5230,7 +5084,7 @@ mod tests {
         let mut lines = Vec::new();
         push_user_message(&mut lines, "aaaa bbbbbb", &[], &Theme::system(), 12);
         assert_eq!(
-            lines.iter().map(rendered_text).collect::<Vec<_>>(),
+            lines.iter().map(projected_text).collect::<Vec<_>>(),
             ["\u{2503} aaaa      ", "\u{2503} bbbbbb    "],
             "a word that does not fit the room left moves down whole"
         );
@@ -5240,7 +5094,7 @@ mod tests {
     fn a_user_message_keeps_a_column_of_air_at_its_right_edge() {
         let mut lines = Vec::new();
         push_user_message(&mut lines, "aaaaaaaaaaaa", &[], &Theme::system(), 12);
-        let rows = lines.iter().map(rendered_text).collect::<Vec<_>>();
+        let rows = lines.iter().map(projected_text).collect::<Vec<_>>();
         assert_eq!(rows, ["\u{2503} aaaaaaaaa ", "\u{2503} aaa       "]);
         for row in &rows {
             assert_eq!(row.width(), 12, "every row fills the width it was given");
@@ -5842,7 +5696,7 @@ mod tests {
         let turns = TranscriptTurnFolds::default();
 
         let before = projected_view_through(&cache, &snapshot, &folds, &groups, &turns);
-        let before_rows = row_text(&before.window(0, before.row_count()).lines);
+        let before_rows = row_text(&before.window(0, before.row_count()).rows);
         drop(before);
 
         snapshot.revision = SessionRevision(snapshot.revision.0 + 1);
@@ -5853,7 +5707,7 @@ mod tests {
         });
         snapshot.turns[0].cost = Cost::from_usd(0.03);
         let after = projected_view_through(&cache, &snapshot, &folds, &groups, &turns);
-        let after_rows = row_text(&after.window(0, after.row_count()).lines);
+        let after_rows = row_text(&after.window(0, after.row_count()).rows);
 
         assert_eq!(before_rows[2], "  ✓ Worked for 12s");
         assert_eq!(
@@ -6039,7 +5893,7 @@ mod tests {
             .expect("the expanded command anchors a click");
         assert_eq!(
             view.window(0, view.row_count())
-                .lines
+                .rows
                 .get(1)
                 .map(rendered_text)
                 .as_deref(),
@@ -6093,8 +5947,8 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
 
-        let opening_on_it = view.window(1, 2).lines;
-        let opening_past_it = view.window(2, 2).lines;
+        let opening_on_it = view.window(1, 2).rows;
+        let opening_past_it = view.window(2, 2).rows;
 
         assert_eq!(row_text(&opening_on_it), ["", "  ✓ cargo test"]);
         assert_eq!(
@@ -6117,7 +5971,7 @@ mod tests {
         let cache = TranscriptCache::default();
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
 
-        let whole = view.window(0, view.row_count()).lines;
+        let whole = view.window(0, view.row_count()).rows;
 
         assert_eq!(
             whole.len(),
@@ -6127,11 +5981,341 @@ mod tests {
         for (row, drawn) in whole.iter().enumerate() {
             let window = view.window(row, 1);
             assert_eq!(
-                rendered_text(&window.lines[window.local_scroll]),
+                rendered_text(&window.rows[0]),
                 rendered_text(drawn),
                 "scrolling to row {row} must land on the same row the whole window draws"
             );
         }
+    }
+
+    /// Projects a Transcript at a width of the test's choosing.
+    fn projected_view_at<'a>(
+        cache: &'a TranscriptCache,
+        snapshot: &SessionSnapshot,
+        width: u16,
+    ) -> std::cell::Ref<'a, TranscriptView> {
+        cache.view(
+            0,
+            snapshot,
+            &[],
+            TranscriptDisclosure {
+                folds: &TranscriptFolds::default(),
+                groups: &TranscriptGroups::default(),
+                turns: &TranscriptTurnFolds::default(),
+                reasoning_visibility: ReasoningVisibility::Shown,
+            },
+            &Theme::system(),
+            width,
+        )
+    }
+
+    #[test]
+    fn a_cell_resolves_to_the_line_and_offset_the_wrap_put_there() {
+        let snapshot = transcript_snapshot(vec![Entry::Message(agent_message(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+        ))]);
+        let cache = TranscriptCache::default();
+        let width = 24;
+        let view = projected_view_at(&cache, &snapshot, width);
+        let rows = view.window(0, view.row_count()).rows;
+        assert!(rows.len() > 2, "the Message wraps: {rows:?}");
+        let line = view
+            .projected_line(0)
+            .expect("the Message projects a line")
+            .written_text();
+
+        for (row, drawn) in rows.iter().enumerate() {
+            let drawn = rendered_text(drawn);
+            let shown = drawn.trim();
+            let indent = drawn.len() - drawn.trim_start().len();
+            let start = view.position_at(row, indent).expect("a drawn row resolves");
+            assert_eq!(
+                start.line, 0,
+                "every row of the Message belongs to its one line"
+            );
+            assert!(
+                line[start.offset..].starts_with(shown),
+                "row {row} begins at the offset of the text it shows: {shown:?} at {}",
+                start.offset
+            );
+            let end = view
+                .position_at(row, usize::from(width))
+                .expect("a column past the text resolves");
+            assert!(
+                line[..end.offset].ends_with(shown),
+                "a column past the row's text resolves past its last character"
+            );
+            let inside = view
+                .position_at(row, indent + 2)
+                .expect("a column inside the text resolves");
+            assert_eq!(
+                inside.offset,
+                start.offset + 2,
+                "a column in the text resolves to the character drawn there"
+            );
+        }
+    }
+
+    #[test]
+    fn both_cells_of_a_wide_character_resolve_to_that_character() {
+        let snapshot =
+            transcript_snapshot(vec![Entry::Message(agent_message("\u{5b57}\u{5b57} wide"))]);
+        let cache = TranscriptCache::default();
+        let view = projected_view_at(&cache, &snapshot, 40);
+        let text = view
+            .projected_line(0)
+            .expect("the Message projects a line")
+            .written_text();
+        let first = text.find('\u{5b57}').expect("the line holds the character");
+        assert_eq!(
+            (
+                view.position_at(0, 2).expect("resolves").offset,
+                view.position_at(0, 3).expect("resolves").offset,
+                view.position_at(0, 4).expect("resolves").offset,
+            ),
+            (first, first, first + '\u{5b57}'.len_utf8()),
+            "the Message's indent takes two columns, then each wide character two"
+        );
+    }
+
+    #[test]
+    fn a_separator_row_resolves_to_an_empty_line_of_its_own() {
+        let snapshot = transcript_snapshot(vec![
+            Entry::Activity(command("cargo build", "")),
+            Entry::Message(agent_message("Build is green.")),
+        ]);
+        let cache = TranscriptCache::default();
+        let view = projected_view_at(&cache, &snapshot, 80);
+        let rows = row_text(&view.window(0, view.row_count()).rows);
+        assert_eq!(rows, ["  ✓ cargo build", "", "  Build is green."]);
+
+        assert_eq!(
+            view.position_at(1, 7),
+            Some(TextPosition { line: 1, offset: 0 }),
+            "the blank row between units is a line of its own"
+        );
+        let separator = view.projected_line(1).expect("the separator is a line");
+        assert!(separator.is_empty() && !separator.continuation);
+        assert_eq!(
+            view.position_at(2, 4),
+            Some(TextPosition {
+                line: 2,
+                offset: "  Bu".len()
+            }),
+            "lines after the separator count it"
+        );
+        assert_eq!(
+            view.projected_line(2).map(projected_text).as_deref(),
+            Some("  Build is green.")
+        );
+        assert_eq!(
+            view.position_at(3, 0),
+            None,
+            "a row past the Transcript resolves to nothing"
+        );
+        assert!(view.projected_line(3).is_none());
+    }
+
+    #[test]
+    fn rows_of_a_line_the_cap_split_resolve_to_its_continuations() {
+        let width = 26u16;
+        let content = "x".repeat(usize::from(width) * MAX_TRANSCRIPT_SOURCE_LINE_ROWS * 3);
+        let snapshot = transcript_snapshot(vec![Entry::Message(agent_message(&content))]);
+        let cache = TranscriptCache::default();
+        let view = projected_view_at(&cache, &snapshot, width);
+        assert!(
+            view.row_count() > MAX_TRANSCRIPT_SOURCE_LINE_ROWS,
+            "the Message wraps past the cap"
+        );
+
+        let opening = view.position_at(0, 2).expect("the first row resolves");
+        assert!(
+            !view
+                .projected_line(opening.line)
+                .expect("a line")
+                .continuation,
+            "the first row opens the written line"
+        );
+        let deep = view
+            .position_at(view.row_count() - 1, 2)
+            .expect("the last row resolves");
+        assert!(
+            deep.line > opening.line,
+            "the cap split the line into pieces"
+        );
+        assert!(
+            view.projected_line(deep.line).expect("a line").continuation,
+            "a later piece continues the line the cap split"
+        );
+        assert!(
+            (opening.line + 1..=deep.line)
+                .all(|line| view.projected_line(line).expect("a line").continuation),
+            "every piece after the first is a continuation"
+        );
+    }
+
+    /// Each span as (chrome, content), which is what a copy reads off a line.
+    fn span_marks(line: &StyledLine) -> Vec<(bool, &str)> {
+        line.spans
+            .iter()
+            .map(|span| (span.chrome, span.content.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_commands_marker_gutters_prefixes_and_fold_marker_are_chrome() {
+        let activity = Activity::Command {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Failed,
+            command: "cargo build".to_owned(),
+            cwd: Some("/work".into()),
+            output: (1..=10)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            output_truncated: true,
+            exit_status: Some(101),
+        };
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        render_activity(
+            &mut lines,
+            &mut links,
+            &activity,
+            FoldStep::Peek,
+            &Theme::system(),
+            80,
+            std::path::Path::new(""),
+        );
+
+        assert_eq!(
+            span_marks(&lines[0]),
+            [
+                (true, "  × "),
+                (false, "cargo build"),
+                (true, " (exit 101)")
+            ],
+            "the Marker and the exit suffix decorate the command"
+        );
+        assert_eq!(
+            span_marks(&lines[1]),
+            [(true, "      in "), (false, "/work")],
+            "the workspace prefix decorates its path"
+        );
+        assert!(
+            lines[2].spans.iter().all(|span| span.chrome)
+                && projected_text(&lines[2]).contains("… +"),
+            "a fold marker is chrome through and through: {:?}",
+            lines[2]
+        );
+        assert_eq!(
+            span_marks(&lines[3]),
+            [(true, "      "), (false, "line 5")],
+            "output keeps its gutter as chrome and its text as text"
+        );
+        let truncation = lines
+            .last()
+            .expect("the truncation marker closes the block");
+        assert_eq!(
+            span_marks(truncation),
+            [(true, "      "), (false, "[output truncated]")]
+        );
+    }
+
+    #[test]
+    fn a_folded_command_keeps_its_ellipsis_as_text() {
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        render_activity(
+            &mut lines,
+            &mut links,
+            &command("cargo build --release --workspace --all-targets", ""),
+            FoldStep::Folded,
+            &Theme::system(),
+            20,
+            std::path::Path::new(""),
+        );
+        assert_eq!(
+            span_marks(&lines[0]),
+            [(true, "  ✓ "), (false, "cargo build --r…")]
+        );
+    }
+
+    #[test]
+    fn message_gutters_and_padding_are_chrome_and_prose_is_text() {
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+        render_message(&mut lines, &user_message("hello there"), &theme, 20);
+        assert_eq!(
+            span_marks(&lines[0]),
+            [(true, "┃ "), (false, "hello there"), (true, "       ")],
+            "a user Message's bar and the air at its right edge are chrome"
+        );
+
+        let mut lines = Vec::new();
+        render_message(
+            &mut lines,
+            &agent_message("- item one\n\n```rust\nlet x = 1;\n```"),
+            &theme,
+            40,
+        );
+        assert_eq!(
+            span_marks(&lines[0]),
+            [(true, "  "), (false, "• "), (false, "item one")],
+            "an agent Message's indent is chrome and its Markdown is text"
+        );
+        assert_eq!(
+            span_marks(&lines[2]),
+            [(true, "  "), (true, "rust")],
+            "a Code Block's language label names the fence rather than the code"
+        );
+        assert!(
+            lines[3].spans.iter().skip(1).all(|span| !span.chrome)
+                && projected_text(&lines[3]).contains("let x = 1;"),
+            "the code itself is text: {:?}",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn a_reasoning_headers_marker_and_fold_affordance_are_chrome() {
+        let mut lines = Vec::new();
+        let mut links = Vec::new();
+        render_activity(
+            &mut lines,
+            &mut links,
+            &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
+            FoldStep::Folded,
+            &Theme::system(),
+            80,
+            std::path::Path::new(""),
+        );
+        assert_eq!(
+            span_marks(&lines[0]),
+            [
+                (true, "  ✓ "),
+                (false, "Thought: Plan"),
+                (true, " · "),
+                (true, "+3 lines")
+            ]
+        );
+
+        let mut lines = Vec::new();
+        render_activity(
+            &mut lines,
+            &mut links,
+            &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
+            FoldStep::Expanded,
+            &Theme::system(),
+            80,
+            std::path::Path::new(""),
+        );
+        assert_eq!(
+            span_marks(&lines[1]),
+            [(true, "    "), (false, "First.")],
+            "an opened block's prose sits behind a chrome indent"
+        );
     }
 
     #[test]
@@ -6165,11 +6349,11 @@ mod tests {
 
         let whole = view.window(0, view.row_count());
         assert_eq!(
-            whole.spinner_lines.len(),
+            whole.spinner_rows.len(),
             1,
             "only the running command animates; the settled one keeps its outcome glyph"
         );
-        let spinner_row = rendered_text(&whole.lines[whole.spinner_lines[0]]);
+        let spinner_row = rendered_text(&whole.rows[whole.spinner_rows[0]]);
         assert!(
             spinner_row.contains(super::spinner::MARKER) && spinner_row.contains("cargo build"),
             "the recorded line is the running command's header: {spinner_row}"
@@ -6177,7 +6361,7 @@ mod tests {
 
         let past_it = view.window(view.row_count().saturating_sub(1), 1);
         assert!(
-            past_it.spinner_lines.is_empty(),
+            past_it.spinner_rows.is_empty(),
             "a window opening past the Marker records nothing to patch"
         );
     }
@@ -6235,7 +6419,7 @@ mod tests {
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
         let rows: Vec<_> = view
             .window(0, view.row_count())
-            .lines
+            .rows
             .iter()
             .map(rendered_text)
             .collect();
@@ -6285,7 +6469,7 @@ mod tests {
             let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
             let rows: Vec<_> = view
                 .window(0, view.row_count())
-                .lines
+                .rows
                 .iter()
                 .map(rendered_text)
                 .collect();
@@ -6331,7 +6515,7 @@ mod tests {
             );
             let rows: Vec<_> = view
                 .window(0, view.row_count())
-                .lines
+                .rows
                 .iter()
                 .map(rendered_text)
                 .collect();
@@ -6366,12 +6550,12 @@ mod tests {
 
         let window = view.window(0, view.row_count());
         assert_eq!(
-            window.spinner_lines.len(),
+            window.spinner_rows.len(),
             4,
             "each of the four visible folded file rows repeats the Activity Spinner"
         );
-        for spinner_line in window.spinner_lines {
-            let row = rendered_text(&window.lines[spinner_line]);
+        for spinner_line in window.spinner_rows {
+            let row = rendered_text(&window.rows[spinner_line]);
             assert!(
                 row.contains(super::spinner::MARKER) && row.contains("Creating src/file"),
                 "every recorded row carries the repeated live Marker and action: {row}"
@@ -6404,7 +6588,7 @@ mod tests {
             );
 
             assert_eq!(lines.len(), 1, "one File Change stays one source line");
-            let row = rendered_text(&lines[0]);
+            let row = projected_text(&lines[0]);
             assert!(
                 row.width() <= usize::from(width),
                 "the complete row, including its action, respects width {width}: {row}"
@@ -6436,7 +6620,7 @@ mod tests {
 
         let whole = view.window(0, view.row_count());
         let rows = whole
-            .lines
+            .rows
             .iter()
             .map(|line| rendered_text(line).trim_end().to_owned())
             .collect::<Vec<_>>();
@@ -6473,19 +6657,19 @@ mod tests {
 
         let whole = view.window(0, view.row_count());
         assert_eq!(
-            whole.spinner_lines.len(),
+            whole.spinner_rows.len(),
             1,
             "the Group speaks for the member still thinking, so its header is the one \
              Marker on screen"
         );
-        let spinner_row = rendered_text(&whole.lines[whole.spinner_lines[0]]);
+        let spinner_row = rendered_text(&whole.rows[whole.spinner_rows[0]]);
         assert_eq!(
             spinner_row.trim_end(),
             format!("  {}Thinking: Settling", super::spinner::MARKER),
             "the recorded line is the Group's live header"
         );
         let rendered = whole
-            .lines
+            .rows
             .iter()
             .map(rendered_text)
             .collect::<Vec<_>>()

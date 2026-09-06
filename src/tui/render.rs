@@ -47,7 +47,7 @@ use super::{
     spinner,
     state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
     subagent_picker::working_subagents,
-    text_layout::TextLayout,
+    text_layout::{TextLayout, draw_row},
     theme_picker::ThemePickerRow,
     transcript::{TranscriptDisclosure, client_error_lines},
     usage::{compact_cost, compact_count},
@@ -3145,31 +3145,19 @@ fn render_session(
     let composer_top_area = in_column(composer_top_area, content_column);
     let composer_area = in_column(composer_area, content_column);
     let footer_area = in_column(status_area, content_column);
-    let mut window = transcript_view.window_with_tail(
-        &working_indicator_lines,
-        scroll_position,
-        usize::from(transcript_area.height),
-    );
-    spinner::overlay_frame(
-        &mut window.lines,
-        &window.spinner_lines,
-        state.spinner_frame / 3,
-    );
-    let local_scroll = window
-        .local_scroll
-        .min(usize::from(u16::MAX.saturating_sub(transcript_area.height)))
-        as u16;
     let has_top_border = transcript_area.height > 1;
     // The top border pushes projected rows down one, so a pointer maps back to
-    // a transcript row through the same offset the widget draws with.
+    // a transcript row through the same offset the rows are drawn with.
     let border_rows = u16::from(has_top_border);
     let visible_rows = usize::from(transcript_area.height.saturating_sub(border_rows));
-    let local_visible_start = usize::from(local_scroll);
-    let local_visible_end = local_visible_start.saturating_add(visible_rows);
-    let spinner_visible = window
-        .spinner_lines
-        .iter()
-        .any(|line| *line >= local_visible_start && *line < local_visible_end);
+    let mut window =
+        transcript_view.window_with_tail(&working_indicator_lines, scroll_position, visible_rows);
+    spinner::overlay_frame(
+        &mut window.rows,
+        &window.spinner_rows,
+        state.spinner_frame / 3,
+    );
+    let spinner_visible = window.spinner_rows.iter().any(|row| *row < visible_rows);
     let tail_start = transcript_view.row_count();
     let tail_visible = !working_indicator_lines.is_empty()
         && scroll_position < transcript_rows
@@ -3188,17 +3176,28 @@ fn render_session(
         content_left: transcript_area.x,
         content_width: transcript_area.width,
     }));
-    let transcript_widget = Paragraph::new(Text::from(window.lines)).wrap(Wrap { trim: false });
-    let transcript_widget = if has_top_border {
-        transcript_widget.block(
+    if has_top_border {
+        frame.render_widget(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(theme.border.subdued),
-        )
-    } else {
-        transcript_widget
-    };
-    frame.render_widget(transcript_widget.scroll((local_scroll, 0)), transcript_area);
+            transcript_area,
+        );
+    }
+    // The rows come wrapped from the projection, so the draw places each one
+    // on its own terminal row rather than handing them to a wrapping widget
+    // (ADR 0020): the row a cell is drawn on is the row a pointer resolves.
+    let content_top = transcript_area.y.saturating_add(border_rows);
+    let buffer = frame.buffer_mut();
+    for (index, row) in window.rows.iter().take(visible_rows).enumerate() {
+        draw_row(
+            buffer,
+            transcript_area.x,
+            content_top.saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+            transcript_area.width,
+            row,
+        );
+    }
     if pending_height > 0 {
         render_pending_prompts(
             frame,
