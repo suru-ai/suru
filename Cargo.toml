@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 anyhow = "1.0.99"
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 axum = "0.8.4"
 base64 = "0.22.1"
 blake3 = "1.8.2"

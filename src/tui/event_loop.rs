@@ -490,6 +490,7 @@ async fn run_loop(
         spinner_tick: None,
         needs_redraw: true,
     };
+    let mut clipboard = native_clipboard();
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
@@ -524,7 +525,7 @@ async fn run_loop(
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             input_event = input.next() => match input_event {
-                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut())?,
+                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard)?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             },
@@ -553,7 +554,9 @@ async fn run_loop(
                 break;
             };
             let step = match pending_input {
-                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut())?,
+                Some(Ok(event)) => {
+                    run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard)?
+                }
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             };
@@ -580,10 +583,11 @@ impl RunLoop {
         &mut self,
         input: TerminalInput,
         output: &mut impl std::io::Write,
+        clipboard: &mut impl NativeClipboardSink,
     ) -> Result<ControlFlow<Exit>> {
         match input {
             TerminalInput::Event(event) => {
-                self.handle_input_event(event, &mut TerminalOutput(output))
+                self.handle_input_event(event, &mut TerminalOutput(output), clipboard)
             }
             TerminalInput::Colors(update) => {
                 let mut facts = self.application.terminal_facts;
@@ -620,6 +624,7 @@ impl RunLoop {
         &mut self,
         event: InputEvent,
         output: &mut impl TerminalSink,
+        clipboard: &mut impl NativeClipboardSink,
     ) -> Result<ControlFlow<Exit>> {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
@@ -635,7 +640,7 @@ impl RunLoop {
             .application
             .handle_event(ApplicationEvent::Command(command))?;
         if let ApplicationTransition::CopyToClipboard(text) = transition {
-            copy_to_clipboard(output, &text)?;
+            copy_to_clipboard(output, clipboard, &text);
             return Ok(ControlFlow::Continue(()));
         }
         Ok(self.dispatch_transition(transition))
@@ -2527,6 +2532,11 @@ impl crossterm::Command for EnableMouseButtonReporting {
     }
 
     #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
     }
@@ -2537,6 +2547,11 @@ struct DisableMouseButtonReporting;
 impl crossterm::Command for DisableMouseButtonReporting {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
         f.write_str(concat!("\x1b[?1002l", "\x1b[?1006l", "\x1b[?1000l"))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 
     #[cfg(windows)]
@@ -2643,6 +2658,54 @@ trait TerminalSink {
     fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()>;
 }
 
+/// Native copies are best effort: no failure may reach the Application or end
+/// the run. Tests substitute a recording sink without opening a display.
+trait NativeClipboardSink {
+    fn copy(&mut self, text: &str);
+}
+
+/// The native writer is injectable so failure reporting can be exercised
+/// through the sink without ever accessing a real Clipboard.
+struct NativeClipboard<W> {
+    write: W,
+    failure_reported: bool,
+}
+
+impl<W: FnMut(&str) -> Result<(), arboard::Error>> NativeClipboard<W> {
+    fn new(write: W) -> Self {
+        Self {
+            write,
+            failure_reported: false,
+        }
+    }
+}
+
+impl<W: FnMut(&str) -> Result<(), arboard::Error>> NativeClipboardSink for NativeClipboard<W> {
+    fn copy(&mut self, text: &str) {
+        if let Err(error) = (self.write)(text) {
+            if self.failure_reported {
+                tracing::debug!(%error, "could not write native Clipboard");
+            } else {
+                self.failure_reported = true;
+                tracing::warn!(%error, "could not write native Clipboard");
+            }
+        }
+    }
+}
+
+fn native_clipboard() -> impl NativeClipboardSink {
+    // Keep the handle for the whole run: on Linux it owns the copied text.
+    // Failed creation leaves it absent, so the next copy retries immediately.
+    let mut clipboard = None;
+    NativeClipboard::new(move |text: &str| {
+        let clipboard = match &mut clipboard {
+            Some(clipboard) => clipboard,
+            slot @ None => slot.insert(arboard::Clipboard::new()?),
+        };
+        clipboard.set_text(text)
+    })
+}
+
 /// OSC 52 asks the terminal to place bytes on its clipboard. The Invite stays
 /// drawn after this command, so a terminal that ignores OSC 52 still leaves
 /// the reader able to select the same string directly from the screen.
@@ -2659,8 +2722,15 @@ impl crossterm::Command for CopyToClipboard<'_> {
     }
 }
 
-fn copy_to_clipboard(output: &mut impl TerminalSink, text: &str) -> std::io::Result<()> {
-    ignore_unsupported(output.apply(CopyToClipboard(text)))
+fn copy_to_clipboard(
+    output: &mut impl TerminalSink,
+    native: &mut impl NativeClipboardSink,
+    text: &str,
+) {
+    native.copy(text);
+    if let Err(error) = ignore_unsupported(output.apply(CopyToClipboard(text))) {
+        tracing::warn!(%error, "could not write Clipboard through OSC 52");
+    }
 }
 
 struct TerminalOutput<W: std::io::Write>(W);
@@ -2755,9 +2825,9 @@ mod tests {
 
     use super::{
         Application, ApplicationEvent, DisableMouseButtonReporting, EnableMouseButtonReporting,
-        PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
-        enter_terminal_display, ignore_unsupported, leave_terminal_display,
-        remote_failure_from_session_error,
+        NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting, PushModifiedKeyReporting,
+        TerminalSink, copy_to_clipboard, enter_terminal_display, ignore_unsupported,
+        leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
@@ -2846,11 +2916,111 @@ mod tests {
     }
 
     #[test]
-    fn copying_an_invite_writes_osc_52_through_the_terminal_sink() {
-        let transcript =
-            AnsiTranscript::record(|output| copy_to_clipboard(output, "suru-v1-example"));
+    fn copying_an_invite_writes_the_same_text_to_both_clipboards() {
+        let mut native = RecordingClipboard::default();
+        let mut terminal = AnsiTranscript(String::new());
+        copy_to_clipboard(&mut terminal, &mut native, "suru-v1-example");
 
-        assert_eq!(transcript, "\x1b]52;c;c3VydS12MS1leGFtcGxl\x07");
+        assert_eq!(terminal.0, "\x1b]52;c;c3VydS12MS1leGFtcGxl\x07");
+        assert_eq!(native.0, ["suru-v1-example"]);
+    }
+
+    #[test]
+    fn copying_a_text_selection_preserves_unicode_and_newlines_in_both_clipboards() {
+        let mut native = RecordingClipboard::default();
+        let mut terminal = AnsiTranscript(String::new());
+        copy_to_clipboard(&mut terminal, &mut native, "Hello\n界🙂");
+
+        assert_eq!(native.0, ["Hello\n界🙂"]);
+        assert_eq!(terminal.0, "\x1b]52;c;SGVsbG8K55WM8J+Zgg==\x07");
+    }
+
+    #[derive(Default)]
+    struct RecordingClipboard(Vec<String>);
+
+    impl NativeClipboardSink for RecordingClipboard {
+        fn copy(&mut self, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+
+    struct FailedTerminal(std::io::ErrorKind);
+
+    impl TerminalSink for FailedTerminal {
+        fn apply(&mut self, _: impl Command) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+    }
+
+    fn record_log(action: impl FnOnce()) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clipboard.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::sync::Arc::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn an_osc_52_io_failure_is_logged_without_failing_the_copy() {
+        let log = record_log(|| {
+            let mut terminal = FailedTerminal(std::io::ErrorKind::BrokenPipe);
+            let mut native = RecordingClipboard::default();
+            copy_to_clipboard(&mut terminal, &mut native, "private copied text");
+            assert_eq!(native.0, ["private copied text"]);
+        });
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("OSC 52"), "{log}");
+        assert!(!log.contains("private copied text"), "{log}");
+    }
+
+    #[test]
+    fn unsupported_osc_52_still_copies_natively_without_a_warning() {
+        let log = record_log(|| {
+            let mut terminal = FailedTerminal(std::io::ErrorKind::Unsupported);
+            let mut native = RecordingClipboard::default();
+            copy_to_clipboard(&mut terminal, &mut native, "suru-v1-example");
+            assert_eq!(native.0, ["suru-v1-example"]);
+        });
+        assert!(log.is_empty(), "{log}");
+    }
+
+    #[test]
+    fn native_failures_warn_once_per_run_and_never_suppress_osc_52() {
+        let mut terminal = AnsiTranscript(String::new());
+        let mut offered = Vec::new();
+        let log = record_log(|| {
+            let mut native = NativeClipboard::new(|text: &str| {
+                offered.push(text.to_owned());
+                if text == "ok" {
+                    Ok(())
+                } else {
+                    Err(arboard::Error::ClipboardNotSupported)
+                }
+            });
+            for text in ["one", "two", "ok", "three"] {
+                copy_to_clipboard(&mut terminal, &mut native, text);
+            }
+        });
+
+        assert_eq!(offered, ["one", "two", "ok", "three"]);
+        assert_eq!(
+            terminal.0,
+            "\x1b]52;c;b25l\x07\x1b]52;c;dHdv\x07\x1b]52;c;b2s=\x07\x1b]52;c;dGhyZWU=\x07"
+        );
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log}");
+        assert!(lines[0].contains("WARN"), "{log}");
+        assert!(lines[1].contains("DEBUG"), "{log}");
+        assert!(lines[2].contains("DEBUG"), "{log}");
+        assert!(
+            lines.iter().all(|line| line.contains("native Clipboard")),
+            "{log}"
+        );
     }
 
     /// The screen has to be taken before the input features are turned on: a
