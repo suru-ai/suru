@@ -659,10 +659,7 @@ impl TranscriptView {
         if row >= self.row_count {
             return None;
         }
-        let unit = &self.units[self
-            .units
-            .partition_point(|unit| unit.start_row <= row)
-            .checked_sub(1)?];
+        let unit = self.unit_at(|unit| unit.start_row, row)?;
         let mut local_row = row - unit.start_row;
         let mut line = unit.start_line;
         if unit.leading_separator {
@@ -686,10 +683,7 @@ impl TranscriptView {
     /// past the last one. Recorded for the same reader as `position_at`.
     #[allow(dead_code)]
     pub(super) fn projected_line(&self, line: usize) -> Option<&StyledLine> {
-        let unit = &self.units[self
-            .units
-            .partition_point(|unit| unit.start_line <= line)
-            .checked_sub(1)?];
+        let unit = self.unit_at(|unit| unit.start_line, line)?;
         let mut local = line - unit.start_line;
         if unit.leading_separator {
             if local == 0 {
@@ -715,6 +709,16 @@ impl TranscriptView {
         self.units.iter().flat_map(|unit| unit.links.iter())
     }
 
+    /// The last unit whose `start` is at or before `index`: the one an index
+    /// counted across the view falls in, or `None` before the first unit.
+    fn unit_at(&self, start: impl Fn(&UnitView) -> usize, index: usize) -> Option<&UnitView> {
+        self.units.get(
+            self.units
+                .partition_point(|unit| start(unit) <= index)
+                .checked_sub(1)?,
+        )
+    }
+
     /// Extracts the rows needed to draw `viewport_rows` rows starting at
     /// `scroll_position`. Every row is already wrapped, so a window opening
     /// partway through a wrapped line starts on that row rather than at the
@@ -730,7 +734,7 @@ impl TranscriptView {
             .units
             .partition_point(|unit| unit.start_row <= scroll_position)
             .saturating_sub(1);
-        'units: for unit in &self.units[first_unit.min(self.units.len())..] {
+        'units: for unit in &self.units[first_unit..] {
             let mut skip = scroll_position.saturating_sub(unit.start_row);
             if unit.leading_separator {
                 // The separator is the unit's first row for indexing, so a
@@ -3173,7 +3177,9 @@ fn push_file_change_activity(
             row.into_iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    if index == 0 && (item.text == marker_lead || row_width < marker_lead.width()) {
+                    if index == 0
+                        && (marker_lead.starts_with(&item.text) || row_width < marker_lead.width())
+                    {
                         StyledSpan::chrome(item.text, item.style)
                     } else {
                         StyledSpan::text(item.text, item.style)

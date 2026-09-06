@@ -253,6 +253,7 @@ pub(super) struct StyledLine {
 
 impl StyledLine {
     /// A line of one span of text.
+    /// Read by the projection's tests until a renderer needs a bare text line.
     #[allow(dead_code)]
     pub(super) fn text(content: impl Into<String>, style: Style) -> Self {
         Self::from(vec![StyledSpan::text(content, style)])
@@ -265,6 +266,7 @@ impl StyledLine {
 
     /// Everything the line draws, chrome included, as one string. Offsets a
     /// row reports are byte offsets into this.
+    /// Read by the offset lookup's tests until the Text Selection lands.
     #[allow(dead_code)]
     pub(super) fn written_text(&self) -> String {
         self.spans
@@ -277,6 +279,7 @@ impl StyledLine {
         self.spans.iter().map(StyledSpan::width).sum()
     }
 
+    /// Read by the projection's tests until the Text Selection lands.
     #[allow(dead_code)]
     pub(super) fn is_empty(&self) -> bool {
         self.spans.is_empty()
@@ -363,24 +366,33 @@ impl StyledRow {
     /// lands on. A column in the hanging indent answers where the row's text
     /// begins; both cells of a wide character answer that character; a column
     /// past the row's text answers the offset past its last character.
+    /// Read by the projection's tests until the Text Selection lands.
     #[allow(dead_code)]
     pub(super) fn offset_at(&self, line: &StyledLine, width: u16, column: usize) -> usize {
-        let text = line.written_text();
         let Some(column) = column.checked_sub(self.indent) else {
             return self.start;
         };
         let maximum = usize::from(width);
         let mut used = 0;
-        for (offset, symbol) in text[self.start..self.end].grapheme_indices(true) {
-            let symbol_width = symbol.width();
-            if symbol_width > maximum {
-                // The wrap drew nothing for a symbol wider than a row.
-                continue;
+        // Symbols are read span by span, as the wrap read them, so a cluster
+        // that straddles two spans resolves at the boundary the wrap used.
+        let mut span_start = 0;
+        for span in &line.spans {
+            let span_end = span_start + span.content.len();
+            let from = self.start.clamp(span_start, span_end) - span_start;
+            let to = self.end.clamp(span_start, span_end) - span_start;
+            for (offset, symbol) in span.content[from..to].grapheme_indices(true) {
+                let symbol_width = symbol.width();
+                if symbol_width > maximum {
+                    // The wrap drew nothing for a symbol wider than a row.
+                    continue;
+                }
+                if column < used + symbol_width {
+                    return span_start + from + offset;
+                }
+                used += symbol_width;
             }
-            if column < used + symbol_width {
-                return self.start + offset;
-            }
-            used += symbol_width;
+            span_start = span_end;
         }
         self.end
     }
@@ -428,6 +440,7 @@ impl StyledLayout {
         }
     }
 
+    /// Read by the layout's tests; the projection takes its rows by value.
     #[allow(dead_code)]
     pub(super) fn rows(&self) -> &[StyledRow] {
         &self.rows
@@ -581,6 +594,17 @@ fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize
     .then_some(digits_end + 2)
 }
 
+/// The offset of the first symbol still waiting to be placed on a row.
+fn next_offset(
+    pending_whitespace: &VecDeque<StyledSymbol>,
+    pending_word: &[StyledSymbol],
+) -> Option<usize> {
+    pending_whitespace
+        .front()
+        .or(pending_word.first())
+        .and_then(|next| next.offset)
+}
+
 /// A row from the symbols it draws. `fallback` is where the row's text would
 /// begin had it any: the offset of the next symbol still to be placed.
 fn row_from_symbols(symbols: Vec<StyledSymbol>, fallback: usize) -> StyledRow {
@@ -662,10 +686,7 @@ fn wrap_with_continuation_indent(
             symbol_width > 0 && line_width + whitespace_width + word_width >= maximum;
         if line_full || pending_word_overflow {
             let mut remaining_width = maximum.saturating_sub(line_width);
-            let fallback = pending_whitespace
-                .front()
-                .or(pending_word.first())
-                .and_then(|next| next.offset)
+            let fallback = next_offset(&pending_whitespace, &pending_word)
                 .or(symbol.offset)
                 .unwrap_or(text_len);
             wrapped.push(row_from_symbols(
@@ -699,11 +720,7 @@ fn wrap_with_continuation_indent(
         non_whitespace_previous = !is_whitespace;
     }
 
-    let fallback = pending_whitespace
-        .front()
-        .or(pending_word.first())
-        .and_then(|next| next.offset)
-        .unwrap_or(text_len);
+    let fallback = next_offset(&pending_whitespace, &pending_word).unwrap_or(text_len);
     if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
         wrapped.push(row_from_symbols(Vec::new(), fallback));
     }

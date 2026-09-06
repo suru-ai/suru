@@ -119,7 +119,8 @@ impl<'a> Renderer<'a> {
                 self.flush_line();
                 let depth = self.lists.len().saturating_sub(1);
                 if depth > 0 {
-                    self.push("  ".repeat(depth), self.theme.text.primary);
+                    // Nesting indent is layout rather than the item's words.
+                    self.push_chrome("  ".repeat(depth), self.theme.text.primary);
                 }
                 let marker = match self.lists.last_mut() {
                     Some(Some(next)) => {
