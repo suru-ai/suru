@@ -3331,7 +3331,8 @@ fn render_session(
         && !state.overlay_owns_input()
     {
         if selection.epoch == state.transcript_cache.selection_epoch() {
-            selection.highlight(
+            transcript_view.highlight_selection(
+                selection,
                 buffer,
                 Rect::new(
                     transcript_area.x,

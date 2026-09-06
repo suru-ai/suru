@@ -6975,16 +6975,21 @@ fn transcript_selection_clamps_to_the_centered_column_and_never_highlights_the_c
             }
         }
     }
-    assert!(
-        selected[(start.0 - 2, start.1 + 1)]
-            .modifier
-            .contains(Modifier::REVERSED)
-    );
-    assert!(
-        selected[(start.0 - 2 + 79, start.1 + 1)]
-            .modifier
-            .contains(Modifier::REVERSED)
-    );
+    // The highlight covers the text a copy would hold and nothing else: the
+    // blank row between the lines, the gutter to the left of "Last line", and
+    // the empty cells to the right of "First line" all stay as drawn.
+    let reversed = |position: (u16, u16)| selected[position].modifier.contains(Modifier::REVERSED);
+    for x in 0..160 {
+        assert!(!reversed((x, start.1 + 1)), "blank row lit at {x}");
+    }
+    for x in 0..end.0 {
+        assert!(!reversed((x, end.1)), "gutter lit at {x}");
+    }
+    assert!(!reversed((start.0 + "First line".len() as u16, start.1)));
+    assert!(reversed((start.0, start.1)));
+    assert!(reversed((start.0 + "First line".len() as u16 - 1, start.1)));
+    assert!(reversed((end.0, end.1)));
+    assert!(reversed((end.0 + "Last line".len() as u16 - 1, end.1)));
 }
 
 #[test]

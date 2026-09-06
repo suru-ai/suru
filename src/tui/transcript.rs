@@ -34,6 +34,8 @@ use std::{
 };
 
 use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::Line,
 };
@@ -689,6 +691,19 @@ static SEPARATOR_LINE: StyledLine = StyledLine {
     omitted_prefix: String::new(),
 };
 
+/// What a Transcript row draws: a unit's separator, or one wrapped row of a
+/// projected line.
+enum RowAt<'a> {
+    Separator {
+        line: usize,
+    },
+    Wrapped {
+        line: usize,
+        source: &'a StyledLine,
+        row: &'a StyledRow,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptLink {
     pub(super) target: String,
@@ -760,6 +775,22 @@ impl TranscriptView {
     }
 
     fn position_at_edge(&self, row: usize, column: usize, after: bool) -> Option<TextPosition> {
+        let (line, wrapped) = match self.wrapped_row_at(row)? {
+            RowAt::Separator { line } => return Some(TextPosition { line, offset: 0 }),
+            RowAt::Wrapped { line, source, row } => (line, (source, row)),
+        };
+        let (source, row) = wrapped;
+        let offset = if after {
+            row.offset_after(source, self.key.width, column)
+        } else {
+            row.offset_at(source, self.key.width, column)
+        };
+        Some(TextPosition { line, offset })
+    }
+
+    /// The wrapped row drawn at a Transcript row, with the projected line it
+    /// draws, or `None` past the Transcript.
+    fn wrapped_row_at(&self, row: usize) -> Option<RowAt<'_>> {
         if row >= self.row_count {
             return None;
         }
@@ -768,25 +799,89 @@ impl TranscriptView {
         let mut line = unit.start_line;
         if unit.leading_separator {
             if local_row == 0 {
-                return Some(TextPosition { line, offset: 0 });
+                return Some(RowAt::Separator { line });
             }
             local_row -= 1;
             line += 1;
         }
         let wrapped = unit.rows.get(local_row)?;
-        let offset = if after {
-            wrapped
-                .row
-                .offset_after(&unit.lines[wrapped.line], self.key.width, column)
-        } else {
-            wrapped
-                .row
-                .offset_at(&unit.lines[wrapped.line], self.key.width, column)
-        };
-        Some(TextPosition {
+        Some(RowAt::Wrapped {
             line: line + wrapped.line,
-            offset,
+            source: &unit.lines[wrapped.line],
+            row: &wrapped.row,
         })
+    }
+
+    /// Reverses the cells a selection covers, the way the copy reads them:
+    /// text only. The gutter, hanging indent, and every other chrome span
+    /// stay as drawn, so what lights up is what a copy would hold. Rows that
+    /// draw no text — separators, blank lines — light nothing.
+    pub(super) fn highlight_selection(
+        &self,
+        selection: super::selection::TextSelection,
+        buffer: &mut Buffer,
+        area: Rect,
+        scroll: usize,
+    ) {
+        let (start, end) = selection.ordered();
+        for y in area.y..area.bottom() {
+            let row = scroll + usize::from(y - area.y);
+            if row < start.row {
+                continue;
+            }
+            if row > end.row {
+                break;
+            }
+            let Some(RowAt::Wrapped {
+                source,
+                row: wrapped,
+                ..
+            }) = self.wrapped_row_at(row)
+            else {
+                continue;
+            };
+            for (column, width) in self.text_cells(source, wrapped) {
+                let selected_from_start = row > start.row || column + width > start.column;
+                let selected_to_end = row < end.row || column <= end.column;
+                if !(selected_from_start && selected_to_end) {
+                    continue;
+                }
+                let left = u16::try_from(column).unwrap_or(u16::MAX);
+                let right = u16::try_from(column + width).unwrap_or(u16::MAX);
+                for x in area.x.saturating_add(left)..area.x.saturating_add(right).min(area.right())
+                {
+                    buffer[(x, y)].modifier.insert(Modifier::REVERSED);
+                }
+            }
+        }
+    }
+
+    /// The cells of a wrapped row that draw text rather than chrome, each as
+    /// its row-local column and width, read the way the draw and the offset
+    /// lookup read them: symbol by symbol, span by span, past the indent.
+    fn text_cells(&self, source: &StyledLine, wrapped: &StyledRow) -> Vec<(usize, usize)> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let maximum = usize::from(self.key.width);
+        let mut cells = Vec::new();
+        let mut column = wrapped.indent;
+        let mut span_start = 0;
+        for span in &source.spans {
+            let span_end = span_start + span.content.len();
+            let from = wrapped.start.clamp(span_start, span_end) - span_start;
+            let to = wrapped.end.clamp(span_start, span_end) - span_start;
+            for symbol in span.content[from..to].graphemes(true) {
+                let width = symbol.width();
+                if width == 0 || width > maximum {
+                    continue;
+                }
+                if !span.chrome {
+                    cells.push((column, width));
+                }
+                column += width;
+            }
+            span_start = span_end;
+        }
+        cells
     }
 
     /// A projected line by the index [`Self::position_at`] reports, or `None`
