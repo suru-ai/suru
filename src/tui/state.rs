@@ -24,8 +24,8 @@ use crate::{
         InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId, PromptStatus,
         ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionId, SessionListItem,
         SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
-        SkillCatalog, SkillCatalogRequest, TurnId, TurnStatus, UpdateAgentSelectionRequest,
-        Workspace,
+        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -3187,6 +3187,13 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            CommandId::ClearOrExit | CommandId::OpenContextMenuAt { .. }
+                if self.state.text_selection.get().is_some() =>
+            {
+                let transition = self.invoke_semantic(SemanticCommandId::TextSelectionCopy)?;
+                self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
+                Ok(transition)
+            }
             CommandId::QuestionnaireInsert(text) => {
                 if let Some(questionnaire) = self.state.open_questionnaire().cloned() {
                     self.state.questionnaires.insert(&questionnaire, &text);
@@ -3274,7 +3281,12 @@ impl Application {
                         subject: SemanticSubject::ScreenPosition(position),
                     })?;
                     self.state.left_press = None;
-                    return self.invoke_semantic(SemanticCommandId::TextSelectionCopy);
+                    return if self.state.settings.text_selection.copy == TextSelectionCopy::Release
+                    {
+                        self.invoke_semantic(SemanticCommandId::TextSelectionCopy)
+                    } else {
+                        Ok(ApplicationTransition::Continue)
+                    };
                 }
 
                 if let Some(press) = self.state.left_press.take()
@@ -5372,6 +5384,25 @@ impl Application {
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
         self.refresh_text_selection();
+        if self.state.text_selection.get().is_some() {
+            match &event {
+                InputEvent::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('c')
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    return Some(CommandId::ClearOrExit);
+                }
+                InputEvent::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Right) =>
+                {
+                    return Some(CommandId::OpenContextMenuAt {
+                        position: Position::new(mouse.column, mouse.row),
+                    });
+                }
+                _ => {}
+            }
+        }
         if matches!(&event, InputEvent::Key(key) if key.code == KeyCode::Esc)
             && self.state.text_selection.get().is_some()
         {

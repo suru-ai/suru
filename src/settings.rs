@@ -34,7 +34,8 @@ use crate::protocol::{
     AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EffectiveSettings,
     EmojiVisibility, FoldPosture, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
     SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
+    TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -46,6 +47,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const APPEARANCE_THEME: &str = "appearance.theme";
 const APPEARANCE_MODE: &str = "appearance.mode";
+const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
@@ -456,6 +458,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
             value.as_ref() == Some(&settings.appearance.theme)
         }
         SettingMutation::AppearanceMode { value } => *value == Some(settings.appearance.mode),
+        SettingMutation::TextSelectionCopy { value } => {
+            *value == Some(settings.text_selection.copy)
+        }
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             *value == Some(settings.transcript.default_fold_posture)
         }
@@ -836,6 +841,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     // table itself read in; the settings panel presents Enablement on the
     // Provider's own row rather than in this order.
     SettingDescriptor {
+        key: TEXT_SELECTION_COPY,
+        label: "Copy Text Selection",
+        description: "Copy when a drag ends, or manually with Ctrl+C or right-click",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "release",
+                build_mutation: || SettingMutation::TextSelectionCopy {
+                    value: Some(TextSelectionCopy::Release),
+                },
+            },
+            SettingChoice {
+                value: "manual",
+                build_mutation: || SettingMutation::TextSelectionCopy {
+                    value: Some(TextSelectionCopy::Manual),
+                },
+            },
+        ]),
+        reset: SettingMutation::TextSelectionCopy { value: None },
+        apply: |settings, value| apply_value(value, |copy| settings.text_selection.copy = copy),
+    },
+    SettingDescriptor {
         key: PROVIDER_CODEX_ENABLED,
         label: "Codex Provider",
         description: "Whether Suru offers Codex, or leaves it entirely alone",
@@ -1207,6 +1235,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             .map(|value| serde_json::to_value(value).expect("Setting values always serialize"))
     }
     match mutation {
+        SettingMutation::TextSelectionCopy { value } => (TEXT_SELECTION_COPY, pinned(value)),
         SettingMutation::AppearanceTheme { value } => (APPEARANCE_THEME, pinned(value)),
         SettingMutation::AppearanceMode { value } => (APPEARANCE_MODE, pinned(value)),
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
@@ -1750,6 +1779,7 @@ mod tests {
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
+                "one of \"release\" or \"manual\"".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
                 "one of true or false".to_owned(),

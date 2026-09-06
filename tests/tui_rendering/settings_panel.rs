@@ -2787,3 +2787,32 @@ fn choosing_another_title_model_or_provider_starts_with_inherited_options() {
         );
     }
 }
+
+#[test]
+fn copy_text_selection_cycles_on_the_general_tab() {
+    use suru::protocol::TextSelectionCopy;
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    open_panel(&mut application);
+    for (current, next) in [
+        (TextSelectionCopy::Release, TextSelectionCopy::Manual),
+        (TextSelectionCopy::Manual, TextSelectionCopy::Release),
+    ] {
+        let mut settings = EffectiveSettings::default();
+        settings.text_selection.copy = current;
+        deliver_snapshot(&mut application, settings, &["textSelection.copy"]);
+        focus_setting(&mut application, "textSelection.copy");
+        assert!(
+            row(&application, "Copy Text Selection").contains(match current {
+                TextSelectionCopy::Release => "release [pinned]",
+                TextSelectionCopy::Manual => "manual [pinned]",
+            })
+        );
+        assert_eq!(
+            press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+            ApplicationTransition::MutateSetting(SettingMutation::TextSelectionCopy {
+                value: Some(next)
+            })
+        );
+    }
+}

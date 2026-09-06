@@ -6624,6 +6624,7 @@ fn transcript_selection_unwraps_text_and_persists_after_copy() {
     use crossterm::event::MouseButton;
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    pin_release_copy(&mut application);
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     snapshot
         .messages
@@ -6736,6 +6737,7 @@ fn transcript_selection_copies_source_lines_skipping_chrome_and_keeping_separato
     ] {
         let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &entries);
         let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .unwrap();
@@ -6757,6 +6759,7 @@ fn transcript_selection_survives_typing_and_clears_on_press_escape_resize_and_se
         &[RunEntry::AgentMessage("Selected words")],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .unwrap();
@@ -6818,6 +6821,7 @@ fn transcript_selection_clears_when_streaming_reprojects_but_survives_a_pure_app
         );
         snapshot.messages[0].status = MessageStatus::Streaming;
         let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
             .unwrap();
@@ -6877,6 +6881,7 @@ fn transcript_selection_stays_on_text_when_the_wheel_scrolls() {
     );
     snapshot.messages[0].content = text;
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -6924,6 +6929,7 @@ fn transcript_selection_joins_an_oversize_split_line() {
     let source = format!("START {} END", "x".repeat(36_000));
     snapshot.messages[0].content = source.clone();
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -6946,6 +6952,7 @@ fn transcript_selection_clamps_to_the_centered_column_and_never_highlights_the_c
         &[RunEntry::AgentMessage("First line\n\nLast line")],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -6993,6 +7000,7 @@ fn transcript_selection_copies_a_wide_character_once_in_either_direction_and_bla
         ],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7031,6 +7039,7 @@ fn transcript_selection_clears_when_a_fold_is_toggled() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7055,6 +7064,7 @@ fn transcript_selection_past_a_wrapped_rows_text_does_not_copy_the_next_rows_cha
         &[RunEntry::AgentMessage("abcdefghijklmnopqrstuvw界tail")],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7076,6 +7086,7 @@ fn transcript_selection_drag_returning_to_its_anchor_does_not_select_one_cell_or
         &[RunEntry::Command(ActivityStatus::Completed, Some(0))],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7109,6 +7120,7 @@ fn transcript_selection_highlights_a_wide_glyph_when_dragging_from_its_trailing_
         &[RunEntry::AgentMessage("A界🙂Z")],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7141,6 +7153,7 @@ fn transcript_selection_unwraps_user_messages_without_losing_whitespace_or_empty
         &[RunEntry::UserMessage(source)],
     );
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7161,6 +7174,7 @@ fn transcript_selection_unwraps_the_visible_tail_of_a_folded_command_line() {
     let (snapshot, _) =
         command_activity_session(workspace.path(), ActivityStatus::Completed, &output, false);
     let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -7184,4 +7198,80 @@ fn transcript_selection_unwraps_the_visible_tail_of_a_folded_command_line() {
         select_transcript(&mut application, start, (end.0 + 2, end.1)),
         selected
     );
+}
+
+#[test]
+fn manual_selection_waits_for_copy_and_explicit_copy_clears_in_both_modes() {
+    use crossterm::event::MouseButton;
+    use suru::protocol::TextSelectionCopy;
+    let workspace = workspace_dir();
+    for mode in [TextSelectionCopy::Manual, TextSelectionCopy::Release] {
+        for right_click in [false, true] {
+            let mut application = connected_application(workspace.path());
+            application
+                .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                    SessionId::new(),
+                    workspace.path(),
+                    &[RunEntry::AgentMessage("Selected words")],
+                )))
+                .unwrap();
+            let mut settings = EffectiveSettings::default();
+            settings.text_selection.copy = match mode {
+                TextSelectionCopy::Manual => TextSelectionCopy::Release,
+                TextSelectionCopy::Release => TextSelectionCopy::Manual,
+            };
+            deliver_settings(&mut application, settings, &["textSelection.copy"]);
+            let buffer = rendered_application_buffer(&application, 60, 24);
+            let start = text_position(&buffer, "Selected words");
+            let end = (start.0 + 13, start.1);
+            for (kind, position) in [
+                (MouseEventKind::Down(MouseButton::Left), start),
+                (MouseEventKind::Drag(MouseButton::Left), end),
+            ] {
+                application
+                    .handle_terminal_event(selection_mouse(kind, position))
+                    .unwrap();
+            }
+            // A settings update during the drag governs this release immediately.
+            let mut settings = EffectiveSettings::default();
+            settings.text_selection.copy = mode;
+            deliver_settings(&mut application, settings, &["textSelection.copy"]);
+            let released = application
+                .handle_terminal_event(selection_mouse(MouseEventKind::Up(MouseButton::Left), end))
+                .unwrap();
+            assert_eq!(
+                released,
+                if mode == TextSelectionCopy::Manual {
+                    ApplicationTransition::Continue
+                } else {
+                    ApplicationTransition::CopyToClipboard("Selected words".into())
+                }
+            );
+            assert!(
+                rendered_application_buffer(&application, 60, 24)[start]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            let event = if right_click {
+                selection_mouse(MouseEventKind::Down(MouseButton::Right), (0, 0))
+            } else {
+                InputEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            };
+            assert_eq!(
+                application.handle_terminal_event(event).unwrap(),
+                ApplicationTransition::CopyToClipboard("Selected words".into())
+            );
+            assert!(
+                !rendered_application_buffer(&application, 60, 24)[start]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+    }
+}
+
+fn pin_release_copy(application: &mut Application) {
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    deliver_settings(application, settings, &["textSelection.copy"]);
 }

@@ -1207,11 +1207,28 @@ impl Default for ServingSettings {
     }
 }
 
+/// When a reader copies a Text Selection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSelectionCopy {
+    #[cfg_attr(not(windows), default)]
+    Release,
+    #[cfg_attr(windows, default)]
+    Manual,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextSelectionSettings {
+    pub copy: TextSelectionCopy,
+}
+
 /// The effective value of every defined Setting: what a Config Document
 /// pinned where it did, the built-in default everywhere else.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSettings {
+    pub text_selection: TextSelectionSettings,
     pub appearance: AppearanceSettings,
     pub transcript: TranscriptSettings,
     pub session: SessionSettings,
@@ -1249,6 +1266,9 @@ impl EffectiveSettings {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SettingMutation {
+    TextSelectionCopy {
+        value: Option<TextSelectionCopy>,
+    },
     AppearanceTheme {
         value: Option<String>,
     },

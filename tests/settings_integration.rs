@@ -1943,3 +1943,98 @@ async fn a_reset_on_a_fresh_install_leaves_the_config_root_empty() {
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+#[tokio::test]
+async fn text_selection_copy_pins_resets_and_reaches_every_client() {
+    use suru::protocol::TextSelectionCopy;
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{"textSelection": {"copy": "manual"}}"#,
+    )
+    .unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "selection-copy")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (mut editor, opening) = attach(state_dir.path(), "selection-copy").await;
+    let (mut onlooker, second) = attach(state_dir.path(), "selection-copy").await;
+    assert_eq!(opening, second);
+    assert_eq!(
+        opening.settings.text_selection.copy,
+        TextSelectionCopy::Manual
+    );
+    assert_eq!(opening.pinned, ["textSelection.copy"]);
+    assert!(opening.diagnostics.is_empty());
+    let pinned = editor
+        .mutate_setting(SettingMutation::TextSelectionCopy {
+            value: Some(TextSelectionCopy::Release),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.settings.text_selection.copy,
+        TextSelectionCopy::Release
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, pinned);
+    }
+    let reset = editor
+        .mutate_setting(SettingMutation::TextSelectionCopy { value: None })
+        .await
+        .unwrap();
+    #[cfg(windows)]
+    assert_eq!(
+        reset.settings.text_selection.copy,
+        TextSelectionCopy::Manual
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        reset.settings.text_selection.copy,
+        TextSelectionCopy::Release
+    );
+    assert!(reset.pinned.is_empty());
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, reset);
+    }
+    let (late, snapshot) = attach(state_dir.path(), "selection-copy").await;
+    assert_eq!(snapshot, reset);
+    drop((editor, onlooker, late));
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn text_selection_copy_rejects_unknown_values_naming_both_choices() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{"textSelection":{"copy":"never"}}"#,
+    )
+    .unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "selection-invalid")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (client, snapshot) = attach(state_dir.path(), "selection-invalid").await;
+    assert!(snapshot.pinned.is_empty());
+    assert_eq!(snapshot.settings, Default::default());
+    assert_eq!(snapshot.diagnostics.len(), 1);
+    let diagnostic = &snapshot.diagnostics[0];
+    assert_eq!(diagnostic.key.as_deref(), Some("textSelection.copy"));
+    assert!(
+        diagnostic
+            .message
+            .contains("one of \"release\" or \"manual\""),
+        "{diagnostic:?}"
+    );
+    drop(client);
+    server.shutdown().await.unwrap();
+}
