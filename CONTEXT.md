@@ -260,6 +260,10 @@ _Avoid_: Diagnostics, telemetry, trace
 The run of text a reader marks by dragging across a client's screen, so that the text behind it may be copied as it was written rather than as it was wrapped or decorated to fit the screen. It is a fact about the client's screen rather than the Session: it lives in no Transcript, belongs to the one surface it was begun on, follows that surface's content as it scrolls, and is gone the moment that content is laid out afresh. Distinct from an Agent Selection, from the row focus a list keeps, and from a Fold's disclosure.
 _Avoid_: Selection (bare), highlight, mark, mouse selection
 
+**Clipboard**:
+Where a copy lands, so that text taken from Suru can be pasted anywhere else. A copy is offered to every Clipboard the client can reach at once: the machine's own, and the terminal's by escape sequence, so a copy from a Suru run over SSH still reaches the reader's machine. Where the machine keeps a primary selection beside its clipboard, a copy fills both.
+_Avoid_: Host clipboard, system clipboard, OSC 52 (for the destination itself)
+
 **Notice**:
 A transient, one-line message a client shows about Suru's own behavior rather than about a Session. The reader's next interaction dismisses that Notice and it does not return, while a distinct runtime condition may raise a new Notice; each points at the Log rather than carrying the detail itself.
 _Avoid_: Banner, toast, alert, diagnostic
