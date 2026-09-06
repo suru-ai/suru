@@ -52,6 +52,8 @@ use crate::terminal::{
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
+mod clipboard_thread;
+
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
@@ -490,7 +492,7 @@ async fn run_loop(
         spinner_tick: None,
         needs_redraw: true,
     };
-    let mut clipboard = native_clipboard();
+    let mut clipboard = clipboard_thread::ClipboardThread::new(native_clipboard);
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
@@ -531,6 +533,7 @@ async fn run_loop(
             },
         };
         if let ControlFlow::Break(exit) = step {
+            clipboard.shutdown();
             return leave_run_loop(terminal, &run.application, exit);
         }
 
@@ -561,6 +564,7 @@ async fn run_loop(
                 None => ControlFlow::Break(Exit::Now),
             };
             if let ControlFlow::Break(exit) = step {
+                clipboard.shutdown();
                 return leave_run_loop(terminal, &run.application, exit);
             }
         }
@@ -2939,6 +2943,47 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_stalled_native_write_leaves_copy_responsive_and_only_keeps_the_latest_waiting_text() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        let (started, writing) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Arc::new(Mutex::new(resume));
+        let (written, copies) = mpsc::channel();
+        let mut native = super::clipboard_thread::ClipboardThread::new(move || {
+            let started = started.clone();
+            let resume = resume.clone();
+            let written = written.clone();
+            NativeClipboard::new(move |target, text: &str| {
+                if target == super::NativeClipboardTarget::Clipboard {
+                    if text == "first" {
+                        started.send(()).unwrap();
+                        let _ = resume.lock().unwrap().recv();
+                    }
+                    written.send(text.to_owned()).unwrap();
+                }
+                Ok(())
+            })
+        })
+        .with_exit_timeout(Duration::from_millis(100));
+        let mut terminal = AnsiTranscript(String::new());
+        copy_to_clipboard(&mut terminal, &mut native, "first");
+        writing.recv_timeout(Duration::from_secs(1)).unwrap();
+        copy_to_clipboard(&mut terminal, &mut native, "second");
+        copy_to_clipboard(&mut terminal, &mut native, "latest");
+        assert_eq!(
+            terminal.0,
+            "\x1b]52;c;Zmlyc3Q=\x07\x1b]52;c;c2Vjb25k\x07\x1b]52;c;bGF0ZXN0\x07"
+        );
+        assert!(copies.try_recv().is_err());
+
+        release.send(()).unwrap();
+        assert!(native.shutdown());
+        assert_eq!(copies.try_iter().collect::<Vec<_>>(), ["first", "latest"]);
     }
 
     #[test]
