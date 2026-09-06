@@ -2664,6 +2664,13 @@ trait NativeClipboardSink {
     fn copy(&mut self, text: &str);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeClipboardTarget {
+    Clipboard,
+    #[cfg(target_os = "linux")]
+    Primary,
+}
+
 /// The native writer is injectable so failure reporting can be exercised
 /// through the sink without ever accessing a real Clipboard.
 struct NativeClipboard<W> {
@@ -2671,7 +2678,7 @@ struct NativeClipboard<W> {
     failure_reported: bool,
 }
 
-impl<W: FnMut(&str) -> Result<(), arboard::Error>> NativeClipboard<W> {
+impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> NativeClipboard<W> {
     fn new(write: W) -> Self {
         Self {
             write,
@@ -2680,15 +2687,23 @@ impl<W: FnMut(&str) -> Result<(), arboard::Error>> NativeClipboard<W> {
     }
 }
 
-impl<W: FnMut(&str) -> Result<(), arboard::Error>> NativeClipboardSink for NativeClipboard<W> {
+impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> NativeClipboardSink
+    for NativeClipboard<W>
+{
     fn copy(&mut self, text: &str) {
-        if let Err(error) = (self.write)(text) {
+        if let Err(error) = (self.write)(NativeClipboardTarget::Clipboard, text) {
             if self.failure_reported {
                 tracing::debug!(%error, "could not write native Clipboard");
             } else {
                 self.failure_reported = true;
                 tracing::warn!(%error, "could not write native Clipboard");
             }
+        }
+        // Clipboard delivery decides success; an unavailable primary selection
+        // must not consume the run's first native Clipboard failure warning.
+        #[cfg(target_os = "linux")]
+        if let Err(error) = (self.write)(NativeClipboardTarget::Primary, text) {
+            tracing::debug!(%error, "could not write native primary selection");
         }
     }
 }
@@ -2697,12 +2712,23 @@ fn native_clipboard() -> impl NativeClipboardSink {
     // Keep the handle for the whole run: on Linux it owns the copied text.
     // Failed creation leaves it absent, so the next copy retries immediately.
     let mut clipboard = None;
-    NativeClipboard::new(move |text: &str| {
+    NativeClipboard::new(move |target, text: &str| {
         let clipboard = match &mut clipboard {
             Some(clipboard) => clipboard,
             slot @ None => slot.insert(arboard::Clipboard::new()?),
         };
-        clipboard.set_text(text)
+        match target {
+            NativeClipboardTarget::Clipboard => clipboard.set_text(text),
+            #[cfg(target_os = "linux")]
+            NativeClipboardTarget::Primary => {
+                use arboard::{LinuxClipboardKind, SetExtLinux};
+
+                clipboard
+                    .set()
+                    .clipboard(LinuxClipboardKind::Primary)
+                    .text(text)
+            }
+        }
     })
 }
 
@@ -2935,6 +2961,37 @@ mod tests {
         assert_eq!(terminal.0, "\x1b]52;c;SGVsbG8K55WM8J+Zgg==\x07");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn text_selection_and_invite_copies_also_fill_the_native_primary_selection() {
+        use super::NativeClipboardTarget::{Clipboard, Primary};
+
+        let mut offered = Vec::new();
+        let mut terminal = AnsiTranscript(String::new());
+        {
+            let mut native = NativeClipboard::new(|target, text: &str| {
+                offered.push((target, text.to_owned()));
+                Ok(())
+            });
+            copy_to_clipboard(&mut terminal, &mut native, "Hello\n界🙂");
+            copy_to_clipboard(&mut terminal, &mut native, "suru-v1-example");
+        }
+
+        assert_eq!(
+            offered,
+            [
+                (Clipboard, "Hello\n界🙂".to_owned()),
+                (Primary, "Hello\n界🙂".to_owned()),
+                (Clipboard, "suru-v1-example".to_owned()),
+                (Primary, "suru-v1-example".to_owned()),
+            ]
+        );
+        assert_eq!(
+            terminal.0,
+            "\x1b]52;c;SGVsbG8K55WM8J+Zgg==\x07\x1b]52;c;c3VydS12MS1leGFtcGxl\x07"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingClipboard(Vec<String>);
 
@@ -2989,12 +3046,52 @@ mod tests {
         assert!(log.is_empty(), "{log}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_primary_selection_logs_at_debug_without_counting_as_a_clipboard_failure() {
+        use super::NativeClipboardTarget::{Clipboard, Primary};
+
+        let mut terminal = AnsiTranscript(String::new());
+        let mut copied = Vec::new();
+        let log = record_log(|| {
+            let mut native = NativeClipboard::new(|target, text: &str| match (target, text) {
+                (Clipboard, "failed") => Err(arboard::Error::ClipboardNotSupported),
+                (Clipboard, _) => {
+                    copied.push(text.to_owned());
+                    Ok(())
+                }
+                (Primary, "failed") => Ok(()),
+                (Primary, _) => Err(arboard::Error::ClipboardNotSupported),
+            });
+            for text in ["one", "two", "failed"] {
+                copy_to_clipboard(&mut terminal, &mut native, text);
+            }
+        });
+
+        assert_eq!(copied, ["one", "two"]);
+        assert_eq!(
+            terminal.0,
+            "\x1b]52;c;b25l\x07\x1b]52;c;dHdv\x07\x1b]52;c;ZmFpbGVk\x07"
+        );
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log}");
+        for line in &lines[..2] {
+            assert!(line.contains("DEBUG"), "{log}");
+            assert!(line.contains("primary selection"), "{log}");
+        }
+        assert!(lines[2].contains("WARN"), "{log}");
+        assert!(lines[2].contains("native Clipboard"), "{log}");
+    }
+
     #[test]
     fn native_failures_warn_once_per_run_and_never_suppress_osc_52() {
         let mut terminal = AnsiTranscript(String::new());
         let mut offered = Vec::new();
         let log = record_log(|| {
-            let mut native = NativeClipboard::new(|text: &str| {
+            let mut native = NativeClipboard::new(|target, text: &str| {
+                if target != super::NativeClipboardTarget::Clipboard {
+                    return Ok(());
+                }
                 offered.push(text.to_owned());
                 if text == "ok" {
                     Ok(())
