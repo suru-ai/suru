@@ -14,6 +14,7 @@ mod model_picker;
 mod notice;
 mod questionnaire;
 mod render;
+mod selection;
 mod serve_overlay;
 mod session_listing;
 mod session_picker;

@@ -555,3 +555,52 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
         ApplicationTransition::Continue
     ));
 }
+
+#[test]
+fn escape_clears_text_selection_before_leaving_a_subagent() {
+    use ratatui::style::Modifier;
+    let workspace = workspace_dir();
+    let parent_id = SessionId::new();
+    let child = child_session_snapshot(SessionId::new(), parent_id, workspace.path());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 22);
+    let (x, y) = text_position(&buffer, "Mapping");
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), x),
+        (MouseEventKind::Drag(MouseButton::Left), x + 6),
+        (MouseEventKind::Up(MouseButton::Left), x + 6),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    assert!(
+        rendered_application_buffer(&application, 80, 22)[(x, y)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_buffer(&application, 80, 22)[(x, y)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Esc),
+        ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            parent_id
+        ))
+    );
+}

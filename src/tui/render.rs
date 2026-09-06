@@ -49,7 +49,7 @@ use super::{
     subagent_picker::working_subagents,
     text_layout::{TextLayout, draw_row},
     theme_picker::ThemePickerRow,
-    transcript::{TranscriptDisclosure, client_error_lines},
+    transcript::client_error_lines,
     usage::{compact_cost, compact_count},
     workspace_picker::WorkspacePickerRow,
 };
@@ -3031,26 +3031,12 @@ fn render_session(
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
-    let provisional_prompts = state.provisional_prompts(session_id);
     let interaction = state
         .session_interaction(&session_reference)
         .expect("Session interaction is initialized with its snapshot");
-    let folds = interaction.folds.borrow();
-    let groups = interaction.groups.borrow();
-    let turns = interaction.turns.borrow();
-    let transcript_view = state.transcript_cache.view(
-        state.transcript_generation,
-        snapshot,
-        &provisional_prompts,
-        TranscriptDisclosure {
-            folds: &folds,
-            groups: &groups,
-            turns: &turns,
-            reasoning_visibility: state.settings().transcript.reasoning_visibility,
-        },
-        theme,
-        content_width,
-    );
+    let transcript_view = state
+        .transcript_view(theme, content_width)
+        .expect("the rendered Session has its projection and interaction");
     let transcript_rows = transcript_view.row_count_with_tail(&working_indicator_lines);
     let [_, transcript_without_latest, _, _, _, _, _, _] = session_areas(
         area,
@@ -3197,6 +3183,22 @@ fn render_session(
             transcript_area.width,
             row,
         );
+    }
+    if let Some(selection) = state.text_selection.get() {
+        if selection.epoch == state.transcript_cache.selection_epoch() {
+            selection.highlight(
+                buffer,
+                Rect::new(
+                    transcript_area.x,
+                    content_top,
+                    transcript_area.width,
+                    transcript_area.height.saturating_sub(border_rows),
+                ),
+                scroll_position,
+            );
+        } else {
+            state.text_selection.set(None);
+        }
     }
     if pending_height > 0 {
         render_pending_prompts(

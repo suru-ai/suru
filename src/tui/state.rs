@@ -11,7 +11,8 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{
-    Event as InputEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event as InputEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{Frame, layout::Position, style::Style};
 
@@ -52,6 +53,7 @@ use super::{
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, Notice},
     render::render_with_slots,
+    selection::{TextSelection, TranscriptCell},
     serve_overlay::ServeOverlay,
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
@@ -60,8 +62,8 @@ use super::{
     subagent_picker::{SubagentPicker, working_subagents},
     theme_picker::ThemePicker,
     transcript::{
-        FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptFolds, TranscriptGroups,
-        TranscriptTurnFolds, UnitKey, UnitStart,
+        FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptDisclosure,
+        TranscriptFolds, TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart,
     },
     workspace_picker::WorkspacePicker,
 };
@@ -327,6 +329,7 @@ impl TranscriptViewport {
 #[derive(Clone, Debug)]
 pub struct TuiState {
     left_press: Option<LeftPress>,
+    pub(super) text_selection: Cell<Option<TextSelection>>,
     pub(super) outlook: Outlook,
     outlook_workspaces: HashMap<Outlook, PathBuf>,
     workspace_resolution_sequence: u64,
@@ -500,6 +503,7 @@ impl TuiState {
         let workspace = workspace_reading(workspace.as_ref());
         Self {
             left_press: None,
+            text_selection: Cell::new(None),
             outlook: Outlook::Local,
             outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
             workspace_resolution_sequence: 0,
@@ -611,6 +615,8 @@ impl TuiState {
     /// swaps — and what it sends is taken and dropped rather than drawn,
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
+        self.text_selection.set(None);
+        self.left_press = None;
         self.session = None;
         self.session_reference = None;
         self.route = Some(target);
@@ -637,6 +643,8 @@ impl TuiState {
     /// reader is on their way to, and leaving is them saying they are not
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
+        self.text_selection.set(None);
+        self.left_press = None;
         self.session = None;
         self.session_reference = None;
         self.opening_error = None;
@@ -1363,6 +1371,8 @@ impl TuiState {
     }
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
+        self.text_selection.set(None);
+        self.left_press = None;
         // The picker browses the Session that was open, so a swap to another
         // one takes it away rather than leaving it standing over rows it
         // never offered.
@@ -1628,6 +1638,30 @@ impl TuiState {
         session: &SessionReference,
     ) -> Option<&SessionInteraction> {
         self.session_interactions.get(session)
+    }
+
+    /// One set of projection inputs serves both drawing and input-time
+    /// validation of content coordinates.
+    pub(super) fn transcript_view(
+        &self,
+        theme: &Theme,
+        width: u16,
+    ) -> Option<std::cell::Ref<'_, TranscriptView>> {
+        let snapshot = self.session.as_ref()?.snapshot();
+        let interaction = self.session_interaction(self.session_reference.as_ref()?)?;
+        Some(self.transcript_cache.view(
+            self.transcript_generation,
+            snapshot,
+            &self.provisional_prompts(snapshot.session.id),
+            TranscriptDisclosure {
+                folds: &interaction.folds.borrow(),
+                groups: &interaction.groups.borrow(),
+                turns: &interaction.turns.borrow(),
+                reasoning_visibility: self.settings().transcript.reasoning_visibility,
+            },
+            theme,
+            width,
+        ))
     }
 
     fn navigate_transcript_page(&mut self, direction: TranscriptDirection) {
@@ -2202,6 +2236,7 @@ pub(super) struct QueuedPrompt<'a> {
 struct LeftPress {
     position: Position,
     dragged: bool,
+    selection_anchor: Option<(TranscriptCell, u64)>,
 }
 
 pub struct Application {
@@ -3193,9 +3228,33 @@ impl Application {
             | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest) => self.handle_transcript_command(command),
             CommandId::PressAt { position } => {
+                self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
+                let selection_anchor =
+                    if !self.state.overlay_owns_input() && !self.state.reconnect_overlay_visible {
+                        self.state
+                            .session_reference
+                            .as_ref()
+                            .and_then(|session| self.state.session_interaction(session))
+                            .and_then(|interaction| {
+                                interaction.viewport.borrow().as_ref().and_then(|viewport| {
+                                    let row = viewport.transcript_row(position)?;
+                                    (row < self.state.transcript_cache.row_count()).then_some((
+                                        TranscriptCell {
+                                            row,
+                                            column: usize::from(position.x - viewport.content_left),
+                                        },
+                                        self.state.transcript_cache.selection_epoch(),
+                                    ))
+                                })
+                            })
+                    } else {
+                        None
+                    };
+
                 self.state.left_press = Some(LeftPress {
                     position,
                     dragged: false,
+                    selection_anchor,
                 });
                 Ok(ApplicationTransition::Continue)
             }
@@ -3204,6 +3263,20 @@ impl Application {
                 subject: SemanticSubject::ScreenPosition(position),
             }),
             CommandId::ReleaseAt { position } => {
+                if self
+                    .state
+                    .left_press
+                    .as_ref()
+                    .is_some_and(|press| press.dragged)
+                {
+                    self.invoke_semantic(SemanticInvocation {
+                        id: SemanticCommandId::PointerDrag,
+                        subject: SemanticSubject::ScreenPosition(position),
+                    })?;
+                    self.state.left_press = None;
+                    return self.invoke_semantic(SemanticCommandId::TextSelectionCopy);
+                }
+
                 if let Some(press) = self.state.left_press.take()
                     && !press.dragged
                     && press.position == position
@@ -4311,6 +4384,42 @@ impl Application {
         Ok(ApplicationTransition::Continue)
     }
 
+    /// Input may arrive after a Session update and before the next draw. Resolve
+    /// selection validity against that update before acting on cached cells.
+    fn refresh_text_selection(&self) {
+        if self.state.text_selection.get().is_none()
+            && self
+                .state
+                .left_press
+                .as_ref()
+                .is_none_or(|press| press.selection_anchor.is_none())
+        {
+            return;
+        }
+        let Some(interaction) = self
+            .state
+            .session_reference
+            .as_ref()
+            .and_then(|reference| self.state.session_interaction(reference))
+        else {
+            return;
+        };
+        let Some(width) = interaction
+            .viewport
+            .borrow()
+            .as_ref()
+            .map(|view| view.content_width)
+        else {
+            return;
+        };
+        self.state.transcript_view(&self.theme, width);
+        if self.state.text_selection.get().is_some_and(|selection| {
+            selection.epoch != self.state.transcript_cache.selection_epoch()
+        }) {
+            self.state.text_selection.set(None);
+        }
+    }
+
     /// Runs one semantic command against what it names. Every surface that can
     /// drive the view — a keybinding, a slash command, a click, and one day a
     /// plugin — arrives here, so a behavior is defined once and invoked by
@@ -4319,6 +4428,7 @@ impl Application {
         &mut self,
         invocation: impl Into<SemanticInvocation>,
     ) -> Result<ApplicationTransition> {
+        self.refresh_text_selection();
         let invocation = invocation.into();
         let command = invocation.id;
         if self.state.selection_update_pending()
@@ -4366,9 +4476,62 @@ impl Application {
                     && let Some(press) = &mut self.state.left_press
                 {
                     press.dragged |= position != press.position;
+                    if press.dragged
+                        && let Some((anchor, epoch)) = press.selection_anchor
+                        && epoch == self.state.transcript_cache.selection_epoch()
+                        && let Some(interaction) = self
+                            .state
+                            .session_reference
+                            .as_ref()
+                            .and_then(|session| self.state.session_interactions.get(session))
+                        && let Some(viewport) = interaction.viewport.borrow().as_ref()
+                        && viewport.content_width > 0
+                        && viewport.content_rows > 0
+                    {
+                        let row = viewport.scroll_position
+                            + usize::from(
+                                position.y.clamp(
+                                    viewport.content_top,
+                                    viewport.content_top + viewport.content_rows - 1,
+                                ) - viewport.content_top,
+                            );
+                        let column = usize::from(
+                            position.x.clamp(
+                                viewport.content_left,
+                                viewport.content_left + viewport.content_width - 1,
+                            ) - viewport.content_left,
+                        );
+                        let focus = TranscriptCell {
+                            row: row.min(self.state.transcript_cache.row_count().saturating_sub(1)),
+                            column,
+                        };
+                        self.state
+                            .text_selection
+                            .set((anchor != focus).then_some(TextSelection {
+                                anchor,
+                                focus,
+                                epoch,
+                            }));
+                    }
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::TextSelectionClear => {
+                self.state.text_selection.set(None);
+                if let Some(press) = &mut self.state.left_press {
+                    press.selection_anchor = None;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::TextSelectionCopy => Ok(self
+                .state
+                .text_selection
+                .get()
+                .and_then(|selection| self.state.transcript_cache.copy_selection(selection))
+                .map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::CopyToClipboard,
+                )),
             SemanticCommandId::ComposerPlaceCursor => {
                 if !self.state.overlay_owns_input()
                     && !self.state.reconnect_overlay_visible
@@ -5208,6 +5371,19 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
+        self.refresh_text_selection();
+        if matches!(&event, InputEvent::Key(key) if key.code == KeyCode::Esc)
+            && self.state.text_selection.get().is_some()
+        {
+            return Some(CommandId::InvokeSemantic(
+                SemanticCommandId::TextSelectionClear,
+            ));
+        }
+        if matches!(&event, InputEvent::Resize(..)) {
+            return Some(CommandId::InvokeSemantic(
+                SemanticCommandId::TextSelectionClear,
+            ));
+        }
         if let InputEvent::Mouse(mouse) = &event {
             let position = Position::new(mouse.column, mouse.row);
             match mouse.kind {

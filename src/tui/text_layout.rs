@@ -249,6 +249,9 @@ impl StyledSpan {
 pub(super) struct StyledLine {
     pub(super) spans: Vec<StyledSpan>,
     pub(super) continuation: bool,
+    /// Source whitespace omitted between this continuation and the preceding
+    /// prewrapped row. Copy restores it only when joining those rows.
+    pub(super) omitted_prefix: String,
 }
 
 impl StyledLine {
@@ -307,6 +310,11 @@ impl StyledLine {
         Self {
             spans,
             continuation: self.continuation,
+            omitted_prefix: if range.start == 0 {
+                self.omitted_prefix.clone()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -340,6 +348,7 @@ impl From<Vec<StyledSpan>> for StyledLine {
         Self {
             spans,
             continuation: false,
+            omitted_prefix: String::new(),
         }
     }
 }
@@ -362,6 +371,28 @@ pub(super) struct StyledRow {
 }
 
 impl StyledRow {
+    /// The byte boundary after a selected cell, including a whole wide glyph
+    /// but never the first glyph of the next wrapped row.
+    pub(super) fn offset_after(&self, line: &StyledLine, width: u16, column: usize) -> usize {
+        let offset = self.offset_at(line, width, column);
+        if offset == self.end || column < self.indent {
+            return offset;
+        }
+        let mut span_start = 0;
+        for span in &line.spans {
+            let span_end = span_start + span.content.len();
+            if offset < span_end {
+                return offset
+                    + span.content[offset - span_start..]
+                        .graphemes(true)
+                        .next()
+                        .map_or(0, str::len);
+            }
+            span_start = span_end;
+        }
+        offset
+    }
+
     /// The byte offset in `line`'s text that column `column` of this row
     /// lands on. A column in the hanging indent answers where the row's text
     /// begins; both cells of a wide character answer that character; a column

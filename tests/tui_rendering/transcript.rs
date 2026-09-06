@@ -6618,3 +6618,570 @@ fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
         rows.join("\n")
     );
 }
+
+#[test]
+fn transcript_selection_unwraps_text_and_persists_after_copy() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|m| m.role == MessageRole::Agent)
+        .unwrap()
+        .content = "Alpha bravo charlie delta echo foxtrot golf hotel   ".into();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 32, 24);
+    let start = text_position(&buffer, "Alpha");
+    let end = text_position(&buffer, "hotel");
+    let mouse = |kind, (x, y)| {
+        InputEvent::Mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    application
+        .handle_terminal_event(mouse(MouseEventKind::Down(MouseButton::Left), start))
+        .unwrap();
+    application
+        .handle_terminal_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            (end.0 + 10, end.1),
+        ))
+        .unwrap();
+    let selected = rendered_application_buffer(&application, 32, 24);
+    assert!(selected[start].modifier.contains(Modifier::REVERSED));
+    let transition = application
+        .handle_terminal_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            (end.0 + 10, end.1),
+        ))
+        .unwrap();
+    assert!(
+        matches!(transition, ApplicationTransition::CopyToClipboard(ref text)
+        if text == "Alpha bravo charlie delta echo foxtrot golf hotel"),
+        "{transition:?}"
+    );
+    assert!(
+        rendered_application_buffer(&application, 32, 24)[start]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+fn selection_mouse(kind: MouseEventKind, position: (u16, u16)) -> InputEvent {
+    InputEvent::Mouse(MouseEvent {
+        kind,
+        column: position.0,
+        row: position.1,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn select_transcript(application: &mut Application, start: (u16, u16), end: (u16, u16)) -> String {
+    use crossterm::event::MouseButton;
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+        ))
+        .unwrap();
+    match application
+        .handle_terminal_event(selection_mouse(MouseEventKind::Up(MouseButton::Left), end))
+        .unwrap()
+    {
+        ApplicationTransition::CopyToClipboard(text) => text,
+        other => panic!("expected copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn transcript_selection_copies_source_lines_skipping_chrome_and_keeping_separators() {
+    let workspace = workspace_dir();
+    for (entries, first, last, expected) in [
+        (
+            vec![RunEntry::AgentMessage(
+                "```rust\nlet answer = 42;   \n\nprintln!(\"界🙂\");\n```",
+            )],
+            "rust",
+            "println!",
+            "let answer = 42;\n\nprintln!(\"界🙂\");",
+        ),
+        (
+            vec![RunEntry::Command(ActivityStatus::Completed, Some(0))],
+            "command 1",
+            "command 1",
+            "command 1",
+        ),
+        (
+            vec![
+                RunEntry::AgentMessage("First source line"),
+                RunEntry::UserMessage("Second source line"),
+            ],
+            "First source",
+            "Second source",
+            "First source line\n\nSecond source line",
+        ),
+    ] {
+        let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &entries);
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let (x, y) = text_position(&buffer, first);
+        let (_, end_y) = text_position(&buffer, last);
+        let copied = select_transcript(&mut application, (x.saturating_sub(2), y), (58, end_y));
+        assert_eq!(copied, expected);
+    }
+}
+
+#[test]
+fn transcript_selection_survives_typing_and_clears_on_press_escape_resize_and_session_switch() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("Selected words")],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .unwrap();
+    for action in 0..4 {
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let start = text_position(&buffer, "Selected words");
+        assert_eq!(
+            select_transcript(&mut application, start, (start.0 + 13, start.1)),
+            "Selected words"
+        );
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(
+            rendered_application_buffer(&application, 60, 24)[start]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        let transition = match action {
+            0 => application.handle_terminal_event(selection_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                (0, 0),
+            )),
+            1 => application.handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            2 => application.handle_terminal_event(InputEvent::Resize(61, 24)),
+            _ => application.handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage("Selected words")],
+            ))),
+        }
+        .unwrap();
+        assert!(
+            action == 3 || matches!(transition, ApplicationTransition::Continue),
+            "{transition:?}"
+        );
+        assert!(
+            !rendered_application_buffer(&application, 60, 24)[start]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+}
+
+#[test]
+fn transcript_selection_clears_when_streaming_reprojects_but_survives_a_pure_append() {
+    let workspace = workspace_dir();
+    for streaming in [false, true] {
+        let mut snapshot = command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage("Selected words")],
+        );
+        snapshot.messages[0].status = MessageStatus::Streaming;
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let start = text_position(&buffer, "Selected words");
+        select_transcript(&mut application, start, (start.0 + 13, start.1));
+        let change = if streaming {
+            SessionChange::MessageContentAppended {
+                message_id: snapshot.messages[0].id,
+                content: " more words".into(),
+            }
+        } else {
+            let mut message = snapshot.messages[0].clone();
+            message.id = MessageId::new();
+            message.content = "New message appended".into();
+            SessionChange::MessageAdded { message }
+        };
+        application
+            .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+                SessionUpdate {
+                    session_id: snapshot.session.id,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![change],
+                },
+            )))
+            .unwrap();
+        let copy = application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::TextSelectionCopy,
+            )))
+            .unwrap();
+        assert_eq!(
+            matches!(copy, ApplicationTransition::CopyToClipboard(_)),
+            !streaming
+        );
+        let after = rendered_application_buffer(&application, 60, 24);
+        let position = text_position(&after, "Selected words");
+        assert_eq!(
+            after[position].modifier.contains(Modifier::REVERSED),
+            !streaming
+        );
+    }
+}
+
+#[test]
+fn transcript_selection_stays_on_text_when_the_wheel_scrolls() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let text = (0..35)
+        .map(|i| format!("unique row {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("placeholder")],
+    );
+    snapshot.messages[0].content = text;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&buffer, "unique row 31");
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            (start.0 + 12, start.1),
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(MouseEventKind::ScrollUp, start))
+        .unwrap();
+    let after = rendered_application_buffer(&application, 60, 24);
+    let moved = text_position(&after, "unique row 31");
+    assert_ne!(start.1, moved.1);
+    assert!(after[moved].modifier.contains(Modifier::REVERSED));
+    let copy = application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            (moved.0 + 12, moved.1),
+        ))
+        .unwrap();
+    assert!(
+        matches!(copy, ApplicationTransition::CopyToClipboard(ref text) if text == "unique row 31"),
+        "{copy:?}"
+    );
+}
+
+#[test]
+fn transcript_selection_joins_an_oversize_split_line() {
+    let workspace = workspace_dir();
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("placeholder")],
+    );
+    let source = format!("START {} END", "x".repeat(36_000));
+    snapshot.messages[0].content = source.clone();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 32, 1600);
+    let start = text_position(&buffer, "START");
+    let end = text_position(&buffer, "END");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 2, end.1)),
+        source
+    );
+}
+
+#[test]
+fn transcript_selection_clamps_to_the_centered_column_and_never_highlights_the_composer_or_sidebar()
+{
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("First line\n\nLast line")],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 160, 30);
+    let start = text_position(&buffer, "First line");
+    let end = text_position(&buffer, "Last line");
+    // The pointer leaves both the column and the Transcript's vertical extent.
+    assert_eq!(
+        select_transcript(&mut application, start, (159, 29)),
+        "First line\n\nLast line"
+    );
+    let selected = rendered_application_buffer(&application, 160, 30);
+    for y in 0..30 {
+        for x in 0..160 {
+            if selected[(x, y)].modifier.contains(Modifier::REVERSED)
+                && !buffer[(x, y)].modifier.contains(Modifier::REVERSED)
+            {
+                assert!(y >= start.1 && y <= end.1);
+                assert!(x >= start.0 - 2 && x < start.0 - 2 + 80, "{x},{y}");
+            }
+        }
+    }
+    assert!(
+        selected[(start.0 - 2, start.1 + 1)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert!(
+        selected[(start.0 - 2 + 79, start.1 + 1)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn transcript_selection_copies_a_wide_character_once_in_either_direction_and_blank_rows_as_empty_lines()
+ {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::AgentMessage("A界🙂Z"),
+            RunEntry::UserMessage("Last"),
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&buffer, "A界");
+    let last = text_position(&buffer, "Last");
+    assert_eq!(
+        select_transcript(
+            &mut application,
+            (start.0 + 1, start.1),
+            (start.0 + 2, start.1)
+        ),
+        "界"
+    );
+    assert_eq!(
+        select_transcript(
+            &mut application,
+            (start.0 + 4, start.1),
+            (start.0 + 1, start.1)
+        ),
+        "界🙂"
+    );
+    assert_eq!(
+        select_transcript(&mut application, start, (58, last.1 - 1)),
+        "A界🙂Z\n"
+    );
+}
+
+#[test]
+fn transcript_selection_clears_when_a_fold_is_toggled() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&buffer, "cargo test");
+    select_transcript(&mut application, start, (start.0 + 9, start.1));
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::TranscriptFoldsToggle,
+        )))
+        .unwrap();
+    let after = rendered_application_buffer(&application, 60, 24);
+    assert!(!after[start].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn transcript_selection_past_a_wrapped_rows_text_does_not_copy_the_next_rows_character() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("abcdefghijklmnopqrstuvw界tail")],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 28, 24);
+    let start = text_position(&buffer, "abcdefghijklmnopqrstuvw");
+    assert_eq!(
+        select_transcript(&mut application, start, (27, start.1)),
+        "abcdefghijklmnopqrstuvw"
+    );
+}
+
+#[test]
+fn transcript_selection_drag_returning_to_its_anchor_does_not_select_one_cell_or_click() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::Command(ActivityStatus::Completed, Some(0))],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let before = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&before, "command 1");
+    for (kind, position) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (
+            MouseEventKind::Drag(MouseButton::Left),
+            (start.0 + 2, start.1),
+        ),
+        (MouseEventKind::Drag(MouseButton::Left), start),
+        (MouseEventKind::Up(MouseButton::Left), start),
+    ] {
+        assert_eq!(
+            application
+                .handle_terminal_event(selection_mouse(kind, position))
+                .unwrap(),
+            ApplicationTransition::Continue
+        );
+    }
+    assert_eq!(rendered_application_buffer(&application, 60, 24), before);
+}
+
+#[test]
+fn transcript_selection_highlights_a_wide_glyph_when_dragging_from_its_trailing_cell() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::AgentMessage("A界🙂Z")],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let before = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&before, "A界");
+    assert_eq!(
+        select_transcript(
+            &mut application,
+            (start.0 + 2, start.1),
+            (start.0 + 5, start.1)
+        ),
+        "界🙂Z"
+    );
+    let after = rendered_application_buffer(&application, 60, 24);
+    assert!(
+        after[(start.0 + 1, start.1)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert!(!after[start].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn transcript_selection_unwraps_user_messages_without_losing_whitespace_or_empty_source_lines() {
+    let workspace = workspace_dir();
+    let source = "First words                        next words that wrap\n\nLast line   ";
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::UserMessage(source)],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 28, 24);
+    let start = text_position(&buffer, "First words");
+    let end = text_position(&buffer, "Last line");
+    assert_eq!(
+        select_transcript(&mut application, start, (27, end.1)),
+        "First words                        next words that wrap\n\nLast line"
+    );
+}
+
+#[test]
+fn transcript_selection_unwraps_the_visible_tail_of_a_folded_command_line() {
+    let workspace = workspace_dir();
+    let selected = format!("SELECT {} END", "z".repeat(100));
+    let output = format!("{}{}", "x".repeat(500), selected);
+    let (snapshot, _) =
+        command_activity_session(workspace.path(), ActivityStatus::Completed, &output, false);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    // Open its Peek, which can start partway through a source line.
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let header = text_position(&buffer, "cargo test");
+    super::support::click_mouse(
+        &mut application,
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: header.0,
+            row: header.1,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&buffer, "SELECT");
+    let end = text_position(&buffer, "END");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 2, end.1)),
+        selected
+    );
+}

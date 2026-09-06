@@ -27,7 +27,7 @@
 //! whole transcript to the terminal.
 
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::{Component, Path},
@@ -536,9 +536,31 @@ impl UnitStart {
 #[derive(Clone, Debug, Default)]
 pub(super) struct TranscriptCache {
     view: RefCell<Option<TranscriptView>>,
+    selection_epoch: Cell<u64>,
 }
 
 impl TranscriptCache {
+    pub(super) fn selection_epoch(&self) -> u64 {
+        self.selection_epoch.get()
+    }
+
+    pub(super) fn copy_selection(
+        &self,
+        selection: super::selection::TextSelection,
+    ) -> Option<String> {
+        if selection.epoch != self.selection_epoch() {
+            return None;
+        }
+        self.view.borrow().as_ref()?.copy_selection(selection)
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        self.view
+            .borrow()
+            .as_ref()
+            .map_or(0, TranscriptView::row_count)
+    }
+
     /// Returns the transcript view for the given content, rebuilding only the
     /// parts whose inputs changed since the previous frame.
     pub(super) fn view(
@@ -570,7 +592,17 @@ impl TranscriptCache {
         if needs_rebuild {
             let mut slot = self.view.borrow_mut();
             let previous = slot.take();
-            *slot = Some(rebuild(
+            let previous_key = previous.as_ref().map(|view| view.key);
+            let previous_units = previous
+                .as_ref()
+                .map(|view| {
+                    view.units
+                        .iter()
+                        .map(|unit| (unit.key, unit.fingerprint, unit.leading_separator))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let rebuilt = rebuild(
                 previous,
                 key,
                 snapshot,
@@ -578,7 +610,29 @@ impl TranscriptCache {
                 disclosure,
                 theme,
                 width,
-            ));
+            );
+            let same_layout = previous_key.is_some_and(|old| {
+                old.generation == key.generation
+                    && old.session_id == key.session_id
+                    && old.width == key.width
+                    && old.theme == key.theme
+                    && old.reasoning_visibility == key.reasoning_visibility
+                    && old.folds_fingerprint == key.folds_fingerprint
+                    && old.groups_fingerprint == key.groups_fingerprint
+                    && old.turns_fingerprint == key.turns_fingerprint
+            });
+            let pure_append = rebuilt.units.len() >= previous_units.len()
+                && previous_units
+                    .iter()
+                    .zip(&rebuilt.units)
+                    .all(|(old, unit)| {
+                        *old == (unit.key, unit.fingerprint, unit.leading_separator)
+                    });
+            if !same_layout || !pure_append {
+                self.selection_epoch
+                    .set(self.selection_epoch.get().wrapping_add(1));
+            }
+            *slot = Some(rebuilt);
         }
         Ref::map(self.view.borrow(), |view| {
             view.as_ref().expect("transcript view was just rebuilt")
@@ -623,7 +677,6 @@ pub(super) struct TranscriptView {
 /// across the whole view with separators as lines of their own, and a byte
 /// offset into that line's text (see [`StyledLine::written_text`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(super) struct TextPosition {
     pub(super) line: usize,
     pub(super) offset: usize,
@@ -633,6 +686,7 @@ pub(super) struct TextPosition {
 static SEPARATOR_LINE: StyledLine = StyledLine {
     spans: Vec::new(),
     continuation: false,
+    omitted_prefix: String::new(),
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -641,6 +695,55 @@ pub(super) struct TranscriptLink {
 }
 
 impl TranscriptView {
+    fn copy_selection(&self, selection: super::selection::TextSelection) -> Option<String> {
+        let (start, end) = selection.ordered();
+        let start = self.position_at(start.row, start.column)?;
+        let end = self.position_at_edge(end.row, end.column, true)?;
+        let mut copied = String::new();
+        let mut has_source_line = false;
+        for index in start.line..=end.line {
+            let line = self.projected_line(index)?;
+            // A standalone decoration has no source line. Empty source lines
+            // have no spans or an explicit empty text span beneath their gutter.
+            if !line.spans.is_empty() && line.spans.iter().all(|span| span.chrome) {
+                continue;
+            }
+            if has_source_line {
+                if line.continuation {
+                    copied.push_str(&line.omitted_prefix);
+                } else {
+                    copied.push('\n');
+                }
+            }
+            has_source_line = true;
+            let from = if index == start.line { start.offset } else { 0 };
+            let to = if index == end.line {
+                end.offset
+            } else {
+                usize::MAX
+            };
+            let mut offset = 0;
+            for span in &line.spans {
+                let span_end = offset + span.content.len();
+                if !span.chrome {
+                    copied.push_str(
+                        &span.content[from.clamp(offset, span_end) - offset
+                            ..to.clamp(offset, span_end) - offset],
+                    );
+                }
+                offset = span_end;
+            }
+        }
+        // Trim each source line without removing separator lines.
+        Some(
+            copied
+                .split('\n')
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     pub(super) fn row_count(&self) -> usize {
         self.row_count
     }
@@ -652,10 +755,11 @@ impl TranscriptView {
     /// The projected line and byte offset behind a Transcript cell, resolved
     /// through the same wrap that put the cell there, or `None` for a row
     /// past the Transcript. A separator row resolves to its own empty line.
-    /// Recorded for the Text Selection (ADR 0020); nothing outside the
-    /// projection's tests reads it yet.
-    #[allow(dead_code)]
     pub(super) fn position_at(&self, row: usize, column: usize) -> Option<TextPosition> {
+        self.position_at_edge(row, column, false)
+    }
+
+    fn position_at_edge(&self, row: usize, column: usize, after: bool) -> Option<TextPosition> {
         if row >= self.row_count {
             return None;
         }
@@ -670,9 +774,15 @@ impl TranscriptView {
             line += 1;
         }
         let wrapped = unit.rows.get(local_row)?;
-        let offset = wrapped
-            .row
-            .offset_at(&unit.lines[wrapped.line], self.key.width, column);
+        let offset = if after {
+            wrapped
+                .row
+                .offset_after(&unit.lines[wrapped.line], self.key.width, column)
+        } else {
+            wrapped
+                .row
+                .offset_at(&unit.lines[wrapped.line], self.key.width, column)
+        };
         Some(TextPosition {
             line: line + wrapped.line,
             offset,
@@ -680,8 +790,7 @@ impl TranscriptView {
     }
 
     /// A projected line by the index [`Self::position_at`] reports, or `None`
-    /// past the last one. Recorded for the same reader as `position_at`.
-    #[allow(dead_code)]
+    /// past the last one.
     pub(super) fn projected_line(&self, line: usize) -> Option<&StyledLine> {
         let unit = self.unit_at(|unit| unit.start_line, line)?;
         let mut local = line - unit.start_line;
@@ -2930,7 +3039,21 @@ fn fold_output_to_tail(
         let keep_from = rows.len().saturating_sub(remaining_rows);
         rows[keep_from..]
             .iter()
-            .map(|row| row_as_line(source, row))
+            .enumerate()
+            .map(|(index, row)| {
+                let mut line = row_as_line(source, row);
+                if index > 0 {
+                    line.continuation = true;
+                    line.omitted_prefix = source
+                        .slice(rows[keep_from + index - 1].end..row.start)
+                        .spans
+                        .into_iter()
+                        .filter(|span| !span.chrome)
+                        .map(|span| span.content)
+                        .collect();
+                }
+                line
+            })
             .collect()
     } else {
         Vec::new()
@@ -3417,6 +3540,7 @@ fn push_user_message(
         .saturating_sub(USER_MESSAGE_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
         .max(1);
     let layout = TextLayout::new(&content, u16::try_from(content_width).unwrap_or(u16::MAX));
+    let mut previous_end = 0;
     for row in layout.rows() {
         let mut segments = Vec::<(Style, String)>::new();
         for (offset, character) in row.text.char_indices() {
@@ -3432,6 +3556,12 @@ fn push_user_message(
             }
         }
         push_user_message_row(lines, segments, row.width, available_width, surface, accent);
+        let projected = lines.last_mut().expect("the user row was just pushed");
+        projected.continuation = row.start > 0 && content.as_bytes()[row.start - 1] != b'\n';
+        if projected.continuation {
+            projected.omitted_prefix = content[previous_end..row.start].to_owned();
+        }
+        previous_end = row.start + row.text.len();
     }
 }
 
@@ -3460,6 +3590,9 @@ fn push_user_message_row(
     let padding = available_width.saturating_sub(USER_MESSAGE_GUTTER.width() + row_width);
     let mut spans = Vec::with_capacity(segments.len() + 2);
     spans.push(StyledSpan::chrome(USER_MESSAGE_GUTTER, accent));
+    if segments.is_empty() {
+        spans.push(StyledSpan::text("", surface));
+    }
     spans.extend(
         segments
             .into_iter()
@@ -3502,9 +3635,7 @@ fn push_prefixed_lines_with_indent(
             if index == 0 { prefix } else { indent },
             style,
         )];
-        if !line.is_empty() {
-            spans.push(StyledSpan::text(line, style));
-        }
+        spans.push(StyledSpan::text(line, style));
         lines.push(StyledLine::from(spans));
     }
 }
@@ -3554,6 +3685,9 @@ fn push_styled_prefixed_lines(
                 line_has_content = true;
             }
             ContentToken::LineBreak => {
+                if !line_has_content {
+                    spans.push(StyledSpan::text("", base_style));
+                }
                 projection
                     .lines
                     .push(StyledLine::from(std::mem::take(&mut spans)));
@@ -3789,7 +3923,11 @@ fn layout_line(line: StyledLine, width: u16) -> Vec<(StyledLine, StyledLayout)> 
         return vec![(line, layout)];
     }
     let continuation = line.continuation;
+    let omitted_prefix = line.omitted_prefix.clone();
     let mut pieces = split_oversized_line(line, width);
+    if let Some((first, _)) = pieces.first_mut() {
+        first.omitted_prefix = omitted_prefix;
+    }
     for (index, (piece, _)) in pieces.iter_mut().enumerate() {
         piece.continuation = continuation || index > 0;
     }
