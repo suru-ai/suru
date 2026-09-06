@@ -549,7 +549,7 @@ impl TranscriptCache {
     pub(super) fn copy_selection(
         &self,
         selection: super::selection::TextSelection,
-    ) -> Option<String> {
+    ) -> Option<super::ClipboardContent> {
         if selection.epoch != self.selection_epoch() {
             return None;
         }
@@ -711,7 +711,10 @@ pub(super) struct TranscriptLink {
 }
 
 impl TranscriptView {
-    fn copy_selection(&self, selection: super::selection::TextSelection) -> Option<String> {
+    fn copy_selection(
+        &self,
+        selection: super::selection::TextSelection,
+    ) -> Option<super::ClipboardContent> {
         let (start, end) = selection.ordered();
         let start = self.position_at(start.row, start.column)?;
         let end = self.position_at_edge(end.row, end.column, true)?;
@@ -796,17 +799,33 @@ impl TranscriptView {
         let copied = parts
             .into_iter()
             .map(|part| match part {
-                Part::Plain(text) => text,
+                Part::Plain(text) => super::ClipboardContent::from(text),
                 Part::Markdown(document, ranges) => document.copy(&ranges, single_content),
             })
-            .collect::<String>();
-        Some(
+            .collect::<Vec<_>>();
+        let html = copied.iter().any(|part| part.html.is_some()).then(|| {
             copied
+                .iter()
+                .map(|part| {
+                    part.html.clone().unwrap_or_else(|| {
+                        if part.text.trim().is_empty() {
+                            String::new()
+                        } else {
+                            part.plain_html()
+                        }
+                    })
+                })
+                .collect::<String>()
+        });
+        let text = copied.into_iter().map(|part| part.text).collect::<String>();
+        Some(super::ClipboardContent {
+            text: text
                 .split('\n')
                 .map(str::trim_end)
                 .collect::<Vec<_>>()
                 .join("\n"),
-        )
+            html,
+        })
     }
 
     pub(super) fn row_count(&self) -> usize {

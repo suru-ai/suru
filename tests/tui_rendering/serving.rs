@@ -75,7 +75,7 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
 
     assert_eq!(
         press_with(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL,),
-        ApplicationTransition::CopyToClipboard(invite)
+        ApplicationTransition::CopyToClipboard(invite.into())
     );
     assert_eq!(
         press(&mut application, KeyCode::Char('x')),

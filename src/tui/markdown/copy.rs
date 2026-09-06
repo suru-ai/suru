@@ -197,7 +197,11 @@ impl Builder {
 }
 
 impl Document {
-    pub(crate) fn copy(&self, ranges: &[SourceRange], single_content: bool) -> String {
+    pub(crate) fn copy(
+        &self,
+        ranges: &[SourceRange],
+        single_content: bool,
+    ) -> crate::tui::ClipboardContent {
         let mut selected: BTreeMap<usize, Vec<Range<usize>>> = BTreeMap::new();
         for source in ranges {
             if !source.range.is_empty() {
@@ -218,8 +222,11 @@ impl Document {
         } else {
             0
         };
-        self.fragment(root, &selected, code_only)
-            .unwrap_or_default()
+        crate::tui::ClipboardContent::markdown(
+            self.fragment(root, &selected, code_only)
+                .unwrap_or_default(),
+            code_only,
+        )
     }
 
     fn fragment(

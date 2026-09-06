@@ -1,6 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
 mod attachment;
+mod clipboard;
 mod commands;
 mod completion;
 mod composer;
@@ -32,6 +33,7 @@ mod usage;
 mod workspace_picker;
 
 pub use crate::terminal::{TerminalColor, TerminalColorProbe, TerminalFacts};
+pub use clipboard::ClipboardContent;
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;
 pub use event_loop::run;

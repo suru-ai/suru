@@ -1925,7 +1925,7 @@ fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
         }))
         .unwrap();
     assert!(
-        matches!(copied, ApplicationTransition::CopyToClipboard(ref text) if text == draft),
+        matches!(copied, ApplicationTransition::CopyToClipboard(ref text) if text.text == draft),
         "{copied:?}"
     );
     assert_eq!(rendered_application_cursor_at(&application, 50, 24), cursor);

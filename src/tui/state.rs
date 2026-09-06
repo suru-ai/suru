@@ -2641,7 +2641,7 @@ pub enum ApplicationTransition {
     },
     /// Issue a fresh Invite containing exactly the addresses the reader chose.
     IssueInvite(crate::protocol::IssueInviteRequest),
-    CopyToClipboard(String),
+    CopyToClipboard(super::ClipboardContent),
     RemovePeer(String),
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
@@ -4734,7 +4734,8 @@ impl Application {
                         .state
                         .composers
                         .selection_frame()
-                        .and_then(|frame| frame.copy(selection)),
+                        .and_then(|frame| frame.copy(selection))
+                        .map(Into::into),
                     _ => self
                         .state
                         .selection_frames
@@ -4743,7 +4744,8 @@ impl Application {
                         .find(|frame| {
                             frame.surface == selection.surface && frame.epoch() == selection.epoch
                         })
-                        .and_then(|frame| frame.copy(selection)),
+                        .and_then(|frame| frame.copy(selection))
+                        .map(Into::into),
                 })
                 .map_or(
                     ApplicationTransition::Continue,
@@ -4850,10 +4852,12 @@ impl Application {
                 ApplicationTransition::Continue,
                 ApplicationTransition::IssueInvite,
             )),
-            SemanticCommandId::ServeCopyInvite => Ok(self.state.serve_overlay.copy_text().map_or(
-                ApplicationTransition::Continue,
-                ApplicationTransition::CopyToClipboard,
-            )),
+            SemanticCommandId::ServeCopyInvite => {
+                Ok(self.state.serve_overlay.copy_text().map(Into::into).map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::CopyToClipboard,
+                ))
+            }
             SemanticCommandId::ServeRemovePeer => {
                 Ok(self.state.serve_overlay.remove_selected().map_or(
                     ApplicationTransition::Continue,

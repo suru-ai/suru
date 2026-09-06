@@ -162,7 +162,7 @@ fn composer_and_transcript_drags_stay_on_the_surface_they_started_on() {
     assert!(!buffer[transcript].modifier.contains(Modifier::REVERSED));
     let copied = drag(&mut application, transcript, (99, composer.1));
     assert!(
-        matches!(copied, ApplicationTransition::CopyToClipboard(ref text) if text.contains("Initial Prompt") && !text.contains("draft remains here")),
+        matches!(copied, ApplicationTransition::CopyToClipboard(ref text) if text.text.contains("Initial Prompt") && !text.text.contains("draft remains here")),
         "{copied:?}"
     );
     assert!(

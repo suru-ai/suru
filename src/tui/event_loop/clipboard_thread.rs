@@ -4,13 +4,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::NativeClipboardSink;
+use super::{ClipboardContent, NativeClipboardSink};
 
 const DEFAULT_EXIT_TIMEOUT: Duration = Duration::from_millis(250);
 
+struct CopyRequest {
+    content: ClipboardContent,
+    completed: Box<dyn FnOnce(bool) + Send>,
+}
+
 #[derive(Default)]
 struct PendingCopy {
-    text: Option<String>,
+    copy: Option<CopyRequest>,
     stopping: bool,
 }
 
@@ -46,7 +51,7 @@ where
     F: Fn() -> S + Send + Sync + 'static,
     S: NativeClipboardSink + 'static,
 {
-    fn copy(&mut self, text: &str) {
+    fn copy(&mut self, content: &ClipboardContent, completed: impl FnOnce(bool) + Send + 'static) {
         if self.worker.is_none() {
             let pending = Arc::new((Mutex::new(PendingCopy::default()), Condvar::new()));
             let incoming = pending.clone();
@@ -58,19 +63,19 @@ where
                     // the native writer need not even be Send.
                     let mut writer = create_writer();
                     loop {
-                        let text = {
+                        let copy = {
                             let (slot, wake) = &*incoming;
                             let mut pending = slot.lock().unwrap();
-                            while pending.text.is_none() && !pending.stopping {
+                            while pending.copy.is_none() && !pending.stopping {
                                 pending = wake.wait(pending).unwrap();
                             }
-                            match pending.text.take() {
-                                Some(text) => text,
+                            match pending.copy.take() {
+                                Some(copy) => copy,
                                 None => break,
                             }
                         };
                         // Never hold the slot's lock across a display call.
-                        writer.copy(&text);
+                        writer.copy(&copy.content, copy.completed);
                     }
                 }) {
                 Ok(thread) => self.worker = Some(Worker { pending, thread }),
@@ -81,12 +86,16 @@ where
                         self.failure_reported = true;
                         tracing::warn!(%error, "could not start native Clipboard thread");
                     }
+                    completed(false);
                     return;
                 }
             }
         }
         let (slot, wake) = &*self.worker.as_ref().unwrap().pending;
-        slot.lock().unwrap().text = Some(text.to_owned());
+        slot.lock().unwrap().copy = Some(CopyRequest {
+            content: content.clone(),
+            completed: Box::new(completed),
+        });
         wake.notify_one();
     }
 }
@@ -137,8 +146,13 @@ mod tests {
     struct Writer<F>(F);
 
     impl<F: FnMut(&str)> NativeClipboardSink for Writer<F> {
-        fn copy(&mut self, text: &str) {
-            (self.0)(text);
+        fn copy(
+            &mut self,
+            content: &ClipboardContent,
+            completed: impl FnOnce(bool) + Send + 'static,
+        ) {
+            (self.0)(&content.text);
+            completed(true);
         }
     }
 
@@ -161,10 +175,15 @@ mod tests {
         }
 
         impl NativeClipboardSink for Handle {
-            fn copy(&mut self, text: &str) {
+            fn copy(
+                &mut self,
+                content: &ClipboardContent,
+                completed: impl FnOnce(bool) + Send + 'static,
+            ) {
                 self.events
-                    .send((text.to_owned(), thread::current().id()))
+                    .send((content.text.clone(), thread::current().id()))
                     .unwrap();
+                completed(true);
             }
         }
 
@@ -186,7 +205,7 @@ mod tests {
             }
         })
         .with_exit_timeout(Duration::from_millis(100));
-        clipboard.copy("first");
+        clipboard.copy(&"first".into(), |_| {});
         let created = received.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(created.0, "created");
         assert_ne!(created.1, thread::current().id());
@@ -194,7 +213,7 @@ mod tests {
             received.recv_timeout(Duration::from_secs(1)).unwrap(),
             ("first".to_owned(), created.1)
         );
-        clipboard.copy("latest");
+        clipboard.copy(&"latest".into(), |_| {});
         assert!(clipboard.shutdown());
         assert_eq!(
             received.try_iter().collect::<Vec<_>>(),
@@ -221,7 +240,7 @@ mod tests {
                 })
             })
             .with_exit_timeout(Duration::from_millis(20));
-            clipboard.copy("text");
+            clipboard.copy(&"text".into(), |_| {});
             writing.recv_timeout(Duration::from_secs(1)).unwrap();
             let began = Instant::now();
             let joined = clipboard.shutdown();
@@ -250,7 +269,13 @@ mod tests {
         }
 
         impl NativeClipboardSink for Handle {
-            fn copy(&mut self, _: &str) {}
+            fn copy(
+                &mut self,
+                _: &ClipboardContent,
+                completed: impl FnOnce(bool) + Send + 'static,
+            ) {
+                completed(true);
+            }
         }
 
         impl Drop for Handle {
@@ -284,7 +309,7 @@ mod tests {
                     }
                 })
                 .with_exit_timeout(Duration::from_millis(20));
-                clipboard.copy("text");
+                clipboard.copy(&"text".into(), |_| {});
                 let began = Instant::now();
                 drop(clipboard);
                 stopped.send(began.elapsed()).unwrap();

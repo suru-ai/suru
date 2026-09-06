@@ -261,7 +261,7 @@ The run of text a reader marks by dragging across a client's screen, so that the
 _Avoid_: Selection (bare), highlight, mark, mouse selection
 
 **Clipboard**:
-Where a copy lands, so that text taken from Suru can be pasted anywhere else. A copy is offered to every Clipboard the client can reach at once: the machine's own, and the terminal's by escape sequence, so a copy from a Suru run over SSH still reaches the reader's machine. Where the machine keeps a primary selection beside its clipboard, a copy fills both.
+Where content taken from Suru is offered for pasting elsewhere: formatted Markdown carries both formatting and its Markdown text alternative, while other copies carry plain text. A formatted copy prefers the machine's Clipboard and falls back to the terminal's when needed; plain-text copies reach both, and either kind also fills the machine's primary selection where one exists.
 _Avoid_: Host clipboard, system clipboard, OSC 52 (for the destination itself)
 
 **Notice**:

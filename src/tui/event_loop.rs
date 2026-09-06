@@ -38,6 +38,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use termina::Terminal as _;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::ClipboardContent;
 use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
 use super::commands::SemanticCommandId;
 use super::shimmer;
@@ -493,6 +494,7 @@ async fn run_loop(
         needs_redraw: true,
     };
     let mut clipboard = clipboard_thread::ClipboardThread::new(native_clipboard);
+    let mut delivery = ClipboardDelivery::default();
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
@@ -507,6 +509,10 @@ async fn run_loop(
         // the run -- a Provider shutdown and the exit command -- leave by the
         // same path as the input stream closing.
         let step = tokio::select! {
+            text = delivery.fallback() => {
+                copy_to_terminal(&mut TerminalOutput(terminal.backend_mut()), &text);
+                ControlFlow::Continue(())
+            }
             managed_event = run.client.next() => run.receive_managed_event(managed_event)?,
             () = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
                 run.expire_reconnect_grace()?
@@ -527,13 +533,14 @@ async fn run_loop(
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             input_event = input.next() => match input_event {
-                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard)?,
+                Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             },
         };
         if let ControlFlow::Break(exit) = step {
             clipboard.shutdown();
+            delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
             return leave_run_loop(terminal, &run.application, exit);
         }
 
@@ -557,14 +564,18 @@ async fn run_loop(
                 break;
             };
             let step = match pending_input {
-                Some(Ok(event)) => {
-                    run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard)?
-                }
+                Some(Ok(event)) => run.handle_terminal_input(
+                    event,
+                    terminal.backend_mut(),
+                    &mut clipboard,
+                    &mut delivery,
+                )?,
                 Some(Err(error)) => return Err(error.into()),
                 None => ControlFlow::Break(Exit::Now),
             };
             if let ControlFlow::Break(exit) = step {
                 clipboard.shutdown();
+                delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
                 return leave_run_loop(terminal, &run.application, exit);
             }
         }
@@ -588,10 +599,11 @@ impl RunLoop {
         input: TerminalInput,
         output: &mut impl std::io::Write,
         clipboard: &mut impl NativeClipboardSink,
+        delivery: &mut ClipboardDelivery,
     ) -> Result<ControlFlow<Exit>> {
         match input {
             TerminalInput::Event(event) => {
-                self.handle_input_event(event, &mut TerminalOutput(output), clipboard)
+                self.handle_input_event(event, &mut TerminalOutput(output), clipboard, delivery)
             }
             TerminalInput::Colors(update) => {
                 let mut facts = self.application.terminal_facts;
@@ -629,6 +641,7 @@ impl RunLoop {
         event: InputEvent,
         output: &mut impl TerminalSink,
         clipboard: &mut impl NativeClipboardSink,
+        delivery: &mut ClipboardDelivery,
     ) -> Result<ControlFlow<Exit>> {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
@@ -644,7 +657,7 @@ impl RunLoop {
             .application
             .handle_event(ApplicationEvent::Command(command))?;
         if let ApplicationTransition::CopyToClipboard(text) = transition {
-            copy_to_clipboard(output, clipboard, &text);
+            delivery.copy(output, clipboard, &text);
             return Ok(ControlFlow::Continue(()));
         }
         Ok(self.dispatch_transition(transition))
@@ -2665,7 +2678,9 @@ trait TerminalSink {
 /// Native copies are best effort: no failure may reach the Application or end
 /// the run. Tests substitute a recording sink without opening a display.
 trait NativeClipboardSink {
-    fn copy(&mut self, text: &str);
+    /// Report Clipboard delivery before attempting the optional primary selection.
+    /// A queued sink owns the callback with the corresponding content.
+    fn copy(&mut self, content: &ClipboardContent, completed: impl FnOnce(bool) + Send + 'static);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2682,7 +2697,9 @@ struct NativeClipboard<W> {
     failure_reported: bool,
 }
 
-impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> NativeClipboard<W> {
+impl<W: FnMut(NativeClipboardTarget, &ClipboardContent) -> Result<(), arboard::Error>>
+    NativeClipboard<W>
+{
     fn new(write: W) -> Self {
         Self {
             write,
@@ -2691,11 +2708,13 @@ impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> Native
     }
 }
 
-impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> NativeClipboardSink
-    for NativeClipboard<W>
+impl<W: FnMut(NativeClipboardTarget, &ClipboardContent) -> Result<(), arboard::Error>>
+    NativeClipboardSink for NativeClipboard<W>
 {
-    fn copy(&mut self, text: &str) {
-        if let Err(error) = (self.write)(NativeClipboardTarget::Clipboard, text) {
+    fn copy(&mut self, content: &ClipboardContent, completed: impl FnOnce(bool) + Send + 'static) {
+        let result = (self.write)(NativeClipboardTarget::Clipboard, content);
+        let delivered = result.is_ok();
+        if let Err(error) = result {
             if self.failure_reported {
                 tracing::debug!(%error, "could not write native Clipboard");
             } else {
@@ -2703,10 +2722,13 @@ impl<W: FnMut(NativeClipboardTarget, &str) -> Result<(), arboard::Error>> Native
                 tracing::warn!(%error, "could not write native Clipboard");
             }
         }
+        completed(delivered);
         // Clipboard delivery decides success; an unavailable primary selection
         // must not consume the run's first native Clipboard failure warning.
         #[cfg(target_os = "linux")]
-        if let Err(error) = (self.write)(NativeClipboardTarget::Primary, text) {
+        if let Err(error) =
+            (self.write)(NativeClipboardTarget::Primary, &content.text.clone().into())
+        {
             tracing::debug!(%error, "could not write native primary selection");
         }
     }
@@ -2716,13 +2738,16 @@ fn native_clipboard() -> impl NativeClipboardSink {
     // Keep the handle for the whole run: on Linux it owns the copied text.
     // Failed creation leaves it absent, so the next copy retries immediately.
     let mut clipboard = None;
-    NativeClipboard::new(move |target, text: &str| {
+    NativeClipboard::new(move |target, content: &ClipboardContent| {
         let clipboard = match &mut clipboard {
             Some(clipboard) => clipboard,
             slot @ None => slot.insert(arboard::Clipboard::new()?),
         };
         match target {
-            NativeClipboardTarget::Clipboard => clipboard.set_text(text),
+            NativeClipboardTarget::Clipboard => match &content.html {
+                Some(html) => clipboard.set_html(html.as_str(), Some(content.text.as_str())),
+                None => clipboard.set_text(content.text.as_str()),
+            },
             #[cfg(target_os = "linux")]
             NativeClipboardTarget::Primary => {
                 use arboard::{LinuxClipboardKind, SetExtLinux};
@@ -2730,7 +2755,7 @@ fn native_clipboard() -> impl NativeClipboardSink {
                 clipboard
                     .set()
                     .clipboard(LinuxClipboardKind::Primary)
-                    .text(text)
+                    .text(content.text.as_str())
             }
         }
     })
@@ -2752,15 +2777,104 @@ impl crossterm::Command for CopyToClipboard<'_> {
     }
 }
 
+/// Only the current copy may request terminal fallback. Replacing this receiver
+/// cancels older callbacks without retaining an unbounded queue of completions.
+struct ClipboardFallback {
+    result: tokio::sync::oneshot::Receiver<bool>,
+    text: String,
+    deadline: tokio::time::Instant,
+}
+
+struct ClipboardDelivery {
+    pending: Option<ClipboardFallback>,
+    timeout: Duration,
+}
+
+impl Default for ClipboardDelivery {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            timeout: Duration::from_millis(250),
+        }
+    }
+}
+
+impl ClipboardDelivery {
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn copy(
+        &mut self,
+        output: &mut impl TerminalSink,
+        native: &mut impl NativeClipboardSink,
+        content: &ClipboardContent,
+    ) {
+        self.pending = None;
+        let (completed, result) = tokio::sync::oneshot::channel();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        native.copy(content, move |delivered| {
+            let _ = completed.send(delivered);
+        });
+        if content.html.is_some() {
+            self.pending = Some(ClipboardFallback {
+                result,
+                text: content.text.clone(),
+                deadline,
+            });
+        } else {
+            copy_to_terminal(output, &content.text);
+        }
+    }
+
+    /// Called after the worker's bounded shutdown: do not lose a copy merely
+    /// because exit was the next input event, and never wait a second deadline.
+    fn finish(&mut self, output: &mut impl TerminalSink) {
+        if let Some(mut copy) = self.pending.take()
+            && !matches!(copy.result.try_recv(), Ok(true))
+        {
+            copy_to_terminal(output, &copy.text);
+        }
+    }
+
+    /// Cancellation safe: select can poll this alongside input, then replace the
+    /// pending copy before polling it again. No detached task writes to stdout.
+    async fn fallback(&mut self) -> String {
+        loop {
+            let Some(copy) = &mut self.pending else {
+                return pending().await;
+            };
+            let delivered = tokio::select! {
+                biased;
+                result = &mut copy.result => result.unwrap_or(false),
+                () = tokio::time::sleep_until(copy.deadline) => {
+                    tracing::debug!("native Clipboard delivery exceeded its fallback timeout");
+                    false
+                }
+            };
+            let copy = self.pending.take().unwrap();
+            if !delivered {
+                return copy.text;
+            }
+        }
+    }
+}
+
+fn copy_to_terminal(output: &mut impl TerminalSink, text: &str) {
+    if let Err(error) = ignore_unsupported(output.apply(CopyToClipboard(text))) {
+        tracing::warn!(%error, "could not write Clipboard through OSC 52");
+    }
+}
+
+#[cfg(test)]
 fn copy_to_clipboard(
     output: &mut impl TerminalSink,
     native: &mut impl NativeClipboardSink,
     text: &str,
 ) {
-    native.copy(text);
-    if let Err(error) = ignore_unsupported(output.apply(CopyToClipboard(text))) {
-        tracing::warn!(%error, "could not write Clipboard through OSC 52");
-    }
+    ClipboardDelivery::default().copy(output, native, &text.into());
 }
 
 struct TerminalOutput<W: std::io::Write>(W);
@@ -2854,10 +2968,10 @@ mod tests {
     use crossterm::Command;
 
     use super::{
-        Application, ApplicationEvent, DisableMouseButtonReporting, EnableMouseButtonReporting,
-        NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting, PushModifiedKeyReporting,
-        TerminalSink, copy_to_clipboard, enter_terminal_display, ignore_unsupported,
-        leave_terminal_display, remote_failure_from_session_error,
+        Application, ApplicationEvent, ClipboardContent, DisableMouseButtonReporting,
+        EnableMouseButtonReporting, NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting,
+        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, enter_terminal_display,
+        ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
@@ -2958,7 +3072,8 @@ mod tests {
             let started = started.clone();
             let resume = resume.clone();
             let written = written.clone();
-            NativeClipboard::new(move |target, text: &str| {
+            NativeClipboard::new(move |target, content: &ClipboardContent| {
+                let text = content.text.as_str();
                 if target == super::NativeClipboardTarget::Clipboard {
                     if text == "first" {
                         started.send(()).unwrap();
@@ -2986,6 +3101,260 @@ mod tests {
         assert_eq!(copies.try_iter().collect::<Vec<_>>(), ["first", "latest"]);
     }
 
+    #[tokio::test]
+    async fn rich_native_success_keeps_html_and_does_not_write_terminal_text() {
+        let content = crate::tui::ClipboardContent {
+            text: "**chosen**".into(),
+            html: Some("<p><strong>chosen</strong></p>\n".into()),
+        };
+        let mut offered = Vec::new();
+        let mut terminal = AnsiTranscript(String::new());
+        let mut delivery = super::ClipboardDelivery::default();
+        let mut native = NativeClipboard::new(|target, content: &crate::tui::ClipboardContent| {
+            offered.push((target, content.clone()));
+            Ok(())
+        });
+        delivery.copy(&mut terminal, &mut native, &content);
+        assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
+        assert!(terminal.0.is_empty());
+        assert_eq!(
+            offered[0],
+            (super::NativeClipboardTarget::Clipboard, content)
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            offered[1],
+            (super::NativeClipboardTarget::Primary, "**chosen**".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn rich_failure_falls_back_to_markdown_and_terminal_failure_is_log_only() {
+        let content = ClipboardContent {
+            text: "**chosen**".into(),
+            html: Some("<strong>chosen</strong>".into()),
+        };
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            let mut native = NativeClipboard::new(|_, _: &ClipboardContent| {
+                Err(arboard::Error::ClipboardNotSupported)
+            });
+            let mut delivery = super::ClipboardDelivery::default()
+                .with_timeout(std::time::Duration::from_millis(5));
+            let mut terminal = AnsiTranscript(String::new());
+            delivery.copy(&mut terminal, &mut native, &content);
+            assert!(terminal.0.is_empty());
+            let text = delivery.fallback().await;
+            super::copy_to_terminal(&mut terminal, &text);
+            assert_eq!(terminal.0, "\x1b]52;c;KipjaG9zZW4qKg==\x07");
+            let log = record_log(|| super::copy_to_terminal(&mut FailedTerminal(kind), &text));
+            assert_eq!(
+                log.contains("WARN"),
+                kind != std::io::ErrorKind::Unsupported
+            );
+            assert!(!log.contains("chosen"));
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_rich_completions_cannot_fall_back_and_pending_formats_stay_paired() {
+        use std::sync::{Arc, Mutex, mpsc};
+        for latest_is_rich in [true, false] {
+            let (entered, writing) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let resume = Arc::new(Mutex::new(resume));
+            let (offered, copies) = mpsc::channel();
+            let mut native = super::clipboard_thread::ClipboardThread::new(move || {
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let offered = offered.clone();
+                NativeClipboard::new(move |target, content: &ClipboardContent| {
+                    if target != super::NativeClipboardTarget::Clipboard {
+                        return Ok(());
+                    }
+                    offered.send(content.clone()).unwrap();
+                    if content.text == "first" {
+                        entered.send(()).unwrap();
+                        let _ = resume.lock().unwrap().recv();
+                        Err(arboard::Error::ClipboardNotSupported)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .with_exit_timeout(std::time::Duration::from_millis(100));
+            let first = ClipboardContent {
+                text: "first".into(),
+                html: Some("<p>first</p>".into()),
+            };
+            let replaced = ClipboardContent {
+                text: "replaced".into(),
+                html: Some("<h1>replaced</h1>".into()),
+            };
+            let latest = ClipboardContent {
+                text: "latest".into(),
+                html: latest_is_rich.then(|| "<em>latest</em>".into()),
+            };
+            let mut delivery = super::ClipboardDelivery::default()
+                .with_timeout(std::time::Duration::from_millis(5));
+            let mut terminal = AnsiTranscript(String::new());
+            delivery.copy(&mut terminal, &mut native, &first);
+            writing
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            delivery.copy(&mut terminal, &mut native, &replaced);
+            delivery.copy(&mut terminal, &mut native, &latest);
+            release.send(()).unwrap();
+            assert!(native.shutdown());
+            assert_eq!(copies.try_iter().collect::<Vec<_>>(), [first, latest]);
+            assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
+            assert_eq!(
+                terminal.0,
+                if latest_is_rich {
+                    ""
+                } else {
+                    "\x1b]52;c;bGF0ZXN0\x07"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_rich_native_access_has_bounded_fallback_and_shutdown() {
+        use std::sync::{Arc, Mutex, mpsc};
+        for stall_creation in [true, false] {
+            let (entered, stalled) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let resume = Arc::new(Mutex::new(resume));
+            let (done, finished) = mpsc::channel();
+            let mut native = super::clipboard_thread::ClipboardThread::new(move || {
+                if stall_creation {
+                    entered.send(()).unwrap();
+                    let _ = resume.lock().unwrap().recv();
+                }
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let done = done.clone();
+                NativeClipboard::new(move |target, _: &ClipboardContent| {
+                    if target == super::NativeClipboardTarget::Clipboard {
+                        if !stall_creation {
+                            entered.send(()).unwrap();
+                            let _ = resume.lock().unwrap().recv();
+                        }
+                        done.send(()).unwrap();
+                        return Err(arboard::Error::ClipboardNotSupported);
+                    }
+                    Ok(())
+                })
+            })
+            .with_exit_timeout(std::time::Duration::from_millis(5));
+            let mut delivery = super::ClipboardDelivery::default()
+                .with_timeout(std::time::Duration::from_millis(5));
+            let mut terminal = AnsiTranscript(String::new());
+            let content = ClipboardContent {
+                text: "**chosen**".into(),
+                html: Some("<strong>chosen</strong>".into()),
+            };
+            delivery.copy(&mut terminal, &mut native, &content);
+            stalled
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let text = tokio::time::timeout(std::time::Duration::from_secs(1), delivery.fallback())
+                .await
+                .unwrap();
+            super::copy_to_terminal(&mut terminal, &text);
+            assert_eq!(terminal.0, "\x1b]52;c;KipjaG9zZW4qKg==\x07");
+            let began = std::time::Instant::now();
+            assert!(!native.shutdown());
+            assert!(began.elapsed() < std::time::Duration::from_millis(120));
+            release.send(()).unwrap();
+            finished
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rich_success_is_reported_before_a_stalled_or_unsupported_primary_selection() {
+        use std::sync::{Arc, Mutex, mpsc};
+        let (entered, stalled) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Arc::new(Mutex::new(resume));
+        let mut native = super::clipboard_thread::ClipboardThread::new(move || {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            NativeClipboard::new(move |target, content: &ClipboardContent| {
+                if target == super::NativeClipboardTarget::Primary {
+                    assert_eq!(content, &ClipboardContent::from("chosen"));
+                    entered.send(()).unwrap();
+                    let _ = resume.lock().unwrap().recv();
+                    return Err(arboard::Error::ClipboardNotSupported);
+                }
+                Ok(())
+            })
+        })
+        .with_exit_timeout(std::time::Duration::from_millis(100));
+        let mut delivery =
+            super::ClipboardDelivery::default().with_timeout(std::time::Duration::ZERO);
+        let mut terminal = AnsiTranscript(String::new());
+        delivery.copy(
+            &mut terminal,
+            &mut native,
+            &ClipboardContent {
+                text: "chosen".into(),
+                html: Some("<p>chosen</p>".into()),
+            },
+        );
+        stalled
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
+        release.send(()).unwrap();
+        assert!(native.shutdown());
+        assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
+        assert!(terminal.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exiting_after_rich_copy_preserves_success_or_flushes_the_latest_fallback() {
+        for delivered in [true, false] {
+            let mut native = super::clipboard_thread::ClipboardThread::new(move || {
+                NativeClipboard::new(move |_, _: &ClipboardContent| {
+                    if delivered {
+                        Ok(())
+                    } else {
+                        Err(arboard::Error::ClipboardNotSupported)
+                    }
+                })
+            })
+            .with_exit_timeout(std::time::Duration::from_millis(100));
+            let mut delivery = super::ClipboardDelivery::default();
+            let mut terminal = AnsiTranscript(String::new());
+            delivery.copy(
+                &mut terminal,
+                &mut native,
+                &ClipboardContent {
+                    text: "chosen".into(),
+                    html: Some("<p>chosen</p>".into()),
+                },
+            );
+            assert!(native.shutdown());
+            delivery.finish(&mut terminal);
+            assert_eq!(
+                terminal.0,
+                if delivered {
+                    ""
+                } else {
+                    "\x1b]52;c;Y2hvc2Vu\x07"
+                }
+            );
+        }
+    }
+
     #[test]
     fn copying_an_invite_writes_the_same_text_to_both_clipboards() {
         let mut native = RecordingClipboard::default();
@@ -3006,8 +3375,8 @@ mod tests {
         assert_eq!(terminal.0, "\x1b]52;c;SGVsbG8K55WM8J+Zgg==\x07");
     }
 
-    #[test]
-    fn rendered_markdown_selection_reaches_clipboard_destinations_in_both_copy_modes() {
+    #[tokio::test]
+    async fn rendered_markdown_selection_reaches_clipboard_destinations_in_both_copy_modes() {
         use crate::protocol::{
             Message, MessageId, MessageRole, MessageStatus, ModelAvailability, Session, SessionId,
             SessionRevision, SessionSnapshot, SessionStatus, SidebarVisibility, TextSelectionCopy,
@@ -3116,22 +3485,30 @@ mod tests {
             let mut offered = Vec::new();
             let mut ansi = AnsiTranscript(String::new());
             {
-                let mut native = NativeClipboard::new(|target, text: &str| {
-                    offered.push((target, text.to_owned()));
+                let mut native = NativeClipboard::new(|target, content: &ClipboardContent| {
+                    offered.push((target, content.clone()));
                     Ok(())
                 });
-                copy_to_clipboard(&mut ansi, &mut native, &text);
+                let mut delivery = super::ClipboardDelivery::default();
+                delivery.copy(&mut ansi, &mut native, &text);
+                assert!(futures_util::FutureExt::now_or_never(delivery.fallback()).is_none());
             }
             assert_eq!(
                 offered[0],
-                (super::NativeClipboardTarget::Clipboard, "**chosen**".into())
+                (
+                    super::NativeClipboardTarget::Clipboard,
+                    ClipboardContent {
+                        text: "**chosen**".into(),
+                        html: Some("<p><strong>chosen</strong></p>\n".into())
+                    }
+                )
             );
             #[cfg(target_os = "linux")]
             assert_eq!(
                 offered[1],
                 (super::NativeClipboardTarget::Primary, "**chosen**".into())
             );
-            assert_eq!(ansi.0, "\x1b]52;c;KipjaG9zZW4qKg==\x07");
+            assert!(ansi.0.is_empty());
         }
     }
 
@@ -3143,7 +3520,8 @@ mod tests {
         let mut offered = Vec::new();
         let mut terminal = AnsiTranscript(String::new());
         {
-            let mut native = NativeClipboard::new(|target, text: &str| {
+            let mut native = NativeClipboard::new(|target, content: &ClipboardContent| {
+                let text = content.text.as_str();
                 offered.push((target, text.to_owned()));
                 Ok(())
             });
@@ -3170,8 +3548,13 @@ mod tests {
     struct RecordingClipboard(Vec<String>);
 
     impl NativeClipboardSink for RecordingClipboard {
-        fn copy(&mut self, text: &str) {
-            self.0.push(text.to_owned());
+        fn copy(
+            &mut self,
+            content: &ClipboardContent,
+            completed: impl FnOnce(bool) + Send + 'static,
+        ) {
+            self.0.push(content.text.clone());
+            completed(true);
         }
     }
 
@@ -3228,14 +3611,16 @@ mod tests {
         let mut terminal = AnsiTranscript(String::new());
         let mut copied = Vec::new();
         let log = record_log(|| {
-            let mut native = NativeClipboard::new(|target, text: &str| match (target, text) {
-                (Clipboard, "failed") => Err(arboard::Error::ClipboardNotSupported),
-                (Clipboard, _) => {
-                    copied.push(text.to_owned());
-                    Ok(())
+            let mut native = NativeClipboard::new(|target, content: &ClipboardContent| {
+                match (target, content.text.as_str()) {
+                    (Clipboard, "failed") => Err(arboard::Error::ClipboardNotSupported),
+                    (Clipboard, _) => {
+                        copied.push(content.text.clone());
+                        Ok(())
+                    }
+                    (Primary, "failed") => Ok(()),
+                    (Primary, _) => Err(arboard::Error::ClipboardNotSupported),
                 }
-                (Primary, "failed") => Ok(()),
-                (Primary, _) => Err(arboard::Error::ClipboardNotSupported),
             });
             for text in ["one", "two", "failed"] {
                 copy_to_clipboard(&mut terminal, &mut native, text);
@@ -3262,7 +3647,8 @@ mod tests {
         let mut terminal = AnsiTranscript(String::new());
         let mut offered = Vec::new();
         let log = record_log(|| {
-            let mut native = NativeClipboard::new(|target, text: &str| {
+            let mut native = NativeClipboard::new(|target, content: &ClipboardContent| {
+                let text = content.text.as_str();
                 if target != super::NativeClipboardTarget::Clipboard {
                     return Ok(());
                 }

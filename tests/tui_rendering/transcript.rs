@@ -6665,7 +6665,7 @@ fn transcript_selection_unwraps_text_and_persists_after_copy() {
         .unwrap();
     assert!(
         matches!(transition, ApplicationTransition::CopyToClipboard(ref text)
-        if text == "Alpha bravo charlie delta echo foxtrot golf hotel"),
+        if text.text == "Alpha bravo charlie delta echo foxtrot golf hotel"),
         "{transition:?}"
     );
     assert!(
@@ -6684,7 +6684,11 @@ fn selection_mouse(kind: MouseEventKind, position: (u16, u16)) -> InputEvent {
     })
 }
 
-fn select_transcript(application: &mut Application, start: (u16, u16), end: (u16, u16)) -> String {
+fn select_transcript_payload(
+    application: &mut Application,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> suru::tui::ClipboardContent {
     use crossterm::event::MouseButton;
     application
         .handle_terminal_event(selection_mouse(
@@ -6707,6 +6711,10 @@ fn select_transcript(application: &mut Application, start: (u16, u16), end: (u16
     }
 }
 
+fn select_transcript(application: &mut Application, start: (u16, u16), end: (u16, u16)) -> String {
+    select_transcript_payload(application, start, end).text
+}
+
 #[test]
 fn markdown_selection_balances_partial_inline_formatting_without_unselected_words() {
     let workspace = workspace_dir();
@@ -6724,8 +6732,11 @@ fn markdown_selection_balances_partial_inline_formatting_without_unselected_word
     let buffer = rendered_application_buffer(&application, 80, 24);
     let start = text_position(&buffer, "chosen words");
     assert_eq!(
-        select_transcript(&mut application, start, (start.0 + 5, start.1)),
-        "***chosen***"
+        select_transcript_payload(&mut application, start, (start.0 + 5, start.1)),
+        suru::tui::ClipboardContent {
+            text: "***chosen***".into(),
+            html: Some("<p><em><strong>chosen</strong></em></p>\n".into()),
+        }
     );
 }
 
@@ -6935,7 +6946,7 @@ fn transcript_selection_stays_on_text_when_the_wheel_scrolls() {
         ))
         .unwrap();
     assert!(
-        matches!(copy, ApplicationTransition::CopyToClipboard(ref text) if text == "unique row 31"),
+        matches!(copy, ApplicationTransition::CopyToClipboard(ref text) if text.text == "unique row 31"),
         "{copy:?}"
     );
 }
@@ -7271,7 +7282,10 @@ fn manual_selection_waits_for_copy_and_explicit_copy_clears_in_both_modes() {
                 if mode == TextSelectionCopy::Manual {
                     ApplicationTransition::Continue
                 } else {
-                    ApplicationTransition::CopyToClipboard("Selected words".into())
+                    ApplicationTransition::CopyToClipboard(suru::tui::ClipboardContent {
+                        text: "Selected words".into(),
+                        html: Some("<p>Selected words</p>\n".into()),
+                    })
                 }
             );
             assert!(
@@ -7286,7 +7300,10 @@ fn manual_selection_waits_for_copy_and_explicit_copy_clears_in_both_modes() {
             };
             assert_eq!(
                 application.handle_terminal_event(event).unwrap(),
-                ApplicationTransition::CopyToClipboard("Selected words".into())
+                ApplicationTransition::CopyToClipboard(suru::tui::ClipboardContent {
+                    text: "Selected words".into(),
+                    html: Some("<p>Selected words</p>\n".into())
+                })
             );
             assert!(
                 !rendered_application_buffer(&application, 60, 24)[start]
@@ -7375,7 +7392,7 @@ fn transcript_edge_drag_scrolls_on_events_and_ticks_and_copies_the_whole_selecti
         ))
         .unwrap();
     assert!(
-        matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied == &text),
+        matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied.text == text),
         "{transition:?}"
     );
     assert!(
@@ -7494,7 +7511,7 @@ fn transcript_edge_drag_speed_tracks_distance_and_reentry_disarms_ticks() {
             ))
             .unwrap();
         assert!(
-            matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied == &text),
+            matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied.text == text),
             "{transition:?}"
         );
         assert!(!application.wants_spinner());
@@ -7555,13 +7572,14 @@ fn reconnecting_cancels_a_held_transcript_edge_drag() {
 #[test]
 fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
     let workspace = workspace_dir();
-    for (source, first, last, last_width, expected) in [
+    for (source, first, last, last_width, expected, expected_html) in [
         (
             "## Heading\n\nA **bold** and *soft* `value` [link](https://example.test).\n\n> quoted words",
             "Heading",
             "quoted words",
             12,
             "## Heading\n\nA **bold** and *soft* `value` [link](https://example.test).\n\n> quoted words",
+            "<h2>Heading</h2>\n<p>A <strong>bold</strong> and <em>soft</em> <code>value</code> <a href=\"https://example.test\">link</a>.</p>\n<blockquote>\n<p>quoted words</p>\n</blockquote>\n",
         ),
         (
             "3. before **chosen words** after\n   - nested *child text*\n4. outside",
@@ -7569,6 +7587,7 @@ fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
             "child text",
             5,
             "3. **chosen words** after\n   - nested *child*",
+            "<ol start=\"3\">\n<li><strong>chosen words</strong> after\n<ul>\n<li>nested <em>child</em></li>\n</ul>\n</li>\n</ol>\n",
         ),
     ] {
         let mut application = connected_application(workspace.path());
@@ -7583,10 +7602,10 @@ fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
         let buffer = rendered_application_buffer(&application, 100, 32);
         let start = text_position(&buffer, first);
         let end = text_position(&buffer, last);
-        assert_eq!(
-            select_transcript(&mut application, start, (end.0 + last_width - 1, end.1)),
-            expected
-        );
+        let content =
+            select_transcript_payload(&mut application, start, (end.0 + last_width - 1, end.1));
+        assert_eq!(content.text, expected);
+        assert_eq!(content.html.as_deref(), Some(expected_html));
     }
 }
 
@@ -7594,20 +7613,28 @@ fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
 fn markdown_selection_copies_complete_and_partial_pipe_tables() {
     let workspace = workspace_dir();
     let source = "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` | |\n| beta | left\\|right | |";
-    for (first, last, last_width, expected) in [
+    for (first, last, last_width, expected, expected_html) in [
         (
             "Name",
             "left|right",
             14,
             "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` |  |\n| beta | left\\|right |  |",
+            "<table><thead><tr><th style=\"text-align: left\">Name</th><th style=\"text-align: right\">Value</th><th style=\"text-align: center\">Empty</th></tr></thead><tbody>\n<tr><td style=\"text-align: left\"><strong>alpha</strong></td><td style=\"text-align: right\"><code>a|b</code></td><td style=\"text-align: center\"></td></tr>\n<tr><td style=\"text-align: left\">beta</td><td style=\"text-align: right\">left|right</td><td style=\"text-align: center\"></td></tr>\n</tbody></table>\n",
         ),
         (
             "alpha",
             "left|right",
             4,
             "|  |  |  |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` |  |\n| beta | left |  |",
+            "<table><thead><tr><th style=\"text-align: left\"></th><th style=\"text-align: right\"></th><th style=\"text-align: center\"></th></tr></thead><tbody>\n<tr><td style=\"text-align: left\"><strong>alpha</strong></td><td style=\"text-align: right\"><code>a|b</code></td><td style=\"text-align: center\"></td></tr>\n<tr><td style=\"text-align: left\">beta</td><td style=\"text-align: right\">left</td><td style=\"text-align: center\"></td></tr>\n</tbody></table>\n",
         ),
-        ("left|right", "left|right", 4, "|  |\n| ---: |\n| left |"),
+        (
+            "left|right",
+            "left|right",
+            4,
+            "|  |\n| ---: |\n| left |",
+            "<table><thead><tr><th style=\"text-align: right\"></th></tr></thead><tbody>\n<tr><td style=\"text-align: right\">left</td></tr>\n</tbody></table>\n",
+        ),
     ] {
         let mut application = connected_application(workspace.path());
         pin_release_copy(&mut application);
@@ -7621,10 +7648,10 @@ fn markdown_selection_copies_complete_and_partial_pipe_tables() {
         let buffer = rendered_application_buffer(&application, 100, 32);
         let start = text_position(&buffer, first);
         let end = text_position(&buffer, last);
-        assert_eq!(
-            select_transcript(&mut application, start, (end.0 + last_width - 1, end.1)),
-            expected
-        );
+        let content =
+            select_transcript_payload(&mut application, start, (end.0 + last_width - 1, end.1));
+        assert_eq!(content.text, expected);
+        assert_eq!(content.html.as_deref(), Some(expected_html));
     }
 }
 
@@ -7689,8 +7716,15 @@ fn markdown_selection_unwraps_formatted_unicode_across_messages_and_omits_hidden
     let buffer = rendered_application_buffer(&application, 32, 40);
     let start = text_position(&buffer, "First");
     let end = text_position(&buffer, "final words");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 10, end.1));
     assert_eq!(
-        select_transcript(&mut application, start, (end.0 + 10, end.1)),
+        content.html.as_deref(),
+        Some(
+            "<h2>First</h2>\n<p><strong>one two three four five six seven eight 界🙂 nine ten</strong></p>\n<h2>Last</h2>\n<p><em>final words</em></p>\n"
+        )
+    );
+    assert_eq!(
+        content.text,
         "## First\n\n**one two three four five six seven eight 界🙂 nine ten**\n\n## Last\n\n*final words*"
     );
 }
@@ -7727,9 +7761,11 @@ fn markdown_selection_preserves_visible_reasoning_and_excludes_folded_body() {
     let buffer = rendered_application_buffer(&application, 80, 32);
     let start = text_position(&buffer, "Plan");
     let end = text_position(&buffer, "this");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 3, end.1));
+    assert_eq!(content.text, "### Plan\n\nChoose **this**");
     assert_eq!(
-        select_transcript(&mut application, start, (end.0 + 3, end.1)),
-        "### Plan\n\nChoose **this**"
+        content.html.as_deref(),
+        Some("<h3>Plan</h3>\n<p>Choose <strong>this</strong></p>\n")
     );
 }
 
@@ -7751,9 +7787,13 @@ fn markdown_selection_fences_a_code_only_message_when_other_selected_messages_ar
     let buffer = rendered_application_buffer(&application, 80, 32);
     let start = text_position(&buffer, "Example");
     let end = text_position(&buffer, "let answer");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 15, end.1));
+    assert_eq!(content.text, "Example\n\n```rust\nlet answer = 42;\n```");
     assert_eq!(
-        select_transcript(&mut application, start, (end.0 + 15, end.1)),
-        "Example\n\n```rust\nlet answer = 42;\n```"
+        content.html.as_deref(),
+        Some(
+            "<p>Example</p>\n<pre><code class=\"language-rust\">let answer = 42;\n</code></pre>\n"
+        )
     );
 }
 
@@ -7926,4 +7966,52 @@ fn markdown_selection_keeps_a_leading_tilde_fence_inside_a_list() {
         select_transcript(&mut application, start, (end.0 + 4, end.1)),
         "- ~~~lang`meta\n  code\n  ~~~\n\n  after"
     );
+}
+
+#[test]
+fn rich_selection_escapes_literal_markup_and_keeps_code_literal() {
+    let workspace = workspace_dir();
+    for (source, first, last, last_width, text, html) in [
+        (
+            "before <script>alert(1)</script> after",
+            "<script>",
+            "</script>",
+            9,
+            "\\<script\\>alert(1)\\</script\\>",
+            "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n",
+        ),
+        (
+            "```html\n<b>**literal** & value</b>   \nlast\n```",
+            "<b>",
+            "last",
+            4,
+            "<b>**literal** & value</b>\nlast",
+            "<pre><code>&lt;b&gt;**literal** &amp; value&lt;/b&gt;\nlast</code></pre>\n",
+        ),
+        (
+            "[chosen](javascript:alert%281%29) ![picture](https://example.test/image.png)",
+            "chosen",
+            "picture",
+            7,
+            "[chosen](javascript:alert%281%29) ![picture](https://example.test/image.png)",
+            "<p><a href=\"\">chosen</a> <a href=\"https://example.test/image.png\">picture</a></p>\n",
+        ),
+    ] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage(source)],
+            )))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        let start = text_position(&buffer, first);
+        let end = text_position(&buffer, last);
+        let content =
+            select_transcript_payload(&mut application, start, (end.0 + last_width - 1, end.1));
+        assert_eq!(content.text, text, "{source}");
+        assert_eq!(content.html.as_deref(), Some(html), "{source}");
+    }
 }

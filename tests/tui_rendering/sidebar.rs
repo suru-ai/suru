@@ -8062,7 +8062,7 @@ fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
             (1, first.1.min(second.1)),
             (29, first.1.max(second.1))
         ),
-        ApplicationTransition::CopyToClipboard(expected)
+        ApplicationTransition::CopyToClipboard(expected.into())
     );
     for position in [(0, first.1), (31, first.1), (70, PRESS_HEIGHT - 1)] {
         mouse(
