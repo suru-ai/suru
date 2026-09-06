@@ -667,12 +667,15 @@ fn pending_transcript_activity_opens_its_own_request() {
         .nth(1)
         .unwrap()
         .0;
-    app.handle_terminal_event(Event::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: rows[row].find("Questionnaire").unwrap() as u16,
-        row: row as u16,
-        modifiers: KeyModifiers::NONE,
-    }))
+    super::support::click_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rows[row].find("Questionnaire").unwrap() as u16,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
     .unwrap();
     let screen = rendered_application_rows(&app).join("\n");
     assert!(

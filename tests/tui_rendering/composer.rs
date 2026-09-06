@@ -1602,14 +1602,16 @@ fn clicking_the_composer_places_the_insertion_point_on_landing_and_session() {
 }
 
 fn click_composer(application: &mut Application, column: u16, row: u16) {
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("click the composer");
+        },
+    )
+    .expect("click the composer");
 }
 
 #[test]
@@ -1693,7 +1695,7 @@ fn composer_clicks_follow_word_wrapping_and_internal_scrolling_after_resize() {
 }
 
 #[test]
-fn composer_clicks_ignore_borders_padding_and_non_press_mouse_events() {
+fn composer_clicks_ignore_borders_padding_and_unpaired_mouse_events() {
     for target in 0..7 {
         let mut application = Application::default();
         type_terminal_text(&mut application, "hello");
@@ -1717,14 +1719,16 @@ fn composer_clicks_ignore_borders_padding_and_non_press_mouse_events() {
             5 => (block.left + 2, row, MouseEventKind::Drag(MouseButton::Left)),
             _ => (0, row, MouseEventKind::Down(MouseButton::Left)),
         };
-        application
-            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+        super::support::click_mouse(
+            &mut application,
+            MouseEvent {
                 kind,
                 column,
                 row,
                 modifiers: KeyModifiers::NONE,
-            }))
-            .unwrap();
+            },
+        )
+        .unwrap();
         type_terminal_text(&mut application, "!");
         assert!(
             rendered_application_rows_at(&application, 80, 30)

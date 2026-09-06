@@ -120,14 +120,16 @@ fn press_text(
 ) -> ApplicationTransition {
     let buffer = rendered_application_buffer(application, width, height);
     let (column, row) = text_position(&buffer, needle);
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("press the rendered row")
+        },
+    )
+    .expect("press the rendered row")
 }
 
 fn press_key(application: &mut Application, code: KeyCode) -> ApplicationTransition {

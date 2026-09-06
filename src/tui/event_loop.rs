@@ -2514,7 +2514,8 @@ struct TerminalSession {
     terminal: Terminal<CrosstermBackend<termina::PlatformTerminal>>,
 }
 
-/// Enables button-press and wheel reporting (1000) with SGR encoding (1006).
+/// Enables button and wheel reporting (1000), SGR encoding (1006), and
+/// motion while a button is held (1002).
 /// Deliberately excludes any-motion tracking (1003), which crossterm's
 /// `EnableMouseCapture` turns on: motion tracking floods the input stream with
 /// pointer-move events nothing in the TUI consumes.
@@ -2522,7 +2523,7 @@ struct EnableMouseButtonReporting;
 
 impl crossterm::Command for EnableMouseButtonReporting {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h"))
+        f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h", "\x1b[?1002h"))
     }
 
     #[cfg(windows)]
@@ -2535,7 +2536,7 @@ struct DisableMouseButtonReporting;
 
 impl crossterm::Command for DisableMouseButtonReporting {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str(concat!("\x1b[?1006l", "\x1b[?1000l"))
+        f.write_str(concat!("\x1b[?1002l", "\x1b[?1006l", "\x1b[?1000l"))
     }
 
     #[cfg(windows)]
@@ -2865,6 +2866,8 @@ mod tests {
                 "\x1b[?25l",   // cursor hidden
                 "\x1b[?2004h", // bracketed paste
                 "\x1b[?1000h", // mouse button reporting
+                "\x1b[?1006h", // SGR mouse encoding
+                "\x1b[?1002h", // button-motion reporting
                 "\x1b[>1u",    // modified key reporting
                 "\x1b[?2031h", // terminal Theme updates
             ],
@@ -2886,6 +2889,8 @@ mod tests {
             &[
                 "\x1b[?2031l", // terminal Theme updates
                 "\x1b[<1u",    // modified key reporting
+                "\x1b[?1002l", // button-motion reporting
+                "\x1b[?1006l", // SGR mouse encoding
                 "\x1b[?1000l", // mouse button reporting
                 "\x1b[?2004l", // bracketed paste
                 "\x1b[?1049l", // alternate screen
@@ -2904,12 +2909,17 @@ mod tests {
     fn every_feature_entering_the_display_turns_on_is_turned_off_again() {
         let entered = AnsiTranscript::record(enter_terminal_display);
         let left = AnsiTranscript::record(leave_terminal_display);
+        assert!(
+            !entered.contains("\x1b[?1003h"),
+            "any-motion tracking stays off"
+        );
         for (enabled, disabled) in [
             ("\x1b[?1049h", "\x1b[?1049l"),
             ("\x1b[?25l", "\x1b[?25h"),
             ("\x1b[?2004h", "\x1b[?2004l"),
             ("\x1b[?1000h", "\x1b[?1000l"),
             ("\x1b[?1006h", "\x1b[?1006l"),
+            ("\x1b[?1002h", "\x1b[?1002l"),
             ("\x1b[>1u", "\x1b[<1u"),
             ("\x1b[?2031h", "\x1b[?2031l"),
         ] {

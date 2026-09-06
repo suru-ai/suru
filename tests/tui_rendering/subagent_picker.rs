@@ -159,14 +159,16 @@ fn press_text(
 ) -> ApplicationTransition {
     let buffer = rendered_application_buffer(application, width, height);
     let (column, row) = text_position(&buffer, needle);
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("press the rendered row")
+        },
+    )
+    .expect("press the rendered row")
 }
 
 /// Settles one Subagent through the live session stream, the way the server
@@ -527,7 +529,7 @@ fn rows_answer_the_pointer_as_readily_as_the_keys() {
 }
 
 #[test]
-fn a_press_outside_the_picker_dismisses_it() {
+fn a_click_outside_the_picker_dismisses_it_but_a_drag_leaves_it_open() {
     let workspace = workspace_dir();
     let (snapshot, _) =
         parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
@@ -540,15 +542,38 @@ fn a_press_outside_the_picker_dismisses_it() {
     let buffer = rendered_application_buffer(&application, 80, 22);
     let (x, y) = text_position(&buffer, "hello world");
 
-    assert_eq!(
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), x),
+        (MouseEventKind::Drag(MouseButton::Left), x + 1),
+        (MouseEventKind::Up(MouseButton::Left), x),
+    ] {
         application
             .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+        assert!(
+            rendered_application_rows_at(&application, 80, 22)
+                .join("\n")
+                .contains("Subagents"),
+            "neither a press nor a drag dismisses the picker"
+        );
+    }
+
+    assert_eq!(
+        super::support::click_mouse(
+            &mut application,
+            MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: x,
                 row: y,
                 modifiers: KeyModifiers::NONE,
-            }))
-            .expect("press outside the picker"),
+            }
+        )
+        .expect("press outside the picker"),
         ApplicationTransition::Continue,
         "a press outside the picker is how a reader dismisses it"
     );

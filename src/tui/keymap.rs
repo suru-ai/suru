@@ -20,10 +20,7 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
         InputEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
             MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
-            // A press, not a release, so the frame answers the click the
-            // reader just made rather than trailing a drag that ends
-            // elsewhere.
-            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::PressAt {
+            MouseEventKind::Up(MouseButton::Left) => Some(CommandId::ClickAt {
                 position: Position::new(mouse.column, mouse.row),
             }),
             MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
@@ -65,9 +62,7 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
         InputEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
             MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
-            // A press, not a release, for the same reason the composer's view
-            // answers presses: the click the reader just made, not a drag.
-            MouseEventKind::Down(MouseButton::Left) => Some(CommandId::PressAt {
+            MouseEventKind::Up(MouseButton::Left) => Some(CommandId::ClickAt {
                 position: Position::new(mouse.column, mouse.row),
             }),
             MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
@@ -442,13 +437,11 @@ pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<Comma
 /// composer while the panel is open.
 ///
 /// The reader may also point at the panel, which the frame's own geometry
-/// resolves. A left press is the whole of it: the pointer asks for a tab or a
+/// resolves. A click is the whole of it: the pointer asks for a tab or a
 /// row, and no click carries a key's meaning.
 pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<CommandId> {
     if let InputEvent::Mouse(mouse) = &event {
-        // A press, not a release, so the panel answers the click the reader
-        // just made rather than trailing a drag that ends elsewhere.
-        return matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)).then_some(
+        return matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)).then_some(
             CommandId::FocusSettingsPanelAt {
                 column: mouse.column,
                 screen_row: mouse.row,

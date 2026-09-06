@@ -894,8 +894,7 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
         press_leader_chord(&mut application, 'f');
         if status == ActivityStatus::Active {
             let folded = rendered_application_rows_at(&application, 43, 18);
-            application
-                .handle_terminal_event(left_click_at(rendered_row(&folded, heading) as u16))
+            left_click_at(&mut application, rendered_row(&folded, heading) as u16)
                 .expect("open the active command whose details this matrix exercises");
         }
 
@@ -1712,13 +1711,16 @@ fn numbered_output(lines: usize) -> String {
     prefixed_output("output", lines)
 }
 
-fn left_click_at(row: u16) -> InputEvent {
-    InputEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: 6,
-        row,
-        modifiers: KeyModifiers::NONE,
-    })
+fn left_click_at(application: &mut Application, row: u16) -> anyhow::Result<ApplicationTransition> {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
 }
 
 /// Presses the Ctrl+X leader chord followed by `key`, the way a reader
@@ -1814,11 +1816,11 @@ fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the command's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the command's Peek");
 
     let narrow = rendered_application_rows_at(&application, 44, 24).join("\n");
     let wide = rendered_application_rows_at(&application, 110, 24).join("\n");
@@ -1841,11 +1843,11 @@ fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with very long output lines");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the command's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the command's Peek");
 
     let peek = rendered_application_rows_at(&application, 60, 24).join("\n");
 
@@ -1857,6 +1859,70 @@ fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
         peek.contains("line 4") && !peek.contains("line 3 "),
         "the Peek keeps only the tail the row budget allows: {peek}"
     );
+}
+
+#[test]
+fn a_fold_click_waits_for_release_and_a_drag_never_toggles_it() {
+    use crossterm::event::MouseButton;
+
+    for (motion_column, release_column, is_click) in [
+        (None, 6, true),
+        (Some(6), 6, true),
+        (None, 7, false),
+        (Some(7), 7, false),
+        (Some(7), 6, false),
+    ] {
+        let workspace = workspace_dir();
+        let (snapshot, _) = command_activity_session(
+            workspace.path(),
+            ActivityStatus::Completed,
+            &numbered_output(12),
+            false,
+        );
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .unwrap();
+        let before = rendered_application_rows_at(&application, 60, 24);
+        let row = rendered_row(&before, "✓ cargo test") as u16;
+        let mouse = |kind, column| {
+            InputEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        application
+            .handle_terminal_event(mouse(MouseEventKind::Down(MouseButton::Left), 6))
+            .unwrap();
+        assert_eq!(
+            rendered_application_rows_at(&application, 60, 24),
+            before,
+            "pressing alone must not open the Fold"
+        );
+        if let Some(column) = motion_column {
+            application
+                .handle_terminal_event(mouse(MouseEventKind::Drag(MouseButton::Left), column))
+                .unwrap();
+            assert_eq!(rendered_application_rows_at(&application, 60, 24), before);
+        }
+        application
+            .handle_terminal_event(mouse(MouseEventKind::Up(MouseButton::Left), release_column))
+            .unwrap();
+        let after = rendered_application_rows_at(&application, 60, 24);
+        if !is_click {
+            assert_eq!(
+                after, before,
+                "a drag must not toggle, even when it returns to the anchor"
+            );
+        } else {
+            assert!(
+                after.join("\n").contains("output line 12"),
+                "a click opens the Fold"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1875,11 +1941,11 @@ fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
 
     assert_eq!(
-        application
-            .handle_terminal_event(left_click_at(
-                rendered_row(&folded_rows, "✓ cargo test") as u16
-            ))
-            .expect("click the folded row"),
+        left_click_at(
+            &mut application,
+            rendered_row(&folded_rows, "✓ cargo test") as u16
+        )
+        .expect("click the folded row"),
         ApplicationTransition::Continue
     );
     let peek_rows = rendered_application_rows_at(&application, 60, 24);
@@ -1899,9 +1965,11 @@ fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
         "the fold marker sits above the tail it stands in for: {peek}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
-        .expect("click the fold marker");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("click the fold marker");
     let expanded_rows = rendered_application_rows_at(&application, 60, 24);
     let expanded = expanded_rows.join("\n");
     for line in 1..=12 {
@@ -1915,11 +1983,11 @@ fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
         "no fold marker remains: {expanded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "✓ cargo test") as u16
-        ))
-        .expect("click the entry header");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ cargo test") as u16,
+    )
+    .expect("click the entry header");
     let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         refolded.contains("✓ cargo test") && !refolded.contains("output line"),
@@ -1985,8 +2053,7 @@ fn expanding_failed_command_blank_output_keeps_working_tail_visible() {
         "a view following the tail has no Latest affordance: {peek}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +") as u16))
+    left_click_at(&mut application, rendered_row(&peek_rows, "… +") as u16)
         .expect("expand the failed command from its Peek");
 
     let expanded_rows = rendered_application_rows_at(&application, 60, 24);
@@ -2008,11 +2075,11 @@ fn expanding_failed_command_blank_output_keeps_working_tail_visible() {
     );
 
     let restored_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&restored_rows, "× cargo test") as u16
-        ))
-        .expect("collapse the expanded failed command");
+    left_click_at(
+        &mut application,
+        rendered_row(&restored_rows, "× cargo test") as u16,
+    )
+    .expect("collapse the expanded failed command");
     let collapsed = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         collapsed.contains("Working (") && !collapsed.contains("Latest ↓"),
@@ -2177,9 +2244,11 @@ fn a_folded_failed_row_keeps_its_exit_suffix_past_the_clamp() {
         .expect("attach a Session with a long failed command");
     let peek_rows = rendered_application_rows_at(&application, 40, 24);
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "× cargo run") as u16))
-        .expect("fold the failed command to its single row");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "× cargo run") as u16,
+    )
+    .expect("fold the failed command to its single row");
 
     let rows = rendered_application_rows_at(&application, 40, 24);
     let header = rows
@@ -2217,11 +2286,11 @@ fn the_folded_row_hides_the_cwd_line_until_the_peek() {
         "the single folded row keeps the cwd line back: {folded_rows:?}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the command's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the command's Peek");
     let peek = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         peek.contains("in /fixture/work"),
@@ -2244,11 +2313,11 @@ fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() 
         .expect("attach a Session with a short-output command");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the command's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the command's Peek");
     let peek_rows = rendered_application_rows_at(&application, 60, 24);
     let peek = peek_rows.join("\n");
     for line in 1..=4 {
@@ -2262,11 +2331,11 @@ fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() 
         "a fold marker never says +0 lines: {peek}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&peek_rows, "output line 2") as u16
-        ))
-        .expect("click the revealed output");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "output line 2") as u16,
+    )
+    .expect("click the revealed output");
     assert!(
         rendered_application_rows_at(&application, 60, 24)
             .join("\n")
@@ -2274,11 +2343,11 @@ fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() 
         "with nothing left to reveal, an output click changes nothing"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&peek_rows, "✓ cargo test") as u16
-        ))
-        .expect("click the entry header");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "✓ cargo test") as u16,
+    )
+    .expect("click the entry header");
     let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         !refolded.contains("output line"),
@@ -2300,33 +2369,35 @@ fn clicks_on_revealed_output_change_nothing() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the command's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the command's Peek");
     let peek_rows = rendered_application_rows_at(&application, 60, 24);
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&peek_rows, "output line 9") as u16
-        ))
-        .expect("click a revealed tail line");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "output line 9") as u16,
+    )
+    .expect("click a revealed tail line");
     let after_peek_click = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
         after_peek_click.contains("… +6 lines") && !after_peek_click.contains("output line 6"),
         "a click on the Peek's output moves nothing, keeping the surface free for selection: {after_peek_click}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
-        .expect("open the Fold the rest of the way");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the Fold the rest of the way");
     let expanded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "output line 6") as u16
-        ))
-        .expect("click inside the fully revealed output");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "output line 6") as u16,
+    )
+    .expect("click inside the fully revealed output");
 
     let after = rendered_application_rows_at(&application, 60, 24).join("\n");
     assert!(
@@ -2349,11 +2420,11 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open one entry's Peek by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open one entry's Peek by hand");
 
     press_leader_chord(&mut application, 'f');
     let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
@@ -2643,9 +2714,11 @@ fn file_change_activities_fold_past_the_path_budget_and_expand_on_click() {
         "the fold marker counts the paths it hides: {folded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "… +3 more") as u16))
-        .expect("expand the file-change entry");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "… +3 more") as u16,
+    )
+    .expect("expand the file-change entry");
     let expanded = rendered_application_rows_at(&application, 60, 24).join("\n");
     for change in 1..=7 {
         assert!(
@@ -2713,12 +2786,11 @@ fn folded_reasoning_is_one_line_naming_its_title_and_how_long_it_took() {
         "a folded Reasoning block hides the summary itself: {folded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(
-            &folded_rows,
-            "Thought: Inspecting the seam",
-        ) as u16))
-        .expect("expand the Reasoning entry");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "Thought: Inspecting the seam") as u16,
+    )
+    .expect("expand the Reasoning entry");
     let expanded_rows = rendered_application_rows_at(&application, 72, 24);
     let expanded = expanded_rows.join("\n");
     for revealed in ["Reading the projection.", "Then the store."] {
@@ -3501,11 +3573,11 @@ fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a streaming command");
     let folded_rows = rendered_application_rows_at(&application, 60, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "⠋ cargo test") as u16
-        ))
-        .expect("open the running command by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "⠋ cargo test") as u16,
+    )
+    .expect("open the running command by hand");
     assert!(
         rendered_application_rows_at(&application, 60, 24)
             .join("\n")
@@ -3567,11 +3639,11 @@ fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_ma
         "the single folded row keeps even the truncation marker back: {folded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("open the capped entry's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("open the capped entry's Peek");
     let peek_rows = rendered_application_rows_at(&application, 60, 30);
     let peek = peek_rows.join("\n");
     assert!(
@@ -3579,9 +3651,11 @@ fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_ma
         "one entry carries both a Fold and a Truncation: {peek}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
-        .expect("open the capped entry the rest of the way");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the capped entry the rest of the way");
 
     let expanded_rows = rendered_application_rows_at(&application, 60, 30);
     let expanded = expanded_rows.join("\n");
@@ -3620,11 +3694,11 @@ fn fold_state_stays_local_to_the_client_that_flipped_it() {
     }
     let folded_rows = rendered_application_rows_at(&reader, 60, 24);
 
-    reader
-        .handle_terminal_event(left_click_at(
-            rendered_row(&folded_rows, "✓ cargo test") as u16
-        ))
-        .expect("one client opens the entry's Peek");
+    left_click_at(
+        &mut reader,
+        rendered_row(&folded_rows, "✓ cargo test") as u16,
+    )
+    .expect("one client opens the entry's Peek");
 
     assert!(
         rendered_application_rows_at(&reader, 60, 24)
@@ -3658,8 +3732,7 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
         "the fixture starts with no content to hide"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&rows, "⠋ cargo test") as u16))
+    left_click_at(&mut application, rendered_row(&rows, "⠋ cargo test") as u16)
         .expect("click an entry that hides nothing");
 
     application
@@ -3709,9 +3782,11 @@ fn clicking_an_empty_active_row_under_the_expanded_posture_does_not_block_auto_p
     );
     let empty = rendered_application_rows_at(&application, 60, 24);
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&empty, "⠋ cargo test") as u16))
-        .expect("click the empty Active row");
+    left_click_at(
+        &mut application,
+        rendered_row(&empty, "⠋ cargo test") as u16,
+    )
+    .expect("click the empty Active row");
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
             SessionUpdate {
@@ -3759,13 +3834,7 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
             .handle_terminal_event(InputEvent::Key(key))
             .expect("open the Session picker over the transcript");
     }
-    assert_eq!(
-        application.command_for_terminal_input(left_click_at(command_row)),
-        None,
-        "a picker owns the surface, so a click never reaches the transcript beneath it"
-    );
-    application
-        .handle_terminal_event(left_click_at(command_row))
+    left_click_at(&mut application, command_row)
         .expect("click while the picker covers the transcript");
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -4572,11 +4641,11 @@ fn clicking_a_collapsed_group_expands_it_into_indented_folded_members() {
         .expect("attach a Session with a run of successful commands");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
-        ))
-        .expect("click the collapsed Group row");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+    )
+    .expect("click the collapsed Group row");
 
     let rows = rendered_application_rows_at(&application, 80, 30);
     let rendered = rows.join("\n");
@@ -4617,11 +4686,11 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of successful commands");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the Group");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the Group");
     let expanded_rows = rendered_application_rows_at(&application, 80, 36);
     let expanded = expanded_rows.join("\n");
     assert!(
@@ -4629,11 +4698,11 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
         "both members start out as single folded rows: {expanded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "✓ command 1") as u16
-        ))
-        .expect("open one member's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ command 1") as u16,
+    )
+    .expect("open one member's Peek");
 
     let rows = rendered_application_rows_at(&application, 80, 36);
     let rendered = rows.join("\n");
@@ -4652,8 +4721,7 @@ fn a_members_fold_toggles_independently_within_an_expanded_group() {
         "a member's Fold never collapses the Group: {rendered}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&rows, "✓ command 1") as u16))
+    left_click_at(&mut application, rendered_row(&rows, "✓ command 1") as u16)
         .expect("fold the member back from its header");
     let refolded = rendered_application_rows_at(&application, 80, 36).join("\n");
     assert!(
@@ -4676,34 +4744,36 @@ fn a_members_fold_override_survives_collapse_and_re_expansion() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of successful commands");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the Group");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the Group");
     let expanded_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "✓ command 1") as u16
-        ))
-        .expect("open the member's Peek");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ command 1") as u16,
+    )
+    .expect("open the member's Peek");
     let peek_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
-        .expect("open the member's Fold the rest of the way");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the member's Fold the rest of the way");
     let unfolded_rows = rendered_application_rows_at(&application, 80, 36);
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&unfolded_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("collapse the Group over the unfolded member");
+    left_click_at(
+        &mut application,
+        rendered_row(&unfolded_rows, "Ran 2 commands") as u16,
+    )
+    .expect("collapse the Group over the unfolded member");
     let recollapsed_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&recollapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the Group again");
+    left_click_at(
+        &mut application,
+        rendered_row(&recollapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the Group again");
 
     let rendered = rendered_application_rows_at(&application, 80, 36).join("\n");
     assert!(
@@ -4726,29 +4796,29 @@ fn an_expanded_group_recollapses_only_from_its_header_row() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a run of successful commands");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
-        ))
-        .expect("expand the Group");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+    )
+    .expect("expand the Group");
     let expanded_rows = rendered_application_rows_at(&application, 80, 30);
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "✓ command 2") as u16
-        ))
-        .expect("click a member row below the header");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ command 2") as u16,
+    )
+    .expect("click a member row below the header");
     let still_expanded = rendered_application_rows_at(&application, 80, 30).join("\n");
     assert!(
         still_expanded.contains("✓ command 2"),
         "a click below the header leaves the Group expanded: {still_expanded}"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "Ran 3 commands") as u16,
-        ))
-        .expect("click the Group header");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "Ran 3 commands") as u16,
+    )
+    .expect("click the Group header");
     let collapsed = rendered_application_rows_at(&application, 80, 30).join("\n");
     assert!(
         collapsed.contains("✓ Ran 3 commands"),
@@ -4777,11 +4847,11 @@ fn group_state_stays_local_to_the_client_that_flipped_it() {
     }
     let collapsed_rows = rendered_application_rows_at(&reader, 80, 30);
 
-    reader
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
-        ))
-        .expect("one client expands the Group");
+    left_click_at(
+        &mut reader,
+        rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+    )
+    .expect("one client expands the Group");
 
     assert!(
         rendered_application_rows_at(&reader, 80, 30)
@@ -4808,11 +4878,11 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a running command after a run");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the Group while the Turn runs");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the Group while the Turn runs");
     let expanded_rows = rendered_application_rows_at(&application, 80, 30);
     let running = &expanded_rows[rendered_row(&expanded_rows, "⠋ command 3")];
     assert!(
@@ -4865,11 +4935,11 @@ fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides()
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with two Groups");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the first Group by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the first Group by hand");
 
     press_leader_chord(&mut application, 'g');
     let expanded = rendered_application_rows_at(&application, 80, 36).join("\n");
@@ -4922,21 +4992,23 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with two Groups and long outputs");
     let collapsed_rows = rendered_application_rows_at(&application, 80, 50);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the first Group by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the first Group by hand");
     let member_rows = rendered_application_rows_at(&application, 80, 50);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&member_rows, "✓ command 1") as u16
-        ))
-        .expect("open the first member's Peek by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&member_rows, "✓ command 1") as u16,
+    )
+    .expect("open the first member's Peek by hand");
     let peek_rows = rendered_application_rows_at(&application, 80, 50);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&peek_rows, "… +6 lines") as u16))
-        .expect("open the first member's Fold the rest of the way");
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the first member's Fold the rest of the way");
 
     press_leader_chord(&mut application, 'g');
     let groups_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
@@ -4951,11 +5023,11 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
 
     press_leader_chord(&mut application, 'g');
     let collapsed_again = rendered_application_rows_at(&application, 80, 50);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&collapsed_again, "Ran 2 commands") as u16,
-        ))
-        .expect("expand the first Group by hand again");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_again, "Ran 2 commands") as u16,
+    )
+    .expect("expand the first Group by hand again");
 
     press_leader_chord(&mut application, 'f');
     let folds_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
@@ -5165,8 +5237,7 @@ fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
         .expect("attach a Session with a run of settled Reasoning blocks");
 
     let collapsed = rendered_application_rows_at(&application, 80, 24);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+    left_click_at(&mut application, rendered_row(&collapsed, "Thought") as u16)
         .expect("expand the Reasoning Group");
 
     let buffer = rendered_application_buffer(&application, 80, 24);
@@ -5202,9 +5273,11 @@ fn clicking_a_reasoning_group_opens_onto_every_members_prose_and_folds_back() {
         );
     }
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&expanded_rows, "Thought") as u16))
-        .expect("fold the Reasoning Group back");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "Thought") as u16,
+    )
+    .expect("fold the Reasoning Group back");
 
     let refolded = rendered_application_rows_at(&application, 80, 24);
     assert_eq!(
@@ -5223,15 +5296,14 @@ fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
         .expect("attach a Session with a run of settled Reasoning blocks");
 
     let collapsed = rendered_application_rows_at(&application, 80, 24);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+    left_click_at(&mut application, rendered_row(&collapsed, "Thought") as u16)
         .expect("expand the Reasoning Group");
     let expanded = rendered_application_rows_at(&application, 80, 24);
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded, "Read the projection.") as u16,
-        ))
-        .expect("click the revealed prose");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded, "Read the projection.") as u16,
+    )
+    .expect("click the revealed prose");
 
     assert_eq!(
         rendered_application_rows_at(&application, 80, 24),
@@ -5409,8 +5481,7 @@ fn an_expanded_reasoning_group_marks_the_member_whose_prose_the_cap_cut_short() 
         .expect("attach a Session whose first Reasoning block the cap cut short");
 
     let collapsed = rendered_application_rows_at(&application, 80, 18);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thought") as u16))
+    left_click_at(&mut application, rendered_row(&collapsed, "Thought") as u16)
         .expect("expand the Reasoning Group");
 
     let rows = rendered_application_rows_at(&application, 80, 18);
@@ -5508,9 +5579,11 @@ fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_agai
         .expect("attach a Session still thinking after a settled run");
 
     let collapsed = rendered_application_rows_at(&application, 80, 24);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thinking") as u16))
-        .expect("open the live Reasoning row");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed, "Thinking") as u16,
+    )
+    .expect("open the live Reasoning row");
 
     let expanded_rows = rendered_application_rows_at(&application, 80, 24);
     let header = rendered_row(&expanded_rows, "Thinking");
@@ -5535,11 +5608,11 @@ fn clicking_the_live_reasoning_row_reveals_the_streaming_prose_and_hides_it_agai
         expanded_rows.join("\n")
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "Thinking") as u16
-        ))
-        .expect("hide the streaming prose again");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "Thinking") as u16,
+    )
+    .expect("hide the streaming prose again");
 
     assert_eq!(
         rendered_application_rows_at(&application, 80, 24),
@@ -5669,9 +5742,11 @@ fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
         .expect("attach a Session still thinking after a settled run");
 
     let collapsed = rendered_application_rows_at(&application, 80, 40);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&collapsed, "Thinking") as u16))
-        .expect("open the live Reasoning row to watch the prose stream");
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed, "Thinking") as u16,
+    )
+    .expect("open the live Reasoning row to watch the prose stream");
     for _ in 0..2 {
         application
             .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -5748,8 +5823,7 @@ fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
 
     let toggle_turn = |application: &mut Application| {
         let rows = rendered_application_rows_at(application, 80, 24);
-        application
-            .handle_terminal_event(left_click_at(rendered_row(&rows, "Worked") as u16))
+        left_click_at(application, rendered_row(&rows, "Worked") as u16)
             .expect("toggle the Turn Fold");
     };
 
@@ -5763,8 +5837,7 @@ fn a_turn_fold_reveals_its_reasoning_group_in_the_state_the_reader_left_it() {
         opened.join("\n")
     );
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&opened, "Thought") as u16))
+    left_click_at(&mut application, rendered_row(&opened, "Thought") as u16)
         .expect("expand the Reasoning Group inside the opened Turn");
     let group_expanded = rendered_application_rows_at(&application, 80, 24);
     assert!(
@@ -6091,9 +6164,11 @@ fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
         .expect("attach a Session whose Turn has settled");
     let folded_rows = rendered_application_rows_at(&application, 80, 24);
 
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
-        .expect("click the Turn Fold marker");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ Worked") as u16,
+    )
+    .expect("click the Turn Fold marker");
 
     let expanded_rows = rendered_application_rows_at(&application, 80, 24);
     let expanded = expanded_rows.join("\n");
@@ -6114,11 +6189,11 @@ fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
         "the Turn's entries open below the marker, so the row the reader clicked stays put"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "The workflow is green.") as u16,
-        ))
-        .expect("click the Transcript's output body");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "The workflow is green.") as u16,
+    )
+    .expect("click the Transcript's output body");
 
     assert_eq!(
         rendered_application_rows_at(&application, 80, 24),
@@ -6126,11 +6201,11 @@ fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
         "clicking Transcript body text changes nothing"
     );
 
-    application
-        .handle_terminal_event(left_click_at(
-            rendered_row(&expanded_rows, "✓ Worked") as u16
-        ))
-        .expect("click the Turn Fold marker again");
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ Worked") as u16,
+    )
+    .expect("click the Turn Fold marker again");
 
     let refolded = rendered_application_rows_at(&application, 80, 24).join("\n");
     for hidden in ["Ran 2 commands", "Reading the workflow"] {
@@ -6164,9 +6239,11 @@ fn toggling_the_turn_posture_flips_every_turn_fold_and_clears_per_turn_overrides
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with two settled Turns");
     let folded_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
-        .expect("expand the first Turn by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ Worked") as u16,
+    )
+    .expect("expand the first Turn by hand");
 
     application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -6452,9 +6529,11 @@ fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Turn has settled");
     let folded_rows = rendered_application_rows_at(&application, 80, 36);
-    application
-        .handle_terminal_event(left_click_at(rendered_row(&folded_rows, "✓ Worked") as u16))
-        .expect("expand the settled Turn by hand");
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ Worked") as u16,
+    )
+    .expect("expand the settled Turn by hand");
     assert!(
         rendered_application_rows_at(&application, 80, 36)
             .join("\n")

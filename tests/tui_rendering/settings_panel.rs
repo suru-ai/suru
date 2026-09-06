@@ -131,18 +131,18 @@ fn press(
         .expect("handle a settings panel key")
 }
 
-/// A left click on one cell of the panel, which is the only mouse event it
-/// answers. The press rather than the release, so the panel answers the click
-/// the reader has just made.
+/// A left click on one cell of the panel, sent as a press and release.
 fn click(application: &mut Application, column: u16, row: u16) -> ApplicationTransition {
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("handle a settings panel click")
+        },
+    )
+    .expect("handle a settings panel click")
 }
 
 /// Clicks the label the tab bar draws for `title`, which is where a reader

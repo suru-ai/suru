@@ -269,14 +269,16 @@ pub fn press_add_workspace(application: &mut Application) -> ApplicationTransiti
         .chars()
         .position(|character| character == ADD_WORKSPACE)
         .expect("the affordance is drawn beside the selector");
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: column.try_into().expect("the column fits a screen column"),
             row: SELECTOR_ROW,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("press the add-Workspace affordance")
+        },
+    )
+    .expect("press the add-Workspace affordance")
 }
 
 /// Names a Workspace the way a reader does: open the path entry, type the
@@ -655,5 +657,19 @@ impl FailedTurnFixture {
                 activity: self.activity,
             },
         ]
+    }
+}
+
+/// Sends a complete click, retaining right-button actions on Down.
+pub fn click_mouse(
+    application: &mut Application,
+    mut mouse: MouseEvent,
+) -> anyhow::Result<ApplicationTransition> {
+    let transition = application.handle_terminal_event(InputEvent::Mouse(mouse))?;
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        application.handle_terminal_event(InputEvent::Mouse(mouse))
+    } else {
+        Ok(transition)
     }
 }

@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{Event as InputEvent, KeyEventKind, MouseEventKind};
+use crossterm::event::{
+    Event as InputEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{Frame, layout::Position, style::Style};
 
 use crate::{
@@ -324,6 +326,7 @@ impl TranscriptViewport {
 
 #[derive(Clone, Debug)]
 pub struct TuiState {
+    left_press: Option<LeftPress>,
     pub(super) outlook: Outlook,
     outlook_workspaces: HashMap<Outlook, PathBuf>,
     workspace_resolution_sequence: u64,
@@ -496,6 +499,7 @@ impl TuiState {
         // Workspace none of this client's Sessions match.
         let workspace = workspace_reading(workspace.as_ref());
         Self {
+            left_press: None,
             outlook: Outlook::Local,
             outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
             workspace_resolution_sequence: 0,
@@ -2194,6 +2198,12 @@ pub(super) struct QueuedPrompt<'a> {
     pub(super) text: &'a str,
 }
 
+#[derive(Clone, Debug)]
+struct LeftPress {
+    position: Position,
+    dragged: bool,
+}
+
 pub struct Application {
     pub(super) state: TuiState,
     pub(super) slots: RenderSlots,
@@ -2378,10 +2388,18 @@ pub enum CommandId {
     ScrollTranscriptLinesUp,
     ScrollTranscriptLinesDown,
     FollowLatest,
-    /// Where in the frame the reader pressed, resolved against the geometry
-    /// the frame in force drew: the Sidebar owns the columns it drew, and the
-    /// main view answers everywhere else.
+    /// Begins a left-button gesture without acting on the surface beneath it.
     PressAt {
+        position: Position,
+    },
+    ReleaseAt {
+        position: Position,
+    },
+    DragAt {
+        position: Position,
+    },
+    /// A click resolved through the active input mode.
+    ClickAt {
         position: Position,
     },
     /// Where the reader asked for a context menu. Only the Sidebar's own rows
@@ -3174,7 +3192,30 @@ impl Application {
             | CommandId::ScrollTranscriptLinesUp
             | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest) => self.handle_transcript_command(command),
-            CommandId::PressAt { position } => self.handle_press(position),
+            CommandId::PressAt { position } => {
+                self.state.left_press = Some(LeftPress {
+                    position,
+                    dragged: false,
+                });
+                Ok(ApplicationTransition::Continue)
+            }
+            CommandId::DragAt { position } => self.invoke_semantic(SemanticInvocation {
+                id: SemanticCommandId::PointerDrag,
+                subject: SemanticSubject::ScreenPosition(position),
+            }),
+            CommandId::ReleaseAt { position } => {
+                if let Some(press) = self.state.left_press.take()
+                    && !press.dragged
+                    && press.position == position
+                {
+                    return self.invoke_semantic(SemanticInvocation {
+                        id: SemanticCommandId::PointerClick,
+                        subject: SemanticSubject::ScreenPosition(position),
+                    });
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            CommandId::ClickAt { position } => self.handle_click(position),
             CommandId::OpenContextMenuAt { position } => {
                 self.state.sidebar.open_menu_at(position);
                 Ok(ApplicationTransition::Continue)
@@ -3346,10 +3387,10 @@ impl Application {
         Ok(ApplicationTransition::Continue)
     }
 
-    /// Answers a press at one cell of the frame, asking the layers in the
+    /// Answers a click at one cell of the frame, asking the layers in the
     /// order they were drawn: the Sidebar owns the columns it drew, and a
-    /// press it does not claim reaches the composer or Transcript beside it.
-    fn handle_press(&mut self, position: Position) -> Result<ApplicationTransition> {
+    /// click it does not claim reaches the composer or Transcript beside it.
+    fn handle_click(&mut self, position: Position) -> Result<ApplicationTransition> {
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
         // row names — the same command Enter invokes — and a press anywhere
@@ -4303,6 +4344,31 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            SemanticCommandId::PointerClick => {
+                let SemanticSubject::ScreenPosition(position) = invocation.subject else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                // Resolve a recognized click through the same mode table as other
+                // input, so overlays retain their ownership of pointer actions.
+                let event = InputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: position.x,
+                    row: position.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                self.command_for_input_mode(event)
+                    .map_or(Ok(ApplicationTransition::Continue), |command| {
+                        self.handle_command(command)
+                    })
+            }
+            SemanticCommandId::PointerDrag => {
+                if let SemanticSubject::ScreenPosition(position) = invocation.subject
+                    && let Some(press) = &mut self.state.left_press
+                {
+                    press.dragged |= position != press.position;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ComposerPlaceCursor => {
                 if !self.state.overlay_owns_input()
                     && !self.state.reconnect_overlay_visible
@@ -4584,6 +4650,7 @@ impl Application {
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
                 SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
                 SemanticSubject::View
+                | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Questionnaire(_)
@@ -4596,6 +4663,7 @@ impl Application {
                     ApplicationTransition::InterruptSession { session }
                 }
                 SemanticSubject::View
+                | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Questionnaire(_)
@@ -4632,6 +4700,7 @@ impl Application {
                 let named = match invocation.subject {
                     SemanticSubject::Session(session) => Some(session),
                     SemanticSubject::View
+                    | SemanticSubject::ScreenPosition(_)
                     | SemanticSubject::ComposerCursor(_)
                     | SemanticSubject::Turn(_)
                     | SemanticSubject::Questionnaire(_)
@@ -4671,6 +4740,7 @@ impl Application {
                     )
                 }
                 SemanticSubject::View
+                | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Session(_)
@@ -5138,6 +5208,25 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
+        if let InputEvent::Mouse(mouse) = &event {
+            let position = Position::new(mouse.column, mouse.row);
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    return Some(CommandId::PressAt { position });
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    return Some(CommandId::DragAt { position });
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    return Some(CommandId::ReleaseAt { position });
+                }
+                _ => {}
+            }
+        }
+        self.command_for_input_mode(event)
+    }
+
+    fn command_for_input_mode(&self, event: InputEvent) -> Option<CommandId> {
         // A choice picker can open over the settings panel, so the newest
         // surface owns every key until the reader is done choosing.
         if self.state.theme_picker.is_open() {
@@ -5214,7 +5303,7 @@ impl Application {
                     | CommandId::FollowLatest
                     | CommandId::BeginLeader
                     | CommandId::InvokeSemantic(_)
-                    | CommandId::PressAt { .. }
+                    | CommandId::ClickAt { .. }
                     | CommandId::OpenContextMenuAt { .. }),
                 ) => Some(command),
                 _ => None,

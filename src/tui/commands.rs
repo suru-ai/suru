@@ -1,6 +1,7 @@
 //! Typed semantic commands and the Command completion mode.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Position;
 
 use super::text_layout::CursorTarget;
 
@@ -28,6 +29,8 @@ pub enum SemanticCommandId {
 
     ApplicationExit,
     ComposerPlaceCursor,
+    PointerClick,
+    PointerDrag,
     ThemeList,
     ModelList,
     ModelOptions,
@@ -167,6 +170,7 @@ impl NumericDigit {
 pub(super) enum SemanticSubject {
     View,
     ComposerCursor(CursorTarget),
+    ScreenPosition(Position),
     Turn(TurnId),
     Questionnaire(QuestionnaireId),
     Origin(Outlook),
@@ -245,6 +249,8 @@ impl SemanticCommandId {
             Self::QuestionnaireReview => "questionnaire.review",
             Self::QuestionnaireSubmit => "questionnaire.submit",
             Self::QuestionnaireDecline => "questionnaire.decline",
+            Self::PointerClick => "pointer.click",
+            Self::PointerDrag => "pointer.drag",
             Self::ComposerPlaceCursor => "composer.cursor.place",
             Self::ApplicationExit => "application.exit",
             Self::ThemeList => "theme.list",
@@ -880,6 +886,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // a Session, and the account of the command names the rest of them.
         description: "Open the Session the Sidebar has selected, show more of the settled shelf, \
                       retry an unreachable Remote, or act on the Workspace selector",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::PointerClick,
+        title: "Click",
+        description: "Act on a screen cell in the active surface",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::PointerDrag,
+        title: "Drag",
+        description: "Move the held pointer without invoking a click",
         slash: None,
         keybinding: None,
     },

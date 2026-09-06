@@ -4,9 +4,7 @@ use crate::support::{
     connected_application, enter_session, navigable_session_snapshot, rendered_application_rows_at,
     rendered_row, workspace_dir,
 };
-use crossterm::event::{
-    Event as InputEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
@@ -95,14 +93,16 @@ fn row_index(rows: &[String], needle: &str) -> u16 {
 }
 
 fn click(application: &mut Application, column: u16, row: u16) {
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("handle Transcript click");
+        },
+    )
+    .expect("handle Transcript click");
 }
 
 fn change_content_width(application: &mut Application, content_width: SessionContentWidth) {

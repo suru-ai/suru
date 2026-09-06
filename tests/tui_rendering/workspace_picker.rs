@@ -388,14 +388,16 @@ fn a_press_over_the_rows_moves_nothing() {
     let before = rendered_application_rows(&application);
     let row = rendered_row(&before, "ledger");
 
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        &mut application,
+        MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 20,
             row: row.try_into().expect("the row fits terminal coordinates"),
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("press over a Workspace row");
+        },
+    )
+    .expect("press over a Workspace row");
 
     assert_eq!(rendered_application_rows(&application), before);
 }

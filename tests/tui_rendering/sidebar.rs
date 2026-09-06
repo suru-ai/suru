@@ -3563,23 +3563,23 @@ const SIDEBAR_CELL: u16 = 4;
 
 /// The frame every press test draws: tall enough for a menu opened on any row
 /// its fixtures list to stand whole.
-/// A press of one mouse button on one cell. The press rather than the release,
-/// so a row answers the click the reader has just made rather than trailing a
-/// drag that ends elsewhere.
+/// A complete left click, or a right-button press, on one cell.
 fn press_at(
     application: &mut Application,
     button: MouseButton,
     column: u16,
     row: u16,
 ) -> ApplicationTransition {
-    application
-        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+    super::support::click_mouse(
+        application,
+        MouseEvent {
             kind: MouseEventKind::Down(button),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        }))
-        .expect("handle a press")
+        },
+    )
+    .expect("handle a press")
 }
 
 /// Presses the line the Sidebar drew `label` on. The frame is drawn first,
