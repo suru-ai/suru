@@ -2235,6 +2235,7 @@ pub(super) struct QueuedPrompt<'a> {
 #[derive(Clone, Debug)]
 struct LeftPress {
     position: Position,
+    pointer: Position,
     dragged: bool,
     selection_anchor: Option<(TranscriptCell, u64)>,
 }
@@ -3260,6 +3261,7 @@ impl Application {
 
                 self.state.left_press = Some(LeftPress {
                     position,
+                    pointer: position,
                     dragged: false,
                     selection_anchor,
                 });
@@ -3276,10 +3278,8 @@ impl Application {
                     .as_ref()
                     .is_some_and(|press| press.dragged)
                 {
-                    self.invoke_semantic(SemanticInvocation {
-                        id: SemanticCommandId::PointerDrag,
-                        subject: SemanticSubject::ScreenPosition(position),
-                    })?;
+                    self.refresh_text_selection();
+                    self.update_transcript_drag(position, 0);
                     self.state.left_press = None;
                     return if self.state.settings.text_selection.copy == TextSelectionCopy::Release
                     {
@@ -4137,6 +4137,8 @@ impl Application {
 
     fn elapse_reconnect_grace(&mut self) -> ApplicationTransition {
         if self.state.recovery.is_some() {
+            // The overlay owns input, including the release that would end a drag.
+            self.state.left_press = None;
             self.state.reconnect_overlay_visible = true;
         }
         ApplicationTransition::Continue
@@ -4432,6 +4434,88 @@ impl Application {
         }
     }
 
+    /// Distance beyond the Transcript determines rows per presentation tick.
+    fn transcript_drag_scroll(&self) -> Option<(TranscriptDirection, usize)> {
+        let press = self.state.left_press.as_ref()?;
+        let (_, epoch) = press.selection_anchor?;
+        if !press.dragged || epoch != self.state.transcript_cache.selection_epoch() {
+            return None;
+        }
+        let interaction = self
+            .state
+            .session_interaction(self.state.session_reference.as_ref()?)?;
+        let viewport = interaction.viewport.borrow();
+        let viewport = viewport.as_ref()?;
+        if viewport.content_rows == 0 || viewport.content_width == 0 {
+            return None;
+        }
+        let bottom = viewport.content_top + viewport.content_rows;
+        if press.pointer.y < viewport.content_top {
+            Some((
+                TranscriptDirection::Up,
+                usize::from(viewport.content_top - press.pointer.y),
+            ))
+        } else if press.pointer.y >= bottom {
+            Some((
+                TranscriptDirection::Down,
+                usize::from(press.pointer.y - bottom) + 1,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn update_transcript_drag(&mut self, position: Position, scroll_rows: usize) {
+        let Some(press) = &mut self.state.left_press else {
+            return;
+        };
+        press.pointer = position;
+        press.dragged |= position != press.position;
+        if scroll_rows > 0
+            && let Some((direction, _)) = self.transcript_drag_scroll()
+        {
+            self.state.navigate_transcript(direction, Some(scroll_rows));
+        }
+        if let Some(press) = &self.state.left_press
+            && press.dragged
+            && let Some((anchor, epoch)) = press.selection_anchor
+            && epoch == self.state.transcript_cache.selection_epoch()
+            && let Some(interaction) = self
+                .state
+                .session_reference
+                .as_ref()
+                .and_then(|session| self.state.session_interactions.get(session))
+            && let Some(viewport) = interaction.viewport.borrow().as_ref()
+            && viewport.content_width > 0
+            && viewport.content_rows > 0
+        {
+            let row = viewport.scroll_position
+                + usize::from(
+                    position.y.clamp(
+                        viewport.content_top,
+                        viewport.content_top + viewport.content_rows - 1,
+                    ) - viewport.content_top,
+                );
+            let column = usize::from(
+                position.x.clamp(
+                    viewport.content_left,
+                    viewport.content_left + viewport.content_width - 1,
+                ) - viewport.content_left,
+            );
+            let focus = TranscriptCell {
+                row: row.min(self.state.transcript_cache.row_count().saturating_sub(1)),
+                column,
+            };
+            self.state
+                .text_selection
+                .set((anchor != focus).then_some(TextSelection {
+                    anchor,
+                    focus,
+                    epoch,
+                }));
+        }
+    }
+
     /// Runs one semantic command against what it names. Every surface that can
     /// drive the view — a keybinding, a slash command, a click, and one day a
     /// plugin — arrives here, so a behavior is defined once and invoked by
@@ -4484,47 +4568,8 @@ impl Application {
                     })
             }
             SemanticCommandId::PointerDrag => {
-                if let SemanticSubject::ScreenPosition(position) = invocation.subject
-                    && let Some(press) = &mut self.state.left_press
-                {
-                    press.dragged |= position != press.position;
-                    if press.dragged
-                        && let Some((anchor, epoch)) = press.selection_anchor
-                        && epoch == self.state.transcript_cache.selection_epoch()
-                        && let Some(interaction) = self
-                            .state
-                            .session_reference
-                            .as_ref()
-                            .and_then(|session| self.state.session_interactions.get(session))
-                        && let Some(viewport) = interaction.viewport.borrow().as_ref()
-                        && viewport.content_width > 0
-                        && viewport.content_rows > 0
-                    {
-                        let row = viewport.scroll_position
-                            + usize::from(
-                                position.y.clamp(
-                                    viewport.content_top,
-                                    viewport.content_top + viewport.content_rows - 1,
-                                ) - viewport.content_top,
-                            );
-                        let column = usize::from(
-                            position.x.clamp(
-                                viewport.content_left,
-                                viewport.content_left + viewport.content_width - 1,
-                            ) - viewport.content_left,
-                        );
-                        let focus = TranscriptCell {
-                            row: row.min(self.state.transcript_cache.row_count().saturating_sub(1)),
-                            column,
-                        };
-                        self.state
-                            .text_selection
-                            .set((anchor != focus).then_some(TextSelection {
-                                anchor,
-                                focus,
-                                epoch,
-                            }));
-                    }
+                if let SemanticSubject::ScreenPosition(position) = invocation.subject {
+                    self.update_transcript_drag(position, 1);
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -5576,11 +5621,18 @@ impl Application {
             // Working duration has to be seen rising.
             || self.state.sidebar.shows_live_work()
             || self.state.session_animation_on_screen.get()
+            || self.transcript_drag_scroll().is_some()
     }
 
     /// Advances presentation animation one frame. Called from the run loop's
     /// tick, which only exists while [`Self::wants_spinner`] holds.
     pub(super) fn advance_spinner(&mut self) {
+        self.refresh_text_selection();
+        if let Some((_, rows)) = self.transcript_drag_scroll()
+            && let Some(press) = &self.state.left_press
+        {
+            self.update_transcript_drag(press.pointer, rows);
+        }
         self.state.promote_aged_commands();
         self.state.reconcile_command_mode();
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);

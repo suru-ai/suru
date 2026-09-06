@@ -7275,3 +7275,252 @@ fn pin_release_copy(application: &mut Application) {
     settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
     deliver_settings(application, settings, &["textSelection.copy"]);
 }
+
+fn edge_drag_application(workspace: &std::path::Path) -> (Application, String) {
+    let mut application = connected_application(workspace);
+    pin_release_copy(&mut application);
+    let lines = (0..60).map(|n| format!("line {n:02}")).collect::<Vec<_>>();
+    let text = lines.join("\n");
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace,
+        &[RunEntry::UserMessage("placeholder")],
+    );
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|m| m.role == MessageRole::User)
+        .unwrap()
+        .content = text.clone();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    (application, text)
+}
+
+#[test]
+fn transcript_edge_drag_scrolls_on_events_and_ticks_and_copies_the_whole_selection() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let (mut application, text) = edge_drag_application(workspace.path());
+    let buffer = rendered_application_buffer(&application, 80, 20);
+    let start = text_position(&buffer, "line 59");
+    let top = buffer_rows(&buffer)
+        .iter()
+        .position(|row| row.contains("line "))
+        .unwrap() as u16;
+    assert!(top > 0);
+    let outside = (start.0, top - 1);
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (start.0 + 6, start.1),
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            outside,
+        ))
+        .unwrap();
+    assert!(
+        application.wants_spinner(),
+        "holding above the edge arms presentation ticks"
+    );
+    let after_drag = rendered_application_buffer(&application, 80, 20);
+    assert_ne!(
+        buffer_rows(&buffer),
+        buffer_rows(&after_drag),
+        "the drag itself scrolls one row"
+    );
+    for _ in 0..80 {
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .unwrap();
+    }
+    let selected = rendered_application_buffer(&application, 80, 20);
+    let first = text_position(&selected, "line 00");
+    assert!(selected[first].modifier.contains(Modifier::REVERSED));
+    let transition = application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            outside,
+        ))
+        .unwrap();
+    assert!(
+        matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied == &text),
+        "{transition:?}"
+    );
+    assert!(
+        !application.wants_spinner(),
+        "release disarms idle presentation"
+    );
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .unwrap();
+    assert_eq!(
+        buffer_rows(&selected),
+        buffer_rows(&rendered_application_buffer(&application, 80, 20))
+    );
+}
+
+#[test]
+fn transcript_edge_drag_speed_tracks_distance_and_reentry_disarms_ticks() {
+    use crossterm::event::MouseButton;
+    for distance in [1, 3] {
+        let workspace = workspace_dir();
+        let (mut application, text) = edge_drag_application(workspace.path());
+        rendered_application_buffer(&application, 80, 20);
+        for _ in 0..10 {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::ScrollTranscriptPageUp))
+                .unwrap();
+        }
+        let buffer = rendered_application_buffer(&application, 80, 20);
+        let start = text_position(&buffer, "line 00");
+        let rows = buffer_rows(&buffer);
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.contains("┃ line "))
+            .unwrap() as u16;
+        let last_number = |buffer: &Buffer| -> usize {
+            buffer_rows(buffer)
+                .iter()
+                .filter_map(|row| {
+                    row.split_once("line ")
+                        .and_then(|(_, tail)| tail.trim().parse().ok())
+                })
+                .last()
+                .unwrap()
+        };
+        let before = last_number(&buffer);
+        let outside = (start.0 + 6, bottom + distance);
+        application
+            .handle_terminal_event(selection_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                start,
+            ))
+            .unwrap();
+        application
+            .handle_terminal_event(selection_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside,
+            ))
+            .unwrap();
+        let selected = rendered_application_buffer(&application, 80, 20);
+        assert_eq!(
+            last_number(&selected),
+            before + 1,
+            "every drag event scrolls exactly one row regardless of distance"
+        );
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .unwrap();
+        let selected = rendered_application_buffer(&application, 80, 20);
+        assert_eq!(
+            last_number(&selected),
+            before + 1 + usize::from(distance),
+            "before {rows:?} after {:?}",
+            buffer_rows(&selected)
+        );
+        let focus = text_position(&selected, &format!("line {:02}", last_number(&selected)));
+        assert!(selected[focus].modifier.contains(Modifier::REVERSED));
+        application
+            .handle_terminal_event(selection_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                (outside.0, bottom),
+            ))
+            .unwrap();
+        assert!(!application.wants_spinner());
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .unwrap();
+        assert_eq!(
+            buffer_rows(&selected),
+            buffer_rows(&rendered_application_buffer(&application, 80, 20))
+        );
+        application
+            .handle_terminal_event(selection_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside,
+            ))
+            .unwrap();
+        assert!(application.wants_spinner());
+        for _ in 0..80 {
+            application
+                .handle_event(ApplicationEvent::SpinnerTick)
+                .unwrap();
+        }
+        let at_end = rendered_application_buffer(&application, 80, 20);
+        assert_eq!(last_number(&at_end), 59);
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .unwrap();
+        assert_eq!(
+            buffer_rows(&at_end),
+            buffer_rows(&rendered_application_buffer(&application, 80, 20))
+        );
+        let transition = application
+            .handle_terminal_event(selection_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                outside,
+            ))
+            .unwrap();
+        assert!(
+            matches!(transition, ApplicationTransition::CopyToClipboard(ref copied) if copied == &text),
+            "{transition:?}"
+        );
+        assert!(!application.wants_spinner());
+    }
+}
+
+#[test]
+fn reconnecting_cancels_a_held_transcript_edge_drag() {
+    use crossterm::event::MouseButton;
+    let workspace = workspace_dir();
+    let (mut application, _) = edge_drag_application(workspace.path());
+    let buffer = rendered_application_buffer(&application, 80, 20);
+    let start = text_position(&buffer, "line 59");
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            (start.0, 0),
+        ))
+        .unwrap();
+    assert!(application.wants_spinner());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            suru::managed_client::RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::ZERO,
+            },
+        )))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            (start.0, 0),
+        ))
+        .unwrap();
+    assert!(
+        !application.wants_spinner(),
+        "recovery must not retain a held drag behind its overlay"
+    );
+    let stopped = rendered_application_buffer(&application, 80, 20);
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .unwrap();
+    assert_eq!(
+        buffer_rows(&stopped),
+        buffer_rows(&rendered_application_buffer(&application, 80, 20))
+    );
+}
