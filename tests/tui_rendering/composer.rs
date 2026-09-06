@@ -1835,6 +1835,55 @@ fn clicking_blank_space_after_a_wide_hard_wrap_preserves_the_insertion_offset() 
 }
 
 #[test]
+fn composer_selection_highlights_typed_text_and_not_the_padding_past_it() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let draft = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
+    type_terminal_text(&mut application, draft);
+    let buffer = rendered_application_buffer(&application, 50, 24);
+    let start = text_position(&buffer, "alpha");
+    let end = text_position(&buffer, "lima");
+    assert!(end.1 > start.1);
+    // The drag runs well past the end of the typed text on both rows.
+    for (kind, position) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), (end.0 + 12, end.1)),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column: position.0,
+                row: position.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    let selected = rendered_application_buffer(&application, 50, 24);
+    let reversed = |position: (u16, u16)| {
+        selected[position]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    };
+    assert!(reversed(start));
+    assert!(reversed(end));
+    assert!(reversed((end.0 + "lima".len() as u16 - 1, end.1)));
+    for y in start.1..=end.1 {
+        // The interior runs from the text's first column to the right border.
+        let border = (start.0..50)
+            .find(|x| buffer[(*x, y)].symbol() == "│")
+            .expect("the composer draws a right border");
+        let last_text = (start.0..border)
+            .rev()
+            .find(|x| !buffer[(*x, y)].symbol().trim().is_empty())
+            .expect("each selected row holds typed text");
+        assert!(last_text + 1 < border, "row {y} has no padding to check");
+        for x in last_text + 1..border {
+            assert!(!reversed((x, y)), "padding lit at {x},{y}");
+        }
+    }
+}
+
+#[test]
 fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());

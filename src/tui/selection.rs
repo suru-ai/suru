@@ -20,31 +20,6 @@ impl TextSelection {
     pub(super) fn ordered(self) -> (SelectionCell, SelectionCell) {
         (self.anchor.min(self.focus), self.anchor.max(self.focus))
     }
-
-    pub(super) fn highlight(self, buffer: &mut Buffer, area: Rect, scroll: usize) {
-        let (start, end) = self.ordered();
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                let cell = SelectionCell {
-                    row: scroll + usize::from(y - area.y),
-                    column: usize::from(x - area.x),
-                };
-                let width = u16::try_from(buffer[(x, y)].symbol().width())
-                    .unwrap_or(1)
-                    .max(1);
-                let right = x.saturating_add(width).min(area.right());
-                let last = SelectionCell {
-                    column: cell.column + usize::from(right - x - 1),
-                    ..cell
-                };
-                if last >= start && cell <= end {
-                    for column in x..right {
-                        buffer[(column, y)].modifier.insert(Modifier::REVERSED);
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +76,50 @@ impl SelectionFrame {
             .min(self.rows.len() - 1),
             column: usize::from(position.x.clamp(self.area.x, self.area.right() - 1) - self.area.x),
         })
+    }
+
+    /// Reverses the cells a selection covers, the way [`Self::copy`] reads
+    /// them: the text each row holds, up to its last non-blank glyph. Padding
+    /// past the text and rows holding no text stay as drawn, so what lights
+    /// up is what a copy would hold.
+    pub(super) fn highlight(&self, selection: TextSelection, buffer: &mut Buffer) {
+        let (start, end) = selection.ordered();
+        let area = self.area;
+        for y in area.y..area.bottom() {
+            let row = self.scroll + usize::from(y - area.y);
+            if row < start.row {
+                continue;
+            }
+            if row > end.row {
+                break;
+            }
+            let Some(range) = self.rows.get(row) else {
+                break;
+            };
+            let mut column = 0;
+            for glyph in unicode_segmentation::UnicodeSegmentation::graphemes(
+                self.text[range.clone()].trim_end(),
+                true,
+            ) {
+                let width = glyph.width();
+                let left = column;
+                column += width;
+                if width == 0 {
+                    continue;
+                }
+                let selected_from_start = row > start.row || column > start.column;
+                let selected_to_end = row < end.row || left <= end.column;
+                if !(selected_from_start && selected_to_end) {
+                    continue;
+                }
+                let left = u16::try_from(left).unwrap_or(u16::MAX);
+                let right = u16::try_from(column).unwrap_or(u16::MAX);
+                for x in area.x.saturating_add(left)..area.x.saturating_add(right).min(area.right())
+                {
+                    buffer[(x, y)].modifier.insert(Modifier::REVERSED);
+                }
+            }
+        }
     }
 
     pub(super) fn copy(&self, selection: TextSelection) -> Option<String> {

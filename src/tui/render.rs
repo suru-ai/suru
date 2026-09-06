@@ -267,7 +267,7 @@ pub(super) fn render_with_slots(
         if let Some(surface) = state.selection_frames.borrow().iter().find(|surface| {
             surface.surface == selection.surface && surface.epoch() == selection.epoch
         }) {
-            selection.highlight(frame.buffer_mut(), surface.area, surface.scroll);
+            surface.highlight(selection, frame.buffer_mut());
         } else {
             state.text_selection.set(None);
         }
