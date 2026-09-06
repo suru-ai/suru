@@ -1833,3 +1833,72 @@ fn clicking_blank_space_after_a_wide_hard_wrap_preserves_the_insertion_offset() 
     };
     assert_eq!(request.prompt.text, format!("{prefix}🙂!🙂🙂"));
 }
+
+#[test]
+fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    crate::support::deliver_settings(&mut application, settings);
+    let draft = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
+    type_terminal_text(&mut application, draft);
+    let buffer = rendered_application_buffer(&application, 50, 24);
+    let start = text_position(&buffer, "alpha");
+    let end = text_position(&buffer, "lima");
+    assert!(end.1 > start.1);
+    let cursor = rendered_application_cursor_at(&application, 50, 24);
+    for (kind, position) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), (end.0 + 3, end.1)),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column: position.0,
+                row: position.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    let selected = rendered_application_buffer(&application, 50, 24);
+    assert!(
+        selected[start]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    let copied = application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: end.0 + 3,
+            row: end.1,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    assert!(
+        matches!(copied, ApplicationTransition::CopyToClipboard(ref text) if text == draft),
+        "{copied:?}"
+    );
+    assert_eq!(rendered_application_cursor_at(&application, 50, 24), cursor);
+    type_terminal_text(&mut application, "!");
+    assert!(
+        rendered_application_buffer(&application, 50, 24)[start]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    assert!(
+        rendered_application_rows_at(&application, 50, 24)
+            .join("\n")
+            .contains("lima!")
+    );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert_eq!(
+        buffer_rows(&rendered_application_buffer(&application, 50, 24)),
+        buffer_rows(&buffer)
+    );
+}

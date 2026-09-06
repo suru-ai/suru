@@ -529,7 +529,7 @@ fn rows_answer_the_pointer_as_readily_as_the_keys() {
 }
 
 #[test]
-fn a_click_outside_the_picker_dismisses_it_but_a_drag_leaves_it_open() {
+fn clicks_and_drags_outside_the_picker_dismiss_it_only_on_release() {
     let workspace = workspace_dir();
     let (snapshot, _) =
         parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
@@ -555,14 +555,17 @@ fn a_click_outside_the_picker_dismisses_it_but_a_drag_leaves_it_open() {
                 modifiers: KeyModifiers::NONE,
             }))
             .unwrap();
-        assert!(
+        assert_eq!(
             rendered_application_rows_at(&application, 80, 22)
                 .join("\n")
                 .contains("Subagents"),
-            "neither a press nor a drag dismisses the picker"
+            !matches!(kind, MouseEventKind::Up(MouseButton::Left)),
+            "an outside drag dismisses only on release"
         );
     }
 
+    press_key(&mut application, KeyCode::Down);
+    rendered_application_buffer(&application, 80, 22);
     assert_eq!(
         super::support::click_mouse(
             &mut application,

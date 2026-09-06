@@ -1,6 +1,7 @@
 //! Frame rendering: the landing and Session screens, the pickers and overlays,
 //! and the shared text and layout helpers they draw with.
 
+use super::selection::{SelectionFrame, SelectionSurface};
 use std::path::Path;
 
 use ratatui::{
@@ -24,7 +25,6 @@ use crate::{
 use super::{
     completion::CompletionRow,
     composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
-    connect_overlay::ConnectOverlay,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -111,6 +111,8 @@ pub(super) fn render_with_slots(
     // The settings panel is pointable, and only a frame that drew it can say
     // where. Every frame starts by giving up what the last one recorded, so the
     // geometry a click resolves against is always the one on screen.
+    state.selection_frames.borrow_mut().clear();
+    state.selection_overlay_area.set(None);
     state.settings_panel.forget_layout();
     // The Sidebar's own frame record, given up for the same reason: whether it
     // has the keys depends on whether the frame had the columns to draw it.
@@ -136,6 +138,9 @@ pub(super) fn render_with_slots(
     } else {
         render_landing(frame, state, main, slots, theme)
     };
+    if let Some(surface) = state.composers.selection_frame() {
+        state.selection_frames.borrow_mut().push(surface);
+    }
     let pending: Vec<_> = state.pending_questionnaires().collect();
     if let Some(questionnaire) = state.open_questionnaire() {
         state.questionnaires.render(
@@ -233,9 +238,10 @@ pub(super) fn render_with_slots(
         render_serve_overlay(frame, state, main, theme);
     }
     if state.connect_overlay.is_open() && !state.reconnect_overlay_visible {
-        render_connect_overlay(frame, &state.connect_overlay, main, theme);
+        render_connect_overlay(frame, state, main, theme);
     }
     if state.reconnect_overlay_visible {
+        state.selection_frames.borrow_mut().clear();
         render_reconnect_overlay(frame, theme);
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
@@ -254,6 +260,17 @@ pub(super) fn render_with_slots(
         && let Some(cursor) = composer.cursor
     {
         frame.set_cursor_position(cursor);
+    }
+    if let Some(selection) = state.text_selection.get()
+        && selection.surface != SelectionSurface::Transcript
+    {
+        if let Some(surface) = state.selection_frames.borrow().iter().find(|surface| {
+            surface.surface == selection.surface && surface.epoch() == selection.epoch
+        }) {
+            selection.highlight(frame.buffer_mut(), surface.area, surface.scroll);
+        } else {
+            state.text_selection.set(None);
+        }
     }
 }
 
@@ -283,12 +300,8 @@ fn render_application_notice(
     main
 }
 
-fn render_connect_overlay(
-    frame: &mut Frame<'_>,
-    overlay: &ConnectOverlay,
-    main: Rect,
-    theme: &Theme,
-) {
+fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let overlay = &state.connect_overlay;
     let area = centered_rect(
         main,
         main.width.saturating_sub(4).min(88),
@@ -297,6 +310,8 @@ fn render_connect_overlay(
     if let Some(label) = overlay.loading_label() {
         render_overlay_box(
             frame,
+            state,
+            SelectionSurface::Connect,
             area,
             vec![Line::styled(label, theme.text.subdued)],
             " Connect ",
@@ -324,7 +339,15 @@ fn render_connect_overlay(
             "Enter inspect · Esc close",
             theme.text.subdued,
         ));
-        render_overlay_box(frame, area, lines, " Connect ", theme);
+        render_overlay_box(
+            frame,
+            state,
+            SelectionSurface::Connect,
+            area,
+            lines,
+            " Connect ",
+            theme,
+        );
         return;
     }
     if let Some(preview) = overlay.confirmation() {
@@ -339,7 +362,15 @@ fn render_connect_overlay(
                 .map(|row| Line::styled(row.text.to_owned(), theme.text.primary)),
         );
         lines.push(Line::styled("Enter trust · Esc cancel", theme.text.subdued));
-        render_overlay_box(frame, area, lines, " Connect ", theme);
+        render_overlay_box(
+            frame,
+            state,
+            SelectionSurface::Connect,
+            area,
+            lines,
+            " Connect ",
+            theme,
+        );
         return;
     }
     if let Some(details) = overlay.details() {
@@ -389,7 +420,15 @@ fn render_connect_overlay(
             "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel",
             theme.text.subdued,
         ));
-        render_overlay_box(frame, area, lines, " Connect ", theme);
+        render_overlay_box(
+            frame,
+            state,
+            SelectionSurface::Connect,
+            area,
+            lines,
+            " Connect ",
+            theme,
+        );
         return;
     }
     let mut lines = vec![Line::styled(
@@ -438,7 +477,15 @@ fn render_connect_overlay(
         "↑↓ choose · a pair another · Esc close",
         theme.text.subdued,
     ));
-    render_overlay_box(frame, area, lines, " Connect ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Connect,
+        area,
+        lines,
+        " Connect ",
+        theme,
+    );
 }
 
 fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -450,6 +497,8 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     if state.serve_overlay.is_preparing() {
         render_overlay_box(
             frame,
+            state,
+            SelectionSurface::Serve,
             area,
             vec![Line::styled("Preparing Serving…", theme.text.subdued)],
             " Serve ",
@@ -503,7 +552,15 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             "Ctrl+C copy · ↑↓ choose Peer · x remove · Esc close",
             theme.text.subdued,
         ));
-        render_overlay_box(frame, area, lines, " Serve ", theme);
+        render_overlay_box(
+            frame,
+            state,
+            SelectionSurface::Serve,
+            area,
+            lines,
+            " Serve ",
+            theme,
+        );
         return;
     }
 
@@ -550,7 +607,15 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         "↑↓ move · Space toggle · Enter issue Invite · Esc close",
         theme.text.subdued,
     ));
-    render_overlay_box(frame, area, lines, " Serve ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Serve,
+        area,
+        lines,
+        " Serve ",
+        theme,
+    );
 }
 
 fn serve_peer_lines(
@@ -617,7 +682,15 @@ fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         Line::styled(editor.error.unwrap_or(""), theme.feedback.error),
         Line::styled("Enter apply · Esc cancel", theme.text.subdued),
     ];
-    render_overlay_box(frame, area, lines, " Number ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::NumericEditor,
+        area,
+        lines,
+        " Number ",
+        theme,
+    );
 }
 
 fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -703,6 +776,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         ),
         area,
     );
+    record_overlay_selection(frame, state, area, SelectionSurface::Sessions, true);
 }
 
 /// The Workspace Picker, drawn in the session picker's mold: a centered box
@@ -781,7 +855,15 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
             style,
         ));
     }
-    render_overlay_box(frame, area, lines, " Workspaces ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Workspaces,
+        area,
+        lines,
+        " Workspaces ",
+        theme,
+    );
 }
 
 /// One Workspace Picker row: the name the Workspace goes by, whether it is
@@ -924,6 +1006,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         ),
         area,
     );
+    record_overlay_selection(frame, state, area, SelectionSurface::Models, true);
 }
 
 fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -994,6 +1077,7 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         ),
         area,
     );
+    record_overlay_selection(frame, state, area, SelectionSurface::Themes, true);
 }
 
 /// What the tab bar puts between two labels, which the hit test steps over as
@@ -1185,7 +1269,15 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             count: drawn_rows,
         }),
     ));
-    render_overlay_box(frame, area, lines, " Settings ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Settings,
+        area,
+        lines,
+        " Settings ",
+        theme,
+    );
 }
 
 fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -1253,6 +1345,8 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         }
         render_overlay_box(
             frame,
+            state,
+            SelectionSurface::ModelOptions,
             area,
             lines,
             &format!(" {} Choices ", descriptor.label),
@@ -1334,7 +1428,15 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             theme.text.subdued,
         ));
     }
-    render_overlay_box(frame, area, lines, " Model Options ", theme);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::ModelOptions,
+        area,
+        lines,
+        " Model Options ",
+        theme,
+    );
 }
 
 fn model_option_choice_line(
@@ -1386,8 +1488,36 @@ fn picker_search_line(query: &str, width: usize) -> String {
     truncate_to_width(&format!("Search: {query}"), width)
 }
 
+fn record_overlay_selection(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    surface: SelectionSurface,
+    bordered: bool,
+) {
+    let mut content = if bordered {
+        area.inner(ratatui::layout::Margin::new(1, 1))
+    } else {
+        area
+    };
+    if surface == SelectionSurface::Settings && content.height >= 4 {
+        content.y += 1;
+        content.height -= 1;
+    }
+    state.selection_overlay_area.set(Some(area));
+    let mut surfaces = state.selection_frames.borrow_mut();
+    surfaces.clear();
+    surfaces.push(SelectionFrame::painted(
+        surface,
+        frame.buffer_mut(),
+        content,
+    ));
+}
+
 fn render_overlay_box(
     frame: &mut Frame<'_>,
+    state: &TuiState,
+    surface: SelectionSurface,
     area: Rect,
     lines: Vec<Line<'static>>,
     title: &str,
@@ -1404,6 +1534,7 @@ fn render_overlay_box(
         ),
         area,
     );
+    record_overlay_selection(frame, state, area, surface, true);
 }
 
 /// The row standing for a Provider's condition, which choosing re-checks.
@@ -1768,6 +1899,7 @@ fn render_composer_completion(
     };
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+    record_overlay_selection(frame, state, area, SelectionSurface::Completions, bordered);
 }
 
 /// Draws the Subagent Picker docked over the composer, as the completion list
@@ -1871,6 +2003,7 @@ fn render_subagent_picker(
     };
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+    record_overlay_selection(frame, state, area, SelectionSurface::Subagents, bordered);
 }
 
 /// Draws the Sidebar down the left of the frame and reports what is left for
@@ -1903,6 +2036,14 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let (lines, rows, rails) = sidebar_lines(state, content, theme);
     frame.render_widget(Paragraph::new(lines).style(theme.surface.elevated), content);
     paint_standing_rails(frame, &rails, inside.x, theme);
+    state
+        .selection_frames
+        .borrow_mut()
+        .push(SelectionFrame::painted(
+            SelectionSurface::Sidebar,
+            frame.buffer_mut(),
+            content,
+        ));
     // The columns inside the rule rather than the content's own, so the
     // padding a row is inset by presses the row it insets. The spans the body
     // narrows to a run of one line are measured from the same edges, in
@@ -2069,6 +2210,7 @@ fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
         top: area.y + 1,
         count: height.saturating_sub(2),
     });
+    record_overlay_selection(frame, state, area, SelectionSurface::SidebarMenu, true);
 }
 
 /// The Sidebar's whole body: the search box, then what the server last
@@ -3184,7 +3326,10 @@ fn render_session(
             row,
         );
     }
-    if let Some(selection) = state.text_selection.get() {
+    if let Some(selection) = state.text_selection.get()
+        && selection.surface == super::selection::SelectionSurface::Transcript
+        && !state.overlay_owns_input()
+    {
         if selection.epoch == state.transcript_cache.selection_epoch() {
             selection.highlight(
                 buffer,

@@ -85,6 +85,23 @@ impl ComposerMemory {
             .replace(Some(ComposerFrame { key, area, scroll }));
     }
 
+    pub(super) fn selection_frame(&self) -> Option<super::selection::SelectionFrame> {
+        let frame = self.frame.borrow();
+        let frame = frame.as_ref()?;
+        let text = self.text(frame.key.clone());
+        let layout = TextLayout::new(text, frame.area.width);
+        Some(super::selection::SelectionFrame {
+            surface: super::selection::SelectionSurface::Composer,
+            area: frame.area,
+            scroll: usize::from(frame.scroll),
+            rows: layout
+                .rows()
+                .map(|row| row.start..row.start + row.text.len())
+                .collect(),
+            text: text.to_owned(),
+        })
+    }
+
     pub(super) fn hit(&self, key: ComposerKey, position: Position) -> Option<CursorTarget> {
         let frame = self.frame.borrow();
         let frame = frame.as_ref()?;

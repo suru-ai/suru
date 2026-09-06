@@ -8021,3 +8021,72 @@ fn pending_questionnaires_mark_both_session_listings_and_clear_when_unavailable(
         "{screen}"
     );
 }
+
+#[test]
+fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
+    use super::selection::{drag, mouse};
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed_as(
+                SessionId::new(),
+                "A title far too long to fit in the Sidebar column",
+                workspace.path(),
+                1,
+            ),
+            listed_as(SessionId::new(), "Second title", workspace.path(), 2),
+        ],
+    );
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar = shown(AutoSettle::default());
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    deliver_settings(&mut application, settings);
+    let buffer = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+    let first = text_position(&buffer, "A title far");
+    let second = text_position(&buffer, "Second title");
+    let expected = (first.1.min(second.1)..=first.1.max(second.1))
+        .map(|y| {
+            (1..30)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(expected.contains('…'), "{expected}");
+    assert_eq!(
+        drag(
+            &mut application,
+            (1, first.1.min(second.1)),
+            (29, first.1.max(second.1))
+        ),
+        ApplicationTransition::CopyToClipboard(expected)
+    );
+    for position in [(0, first.1), (31, first.1), (70, PRESS_HEIGHT - 1)] {
+        mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            position,
+        );
+        mouse(
+            &mut application,
+            MouseEventKind::Drag(MouseButton::Left),
+            first,
+        );
+        assert_eq!(
+            mouse(
+                &mut application,
+                MouseEventKind::Up(MouseButton::Left),
+                first
+            ),
+            ApplicationTransition::Continue
+        );
+        assert!(
+            !rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)[first]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+}

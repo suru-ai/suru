@@ -717,11 +717,10 @@ fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
     );
 }
 
-/// The panel answers a click on a tab label and on a row, and on nothing else:
-/// the headline, the footer, the tab bar's empty end, the border, and the
-/// screen outside the box are all surfaces the reader may click through.
+/// Prose and chrome inside the panel keep clicks inert; outside releases
+/// dismiss it, including a press that never became a selection.
 #[test]
-fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
+fn panel_clicks_keep_prose_and_chrome_inert_and_dismiss_outside() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
@@ -745,8 +744,6 @@ fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
         // The box's own left border, beside the tab bar and beside a row.
         (general_column - 1, general_row),
         (general_column - 1, listed_row as u16),
-        // And the screen the overlay is drawn over.
-        (0, 0),
     ] {
         assert_eq!(
             click(&mut application, column, row),
@@ -759,6 +756,15 @@ fn a_click_on_anything_but_a_tab_or_a_row_changes_nothing() {
             "a click at ({column}, {row}) changed the panel"
         );
     }
+    assert_eq!(
+        click(&mut application, 0, 0),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Settings ─")
+    );
 }
 
 #[test]
@@ -2815,4 +2821,45 @@ fn copy_text_selection_cycles_on_the_general_tab() {
             })
         );
     }
+}
+
+#[test]
+fn numeric_editor_selection_is_modal_over_the_settings_panel() {
+    use super::selection::{drag, mouse};
+    let workspace = workspace_dir();
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let mut application = client_showing(workspace.path(), settings, &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "session.contentWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "Maximum columns");
+    assert_eq!(
+        drag(&mut application, start, (start.0 + 14, start.1)),
+        ApplicationTransition::CopyToClipboard("Maximum columns".into())
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (99, 31),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Drag(MouseButton::Left),
+        start,
+    );
+    assert!(
+        !rendered_application_buffer(&application, 100, 32)[start]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        start,
+    );
+    let screen = rendered_application_rows_at(&application, 100, 32).join("\n");
+    assert!(!screen.contains("Maximum columns"));
+    assert!(screen.contains("Session content width"));
 }

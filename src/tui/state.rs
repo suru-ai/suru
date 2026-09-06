@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{
-    Event as InputEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use ratatui::{Frame, layout::Position, style::Style};
@@ -53,7 +53,7 @@ use super::{
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, Notice},
     render::render_with_slots,
-    selection::{TextSelection, TranscriptCell},
+    selection::{SelectionCell, SelectionFrame, SelectionSurface, TextSelection},
     serve_overlay::ServeOverlay,
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
@@ -330,6 +330,8 @@ impl TranscriptViewport {
 pub struct TuiState {
     left_press: Option<LeftPress>,
     pub(super) text_selection: Cell<Option<TextSelection>>,
+    pub(super) selection_frames: RefCell<Vec<SelectionFrame>>,
+    pub(super) selection_overlay_area: Cell<Option<ratatui::layout::Rect>>,
     pub(super) outlook: Outlook,
     outlook_workspaces: HashMap<Outlook, PathBuf>,
     workspace_resolution_sequence: u64,
@@ -504,6 +506,8 @@ impl TuiState {
         Self {
             left_press: None,
             text_selection: Cell::new(None),
+            selection_frames: RefCell::new(Vec::new()),
+            selection_overlay_area: Cell::new(None),
             outlook: Outlook::Local,
             outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
             workspace_resolution_sequence: 0,
@@ -1976,6 +1980,55 @@ impl TuiState {
         self.sidebar.has_focus() && !self.overlay_owns_input()
     }
 
+    fn active_selection_overlay_area(&self) -> Option<ratatui::layout::Rect> {
+        self.selection_overlay_area.get().filter(|_| {
+            self.selection_frames.borrow().last().is_some_and(|frame| {
+                frame.surface.is_overlay() && self.selection_surface_visible(frame.surface)
+            })
+        })
+    }
+
+    /// The top painted overlay owns selection and pointer/key dispatch alike.
+    fn top_selection_overlay(&self) -> Option<SelectionSurface> {
+        if self.connect_overlay.is_open() {
+            Some(SelectionSurface::Connect)
+        } else if self.serve_overlay.is_open() {
+            Some(SelectionSurface::Serve)
+        } else if self.theme_picker.is_open() {
+            Some(SelectionSurface::Themes)
+        } else if self.model_picker.is_open() {
+            Some(SelectionSurface::Models)
+        } else if self.model_options.is_open() {
+            Some(SelectionSurface::ModelOptions)
+        } else if self.settings_panel.numeric_editor_is_open() {
+            Some(SelectionSurface::NumericEditor)
+        } else if self.settings_panel.is_open() {
+            Some(SelectionSurface::Settings)
+        } else if self.workspace_picker.is_open() {
+            Some(SelectionSurface::Workspaces)
+        } else if self.session_picker.is_open() {
+            Some(SelectionSurface::Sessions)
+        } else if self.sidebar.menu_is_open() {
+            Some(SelectionSurface::SidebarMenu)
+        } else if self.subagent_picker.is_open() {
+            Some(SelectionSurface::Subagents)
+        } else if self.composer_completion.is_visible() {
+            Some(SelectionSurface::Completions)
+        } else {
+            None
+        }
+    }
+
+    fn selection_surface_visible(&self, surface: SelectionSurface) -> bool {
+        if self.reconnect_overlay_visible {
+            return false;
+        }
+        if let Some(overlay) = self.top_selection_overlay() {
+            return surface == overlay;
+        }
+        !surface.is_overlay() && !self.overlay_owns_input()
+    }
+
     /// Whether a surface opened over the main view holds the keys. These are
     /// the surfaces [`Application::command_for_terminal_input`] asks before it
     /// asks the Sidebar, so the two readings must agree — which is why that
@@ -1986,7 +2039,7 @@ impl TuiState {
     /// deliberately not here: it is part of the column rather than something
     /// opened over it, and the row it stands on goes on saying which row it
     /// acts upon.
-    fn overlay_owns_input(&self) -> bool {
+    pub(super) fn overlay_owns_input(&self) -> bool {
         self.theme_picker.is_open()
             || self.model_picker.is_open()
             || self.connect_overlay.is_open()
@@ -2237,7 +2290,8 @@ struct LeftPress {
     position: Position,
     pointer: Position,
     dragged: bool,
-    selection_anchor: Option<(TranscriptCell, u64)>,
+    outside_overlay: bool,
+    selection_anchor: Option<(SelectionCell, u64, SelectionSurface)>,
 }
 
 pub struct Application {
@@ -3237,32 +3291,58 @@ impl Application {
             | CommandId::FollowLatest) => self.handle_transcript_command(command),
             CommandId::PressAt { position } => {
                 self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
-                let selection_anchor =
-                    if !self.state.overlay_owns_input() && !self.state.reconnect_overlay_visible {
-                        self.state
-                            .session_reference
-                            .as_ref()
-                            .and_then(|session| self.state.session_interaction(session))
-                            .and_then(|interaction| {
-                                interaction.viewport.borrow().as_ref().and_then(|viewport| {
-                                    let row = viewport.transcript_row(position)?;
-                                    (row < self.state.transcript_cache.row_count()).then_some((
-                                        TranscriptCell {
-                                            row,
-                                            column: usize::from(position.x - viewport.content_left),
-                                        },
-                                        self.state.transcript_cache.selection_epoch(),
-                                    ))
+                let selection_anchor = self
+                    .state
+                    .selection_frames
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|frame| {
+                        frame.area.contains(position)
+                            && self.state.selection_surface_visible(frame.surface)
+                    })
+                    .and_then(|frame| {
+                        frame
+                            .cell(position)
+                            .map(|cell| (cell, frame.epoch(), frame.surface))
+                    })
+                    .or_else(|| {
+                        if !self.state.overlay_owns_input()
+                            && !self.state.reconnect_overlay_visible
+                            && self.state.active_selection_overlay_area().is_none()
+                        {
+                            self.state
+                                .session_reference
+                                .as_ref()
+                                .and_then(|session| self.state.session_interaction(session))
+                                .and_then(|interaction| {
+                                    interaction.viewport.borrow().as_ref().and_then(|viewport| {
+                                        let row = viewport.transcript_row(position)?;
+                                        (row < self.state.transcript_cache.row_count()).then_some((
+                                            SelectionCell {
+                                                row,
+                                                column: usize::from(
+                                                    position.x - viewport.content_left,
+                                                ),
+                                            },
+                                            self.state.transcript_cache.selection_epoch(),
+                                            SelectionSurface::Transcript,
+                                        ))
+                                    })
                                 })
-                            })
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        }
+                    });
 
                 self.state.left_press = Some(LeftPress {
                     position,
                     pointer: position,
                     dragged: false,
+                    outside_overlay: self
+                        .state
+                        .active_selection_overlay_area()
+                        .is_some_and(|area| !area.contains(position)),
                     selection_anchor,
                 });
                 Ok(ApplicationTransition::Continue)
@@ -3276,10 +3356,22 @@ impl Application {
                     .state
                     .left_press
                     .as_ref()
+                    .is_some_and(|press| press.outside_overlay)
+                {
+                    let press = self.state.left_press.take().expect("outside press exists");
+                    return self.invoke_semantic(SemanticInvocation {
+                        id: SemanticCommandId::PointerClick,
+                        subject: SemanticSubject::ScreenPosition(press.position),
+                    });
+                }
+                if self
+                    .state
+                    .left_press
+                    .as_ref()
                     .is_some_and(|press| press.dragged)
                 {
                     self.refresh_text_selection();
-                    self.update_transcript_drag(position, 0);
+                    self.update_text_selection_drag(position, 0);
                     self.state.left_press = None;
                     return if self.state.settings.text_selection.copy == TextSelectionCopy::Release
                     {
@@ -4401,6 +4493,14 @@ impl Application {
     /// Input may arrive after a Session update and before the next draw. Resolve
     /// selection validity against that update before acting on cached cells.
     fn refresh_text_selection(&self) {
+        if self
+            .state
+            .text_selection
+            .get()
+            .is_some_and(|selection| !self.state.selection_surface_visible(selection.surface))
+        {
+            self.state.text_selection.set(None);
+        }
         if self.state.text_selection.get().is_none()
             && self
                 .state
@@ -4428,7 +4528,8 @@ impl Application {
         };
         self.state.transcript_view(&self.theme, width);
         if self.state.text_selection.get().is_some_and(|selection| {
-            selection.epoch != self.state.transcript_cache.selection_epoch()
+            selection.surface == SelectionSurface::Transcript
+                && selection.epoch != self.state.transcript_cache.selection_epoch()
         }) {
             self.state.text_selection.set(None);
         }
@@ -4437,7 +4538,10 @@ impl Application {
     /// Distance beyond the Transcript determines rows per presentation tick.
     fn transcript_drag_scroll(&self) -> Option<(TranscriptDirection, usize)> {
         let press = self.state.left_press.as_ref()?;
-        let (_, epoch) = press.selection_anchor?;
+        let (_, epoch, surface) = press.selection_anchor?;
+        if surface != SelectionSurface::Transcript {
+            return None;
+        }
         if !press.dragged || epoch != self.state.transcript_cache.selection_epoch() {
             return None;
         }
@@ -4465,12 +4569,35 @@ impl Application {
         }
     }
 
-    fn update_transcript_drag(&mut self, position: Position, scroll_rows: usize) {
+    fn update_text_selection_drag(&mut self, position: Position, scroll_rows: usize) {
         let Some(press) = &mut self.state.left_press else {
             return;
         };
         press.pointer = position;
         press.dragged |= position != press.position;
+        if let Some((anchor, epoch, surface)) = press.selection_anchor
+            && surface != SelectionSurface::Transcript
+        {
+            if press.dragged
+                && let Some(frame) = self
+                    .state
+                    .selection_frames
+                    .borrow()
+                    .iter()
+                    .find(|frame| frame.surface == surface && frame.epoch() == epoch)
+                && let Some(focus) = frame.cell(position)
+            {
+                self.state
+                    .text_selection
+                    .set((anchor != focus).then_some(TextSelection {
+                        anchor,
+                        focus,
+                        epoch,
+                        surface,
+                    }));
+            }
+            return;
+        }
         if scroll_rows > 0
             && let Some((direction, _)) = self.transcript_drag_scroll()
         {
@@ -4478,7 +4605,7 @@ impl Application {
         }
         if let Some(press) = &self.state.left_press
             && press.dragged
-            && let Some((anchor, epoch)) = press.selection_anchor
+            && let Some((anchor, epoch, surface)) = press.selection_anchor
             && epoch == self.state.transcript_cache.selection_epoch()
             && let Some(interaction) = self
                 .state
@@ -4502,7 +4629,7 @@ impl Application {
                     viewport.content_left + viewport.content_width - 1,
                 ) - viewport.content_left,
             );
-            let focus = TranscriptCell {
+            let focus = SelectionCell {
                 row: row.min(self.state.transcript_cache.row_count().saturating_sub(1)),
                 column,
             };
@@ -4512,6 +4639,7 @@ impl Application {
                     anchor,
                     focus,
                     epoch,
+                    surface,
                 }));
         }
     }
@@ -4554,6 +4682,20 @@ impl Application {
                 let SemanticSubject::ScreenPosition(position) = invocation.subject else {
                     return Ok(ApplicationTransition::Continue);
                 };
+                if self
+                    .state
+                    .active_selection_overlay_area()
+                    .is_some_and(|area| !area.contains(position))
+                {
+                    return self
+                        .command_for_input_mode(InputEvent::Key(KeyEvent::new(
+                            KeyCode::Esc,
+                            KeyModifiers::NONE,
+                        )))
+                        .map_or(Ok(ApplicationTransition::Continue), |command| {
+                            self.handle_command(command)
+                        });
+                }
                 // Resolve a recognized click through the same mode table as other
                 // input, so overlays retain their ownership of pointer actions.
                 let event = InputEvent::Mouse(MouseEvent {
@@ -4569,7 +4711,7 @@ impl Application {
             }
             SemanticCommandId::PointerDrag => {
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
-                    self.update_transcript_drag(position, 1);
+                    self.update_text_selection_drag(position, 1);
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -4584,7 +4726,25 @@ impl Application {
                 .state
                 .text_selection
                 .get()
-                .and_then(|selection| self.state.transcript_cache.copy_selection(selection))
+                .and_then(|selection| match selection.surface {
+                    SelectionSurface::Transcript => {
+                        self.state.transcript_cache.copy_selection(selection)
+                    }
+                    SelectionSurface::Composer => self
+                        .state
+                        .composers
+                        .selection_frame()
+                        .and_then(|frame| frame.copy(selection)),
+                    _ => self
+                        .state
+                        .selection_frames
+                        .borrow()
+                        .iter()
+                        .find(|frame| {
+                            frame.surface == selection.surface && frame.epoch() == selection.epoch
+                        })
+                        .and_then(|frame| frame.copy(selection)),
+                })
                 .map_or(
                     ApplicationTransition::Continue,
                     ApplicationTransition::CopyToClipboard,
@@ -5479,51 +5639,26 @@ impl Application {
     }
 
     fn command_for_input_mode(&self, event: InputEvent) -> Option<CommandId> {
-        // A choice picker can open over the settings panel, so the newest
-        // surface owns every key until the reader is done choosing.
-        if self.state.theme_picker.is_open() {
-            return command_for_theme_picker_event(event);
-        }
-        if self.state.model_picker.is_open() {
-            return command_for_model_picker_event(event);
-        }
-        if self.state.connect_overlay.is_open() {
-            return command_for_connect_overlay_event(
-                event,
-                self.state.connect_overlay.input_mode(),
-            );
-        }
-        if self.state.serve_overlay.is_open() {
-            return command_for_serve_overlay_event(event);
-        }
-        if self.state.model_options.is_open() {
-            return command_for_model_options_event(event);
-        }
-        if self.state.settings_panel.numeric_editor_is_open() {
-            return command_for_numeric_editor_event(event);
-        }
-        if self.state.settings_panel.is_open() {
-            return command_for_settings_panel_event(event);
-        }
-        if self.state.session_picker.is_open() {
-            return command_for_session_picker_event(event);
-        }
-        if self.state.workspace_picker.is_open() {
-            return command_for_workspace_picker_event(event);
-        }
-        // A Sidebar row's context menu is drawn over the rows and takes the
-        // keys while it is up, whether or not the Sidebar itself has them: a
-        // reader who opened it by pointing must be able to walk it and back
-        // out of it without reaching for the mouse again.
-        if self.state.sidebar.menu_is_open() {
-            return command_for_sidebar_menu_event(event);
-        }
-        // The Subagent Picker docks over the composer and is the newest
-        // surface while it is up, so it outranks the composer's own surfaces
-        // and the Subagent view's reading keys — Escape must close the picker
-        // before it can mean anything else.
-        if self.state.subagent_picker.is_open() {
-            return command_for_subagent_picker_event(event);
+        match self.state.top_selection_overlay() {
+            Some(SelectionSurface::Connect) => {
+                return command_for_connect_overlay_event(
+                    event,
+                    self.state.connect_overlay.input_mode(),
+                );
+            }
+            Some(SelectionSurface::Serve) => return command_for_serve_overlay_event(event),
+            Some(SelectionSurface::Themes) => return command_for_theme_picker_event(event),
+            Some(SelectionSurface::Models) => return command_for_model_picker_event(event),
+            Some(SelectionSurface::ModelOptions) => return command_for_model_options_event(event),
+            Some(SelectionSurface::NumericEditor) => {
+                return command_for_numeric_editor_event(event);
+            }
+            Some(SelectionSurface::Settings) => return command_for_settings_panel_event(event),
+            Some(SelectionSurface::Workspaces) => return command_for_workspace_picker_event(event),
+            Some(SelectionSurface::Sessions) => return command_for_session_picker_event(event),
+            Some(SelectionSurface::SidebarMenu) => return command_for_sidebar_menu_event(event),
+            Some(SelectionSurface::Subagents) => return command_for_subagent_picker_event(event),
+            _ => {}
         }
         // The Sidebar comes after every overlay and before the composer's own
         // surfaces: it stands beside the main view rather than over it, so an
@@ -5631,7 +5766,7 @@ impl Application {
         if let Some((_, rows)) = self.transcript_drag_scroll()
             && let Some(press) = &self.state.left_press
         {
-            self.update_transcript_drag(press.pointer, rows);
+            self.update_text_selection_drag(press.pointer, rows);
         }
         self.state.promote_aged_commands();
         self.state.reconcile_command_mode();
