@@ -217,6 +217,9 @@ pub(super) struct StyledSpan {
     pub(super) content: String,
     pub(super) style: Style,
     pub(super) chrome: bool,
+    /// The decoded Markdown event bytes painted by this span, when authored
+    /// as Markdown. Slicing a span slices these offsets along with its text.
+    pub(super) source: Option<super::markdown::copy::SourceRange>,
 }
 
 impl StyledSpan {
@@ -225,6 +228,7 @@ impl StyledSpan {
             content: content.into(),
             style,
             chrome: false,
+            source: None,
         }
     }
 
@@ -233,6 +237,7 @@ impl StyledSpan {
             content: content.into(),
             style,
             chrome: true,
+            source: None,
         }
     }
 
@@ -252,6 +257,9 @@ pub(super) struct StyledLine {
     /// Source whitespace omitted between this continuation and the preceding
     /// prewrapped row. Copy restores it only when joining those rows.
     pub(super) omitted_prefix: String,
+    /// Shared across the lines of one Markdown projection, including blank
+    /// lines. Its identity keeps selected Messages and Reasoning blocks apart.
+    pub(super) markdown: Option<std::sync::Arc<super::markdown::copy::Document>>,
 }
 
 impl StyledLine {
@@ -304,12 +312,16 @@ impl StyledLine {
                         .to_owned(),
                     style: span.style,
                     chrome: span.chrome,
+                    source: span.source.as_ref().map(|source| {
+                        source.slice(start - span_range.start..end - span_range.start)
+                    }),
                 });
             }
         }
         Self {
             spans,
             continuation: self.continuation,
+            markdown: self.markdown.clone(),
             omitted_prefix: if range.start == 0 {
                 self.omitted_prefix.clone()
             } else {
@@ -349,6 +361,7 @@ impl From<Vec<StyledSpan>> for StyledLine {
             spans,
             continuation: false,
             omitted_prefix: String::new(),
+            markdown: None,
         }
     }
 }

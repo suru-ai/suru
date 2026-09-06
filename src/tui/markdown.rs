@@ -7,6 +7,7 @@ use crate::theme::Theme;
 
 use super::text_layout::{StyledLine, StyledSpan};
 
+pub(super) mod copy;
 mod syntax;
 
 pub(super) fn render(content: &str, theme: &Theme) -> Vec<StyledLine> {
@@ -18,12 +19,19 @@ pub(super) fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> 
 }
 
 fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<StyledLine> {
-    let parser = Parser::new_ext(content, Options::empty());
+    let parser = Parser::new_ext(content, Options::ENABLE_TABLES);
     let mut renderer = Renderer::new(theme, subdued);
+    let mut builder = copy::Builder::new();
     for event in parser {
+        renderer.source = builder.event(&event);
         renderer.event(event);
     }
-    renderer.finish()
+    let document = std::sync::Arc::new(builder.finish());
+    let mut lines = renderer.finish();
+    for line in &mut lines {
+        line.markdown = Some(document.clone());
+    }
+    lines
 }
 
 struct Renderer<'a> {
@@ -35,11 +43,14 @@ struct Renderer<'a> {
     lists: Vec<Option<u64>>,
     links: Vec<String>,
     code_block: Option<CodeBlock>,
+    source: Option<copy::SourceRange>,
+    table_alignments: Vec<copy::ColumnAlignment>,
 }
 
 struct CodeBlock {
     info: String,
     content: String,
+    source: Option<copy::SourceRange>,
 }
 
 impl<'a> Renderer<'a> {
@@ -53,6 +64,8 @@ impl<'a> Renderer<'a> {
             lists: Vec::new(),
             links: Vec::new(),
             code_block: None,
+            source: None,
+            table_alignments: Vec::new(),
         }
     }
 
@@ -104,6 +117,7 @@ impl<'a> Renderer<'a> {
                         CodeBlockKind::Indented => String::new(),
                     },
                     content: String::new(),
+                    source: None,
                 });
                 if let CodeBlockKind::Fenced(language) = kind
                     && !language.is_empty()
@@ -130,7 +144,7 @@ impl<'a> Renderer<'a> {
                     }
                     _ => "• ".to_owned(),
                 };
-                self.push(marker, self.theme.markdown.list_marker);
+                self.push_chrome(marker, self.theme.markdown.list_marker);
             }
             Tag::Emphasis => self.push_style(self.theme.markdown.emphasis),
             Tag::Strong => self.push_style(self.theme.markdown.strong),
@@ -144,16 +158,24 @@ impl<'a> Renderer<'a> {
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
-                self.push("│ ", self.theme.markdown.list_marker);
+                self.push_chrome("│ ", self.theme.markdown.list_marker);
+            }
+            Tag::Table(alignments) => {
+                self.flush_line();
+                self.table_alignments = alignments
+                    .into_iter()
+                    .map(copy::ColumnAlignment::from)
+                    .collect();
+            }
+            Tag::TableHead | Tag::TableRow => {
+                self.flush_line();
+                self.push_chrome("| ", self.theme.markdown.list_marker);
             }
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
             | Tag::TableCell
             | Tag::Strikethrough
             | Tag::Superscript
@@ -175,6 +197,7 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::CodeBlock => {
                 if let Some(block) = self.code_block.take() {
+                    let mut offset = 0;
                     self.lines.extend(
                         syntax::render(
                             &block.content,
@@ -183,7 +206,17 @@ impl<'a> Renderer<'a> {
                             self.prose_style(self.theme.markdown.code_block),
                         )
                         .into_iter()
-                        .map(StyledLine::from),
+                        .map(|line| {
+                            let mut line = StyledLine::from(line);
+                            for span in &mut line.spans {
+                                span.source = block.source.as_ref().map(|source| {
+                                    source.slice(offset..offset + span.content.len())
+                                });
+                                offset += span.content.len();
+                            }
+                            offset += 1;
+                            line
+                        }),
                     );
                 }
                 self.blank_line();
@@ -199,22 +232,32 @@ impl<'a> Renderer<'a> {
             TagEnd::Link | TagEnd::Image => {
                 self.pop_style();
                 if let Some(destination) = self.links.pop() {
-                    self.push(format!(" ({destination})"), self.theme.markdown.link);
+                    self.push_chrome(format!(" ({destination})"), self.theme.markdown.link);
                 }
             }
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.blank_line();
             }
+            TagEnd::TableCell => self.push_chrome(" | ", self.theme.markdown.list_marker),
+            TagEnd::TableHead => {
+                self.flush_line();
+                let separator = self
+                    .table_alignments
+                    .iter()
+                    .map(copy::ColumnAlignment::separator)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                self.push_chrome(format!("| {separator} |"), self.theme.markdown.list_marker);
+                self.flush_line();
+            }
+            TagEnd::TableRow => self.flush_line(),
+            TagEnd::Table => self.blank_line(),
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript
@@ -224,6 +267,9 @@ impl<'a> Renderer<'a> {
 
     fn text(&mut self, text: &str) {
         if let Some(block) = &mut self.code_block {
+            if block.source.is_none() {
+                block.source = self.source.clone();
+            }
             block.content.push_str(text);
         } else {
             self.push(text, self.current_style());
@@ -258,16 +304,18 @@ impl<'a> Renderer<'a> {
     fn push(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            self.current
-                .push(StyledSpan::text(content, self.prose_style(style)));
+            let mut span = StyledSpan::text(content, self.prose_style(style));
+            span.source = self.source.clone();
+            self.current.push(span);
         }
     }
 
     fn push_chrome(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            self.current
-                .push(StyledSpan::chrome(content, self.prose_style(style)));
+            let mut span = StyledSpan::chrome(content, self.prose_style(style));
+            span.source = self.source.clone();
+            self.current.push(span);
         }
     }
 
@@ -298,6 +346,26 @@ impl<'a> Renderer<'a> {
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    // These tests assert paint, independently of the source metadata exercised
+    // through rendered Application selections in the integration suite.
+    fn painted(mut lines: Vec<StyledLine>) -> Vec<StyledLine> {
+        for line in &mut lines {
+            line.markdown = None;
+            for span in &mut line.spans {
+                span.source = None;
+            }
+        }
+        lines
+    }
+
+    fn render(content: &str, theme: &Theme) -> Vec<StyledLine> {
+        painted(super::render(content, theme))
+    }
+
+    fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> {
+        painted(super::render_reasoning(content, theme))
+    }
 
     #[test]
     fn streaming_fences_keep_their_colors_when_closed() {

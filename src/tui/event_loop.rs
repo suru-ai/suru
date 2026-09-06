@@ -3006,6 +3006,135 @@ mod tests {
         assert_eq!(terminal.0, "\x1b]52;c;SGVsbG8K55WM8J+Zgg==\x07");
     }
 
+    #[test]
+    fn rendered_markdown_selection_reaches_clipboard_destinations_in_both_copy_modes() {
+        use crate::protocol::{
+            Message, MessageId, MessageRole, MessageStatus, ModelAvailability, Session, SessionId,
+            SessionRevision, SessionSnapshot, SessionStatus, SidebarVisibility, TextSelectionCopy,
+            TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        };
+        use crate::tui::{ApplicationTransition, CommandId, SemanticCommandId};
+        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        for mode in [TextSelectionCopy::Manual, TextSelectionCopy::Release] {
+            let mut application = Application::new(&workspace, Default::default());
+            let mut settings = EffectiveSettings::default();
+            settings.text_selection.copy = mode;
+            settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+            application
+                .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+                    SettingsSnapshot {
+                        settings,
+                        pinned: vec![],
+                        diagnostics: vec![],
+                    },
+                )))
+                .unwrap();
+            let message_id = MessageId::new();
+            let turn_id = TurnId::new();
+            application
+                .handle_event(ApplicationEvent::SessionAttached(SessionSnapshot {
+                    session: Session {
+                        id: SessionId::new(),
+                        workspace: Workspace {
+                            path: workspace.clone(),
+                        },
+                        agent_selection: None,
+                        agent_selection_availability: ModelAvailability::Available,
+                        status: SessionStatus::Idle,
+                        working_since: None,
+                        parent: None,
+                    },
+                    revision: SessionRevision::INITIAL,
+                    prompts: vec![],
+                    turns: vec![Turn {
+                        id: turn_id,
+                        prompt_id: None,
+                        agent: None,
+                        status: TurnStatus::Completed,
+                        started_at: None,
+                        settled_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
+                    }],
+                    messages: vec![Message {
+                        id: message_id,
+                        turn_id,
+                        role: MessageRole::Agent,
+                        status: MessageStatus::Completed,
+                        content: "**chosen words**".into(),
+                        skill_invocations: vec![],
+                        truncated: false,
+                    }],
+                    activities: vec![],
+                    transcript: vec![TranscriptItem::Message { message_id }],
+                    subagent_questionnaires: vec![],
+                    subagent_usage: None,
+                }))
+                .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| application.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let start = (0..24)
+                .find_map(|y| {
+                    let row = (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+                    row.find("chosen words").map(|x| (x as u16, y))
+                })
+                .expect("the Agent Message is painted");
+            let mut released = ApplicationTransition::Continue;
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), start.0),
+                (MouseEventKind::Drag(MouseButton::Left), start.0 + 5),
+                (MouseEventKind::Up(MouseButton::Left), start.0 + 5),
+            ] {
+                released = application
+                    .handle_terminal_event(Event::Mouse(MouseEvent {
+                        kind,
+                        column,
+                        row: start.1,
+                        modifiers: KeyModifiers::NONE,
+                    }))
+                    .unwrap();
+            }
+            let transition = if mode == TextSelectionCopy::Manual {
+                assert_eq!(released, ApplicationTransition::Continue);
+                application
+                    .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                        SemanticCommandId::TextSelectionCopy,
+                    )))
+                    .unwrap()
+            } else {
+                released
+            };
+            let ApplicationTransition::CopyToClipboard(text) = transition else {
+                panic!("expected a copy")
+            };
+            let mut offered = Vec::new();
+            let mut ansi = AnsiTranscript(String::new());
+            {
+                let mut native = NativeClipboard::new(|target, text: &str| {
+                    offered.push((target, text.to_owned()));
+                    Ok(())
+                });
+                copy_to_clipboard(&mut ansi, &mut native, &text);
+            }
+            assert_eq!(
+                offered[0],
+                (super::NativeClipboardTarget::Clipboard, "**chosen**".into())
+            );
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                offered[1],
+                (super::NativeClipboardTarget::Primary, "**chosen**".into())
+            );
+            assert_eq!(ansi.0, "\x1b]52;c;KipjaG9zZW4qKg==\x07");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn text_selection_and_invite_copies_also_fill_the_native_primary_selection() {

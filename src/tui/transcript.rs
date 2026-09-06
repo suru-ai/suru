@@ -689,6 +689,7 @@ static SEPARATOR_LINE: StyledLine = StyledLine {
     spans: Vec::new(),
     continuation: false,
     omitted_prefix: String::new(),
+    markdown: None,
 };
 
 /// What a Transcript row draws: a unit's separator, or one wrapped row of a
@@ -714,16 +715,44 @@ impl TranscriptView {
         let (start, end) = selection.ordered();
         let start = self.position_at(start.row, start.column)?;
         let end = self.position_at_edge(end.row, end.column, true)?;
+        enum Part {
+            Plain(String),
+            Markdown(
+                std::sync::Arc<markdown::copy::Document>,
+                Vec<markdown::copy::SourceRange>,
+            ),
+        }
+        let mut parts = Vec::new();
         let mut copied = String::new();
         let mut has_source_line = false;
+        let mut markdown: Option<std::sync::Arc<markdown::copy::Document>> = None;
+        let mut ranges = Vec::new();
         for index in start.line..=end.line {
             let line = self.projected_line(index)?;
-            // A standalone decoration has no source line. Empty source lines
-            // have no spans or an explicit empty text span beneath their gutter.
-            if !line.spans.is_empty() && line.spans.iter().all(|span| span.chrome) {
+            if !line.spans.is_empty()
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| span.chrome && span.source.is_none())
+            {
                 continue;
             }
-            if has_source_line {
+            let same_document = match (&markdown, &line.markdown) {
+                (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_document {
+                if let Some(document) = markdown.take() {
+                    parts.push(Part::Plain(std::mem::take(&mut copied)));
+                    parts.push(Part::Markdown(document, std::mem::take(&mut ranges)));
+                }
+                if has_source_line && line.markdown.is_some() {
+                    copied.push('\n');
+                }
+                markdown = line.markdown.clone();
+            }
+            if markdown.is_none() && has_source_line {
                 if line.continuation {
                     copied.push_str(&line.omitted_prefix);
                 } else {
@@ -737,19 +766,40 @@ impl TranscriptView {
             } else {
                 usize::MAX
             };
-            let mut offset = 0;
-            for span in &line.spans {
-                let span_end = offset + span.content.len();
-                if !span.chrome {
-                    copied.push_str(
-                        &span.content[from.clamp(offset, span_end) - offset
-                            ..to.clamp(offset, span_end) - offset],
-                    );
+            let selected = line.slice(from..to);
+            for span in &selected.spans {
+                if span.chrome && span.source.is_none() {
+                    continue;
                 }
-                offset = span_end;
+                if markdown.is_some() {
+                    if let Some(source) = &span.source {
+                        ranges.push(source.clone());
+                    }
+                } else {
+                    copied.push_str(&span.content);
+                }
             }
         }
-        // Trim each source line without removing separator lines.
+        if let Some(document) = markdown {
+            parts.push(Part::Plain(std::mem::take(&mut copied)));
+            parts.push(Part::Markdown(document, ranges));
+        }
+        parts.push(Part::Plain(copied));
+        let single_content = parts
+            .iter()
+            .filter(|part| match part {
+                Part::Plain(text) => !text.trim().is_empty(),
+                Part::Markdown(_, ranges) => !ranges.is_empty(),
+            })
+            .count()
+            == 1;
+        let copied = parts
+            .into_iter()
+            .map(|part| match part {
+                Part::Plain(text) => text,
+                Part::Markdown(document, ranges) => document.copy(&ranges, single_content),
+            })
+            .collect::<String>();
         Some(
             copied
                 .split('\n')
@@ -4061,47 +4111,23 @@ fn split_line_at_column_budget(line: StyledLine, width: u16) -> Vec<StyledLine> 
         .saturating_mul(usize::from(width.max(1)))
         .max(1);
     let mut chunks = Vec::new();
-    let mut chunk_spans: Vec<StyledSpan> = Vec::new();
-    let mut chunk_columns = 0usize;
-    for span in line.spans {
-        let span_columns = span.width();
-        if chunk_columns + span_columns <= column_budget {
-            chunk_columns += span_columns;
-            chunk_spans.push(span);
-            continue;
-        }
-        let StyledSpan {
-            content,
-            style,
-            chrome,
-        } = span;
-        let mut piece = String::new();
-        for character in content.chars() {
-            let character_columns = character.width().unwrap_or(0);
-            if chunk_columns + character_columns > column_budget && chunk_columns > 0 {
-                if !piece.is_empty() {
-                    chunk_spans.push(StyledSpan {
-                        content: std::mem::take(&mut piece),
-                        style,
-                        chrome,
-                    });
-                }
-                chunks.push(StyledLine::from(std::mem::take(&mut chunk_spans)));
-                chunk_columns = 0;
+    let mut start = 0;
+    let mut offset = 0;
+    let mut columns = 0;
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let width = character.width().unwrap_or(0);
+            if columns + width > column_budget && columns > 0 {
+                chunks.push(line.slice(start..offset));
+                start = offset;
+                columns = 0;
             }
-            piece.push(character);
-            chunk_columns += character_columns;
-        }
-        if !piece.is_empty() {
-            chunk_spans.push(StyledSpan {
-                content: piece,
-                style,
-                chrome,
-            });
+            offset += character.len_utf8();
+            columns += width;
         }
     }
-    if !chunk_spans.is_empty() || chunks.is_empty() {
-        chunks.push(StyledLine::from(chunk_spans));
+    if start < offset || chunks.is_empty() {
+        chunks.push(line.slice(start..offset));
     }
     chunks
 }
@@ -4134,49 +4160,15 @@ fn split_line_at_character_midpoint(
     line: StyledLine,
     character_count: usize,
 ) -> (StyledLine, StyledLine) {
-    let mut remaining_left = character_count / 2;
-    let mut left_spans = Vec::new();
-    let mut right_spans = Vec::new();
-    for span in line.spans {
-        if remaining_left == 0 {
-            right_spans.push(span);
-            continue;
-        }
-        let span_character_count = span.content.chars().count();
-        if span_character_count <= remaining_left {
-            remaining_left -= span_character_count;
-            left_spans.push(span);
-            continue;
-        }
-
-        let StyledSpan {
-            content,
-            style,
-            chrome,
-        } = span;
-        let split_byte = content
-            .char_indices()
-            .nth(remaining_left)
-            .map_or(content.len(), |(index, _)| index);
-        let (left, right) = content.split_at(split_byte);
-        if !left.is_empty() {
-            left_spans.push(StyledSpan {
-                content: left.to_owned(),
-                style,
-                chrome,
-            });
-        }
-        if !right.is_empty() {
-            right_spans.push(StyledSpan {
-                content: right.to_owned(),
-                style,
-                chrome,
-            });
-        }
-        remaining_left = 0;
-    }
-
-    (StyledLine::from(left_spans), StyledLine::from(right_spans))
+    let split_byte = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .take(character_count / 2)
+        .map(char::len_utf8)
+        .sum();
+    let bytes = line.spans.iter().map(|span| span.content.len()).sum();
+    (line.slice(0..split_byte), line.slice(split_byte..bytes))
 }
 
 #[cfg(test)]
@@ -6501,8 +6493,8 @@ mod tests {
         );
         assert_eq!(
             span_marks(&lines[0]),
-            [(true, "  "), (false, "• "), (false, "item one")],
-            "an agent Message's indent is chrome and its Markdown is text"
+            [(true, "  "), (true, "• "), (false, "item one")],
+            "the rendered bullet is decoration; copying obtains its marker from Markdown structure"
         );
         assert_eq!(
             span_marks(&lines[2]),

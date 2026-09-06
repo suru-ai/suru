@@ -6708,6 +6708,28 @@ fn select_transcript(application: &mut Application, start: (u16, u16), end: (u16
 }
 
 #[test]
+fn markdown_selection_balances_partial_inline_formatting_without_unselected_words() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "Before **bold *chosen words* after** outside",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "chosen words");
+    assert_eq!(
+        select_transcript(&mut application, start, (start.0 + 5, start.1)),
+        "***chosen***"
+    );
+}
+
+#[test]
 fn transcript_selection_copies_source_lines_skipping_chrome_and_keeping_separators() {
     let workspace = workspace_dir();
     for (entries, first, last, expected) in [
@@ -7527,5 +7549,381 @@ fn reconnecting_cancels_a_held_transcript_edge_drag() {
     assert_eq!(
         buffer_rows(&stopped),
         buffer_rows(&rendered_application_buffer(&application, 80, 20))
+    );
+}
+
+#[test]
+fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
+    let workspace = workspace_dir();
+    for (source, first, last, last_width, expected) in [
+        (
+            "## Heading\n\nA **bold** and *soft* `value` [link](https://example.test).\n\n> quoted words",
+            "Heading",
+            "quoted words",
+            12,
+            "## Heading\n\nA **bold** and *soft* `value` [link](https://example.test).\n\n> quoted words",
+        ),
+        (
+            "3. before **chosen words** after\n   - nested *child text*\n4. outside",
+            "chosen",
+            "child text",
+            5,
+            "3. **chosen words** after\n   - nested *child*",
+        ),
+    ] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage(source)],
+            )))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        let start = text_position(&buffer, first);
+        let end = text_position(&buffer, last);
+        assert_eq!(
+            select_transcript(&mut application, start, (end.0 + last_width - 1, end.1)),
+            expected
+        );
+    }
+}
+
+#[test]
+fn markdown_selection_copies_complete_and_partial_pipe_tables() {
+    let workspace = workspace_dir();
+    let source = "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` | |\n| beta | left\\|right | |";
+    for (first, last, last_width, expected) in [
+        (
+            "Name",
+            "left|right",
+            14,
+            "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` |  |\n| beta | left\\|right |  |",
+        ),
+        (
+            "alpha",
+            "left|right",
+            4,
+            "|  |  |  |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` |  |\n| beta | left |  |",
+        ),
+        ("left|right", "left|right", 4, "|  |\n| ---: |\n| left |"),
+    ] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage(source)],
+            )))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        let start = text_position(&buffer, first);
+        let end = text_position(&buffer, last);
+        assert_eq!(
+            select_transcript(&mut application, start, (end.0 + last_width - 1, end.1)),
+            expected
+        );
+    }
+}
+
+#[test]
+fn markdown_selection_keeps_code_raw_inside_a_block_and_fenced_across_prose() {
+    let workspace = workspace_dir();
+    let source = "Before **code**\n\n````rust\nlet ticks = \"```\";\nlet 界 = 2;\n````\n\nAfter";
+    for (first, last, last_width, expected) in [
+        ("ticks", "let 界", 11, "ticks = \"```\";\nlet 界 = 2;"),
+        (
+            "Before",
+            "let 界",
+            11,
+            "Before **code**\n\n````rust\nlet ticks = \"```\";\nlet 界 = 2;\n````",
+        ),
+        (
+            "ticks",
+            "After",
+            5,
+            "````rust\nticks = \"```\";\nlet 界 = 2;\n````\n\nAfter",
+        ),
+    ] {
+        for reverse in [false, true] {
+            let mut application = connected_application(workspace.path());
+            pin_release_copy(&mut application);
+            application
+                .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                    SessionId::new(),
+                    workspace.path(),
+                    &[RunEntry::AgentMessage(source)],
+                )))
+                .unwrap();
+            let buffer = rendered_application_buffer(&application, 60, 32);
+            let start = text_position(&buffer, first);
+            let end = text_position(&buffer, last);
+            let end = (end.0 + last_width - 1, end.1);
+            let (start, end) = if reverse { (end, start) } else { (start, end) };
+            assert_eq!(select_transcript(&mut application, start, end), expected);
+        }
+    }
+}
+
+#[test]
+fn markdown_selection_unwraps_formatted_unicode_across_messages_and_omits_hidden_reasoning() {
+    let workspace = workspace_dir();
+    let entries = [
+        RunEntry::AgentMessage(
+            "## First\n\n**one two three four five six seven eight 界🙂 nine ten**",
+        ),
+        RunEntry::Reasoning(ReasoningBlock::thought("Hidden", "Secret **words**", 20)),
+        RunEntry::AgentMessage("## Last\n\n*final words*"),
+    ];
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &entries,
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 32, 40);
+    let start = text_position(&buffer, "First");
+    let end = text_position(&buffer, "final words");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 10, end.1)),
+        "## First\n\n**one two three four five six seven eight 界🙂 nine ten**\n\n## Last\n\n*final words*"
+    );
+}
+
+#[test]
+fn markdown_selection_preserves_visible_reasoning_and_excludes_folded_body() {
+    let workspace = workspace_dir();
+    let mut application = client_showing_reasoning(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    deliver_settings(
+        &mut application,
+        settings,
+        &["textSelection.copy", "transcript.reasoningVisibility"],
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[
+                RunEntry::Reasoning(ReasoningBlock::thought(
+                    "Inspect",
+                    "### Plan\n\nChoose **this** path",
+                    20,
+                )),
+                RunEntry::AgentMessage("Final answer"),
+            ],
+        )))
+        .unwrap();
+    let rows = rendered_application_rows_at(&application, 80, 32);
+    left_click_at(&mut application, rendered_row(&rows, "Thought") as u16).unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 32);
+    let start = text_position(&buffer, "Plan");
+    let end = text_position(&buffer, "this");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 3, end.1)),
+        "### Plan\n\nChoose **this**"
+    );
+}
+
+#[test]
+fn markdown_selection_fences_a_code_only_message_when_other_selected_messages_are_prose() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[
+                RunEntry::AgentMessage("Example"),
+                RunEntry::AgentMessage("```rust\nlet answer = 42;\n```"),
+            ],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 32);
+    let start = text_position(&buffer, "Example");
+    let end = text_position(&buffer, "let answer");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 15, end.1)),
+        "Example\n\n```rust\nlet answer = 42;\n```"
+    );
+}
+
+#[test]
+fn markdown_selection_preserves_hard_breaks_inside_inline_formatting() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage("A **bold  \nnext** sentence")],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "A bold");
+    let end = text_position(&buffer, "next sentence");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 12, end.1)),
+        "A **bold\\\nnext** sentence"
+    );
+}
+
+#[test]
+fn markdown_selection_inside_a_nested_code_block_copies_only_code() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "- context\n\n  ```rust\n  let answer = 42;\n  ```",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "let answer");
+    assert_eq!(
+        select_transcript(&mut application, start, (start.0 + 15, start.1)),
+        "let answer = 42;"
+    );
+}
+
+#[test]
+fn markdown_selection_keeps_code_as_a_separate_block_in_a_list_item() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "- context\n\n  ```rust\n  let answer = 42;\n  ```",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "context");
+    let end = text_position(&buffer, "let answer");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 15, end.1)),
+        "- context\n\n  ```rust\n  let answer = 42;\n  ```"
+    );
+}
+
+#[test]
+fn markdown_selection_keeps_literal_entities_and_block_markers_as_selected_text() {
+    let workspace = workspace_dir();
+    for (source, first, last, expected) in [
+        (
+            "&amp;copy; remains",
+            "&copy;",
+            "remains",
+            "\\&copy; remains",
+        ),
+        ("before - literal", "- literal", "literal", "\\- literal"),
+        ("before 1. literal", "1. literal", "literal", "1\\. literal"),
+        (r"\<tag> literal", "<tag>", "literal", r"\<tag\> literal"),
+    ] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage(source)],
+            )))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 80, 24);
+        let start = text_position(&buffer, first);
+        let end = text_position(&buffer, last);
+        assert_eq!(
+            select_transcript(
+                &mut application,
+                start,
+                (end.0 + last.len() as u16 - 1, end.1)
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn markdown_selection_preserves_escaped_link_metadata() {
+    let workspace = workspace_dir();
+    let source = r#"[link](https://example.test/a\\ "a&amp;copy;") and [next](https://example.test/a&amp;copy;)"#;
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 160, 24);
+    let start = text_position(&buffer, "link");
+    let end = text_position(&buffer, "next");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 3, end.1)),
+        source
+    );
+}
+
+#[test]
+fn markdown_selection_uses_valid_fences_for_backticks_in_language_metadata() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "Example\n\n~~~~lang`meta\nlet ticks = \"~~~\";\n~~~~",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "Example");
+    let end = text_position(&buffer, "let ticks");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 17, end.1)),
+        "Example\n\n~~~~lang`meta\nlet ticks = \"~~~\";\n~~~~"
+    );
+}
+
+#[test]
+fn markdown_selection_keeps_a_leading_tilde_fence_inside_a_list() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "- ~~~lang`meta\n  code\n  ~~~\n\n  after",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "code");
+    let end = text_position(&buffer, "after");
+    assert_eq!(
+        select_transcript(&mut application, start, (end.0 + 4, end.1)),
+        "- ~~~lang`meta\n  code\n  ~~~\n\n  after"
     );
 }
