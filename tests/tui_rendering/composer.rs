@@ -2045,3 +2045,205 @@ fn composer_line_edges_resolve_through_application_and_stay_on_the_written_line(
         );
     }
 }
+
+fn composer_selection_key(
+    application: &mut Application,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, modifiers)))
+        .unwrap()
+}
+
+fn assert_composer_mark(application: &Application, width: u16, text: &str, selected: bool) {
+    let buffer = rendered_application_buffer(application, width, 32);
+    let position = text_position(&buffer, text);
+    for x in position.0..position.0 + text.len() as u16 {
+        assert_eq!(
+            buffer[(x, position.1)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            selected,
+            "{text} at {x},{}",
+            position.1
+        );
+    }
+}
+
+#[test]
+fn composer_selection_survives_resize_and_copies_the_same_wrapped_text() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    crate::support::deliver_settings(&mut application, settings);
+    type_terminal_text(
+        &mut application,
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+    );
+    let buffer = rendered_application_buffer(&application, 50, 32);
+    let start = text_position(&buffer, "bravo");
+    let end = text_position(&buffer, "juliet");
+    assert!(end.1 > start.1);
+    let expected = ApplicationTransition::CopyToClipboard(
+        "bravo charlie delta echo foxtrot golf hotel india juliet".into(),
+    );
+    assert_eq!(
+        super::selection::drag(&mut application, start, (end.0 + 5, end.1)),
+        expected
+    );
+    application
+        .handle_terminal_event(InputEvent::Resize(80, 32))
+        .unwrap();
+    assert_composer_mark(&application, 80, "bravo", true);
+    assert_composer_mark(&application, 80, "juliet", true);
+    assert_composer_mark(&application, 80, "alpha", false);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        expected
+    );
+    assert_composer_mark(&application, 80, "bravo", false);
+}
+
+#[test]
+fn composer_selection_survives_sidebar_and_picker_key_ownership() {
+    use suru::tui::SemanticCommandId;
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    crate::support::deliver_settings(&mut application, settings);
+    type_terminal_text(&mut application, "marked draft");
+    let buffer = rendered_application_buffer(&application, 140, 32);
+    let start = text_position(&buffer, "marked draft");
+    super::selection::drag(&mut application, start, (start.0 + 5, start.1));
+    composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    assert_composer_mark(&application, 140, "marked", true);
+    type_terminal_text(&mut application, "search");
+    assert_composer_mark(&application, 140, "marked", true);
+    composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    assert_composer_mark(&application, 140, "marked", true);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ThemeList,
+        )))
+        .unwrap();
+    rendered_application_buffer(&application, 140, 32);
+    // Closing the picker semantically avoids Escape's intentional selection-clear precedence.
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseThemePicker))
+        .unwrap();
+    assert_composer_mark(&application, 140, "marked", true);
+}
+
+#[test]
+fn composer_selection_clears_on_submit_and_session_switch() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let (_, first) = enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "marked draft");
+    let mark = |application: &mut Application| {
+        let buffer = rendered_application_buffer(application, 100, 32);
+        let start = text_position(&buffer, "marked draft");
+        super::selection::drag(application, start, (start.0 + 5, start.1));
+    };
+    mark(&mut application);
+    let second = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Another Session",
+        workspace.path(),
+    );
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(second)))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(first)))
+        .unwrap();
+    assert_composer_mark(&application, 100, "marked", false);
+    mark(&mut application);
+    let transition = composer_selection_key(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        matches!(transition, ApplicationTransition::AdmitPrompt { .. }),
+        "{transition:?}"
+    );
+    type_terminal_text(&mut application, "marked draft");
+    assert_composer_mark(&application, 100, "marked", false);
+}
+
+#[test]
+fn composer_and_transcript_marks_replace_each_other_in_both_directions() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "marked draft");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let transcript = text_position(&buffer, "Initial Prompt");
+    let composer = text_position(&buffer, "marked draft");
+    for (start, end, marked, cleared) in [
+        (
+            transcript,
+            (transcript.0 + 6, transcript.1),
+            "Initial",
+            "marked",
+        ),
+        (composer, (composer.0 + 5, composer.1), "marked", "Initial"),
+        (
+            transcript,
+            (transcript.0 + 6, transcript.1),
+            "Initial",
+            "marked",
+        ),
+    ] {
+        super::selection::drag(&mut application, start, end);
+        assert_composer_mark(&application, 100, marked, true);
+        assert_composer_mark(&application, 100, cleared, false);
+    }
+}
+
+#[test]
+fn composer_selection_focus_follows_a_reverse_drag_and_copy_leaves_it_there() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "alpha 界🙂 bravo");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "alpha");
+    super::selection::drag(
+        &mut application,
+        (start.0 + 9, start.1),
+        (start.0 + 6, start.1),
+    );
+    let focus = Position::new(start.0 + 6, start.1);
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("界🙂".into())
+    );
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    assert!(
+        !buffer[(start.0 + 6, start.1)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn composer_selection_escape_and_any_left_press_clear_the_mark() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "marked draft");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "marked draft");
+    super::selection::drag(&mut application, start, (start.0 + 5, start.1));
+    composer_selection_key(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    assert_composer_mark(&application, 100, "marked", false);
+    super::selection::drag(&mut application, start, (start.0 + 5, start.1));
+    super::selection::mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (99, 0),
+    );
+    assert_composer_mark(&application, 100, "marked", false);
+}

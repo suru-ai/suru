@@ -39,6 +39,7 @@ struct ComposerFrame {
 struct ComposerState {
     text: String,
     cursor: usize,
+    selection_anchor: Option<usize>,
     // Pointer placement may choose the end of the row before a wrap;
     // ordinary editing and navigation return to the default wrap side.
     prefer_previous_row: bool,
@@ -100,6 +101,47 @@ impl ComposerMemory {
                 .collect(),
             text: text.to_owned(),
         })
+    }
+
+    /// Selection offsets belong to this draft; its cursor is the focus.
+    pub(super) fn selection_range(&self, key: ComposerKey) -> Option<Range<usize>> {
+        let composer = self.composers.get(&key)?;
+        let anchor = composer.selection_anchor?;
+        let range = anchor.min(composer.cursor)..anchor.max(composer.cursor);
+        (!range.is_empty() && composer.text.get(range.clone()).is_some()).then_some(range)
+    }
+
+    pub(super) fn select(&mut self, key: ComposerKey, anchor: usize, focus: usize) {
+        let composer = self.composer_mut(key);
+        if composer.text.is_char_boundary(anchor) && composer.text.is_char_boundary(focus) {
+            composer.selection_anchor = (anchor != focus).then_some(anchor);
+            composer.cursor = focus;
+            composer.prefer_previous_row = false;
+        }
+    }
+
+    pub(super) fn clear_selections(&mut self) {
+        for composer in self.composers.values_mut() {
+            composer.selection_anchor = None;
+        }
+    }
+
+    pub(super) fn highlight_selection(&self, buffer: &mut ratatui::buffer::Buffer) {
+        let Some(frame) = self.selection_frame() else {
+            return;
+        };
+        let recorded = self.frame.borrow();
+        let Some(recorded) = recorded.as_ref() else {
+            return;
+        };
+        if let Some(range) = self.selection_range(recorded.key.clone()) {
+            frame.highlight_range(range, buffer);
+        }
+    }
+
+    pub(super) fn copy_selection(&self, key: ComposerKey) -> Option<String> {
+        let range = self.selection_range(key)?;
+        self.selection_frame()?.copy_range(range)
     }
 
     pub(super) fn hit(&self, key: ComposerKey, position: Position) -> Option<CursorTarget> {
@@ -480,6 +522,12 @@ impl ComposerState {
         let cursor = range.start + replacement.len();
         self.text.replace_range(range, replacement);
         self.cursor = cursor;
+        if self
+            .selection_anchor
+            .is_some_and(|anchor| !self.text.is_char_boundary(anchor))
+        {
+            self.selection_anchor = None;
+        }
         self.invalidate_retry_after_edit();
         true
     }
@@ -605,6 +653,7 @@ impl ComposerState {
 
     fn clear(&mut self) {
         self.text.clear();
+        self.selection_anchor = None;
         self.cursor = 0;
         self.history_position = None;
         self.history_scratch = None;
@@ -632,6 +681,7 @@ impl ComposerState {
             .collect();
         self.skill_issues.clear();
         self.text.clear();
+        self.selection_anchor = None;
         self.cursor = 0;
         self.history_position = None;
         self.history_scratch = None;

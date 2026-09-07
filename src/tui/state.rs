@@ -635,6 +635,7 @@ impl TuiState {
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
         self.text_selection.set(None);
+        self.composers.clear_selections();
         self.left_press = None;
         self.session = None;
         self.session_reference = None;
@@ -663,6 +664,7 @@ impl TuiState {
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
         self.text_selection.set(None);
+        self.composers.clear_selections();
         self.left_press = None;
         self.session = None;
         self.session_reference = None;
@@ -1394,6 +1396,7 @@ impl TuiState {
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
         self.text_selection.set(None);
+        self.composers.clear_selections();
         self.left_press = None;
         // The picker browses the Session that was open, so a swap to another
         // one takes it away rather than leaving it standing over rows it
@@ -1471,6 +1474,14 @@ impl TuiState {
             // Command; Expanded remains reserved for manual disclosure.
             folds.auto_promote(activity_id);
         }
+    }
+
+    fn has_text_selection(&self) -> bool {
+        self.text_selection.get().is_some()
+            || self
+                .composers
+                .selection_range(self.composer_key())
+                .is_some()
     }
 
     /// The composer the keys write into, which is the one belonging to the
@@ -2332,6 +2343,7 @@ struct LeftPress {
     dragged: bool,
     outside_overlay: bool,
     selection_anchor: Option<(SelectionCell, u64, SelectionSurface)>,
+    composer_anchor: Option<std::ops::Range<usize>>,
 }
 
 pub struct Application {
@@ -3293,7 +3305,7 @@ impl Application {
         }
         match command {
             CommandId::ClearOrExit | CommandId::OpenContextMenuAt { .. }
-                if self.state.text_selection.get().is_some() =>
+                if self.state.has_text_selection() =>
             {
                 let transition = self.invoke_semantic(SemanticCommandId::TextSelectionCopy)?;
                 self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
@@ -3368,6 +3380,11 @@ impl Application {
                         })
                     });
 
+                let composer_anchor = selection_anchor
+                    .filter(|(_, _, surface)| *surface == SelectionSurface::Composer)
+                    .and_then(|(cell, _, _)| {
+                        self.state.composers.selection_frame()?.cell_range(cell)
+                    });
                 self.state.left_press = Some(LeftPress {
                     position,
                     pointer: position,
@@ -3377,6 +3394,7 @@ impl Application {
                         .active_selection_overlay_area()
                         .is_some_and(|area| !area.contains(position)),
                     selection_anchor,
+                    composer_anchor,
                 });
                 let mut click = LastClick {
                     count: 1,
@@ -4650,6 +4668,7 @@ impl Application {
         let Some((anchor, focus)) = bounds else {
             return;
         };
+        self.state.composers.clear_selections();
         self.state.text_selection.set(Some(TextSelection {
             surface: SelectionSurface::Transcript,
             anchor,
@@ -4699,6 +4718,26 @@ impl Application {
         };
         press.pointer = position;
         press.dragged |= position != press.position;
+        if let Some(anchor) = press.composer_anchor.clone() {
+            if press.dragged
+                && let Some(frame) = self.state.composers.selection_frame()
+                && let Some(cell) = frame.cell(position)
+                && let Some(focus) = frame.cell_range(cell)
+            {
+                let (anchor, focus) = if focus.start < anchor.start {
+                    (anchor.end, focus.start)
+                } else if focus.start > anchor.start {
+                    (anchor.start, focus.end)
+                } else {
+                    (anchor.start, anchor.start)
+                };
+                self.state.text_selection.set(None);
+                self.state
+                    .composers
+                    .select(self.state.composer_key(), anchor, focus);
+            }
+            return;
+        }
         if let Some((anchor, epoch, surface)) = press.selection_anchor
             && surface != SelectionSurface::Transcript
         {
@@ -4854,40 +4893,46 @@ impl Application {
             }
             SemanticCommandId::TextSelectionClear => {
                 self.state.text_selection.set(None);
+                self.state.composers.clear_selections();
                 if let Some(press) = &mut self.state.left_press {
                     press.selection_anchor = None;
+                    press.composer_anchor = None;
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            SemanticCommandId::TextSelectionCopy => Ok(self
-                .state
-                .text_selection
-                .get()
-                .and_then(|selection| match selection.surface {
-                    SelectionSurface::Transcript => {
-                        self.state.transcript_cache.copy_selection(selection)
-                    }
-                    SelectionSurface::Composer => self
-                        .state
-                        .composers
-                        .selection_frame()
-                        .and_then(|frame| frame.copy(selection))
-                        .map(Into::into),
-                    _ => self
-                        .state
-                        .selection_frames
-                        .borrow()
-                        .iter()
-                        .find(|frame| {
-                            frame.surface == selection.surface && frame.epoch() == selection.epoch
-                        })
-                        .and_then(|frame| frame.copy(selection))
-                        .map(Into::into),
-                })
-                .map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::CopyToClipboard,
-                )),
+            SemanticCommandId::TextSelectionCopy => {
+                if let Some(text) = self
+                    .state
+                    .composers
+                    .copy_selection(self.state.composer_key())
+                {
+                    return Ok(ApplicationTransition::CopyToClipboard(text.into()));
+                }
+                Ok(self
+                    .state
+                    .text_selection
+                    .get()
+                    .and_then(|selection| match selection.surface {
+                        SelectionSurface::Transcript => {
+                            self.state.transcript_cache.copy_selection(selection)
+                        }
+                        _ => self
+                            .state
+                            .selection_frames
+                            .borrow()
+                            .iter()
+                            .find(|frame| {
+                                frame.surface == selection.surface
+                                    && frame.epoch() == selection.epoch
+                            })
+                            .and_then(|frame| frame.copy(selection))
+                            .map(Into::into),
+                    })
+                    .map_or(
+                        ApplicationTransition::Continue,
+                        ApplicationTransition::CopyToClipboard,
+                    ))
+            }
             SemanticCommandId::ComposerPlaceCursor => {
                 if !self.state.overlay_owns_input()
                     && !self.state.reconnect_overlay_visible
@@ -5730,7 +5775,7 @@ impl Application {
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
         self.refresh_text_selection();
-        if self.state.text_selection.get().is_some() {
+        if self.state.has_text_selection() {
             match &event {
                 InputEvent::Key(key)
                     if key.kind != KeyEventKind::Release
@@ -5750,13 +5795,19 @@ impl Application {
             }
         }
         if matches!(&event, InputEvent::Key(key) if key.code == KeyCode::Esc)
-            && self.state.text_selection.get().is_some()
+            && self.state.has_text_selection()
         {
             return Some(CommandId::InvokeSemantic(
                 SemanticCommandId::TextSelectionClear,
             ));
         }
-        if matches!(&event, InputEvent::Resize(..)) {
+        if matches!(&event, InputEvent::Resize(..))
+            && self
+                .state
+                .composers
+                .selection_range(self.state.composer_key())
+                .is_none()
+        {
             return Some(CommandId::InvokeSemantic(
                 SemanticCommandId::TextSelectionClear,
             ));

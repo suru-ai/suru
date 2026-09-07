@@ -147,6 +147,7 @@ pub(super) fn render_with_slots(
     } else {
         render_landing(frame, state, main, slots, theme)
     };
+    state.composers.highlight_selection(frame.buffer_mut());
     if let Some(surface) = state.composers.selection_frame() {
         state.selection_frames.borrow_mut().push(surface);
     }

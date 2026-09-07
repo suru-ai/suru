@@ -179,17 +179,64 @@ pub(super) struct SelectionFrame {
 
 impl SelectionFrame {
     /// Painted content must still be the content that received the press.
-    /// Composer edits are copy-only: they keep the standing selection.
     pub(super) fn epoch(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
-        if self.surface == SelectionSurface::Composer {
-            self.area.width.hash(&mut hash);
-        } else {
-            self.area.hash(&mut hash);
-            self.text.hash(&mut hash);
-        }
+        self.area.hash(&mut hash);
+        self.text.hash(&mut hash);
         hash.finish()
+    }
+
+    /// The draft bytes beneath a cell, including the whole glyph it paints.
+    pub(super) fn cell_range(&self, cell: SelectionCell) -> Option<std::ops::Range<usize>> {
+        let range = self.rows.get(cell.row)?;
+        let mut column = 0;
+        for (offset, glyph) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(
+            &self.text[range.clone()],
+            true,
+        ) {
+            column += glyph.width();
+            if cell.column < column {
+                let start = range.start + offset;
+                return Some(start..start + glyph.len());
+            }
+        }
+        Some(range.end..range.end)
+    }
+
+    pub(super) fn copy_range(&self, range: std::ops::Range<usize>) -> Option<String> {
+        Some(
+            self.text
+                .get(range)?
+                .split('\n')
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    pub(super) fn highlight_range(&self, selected: std::ops::Range<usize>, buffer: &mut Buffer) {
+        for y in self.area.y..self.area.bottom() {
+            let Some(row) = self.rows.get(self.scroll + usize::from(y - self.area.y)) else {
+                break;
+            };
+            let mut column = 0;
+            for (offset, glyph) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(
+                self.text[row.clone()].trim_end(),
+                true,
+            ) {
+                let left = column;
+                column += glyph.width();
+                let start = row.start + offset;
+                if start < selected.end && start + glyph.len() > selected.start {
+                    for x in left..column.min(usize::from(self.area.width)) {
+                        buffer[(self.area.x + x as u16, y)]
+                            .modifier
+                            .insert(Modifier::REVERSED);
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn cell(&self, position: ratatui::layout::Position) -> Option<SelectionCell> {
