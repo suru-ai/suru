@@ -761,6 +761,7 @@ impl ComposerState {
             self.push_history(self.text.clone());
         }
         self.text.clone_from(&prompt.text);
+        self.selection_anchor = None;
         self.skill_bindings = prompt
             .skill_invocations
             .iter()
@@ -800,6 +801,7 @@ impl ComposerState {
             .is_some_and(|retry| retry.id == prompt.id && self.text == retry.text);
         if restored_was_current {
             self.text.clear();
+            self.selection_anchor = None;
             self.skill_bindings.clear();
             self.skill_issues.clear();
             self.cursor = 0;

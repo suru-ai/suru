@@ -620,6 +620,12 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
     );
 
     application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("select the restored retry");
+    application
         .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
             delivered_update(
                 session_id,
@@ -638,6 +644,16 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
     );
     assert!(reconciled.contains("Type a prompt"));
     assert!(!reconciled.contains("response connection closed"));
+    type_terminal_text(&mut application, "next draft");
+    let buffer = crate::support::rendered_application_buffer(&application, 100, 32);
+    let cursor = crate::support::rendered_application_cursor_at(&application, 100, 32);
+    for x in cursor.x - 10..cursor.x {
+        assert!(
+            !buffer[(x, cursor.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
 }
 
 fn delivered_update(
@@ -652,4 +668,50 @@ fn delivered_update(
         revision,
         changes: delivered.into_changes(),
     }
+}
+
+#[test]
+fn failed_admission_drops_the_intervening_drafts_selection_before_restoring_text() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "old draft");
+    let ApplicationTransition::AdmitPrompt { session, request } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("submit the original draft");
+    };
+    type_terminal_text(&mut application, "new draft");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session,
+            prompt_id: request.prompt.id,
+            error: "server unavailable".to_owned(),
+        })
+        .unwrap();
+    let buffer = crate::support::rendered_application_buffer(&application, 100, 32);
+    let cursor = crate::support::rendered_application_cursor_at(&application, 100, 32);
+    for x in cursor.x - 9..cursor.x {
+        assert!(
+            !buffer[(x, cursor.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+    type_terminal_text(&mut application, " appended");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("old draft appended")
+    );
 }
