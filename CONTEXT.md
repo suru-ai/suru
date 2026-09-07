@@ -257,8 +257,16 @@ The operator-facing diagnostic record a Suru process writes about its own run. A
 _Avoid_: Diagnostics, telemetry, trace
 
 **Text Selection**:
-The run of text a reader marks by dragging across a client's screen, so that the text behind it may be copied as it was written rather than as it was wrapped or decorated to fit the screen. It is a fact about the client's screen rather than the Session: it lives in no Transcript, belongs to the one surface it was begun on, follows that surface's content as it scrolls, and is gone the moment that content is laid out afresh. Distinct from an Agent Selection, from the row focus a list keeps, and from a Fold's disclosure.
+The run of text a reader marks on a client's screen, by dragging across it, by double-clicking a word, or by triple-clicking a Line, so that the text behind it may be copied as it was written rather than as it was wrapped or decorated to fit the screen. It is a fact about the client's screen rather than the Session: it lives in no Transcript, belongs to the one surface it was begun on, follows that surface's content as it scrolls, and is gone the moment that content is laid out afresh. Distinct from an Agent Selection, from the row focus a list keeps, and from a Fold's disclosure.
 _Avoid_: Selection (bare), highlight, mark, mouse selection
+
+**Line**:
+One line of a surface's text as it was written, which the Transcript may paint across several Rows to fit its width. A triple-click marks a whole Line.
+_Avoid_: Logical line, source line, paragraph
+
+**Row**:
+One painted screen row of a surface. A Row is a fragment of a Line, or a Line entire on a surface that never wraps.
+_Avoid_: Visual line, screen line, wrapped line
 
 **Clipboard**:
 Where content taken from Suru is offered for pasting elsewhere: formatted Markdown carries both formatting and its Markdown text alternative, while other copies carry plain text. A formatted copy prefers the machine's Clipboard and falls back to the terminal's when needed; plain-text copies reach both, and either kind also fills the machine's primary selection where one exists.
