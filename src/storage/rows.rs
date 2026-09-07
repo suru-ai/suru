@@ -81,7 +81,7 @@ pub(super) struct PromptRow {
 #[diesel(table_name = turns)]
 pub(super) struct TurnRow {
     id: String,
-    session_id: String,
+    pub(super) session_id: String,
     prompt_id: Option<String>,
     row_order: i64,
     payload: String,
@@ -349,6 +349,17 @@ impl SessionRow {
         };
         let revision = SessionRevision(i64_to_u64(&session_id, "revision", self.revision)?);
         Ok((summary, revision))
+    }
+
+    pub(super) fn is_child(&self) -> bool {
+        self.parent_session_id.is_some()
+    }
+
+    pub(super) fn parent_id(&self) -> Result<Option<SessionId>, StorageError> {
+        self.parent_session_id
+            .as_deref()
+            .map(|id| parse_id(id, "parent Session ID", SessionId::from_uuid))
+            .transpose()
     }
 
     pub(super) fn unreadable_summary(&self) -> Result<UnreadableSessionSummary, StorageError> {

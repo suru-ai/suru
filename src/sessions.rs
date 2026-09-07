@@ -19,10 +19,11 @@ use crate::protocol::{
     UnreadableSessionSummary, ViewSessionOperationId,
 };
 use crate::provider::ProviderResumeState;
-use crate::storage::{PersistedSession, RestoredSessions, StorageSink, StoredResumeState};
+use crate::storage::{DeferredSessions, RestoredSessions, StorageSink, StoredResumeState};
 
 mod catalog;
 mod emoji;
+mod hydration;
 mod output;
 mod projection;
 mod prompts;
@@ -53,7 +54,7 @@ pub(crate) use title::TitleDerivation;
 pub(crate) use viewed::ViewSessionError;
 
 use catalog::SessionCatalogPublisher;
-use prompts::{PromptOrigin, PromptOwner};
+use prompts::PromptOwner;
 
 const SESSION_UPDATE_CAPACITY: usize = 256;
 
@@ -61,6 +62,7 @@ const SESSION_UPDATE_CAPACITY: usize = 256;
 pub(crate) struct SessionStore {
     state: Arc<Mutex<SessionStoreState>>,
     storage: StorageSink,
+    hydration: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +77,7 @@ struct SessionStoreState {
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
     catalog: SessionCatalogPublisher,
+    deferred: Option<DeferredSessions>,
 }
 
 struct SessionRecord {
@@ -120,6 +123,7 @@ impl SessionStore {
         let RestoredSessions {
             readable: persisted_sessions,
             unreadable,
+            deferred,
         } = restored;
         // Every stored moment the store itself minted, so the clock resumes
         // past all of them. A Settle is minted without a commit, so it can
@@ -141,62 +145,9 @@ impl SessionStore {
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
         for persisted in persisted_sessions {
-            let PersistedSession {
-                summary,
-                mut snapshot,
-                resume_states,
-            } = persisted;
-            for activity in &mut snapshot.activities {
-                if let crate::protocol::Activity::Questionnaire { outcome, .. } = activity
-                    && matches!(
-                        outcome,
-                        crate::protocol::QuestionnaireOutcome::Pending
-                            | crate::protocol::QuestionnaireOutcome::SubmissionRejected
-                            | crate::protocol::QuestionnaireOutcome::Submitting
-                    )
-                {
-                    *outcome = if *outcome == crate::protocol::QuestionnaireOutcome::Submitting {
-                        crate::protocol::QuestionnaireOutcome::DeliveryUncertain
-                    } else {
-                        crate::protocol::QuestionnaireOutcome::Unavailable
-                    };
-                }
-            }
-            let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
-            let next_prompt_order = snapshot
-                .prompts
-                .iter()
-                .map(|prompt| prompt.admission_order.0)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .map(PromptOrder)
-                .expect("persisted Prompt admission order space is not exhausted");
-            for prompt in &snapshot.prompts {
-                prompts.insert(
-                    prompt.id,
-                    PromptOwner {
-                        session_id: snapshot.session.id,
-                        text: prompt.text.clone(),
-                        skill_invocations: prompt.skill_invocations.clone(),
-                        agent_selection: None,
-                        origin: PromptOrigin::Admission(prompt.delivery),
-                    },
-                );
-            }
             sessions.insert(
-                snapshot.session.id,
-                SessionRecord {
-                    snapshot,
-                    summary,
-                    updates,
-                    next_prompt_order,
-                    steer_targets: HashMap::new(),
-                    selection_operations: HashMap::new(),
-                    viewed_operations: HashSet::new(),
-                    selection_retry_prompt: None,
-                    resume_states,
-                },
+                persisted.snapshot.session.id,
+                hydration::restored_record(persisted, &mut prompts),
             );
         }
         let unreadable_sessions = unreadable
@@ -209,6 +160,7 @@ impl SessionStore {
             prompts,
             last_timestamp,
             catalog,
+            deferred,
         };
         // Durable Turns reconstruct Working and Usage before any Session can
         // be listed or opened, without committing synthetic changes.
@@ -223,6 +175,7 @@ impl SessionStore {
         Self {
             state: Arc::new(Mutex::new(state)),
             storage,
+            hydration: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -231,6 +184,9 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        if state.is_deferred(session_id) {
+            return None;
+        }
         let record = state.sessions.get(&session_id)?;
         Some(SessionFeed {
             snapshot: record.snapshot.clone(),
@@ -250,7 +206,12 @@ impl SessionStore {
             // what the catalog holds, and a child joins no listing.
             .filter(|(_, record)| !record.snapshot.session.is_subagent())
             .map(|(session_id, _)| session_id)
-            .chain(state.unreadable_sessions.keys())
+            .chain(
+                state
+                    .unreadable_sessions
+                    .keys()
+                    .filter(|id| !state.is_stored_child(**id)),
+            )
             .copied()
             .collect::<Vec<_>>();
         session_ids.sort_unstable_by_key(ToString::to_string);
@@ -265,9 +226,14 @@ impl SessionStore {
     }
 
     pub(crate) fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
-        self.state
+        let state = self
+            .state
             .lock()
-            .expect("Session store lock is not poisoned")
+            .expect("Session store lock is not poisoned");
+        if state.is_deferred(session_id) {
+            return None;
+        }
+        state
             .sessions
             .get(&session_id)
             .map(|record| record.snapshot.clone())
@@ -351,6 +317,9 @@ impl SessionStore {
             Some(record) if record.snapshot.session.is_subagent() => {
                 return Err(DeleteSessionError::SubagentSession);
             }
+            _ if state.is_stored_child(session_id) => {
+                return Err(DeleteSessionError::SubagentSession);
+            }
             _ => {}
         }
         // A Session's Subagent subtree shares its deletion, walked deepest
@@ -368,6 +337,18 @@ impl SessionStore {
                     .filter(|(_, record)| record.snapshot.session.parent == Some(parent))
                     .map(|(child_id, _)| *child_id),
             );
+            if let Some(deferred) = &state.deferred {
+                let unreadable_children = deferred
+                    .parents
+                    .iter()
+                    .filter(|(id, stored_parent)| {
+                        **stored_parent == Some(parent)
+                            && state.unreadable_sessions.contains_key(id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                doomed.extend(unreadable_children);
+            }
             walk += 1;
         }
         for doomed_id in doomed.iter().rev() {
@@ -376,6 +357,11 @@ impl SessionStore {
                 .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
             state.sessions.remove(doomed_id);
             state.unreadable_sessions.remove(doomed_id);
+            if let Some(deferred) = &mut state.deferred {
+                deferred.summaries.remove(doomed_id);
+                deferred.parents.remove(doomed_id);
+                deferred.child_ids.remove(doomed_id);
+            }
         }
         state
             .prompts
@@ -417,6 +403,7 @@ impl SessionStore {
                 state
                     .unreadable_sessions
                     .values()
+                    .filter(|summary| !state.is_stored_child(summary.id))
                     .filter(|summary| {
                         workspace.as_ref().is_none_or(|path| {
                             summary

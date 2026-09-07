@@ -102,6 +102,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
                 selection: next_selection.clone(),
             }],
         )
+        .await
         .expect("publish a later Agent Selection");
     assert_eq!(next_session_update(&mut feed).await, published);
 

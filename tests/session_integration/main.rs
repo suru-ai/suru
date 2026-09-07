@@ -14,6 +14,7 @@ mod failing_provider_support;
 mod provider_support;
 
 mod continuations;
+mod hydration;
 mod managed_client;
 mod multi_provider;
 mod prompts;

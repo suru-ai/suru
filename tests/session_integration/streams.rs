@@ -208,6 +208,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                 },
             ],
         )
+        .await
         .expect("start an active Turn for Agent output");
     assert_eq!(
         active_update.revision,
@@ -238,20 +239,18 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         },
         AgentOutput::MessageCompleted { message_id },
     ];
-    let published = expected
-        .into_iter()
-        .enumerate()
-        .map(|(index, event)| {
-            let update = output
-                .emit(session_id, event)
-                .expect("publish provider-neutral Agent output");
-            assert_eq!(
-                update.revision,
-                SessionRevision(settled.revision.0 + index as u64 + 2)
-            );
-            update
-        })
-        .collect::<Vec<_>>();
+    let mut published = Vec::new();
+    for (index, event) in expected.into_iter().enumerate() {
+        let update = output
+            .emit(session_id, event)
+            .await
+            .expect("publish provider-neutral Agent output");
+        assert_eq!(
+            update.revision,
+            SessionRevision(settled.revision.0 + index as u64 + 2)
+        );
+        published.push(update);
+    }
     for expected_update in published {
         assert_eq!(
             timeout(Duration::from_secs(1), subscription.next())

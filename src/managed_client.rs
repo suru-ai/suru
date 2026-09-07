@@ -183,6 +183,9 @@ pub enum ManagedEvent {
     /// surface listing Sessions answers it by asking for the listing the new
     /// row is drawn from.
     SessionCreated(SessionCreated),
+    SessionCatalogInvalidated {
+        session_id: SessionId,
+    },
     SessionDeleted(SessionDeleted),
     /// A Session's derived Title and Emoji landed. It arrives for every Session
     /// the server holds, open or not, because the picker lists Sessions this
@@ -236,7 +239,8 @@ impl ManagedEvent {
     pub const fn moves_the_session_catalog(&self) -> bool {
         matches!(
             self,
-            Self::SessionCreated(_)
+            Self::SessionCatalogInvalidated { .. }
+                | Self::SessionCreated(_)
                 | Self::SessionDeleted(_)
                 | Self::SessionTitleChanged(_)
                 | Self::SessionSettlementChanged(_)

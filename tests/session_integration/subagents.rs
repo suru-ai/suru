@@ -677,6 +677,7 @@ async fn callers_cannot_override_the_server_derived_working_clock() {
                 working_since: None,
             }],
         )
+        .await
         .expect("publish an attempted Working override");
     assert!(
         update.changes.is_empty(),

@@ -536,6 +536,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 },
             ],
         )
+        .await
         .expect("start an active provider Turn");
     assert_eq!(
         client
@@ -578,6 +579,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     },
                 ],
             )
+            .await
             .is_err(),
         "a Session must reject a competing active Turn"
     );
@@ -644,6 +646,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
     let delivered = server
         .agent_output()
         .continuation_boundary(session_id, active_turn_id)
+        .await
         .expect("deliver pending steers at a safe continuation boundary");
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].id, steer.id);
@@ -684,6 +687,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 settled_at: None,
             }],
         )
+        .await
         .expect("complete active Turn at an idle boundary");
     let completed = client
         .read_session(session_id)
@@ -947,6 +951,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                     },
                 },
             )
+            .await
             .is_err(),
         "an interrupted Turn must reject later provider output"
     );
@@ -961,6 +966,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                     settled_at: None,
                 }],
             )
+            .await
             .is_err(),
         "an interrupted Turn must not be reopened"
     );

@@ -1,7 +1,7 @@
 //! Durable server state behind a domain-oriented repository seam.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,8 +17,8 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 use crate::{
     protocol::{
-        AgentSelection, ProviderId, SessionId, SessionSnapshot, SessionSummary, TranscriptItem,
-        UnreadableSessionSummary,
+        AgentSelection, PromptId, ProviderId, SessionId, SessionSnapshot, SessionSummary,
+        TranscriptItem, UnreadableSessionSummary,
     },
     provider::ProviderResumeState,
     runtime::protect_current_user_file,
@@ -135,6 +135,14 @@ pub(crate) struct StoredResumeState {
 pub(crate) struct RestoredSessions {
     pub(crate) readable: Vec<PersistedSession>,
     pub(crate) unreadable: Vec<UnreadableSessionSummary>,
+    pub(crate) deferred: Option<DeferredSessions>,
+}
+
+pub(crate) struct DeferredSessions {
+    pub(crate) repository: StorageRepository,
+    pub(crate) summaries: HashMap<SessionId, UnreadableSessionSummary>,
+    pub(crate) parents: HashMap<SessionId, Option<SessionId>>,
+    pub(crate) child_ids: HashSet<SessionId>,
 }
 
 #[derive(Debug)]
@@ -228,6 +236,51 @@ impl StorageRepository {
         on_blocking_task("loading", move || load_sessions(&database_path)).await
     }
 
+    pub(crate) async fn session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<PersistedSession>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("hydrate Session", move || {
+            let mut connection = connect(&path)?;
+            let row = sessions::table
+                .filter(sessions::id.eq(session_id.to_string()))
+                .select(SessionRow::as_select())
+                .first(&mut connection)
+                .optional()
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            row.map(|row| load_session(&mut connection, row))
+                .transpose()
+        })
+        .await
+    }
+
+    pub(crate) async fn prompt_session(
+        &self,
+        prompt_id: PromptId,
+    ) -> Result<Option<SessionId>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("find Prompt owner", move || {
+            let mut connection = connect(&path)?;
+            let id = prompts::table
+                .filter(prompts::id.eq(prompt_id.to_string()))
+                .select(prompts::session_id)
+                .first::<String>(&mut connection)
+                .optional()
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            id.map(|id| {
+                uuid::Uuid::parse_str(&id)
+                    .map(SessionId::from_uuid)
+                    .map_err(|error| StorageError::InvalidSession {
+                        session_id: id,
+                        message: error.to_string(),
+                    })
+            })
+            .transpose()
+        })
+        .await
+    }
+
     pub(crate) async fn landing_agent_selection(
         &self,
     ) -> Result<Option<AgentSelection>, StorageError> {
@@ -312,15 +365,80 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
         .select(SessionRow::as_select())
         .load::<SessionRow>(&mut connection)
         .map_err(|error| StorageError::Read(error.to_string()))?;
+    // Turns contain timing, outcome, and metering, never Transcript content.
+    // One ordered query avoids the per-Session query fanout during readiness.
+    let turn_rows = turns::table
+        .order((turns::session_id.asc(), turns::row_order.asc()))
+        .select(TurnRow::as_select())
+        .load::<TurnRow>(&mut connection)
+        .map_err(|error| StorageError::Read(error.to_string()))?;
+    let decode_started = std::time::Instant::now();
+    let mut by_session: HashMap<String, Vec<TurnRow>> = HashMap::new();
+    for turn in turn_rows {
+        by_session
+            .entry(turn.session_id.clone())
+            .or_default()
+            .push(turn);
+    }
     let mut restored = RestoredSessions::default();
+    let mut deferred = DeferredSessions {
+        repository: StorageRepository {
+            database_path: Arc::new(database_path.to_owned()),
+        },
+        summaries: HashMap::new(),
+        parents: HashMap::new(),
+        child_ids: HashSet::new(),
+    };
     for row in rows {
         let unreadable = row.unreadable_summary()?;
-        match load_session(&mut connection, row) {
-            Ok(session) => restored.readable.push(session),
+        if row.is_child() {
+            deferred.child_ids.insert(unreadable.id);
+        }
+        // Keep malformed parent metadata inside the per-Session decode
+        // boundary below; an invalid link must never fail server startup.
+        let parent = row.parent_id().ok().flatten();
+        deferred.parents.insert(unreadable.id, parent);
+        let turns = by_session.remove(&row.id).unwrap_or_default();
+        let result = (|| {
+            let (mut summary, revision) = row.into_summary_and_revision()?;
+            let turns = turns
+                .into_iter()
+                .map(TurnRow::into_turn)
+                .collect::<Result<Vec<_>, _>>()?;
+            summary.standing_inputs.latest_turn =
+                crate::protocol::SessionStandingInputs::from_turns(&turns).latest_turn;
+            let snapshot = SessionSnapshot {
+                session: summary.session.clone(),
+                revision,
+                turns,
+                prompts: Vec::new(),
+                messages: Vec::new(),
+                activities: Vec::new(),
+                transcript: Vec::new(),
+                subagent_questionnaires: Vec::new(),
+                subagent_usage: None,
+            };
+            summary.total_usage = snapshot.total_usage();
+            Ok::<_, StorageError>(PersistedSession {
+                summary,
+                snapshot,
+                resume_states: HashMap::new(),
+            })
+        })();
+        match result {
+            Ok(session) => {
+                deferred.summaries.insert(unreadable.id, unreadable);
+                restored.readable.push(session);
+            }
             Err(StorageError::InvalidSession { .. }) => restored.unreadable.push(unreadable),
             Err(error) => return Err(error),
         }
     }
+    restored.deferred = Some(deferred);
+    tracing::debug!(
+        storage_decode_us = decode_started.elapsed().as_micros() as u64,
+        "Session metadata decoded"
+    );
     Ok(restored)
 }
 
@@ -360,6 +478,7 @@ fn load_session(
         .load::<ProviderResumeStateRow>(connection)
         .map_err(|error| StorageError::Read(error.to_string()))?;
 
+    let decode_started = std::time::Instant::now();
     let prompts = prompt_rows
         .into_iter()
         .map(PromptRow::into_prompt)
@@ -376,31 +495,23 @@ fn load_session(
         .into_iter()
         .map(ActivityRow::into_activity)
         .collect::<Result<Vec<_>, _>>()?;
-    let messages = decoded_messages
-        .iter()
-        .map(|(message, _)| message.clone())
-        .collect();
-    let activities = decoded_activities
-        .iter()
-        .map(|(activity, _)| activity.clone())
-        .collect();
     let resume_states = resume_state_rows
         .into_iter()
         .map(ProviderResumeStateRow::into_resume_state)
         .collect::<Result<HashMap<_, _>, StorageError>>()?;
     let mut transcript = decoded_messages
-        .into_iter()
+        .iter()
         .map(|(message, order)| {
             (
-                order,
+                *order,
                 TranscriptItem::Message {
                     message_id: message.id,
                 },
             )
         })
-        .chain(decoded_activities.into_iter().map(|(activity, order)| {
+        .chain(decoded_activities.iter().map(|(activity, order)| {
             (
-                order,
+                *order,
                 TranscriptItem::Activity {
                     activity_id: activity.id(),
                 },
@@ -413,8 +524,14 @@ fn load_session(
         revision,
         prompts,
         turns,
-        messages,
-        activities,
+        messages: decoded_messages
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect(),
+        activities: decoded_activities
+            .into_iter()
+            .map(|(activity, _)| activity)
+            .collect(),
         transcript: transcript.into_iter().map(|(_, item)| item).collect(),
         // A child's Usage lives in the child's own stored Turns, so the
         // roll-up is re-derived across the subtree once every Session is
@@ -427,6 +544,10 @@ fn load_session(
     summary.standing_inputs.latest_turn =
         crate::protocol::SessionStandingInputs::from_turns(&snapshot.turns).latest_turn;
     summary.total_usage = snapshot.total_usage();
+    tracing::debug!(
+        storage_decode_us = decode_started.elapsed().as_micros() as u64,
+        "Session history decoded"
+    );
     Ok(PersistedSession {
         summary,
         snapshot,
@@ -505,6 +626,14 @@ fn connect(database_path: &Path) -> Result<SqliteConnection, StorageError> {
             path: database_path.to_owned(),
             message: error.to_string(),
         })?;
+    connection.set_instrumentation(|event: diesel::connection::InstrumentationEvent<'_>| {
+        if matches!(
+            event,
+            diesel::connection::InstrumentationEvent::StartQuery { .. }
+        ) {
+            tracing::debug!(storage_query = 1_u64, "Session repository query");
+        }
+    });
     connection
         .batch_execute(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",

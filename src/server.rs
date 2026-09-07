@@ -120,7 +120,7 @@ pub struct AgentOutputSink {
 }
 
 impl AgentOutputSink {
-    pub fn emit(&self, session_id: SessionId, output: AgentOutput) -> Result<SessionUpdate> {
+    pub async fn emit(&self, session_id: SessionId, output: AgentOutput) -> Result<SessionUpdate> {
         let change = match output {
             AgentOutput::MessageStarted {
                 message_id,
@@ -151,16 +151,24 @@ impl AgentOutputSink {
         if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
             anyhow::bail!("server is not accepting Session updates");
         }
+        self.session_events.sessions.hydrate(session_id).await?;
+        if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
         self.session_events
             .sessions
             .publish_agent_output(session_id, change)
     }
 
-    pub fn continuation_boundary(
+    pub async fn continuation_boundary(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<Vec<crate::protocol::Prompt>> {
+        if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
+        self.session_events.sessions.hydrate(session_id).await?;
         if *self.session_events.lifecycle.borrow() != LifecycleState::Ready {
             anyhow::bail!("server is not accepting Session updates");
         }
@@ -185,11 +193,15 @@ pub struct SessionEventSink {
 }
 
 impl SessionEventSink {
-    pub fn publish(
+    pub async fn publish(
         &self,
         session_id: SessionId,
         changes: Vec<SessionChange>,
     ) -> Result<SessionUpdate> {
+        if *self.lifecycle.borrow() != LifecycleState::Ready {
+            anyhow::bail!("server is not accepting Session updates");
+        }
+        self.sessions.hydrate(session_id).await?;
         if *self.lifecycle.borrow() != LifecycleState::Ready {
             anyhow::bail!("server is not accepting Session updates");
         }
@@ -492,7 +504,7 @@ pub async fn spawn_with_providers_and_timings(
         provider_updates: provider_updates.clone(),
         shutdown_grace: timings.shutdown_grace,
     };
-    let (storage_writer, storage) = StorageWriter::spawn(repository, &persisted_sessions.readable);
+    let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
@@ -560,34 +572,41 @@ pub async fn spawn_with_providers_and_timings(
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/sessions", get(list_sessions).post(create_session))
-        .route(
-            "/v1/sessions/{session_id}",
-            get(read_session).delete(delete_session),
+        .merge(
+            Router::new()
+                .route(
+                    "/v1/sessions/{session_id}",
+                    get(read_session).delete(delete_session),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/agent-selection",
+                    post(update_agent_selection),
+                )
+                .route("/v1/sessions/{session_id}/settlement", post(settle_session))
+                .route("/v1/sessions/{session_id}/viewed", post(view_session))
+                .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
+                .route(
+                    "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
+                    post(promote_prompt),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/prompts/{prompt_id}/cancel",
+                    post(cancel_prompt),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/questionnaires/{id}",
+                    post(submit_questionnaire),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/interrupt",
+                    post(interrupt_session),
+                )
+                .route("/v1/sessions/{session_id}/events", get(session_events))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    hydrate_session_request,
+                )),
         )
-        .route(
-            "/v1/sessions/{session_id}/agent-selection",
-            post(update_agent_selection),
-        )
-        .route("/v1/sessions/{session_id}/settlement", post(settle_session))
-        .route("/v1/sessions/{session_id}/viewed", post(view_session))
-        .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
-        .route(
-            "/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
-            post(promote_prompt),
-        )
-        .route(
-            "/v1/sessions/{session_id}/prompts/{prompt_id}/cancel",
-            post(cancel_prompt),
-        )
-        .route(
-            "/v1/sessions/{session_id}/questionnaires/{id}",
-            post(submit_questionnaire),
-        )
-        .route(
-            "/v1/sessions/{session_id}/interrupt",
-            post(interrupt_session),
-        )
-        .route("/v1/sessions/{session_id}/events", get(session_events))
         .route("/v1/server/stop", post(stop_server))
         .with_state(state);
     let descriptor_path = config.descriptor_path();
@@ -1152,6 +1171,11 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Err(response) => return response,
         };
 
+    if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
+        tracing::warn!("Prompt owner hydration failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     if let Some(selection) = request.agent_selection.take() {
         request.agent_selection = match normalize_agent_selection(
             &state,
@@ -1337,6 +1361,11 @@ async fn admit_prompt(
             Ok(request) => request,
             Err(response) => return response,
         };
+
+    if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
+        tracing::warn!("Prompt owner hydration failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     if !request.prompt.skill_invocations.is_empty()
         && !state.sessions.knows_prompt(request.prompt.id)
@@ -1649,6 +1678,30 @@ async fn list_sessions(
             "Workspace filter must be an existing local directory",
         ),
     }
+}
+
+/// All Session-specific HTTP operations enter through one hydration boundary.
+/// Delete needs identities only; it deliberately races safely with hydration.
+async fn hydrate_session_request(
+    State(state): State<AppState>,
+    AxumPath(parameters): AxumPath<std::collections::HashMap<String, String>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !is_authenticated(request.headers(), &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.method() != axum::http::Method::DELETE {
+        if let Some(id) = parameters
+            .get("session_id")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            && let Err(error) = state.sessions.hydrate(SessionId::from_uuid(id)).await
+        {
+            tracing::warn!("Session hydration failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn read_session(

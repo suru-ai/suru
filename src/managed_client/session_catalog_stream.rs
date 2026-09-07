@@ -321,6 +321,12 @@ fn apply_update(
         .as_mut()
         .expect("a catalog update is decoded only after its snapshot");
     match change {
+        SessionCatalogChange::Invalidated { session_id } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog invalidated an unknown Session");
+            }
+            Ok(ManagedEvent::SessionCatalogInvalidated { session_id })
+        }
         SessionCatalogChange::Created { session_id } => {
             if !known.insert(session_id) {
                 bail!("Session catalog created an existing Session");

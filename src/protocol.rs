@@ -1815,6 +1815,10 @@ pub struct SessionCatalogSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionCatalogChange {
+    /// Stored content proved unreadable; clients refresh the containing root.
+    Invalidated {
+        session_id: SessionId,
+    },
     Created {
         session_id: SessionId,
     },

@@ -678,6 +678,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 },
             ],
         )
+        .await
         .expect("start an active Turn for Agent output");
     apply_next_session_event(&mut application, &mut subscription).await;
 
@@ -693,6 +694,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 },
             },
         )
+        .await
         .expect("publish status Activity");
     apply_next_session_event(&mut application, &mut subscription).await;
 
@@ -705,6 +707,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 turn_id,
             },
         )
+        .await
         .expect("start Agent Message");
     apply_next_session_event(&mut application, &mut subscription).await;
     output
@@ -715,7 +718,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 content: "# Streamed heading\n\nA *useful* [link](https://example.com) with `inline code`.\n\n- first item\n- second item\n\n```rust\nfn main() {"
                     .to_owned(),
             },
-        )
+        ).await
         .expect("publish first Agent Message chunk");
     apply_next_session_event(&mut application, &mut subscription).await;
 
@@ -738,10 +741,12 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                     .to_owned(),
             },
         )
+        .await
         .expect("publish final Agent Message chunk");
     apply_next_session_event(&mut application, &mut subscription).await;
     output
         .emit(session_id, AgentOutput::MessageCompleted { message_id })
+        .await
         .expect("complete Agent Message");
     apply_next_session_event(&mut application, &mut subscription).await;
 

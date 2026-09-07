@@ -43,6 +43,9 @@ impl SessionStoreState {
         session_id: SessionId,
         mut changes: Vec<SessionChange>,
     ) -> anyhow::Result<SessionUpdate> {
+        if self.is_deferred(session_id) {
+            return Err(anyhow!("Session history must be hydrated before mutation"));
+        }
         let updated_at = self.next_timestamp();
         // Working is a server derivation. Callers can describe the Turn
         // transition that changes it, but cannot inject a competing clock.

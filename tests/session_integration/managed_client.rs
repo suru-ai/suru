@@ -449,6 +449,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                 },
             ],
         )
+        .await
         .expect("start active Turn");
     assert!(matches!(
         first_attachment.next().await,
@@ -646,6 +647,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                 },
             ],
         )
+        .await
         .expect("publish provider-neutral Session changes");
     assert_eq!(
         update.revision,

@@ -1042,7 +1042,7 @@ impl TuiState {
             // A creation says an id and nothing a row is drawn from, so there
             // is nothing to take in place: the catch-up above is the whole of
             // the Sidebar's answer to it.
-            ManagedEvent::SessionCreated(_) => {}
+            ManagedEvent::SessionCatalogInvalidated { .. } | ManagedEvent::SessionCreated(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.session_picker.remove(deleted.session_id);
                 self.remove_deleted_session(deleted.session_id);
@@ -1095,7 +1095,9 @@ impl TuiState {
         }
         self.sidebar.catch_up_origin(outlook.clone());
         match event {
-            ManagedEvent::SessionCreated(_) | ManagedEvent::SessionUsageChanged(_) => {}
+            ManagedEvent::SessionCatalogInvalidated { .. }
+            | ManagedEvent::SessionCreated(_)
+            | ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.sidebar
                     .remove_origin(outlook.clone(), deleted.session_id);
@@ -1145,7 +1147,8 @@ impl TuiState {
             self.session_picker.catch_up_origin(outlook.clone());
         }
         match event {
-            ManagedEvent::SessionCreated(_)
+            ManagedEvent::SessionCatalogInvalidated { .. }
+            | ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionWorkingChanged(_)
             | ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionStandingInputsChanged(changed) => {

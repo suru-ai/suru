@@ -1,7 +1,7 @@
 //! The background writer that coalesces Session state into durable rows.
 //!
 //! Streaming paths hand work to [`StorageSink`] and move on. The writer thread owns the projected
-//! copy of every Session, marks it dirty, and flushes on Turn boundaries and idle ticks so SQLite
+//! copy of each accessed or newly created Session, marks it dirty, and flushes on Turn boundaries and idle ticks so SQLite
 //! I/O never sits in the path of a Provider stream.
 
 use std::{
@@ -35,6 +35,7 @@ pub(crate) struct StorageWriter {
 
 enum WriterCommand {
     Create(Box<PersistedSession>),
+    Hydrate(Box<PersistedSession>),
     /// A Session summary that changed without a Session update behind it. A
     /// derived Title is the one such change: it alters nothing a Transcript
     /// reader holds, so it neither carries changes nor bumps the revision, and
@@ -84,6 +85,14 @@ impl StorageWriter {
         let task = thread::spawn(move || {
             loop {
                 match receiver.recv_timeout(IDLE_FLUSH_DELAY) {
+                    Ok(WriterCommand::Hydrate(persisted)) => {
+                        sessions
+                            .entry(persisted.snapshot.session.id)
+                            .or_insert(WriterState {
+                                persisted: *persisted,
+                                dirty: false,
+                            });
+                    }
                     Ok(WriterCommand::Create(persisted)) => {
                         let persisted = *persisted;
                         sessions.insert(
@@ -193,6 +202,12 @@ impl StorageWriter {
 }
 
 impl StorageSink {
+    pub(crate) fn hydrated(&self, persisted: PersistedSession) -> Result<(), StorageError> {
+        self.commands
+            .send(WriterCommand::Hydrate(Box::new(persisted)))
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
+    }
+
     pub(crate) fn created(&self, summary: SessionSummary, snapshot: SessionSnapshot) {
         let _ = self
             .commands

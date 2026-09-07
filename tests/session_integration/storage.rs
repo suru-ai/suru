@@ -658,6 +658,19 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
 
 #[tokio::test]
 async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversation() {
+    resume_after_summary_mutation(None).await;
+}
+
+#[tokio::test]
+async fn summary_mutation_of_an_unopened_session_preserves_opaque_resume_state_and_history() {
+    resume_after_summary_mutation(Some(serde_json::json!({
+        "opaque/provider-token": ["resume-session", {"generation": 3}],
+        "unknown_future_fields": {"keep": true}
+    })))
+    .await;
+}
+
+async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -709,6 +722,37 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
     .await;
     original.shutdown().await.expect("stop original server");
 
+    if let Some(payload) = &resume_state {
+        use diesel::RunQueryDsl;
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        diesel::sql_query("INSERT INTO provider_resume_states(session_id, provider, payload) VALUES (?, 'controlled', ?)")
+            .bind::<diesel::sql_types::Text, _>(created.session.id.to_string())
+            .bind::<diesel::sql_types::Text, _>(payload.to_string())
+            .execute(&mut database).unwrap();
+    }
+    // The first operation after restart mutates only the summary, but the
+    // writer must retain complete durable history and opaque Resume State.
+    let (checkpoint_runtime, _checkpoint_provider) = ControlledProvider::new();
+    let checkpoint = server::spawn_with_provider(config.clone(), checkpoint_runtime)
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{}/v1/sessions/{}/settlement",
+            checkpoint.descriptor().base_url,
+            created.session.id
+        ))
+        .bearer_auth(&checkpoint.descriptor().token)
+        .json(&suru::protocol::SettleSessionRequest { settled: true })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    checkpoint.shutdown().await.unwrap();
+
     let (replacement_runtime, mut replacement_provider) = ControlledProvider::new();
     let replacement = server::spawn_with_provider(config, replacement_runtime)
         .await
@@ -736,7 +780,12 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
     let replacement_start = timeout(Duration::from_secs(1), replacement_provider.next_start())
         .await
         .expect("restored Session starts a Provider conversation");
-    assert!(replacement_start.resume_state().is_none());
+    assert_eq!(
+        replacement_start
+            .resume_state()
+            .map(|state| state.payload()),
+        resume_state.as_ref()
+    );
     let mut replacement_session = replacement_start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-fresh", "low", "slow"),
@@ -752,6 +801,10 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
         SessionRevision(7),
     )
     .await;
+    assert_eq!(
+        reopened.messages[0].content,
+        "Persist without Provider Resume State"
+    );
     assert_eq!(reopened.turns.len(), 2);
     assert_eq!(reopened.turns[1].status, TurnStatus::Completed);
 
@@ -762,7 +815,11 @@ async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversa
 }
 
 #[tokio::test]
-async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed() {
+async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_invalidates_its_listing()
+{
+    use eventsource_stream::Eventsource;
+    use futures_util::StreamExt;
+    use suru::protocol::{SessionCatalogChange, SessionCatalogUpdate};
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -807,9 +864,73 @@ async fn an_undecodable_stored_session_does_not_block_startup_and_remains_listed
         .batch_execute("UPDATE prompts SET payload = '{';")
         .expect("doctor one stored Prompt payload");
 
+    let restart_config = config.clone();
     let replacement = spawn_with_failing_provider(config)
         .await
         .expect("an unreadable Session must not block startup");
+    let initial = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", replacement.descriptor().base_url))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<SessionListItem>>()
+        .await
+        .unwrap();
+    assert!(
+        matches!(&initial[..], [SessionListItem::Readable(summary)] if summary.session.id == created.session.id),
+        "listing does not inspect unopened Prompt content"
+    );
+    replacement.shutdown().await.unwrap();
+    // A shutdown with no history access must not flush partial writer state
+    // over the durable Prompt; its corruption must still be discovered below.
+    let replacement = spawn_with_failing_provider(restart_config).await.unwrap();
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/session-events",
+            replacement.descriptor().base_url
+        ))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut events = response.bytes_stream().eventsource();
+    let first = timeout(Duration::from_secs(1), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.event, suru::protocol::SESSION_CATALOG_SNAPSHOT_EVENT);
+    let failed = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            replacement.descriptor().base_url,
+            created.session.id
+        ))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::NOT_FOUND);
+    let changed = timeout(Duration::from_secs(1), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.event, suru::protocol::SESSION_CATALOG_UPDATED_EVENT);
+    assert_eq!(
+        serde_json::from_str::<SessionCatalogUpdate>(&changed.data)
+            .unwrap()
+            .change,
+        SessionCatalogChange::Invalidated {
+            session_id: created.session.id
+        }
+    );
+    drop(events);
     let listed = reqwest::Client::new()
         .get(format!("{}/v1/sessions", replacement.descriptor().base_url))
         .bearer_auth(&replacement.descriptor().token)
