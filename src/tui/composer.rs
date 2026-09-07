@@ -606,17 +606,14 @@ impl ComposerState {
             return;
         }
         if self.cursor == 0 {
+            self.selection_anchor = None;
             return;
         }
-        self.leave_history_navigation();
         let previous = self.text[..self.cursor]
             .char_indices()
             .next_back()
             .map_or(0, |(index, _)| index);
-        self.rebase_invocations(previous..self.cursor, 0);
-        self.text.replace_range(previous..self.cursor, "");
-        self.cursor = previous;
-        self.invalidate_retry_after_edit();
+        self.replace(previous..self.cursor, "");
     }
 
     fn delete_forward(&mut self) {
@@ -625,16 +622,14 @@ impl ComposerState {
             return;
         }
         if self.cursor == self.text.len() {
+            self.selection_anchor = None;
             return;
         }
-        self.leave_history_navigation();
         let next = self.text[self.cursor..]
             .char_indices()
             .nth(1)
             .map_or(self.text.len(), |(offset, _)| self.cursor + offset);
-        self.rebase_invocations(self.cursor..next, 0);
-        self.text.replace_range(self.cursor..next, "");
-        self.invalidate_retry_after_edit();
+        self.replace(self.cursor..next, "");
     }
 
     fn move_left(&mut self) {

@@ -2522,6 +2522,33 @@ fn keyboard_selection_bindings_belong_only_to_the_composer() {
 }
 
 #[test]
+fn deleting_after_shrinking_a_keyboard_selection_keeps_the_draft_unmarked() {
+    for (key, edited, submitted) in [
+        (KeyCode::Backspace, "acd", "a!cd"),
+        (KeyCode::Delete, "abd", "ab!d"),
+    ] {
+        let workspace = workspace_dir();
+        let mut application = connected_application(workspace.path());
+        type_terminal_text(&mut application, "abcd");
+        for _ in 0..2 {
+            composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+        }
+        composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::SHIFT);
+        composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_composer_mark(&application, 100, "abcd", false);
+        composer_selection_key(&mut application, key, KeyModifiers::NONE);
+        assert_composer_mark(&application, 100, edited, false);
+        type_terminal_text(&mut application, "!");
+        let ApplicationTransition::CreateSession(request) =
+            composer_selection_key(&mut application, KeyCode::Enter, KeyModifiers::NONE)
+        else {
+            panic!("submit the edited draft");
+        };
+        assert_eq!(request.prompt.text, submitted, "{key:?}");
+    }
+}
+
+#[test]
 fn keyboard_selection_keeps_anchor_when_focus_crosses_unicode_characters() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
