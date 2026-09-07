@@ -198,21 +198,6 @@ impl SessionStoreState {
         }
     }
 
-    /// Restores the canonical Working interval on every Session in a subtree
-    /// without spending revisions or writing the derivation back to storage.
-    /// Turn timing is durable, so the uninterrupted interval can be rebuilt
-    /// after restart even though Working itself has no database column.
-    pub(super) fn restore_working(&mut self, root: SessionId) {
-        for session_id in self.subtree(root) {
-            let reading = self.subtree_working_since(session_id);
-            let Some(record) = self.sessions.get_mut(&session_id) else {
-                continue;
-            };
-            record.snapshot.session.working_since = reading;
-            record.summary.session.working_since = reading;
-        }
-    }
-
     /// Re-derives what every Session from this one up to its listed root has
     /// consumed, and announces the root's total when it moved, mirroring
     /// [`Self::reconcile_working`]. A Session's own Turns are its own
@@ -258,21 +243,6 @@ impl SessionStoreState {
         }
     }
 
-    /// Derives the roll-up across one restored Session's whole subtree,
-    /// deepest first so every Session is answered from children already
-    /// derived. Nothing is committed or announced: a restored Session has no
-    /// revision to spend and no client to tell yet.
-    pub(super) fn restore_usage(&mut self, root: SessionId) {
-        for session_id in self.subtree(root).into_iter().rev() {
-            let delegated = self.subagent_usage(session_id);
-            let Some(record) = self.sessions.get_mut(&session_id) else {
-                continue;
-            };
-            record.snapshot.subagent_usage = delegated;
-            record.summary.total_usage = record.snapshot.total_usage();
-        }
-    }
-
     /// Everything this Session's Subagents have consumed, to any depth, and
     /// `None` where they have reported nothing. The Session's own Turns are
     /// left out — the walk skips the Session it starts from — because they
@@ -296,6 +266,12 @@ impl SessionStoreState {
             walk.extend(
                 self.sessions
                     .iter()
+                    .inspect(|_| {
+                        // Include whole-map child searches if restoration ever
+                        // regresses to using the live traversal again.
+                        #[cfg(test)]
+                        super::restoration_tests::record_work(1);
+                    })
                     .filter(|(_, record)| record.snapshot.session.parent == Some(current))
                     .map(|(child_id, _)| *child_id),
             );
