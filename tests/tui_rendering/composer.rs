@@ -1281,7 +1281,8 @@ fn semantic_bindings_preserve_multiline_unicode_input_and_clear_before_exit() {
     assert!(screen.contains("yβ"));
     assert!(!screen.contains('🙂'));
     assert!(!screen.contains("Enter submit"));
-    assert!(screen.contains("Shift+Enter newline"));
+    assert!(!screen.contains("Shift+Enter newline"));
+    assert!(!screen.contains("Alt+Enter queue"));
 
     assert_eq!(
         command_for_terminal_event(InputEvent::Key(KeyEvent::new(

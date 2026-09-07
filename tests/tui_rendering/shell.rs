@@ -445,7 +445,6 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
         "Agent unavailable",
         "Workspace",
         "Connected",
-        "Alt+Enter queue",
     ] {
         assert!(
             wide.contains(content),
@@ -771,7 +770,6 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "Working (",
         "Esc to interrupt",
         "openai · gpt-5",
-        "Alt+Enter queue",
     ] {
         assert!(
             wide.contains(content),

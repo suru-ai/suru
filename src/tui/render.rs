@@ -2935,7 +2935,6 @@ fn render_landing(
             skill_markers: &skill_markers,
         },
         state.composer_border_style(theme),
-        detail,
         theme,
     ));
 
@@ -3033,7 +3032,6 @@ fn render_opening_session(
             skill_markers: &skill_markers,
         },
         state.composer_border_style(theme),
-        ResponsiveDetail::for_width(content_width),
         theme,
     ));
     RenderedComposer {
@@ -3393,7 +3391,6 @@ fn render_session(
                 skill_markers: &skill_markers,
             },
             state.composer_border_style(theme),
-            content_detail,
             theme,
         ))
     };
@@ -3606,7 +3603,6 @@ fn render_composer(
     area: Rect,
     content: ComposerContent<'_>,
     style: Style,
-    detail: ResponsiveDetail,
     theme: &Theme,
 ) -> Position {
     let ComposerContent {
@@ -3616,17 +3612,9 @@ fn render_composer(
         cursor,
         skill_markers,
     } = content;
-    let queue = binding_label(&CommandId::SubmitQueue);
-    let newline = binding_label(&CommandId::InsertNewline);
-    let title = if detail.shows_secondary() {
-        format!(" {queue} queue · {newline} newline ")
-    } else {
-        String::new()
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(COMPOSER_TEXT_MARGIN))
-        .title(title)
         .border_style(style);
     let content_area = block.inner(area);
     let content_width = composer_content_width(area.width);
