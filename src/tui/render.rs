@@ -2905,15 +2905,12 @@ fn render_landing(
     let panel = centered_rect(content, 72, panel_height);
     let mut row = panel.y;
     if show_brand {
+        // Offset the logo's heavier right character for visual balance.
+        let logo_offset = ((panel.width - logo_width) / 2).saturating_sub(1);
         frame.render_widget(
             Paragraph::new(LANDING_LOGO.join("\n"))
                 .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
-            Rect::new(
-                panel.x + (panel.width - logo_width) / 2,
-                row,
-                logo_width,
-                logo_height,
-            ),
+            Rect::new(panel.x + logo_offset, row, logo_width, logo_height),
         );
         row = row.saturating_add(brand_height);
     }

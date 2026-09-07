@@ -421,7 +421,10 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
                 .map(|row| row.trim_end().chars().count())
                 .max()
                 .unwrap();
-            assert!(logo_left.abs_diff(width as usize - logo_right) <= 1);
+            assert!(
+                (logo_left + 1).abs_diff(width as usize - logo_right - 1) <= 1,
+                "the logo sits one column left of center for visual balance"
+            );
         }
     }
 }
