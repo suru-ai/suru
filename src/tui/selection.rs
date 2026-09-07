@@ -14,11 +14,136 @@ pub(super) struct TextSelection {
     pub(super) anchor: SelectionCell,
     pub(super) focus: SelectionCell,
     pub(super) epoch: u64,
+    /// The unit the press that made the selection marked, so a later drag
+    /// can grow it by the same unit.
+    pub(super) granularity: SelectionGranularity,
 }
 
 impl TextSelection {
     pub(super) fn ordered(self) -> (SelectionCell, SelectionCell) {
         (self.anchor.min(self.focus), self.anchor.max(self.focus))
+    }
+}
+
+/// What one press marks: a cell to drag from, or the word under it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelectionGranularity {
+    Cell,
+    Word,
+}
+
+/// The class a grapheme belongs to for word selection, decided by its first
+/// scalar value. Consecutive graphemes of one class form a word, so a run of
+/// spaces or of punctuation is a word of its own, and CJK text is a word
+/// apart from Latin text beside it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WordClass {
+    Whitespace,
+    Delimiter,
+    Cjk,
+    Text,
+}
+
+impl WordClass {
+    /// Ghostty's delimiter set: slash, dot, and hyphen stay inside a word so
+    /// a path, a dotted name, or a kebab-case flag selects whole.
+    const DELIMITERS: &'static str = "'\"`\u{2502}|:;,()[]{}<>$";
+
+    fn of(grapheme: &str) -> Self {
+        let Some(first) = grapheme.chars().next() else {
+            return Self::Text;
+        };
+        if first == ' ' || first == '\t' {
+            Self::Whitespace
+        } else if Self::DELIMITERS.contains(first) {
+            Self::Delimiter
+        } else if is_cjk(first) {
+            Self::Cjk
+        } else {
+            Self::Text
+        }
+    }
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x1100..=0x11FF       // Hangul Jamo
+        | 0x2E80..=0x2FDF     // CJK and Kangxi radicals
+        | 0x3000..=0x303F     // CJK symbols and punctuation
+        | 0x3040..=0x30FF     // Hiragana and Katakana
+        | 0x3100..=0x31FF     // Bopomofo, Hangul compatibility Jamo, Kanbun
+        | 0x3400..=0x4DBF     // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF     // CJK Unified Ideographs
+        | 0xA960..=0xA97F     // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7FF     // Hangul syllables and Jamo Extended-B
+        | 0xF900..=0xFAFF     // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF     // Halfwidth and fullwidth forms
+        | 0x20000..=0x3134F   // CJK Unified Ideographs Extensions B onward
+    )
+}
+
+/// The byte range of the word in `text` around `offset`: the run of
+/// graphemes sharing the class of the grapheme at `offset`, and for a URL the
+/// scheme and the path either side of its `://`, since the colon that would
+/// otherwise split them is what makes the token a link. `None` when `offset`
+/// is past the text.
+pub(super) fn word_range(text: &str, offset: usize) -> Option<std::ops::Range<usize>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    if offset >= text.len() {
+        return None;
+    }
+    let graphemes: Vec<(usize, WordClass)> = text
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| (start, WordClass::of(grapheme)))
+        .collect();
+    let run_at = |offset: usize| {
+        let index = graphemes.iter().rposition(|(start, _)| *start <= offset)?;
+        let class = graphemes[index].1;
+        let first = graphemes[..index]
+            .iter()
+            .rposition(|(_, other)| *other != class)
+            .map_or(0, |before| before + 1);
+        let end = graphemes[index + 1..]
+            .iter()
+            .find(|(_, other)| *other != class)
+            .map_or(text.len(), |(start, _)| *start);
+        Some((class, graphemes[first].0..end))
+    };
+    // A URL is a scheme run, the colon (a delimiter run of its own), and a
+    // path run beginning with two slashes.
+    let scheme_before = |colon: usize| {
+        let (class, scheme) = run_at(colon.checked_sub(1)?)?;
+        (class == WordClass::Text).then_some(scheme)
+    };
+    let path_after = |colon: usize| {
+        let (class, path) = run_at(colon + 1)?;
+        (class == WordClass::Text && text[path.clone()].starts_with("//")).then_some(path)
+    };
+    let (class, range) = run_at(offset)?;
+    match class {
+        WordClass::Delimiter if &text[range.clone()] == ":" => {
+            match (scheme_before(range.start), path_after(range.start)) {
+                (Some(scheme), Some(path)) => Some(scheme.start..path.end),
+                _ => Some(range),
+            }
+        }
+        WordClass::Text => {
+            let mut range = range;
+            if text[range.end..].starts_with(':')
+                && let Some(path) = path_after(range.end)
+            {
+                range.end = path.end;
+            }
+            if text[range.clone()].starts_with("//")
+                && text[..range.start].ends_with(':')
+                && let Some(scheme) = scheme_before(range.start - 1)
+            {
+                range.start = scheme.start;
+            }
+            Some(range)
+        }
+        _ => Some(range),
     }
 }
 

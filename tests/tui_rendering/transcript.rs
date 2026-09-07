@@ -8020,3 +8020,476 @@ fn rich_selection_escapes_literal_markup_and_keeps_code_literal() {
         assert_eq!(content.html.as_deref(), Some(html), "{source}");
     }
 }
+
+/// An Application with one agent Message, driven by a clock the test advances.
+fn word_click_application(content: &'static str) -> (Application, Arc<AtomicU64>) {
+    let workspace = workspace_dir();
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let observed_elapsed_ms = Arc::clone(&elapsed_ms);
+    let origin = Instant::now();
+    let mut application = Application::new(workspace.path(), Default::default())
+        .with_presentation_clock(move || {
+            origin + Duration::from_millis(observed_elapsed_ms.load(Ordering::Relaxed))
+        });
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(content)],
+        )))
+        .unwrap();
+    (application, elapsed_ms)
+}
+
+/// A press and release at one cell; the release's transition.
+fn click_at(application: &mut Application, position: (u16, u16)) -> ApplicationTransition {
+    use crossterm::event::MouseButton;
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            position,
+        ))
+        .unwrap();
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            position,
+        ))
+        .unwrap()
+}
+
+/// Two clicks at one cell within the click interval; the second release's
+/// transition.
+fn double_click_at(
+    application: &mut Application,
+    clock: &AtomicU64,
+    position: (u16, u16),
+) -> ApplicationTransition {
+    click_at(application, position);
+    clock.fetch_add(100, Ordering::Relaxed);
+    click_at(application, position)
+}
+
+fn reversed_columns(buffer: &Buffer, row: u16) -> Vec<u16> {
+    (0..buffer.area.width)
+        .filter(|&x| buffer[(x, row)].modifier.contains(Modifier::REVERSED))
+        .collect()
+}
+
+fn copied_text(transition: &ApplicationTransition) -> Option<&str> {
+    match transition {
+        ApplicationTransition::CopyToClipboard(content) => Some(content.text.as_str()),
+        _ => None,
+    }
+}
+
+#[test]
+fn double_click_highlights_and_copies_the_word_under_the_pointer() {
+    let (mut application, clock) = word_click_application("Alpha bravo charlie");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let bravo = text_position(&buffer, "bravo");
+    let first = click_at(&mut application, (bravo.0 + 2, bravo.1));
+    assert_eq!(first, ApplicationTransition::Continue);
+    assert!(
+        reversed_columns(&rendered_application_buffer(&application, 60, 24), bravo.1).is_empty()
+    );
+    clock.fetch_add(100, Ordering::Relaxed);
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            (bravo.0 + 2, bravo.1),
+        ))
+        .unwrap();
+    assert_eq!(
+        reversed_columns(&rendered_application_buffer(&application, 60, 24), bravo.1),
+        (bravo.0..bravo.0 + 5).collect::<Vec<_>>(),
+        "the word highlights on the press"
+    );
+    let released = application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            (bravo.0 + 2, bravo.1),
+        ))
+        .unwrap();
+    assert_eq!(copied_text(&released), Some("bravo"), "{released:?}");
+    assert_eq!(
+        reversed_columns(&rendered_application_buffer(&application, 60, 24), bravo.1),
+        (bravo.0..bravo.0 + 5).collect::<Vec<_>>(),
+        "the highlight stands after a release copy"
+    );
+}
+
+fn press_at(application: &mut Application, position: (u16, u16)) {
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            position,
+        ))
+        .unwrap();
+}
+
+fn reversed_cells(buffer: &Buffer) -> Vec<(u16, u16)> {
+    let mut cells = Vec::new();
+    for y in 0..buffer.area.height {
+        for x in reversed_columns(buffer, y) {
+            cells.push((x, y));
+        }
+    }
+    cells
+}
+
+fn word_cells((x, y): (u16, u16), width: u16) -> Vec<(u16, u16)> {
+    (x..x + width).map(|x| (x, y)).collect()
+}
+
+#[test]
+fn second_press_one_cell_away_within_the_interval_continues_the_count() {
+    let (mut application, clock) = word_click_application("Alpha bravo  \ncharlie delta");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let bravo = text_position(&buffer, "bravo");
+    let charlie = text_position(&buffer, "charlie");
+    assert_eq!(
+        charlie.1,
+        bravo.1 + 1,
+        "the hard break puts charlie one Row below"
+    );
+    click_at(&mut application, bravo);
+    clock.fetch_add(499, Ordering::Relaxed);
+    let released = click_at(&mut application, (bravo.0 + 1, bravo.1));
+    assert_eq!(copied_text(&released), Some("bravo"));
+    assert_eq!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+        word_cells(bravo, 5)
+    );
+    clock.fetch_add(500, Ordering::Relaxed);
+    click_at(&mut application, (charlie.0 + 2, bravo.1));
+    clock.fetch_add(100, Ordering::Relaxed);
+    let released = click_at(&mut application, (charlie.0 + 2, charlie.1));
+    assert_eq!(
+        copied_text(&released),
+        Some("charlie"),
+        "one Row away still counts"
+    );
+    assert_eq!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+        word_cells(charlie, 7)
+    );
+}
+
+#[test]
+fn second_press_two_cells_away_after_the_interval_or_on_another_surface_starts_over() {
+    let (mut application, clock) = word_click_application("Alpha bravo charlie");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let bravo = text_position(&buffer, "bravo");
+    let composer = text_position(&buffer, "Type a Prompt");
+    click_at(&mut application, bravo);
+    clock.fetch_add(100, Ordering::Relaxed);
+    let released = click_at(&mut application, (bravo.0 + 2, bravo.1));
+    assert_eq!(released, ApplicationTransition::Continue, "two cells away");
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    click_at(&mut application, bravo);
+    clock.fetch_add(501, Ordering::Relaxed);
+    let released = click_at(&mut application, bravo);
+    assert_eq!(
+        released,
+        ApplicationTransition::Continue,
+        "after the interval"
+    );
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    click_at(&mut application, composer);
+    clock.fetch_add(100, Ordering::Relaxed);
+    click_at(&mut application, bravo);
+    assert!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty(),
+        "a press on the composer then one on the Transcript is a fresh count"
+    );
+    clock.fetch_add(100, Ordering::Relaxed);
+    let released = click_at(&mut application, bravo);
+    assert_eq!(
+        copied_text(&released),
+        Some("bravo"),
+        "and the Transcript count then continues"
+    );
+}
+
+#[test]
+fn double_click_in_manual_mode_stands_until_ctrl_c_copies_it() {
+    let (mut application, clock) = word_click_application("Alpha bravo charlie");
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Manual;
+    deliver_settings(&mut application, settings, &["textSelection.copy"]);
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let bravo = text_position(&buffer, "bravo");
+    let released = double_click_at(&mut application, &clock, bravo);
+    assert_eq!(released, ApplicationTransition::Continue);
+    assert_eq!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+        word_cells(bravo, 5)
+    );
+    let copied = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert_eq!(copied_text(&copied), Some("bravo"));
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+}
+
+#[test]
+fn double_click_selects_whole_tokens_and_runs_by_class() {
+    for (content, needle, offset, highlighted, expected) in [
+        (
+            "See src/tui/state.rs now",
+            "tui",
+            0,
+            ("src/tui/state.rs", 16, 1),
+            "src/tui/state.rs",
+        ),
+        (
+            "Open https://example.com/a?b=1 today",
+            "example",
+            3,
+            ("https://example.com/a?b=1", 25, 1),
+            "https://example.com/a?b=1",
+        ),
+        (
+            "```sh\ncargo run --dry-run\n```",
+            "dry",
+            0,
+            ("--dry-run", 9, 1),
+            "--dry-run",
+        ),
+        (
+            "Say 'quoted' aloud",
+            "quoted",
+            2,
+            ("quoted", 6, 1),
+            "quoted",
+        ),
+        ("Call foo(); now", "(", 0, ("();", 3, 1), "();"),
+        ("abc漢字テストxyz", "漢", 2, ("漢", 5, 2), "漢字テスト"),
+        ("ok 🙂 go", "🙂", 1, ("🙂", 1, 2), "🙂"),
+    ] {
+        let (mut application, clock) = word_click_application(content);
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let target = text_position(&buffer, needle);
+        let released = double_click_at(&mut application, &clock, (target.0 + offset, target.1));
+        assert_eq!(
+            copied_text(&released),
+            Some(expected),
+            "{content}: {released:?}"
+        );
+        let (x, y) = text_position(&buffer, highlighted.0);
+        assert_eq!(
+            reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+            (0..highlighted.1)
+                .map(|cell| (x + cell * highlighted.2, y))
+                .collect::<Vec<_>>(),
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn double_click_on_a_run_of_spaces_highlights_the_run() {
+    let (mut application, clock) = word_click_application("```text\nfoo   bar\n```");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let foo = text_position(&buffer, "foo");
+    double_click_at(&mut application, &clock, (foo.0 + 4, foo.1));
+    assert_eq!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+        word_cells((foo.0 + 3, foo.1), 3)
+    );
+}
+
+#[test]
+fn double_click_on_a_soft_wrapped_word_highlights_both_rows_and_copies_it_whole() {
+    let token = "abcdefghij".repeat(5);
+    let content: &'static str = Box::leak(format!("start {token} end").into_boxed_str());
+    let (mut application, clock) = word_click_application(content);
+    let buffer = rendered_application_buffer(&application, 40, 24);
+    let start = text_position(&buffer, "start");
+    let head = text_position(&buffer, "abcdefghij");
+    let released = double_click_at(&mut application, &clock, head);
+    assert_eq!(copied_text(&released), Some(token.as_str()), "{released:?}");
+    let highlighted = reversed_cells(&rendered_application_buffer(&application, 40, 24));
+    let rows: std::collections::BTreeSet<u16> = highlighted.iter().map(|&(_, y)| y).collect();
+    assert_eq!(rows.len(), 2, "{highlighted:?}");
+    assert_eq!(highlighted.len(), 50, "{highlighted:?}");
+    assert!(!highlighted.contains(&start));
+}
+
+#[test]
+fn double_click_on_chrome_or_a_separator_selects_nothing_and_clicks_as_before() {
+    let (mut application, clock) = word_click_application("```rust\nlet answer = 42;\n```");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let info = text_position(&buffer, "rust");
+    assert_eq!(
+        double_click_at(&mut application, &clock, info),
+        ApplicationTransition::Continue
+    );
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+
+    let workspace = workspace_dir();
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let clock = Arc::clone(&elapsed_ms);
+    let origin = Instant::now();
+    let mut application =
+        connected_application(workspace.path()).with_presentation_clock(move || {
+            origin + Duration::from_millis(clock.load(Ordering::Relaxed))
+        });
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let rows = rendered_application_rows_at(&application, 60, 24);
+    let header = rendered_row(&rows, "✓ cargo test") as u16;
+    let separator = (4, header - 1);
+    assert_eq!(rows[usize::from(header - 1)].trim(), "");
+    assert_eq!(
+        double_click_at(&mut application, &elapsed_ms, separator),
+        ApplicationTransition::Continue
+    );
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+
+    elapsed_ms.fetch_add(1_000, Ordering::Relaxed);
+    let marker = (rows[usize::from(header)].find('✓').unwrap() as u16, header);
+    press_at(&mut application, marker);
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+    click_release_at(&mut application, marker);
+    let peek = rendered_application_rows_at(&application, 60, 24);
+    assert!(
+        peek.join("\n").contains("… +6 lines"),
+        "first click opens the Peek"
+    );
+    elapsed_ms.fetch_add(100, Ordering::Relaxed);
+    press_at(&mut application, marker);
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+    click_release_at(&mut application, marker);
+    assert!(
+        !rendered_application_rows_at(&application, 60, 24)
+            .join("\n")
+            .contains("… +6 lines"),
+        "the second click on the Marker column folds again"
+    );
+
+    elapsed_ms.fetch_add(1_000, Ordering::Relaxed);
+    click_at(&mut application, marker);
+    let peek = rendered_application_rows_at(&application, 60, 24);
+    let fold_marker = (
+        peek[rendered_row(&peek, "… +6 lines")].find('…').unwrap() as u16 + 2,
+        rendered_row(&peek, "… +6 lines") as u16,
+    );
+    elapsed_ms.fetch_add(1_000, Ordering::Relaxed);
+    press_at(&mut application, fold_marker);
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+    assert_eq!(
+        click_release_at(&mut application, fold_marker),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows_at(&application, 60, 24)
+            .join("\n")
+            .contains("output line 1 "),
+        "the fold marker click expands as before"
+    );
+}
+
+fn click_release_at(application: &mut Application, position: (u16, u16)) -> ApplicationTransition {
+    application
+        .handle_terminal_event(selection_mouse(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            position,
+        ))
+        .unwrap()
+}
+
+#[test]
+fn click_count_survives_a_release_copy_ctrl_c_escape_and_a_fold_toggle() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    for reset in ["release", "ctrl-c", "escape", "fold"] {
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
+        let clock = Arc::clone(&elapsed_ms);
+        let origin = Instant::now();
+        let mut application =
+            connected_application(workspace.path()).with_presentation_clock(move || {
+                origin + Duration::from_millis(clock.load(Ordering::Relaxed))
+            });
+        let mut settings = EffectiveSettings::default();
+        settings.text_selection.copy = if reset == "ctrl-c" {
+            suru::protocol::TextSelectionCopy::Manual
+        } else {
+            suru::protocol::TextSelectionCopy::Release
+        };
+        deliver_settings(&mut application, settings, &["textSelection.copy"]);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let suite = text_position(&buffer, "suite");
+        double_click_at(&mut application, &elapsed_ms, suite);
+        assert_eq!(
+            reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+            word_cells(suite, 5),
+            "{reset}"
+        );
+        let event = match reset {
+            "ctrl-c" => Some(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            "escape" => Some(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            _ => None,
+        };
+        if let Some(event) = event {
+            application.handle_terminal_event(event).unwrap();
+            assert!(
+                reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty(),
+                "{reset} clears the selection"
+            );
+        }
+        if reset == "fold" {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::TranscriptFoldsToggle,
+                )))
+                .unwrap();
+        }
+        elapsed_ms.fetch_add(100, Ordering::Relaxed);
+        press_at(&mut application, suite);
+        assert_eq!(
+            reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+            word_cells(suite, 5),
+            "{reset}: the next press still continues the count"
+        );
+    }
+}
+
+#[test]
+fn the_word_gesture_is_a_semantic_command() {
+    assert_eq!(
+        SemanticCommandId::TextSelectionWord.as_str(),
+        "text_selection.word"
+    );
+}

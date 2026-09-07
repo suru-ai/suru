@@ -277,8 +277,6 @@ impl StyledLine {
 
     /// Everything the line draws, chrome included, as one string. Offsets a
     /// row reports are byte offsets into this.
-    /// Read by the offset lookup's tests until the Text Selection lands.
-    #[allow(dead_code)]
     pub(super) fn written_text(&self) -> String {
         self.spans
             .iter()
@@ -410,8 +408,6 @@ impl StyledRow {
     /// lands on. A column in the hanging indent answers where the row's text
     /// begins; both cells of a wide character answer that character; a column
     /// past the row's text answers the offset past its last character.
-    /// Read by the projection's tests until the Text Selection lands.
-    #[allow(dead_code)]
     pub(super) fn offset_at(&self, line: &StyledLine, width: u16, column: usize) -> usize {
         let Some(column) = column.checked_sub(self.indent) else {
             return self.start;

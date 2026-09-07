@@ -53,7 +53,9 @@ use super::{
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, Notice},
     render::render_with_slots,
-    selection::{SelectionCell, SelectionFrame, SelectionSurface, TextSelection},
+    selection::{
+        SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
+    },
     serve_overlay::ServeOverlay,
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
@@ -74,6 +76,16 @@ const INTERRUPT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an optimistic Session shell stays visually quiet before it asks
 /// the reader to wait. This is fixed presentation behavior, not a Setting.
 const OPEN_SESSION_LOADING_DELAY: Duration = Duration::from_millis(300);
+/// How long after one left press a second one at the same place continues
+/// the click count rather than starting it over. Fixed presentation
+/// behavior, not a Setting; injectable for tests.
+const CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// How far, in cells on either axis, a press may land from the previous one
+/// and still continue the click count.
+const CLICK_SLOP: u16 = 1;
+/// Click counts stop growing here: a fourth rapid click keeps what the third
+/// selected.
+const CLICK_COUNT_LIMIT: u8 = 3;
 
 #[derive(Clone)]
 struct PresentationClock(Arc<dyn Fn() -> Instant + Send + Sync>);
@@ -329,6 +341,8 @@ impl TranscriptViewport {
 #[derive(Clone, Debug)]
 pub struct TuiState {
     left_press: Option<LeftPress>,
+    last_click: Option<LastClick>,
+    click_interval: Duration,
     pub(super) text_selection: Cell<Option<TextSelection>>,
     pub(super) selection_frames: RefCell<Vec<SelectionFrame>>,
     pub(super) selection_overlay_area: Cell<Option<ratatui::layout::Rect>>,
@@ -505,6 +519,8 @@ impl TuiState {
         let workspace = workspace_reading(workspace.as_ref());
         Self {
             left_press: None,
+            last_click: None,
+            click_interval: CLICK_INTERVAL,
             text_selection: Cell::new(None),
             selection_frames: RefCell::new(Vec::new()),
             selection_overlay_area: Cell::new(None),
@@ -2288,6 +2304,32 @@ pub(super) struct QueuedPrompt<'a> {
     pub(super) text: &'a str,
 }
 
+/// The last left press, kept beside the press history so that nothing that
+/// clears or copies a Text Selection can reset the click count: only time,
+/// distance, and surface do.
+#[derive(Clone, Copy, Debug)]
+struct LastClick {
+    count: u8,
+    surface: Option<SelectionSurface>,
+    position: Position,
+    at: Instant,
+}
+
+impl LastClick {
+    fn continues(
+        &self,
+        surface: Option<SelectionSurface>,
+        position: Position,
+        at: Instant,
+        interval: Duration,
+    ) -> bool {
+        self.surface == surface
+            && at.saturating_duration_since(self.at) <= interval
+            && self.position.x.abs_diff(position.x) <= CLICK_SLOP
+            && self.position.y.abs_diff(position.y) <= CLICK_SLOP
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LeftPress {
     position: Position,
@@ -2776,6 +2818,14 @@ impl Application {
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Self {
         self.state.presentation_clock = PresentationClock(Arc::new(clock));
+        self
+    }
+
+    /// Injects how long after one left press a second one continues the click
+    /// count. Production uses the fixed interval; tests shorten it or advance
+    /// the presentation clock instead of waiting.
+    pub fn with_click_interval(mut self, interval: Duration) -> Self {
+        self.state.click_interval = interval;
         self
     }
 
@@ -3348,6 +3398,28 @@ impl Application {
                         .is_some_and(|area| !area.contains(position)),
                     selection_anchor,
                 });
+                let surface = selection_anchor.map(|(_, _, surface)| surface);
+                let now = self.state.presentation_clock.now();
+                let count = match self.state.last_click {
+                    Some(last)
+                        if last.continues(surface, position, now, self.state.click_interval) =>
+                    {
+                        last.count.saturating_add(1).min(CLICK_COUNT_LIMIT)
+                    }
+                    _ => 1,
+                };
+                self.state.last_click = Some(LastClick {
+                    count,
+                    surface,
+                    position,
+                    at: now,
+                });
+                if count >= 2 && surface == Some(SelectionSurface::Transcript) {
+                    self.invoke_semantic(SemanticInvocation {
+                        id: SemanticCommandId::TextSelectionWord,
+                        subject: SemanticSubject::ScreenPosition(position),
+                    })?;
+                }
                 Ok(ApplicationTransition::Continue)
             }
             CommandId::DragAt { position } => self.invoke_semantic(SemanticInvocation {
@@ -3388,10 +3460,23 @@ impl Application {
                     && !press.dragged
                     && press.position == position
                 {
-                    return self.invoke_semantic(SemanticInvocation {
+                    let click = self.invoke_semantic(SemanticInvocation {
                         id: SemanticCommandId::PointerClick,
                         subject: SemanticSubject::ScreenPosition(position),
-                    });
+                    })?;
+                    // A press that marked a word made a selection the way a
+                    // drag does, so its release copies the way a drag's does.
+                    if self.state.settings.text_selection.copy == TextSelectionCopy::Release
+                        && self.state.text_selection.get().is_some_and(|selection| {
+                            selection.granularity != SelectionGranularity::Cell
+                        })
+                    {
+                        let copy = self.invoke_semantic(SemanticCommandId::TextSelectionCopy)?;
+                        if matches!(copy, ApplicationTransition::CopyToClipboard(_)) {
+                            return Ok(copy);
+                        }
+                    }
+                    return Ok(click);
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -4538,6 +4623,43 @@ impl Application {
         }
     }
 
+    /// Makes the word under a Transcript cell the standing Text Selection,
+    /// or leaves none when no word is there.
+    fn select_transcript_word(&mut self, position: Position) {
+        if self.state.overlay_owns_input()
+            || self.state.reconnect_overlay_visible
+            || self.state.active_selection_overlay_area().is_some()
+        {
+            return;
+        }
+        let Some(interaction) = self
+            .state
+            .session_reference
+            .as_ref()
+            .and_then(|session| self.state.session_interaction(session))
+        else {
+            return;
+        };
+        let viewport = interaction.viewport.borrow();
+        let Some(viewport) = viewport.as_ref() else {
+            return;
+        };
+        let Some(row) = viewport.transcript_row(position) else {
+            return;
+        };
+        let column = usize::from(position.x - viewport.content_left);
+        let Some((anchor, focus)) = self.state.transcript_cache.word_cells(row, column) else {
+            return;
+        };
+        self.state.text_selection.set(Some(TextSelection {
+            surface: SelectionSurface::Transcript,
+            anchor,
+            focus,
+            epoch: self.state.transcript_cache.selection_epoch(),
+            granularity: SelectionGranularity::Word,
+        }));
+    }
+
     /// Distance beyond the Transcript determines rows per presentation tick.
     fn transcript_drag_scroll(&self) -> Option<(TranscriptDirection, usize)> {
         let press = self.state.left_press.as_ref()?;
@@ -4597,6 +4719,7 @@ impl Application {
                         focus,
                         epoch,
                         surface,
+                        granularity: SelectionGranularity::Cell,
                     }));
             }
             return;
@@ -4643,6 +4766,7 @@ impl Application {
                     focus,
                     epoch,
                     surface,
+                    granularity: SelectionGranularity::Cell,
                 }));
         }
     }
@@ -4715,6 +4839,12 @@ impl Application {
             SemanticCommandId::PointerDrag => {
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
                     self.update_text_selection_drag(position, 1);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::TextSelectionWord => {
+                if let SemanticSubject::ScreenPosition(position) = invocation.subject {
+                    self.select_transcript_word(position);
                 }
                 Ok(ApplicationTransition::Continue)
             }

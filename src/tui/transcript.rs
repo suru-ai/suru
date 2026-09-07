@@ -563,6 +563,19 @@ impl TranscriptCache {
             .map_or(0, TranscriptView::row_count)
     }
 
+    /// The first and last cells of the word under a Transcript cell, or
+    /// `None` where no word is (see [`TranscriptView::word_cells`]).
+    pub(super) fn word_cells(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Option<(
+        super::selection::SelectionCell,
+        super::selection::SelectionCell,
+    )> {
+        self.view.borrow().as_ref()?.word_cells(row, column)
+    }
+
     /// Returns the transcript view for the given content, rebuilding only the
     /// parts whose inputs changed since the previous frame.
     pub(super) fn view(
@@ -909,7 +922,7 @@ impl TranscriptView {
             else {
                 continue;
             };
-            for (column, width) in self.text_cells(source, wrapped) {
+            for (column, width, _) in self.text_cells(source, wrapped) {
                 let selected_from_start = row > start.row || column + width > start.column;
                 let selected_to_end = row < end.row || column <= end.column;
                 if !(selected_from_start && selected_to_end) {
@@ -925,10 +938,96 @@ impl TranscriptView {
         }
     }
 
+    /// The first and last text cells of the word under a Transcript cell,
+    /// across every row the word's line wraps to. A word is the run of
+    /// graphemes of one class (see [`super::selection::word_range`]) in the
+    /// line's written text, stopped at chrome spans and the line's ends, so a
+    /// word a soft wrap split is whole. `None` on a separator, on chrome, or
+    /// past a row's text.
+    pub(super) fn word_cells(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Option<(
+        super::selection::SelectionCell,
+        super::selection::SelectionCell,
+    )> {
+        use super::selection::SelectionCell;
+        if row >= self.row_count {
+            return None;
+        }
+        let unit = self.unit_at(|unit| unit.start_row, row)?;
+        let mut local_row = row - unit.start_row;
+        let mut first_row = unit.start_row;
+        if unit.leading_separator {
+            if local_row == 0 {
+                return None;
+            }
+            local_row -= 1;
+            first_row += 1;
+        }
+        let wrapped = unit.rows.get(local_row)?;
+        let source = &unit.lines[wrapped.line];
+        if column < wrapped.row.indent {
+            return None;
+        }
+        let offset = wrapped.row.offset_at(source, self.key.width, column);
+        if offset >= wrapped.row.end {
+            return None;
+        }
+        // The word lives in the run of text spans around the offset: chrome
+        // on either side bounds it as the line's ends do.
+        let mut span_ranges = Vec::with_capacity(source.spans.len());
+        let mut span_start = 0;
+        for span in &source.spans {
+            let span_end = span_start + span.content.len();
+            span_ranges.push((span_start..span_end, span.chrome));
+            span_start = span_end;
+        }
+        let hit = span_ranges
+            .iter()
+            .position(|(range, _)| range.contains(&offset))?;
+        if span_ranges[hit].1 {
+            return None;
+        }
+        let run_start = span_ranges[..hit]
+            .iter()
+            .rposition(|(_, chrome)| *chrome)
+            .map_or(0, |index| span_ranges[index].0.end);
+        let run_end = span_ranges[hit + 1..]
+            .iter()
+            .find(|(_, chrome)| *chrome)
+            .map_or(span_start, |(range, _)| range.start);
+        let text = source.written_text();
+        let word = super::selection::word_range(&text[run_start..run_end], offset - run_start)?;
+        let word = word.start + run_start..word.end + run_start;
+        let mut first = None;
+        let mut last = None;
+        for (index, other) in unit.rows.iter().enumerate() {
+            if other.line != wrapped.line {
+                continue;
+            }
+            let screen_row = first_row + index;
+            for (column, _, offset) in self.text_cells(source, &other.row) {
+                if !word.contains(&offset) {
+                    continue;
+                }
+                let cell = SelectionCell {
+                    row: screen_row,
+                    column,
+                };
+                first.get_or_insert(cell);
+                last = Some(cell);
+            }
+        }
+        Some((first?, last?))
+    }
+
     /// The cells of a wrapped row that draw text rather than chrome, each as
-    /// its row-local column and width, read the way the draw and the offset
-    /// lookup read them: symbol by symbol, span by span, past the indent.
-    fn text_cells(&self, source: &StyledLine, wrapped: &StyledRow) -> Vec<(usize, usize)> {
+    /// its row-local column, width, and byte offset into the line's text,
+    /// read the way the draw and the offset lookup read them: symbol by
+    /// symbol, span by span, past the indent.
+    fn text_cells(&self, source: &StyledLine, wrapped: &StyledRow) -> Vec<(usize, usize, usize)> {
         use unicode_segmentation::UnicodeSegmentation;
         let maximum = usize::from(self.key.width);
         let mut cells = Vec::new();
@@ -938,13 +1037,13 @@ impl TranscriptView {
             let span_end = span_start + span.content.len();
             let from = wrapped.start.clamp(span_start, span_end) - span_start;
             let to = wrapped.end.clamp(span_start, span_end) - span_start;
-            for symbol in span.content[from..to].graphemes(true) {
+            for (offset, symbol) in span.content[from..to].grapheme_indices(true) {
                 let width = symbol.width();
                 if width == 0 || width > maximum {
                     continue;
                 }
                 if !span.chrome {
-                    cells.push((column, width));
+                    cells.push((column, width, span_start + from + offset));
                 }
                 column += width;
             }
