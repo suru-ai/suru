@@ -72,6 +72,10 @@ _Avoid_: Active, busy, running
 The record of the tokens a Turn consumed, kept in five parts — fresh input, cache reads, cache writes, output, and the reasoning within that output — with any part a Provider does not report simply absent, never guessed at zero. A Turn records its Usage the way it records when it began and Settled, and a failed or interrupted Turn keeps whatever Usage it accrued, because Usage answers what a Session has consumed rather than what it got for it. A Session's Usage is the sum over its Turns' Usage, and the total a surface shows for a Session includes its Subagent subtree, while each child Session keeps its own.
 _Avoid_: Token count, consumption, spend
 
+**Context Fill**:
+The latest known number of tokens occupying a Session's context, expressed against its Model's context window when that capacity is known. It belongs to that Session alone, excludes its Subagents, and can decrease after compaction, unlike cumulative Usage; its denominator is the context window, not the Provider's compaction threshold.
+_Avoid_: Session Usage, total tokens used, context remaining
+
 **Cost**:
 The dollar figure attached to a Turn's Usage, fixed when that Usage is recorded and never restated against later prices, so a historical Cost stays a fact about the past. A Cost the Provider states itself outranks one Suru estimates from a rate table, and where neither exists the Cost is absent — shown as nothing rather than as zero, so free and unknown never blur. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed; its Cost Basis says where the number came from.
 _Avoid_: Price (that is a rate), spend, billing
