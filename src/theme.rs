@@ -842,7 +842,9 @@ impl Theme {
             let Some(probe) = terminal_facts.probe else {
                 return Ok(Self::system());
             };
-            if probe.background.is_none() && probe.palette[0].is_none() {
+            // ANSI black is a palette entry, not evidence of the terminal's
+            // background. It often arrives first, even on light terminals.
+            if probe.background.is_none() {
                 return Ok(Self::system());
             }
             let theme = Self::from_terminal_probe(probe, variant);
@@ -879,8 +881,10 @@ impl Theme {
             text,
             surface: SurfaceRoles {
                 base: Style::default().bg(Color::Reset),
-                elevated: Style::default().bg(Color::Black),
-                overlay: Style::default().bg(Color::Black),
+                // Until the terminal reports its background, inherit it. In
+                // particular, do not flash black panels on a light terminal.
+                elevated: Style::default().bg(Color::Reset),
+                overlay: Style::default().bg(Color::Reset),
             },
             accent,
             ansi: AnsiPalette {
@@ -1189,9 +1193,7 @@ impl Theme {
 }
 
 fn terminal_background(terminal_facts: &TerminalFacts) -> Option<TerminalColor> {
-    terminal_facts
-        .probe
-        .and_then(|probe| probe.background.or(probe.palette[0]))
+    terminal_facts.probe.and_then(|probe| probe.background)
 }
 
 fn terminal_luminance(color: TerminalColor) -> f64 {

@@ -753,6 +753,51 @@ fn a_single_variant_theme_does_not_repaint_when_mode_changes() {
 }
 
 #[test]
+fn a_pinned_user_theme_uses_effective_mode_on_the_first_frame_and_after_late_colors() {
+    let workspace = workspace_dir();
+    let config_root = tempfile::tempdir().unwrap();
+    fs::create_dir(config_root.path().join("themes")).unwrap();
+    fs::write(
+        config_root.path().join("themes/reader.json"),
+        include_str!("../../src/theme/assets/catppuccin.json"),
+    )
+    .unwrap();
+    for (mode, initial_background, final_background) in [
+        (
+            AppearanceMode::Dark,
+            Color::Rgb(30, 30, 46),
+            Color::Rgb(30, 30, 46),
+        ),
+        (
+            AppearanceMode::Light,
+            Color::Rgb(239, 241, 245),
+            Color::Rgb(239, 241, 245),
+        ),
+        (
+            AppearanceMode::System,
+            Color::Rgb(30, 30, 46),
+            Color::Rgb(239, 241, 245),
+        ),
+    ] {
+        let mut application = Application::new(workspace.path(), TerminalFacts::unprobed(true))
+            .with_config_root(config_root.path());
+        deliver_settings(&mut application, themed_in_mode("reader", mode));
+        let initial = rendered_application_buffer(&application, 100, 20);
+        assert_eq!(initial.cell((99, 0)).unwrap().bg, initial_background);
+        application.set_terminal_facts(TerminalFacts::new(
+            Some(TerminalColorProbe::new(
+                [None; 16],
+                None,
+                Some(TerminalColor::new(255, 255, 255)),
+            )),
+            true,
+        ));
+        let updated = rendered_application_buffer(&application, 100, 20);
+        assert_eq!(updated.cell((99, 0)).unwrap().bg, final_background);
+    }
+}
+
+#[test]
 fn an_unprobed_terminal_uses_the_dark_variant_in_system_mode() {
     let workspace = workspace_dir();
     let mut application =
@@ -858,7 +903,7 @@ fn system_paints_dark_terminal_surfaces_borders_and_muted_text_dark() {
 }
 
 #[test]
-fn an_unprobed_system_renders_with_the_original_terminal_colors() {
+fn an_unprobed_system_leaves_panel_backgrounds_to_the_terminal() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     deliver_settings(&mut application, EffectiveSettings::default());
@@ -866,14 +911,14 @@ fn an_unprobed_system_renders_with_the_original_terminal_colors() {
     let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
-    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Black);
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Reset);
     assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::DarkGray);
     assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
     assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
 }
 
 #[test]
-fn system_keeps_the_original_theme_when_no_background_was_observed() {
+fn system_leaves_panel_backgrounds_to_the_terminal_until_background_is_observed() {
     let workspace = workspace_dir();
     let mut palette = [None; 16];
     palette[1] = Some(TerminalColor::new(12, 34, 56));
@@ -891,10 +936,38 @@ fn system_keeps_the_original_theme_when_no_background_was_observed() {
     let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
-    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Black);
+    assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Reset);
     assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::DarkGray);
     assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
     assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn system_keeps_terminal_defaults_through_palette_replies_then_repaints_for_a_light_background() {
+    let workspace = workspace_dir();
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
+    deliver_settings(&mut application, EffectiveSettings::default());
+    let initial = rendered_application_buffer(&application, 100, 20);
+    let mut palette = [None; 16];
+    palette[0] = Some(TerminalColor::new(0, 0, 0));
+    application.set_terminal_facts(TerminalFacts::new(
+        Some(TerminalColorProbe::new(palette, None, None)),
+        true,
+    ));
+    assert_eq!(rendered_application_buffer(&application, 100, 20), initial);
+
+    application.set_terminal_facts(TerminalFacts::new(
+        Some(TerminalColorProbe::new(
+            palette,
+            Some(TerminalColor::new(34, 34, 34)),
+            Some(TerminalColor::new(255, 255, 255)),
+        )),
+        true,
+    ));
+    let light = rendered_application_buffer(&application, 100, 20);
+    assert_eq!(light.cell((0, 0)).unwrap().bg, Color::Rgb(238, 238, 238));
+    assert_eq!(light.cell((99, 0)).unwrap().bg, Color::Reset);
 }
 
 #[test]

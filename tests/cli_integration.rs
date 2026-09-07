@@ -1153,7 +1153,7 @@ fn answer_cursor_position_report(shown: &[u8], terminal: &Mutex<Box<dyn std::io:
     let _ = terminal.flush();
 }
 
-/// Answers Suru's startup palette probe with a complete light-terminal palette.
+/// Answers only after the first frame, with a complete light-terminal palette.
 /// The real pseudo-terminal is deliberately otherwise inert, so this is the
 /// terminal-emulator half of the startup boundary under test.
 #[cfg(unix)]
@@ -1164,6 +1164,9 @@ fn answer_terminal_color_queries(
 ) {
     const LAST_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
     if *answered
+        || !shown
+            .windows(b"\x1b[?25h".len())
+            .any(|window| window == b"\x1b[?25h")
         || !shown
             .windows(LAST_QUERY.len())
             .any(|window| window == LAST_QUERY)
@@ -1522,6 +1525,18 @@ async fn clean_tui_exit_restores_the_terminal() {
     })
     .await
     .expect("TUI draws its first frame before clean-exit input");
+    // Unix PTYs pass OSC through, so the harness controls when color replies
+    // arrive. ConPTY emulates colors itself; Application rendering tests cover
+    // the same fallback-to-light transition on every platform.
+    #[cfg(unix)]
+    timeout(Duration::from_secs(5), async {
+        while !String::from_utf8_lossy(&tui.shown()).contains("48;2;238;238;238") {
+            assert!(tui.is_running(), "TUI exited before the color repaint");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("late colors repaint without reader input");
     tui.send(b"\x03");
     timeout(Duration::from_secs(10), async {
         while tui.is_running() {
@@ -1542,15 +1557,19 @@ async fn clean_tui_exit_restores_the_terminal() {
     #[cfg(unix)]
     {
         let query = outcome.position_of("\u{1b}]11;?\u{1b}\\");
-        let first_frame = outcome.position_of("Suru");
+        let first_frame = outcome.position_of("\u{1b}[?25h");
         assert!(
             query < first_frame,
             "the first frame preceded the terminal probe"
         );
         assert!(
-            outcome.screen[..first_frame].contains("48;2;238;238;238"),
-            "the first frame did not use the probed light panel: {:?}",
+            !outcome.screen[..first_frame].contains("48;2;238;238;238"),
+            "the first frame must precede color replies: {:?}",
             outcome.screen
+        );
+        assert!(
+            outcome.position_of("48;2;238;238;238") > first_frame,
+            "late colors must reach a subsequent frame"
         );
     }
 

@@ -46,10 +46,7 @@ use super::state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
     ModelListRequest, SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
 };
-use crate::terminal::{
-    DEFAULT_TERMINAL_PROBE_BUDGET, TerminalEvents, TerminalFacts, TerminalInput,
-    request_terminal_colors,
-};
+use crate::terminal::{TerminalEvents, TerminalFacts, TerminalInput, request_terminal_colors};
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -60,13 +57,8 @@ pub async fn run(client: ManagedClient) -> Result<()> {
         std::env::current_dir().map_err(|error| anyhow!("read current Workspace: {error}"))?;
     let mut session = TerminalSession::enter()?;
     let mut input = TerminalEvents::open()?;
-    let terminal_probe = input
-        .probe_colors(
-            session.terminal.backend_mut(),
-            DEFAULT_TERMINAL_PROBE_BUDGET,
-        )
-        .await?;
-    let terminal_facts = TerminalFacts::new(terminal_probe, available_color_count() == u16::MAX);
+    input.request_colors(session.terminal.backend_mut())?;
+    let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX);
     run_loop(
         &mut session.terminal,
         client,

@@ -294,7 +294,7 @@ fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
     let buffer = rendered_application_buffer(&application, WIDE, 20);
     let rows = crate::support::buffer_rows(&buffer);
     let working_title = u16::try_from(rendered_row(&rows, "Running a build")).expect("screen row");
-    assert_standing_rail(&buffer, working_title, Color::LightBlue, Color::Black);
+    assert_standing_rail(&buffer, working_title, Color::LightBlue, Color::Reset);
     let idle_title = u16::try_from(rendered_row(&rows, "Waiting quietly")).expect("screen row");
     for row in idle_title - 1..=idle_title + 1 {
         assert_ne!(buffer.cell((0, row)).expect("idle Rail cell").symbol(), "▎");
@@ -328,10 +328,10 @@ fn latest_turn_outcomes_draw_failed_and_done_but_leave_interrupted_quiet() {
     let buffer = rendered_application_buffer(&application, WIDE, 20);
     let rows = crate::support::buffer_rows(&buffer);
     let failed = u16::try_from(rendered_row(&rows, "Failed work")).expect("screen row");
-    assert_standing_rail(&buffer, failed, Color::Red, Color::Black);
+    assert_standing_rail(&buffer, failed, Color::Red, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(failed - 1)]).ends_with("Failed"));
     let done = u16::try_from(rendered_row(&rows, "Completed work")).expect("screen row");
-    assert_standing_rail(&buffer, done, Color::Green, Color::Black);
+    assert_standing_rail(&buffer, done, Color::Green, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(done - 1)]).ends_with("Done"));
     let stopped = u16::try_from(rendered_row(&rows, "Stopped work")).expect("screen row");
     for row in stopped - 1..=stopped + 1 {
@@ -379,7 +379,7 @@ fn failed_and_done_draw_only_when_the_latest_turn_settled_after_viewed() {
     }
     assert!(!sidebar_column(&rows[usize::from(cleared - 1)]).contains("Failed"));
     let unseen = u16::try_from(rendered_row(&rows, "New since viewed")).expect("screen row");
-    assert_standing_rail(&buffer, unseen, Color::Green, Color::Black);
+    assert_standing_rail(&buffer, unseen, Color::Green, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(unseen - 1)]).ends_with("Done"));
 }
 
@@ -1964,7 +1964,7 @@ fn the_open_session_draws_only_its_title_in_the_accent_style() {
         .cell((title_column, title_row))
         .expect("open Title cell");
     assert_eq!(title.fg, Color::Cyan);
-    assert_eq!(title.bg, Color::Black);
+    assert_eq!(title.bg, Color::Reset);
     assert!(
         buffer
             .content()
@@ -4658,7 +4658,7 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
         Color::DarkGray,
         "cached rows from the dropped Remote are dimmed"
     );
-    assert_standing_rail(&buffer, studio.1, Color::LightBlue, Color::Black);
+    assert_standing_rail(&buffer, studio.1, Color::LightBlue, Color::Reset);
     let laptop = text_position(&buffer, "Laptop work");
     assert_eq!(
         buffer.cell(laptop).expect("draw the Laptop row").fg,
@@ -5253,7 +5253,7 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
     let buffer = rendered_application_buffer(&application, WIDE, 20);
     let rows = crate::support::buffer_rows(&buffer);
     let remote = u16::try_from(rendered_row(&rows, "Remote work")).expect("screen row");
-    assert_standing_rail(&buffer, remote, Color::Red, Color::Black);
+    assert_standing_rail(&buffer, remote, Color::Red, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(remote - 1)]).ends_with("Failed"));
     let local = u16::try_from(rendered_row(&rows, "Local work")).expect("screen row");
     assert_ne!(

@@ -9,10 +9,9 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 
 const TERMINAL_COLOR_QUERY_SUFFIX: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
-pub(crate) const DEFAULT_TERMINAL_PROBE_BUDGET: Duration = Duration::from_millis(100);
 const DEFAULT_TERMINAL_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 const DEFAULT_COLOR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -571,38 +570,11 @@ impl TerminalEvents {
         })
     }
 
-    /// Sends the startup color query and consumes replies for at most `budget`.
-    /// Reader input that arrives during the probe is retained in order for the
-    /// main run loop.
-    pub(crate) async fn probe_colors(
-        &mut self,
-        output: &mut impl io::Write,
-        budget: Duration,
-    ) -> io::Result<Option<TerminalColorProbe>> {
-        request_terminal_colors(output)?;
+    /// Issue the startup query without consuming input or delaying the first
+    /// frame. Replies and reader input stay ordered in the normal event stream.
+    pub(crate) fn request_colors(&mut self, output: &mut impl io::Write) -> io::Result<()> {
         self.expect_color_responses();
-        let deadline = tokio::time::Instant::now() + budget;
-        let mut deferred = VecDeque::new();
-        let mut facts = TerminalFacts::unprobed(false);
-        loop {
-            let item = match tokio::time::timeout_at(deadline, self.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) | Err(_) => break,
-            };
-            match item {
-                Ok(TerminalInput::Colors(update)) => {
-                    facts.merge_probe(update);
-                    if facts.probe.is_some_and(terminal_probe_complete) {
-                        break;
-                    }
-                }
-                other => deferred.push_back(other),
-            }
-        }
-        while let Some(item) = deferred.pop_back() {
-            self.ready.push_front(item);
-        }
-        Ok(facts.probe)
+        request_terminal_colors(output)
     }
 
     fn expect_color_responses(&mut self) {
@@ -630,12 +602,6 @@ pub(crate) fn request_terminal_colors(output: &mut impl io::Write) -> io::Result
     }
     output.write_all(TERMINAL_COLOR_QUERY_SUFFIX)?;
     output.flush()
-}
-
-fn terminal_probe_complete(probe: TerminalColorProbe) -> bool {
-    probe.palette.into_iter().all(|color| color.is_some())
-        && probe.foreground.is_some()
-        && probe.background.is_some()
 }
 
 impl Stream for TerminalEvents {
@@ -1320,26 +1286,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_probe_consumes_colors_but_preserves_reader_input() {
+    async fn startup_color_queries_do_not_wait_for_reader_input() {
+        let (_sender, source) = tokio::sync::mpsc::unbounded_channel();
+        let mut events = TerminalEvents::from_source(source).unwrap();
+        let mut output = Vec::new();
+        // Returning synchronously with the sender still open proves that no
+        // input, EOF, or probe timeout is needed to proceed to the first frame.
+        events.request_colors(&mut output).unwrap();
+        assert!(output.ends_with(super::TERMINAL_COLOR_QUERY_SUFFIX));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut application =
+            crate::tui::Application::new(workspace.path(), super::TerminalFacts::unprobed(true));
+        application
+            .handle_event(crate::tui::ApplicationEvent::Managed(
+                crate::managed_client::ManagedEvent::SettingsSnapshot(
+                    crate::protocol::SettingsSnapshot::default(),
+                ),
+            ))
+            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| application.render(frame)).unwrap();
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(shown.contains("Type a Prompt and press Enter"));
+    }
+
+    #[tokio::test]
+    async fn startup_queries_preserve_colors_and_reader_input_in_stream_order() {
         use futures_util::StreamExt as _;
 
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         sender
             .send(TerminalSourceInput::Bytes(
-                b"x\x1b]11;rgb:1234/5678/9abc\x1b\\".to_vec(),
+                b"x\x1b]11;rgb:1234/5678/9abc\x1b\\\x1b[200~pasted\x1b[201~\x1b]10;broken\x07y"
+                    .to_vec(),
             ))
             .unwrap();
         drop(sender);
         let mut events = TerminalEvents::from_source(source).unwrap();
         let mut output = Vec::new();
 
-        let probe = events
-            .probe_colors(&mut output, Duration::from_millis(10))
-            .await
-            .unwrap()
-            .unwrap();
+        events.request_colors(&mut output).unwrap();
 
-        assert_eq!(probe.background, Some(TerminalColor::new(18, 86, 154)));
         assert_eq!(
             events.next().await.unwrap().unwrap(),
             TerminalInput::Event(InputEvent::Key(KeyEvent::new(
@@ -1347,23 +1342,37 @@ mod tests {
                 KeyModifiers::NONE,
             )))
         );
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Colors(TerminalColorProbe::new(
+                [None; 16],
+                None,
+                Some(TerminalColor::new(18, 86, 154)),
+            ))
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Event(InputEvent::Paste("pasted".into()))
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )))
+        );
+        assert!(events.next().await.is_none());
         assert!(!output.is_empty());
     }
 
     #[tokio::test]
-    async fn color_reply_arriving_after_the_startup_budget_remains_semantic_input() {
+    async fn color_reply_arriving_after_startup_remains_semantic_input() {
         use futures_util::StreamExt as _;
 
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         let mut events = TerminalEvents::from_source(source).unwrap();
 
-        assert_eq!(
-            events
-                .probe_colors(&mut Vec::new(), Duration::ZERO)
-                .await
-                .unwrap(),
-            None
-        );
+        events.request_colors(&mut Vec::new()).unwrap();
         sender
             .send(TerminalSourceInput::Bytes(
                 b"\x1b]11;rgb:ffff/ffff/ffff\x07".to_vec(),
@@ -1478,13 +1487,7 @@ mod tests {
 
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         let mut events = TerminalEvents::from_source(source).unwrap();
-        assert_eq!(
-            events
-                .probe_colors(&mut Vec::new(), Duration::ZERO)
-                .await
-                .unwrap(),
-            None
-        );
+        events.request_colors(&mut Vec::new()).unwrap();
         sender
             .send(TerminalSourceInput::Bytes(
                 b"\x1b]11;rgb:ffff/ffff".to_vec(),

@@ -815,12 +815,12 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 .cell((user_block_right_edge, row))
                 .expect("elevated row edge")
                 .bg,
-            Color::Black,
-            "the elevated surface spans the full user block width"
+            Color::Reset,
+            "the inherited surface spans the full user block width"
         );
     }
     assert_eq!(text_cell(&completed, "┃").fg, Color::Cyan);
-    assert_eq!(text_cell(&completed, "Explain the stream").bg, Color::Black);
+    assert_eq!(text_cell(&completed, "Explain the stream").bg, Color::Reset);
     assert_eq!(text_cell(&completed, "Error:").fg, Color::Red);
     assert_eq!(text_cell(&completed, "Reading files").fg, Color::DarkGray);
     assert_eq!(text_cell(&completed, "Streamed heading").fg, Color::Cyan);
