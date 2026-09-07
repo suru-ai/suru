@@ -2979,22 +2979,23 @@ async fn a_failed_serving_rebind_keeps_the_listener_already_in_service() {
 fn build_identity_changes_with_executable_contents() {
     let directory = tempfile::tempdir().expect("create build identity fixture directory");
     let executable = directory.path().join("suru-fixture");
-    std::fs::write(&executable, b"first compiled executable")
-        .expect("write first executable contents");
+    std::fs::write(&executable, b"first executable").expect("write first executable contents");
     let first = suru::build_identity::for_executable(&executable)
         .expect("identify first executable contents");
 
-    std::fs::write(&executable, b"rebuilt executable").expect("write rebuilt executable contents");
+    let modified = std::fs::metadata(&executable).unwrap().modified().unwrap();
+    std::fs::write(&executable, b"other executable").expect("write rebuilt executable contents");
+    std::fs::File::options()
+        .write(true)
+        .open(&executable)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
     let rebuilt = suru::build_identity::for_executable(&executable)
         .expect("identify rebuilt executable contents");
 
     assert_ne!(first, rebuilt);
-    assert!(first.starts_with(concat!(
-        env!("CARGO_PKG_NAME"),
-        "@",
-        env!("CARGO_PKG_VERSION"),
-        "+blake3:"
-    )));
+    assert!(first.starts_with("blake3:"));
 }
 
 #[tokio::test]
@@ -3206,20 +3207,6 @@ async fn authenticated_health_describes_the_ready_server() {
     assert_eq!(health.lifecycle, LifecycleState::Ready);
     assert_eq!(health.protocol_version, descriptor.protocol_version);
     assert_eq!(health.build_identity, descriptor.build_identity);
-    assert!(
-        descriptor.build_identity.starts_with(concat!(
-            env!("CARGO_PKG_NAME"),
-            "@",
-            env!("CARGO_PKG_VERSION"),
-            "+blake3:"
-        )),
-        "build identity should include the package version and executable digest"
-    );
-    assert_ne!(
-        descriptor.build_identity,
-        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
-        "package version alone cannot identify executable contents"
-    );
     assert_eq!(
         descriptor.build_identity,
         build_identity::for_current_executable().expect("identify current test executable")

@@ -11,6 +11,13 @@ use suru::{
     tui,
 };
 
+// Keep the marker in allocated storage so stripping debug information preserves
+// it. Taking its address in main also prevents linker garbage collection.
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__suru"))]
+#[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".suru"))]
+static BUILD_ID: [u8; 32] = suru_build_id::generate!();
+
 #[derive(Debug, Parser)]
 #[command(name = "suru", version, about)]
 struct Cli {
@@ -54,6 +61,7 @@ enum ServerCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    std::hint::black_box(&BUILD_ID);
     match Cli::parse().command {
         Some(CliCommand::Server {
             command: ServerCommand::Start { startup_timeout_ms },

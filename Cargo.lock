@@ -1822,6 +1822,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2746,6 +2755,7 @@ dependencies = [
  "jsonc-parser",
  "libc",
  "libsqlite3-sys",
+ "object",
  "portable-pty",
  "pulldown-cmark",
  "ratatui",
@@ -2757,6 +2767,7 @@ dependencies = [
  "shlex",
  "socket2",
  "subtle",
+ "suru-build-id",
  "syntect",
  "sysinfo",
  "tempfile",
@@ -2773,6 +2784,13 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "x509-parser",
+]
+
+[[package]]
+name = "suru-build-id"
+version = "0.1.0"
+dependencies = [
+ "uuid",
 ]
 
 [[package]]

@@ -51,7 +51,7 @@ fn suru_binary_build_identity() -> String {
 }
 
 fn inert_server_executable(state_dir: &std::path::Path) -> PathBuf {
-    let executable = state_dir.join("must-not-spawn");
+    let executable = state_dir.join(format!("must-not-spawn{}", std::env::consts::EXE_SUFFIX));
     if !executable.exists() {
         std::fs::write(&executable, b"inert server fixture executable")
             .expect("write inert server fixture executable");
@@ -94,6 +94,45 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
     assert_eq!(identity.instance_id, replacement.instance_id);
 
     drop(client);
+    stop_test_server(state_dir.path(), channel);
+}
+
+#[tokio::test]
+async fn configured_executable_replaced_at_the_same_path_replaces_then_reuses_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "custom-path-replacement";
+    let executable = inert_server_executable(state_dir.path());
+    let old_identity = build_identity::for_executable(&executable).unwrap();
+    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, &old_identity).await;
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .unwrap()
+        .with_server_executable(&executable);
+    let original = start_server(&config).await.expect("reuse configured build");
+    assert_eq!(original.instance_id, fixture.descriptor().instance_id);
+
+    let modified = std::fs::metadata(&executable).unwrap().modified().unwrap();
+    let replacement_file = tempfile::NamedTempFile::new_in(state_dir.path()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_suru"), replacement_file.path()).unwrap();
+    replacement_file.as_file().set_modified(modified).unwrap();
+    drop(
+        replacement_file
+            .persist(&executable)
+            .expect("atomically replace configured executable"),
+    );
+
+    let replacement = start_server(&config)
+        .await
+        .expect("launch rebuilt configured executable");
+    assert_ne!(replacement.instance_id, original.instance_id);
+    assert_eq!(replacement.build_identity, suru_binary_build_identity());
+    assert_eq!(
+        fixture.shutdown_request().unwrap().reason,
+        ShutdownReason::Replacement
+    );
+    let reused = start_server(&config)
+        .await
+        .expect("reuse rebuilt configured executable");
+    assert_eq!(reused.instance_id, replacement.instance_id);
     stop_test_server(state_dir.path(), channel);
 }
 
