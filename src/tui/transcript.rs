@@ -576,6 +576,17 @@ impl TranscriptCache {
         self.view.borrow().as_ref()?.word_cells(row, column)
     }
 
+    /// Bounds of the whole written Line, including pieces split by the cap.
+    pub(super) fn line_cells(
+        &self,
+        row: usize,
+    ) -> Option<(
+        super::selection::SelectionCell,
+        super::selection::SelectionCell,
+    )> {
+        self.view.borrow().as_ref()?.line_cells(row)
+    }
+
     /// Returns the transcript view for the given content, rebuilding only the
     /// parts whose inputs changed since the previous frame.
     pub(super) fn view(
@@ -1030,6 +1041,79 @@ impl TranscriptView {
             }
         }
         Some((first?, last?))
+    }
+
+    /// Bounds of the written Line containing `row`, across soft wraps and
+    /// cap-split continuations. Chrome and hanging indents are excluded by
+    /// the same cell projection used to highlight and copy. Only Code Blocks
+    /// retain authored leading whitespace; other Lines start at their text.
+    pub(super) fn line_cells(
+        &self,
+        row: usize,
+    ) -> Option<(
+        super::selection::SelectionCell,
+        super::selection::SelectionCell,
+    )> {
+        use super::selection::SelectionCell;
+        let hit = self.wrapped_row_at(row)?;
+        // The exclusive right edge maps to the row's text end when copied
+        // and covers no painted cell, representing an empty Line.
+        let empty = SelectionCell {
+            row,
+            column: usize::from(self.key.width),
+        };
+        let RowAt::Wrapped { .. } = hit else {
+            return Some((empty, empty));
+        };
+        let unit = self.unit_at(|unit| unit.start_row, row)?;
+        let row_base = unit.start_row + usize::from(unit.leading_separator);
+        let mut first_line = unit.rows[row - row_base].line;
+        while first_line > 0 && unit.lines[first_line].continuation {
+            first_line -= 1;
+        }
+        let mut end_line = first_line + 1;
+        while end_line < unit.lines.len() && unit.lines[end_line].continuation {
+            end_line += 1;
+        }
+        let source = &unit.lines[first_line];
+        let preserve_indent = source.markdown.as_ref().is_some_and(|document| {
+            source.spans.iter().any(|span| {
+                span.source
+                    .as_ref()
+                    .is_some_and(|range| document.is_code(range))
+            })
+        });
+        let mut first = None;
+        let mut last = None;
+        let mut written_line = None;
+        let mut text = String::new();
+        for (index, wrapped) in unit.rows.iter().enumerate() {
+            if !(first_line..end_line).contains(&wrapped.line) {
+                continue;
+            }
+            let source = &unit.lines[wrapped.line];
+            if written_line != Some(wrapped.line) {
+                text = source.written_text();
+                written_line = Some(wrapped.line);
+            }
+            for text_cell in self.text_cells(source, &wrapped.row) {
+                let cell = SelectionCell {
+                    row: row_base + index,
+                    column: text_cell.column,
+                };
+                let nonblank = text[text_cell.offset..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace());
+                if nonblank || preserve_indent {
+                    first.get_or_insert(cell);
+                }
+                if nonblank {
+                    last = Some(cell);
+                }
+            }
+        }
+        Some(last.map_or((empty, empty), |last| (first.unwrap_or(last), last)))
     }
 
     /// The cells of a wrapped row that draw text rather than chrome, read the

@@ -8480,9 +8480,22 @@ fn click_count_survives_a_release_copy_ctrl_c_escape_and_a_fold_toggle() {
         press_at(&mut application, suite);
         assert_eq!(
             reversed_cells(&rendered_application_buffer(&application, 60, 24)),
-            word_cells(suite, 5),
-            "{reset}: the next press still continues the count"
+            word_cells(text_position(&buffer, "Run the test suite"), 18),
+            "{reset}: the third press selects the Line"
         );
+        let released = click_release_at(&mut application, suite);
+        let copied = if reset == "ctrl-c" {
+            assert_eq!(released, ApplicationTransition::Continue);
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )))
+                .unwrap()
+        } else {
+            released
+        };
+        assert_eq!(copied_text(&copied), Some("Run the test suite"));
     }
 }
 
@@ -8520,4 +8533,199 @@ fn zz_probe_fold_marker() {
     {
         eprintln!("{i:2}|{r}|");
     }
+}
+
+#[test]
+fn triple_click_selects_a_wrapped_line_and_fourth_click_keeps_it() {
+    let (mut application, clock) =
+        word_click_application("Alpha bravo charlie delta echo foxtrot golf hotel india juliet");
+    let buffer = rendered_application_buffer(&application, 40, 24);
+    let start = text_position(&buffer, "Alpha");
+    let end = text_position(&buffer, "juliet");
+    let bravo = text_position(&buffer, "bravo");
+    assert!(end.1 > start.1);
+    double_click_at(&mut application, &clock, bravo);
+    for _ in 0..2 {
+        clock.fetch_add(100, Ordering::Relaxed);
+        press_at(&mut application, bravo);
+        let selected = rendered_application_buffer(&application, 40, 24);
+        assert!(selected[start].modifier.contains(Modifier::REVERSED));
+        assert!(
+            selected[(end.0 + 5, end.1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        for y in start.1..=end.1 {
+            assert!(!reversed_columns(&selected, y).is_empty());
+            assert!(
+                !selected[(start.0 - 1, y)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+        assert_eq!(
+            copied_text(&click_release_at(&mut application, bravo)),
+            Some("Alpha bravo charlie delta echo foxtrot golf hotel india juliet")
+        );
+        assert_eq!(
+            click_release_at(&mut application, bravo),
+            ApplicationTransition::Continue
+        );
+    }
+}
+
+fn triple_click_at(
+    application: &mut Application,
+    clock: &AtomicU64,
+    position: (u16, u16),
+) -> ApplicationTransition {
+    double_click_at(application, clock, position);
+    clock.fetch_add(100, Ordering::Relaxed);
+    click_at(application, position)
+}
+
+#[test]
+fn triple_click_copies_code_indentation_and_markdown_shape_without_chrome() {
+    for (source, needle, offset, expected, html, highlight) in [
+        (
+            "```rust\n    let answer = 42;   \nnext\n```",
+            "let answer",
+            0,
+            "    let answer = 42;",
+            "<pre><code>    let answer = 42;</code></pre>\n",
+            (4, 20),
+        ),
+        (
+            "Alpha **bravo** charlie",
+            "bravo",
+            0,
+            "Alpha **bravo** charlie",
+            "<p>Alpha <strong>bravo</strong> charlie</p>\n",
+            (6, 19),
+        ),
+    ] {
+        let (mut application, clock) = word_click_application(source);
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let target = text_position(&buffer, needle);
+        let copied = triple_click_at(&mut application, &clock, (target.0 + offset, target.1));
+        assert_eq!(copied_text(&copied), Some(expected));
+        let ApplicationTransition::CopyToClipboard(content) = copied else {
+            panic!("no copy")
+        };
+        assert_eq!(content.html.as_deref(), Some(html));
+        assert_eq!(
+            reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+            word_cells((target.0 - highlight.0, target.1), highlight.1)
+        );
+    }
+}
+
+#[test]
+fn triple_click_on_blank_lines_and_separators_copies_an_empty_line() {
+    for source in ["before\n\nafter", "```text\nbefore\n   \nafter\n```"] {
+        let (mut application, clock) = word_click_application(source);
+        let buffer = rendered_application_buffer(&application, 60, 24);
+        let before = text_position(&buffer, "before");
+        let after = text_position(&buffer, "after");
+        assert_eq!(after.1, before.1 + 2);
+        let copied = triple_click_at(&mut application, &clock, (before.0, before.1 + 1));
+        assert_eq!(copied_text(&copied), Some(""));
+        assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+    }
+}
+
+#[test]
+fn triple_click_selects_every_part_of_an_oversize_line() {
+    let source: &'static str =
+        Box::leak(format!("START {} END", "x".repeat(36_000)).into_boxed_str());
+    let (mut application, clock) = word_click_application(source);
+    let buffer = rendered_application_buffer(&application, 32, 1600);
+    let start = text_position(&buffer, "START");
+    let end = text_position(&buffer, "END");
+    let copied = triple_click_at(&mut application, &clock, end);
+    assert_eq!(copied_text(&copied), Some(source));
+    let selected = rendered_application_buffer(&application, 32, 1600);
+    for y in start.1..=end.1 {
+        assert!(!reversed_columns(&selected, y).is_empty(), "Row {y}");
+    }
+    assert!(selected[start].modifier.contains(Modifier::REVERSED));
+    assert!(
+        selected[(end.0 + 2, end.1)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn triple_click_copies_command_and_fold_words_without_affordances() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    if let Activity::Command { command, .. } = &mut snapshot.activities[0] {
+        *command = "   cargo test   ".into();
+    }
+    let (mut application, clock) = word_click_application("placeholder");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let command = text_position(&buffer, "cargo test");
+    let separator = (command.0, command.1 - 1);
+    assert_eq!(
+        copied_text(&triple_click_at(&mut application, &clock, separator)),
+        Some("")
+    );
+    assert!(reversed_cells(&rendered_application_buffer(&application, 60, 24)).is_empty());
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    assert_eq!(
+        copied_text(&triple_click_at(&mut application, &clock, command)),
+        Some("cargo test")
+    );
+    assert_eq!(
+        reversed_cells(&rendered_application_buffer(&application, 60, 24)),
+        word_cells(command, 10)
+    );
+    let mut settings = EffectiveSettings::default();
+    settings.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    deliver_settings(
+        &mut application,
+        settings,
+        &["textSelection.copy", "transcript.reasoningVisibility"],
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[
+                RunEntry::Reasoning(ReasoningBlock::thought("Inspect the files", "Details", 20)),
+                RunEntry::AgentMessage("Final answer"),
+            ],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let fold = text_position(&buffer, "Inspect the files");
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    let copied = triple_click_at(&mut application, &clock, fold);
+    assert_eq!(
+        copied_text(&copied),
+        Some("Thought: Inspect the files · 20ms")
+    );
+    let selected = rendered_application_buffer(&application, 60, 24);
+    assert_eq!(
+        reversed_cells(&selected),
+        word_cells(text_position(&buffer, "Thought"), 33)
+    );
+}
+
+#[test]
+fn the_line_gesture_is_a_semantic_command() {
+    assert_eq!(
+        SemanticCommandId::TextSelectionLine.as_str(),
+        "text_selection.line"
+    );
 }

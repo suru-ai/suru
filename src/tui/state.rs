@@ -3388,7 +3388,11 @@ impl Application {
                 self.state.last_click = Some(click);
                 if click.count >= 2 && click.surface == Some(SelectionSurface::Transcript) {
                     self.invoke_semantic(SemanticInvocation {
-                        id: SemanticCommandId::TextSelectionWord,
+                        id: if click.count == 2 {
+                            SemanticCommandId::TextSelectionWord
+                        } else {
+                            SemanticCommandId::TextSelectionLine
+                        },
                         subject: SemanticSubject::ScreenPosition(position),
                     })?;
                 }
@@ -3438,7 +3442,7 @@ impl Application {
                         subject: SemanticSubject::ScreenPosition(position),
                     })?;
                 }
-                // A press that marked a word made a selection the way a drag
+                // A press that marked a word or Line made a selection the way a drag
                 // does, so its release copies the way a drag's does; the copy
                 // is what the release reports when both happen.
                 if self.state.settings.text_selection.copy == TextSelectionCopy::Release
@@ -4620,17 +4624,20 @@ impl Application {
         })
     }
 
-    /// Makes the word under a Transcript cell the standing Text Selection,
-    /// or leaves none when no word is there.
-    fn select_transcript_word(&mut self, position: Position) {
+    /// Marks the word or whole Line under a Transcript cell.
+    fn select_transcript_text(&mut self, position: Position, granularity: SelectionGranularity) {
         let Some(cell) = self.transcript_cell(position) else {
             return;
         };
-        let Some((anchor, focus)) = self
-            .state
-            .transcript_cache
-            .word_cells(cell.row, cell.column)
-        else {
+        let bounds = match granularity {
+            SelectionGranularity::Word => self
+                .state
+                .transcript_cache
+                .word_cells(cell.row, cell.column),
+            SelectionGranularity::Line => self.state.transcript_cache.line_cells(cell.row),
+            SelectionGranularity::Cell => None,
+        };
+        let Some((anchor, focus)) = bounds else {
             return;
         };
         self.state.text_selection.set(Some(TextSelection {
@@ -4638,7 +4645,7 @@ impl Application {
             anchor,
             focus,
             epoch: self.state.transcript_cache.selection_epoch(),
-            granularity: SelectionGranularity::Word,
+            granularity,
         }));
     }
 
@@ -4824,9 +4831,14 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            SemanticCommandId::TextSelectionWord => {
+            SemanticCommandId::TextSelectionWord | SemanticCommandId::TextSelectionLine => {
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
-                    self.select_transcript_word(position);
+                    let granularity = if invocation.id == SemanticCommandId::TextSelectionWord {
+                        SelectionGranularity::Word
+                    } else {
+                        SelectionGranularity::Line
+                    };
+                    self.select_transcript_text(position, granularity);
                 }
                 Ok(ApplicationTransition::Continue)
             }

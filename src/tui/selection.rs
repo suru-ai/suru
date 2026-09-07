@@ -25,11 +25,12 @@ impl TextSelection {
     }
 }
 
-/// What one press marks: a cell to drag from, or the word under it.
+/// What one press marks: a cell to drag from, a word, or a whole Line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectionGranularity {
     Cell,
     Word,
+    Line,
 }
 
 /// The class a grapheme belongs to for word selection, decided by its first

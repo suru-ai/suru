@@ -197,6 +197,12 @@ impl Builder {
 }
 
 impl Document {
+    /// Whether these painted bytes belong to a Code Block, whose authored
+    /// indentation is part of a whole-Line selection.
+    pub(crate) fn is_code(&self, source: &SourceRange) -> bool {
+        matches!(self.nodes[source.node].kind, Kind::Code(_))
+    }
+
     pub(crate) fn copy(
         &self,
         ranges: &[SourceRange],
