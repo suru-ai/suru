@@ -614,6 +614,42 @@ struct CommandBinding {
 
 const COMMAND_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
+        code: KeyCode::Left,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionLeft,
+        label: "Shift+Left",
+    },
+    CommandBinding {
+        code: KeyCode::Right,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionRight,
+        label: "Shift+Right",
+    },
+    CommandBinding {
+        code: KeyCode::Up,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionUp,
+        label: "Shift+Up",
+    },
+    CommandBinding {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionDown,
+        label: "Shift+Down",
+    },
+    CommandBinding {
+        code: KeyCode::Home,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionLineStart,
+        label: "Shift+Home",
+    },
+    CommandBinding {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::SHIFT,
+        command: CommandId::ExtendSelectionLineEnd,
+        label: "Shift+End",
+    },
+    CommandBinding {
         code: KeyCode::Enter,
         modifiers: KeyModifiers::NONE,
         command: CommandId::SubmitSteer,

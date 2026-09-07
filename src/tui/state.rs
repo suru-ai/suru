@@ -36,7 +36,7 @@ use crate::{
 use super::{
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
-    composer::{ComposerKey, ComposerMemory},
+    composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::ConnectOverlay,
     keymap::{
         command_for_completion_event, command_for_connect_overlay_event,
@@ -2525,6 +2525,12 @@ pub enum CommandId {
     MoveCursorRight,
     MoveCursorLineStart,
     MoveCursorLineEnd,
+    ExtendSelectionLeft,
+    ExtendSelectionRight,
+    ExtendSelectionUp,
+    ExtendSelectionDown,
+    ExtendSelectionLineStart,
+    ExtendSelectionLineEnd,
     HistoryPrevious,
     HistoryNext,
     ScrollTranscriptPageUp,
@@ -3346,6 +3352,12 @@ impl Application {
             | CommandId::MoveCursorRight
             | CommandId::MoveCursorLineStart
             | CommandId::MoveCursorLineEnd
+            | CommandId::ExtendSelectionLeft
+            | CommandId::ExtendSelectionRight
+            | CommandId::ExtendSelectionUp
+            | CommandId::ExtendSelectionDown
+            | CommandId::ExtendSelectionLineStart
+            | CommandId::ExtendSelectionLineEnd
             | CommandId::HistoryPrevious
             | CommandId::HistoryNext) => Ok(self.handle_composer_command(command)),
             command @ (CommandId::ScrollTranscriptPageUp
@@ -3596,6 +3608,25 @@ impl Application {
             CommandId::DeleteForward => self
                 .state
                 .edit_composer(|composers, key| composers.delete_forward(key)),
+            command @ (CommandId::ExtendSelectionLeft
+            | CommandId::ExtendSelectionRight
+            | CommandId::ExtendSelectionUp
+            | CommandId::ExtendSelectionDown
+            | CommandId::ExtendSelectionLineStart
+            | CommandId::ExtendSelectionLineEnd) => {
+                let motion = match command {
+                    CommandId::ExtendSelectionLeft => SelectionMotion::Left,
+                    CommandId::ExtendSelectionRight => SelectionMotion::Right,
+                    CommandId::ExtendSelectionUp => SelectionMotion::Up,
+                    CommandId::ExtendSelectionDown => SelectionMotion::Down,
+                    CommandId::ExtendSelectionLineStart => SelectionMotion::LineStart,
+                    CommandId::ExtendSelectionLineEnd => SelectionMotion::LineEnd,
+                    _ => unreachable!(),
+                };
+                self.state.text_selection.set(None);
+                self.state
+                    .navigate_composer(|composers, key| composers.extend_selection(key, motion));
+            }
             CommandId::MoveCursorLeft => self
                 .state
                 .navigate_composer(|composers, key| composers.move_left(key)),
@@ -3617,6 +3648,7 @@ impl Application {
             // does nothing. With nothing to browse the open ask leaves the
             // view put, so the key stays as inert as it was.
             CommandId::HistoryNext => {
+                self.state.composers.clear_selections();
                 if self.state.composer_down_is_inert() {
                     self.state.open_subagent_picker();
                 } else {

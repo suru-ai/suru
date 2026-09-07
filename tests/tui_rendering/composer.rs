@@ -2459,3 +2459,327 @@ fn deleting_half_a_bound_skill_drops_its_binding_and_rebases_the_following_skill
     assert_eq!(request.prompt.skill_invocations[0].marker.start, 4);
     assert_eq!(request.prompt.skill_invocations[0].marker.end, 11);
 }
+
+#[test]
+fn keyboard_selection_bindings_belong_only_to_the_composer() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    crate::support::deliver_settings(&mut application, settings);
+    type_terminal_text(&mut application, "draft");
+    let bindings = [
+        (KeyCode::Left, CommandId::ExtendSelectionLeft),
+        (KeyCode::Right, CommandId::ExtendSelectionRight),
+        (KeyCode::Up, CommandId::ExtendSelectionUp),
+        (KeyCode::Down, CommandId::ExtendSelectionDown),
+        (KeyCode::Home, CommandId::ExtendSelectionLineStart),
+        (KeyCode::End, CommandId::ExtendSelectionLineEnd),
+    ];
+    for (key, command) in &bindings {
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                *key,
+                KeyModifiers::SHIFT
+            ))),
+            Some(command.clone()),
+        );
+    }
+    composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::SHIFT);
+    assert_composer_mark(&application, 140, "draft", true);
+    composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    for (key, command) in &bindings {
+        assert_ne!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                *key,
+                KeyModifiers::SHIFT
+            ))),
+            Some(command.clone()),
+        );
+        composer_selection_key(&mut application, *key, KeyModifiers::SHIFT);
+    }
+    composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+    assert_composer_mark(&application, 140, "draft", true);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ThemeList,
+        )))
+        .unwrap();
+    for (key, command) in &bindings {
+        assert_ne!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                *key,
+                KeyModifiers::SHIFT
+            ))),
+            Some(command.clone()),
+        );
+        composer_selection_key(&mut application, *key, KeyModifiers::SHIFT);
+    }
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseThemePicker))
+        .unwrap();
+    assert_composer_mark(&application, 140, "draft", true);
+}
+
+#[test]
+fn keyboard_selection_keeps_anchor_when_focus_crosses_unicode_characters() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "a界🙂z");
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "a界");
+    for (key, column, selected) in [
+        (KeyCode::Left, 1, Some((1, 3))),
+        (KeyCode::Right, 3, None),
+        (KeyCode::Right, 5, Some((3, 5))),
+        (KeyCode::Left, 3, None),
+        (KeyCode::Left, 1, Some((1, 3))),
+    ] {
+        composer_selection_key(&mut application, key, KeyModifiers::SHIFT);
+        assert_eq!(
+            rendered_application_cursor_at(&application, 100, 32),
+            Position::new(start.0 + column, start.1)
+        );
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        // Wide glyph continuation cells are normalized by the terminal backend.
+        for column in [0, 1, 3, 5] {
+            assert_eq!(
+                buffer[(start.0 + column, start.1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+                selected.is_some_and(|(from, to)| (from..to).contains(&column)),
+            );
+        }
+    }
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("界".into()),
+    );
+    assert_eq!(
+        rendered_application_cursor_at(&application, 100, 32),
+        Position::new(start.0 + 1, start.1)
+    );
+    assert_eq!(rendered_application_buffer(&application, 100, 32), buffer);
+}
+
+#[test]
+fn keyboard_selection_extends_by_written_lines_and_to_draft_edges_without_history() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "old history");
+    let ApplicationTransition::CreateSession(created) =
+        composer_selection_key(&mut application, KeyCode::Enter, KeyModifiers::NONE)
+    else {
+        panic!("first Prompt creates a Session");
+    };
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            failed_session_snapshot(
+                SessionId::new(),
+                created.prompt.id,
+                &created.prompt.text,
+                workspace.path(),
+            ),
+        )))
+        .unwrap();
+    // Prove history is populated, then leave its walk before drafting.
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    let cursor = rendered_application_cursor_at(&application, 100, 32);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let row: String = (cursor.x - 11..cursor.x)
+        .map(|x| buffer[(x, cursor.y)].symbol())
+        .collect();
+    assert_eq!(row, "old history");
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    application
+        .handle_terminal_event(InputEvent::Paste("alpha\nbravo\ncharlie".into()))
+        .unwrap();
+    composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let original = rendered_application_buffer(&application, 100, 32);
+    let first = text_position(&original, "alpha");
+    let last = text_position(&original, "charlie");
+    for (selected, focus) in [
+        (["", "avo", "ch"], Position::new(first.0 + 2, first.1 + 1)),
+        (["pha", "bravo", "ch"], Position::new(first.0 + 2, first.1)),
+        (["alpha", "bravo", "ch"], Position::new(first.0, first.1)),
+    ] {
+        composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+        for text in selected.into_iter().filter(|text| !text.is_empty()) {
+            assert_composer_mark(&application, 100, text, true);
+        }
+        assert_composer_mark(&application, 100, "arlie", false);
+    }
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("alpha\nbravo\nch".into()),
+    );
+    for _ in 0..4 {
+        composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::SHIFT);
+    }
+    assert_composer_mark(&application, 100, "alpha", true);
+    assert_composer_mark(&application, 100, "bravo", true);
+    assert_composer_mark(&application, 100, "charlie", true);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 100, 32),
+        Position::new(last.0 + 7, last.1)
+    );
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("alpha\nbravo\ncharlie".into()),
+    );
+    assert_eq!(rendered_application_buffer(&application, 100, 32), original);
+}
+
+#[test]
+fn keyboard_selection_line_edges_and_plain_motion_collapse_or_clear_from_focus() {
+    for (key, column, line) in [
+        (KeyCode::Left, 1, 1),
+        (KeyCode::Right, 3, 1),
+        (KeyCode::Up, 3, 0),
+        (KeyCode::Down, 3, 2),
+        (KeyCode::Home, 0, 1),
+        (KeyCode::End, 5, 1),
+    ] {
+        let workspace = workspace_dir();
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_terminal_event(InputEvent::Paste("alpha\nbravo\ncharm".into()))
+            .unwrap();
+        composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+        composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::NONE);
+        composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::NONE);
+        composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::SHIFT);
+        composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_composer_mark(&application, 100, "ra", true);
+        composer_selection_key(&mut application, key, KeyModifiers::NONE);
+        assert_composer_mark(&application, 100, "bravo", false);
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        let start = text_position(&buffer, "alpha");
+        assert_eq!(
+            rendered_application_cursor_at(&application, 100, 32),
+            Position::new(start.0 + column, start.1 + line)
+        );
+    }
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_terminal_event(InputEvent::Paste("alpha\nbravo\ncharm".into()))
+        .unwrap();
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::SHIFT);
+    assert_composer_mark(&application, 100, "bravo", true);
+    assert_composer_mark(&application, 100, "alpha", false);
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::End, KeyModifiers::SHIFT);
+    assert_composer_mark(&application, 100, "bravo", true);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("bravo".into()),
+    );
+}
+
+#[test]
+fn keyboard_selection_takes_transcript_mark_but_typing_leaves_it() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "draft");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let transcript = text_position(&buffer, "Initial Prompt");
+    super::selection::drag(
+        &mut application,
+        transcript,
+        (transcript.0 + 6, transcript.1),
+    );
+    type_terminal_text(&mut application, "z");
+    assert_composer_mark(&application, 100, "Initial", true);
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::SHIFT);
+    assert_composer_mark(&application, 100, "Initial", false);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("z".into()),
+    );
+}
+
+#[test]
+fn keyboard_selection_continues_mouse_anchor_and_escapes_before_completion_popup() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "abcdef");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "abcdef");
+    super::selection::drag(
+        &mut application,
+        (start.0 + 1, start.1),
+        (start.0 + 2, start.1),
+    );
+    composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::SHIFT);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("bcd".into()),
+    );
+    let (_workspace, mut application) = application_with_skills(
+        vec![SkillDescriptor {
+            id: SkillId::new("review-id"),
+            name: "review".to_owned(),
+            description: "Review changes".to_owned(),
+            scope: None,
+        }],
+        None,
+    );
+    type_terminal_text(&mut application, "$rev");
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("$re".into()),
+    );
+    composer_selection_key(&mut application, KeyCode::End, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::SHIFT);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let focus = rendered_application_cursor_at(&application, 100, 32);
+    assert!(
+        buffer[(focus.x - 1, focus.y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    composer_selection_key(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    assert!(
+        !buffer[(focus.x - 1, focus.y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    composer_selection_key(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+}

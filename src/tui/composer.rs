@@ -21,6 +21,16 @@ pub(super) enum ComposerKey {
     Session(SessionReference),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SelectionMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComposerMemory {
     composers: HashMap<ComposerKey, ComposerState>,
@@ -272,29 +282,67 @@ impl ComposerMemory {
     }
 
     pub(super) fn move_left(&mut self, key: ComposerKey) {
-        self.composer_mut(key).move_left();
+        let range = self.selection_range(key.clone());
+        let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
+        if let Some(range) = range {
+            composer.cursor = range.start;
+        } else {
+            composer.move_left();
+        }
     }
 
     pub(super) fn move_right(&mut self, key: ComposerKey) {
-        self.composer_mut(key).move_right();
+        let range = self.selection_range(key.clone());
+        let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
+        if let Some(range) = range {
+            composer.cursor = range.end;
+        } else {
+            composer.move_right();
+        }
     }
 
     pub(super) fn move_line_start(&mut self, key: ComposerKey) {
         let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
         composer.cursor = composer.line_start();
     }
 
     pub(super) fn move_line_end(&mut self, key: ComposerKey) {
         let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
         composer.cursor = composer.line_end();
     }
 
+    /// Extending uses written Lines and never enters the history walk.
+    pub(super) fn extend_selection(&mut self, key: ComposerKey, motion: SelectionMotion) {
+        let composer = self.composer_mut(key);
+        composer.selection_anchor.get_or_insert(composer.cursor);
+        match motion {
+            SelectionMotion::Left => composer.move_left(),
+            SelectionMotion::Right => composer.move_right(),
+            SelectionMotion::Up if composer.line_start() == 0 => composer.cursor = 0,
+            SelectionMotion::Up => composer.move_up(),
+            SelectionMotion::Down if composer.line_end() == composer.text.len() => {
+                composer.cursor = composer.text.len();
+            }
+            SelectionMotion::Down => composer.move_down(),
+            SelectionMotion::LineStart => composer.cursor = composer.line_start(),
+            SelectionMotion::LineEnd => composer.cursor = composer.line_end(),
+        }
+    }
+
     pub(super) fn history_previous(&mut self, key: ComposerKey) {
-        self.composer_mut(key).history_previous();
+        let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
+        composer.history_previous();
     }
 
     pub(super) fn history_next(&mut self, key: ComposerKey) {
-        self.composer_mut(key).history_next();
+        let composer = self.composer_mut(key);
+        composer.selection_anchor = None;
+        composer.history_next();
     }
 
     /// Whether Down would do nothing in this composer: the caret already rests
