@@ -32,7 +32,7 @@ fn session_with_width(
 fn composer_columns(rows: &[String]) -> (usize, usize) {
     let border = rows
         .iter()
-        .find(|row| row.contains('┌') && row.contains(" Prompt "))
+        .find(|row| row.contains('┌'))
         .expect("Session composer border is visible");
     (
         border
@@ -51,7 +51,7 @@ fn composer_columns(rows: &[String]) -> (usize, usize) {
 fn composer_height(rows: &[String]) -> usize {
     let top = rows
         .iter()
-        .position(|row| row.contains('┌') && row.contains(" Prompt "))
+        .position(|row| row.contains('┌'))
         .expect("composer has a top border");
     let bottom = rows
         .iter()
@@ -270,7 +270,7 @@ fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
         "Pending ·",
         "Latest ↓",
         "Queued inside the column",
-        " Prompt ",
+        "┌",
         "Agent unavailable",
     ] {
         let (left, right) = occupied_columns(row_containing(&rows, surface));

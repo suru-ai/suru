@@ -1315,7 +1315,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(shown.contains("Type a Prompt and press Enter"));
+        assert!(shown.contains("Type a prompt, run a /command, use a $skill"));
     }
 
     #[tokio::test]

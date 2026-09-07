@@ -3616,13 +3616,12 @@ fn render_composer(
         cursor,
         skill_markers,
     } = content;
-    let submit = binding_label(&CommandId::SubmitSteer);
     let queue = binding_label(&CommandId::SubmitQueue);
     let newline = binding_label(&CommandId::InsertNewline);
     let title = if detail.shows_secondary() {
-        format!(" Prompt · {submit} submit · {queue} queue · {newline} newline ")
+        format!(" {queue} queue · {newline} newline ")
     } else {
-        " Prompt ".to_owned()
+        String::new()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3642,7 +3641,7 @@ fn render_composer(
     memory.record_frame(key, content_area, scroll);
     let paragraph = if text.is_empty() {
         Paragraph::new(Span::styled(
-            "Type a Prompt and press Enter",
+            "Type a prompt, run a /command, use a $skill",
             theme.form_field.placeholder,
         ))
     } else {

@@ -99,7 +99,8 @@ fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
     let (session_id, snapshot, turn_id) = enter_active_session(&mut application, workspace.path());
-    let without_usage = rendered_application_rows(&application).join("\n");
+    let rows = rendered_application_rows(&application);
+    let without_usage = rows.last().expect("Session footer is rendered");
     assert!(!without_usage.contains("tokens"));
     assert!(!without_usage.contains('$'));
 
@@ -197,7 +198,10 @@ fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
 fn composer_cursor_tracks_empty_unicode_and_multiline_input() {
     let mut application = Application::default();
     let empty = rendered_application_buffer(&application, 80, 15);
-    let placeholder = text_position(&empty, "Type a Prompt and press Enter");
+    let placeholder = text_position(&empty, "Type a prompt, run a /command, use a $skill");
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(!screen.contains(" Prompt "));
+    assert!(!screen.contains("Enter submit"));
     assert_eq!(
         rendered_application_cursor_at(&application, 80, 15),
         Position::new(placeholder.0, placeholder.1)
@@ -1276,7 +1280,7 @@ fn semantic_bindings_preserve_multiline_unicode_input_and_clear_before_exit() {
     assert!(screen.contains("x"));
     assert!(screen.contains("yβ"));
     assert!(!screen.contains('🙂'));
-    assert!(screen.contains("Enter submit"));
+    assert!(!screen.contains("Enter submit"));
     assert!(screen.contains("Shift+Enter newline"));
 
     assert_eq!(
@@ -1309,7 +1313,7 @@ fn semantic_bindings_preserve_multiline_unicode_input_and_clear_before_exit() {
     assert!(
         rendered_application_rows(&application)
             .join("\n")
-            .contains("Type a Prompt")
+            .contains("Type a prompt")
     );
     assert_eq!(
         application
@@ -1516,7 +1520,7 @@ impl PromptBlock {
 fn prompt_block(rows: &[String]) -> PromptBlock {
     let top = rows
         .iter()
-        .position(|row| row.contains('┌') && row.contains("Prompt"))
+        .position(|row| row.contains('┌'))
         .expect("Prompt block top border is rendered");
     let left = rows[top]
         .chars()

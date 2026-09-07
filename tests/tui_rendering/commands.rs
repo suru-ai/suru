@@ -34,7 +34,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
     );
     let landing = rendered_application_rows(&application).join("\n");
     assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(landing.contains("Type a prompt"));
     assert!(!landing.contains("Long-running work"));
     assert!(!landing.contains("/new"));
 }
@@ -512,7 +512,7 @@ fn autocomplete_navigation_and_tab_invoke_the_canonical_alias_target() {
         ApplicationTransition::DetachSession
     );
     let landing = rendered_application_rows(&application).join("\n");
-    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(landing.contains("Type a prompt"));
     assert!(!landing.contains("/clear"));
 }
 

@@ -80,7 +80,7 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
 
     let screen = rendered_application_rows(&application).join("\n");
     assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(screen.contains("Prompt"));
+    assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
@@ -205,7 +205,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     }
     let landing = rendered_application_rows(&application).join("\n");
     assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(landing.contains("Prompt"));
+    assert!(landing.contains("Type a prompt"));
 
     for character in "Explain this workspace".chars() {
         let command = command_for_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -373,7 +373,7 @@ fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
     let screen = rendered_state_rows(&Application::default()).join("\n");
 
     assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(screen.contains("Type a Prompt and press Enter"));
+    assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connecting to Suru server..."));
 }
 
@@ -385,7 +385,7 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
 
     let screen = rendered_state_rows(&state).join("\n");
     assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(screen.contains("Prompt"));
+    assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
@@ -445,7 +445,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
         "Agent unavailable",
         "Workspace",
         "Connected",
-        "Enter submit",
+        "Alt+Enter queue",
     ] {
         assert!(
             wide.contains(content),
@@ -480,7 +480,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
     let too_small = rendered_application_rows_at(&application, 24, 4).join("\n");
     assert!(too_small.contains("Terminal too small"));
     assert!(!too_small.contains("Keep the composer usable"));
-    assert!(!too_small.contains("Prompt"));
+    assert!(!too_small.contains("Type a prompt"));
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
         "Working (",
         "Esc to interrupt",
         "openai · gpt-5",
-        "Enter submit",
+        "Alt+Enter queue",
     ] {
         assert!(
             wide.contains(content),

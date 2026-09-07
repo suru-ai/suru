@@ -56,7 +56,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         .expect("ignore a queued event from the detached Session");
     let landing = rendered_application_rows(&application).join("\n");
     assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
-    assert!(landing.contains("Type a Prompt and press Enter"));
+    assert!(landing.contains("Type a prompt"));
     assert!(!landing.contains("discard this draft"));
     assert!(!landing.contains("Long-running work"));
 
@@ -161,7 +161,7 @@ fn provisional_steer_is_immediate_single_and_reconciles_in_place() {
     let prompt_id = request.prompt.id;
     let provisional = rendered_application_rows(&application).join("\n");
     assert_eq!(provisional.matches("Use the smaller interface").count(), 1);
-    assert!(provisional.contains("Type a Prompt"));
+    assert!(provisional.contains("Type a prompt"));
 
     assert_eq!(
         application
@@ -636,7 +636,7 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
             .count(),
         1
     );
-    assert!(reconciled.contains("Type a Prompt"));
+    assert!(reconciled.contains("Type a prompt"));
     assert!(!reconciled.contains("response connection closed"));
 }
 

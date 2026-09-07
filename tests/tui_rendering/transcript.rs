@@ -6578,7 +6578,7 @@ fn the_transcript_keeps_a_row_of_air_above_the_composer() {
 
     let rows = rendered_application_rows_at(&application, 80, 15);
 
-    let composer_top = rendered_row(&rows, "Prompt ·");
+    let composer_top = rendered_row(&rows, "┌");
     let gap = composer_top
         .checked_sub(1)
         .expect("the composer is not the first row");
@@ -8182,7 +8182,7 @@ fn second_press_two_cells_away_after_the_interval_or_on_another_surface_starts_o
     let (mut application, clock) = word_click_application("Alpha bravo charlie");
     let buffer = rendered_application_buffer(&application, 60, 24);
     let bravo = text_position(&buffer, "bravo");
-    let composer = text_position(&buffer, "Type a Prompt");
+    let composer = text_position(&buffer, "Type a prompt");
     click_at(&mut application, bravo);
     clock.fetch_add(100, Ordering::Relaxed);
     let released = click_at(&mut application, (bravo.0 + 2, bravo.1));

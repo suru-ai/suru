@@ -1169,8 +1169,7 @@ fn opening_the_sidebar_takes_the_keys_from_the_composer() {
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
-        rows.iter()
-            .any(|row| row.contains("Type a Prompt and press Enter")),
+        rows.iter().any(|row| row.contains("Type a prompt")),
         "the Sidebar the reader opened has the keys, so nothing reaches the composer: {rows:?}"
     );
     assert!(
@@ -1757,8 +1756,7 @@ fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
         "and narrows the list as typing it would have: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .any(|row| row.contains("Type a Prompt and press Enter")),
+        rows.iter().any(|row| row.contains("Type a prompt")),
         "nothing of it reaches a composer that does not have the keys: {rows:?}"
     );
 }

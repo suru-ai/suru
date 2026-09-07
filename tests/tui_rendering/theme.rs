@@ -384,9 +384,7 @@ fn moving_and_filtering_preview_the_top_match_without_leaving_the_client() {
     assert_eq!(aura.cell((99, 0)).unwrap().bg, Color::Rgb(15, 15, 15));
     assert_eq!(aura.cell((0, 0)).unwrap().bg, Color::Rgb(21, 20, 27));
     assert_eq!(
-        aura.cell(text_position(&aura, "Type a Prompt and press Enter"))
-            .unwrap()
-            .bg,
+        aura.cell(text_position(&aura, "Type a prompt")).unwrap().bg,
         Color::Rgb(15, 15, 15),
         "the composer repaints with the preview"
     );
@@ -635,7 +633,7 @@ fn a_snapshot_repaints_an_open_view_and_its_overlay_in_the_named_theme() {
     );
     assert_eq!(
         session
-            .cell(text_position(&session, "Type a Prompt and press Enter"))
+            .cell(text_position(&session, "Type a prompt"))
             .unwrap()
             .bg,
         Color::Rgb(30, 30, 46),
@@ -867,7 +865,7 @@ fn system_theme_uses_a_locked_light_ramp_against_a_dark_terminal_background() {
         themed_in_mode("system", AppearanceMode::Light),
     );
     let buffer = rendered_application_buffer(&application, 100, 20);
-    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let placeholder = text_position(&buffer, "Type a prompt");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(37, 37, 37));
@@ -886,7 +884,7 @@ fn system_paints_light_terminal_surfaces_borders_and_muted_text_light() {
         TerminalColor::new(34, 34, 34),
     );
     let buffer = rendered_application_buffer(&application, 100, 20);
-    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let placeholder = text_position(&buffer, "Type a prompt");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(238, 238, 238));
@@ -905,7 +903,7 @@ fn system_paints_dark_terminal_surfaces_borders_and_muted_text_dark() {
         TerminalColor::new(238, 238, 238),
     );
     let buffer = rendered_application_buffer(&application, 100, 20);
-    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let placeholder = text_position(&buffer, "Type a prompt");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(17, 17, 17));
@@ -926,7 +924,7 @@ fn an_unprobed_system_leaves_panel_backgrounds_to_the_terminal() {
     let mut application = connected_application(workspace.path());
     deliver_settings(&mut application, EffectiveSettings::default());
     let buffer = rendered_application_buffer(&application, 100, 20);
-    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let placeholder = text_position(&buffer, "Type a prompt");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Reset);
@@ -951,7 +949,7 @@ fn system_leaves_panel_backgrounds_to_the_terminal_until_background_is_observed(
     let mut application = connected_application_with_terminal_facts(workspace.path(), facts);
     deliver_settings(&mut application, EffectiveSettings::default());
     let buffer = rendered_application_buffer(&application, 100, 20);
-    let placeholder = text_position(&buffer, "Type a Prompt and press Enter");
+    let placeholder = text_position(&buffer, "Type a prompt");
     let composer_corner = (placeholder.0 - 2, placeholder.1 - 1);
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Reset);
