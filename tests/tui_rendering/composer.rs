@@ -1889,7 +1889,7 @@ fn composer_selection_highlights_typed_text_and_not_the_padding_past_it() {
 }
 
 #[test]
-fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
+fn composer_selection_copies_unwrapped_text_on_release_then_replaces_the_draft() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
@@ -1936,25 +1936,20 @@ fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
     assert_eq!(rendered_application_cursor_at(&application, 50, 24), cursor);
     type_terminal_text(&mut application, "!");
     assert!(
-        rendered_application_buffer(&application, 50, 24)[start]
+        !rendered_application_buffer(&application, 50, 24)[start]
             .modifier
             .contains(ratatui::style::Modifier::REVERSED)
     );
-    assert!(
-        rendered_application_rows_at(&application, 50, 24)
-            .join("\n")
-            .contains("lima!")
-    );
-    application
+    let ApplicationTransition::CreateSession(request) = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-            KeyCode::Backspace,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         )))
-        .unwrap();
-    assert_eq!(
-        buffer_rows(&rendered_application_buffer(&application, 50, 24)),
-        buffer_rows(&buffer)
-    );
+        .unwrap()
+    else {
+        panic!("submit the replacement");
+    };
+    assert_eq!(request.prompt.text, "!");
 }
 
 #[test]
@@ -2268,4 +2263,199 @@ fn composer_selection_copies_after_a_resize_hides_the_composer() {
         .handle_terminal_event(InputEvent::Resize(100, 32))
         .unwrap();
     assert_composer_mark(&application, 100, "marked", false);
+}
+
+fn drag_composer_text(application: &mut Application, text: &str, start: u16, end: u16) {
+    let buffer = rendered_application_buffer(application, 80, 30);
+    let (x, y) = text_position(&buffer, text);
+    for (kind, offset) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), end),
+        (MouseEventKind::Up(MouseButton::Left), end),
+    ] {
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column: x + offset,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    assert!(
+        rendered_application_buffer(application, 80, 30)[(x + start.min(end), y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn composer_selection_edits_replace_the_dragged_characters_and_position_the_cursor() {
+    for (event, replacement) in [
+        (
+            InputEvent::Key(KeyEvent::new(KeyCode::Char('β'), KeyModifiers::NONE)),
+            "β",
+        ),
+        (InputEvent::Paste("pasted🙂".to_owned()), "pasted🙂"),
+        (
+            InputEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            "\n",
+        ),
+        (
+            InputEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            "\n",
+        ),
+        (
+            InputEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            "",
+        ),
+        (
+            InputEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            "",
+        ),
+    ] {
+        for (start, end) in [(2, 4), (4, 2)] {
+            let workspace = workspace_dir();
+            let mut application = connected_application(workspace.path());
+            application
+                .handle_terminal_event(InputEvent::Paste("a bravo z".to_owned()))
+                .unwrap();
+            drag_composer_text(&mut application, "a bravo z", start, end);
+            application.handle_terminal_event(event.clone()).unwrap();
+            let buffer = rendered_application_buffer(&application, 80, 30);
+            let block = prompt_block(&buffer_rows(&buffer));
+            for y in block.top as u16 + 1..buffer.area.bottom() {
+                for x in block.left + 1..block.right {
+                    assert!(
+                        !buffer[(x, y)]
+                            .modifier
+                            .contains(ratatui::style::Modifier::REVERSED)
+                    );
+                }
+            }
+            let (cursor_x, cursor_y) = text_position(&buffer, "vo z");
+            assert_eq!(
+                rendered_application_cursor_at(&application, 80, 30),
+                Position::new(cursor_x, cursor_y),
+                "{event:?} leaves the cursor at the end of its replacement"
+            );
+            // The next character exposes where the edit left the cursor.
+            type_terminal_text(&mut application, "!");
+            let ApplicationTransition::CreateSession(request) = application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap()
+            else {
+                panic!("submit the edited draft");
+            };
+            assert_eq!(
+                request.prompt.text,
+                format!("a {replacement}!vo z"),
+                "{event:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enter_with_a_composer_selection_submits_the_whole_draft() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "alpha bravo charlie");
+    drag_composer_text(&mut application, "alpha bravo charlie", 6, 10);
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("submit the whole draft");
+    };
+    assert_eq!(request.prompt.text, "alpha bravo charlie");
+}
+
+#[test]
+fn typing_a_skill_trigger_over_a_selection_resyncs_completion_and_accepting_clears_it() {
+    let skill = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut application) = application_with_skills(vec![skill.clone()], None);
+    type_terminal_text(&mut application, "old");
+    drag_composer_text(&mut application, "old", 0, 2);
+    type_terminal_text(&mut application, "$");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    // Establish a standing selection while the popup is open, then accept it.
+    type_terminal_text(&mut application, "rev");
+    drag_composer_text(&mut application, "$rev", 1, 2);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let (x, y) = text_position(&buffer, "$review");
+    for column in x..x + 7 {
+        assert!(
+            !buffer[(column, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("submit completed skill");
+    };
+    assert_eq!(request.prompt.text, "$review ");
+    assert_eq!(request.prompt.skill_invocations[0].skill_id, skill.id);
+}
+
+#[test]
+fn deleting_half_a_bound_skill_drops_its_binding_and_rebases_the_following_skill() {
+    let skill = SkillDescriptor {
+        id: SkillId::new("review-id"),
+        name: "review".to_owned(),
+        description: "Review guidance".to_owned(),
+        scope: None,
+    };
+    let (_workspace, mut application) = application_with_skills(vec![skill.clone()], None);
+    application
+        .handle_terminal_event(InputEvent::Paste("$review $review".to_owned()))
+        .unwrap();
+    drag_composer_text(&mut application, "$review $review", 0, 3);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("submit the remaining ordinary text and Skill");
+    };
+    assert_eq!(request.prompt.text, "iew $review");
+    assert_eq!(request.prompt.skill_invocations.len(), 1);
+    assert_eq!(request.prompt.skill_invocations[0].skill_id, skill.id);
+    assert_eq!(request.prompt.skill_invocations[0].marker.start, 4);
+    assert_eq!(request.prompt.skill_invocations[0].marker.end, 11);
 }

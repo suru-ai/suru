@@ -106,9 +106,7 @@ impl ComposerMemory {
     /// Selection offsets belong to this draft; its cursor is the focus.
     pub(super) fn selection_range(&self, key: ComposerKey) -> Option<Range<usize>> {
         let composer = self.composers.get(&key)?;
-        let anchor = composer.selection_anchor?;
-        let range = anchor.min(composer.cursor)..anchor.max(composer.cursor);
-        (!range.is_empty() && composer.text.get(range.clone()).is_some()).then_some(range)
+        composer.selected_range()
     }
 
     pub(super) fn select(&mut self, key: ComposerKey, anchor: usize, focus: usize) {
@@ -501,12 +499,15 @@ impl ComposerState {
         self.skill_issues.sort_by_key(|issue| issue.marker.start);
     }
 
+    fn selected_range(&self) -> Option<Range<usize>> {
+        let anchor = self.selection_anchor?;
+        let range = anchor.min(self.cursor)..anchor.max(self.cursor);
+        (!range.is_empty() && self.text.get(range.clone()).is_some()).then_some(range)
+    }
+
     fn insert(&mut self, text: &str) {
-        self.leave_history_navigation();
-        self.rebase_invocations(self.cursor..self.cursor, text.len());
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
-        self.invalidate_retry_after_edit();
+        let range = self.selected_range().unwrap_or(self.cursor..self.cursor);
+        self.replace(range, text);
     }
 
     fn replace(&mut self, range: Range<usize>, replacement: &str) -> bool {
@@ -522,12 +523,7 @@ impl ComposerState {
         let cursor = range.start + replacement.len();
         self.text.replace_range(range, replacement);
         self.cursor = cursor;
-        if self
-            .selection_anchor
-            .is_some_and(|anchor| !self.text.is_char_boundary(anchor))
-        {
-            self.selection_anchor = None;
-        }
+        self.selection_anchor = None;
         self.invalidate_retry_after_edit();
         true
     }
@@ -557,6 +553,10 @@ impl ComposerState {
     }
 
     fn delete_backward(&mut self) {
+        if let Some(range) = self.selected_range() {
+            self.replace(range, "");
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -572,6 +572,10 @@ impl ComposerState {
     }
 
     fn delete_forward(&mut self) {
+        if let Some(range) = self.selected_range() {
+            self.replace(range, "");
+            return;
+        }
         if self.cursor == self.text.len() {
             return;
         }
