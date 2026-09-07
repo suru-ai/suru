@@ -299,7 +299,8 @@ impl SecretRedactor {
             | Event::SkillsChanged
             | Event::AgentMessageStarted { .. }
             | Event::ReasoningStarted { .. }
-            | Event::TokenUsage { .. } => {}
+            | Event::TokenUsage { .. }
+            | Event::TurnStarted { .. } => {}
         }
         prefix.push(event);
         prefix

@@ -212,11 +212,8 @@ impl SessionStore {
                 state.commit(&self.storage, session_id, salvaged)?;
                 return Ok(None);
             }
-            // A settling Continuation sweeps no steers across its boundary: a
-            // Steer Prompt pending while one ran was admitted to begin a Turn
-            // of its own — Continuations are settled by the next delivered
-            // Prompt, never steered — and folding it into this settle would
-            // swallow the Turn it is owed.
+            // A Continuation's pending Prompts owe their own Turns. Keep
+            // those admissions out of later prompted Turns' steer sweeps too.
             let settling_continuation = record
                 .snapshot
                 .turns
@@ -230,6 +227,7 @@ impl SessionStore {
                     !settling_continuation
                         && prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
+                        && !record.pending_turn_starts.contains(&prompt.id)
                 })
                 .cloned()
                 .collect::<Vec<_>>();

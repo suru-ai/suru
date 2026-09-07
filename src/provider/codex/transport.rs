@@ -34,7 +34,7 @@ use super::{
         NativeCodexErrorInfo, NativeItem, NativeNotification, NativeTurnFailureKind,
         NativeTurnOutcome, NativeTurnStatus, ReasoningSectionBreakParams,
         ReasoningSummaryDeltaParams, RequestId, ThreadSettingsUpdatedParams,
-        ThreadTokenUsageParams, TurnCompletedParams,
+        ThreadTokenUsageParams, TurnCompletedParams, TurnStartedParams,
     },
 };
 use crate::provider::{
@@ -658,6 +658,13 @@ fn decode_notification(
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
                 total: params.token_usage.into_cumulative(),
+            }))
+        }
+        "turn/started" => {
+            let params: TurnStartedParams = decode_notification_params(method, params)?;
+            Ok(Some(NativeNotification::TurnStarted {
+                thread_id: params.thread_id,
+                turn_id: params.turn.id,
             }))
         }
         "turn/completed" => {

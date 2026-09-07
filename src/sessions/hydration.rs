@@ -245,6 +245,7 @@ pub(super) fn restored_record(
         updates,
         next_prompt_order,
         steer_targets: Default::default(),
+        pending_turn_starts: Default::default(),
         selection_operations: Default::default(),
         viewed_operations: Default::default(),
         selection_retry_prompt: None,

@@ -477,6 +477,11 @@ pub enum ProviderSubagentStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    /// The Provider began a new native Turn without a Prompt. Unlike late
+    /// output alone, this Turn has its own interrupt and terminal boundary.
+    ContinuationStarted {
+        selection: AgentSelection,
+    },
     QuestionnaireRequested {
         questionnaire: crate::protocol::Questionnaire,
     },

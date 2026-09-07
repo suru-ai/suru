@@ -86,6 +86,9 @@ struct SessionRecord {
     updates: broadcast::Sender<SessionUpdate>,
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
+    /// Admissions owed their own Turn, even if their command reaches the actor
+    /// after the Continuation they were admitted during has settled.
+    pending_turn_starts: HashSet<PromptId>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
     viewed_operations: HashSet<ViewSessionOperationId>,
     selection_retry_prompt: Option<PromptId>,

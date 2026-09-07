@@ -3,7 +3,7 @@ mod questionnaires;
 use questionnaires::{LiveQuestionnaires, QuestionnaireDeliveries};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -204,14 +204,21 @@ struct ProviderSessionContext {
     updates: ProviderUpdateGate,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContinuationExecution {
+    LateOutput,
+    ProviderTurn,
+}
+
 struct ActiveProviderTurn {
     turn_id: TurnId,
     questionnaires: LiveQuestionnaires,
     /// Whether this Turn is a Continuation — the one kind of Turn no Prompt
     /// began, opened by this actor for output that arrived after the previous
     /// Turn settled. The next delivered Prompt settles it rather than
-    /// steering it, which is the one place the flag is consulted.
-    continuation: bool,
+    /// steering it. A Provider-owned Continuation must first interrupt its
+    /// native Turn; late output alone has no Provider Turn to interrupt.
+    continuation: Option<ContinuationExecution>,
     streaming_message: Option<ActiveProviderMessage>,
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
@@ -251,7 +258,7 @@ impl ActiveProviderTurn {
         Self {
             turn_id,
             questionnaires: LiveQuestionnaires::default(),
-            continuation: false,
+            continuation: None,
             streaming_message: None,
             interruption_acknowledged: false,
             command_activities: HashMap::new(),
@@ -262,7 +269,7 @@ impl ActiveProviderTurn {
 
     fn new_continuation(turn_id: TurnId) -> Self {
         Self {
-            continuation: true,
+            continuation: Some(ContinuationExecution::LateOutput),
             ..Self::new(turn_id)
         }
     }
@@ -1015,6 +1022,7 @@ async fn run_provider_session(
     let mut subagents = SubagentRoutes::default();
     let mut deliveries = QuestionnaireDeliveries::default();
     let mut deferred_prompt_id = None;
+    let mut pending_turn_starts = VecDeque::new();
     let provider_id = runtime.provider_id();
 
     'actor: loop {
@@ -1023,7 +1031,10 @@ async fn run_provider_session(
             break;
         }
         if active.is_none() {
-            let input = if let Some(prompt_id) = deferred_prompt_id.take() {
+            let input = if let Some(prompt_id) = pending_turn_starts
+                .pop_front()
+                .or_else(|| deferred_prompt_id.take())
+            {
                 ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
             } else if let Some(connected) = provider.as_mut() {
                 tokio::select! {
@@ -1101,7 +1112,10 @@ async fn run_provider_session(
                             // an interrupted Turn's trailing stream, say — is
                             // discarded as it always was.
                             event => {
-                                if !subagents.owes_continuation() {
+                                let mut identity = identity.clone();
+                                if let ProviderEvent::ContinuationStarted { selection } = &event {
+                                    identity.selection = selection.clone();
+                                } else if !subagents.owes_continuation() {
                                     continue;
                                 }
                                 let Some(begun) = updates.apply(|| {
@@ -1405,13 +1419,28 @@ async fn run_provider_session(
                 command = commands.recv() => ProviderInput::Command(command),
             }
         };
+        // A native Continuation must release its Provider Turn before the
+        // next Prompt starts one. Reuse the normal interrupt path and wait
+        // for its terminal event; a local settle alone leaves Codex busy.
+        let input = match input {
+            ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                if active.as_ref().is_some_and(|turn| {
+                    turn.continuation == Some(ContinuationExecution::ProviderTurn)
+                }) =>
+            {
+                pending_turn_starts.push_back(prompt_id);
+                let (response, _) = oneshot::channel();
+                ProviderInput::Command(Some(ProviderCommand::InterruptSession { response }))
+            }
+            input => input,
+        };
         match input {
             ProviderInput::Command(None) => break,
             ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id })) => {
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
-                if current.continuation {
+                if current.continuation.is_some() {
                     // The next delivered Prompt settles a stale Continuation
                     // rather than steering it (ADR 0015): close it out as
                     // worked, then deliver the Prompt as its own Turn.
@@ -1434,9 +1463,12 @@ async fn run_provider_session(
                     };
                     active = None;
                     deferred_prompt_id = Some(prompt_id);
+                } else {
+                    // Admission owed this Prompt a Turn of its own. Its
+                    // command may arrive after the Continuation settled and
+                    // an earlier replacement Prompt already began running.
+                    pending_turn_starts.push_back(prompt_id);
                 }
-                // Otherwise the Prompt was admitted while a real Turn ran and
-                // stays pending until that Turn's settle delivers the queue.
             }
             ProviderInput::Command(Some(ProviderCommand::SubmitQuestionnaire {
                 target,
@@ -1540,7 +1572,7 @@ async fn run_provider_session(
                     .expect("Provider connection exists while its Turn is active")
                     .identity
                     .clone();
-                if current.continuation {
+                if current.continuation == Some(ContinuationExecution::LateOutput) {
                     // A Continuation runs no Provider loop of its own — it is
                     // the Turn Suru opened for the output its Subagents still
                     // owed. Interrupting it stops those Subagents, and the
@@ -1682,6 +1714,17 @@ async fn run_provider_session(
                         attribution: ProviderEventAttribution::OwningSession,
                         event,
                     })) => {
+                        // There is no originating Prompt to restore when a
+                        // Continuation's selection is rejected. Keep the
+                        // Provider's failure and let queued work proceed.
+                        let event = match event {
+                            ProviderEvent::AgentSelectionRejected { message }
+                                if current.continuation.is_some() =>
+                            {
+                                ProviderEvent::TurnFailed { message }
+                            }
+                            event => event,
+                        };
                         let selection_rejected =
                             matches!(event, ProviderEvent::AgentSelectionRejected { .. });
                         let identity = provider
@@ -1689,7 +1732,9 @@ async fn run_provider_session(
                             .expect("Provider connection exists while its Turn is active")
                             .identity
                             .clone();
-                        let queued_prompt_disposition = if provider_event_settles_turn(&event) {
+                        let queued_prompt_disposition = if provider_event_settles_turn(&event)
+                            && pending_turn_starts.is_empty()
+                        {
                             queued_prompt_disposition(
                                 &skill_catalog,
                                 &sessions,
@@ -2066,6 +2111,15 @@ fn project_provider_event(
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
+            ProviderEvent::ContinuationStarted { selection } => {
+                active.continuation = Some(ContinuationExecution::ProviderTurn);
+                sessions.reconcile_effective_agent_selection(
+                    session_id,
+                    active.turn_id,
+                    next_agent.agent.clone(),
+                    selection,
+                ).map(|_| ProviderEventProjection::Continue)
+            }
             ProviderEvent::QuestionnaireRequested { questionnaire } => active
                 .questionnaires
                 .register(sessions, session_id, active.turn_id, questionnaire)

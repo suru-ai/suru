@@ -4,13 +4,13 @@
 //! erroring, and a child's own spawns recurse one level down.
 
 use crate::support::{ScriptedCodex, receive_initial_state};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, MessageRole, PromptId,
-        SessionId, SessionSnapshot, TurnStatus, Workspace,
+        Activity, ActivityStatus, AdmitPromptRequest, CreateSessionRequest, InitialPrompt,
+        MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Workspace,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -408,6 +408,392 @@ async fn a_child_completing_after_the_parents_turn_completed_settles_the_row_not
         "the late completion is expected, never a Turn failure"
     );
 
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// Codex resumes the parent itself after its child settles, without another Prompt.
+#[tokio::test]
+async fn a_codex_started_continuation_streams_and_settles_without_a_prompt() {
+    let continuation = r#"
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"inProgress","items":[]}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"root-thread","turnId":"continuation-turn","item":{"type":"agentMessage","id":"continuation-message","text":""}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"root-thread","turnId":"continuation-turn","itemId":"continuation-message","delta":"The audit is clean."}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"continuation-turn","item":{"type":"agentMessage","id":"continuation-message","text":"The audit is clean."}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"completed","items":[]}}}'
+"#;
+    let script = format!(
+        "{}{}  ;;\n",
+        OUTLIVING_CHILD_CODEX.trim_end().trim_end_matches(";;"),
+        continuation
+    );
+    let fixture = ScriptedCodex::new_multiprocess(&script);
+    let opened = opened_session(&fixture, "codex-native-continuation", "Audit the crates").await;
+    let original = settled_session(&opened.client, opened.session_id, 0).await;
+    fixture.release();
+    let snapshot = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(snapshot.turns.len(), 2);
+    assert_eq!(snapshot.turns[0], original.turns[0]);
+    let continuation = &snapshot.turns[1];
+    assert_eq!(continuation.prompt_id, None);
+    assert_eq!(continuation.status, TurnStatus::Completed);
+    assert_eq!(agent_message_contents(&snapshot), ["The audit is clean."]);
+    assert_eq!(snapshot.messages.last().unwrap().turn_id, continuation.id);
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "turn/start")
+            .count(),
+        1
+    );
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+const INTERRUPTIBLE_CONTINUATION: &str = r#"
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"inProgress","items":[]}}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":5,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"interrupted","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn a_codex_started_continuation_can_be_interrupted_before_its_first_output() {
+    let script = format!(
+        "{}{}",
+        OUTLIVING_CHILD_CODEX.trim_end().trim_end_matches(";;"),
+        INTERRUPTIBLE_CONTINUATION
+    );
+    let fixture = ScriptedCodex::new_multiprocess(&script);
+    let opened = opened_session(&fixture, "codex-continuation-interrupt", "Audit the crates").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    fixture.release();
+    session_where(
+        &opened.client,
+        opened.session_id,
+        "the native continuation begins before output",
+        |s| {
+            s.turns
+                .get(1)
+                .is_some_and(|turn| turn.status == TurnStatus::Active)
+        },
+    )
+    .await;
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("interrupt continuation");
+    let snapshot = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(snapshot.turns[1].prompt_id, None);
+    assert_eq!(snapshot.turns[1].status, TurnStatus::Interrupted);
+    let requests = fixture.requests();
+    let interrupt = requests
+        .iter()
+        .find(|r| r["method"] == "turn/interrupt")
+        .expect("interrupt reaches Codex");
+    assert_eq!(interrupt["params"]["threadId"], "root-thread");
+    assert_eq!(interrupt["params"]["turnId"], "continuation-turn");
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn prompts_arriving_during_native_continuation_interruption_each_get_a_turn() {
+    for delay_ack in [false, true] {
+        let next_prompt = r#"
+    *'"method":"turn/start"'*'Continue new work'*)
+      printf '%s\n' '{"id":6,"result":{"turn":{"id":"next-turn"}}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"inProgress","items":[]}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+        let second_prompt = next_prompt
+            .replace("Continue new work", "Then more work")
+            .replace("\"id\":6", "\"id\":7")
+            .replace("next-turn", "last-turn");
+        let second_prompt = if delay_ack {
+            second_prompt.replace("\"id\":7", "\"id\":8")
+        } else {
+            second_prompt
+        };
+        let next_prompt = if delay_ack {
+            next_prompt
+                .lines()
+                .filter(|line| !line.contains("turn/completed"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            next_prompt.to_owned()
+        };
+        let interrupt_next = if delay_ack {
+            r#"
+    *'"method":"turn/interrupt"'*'"turnId":"next-turn"'*)
+      printf '%s\n' '{"id":7,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
+      ;;
+"#
+        } else {
+            ""
+        };
+        let gate_before = if delay_ack {
+            "      printf '%s\\n' '{\"id\":5"
+        } else {
+            "      printf '%s\\n' '{\"method\":\"turn/completed\""
+        };
+        let interrupted = INTERRUPTIBLE_CONTINUATION.replace(gate_before, &format!(
+        "      while [ ! -e \"$CODEX_FIXTURE_RELEASE-2\" ]; do sleep 0.01; done\n{gate_before}"));
+        let script = format!(
+            "{}{}{}{}{}",
+            interrupt_next,
+            next_prompt,
+            second_prompt,
+            OUTLIVING_CHILD_CODEX.trim_end().trim_end_matches(";;"),
+            interrupted
+        );
+        let fixture = ScriptedCodex::new_multiprocess(&script);
+        let opened = opened_session(
+            &fixture,
+            "codex-continuation-new-prompt",
+            "Audit the crates",
+        )
+        .await;
+        settled_session(&opened.client, opened.session_id, 0).await;
+        fixture.release();
+        session_where(
+            &opened.client,
+            opened.session_id,
+            "the native continuation begins",
+            |s| {
+                s.turns
+                    .get(1)
+                    .is_some_and(|turn| turn.status == TurnStatus::Active)
+            },
+        )
+        .await;
+        let prompt_id = PromptId::new();
+        opened
+            .client
+            .admit_prompt(
+                opened.session_id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: prompt_id,
+                        text: "Continue new work".into(),
+                        skill_invocations: Vec::new(),
+                    },
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
+            .expect("admit next Prompt");
+        fixture.wait_for_method("turn/interrupt").await;
+        let second_id = PromptId::new();
+        opened
+            .client
+            .admit_prompt(
+                opened.session_id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: second_id,
+                        text: "Then more work".into(),
+                        skill_invocations: Vec::new(),
+                    },
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
+            .expect("admit second Prompt while interruption is pending");
+        if delay_ack {
+            fixture.release_turn(2);
+            session_where(
+                &opened.client,
+                opened.session_id,
+                "first replacement Turn begins",
+                |s| s.turns.len() == 3,
+            )
+            .await;
+            // The second StartPrompt was queued during the old interrupt RPC and
+            // is consumed before this stop, while the replacement Turn is active.
+            opened
+                .client
+                .interrupt_session(opened.session_id)
+                .await
+                .expect("finish first replacement Turn");
+        } else {
+            // This idempotent stop acknowledges the preceding Prompt command,
+            // while the fixture still holds the native terminal event back.
+            opened
+                .client
+                .interrupt_session(opened.session_id)
+                .await
+                .expect("stop remains acknowledged");
+            fixture.release_turn(2);
+        }
+        let snapshot = settled_session(&opened.client, opened.session_id, 3).await;
+        assert_eq!(snapshot.turns[3].prompt_id, Some(second_id));
+        assert_eq!(snapshot.turns[3].status, TurnStatus::Completed);
+        assert_eq!(snapshot.turns[2].prompt_id, Some(prompt_id));
+        assert_eq!(snapshot.turns[2].status, TurnStatus::Completed);
+        assert_eq!(snapshot.turns[1].status, TurnStatus::Interrupted);
+        assert!(
+            !fixture
+                .methods()
+                .iter()
+                .any(|method| method == "turn/steer")
+        );
+        opened.server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn a_continuation_selection_failure_preserves_the_error_and_delivers_queued_work() {
+    let next_prompt = r#"
+    *'"method":"turn/start"'*'Continue new work'*)
+      printf '%s\n' '{"id":5,"result":{"turn":{"id":"next-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+    let continuation = r#"
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"inProgress","items":[]}}}'
+      while [ ! -e "$CODEX_FIXTURE_RELEASE-2" ]; do sleep 0.01; done
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"failed","error":{"message":"model gpt-fixture is unavailable"},"items":[]}}}'
+      ;;
+"#;
+    let script = format!(
+        "{}{}{}",
+        next_prompt,
+        OUTLIVING_CHILD_CODEX.trim_end().trim_end_matches(";;"),
+        continuation
+    );
+    let fixture = ScriptedCodex::new_multiprocess(&script);
+    let opened = opened_session(
+        &fixture,
+        "codex-continuation-selection-failure",
+        "Audit the crates",
+    )
+    .await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    fixture.release();
+    session_where(
+        &opened.client,
+        opened.session_id,
+        "the native continuation begins",
+        |s| s.turns.len() == 2,
+    )
+    .await;
+    opened
+        .client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Continue new work".into(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("queue work after the continuation");
+    fixture.release_turn(2);
+    let failed = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(failed.turns[1].status, TurnStatus::Failed);
+    assert!(
+        failed.activities.iter().any(|activity| matches!(activity,
+            Activity::Error { text, .. } if text.contains("model gpt-fixture is unavailable")
+        )),
+        "the native failure is retained: {:?}",
+        failed.activities
+    );
+    let snapshot = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(snapshot.turns[2].status, TurnStatus::Completed);
+    assert_eq!(
+        snapshot.prompts.len(),
+        2,
+        "no retry Prompt is invented for the continuation"
+    );
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn continuations_keep_selection_and_usage_without_reopening_stale_or_foreign_turns() {
+    fn notify(method: &str, params: Value) -> String {
+        format!(
+            "      printf '%s\\n' '{}'\n",
+            json!({"method": method, "params": params})
+        )
+    }
+    fn started(thread: &str, turn: &str) -> String {
+        notify(
+            "turn/started",
+            json!({"threadId": thread, "turn": {"id": turn, "status": "inProgress", "items": []}}),
+        )
+    }
+    fn usage(turn: &str, input: u64) -> String {
+        notify(
+            "thread/tokenUsage/updated",
+            json!({"threadId": "root-thread", "turnId": turn, "tokenUsage": {"total": {"inputTokens": input, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0}}}),
+        )
+    }
+    fn completed(turn: &str) -> String {
+        notify(
+            "turn/completed",
+            json!({"threadId": "root-thread", "turn": {"id": turn, "status": "completed", "items": []}}),
+        )
+    }
+    let response = r#"      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'"#;
+    // App-server may announce the requested Turn before its RPC response.
+    let initial = OUTLIVING_CHILD_CODEX.replace(response, &format!("{}{}\n{}{}",
+        started("root-thread", "root-turn"), response, usage("root-turn", 100),
+        notify("thread/settings/updated", json!({"threadId": "root-thread", "threadSettings": {"model": "gpt-effective", "effort": "high"}}))));
+    let mut continuation = String::new();
+    for thread in ["foreign-thread", "child-thread", "root-thread"] {
+        continuation.push_str(&started(thread, "root-turn"));
+        continuation.push_str(&notify("item/completed", json!({"threadId": thread, "turnId": "root-turn", "item": {"type": "agentMessage", "id": "stale-message", "text": "Discard this"}})));
+    }
+    continuation.push_str(&started("root-thread", "continuation-1"));
+    continuation.push_str(&notify("item/started", json!({"threadId": "root-thread", "turnId": "continuation-1", "item": {"type": "agentMessage", "id": "message", "text": ""}})));
+    continuation.push_str(&started("root-thread", "continuation-1"));
+    continuation.push_str(&notify("item/completed", json!({"threadId": "root-thread", "turnId": "continuation-1", "item": {"type": "agentMessage", "id": "message", "text": "Kept"}})));
+    continuation.push_str(&usage("continuation-1", 160));
+    continuation.push_str(&completed("continuation-1"));
+    continuation.push_str(&started("root-thread", "continuation-2"));
+    continuation.push_str(&usage("continuation-2", 200));
+    continuation.push_str(&completed("continuation-2"));
+    let script = format!(
+        "{}{}  ;;\n",
+        initial.trim_end().trim_end_matches(";;"),
+        continuation
+    );
+    let fixture = ScriptedCodex::new_multiprocess(&script);
+    let opened = opened_session(
+        &fixture,
+        "codex-continuation-correlation",
+        "Audit the crates",
+    )
+    .await;
+    let original = settled_session(&opened.client, opened.session_id, 0).await;
+    fixture.release();
+    let snapshot = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(snapshot.turns.len(), 3);
+    assert_eq!(snapshot.turns[0], original.turns[0]);
+    assert_eq!(agent_message_contents(&snapshot), ["Kept"]);
+    for (turn, expected_usage) in snapshot.turns[1..].iter().zip([60, 40]) {
+        assert_eq!(turn.prompt_id, None);
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(
+            turn.usage.as_ref().unwrap().fresh_input_tokens,
+            Some(expected_usage)
+        );
+        let selection = &turn.agent.as_ref().unwrap().selection;
+        assert_eq!(selection.model.as_str(), "gpt-effective");
+        assert_eq!(
+            selection,
+            &original.turns[0].agent.as_ref().unwrap().selection
+        );
+    }
     opened.server.shutdown().await.expect("shut down server");
 }
 

@@ -66,7 +66,9 @@ pub(super) struct NativeCorrelation {
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
-    active_selection: Option<AgentSelection>,
+    // Retained across settlement: Codex-initiated Turns inherit the last selection.
+    effective_selection: Option<AgentSelection>,
+    settled_turns: HashSet<String>,
     /// The Model this connection's Usage is priced at. Codex states no dollar
     /// figure of its own, so the Model is what the rate table is asked about;
     /// it outlives any one Turn because a spawned child thread meters under
@@ -217,7 +219,8 @@ impl NativeCorrelation {
             questionnaires,
             turn_starting: false,
             active_turn_id: None,
-            active_selection: None,
+            effective_selection: None,
+            settled_turns: HashSet::new(),
             metered_model,
             root_metering: ThreadMetering::default(),
             root: ThreadInFlight::default(),
@@ -264,7 +267,7 @@ impl NativeCorrelation {
             Ok(turn_id) if self.active_turn_id.is_none() => {
                 self.active_turn_id = Some(turn_id);
                 self.metered_model = selection.model.clone();
-                self.active_selection = Some(selection);
+                self.effective_selection = Some(selection);
                 self.root = ThreadInFlight::default();
                 Ok(())
             }
@@ -283,8 +286,9 @@ impl NativeCorrelation {
     /// deliberately survive: a Subagent may outlive the Turn that spawned it
     /// (ADR 0015), and its thread keeps streaming until its own settle.
     fn settle_turn(&mut self) {
-        self.active_turn_id = None;
-        self.active_selection = None;
+        if let Some(turn_id) = self.active_turn_id.take() {
+            self.settled_turns.insert(turn_id);
+        }
         self.root = ThreadInFlight::default();
     }
 
@@ -626,6 +630,29 @@ fn project_native_notification(
     notification: NativeNotification,
 ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
     match notification {
+        NativeNotification::TurnStarted { thread_id, turn_id } => {
+            if thread_id != correlation.thread_id
+                || correlation.settled_turns.contains(&turn_id)
+                || correlation.active_turn_id.as_deref() == Some(&turn_id)
+            {
+                return Ok(Vec::new());
+            }
+            if turn_id.is_empty() {
+                return Err(codex_error("Codex reported an empty Turn ID"));
+            }
+            if correlation.turn_starting || correlation.active_turn_id.is_some() {
+                return Err(codex_error(
+                    "Codex started a Turn while another native Turn was active",
+                ));
+            }
+            let Some(selection) = correlation.effective_selection.clone() else {
+                return Ok(Vec::new());
+            };
+            correlation.active_turn_id = Some(turn_id);
+            Ok(owning(vec![ProviderEvent::ContinuationStarted {
+                selection,
+            }]))
+        }
         NativeNotification::QuestionnaireRequested { id, params } => {
             let Some((_, attribution)) =
                 correlation.item_thread(&params.thread_id, &params.turn_id)
@@ -1210,7 +1237,7 @@ fn project_agent_selection_changed(
             "Codex reported an empty effective Model for the active Turn",
         ));
     }
-    let Some(requested) = correlation.active_selection.as_ref() else {
+    let Some(requested) = correlation.effective_selection.as_ref() else {
         return Err(codex_error(
             "Codex reported effective settings before accepting the active Turn",
         ));
@@ -1233,7 +1260,7 @@ fn project_agent_selection_changed(
         return Ok(Vec::new());
     }
     correlation.metered_model = effective.model.clone();
-    correlation.active_selection = Some(effective.clone());
+    correlation.effective_selection = Some(effective.clone());
     Ok(vec![ProviderEvent::AgentSelectionChanged {
         selection: effective,
     }])
@@ -1585,7 +1612,7 @@ fn project_turn_completed(
             .map(|attributed| attributed.event),
         );
     }
-    let selection_rejected = match (&outcome, &correlation.active_selection) {
+    let selection_rejected = match (&outcome, &correlation.effective_selection) {
         (NativeTurnOutcome::Failed { message, kind }, Some(selection)) => {
             is_native_selection_rejection(message, kind, selection)
         }

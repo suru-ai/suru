@@ -271,6 +271,7 @@ impl SessionStore {
                 updates,
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
+                pending_turn_starts: Default::default(),
                 selection_operations: HashMap::new(),
                 viewed_operations: Default::default(),
                 selection_retry_prompt: None,
@@ -375,6 +376,8 @@ impl SessionStore {
         record.next_prompt_order = next_prompt_order;
         if let Some(turn_id) = steer_target {
             record.steer_targets.insert(prompt.id, turn_id);
+        } else if matches!(disposition, PromptAdmissionDisposition::StartImmediately) {
+            record.pending_turn_starts.insert(prompt.id);
         }
         state.prompts.insert(
             request.prompt.id,
@@ -453,6 +456,7 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         record.steer_targets.remove(&prompt_id);
+        record.pending_turn_starts.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }
@@ -643,6 +647,7 @@ impl SessionStore {
                 .filter(|prompt| {
                     prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
+                        && !record.pending_turn_starts.contains(&prompt.id)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -765,6 +770,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
+        record.pending_turn_starts.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }

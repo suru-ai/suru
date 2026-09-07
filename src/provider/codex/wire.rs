@@ -747,6 +747,13 @@ pub(super) struct FileChangeUpdatedParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct TurnStartedParams {
+    pub(super) thread_id: String,
+    pub(super) turn: NativeTurn,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct TurnCompletedParams {
     pub(super) thread_id: String,
     pub(super) turn: CompletedNativeTurn,
@@ -961,6 +968,10 @@ pub(super) struct CompletedNativeAgentMessage {
 
 /// A Codex notification Suru understands, decoded out of its wire params.
 pub(super) enum NativeNotification {
+    TurnStarted {
+        thread_id: String,
+        turn_id: String,
+    },
     QuestionnaireRequested {
         id: RequestId,
         params: UserInputParams,
