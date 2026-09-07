@@ -33,7 +33,7 @@ use suru::{
     server::{self, ServerConfig},
 };
 use sysinfo::{Pid, System};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::{Duration, timeout, timeout_at};
 use uuid::Uuid;
 
@@ -1969,32 +1969,417 @@ async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
 }
 
 #[tokio::test]
-async fn managed_client_bounds_the_initial_event_stream_handshake() {
+async fn managed_client_bounds_either_initial_stream_handshake_and_drops_the_sibling() {
+    for stall_catalog in [false, true] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let channel = "event-handshake-timeout-test";
+        let fixture =
+            ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
+        let (stalled, sibling, name) = fixture.handshake_and_sibling(stall_catalog);
+        stalled.hold();
+        std::fs::write(
+            state_dir.path().join(channel).join("server.log"),
+            format!(
+                "discarded-prefix\n{}\nstream fixture stalled\n",
+                "x".repeat(16 * 1024)
+            ),
+        )
+        .expect("write fixture server log");
+        let config = ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(inert_server_executable(state_dir.path()))
+            .with_startup_timeout(Duration::from_millis(200));
+
+        let error = timeout(Duration::from_secs(1), ManagedClient::connect(config))
+            .await
+            .expect("initial streams use the startup deadline")
+            .err()
+            .expect("a stalled stream prevents connection")
+            .to_string();
+
+        stalled.wait_requested().await;
+        sibling.wait_requested().await;
+        stalled.wait_closed().await;
+        sibling.wait_closed().await;
+        assert!(
+            error.contains(&format!("initial {name} did not open within 200ms")),
+            "{error}"
+        );
+        assert!(error.contains("stream fixture stalled"));
+        assert!(!error.contains("discarded-prefix"));
+        assert!(
+            error.len() < 10 * 1024,
+            "startup diagnostics remain bounded"
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_client_rejects_either_failed_handshake_and_drops_the_sibling() {
+    for reject_catalog in [false, true] {
+        for sibling_open in [false, true] {
+            let state_dir = tempfile::tempdir().expect("create isolated state directory");
+            let channel = "rejected-handshake-test";
+            let fixture =
+                ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
+            fixture.lifecycle_handshake.hold();
+            fixture.catalog_handshake.hold();
+            let (rejected, sibling, name) = fixture.handshake_and_sibling(reject_catalog);
+            let config = ManagedClientConfig::new(state_dir.path(), channel)
+                .expect("configure managed client")
+                .with_server_executable(inert_server_executable(state_dir.path()))
+                .with_startup_timeout(Duration::from_secs(2));
+            let mut connecting = Box::pin(ManagedClient::connect(config));
+            tokio::select! {
+                _ = &mut connecting => panic!("both responses are held"),
+                _ = async {
+                    rejected.wait_requested().await;
+                    sibling.wait_requested().await;
+                } => {}
+            }
+            if sibling_open {
+                sibling.respond(StatusCode::OK);
+                tokio::select! {
+                    _ = &mut connecting => panic!("the rejected response is still held"),
+                    _ = sibling.wait_streaming() => {}
+                }
+                assert!(
+                    timeout(Duration::from_millis(20), &mut connecting)
+                        .await
+                        .is_err()
+                );
+            }
+            rejected.respond(StatusCode::UNAUTHORIZED);
+            let error = timeout(Duration::from_millis(500), connecting)
+                .await
+                .expect("rejection cancels the sibling before the startup deadline")
+                .err()
+                .expect("a rejected stream prevents connection")
+                .to_string();
+            assert!(
+                error.contains(&format!("server rejected the initial {name}")),
+                "{error}"
+            );
+            assert!(error.contains("401 Unauthorized"), "{error}");
+            sibling.wait_closed().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_client_reports_either_broken_handshake_and_closes_the_waiting_sibling() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for break_catalog in [false, true] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let channel = "broken-handshake-test";
+        let _fixture =
+            ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
+        let descriptor_path = state_dir.path().join(channel).join("runtime.json");
+        let mut descriptor = read_runtime_descriptor(&descriptor_path);
+        let upstream = descriptor.base_url.trim_start_matches("http://").to_owned();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind handshake fault proxy");
+        descriptor.base_url = format!("http://{}", listener.local_addr().unwrap());
+        write_runtime_descriptor(&descriptor_path, &descriptor);
+        let (requests, mut received) = tokio::sync::mpsc::channel(2);
+        // Forward the real readiness fixture's health response, but hand both
+        // SSE sockets to the test so it can close one before sending headers.
+        let proxy = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let upstream = upstream.clone();
+                let requests = requests.clone();
+                connections.spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                    }
+                    let path = std::str::from_utf8(&request)
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    if path == "/health" {
+                        let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                        server.write_all(&request).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut socket, &mut server).await;
+                    } else {
+                        requests
+                            .send((path == "/v1/session-events", socket))
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        // Aborting this owner also drops its JoinSet and any forwarded sockets.
+        let _proxy = AbortOnDrop(proxy);
+        let config = ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(inert_server_executable(state_dir.path()))
+            .with_startup_timeout(Duration::from_secs(2));
+        let mut connecting = Box::pin(ManagedClient::connect(config));
+        let sockets = tokio::select! {
+            _ = &mut connecting => panic!("both handshake responses are held"),
+            sockets = timeout(Duration::from_secs(1), async {
+                (received.recv().await.unwrap(), received.recv().await.unwrap())
+            }) => sockets.expect("both handshake sockets reach the proxy"),
+        };
+        let (broken, mut sibling) = if sockets.0.0 == break_catalog {
+            (sockets.0.1, sockets.1.1)
+        } else {
+            (sockets.1.1, sockets.0.1)
+        };
+        drop(broken);
+        let error = timeout(Duration::from_millis(500), connecting)
+            .await
+            .expect("transport failure promptly cancels the sibling")
+            .err()
+            .expect("a broken handshake prevents connection")
+            .to_string();
+        let name = if break_catalog {
+            "Session catalog stream"
+        } else {
+            "event stream"
+        };
+        assert!(
+            error.contains(&format!("could not open the initial {name}")),
+            "{error}"
+        );
+        let mut byte = [0];
+        let closed = timeout(Duration::from_secs(1), sibling.read(&mut byte))
+            .await
+            .expect("the sibling TCP connection closes");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "unexpected sibling traffic: {closed:?}"
+        );
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[tokio::test]
+async fn managed_client_handshakes_share_the_deadline_spent_ensuring_the_server() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let channel = "event-handshake-timeout-test";
-    let fixture = ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
-    fixture.events_ready.store(false, Ordering::SeqCst);
-    std::fs::write(
-        state_dir.path().join(channel).join("server.log"),
-        "event stream fixture stalled\n",
-    )
-    .expect("write fixture server log");
+    let channel = "shared-handshake-deadline-test";
+    let fixture =
+        ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Starting).await;
+    fixture.catalog_handshake.hold();
     let config = ManagedClientConfig::new(state_dir.path(), channel)
         .expect("configure managed client")
         .with_server_executable(inert_server_executable(state_dir.path()))
         .with_startup_timeout(Duration::from_millis(500));
-
-    let result = timeout(Duration::from_secs(2), ManagedClient::connect(config))
+    let started = tokio::time::Instant::now();
+    let mut connecting = Box::pin(ManagedClient::connect(config));
+    tokio::select! {
+        _ = &mut connecting => panic!("server is still initializing"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    assert!(!fixture.health_probes.lock().unwrap().is_empty());
+    *fixture.lifecycle.lock().unwrap() = LifecycleState::Ready;
+    let error = timeout_at(started + Duration::from_millis(650), connecting)
         .await
-        .expect("initial event stream uses the startup deadline");
-    let error = match result {
-        Ok(_) => panic!("managed client unexpectedly connected"),
-        Err(error) => error.to_string(),
-    };
+        .expect("handshakes do not get a fresh 500ms after readiness")
+        .err()
+        .expect("the catalog handshake stalls")
+        .to_string();
+    assert!(
+        error.contains("initial Session catalog stream did not open within 500ms"),
+        "{error}"
+    );
+    fixture.lifecycle_handshake.wait_requested().await;
+    fixture.catalog_handshake.wait_requested().await;
+    fixture.lifecycle_handshake.wait_closed().await;
+}
 
-    assert!(fixture.events_opened.load(Ordering::SeqCst));
-    assert!(error.contains("initial event stream did not open within 500ms"));
-    assert!(error.contains("event stream fixture stalled"));
+#[tokio::test]
+async fn managed_client_opens_both_handshakes_before_adopting_either_response() {
+    for release_catalog_first in [false, true] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let channel = "concurrent-handshakes-test";
+        let fixture =
+            ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
+        fixture.lifecycle_handshake.hold();
+        fixture.catalog_handshake.hold();
+        let config = ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_server_executable(inert_server_executable(state_dir.path()))
+            .with_startup_timeout(Duration::from_secs(2));
+        let mut connecting = Box::pin(ManagedClient::connect(config));
+        tokio::select! {
+            result = &mut connecting => panic!("connected before responses were released: {:?}", result.err()),
+            _ = async {
+                fixture.lifecycle_handshake.wait_requested().await;
+                fixture.catalog_handshake.wait_requested().await;
+            } => {}
+        }
+        let (first, second) = if release_catalog_first {
+            (&fixture.catalog_handshake, &fixture.lifecycle_handshake)
+        } else {
+            (&fixture.lifecycle_handshake, &fixture.catalog_handshake)
+        };
+        first.respond(StatusCode::OK);
+        assert!(
+            timeout(Duration::from_millis(20), &mut connecting)
+                .await
+                .is_err(),
+            "both responses must succeed before adopting the connection"
+        );
+        second.respond(StatusCode::OK);
+        let mut client = connecting.await.expect("both handshakes succeed");
+        receive_initial_state(&mut client).await;
+    }
+}
+
+#[tokio::test]
+async fn managed_client_hydrates_catalog_before_connected_and_settings() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "catalog-hydration-order-test";
+    let fixture = ReadinessFixture::spawn(state_dir.path(), channel, LifecycleState::Ready).await;
+    fixture.catalog_handshake.body_ready.send_replace(false);
+    let config = ManagedClientConfig::new(state_dir.path(), channel)
+        .expect("configure managed client")
+        .with_server_executable(inert_server_executable(state_dir.path()))
+        .with_startup_timeout(Duration::from_millis(500));
+    let mut client = ManagedClient::connect(config)
+        .await
+        .expect("both HTTP handshakes succeed");
+    assert!(matches!(
+        client.next().await,
+        Some(ManagedEvent::Connecting)
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), client.next())
+            .await
+            .is_err(),
+        "Connected and Settings wait for the catalog snapshot body"
+    );
+    fixture.catalog_handshake.body_ready.send_replace(true);
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap(),
+        Some(ManagedEvent::Connected(_))
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap(),
+        Some(ManagedEvent::SettingsSnapshot(_))
+    ));
+}
+
+/// Controls the HTTP boundary and observes cancellation on the server side,
+/// whether the client is still waiting for headers or already owns the body.
+#[derive(Clone)]
+struct FixtureHandshake {
+    response: watch::Sender<Option<StatusCode>>,
+    body_ready: watch::Sender<bool>,
+    streaming: watch::Sender<bool>,
+    requested: Arc<Semaphore>,
+    closed: Arc<Semaphore>,
+}
+
+impl FixtureHandshake {
+    fn new() -> Self {
+        Self {
+            response: watch::channel(Some(StatusCode::OK)).0,
+            body_ready: watch::channel(true).0,
+            streaming: watch::channel(false).0,
+            requested: Arc::new(Semaphore::new(0)),
+            closed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    fn hold(&self) {
+        self.response.send_replace(None);
+    }
+
+    fn respond(&self, status: StatusCode) {
+        self.response.send_replace(Some(status));
+    }
+
+    async fn wait_requested(&self) {
+        timeout(Duration::from_secs(1), self.requested.acquire())
+            .await
+            .expect("server observes the handshake request")
+            .expect("request signal remains open")
+            .forget();
+    }
+
+    async fn wait_streaming(&self) {
+        timeout(
+            Duration::from_secs(1),
+            self.streaming.subscribe().wait_for(|started| *started),
+        )
+        .await
+        .expect("server begins streaming the successful response")
+        .expect("streaming signal remains open");
+    }
+
+    async fn wait_closed(&self) {
+        timeout(Duration::from_secs(1), self.closed.acquire())
+            .await
+            .expect("client drops the sibling request or response")
+            .expect("close signal remains open")
+            .forget();
+    }
+
+    async fn open(&self) -> Result<HandshakeConnection, Response> {
+        let connection = HandshakeConnection {
+            closed: self.closed.clone(),
+            body_ready: self.body_ready.subscribe(),
+            streaming: self.streaming.clone(),
+        };
+        self.requested.add_permits(1);
+        let mut response = self.response.subscribe();
+        let status = *response
+            .wait_for(Option::is_some)
+            .await
+            .expect("handshake response control remains open");
+        match status.expect("response was released") {
+            StatusCode::OK => Ok(connection),
+            status => Err(status.into_response()),
+        }
+    }
+}
+
+struct HandshakeConnection {
+    closed: Arc<Semaphore>,
+    body_ready: watch::Receiver<bool>,
+    streaming: watch::Sender<bool>,
+}
+
+impl HandshakeConnection {
+    fn track(self, response: Response) -> Response {
+        let (parts, body) = response.into_parts();
+        let body = stream::unfold(
+            (body.into_data_stream(), self),
+            |(mut body, mut connection)| async move {
+                connection.body_ready.wait_for(|ready| *ready).await.ok()?;
+                let chunk = body.next().await?;
+                connection.streaming.send_replace(true);
+                Some((chunk, (body, connection)))
+            },
+        );
+        Response::from_parts(parts, axum::body::Body::from_stream(body))
+    }
+}
+
+impl Drop for HandshakeConnection {
+    fn drop(&mut self) {
+        self.closed.add_permits(1);
+    }
 }
 
 #[derive(Clone)]
@@ -2004,7 +2389,8 @@ struct ReadinessState {
     health_probes: Arc<Mutex<Vec<tokio::time::Instant>>>,
     ready_after_probe: Arc<AtomicBool>,
     events_opened: Arc<AtomicBool>,
-    events_ready: Arc<AtomicBool>,
+    lifecycle_handshake: FixtureHandshake,
+    catalog_handshake: FixtureHandshake,
     event_requests: Arc<AtomicUsize>,
     event_behavior: FixtureEventBehavior,
 }
@@ -2029,7 +2415,8 @@ struct ReadinessFixture {
     health_probes: Arc<Mutex<Vec<tokio::time::Instant>>>,
     ready_after_probe: Arc<AtomicBool>,
     events_opened: Arc<AtomicBool>,
-    events_ready: Arc<AtomicBool>,
+    lifecycle_handshake: FixtureHandshake,
+    catalog_handshake: FixtureHandshake,
     event_requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -2146,7 +2533,8 @@ impl ReadinessFixture {
         let health_probes = Arc::new(Mutex::new(Vec::new()));
         let ready_after_probe = Arc::new(AtomicBool::new(false));
         let events_opened = Arc::new(AtomicBool::new(false));
-        let events_ready = Arc::new(AtomicBool::new(true));
+        let lifecycle_handshake = FixtureHandshake::new();
+        let catalog_handshake = FixtureHandshake::new();
         let event_requests = Arc::new(AtomicUsize::new(0));
         let state = ReadinessState {
             descriptor,
@@ -2154,7 +2542,8 @@ impl ReadinessFixture {
             health_probes: health_probes.clone(),
             ready_after_probe: ready_after_probe.clone(),
             events_opened: events_opened.clone(),
-            events_ready: events_ready.clone(),
+            lifecycle_handshake: lifecycle_handshake.clone(),
+            catalog_handshake: catalog_handshake.clone(),
             event_requests: event_requests.clone(),
             event_behavior,
         };
@@ -2174,9 +2563,29 @@ impl ReadinessFixture {
             health_probes,
             ready_after_probe,
             events_opened,
-            events_ready,
+            lifecycle_handshake,
+            catalog_handshake,
             event_requests,
             task,
+        }
+    }
+
+    fn handshake_and_sibling(
+        &self,
+        catalog: bool,
+    ) -> (&FixtureHandshake, &FixtureHandshake, &'static str) {
+        if catalog {
+            (
+                &self.catalog_handshake,
+                &self.lifecycle_handshake,
+                "Session catalog stream",
+            )
+        } else {
+            (
+                &self.lifecycle_handshake,
+                &self.catalog_handshake,
+                "event stream",
+            )
         }
     }
 
@@ -2213,9 +2622,10 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
     }
     state.events_opened.store(true, Ordering::SeqCst);
     let request_index = state.event_requests.fetch_add(1, Ordering::SeqCst);
-    if !state.events_ready.load(Ordering::SeqCst) {
-        return std::future::pending().await;
-    }
+    let connection = match state.lifecycle_handshake.open().await {
+        Ok(connection) => connection,
+        Err(response) => return response,
+    };
     if *state.lifecycle.lock().expect("lock lifecycle") != LifecycleState::Ready {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -2228,7 +2638,7 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
             fixture_settings_snapshot_event(),
         ))))
     };
-    match state.event_behavior {
+    let response = match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
             Sse::new(connected().chain(stream::pending())).into_response()
         }
@@ -2257,7 +2667,8 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
                 .map(Ok::<_, Infallible>);
             Sse::new(stream::iter(events)).into_response()
         }
-    }
+    };
+    connection.track(response)
 }
 
 async fn readiness_catalog_events(
@@ -2270,7 +2681,10 @@ async fn readiness_catalog_events(
     if *state.lifecycle.lock().expect("lock lifecycle") != LifecycleState::Ready {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    empty_catalog_stream()
+    match state.catalog_handshake.open().await {
+        Ok(connection) => connection.track(empty_catalog_stream()),
+        Err(response) => response,
+    }
 }
 
 fn protocol_violation_events(_state: &ReadinessState, violation: ProtocolViolation) -> Vec<Event> {

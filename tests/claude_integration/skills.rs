@@ -3,8 +3,8 @@
 use crate::{
     server_support::next_skill_catalog,
     support::{
-        CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, ScriptedClaude, hosting, list_models_arm,
-        session_where, settled_session, user_turn_arm, version_arm,
+        CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, ScriptedClaude, agent_messages, hosting,
+        list_models_arm, session_where, settled_session, user_turn_arm, version_arm,
     },
 };
 use serde_json::Value;
@@ -429,7 +429,10 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}",
         skill_catalog_arms(),
-        user_turn_arm("      :\n")
+        user_turn_arm(
+            r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Working"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+"#,
+        )
     ));
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -463,12 +466,17 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
         &client,
         &mut feed,
         created.session.id,
-        "the plain Claude Turn starts",
+        // Active is published before the CLI necessarily receives the Prompt.
+        // A streamed reply proves its request log is ready for the assertion below.
+        "Claude receives the plain Prompt and starts replying",
         |snapshot| {
             snapshot
                 .turns
                 .first()
                 .is_some_and(|turn| turn.status == TurnStatus::Active)
+                && agent_messages(snapshot)
+                    .iter()
+                    .any(|message| message.content == "Working")
         },
     )
     .await;

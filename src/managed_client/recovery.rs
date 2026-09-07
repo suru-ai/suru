@@ -109,20 +109,22 @@ async fn open_managed_streams(
     deadline: tokio::time::Instant,
     startup_timeout: Duration,
 ) -> Result<ManagedStreamResponses> {
-    let lifecycle = open_required_stream(
-        deadline,
-        startup_timeout,
-        "event stream",
-        event_stream::open(http, descriptor),
-    )
-    .await?;
-    let catalog = open_required_stream(
-        deadline,
-        startup_timeout,
-        "Session catalog stream",
-        session_catalog_stream::open(http, descriptor),
-    )
-    .await?;
+    // Either failure drops the sibling future, including any response it has
+    // already opened. Both handshakes spend the same remaining startup budget.
+    let (lifecycle, catalog) = tokio::try_join!(
+        open_required_stream(
+            deadline,
+            startup_timeout,
+            "event stream",
+            event_stream::open(http, descriptor),
+        ),
+        open_required_stream(
+            deadline,
+            startup_timeout,
+            "Session catalog stream",
+            session_catalog_stream::open(http, descriptor),
+        ),
+    )?;
     Ok(ManagedStreamResponses { lifecycle, catalog })
 }
 
