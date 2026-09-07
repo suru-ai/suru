@@ -5,7 +5,6 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -38,6 +37,16 @@ pub(super) async fn ensure_server(
     let mut spawned = None;
     let mut registration_seen = false;
     let mut awaiting_election = false;
+    let mut poll_interval = config.initial_readiness_interval;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(startup_error(
+            config,
+            &format!(
+                "detached Suru server did not become ready within {:?}",
+                config.startup_timeout
+            ),
+        ));
+    }
     loop {
         let probe_deadline =
             (tokio::time::Instant::now() + config.health_check_timeout).min(deadline);
@@ -129,6 +138,9 @@ pub(super) async fn ensure_server(
                 ));
             }
         }
+        // Keep the brief fast cadence local to this startup attempt. A slow server
+        // settles at the old probe rate, including across election/replacement races.
+        tokio::time::sleep_until((tokio::time::Instant::now() + poll_interval).min(deadline)).await;
         if tokio::time::Instant::now() >= deadline {
             return Err(startup_error(
                 config,
@@ -138,7 +150,9 @@ pub(super) async fn ensure_server(
                 ),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        poll_interval = poll_interval
+            .saturating_mul(2)
+            .min(config.max_readiness_interval);
     }
 }
 

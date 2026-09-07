@@ -1798,6 +1798,94 @@ async fn sequential_managed_clients_reuse_the_persistent_server() {
 }
 
 #[tokio::test]
+async fn managed_client_recognizes_readiness_just_after_a_probe() {
+    let mut recognition_times = Vec::new();
+    for fixed in [true, false] {
+        let state_dir = tempfile::tempdir().unwrap();
+        let fixture = ReadinessFixture::spawn(
+            state_dir.path(),
+            "prompt-readiness",
+            LifecycleState::Starting,
+        )
+        .await;
+        fixture.ready_after_probe.store(true, Ordering::SeqCst);
+        let mut config = ManagedClientConfig::new(state_dir.path(), "prompt-readiness")
+            .unwrap()
+            .with_server_executable(inert_server_executable(state_dir.path()));
+        if fixed {
+            config = config
+                .with_readiness_polling(Duration::from_millis(250), Duration::from_millis(250));
+        }
+
+        let health = start_server(&config).await.unwrap();
+        let recognized = tokio::time::Instant::now();
+        let probes = fixture.health_probes.lock().unwrap();
+        assert_eq!(health.lifecycle, LifecycleState::Ready);
+        assert_eq!(probes.len(), 2);
+        recognition_times.push(recognized.duration_since(probes[0]));
+    }
+    // Compare against an injected slow cadence rather than imposing a tight
+    // absolute wall-clock limit on HTTP and the platform scheduler.
+    assert!(
+        recognition_times[1] * 2 < recognition_times[0],
+        "adaptive recognition should beat fixed polling: {recognition_times:?}"
+    );
+}
+
+#[tokio::test]
+async fn managed_client_bounds_readiness_sleep_by_the_startup_deadline() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let fixture = ReadinessFixture::spawn(
+        state_dir.path(),
+        "readiness-deadline",
+        LifecycleState::Starting,
+    )
+    .await;
+    let config = ManagedClientConfig::new(state_dir.path(), "readiness-deadline")
+        .unwrap()
+        .with_server_executable(inert_server_executable(state_dir.path()))
+        .with_startup_timeout(Duration::from_millis(150))
+        .with_readiness_polling(Duration::from_millis(1000), Duration::from_millis(1000));
+    let result = timeout(Duration::from_millis(500), start_server(&config))
+        .await
+        .expect("sleep must end at the startup deadline");
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("did not become ready")
+    );
+    assert_eq!(
+        fixture.health_probes.lock().unwrap().len(),
+        1,
+        "do not issue another probe after the deadline"
+    );
+}
+
+#[tokio::test]
+async fn managed_client_backs_off_readiness_probes_for_a_slow_server() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let fixture =
+        ReadinessFixture::spawn(state_dir.path(), "slow-readiness", LifecycleState::Starting).await;
+    let config = ManagedClientConfig::new(state_dir.path(), "slow-readiness")
+        .unwrap()
+        .with_server_executable(inert_server_executable(state_dir.path()))
+        .with_startup_timeout(Duration::from_millis(180));
+    let error = start_server(&config).await.unwrap_err();
+    assert!(error.to_string().contains("did not become ready"));
+    assert!(error.to_string().contains("still starting"));
+    let probes = fixture.health_probes.lock().unwrap();
+    assert!(
+        probes.len() <= 7,
+        "unbounded startup probe rate: {}",
+        probes.len()
+    );
+    for pair in probes.windows(2).skip(4) {
+        assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(50));
+    }
+}
+
+#[tokio::test]
 async fn managed_client_waits_through_transitional_lifecycle_before_opening_events() {
     for (channel, initial_lifecycle) in [
         ("starting-readiness-test", LifecycleState::Starting),
@@ -1913,6 +2001,8 @@ async fn managed_client_bounds_the_initial_event_stream_handshake() {
 struct ReadinessState {
     descriptor: RuntimeDescriptor,
     lifecycle: Arc<Mutex<LifecycleState>>,
+    health_probes: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    ready_after_probe: Arc<AtomicBool>,
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
     event_requests: Arc<AtomicUsize>,
@@ -1936,6 +2026,8 @@ enum ProtocolViolation {
 
 struct ReadinessFixture {
     lifecycle: Arc<Mutex<LifecycleState>>,
+    health_probes: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    ready_after_probe: Arc<AtomicBool>,
     events_opened: Arc<AtomicBool>,
     events_ready: Arc<AtomicBool>,
     event_requests: Arc<AtomicUsize>,
@@ -2051,12 +2143,16 @@ impl ReadinessFixture {
         write_runtime_descriptor(runtime_dir.join("runtime.json"), &descriptor);
 
         let lifecycle = Arc::new(Mutex::new(initial_lifecycle));
+        let health_probes = Arc::new(Mutex::new(Vec::new()));
+        let ready_after_probe = Arc::new(AtomicBool::new(false));
         let events_opened = Arc::new(AtomicBool::new(false));
         let events_ready = Arc::new(AtomicBool::new(true));
         let event_requests = Arc::new(AtomicUsize::new(0));
         let state = ReadinessState {
             descriptor,
             lifecycle: lifecycle.clone(),
+            health_probes: health_probes.clone(),
+            ready_after_probe: ready_after_probe.clone(),
             events_opened: events_opened.clone(),
             events_ready: events_ready.clone(),
             event_requests: event_requests.clone(),
@@ -2075,6 +2171,8 @@ impl ReadinessFixture {
 
         Self {
             lifecycle,
+            health_probes,
+            ready_after_probe,
             events_opened,
             events_ready,
             event_requests,
@@ -2098,6 +2196,14 @@ async fn readiness_health(State(state): State<ReadinessState>, headers: HeaderMa
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let lifecycle = state.lifecycle.lock().expect("lock lifecycle").clone();
+    state
+        .health_probes
+        .lock()
+        .unwrap()
+        .push(tokio::time::Instant::now());
+    if state.ready_after_probe.swap(false, Ordering::SeqCst) {
+        *state.lifecycle.lock().unwrap() = LifecycleState::Ready;
+    }
     Json(state.descriptor.health(lifecycle)).into_response()
 }
 

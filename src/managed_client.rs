@@ -54,6 +54,8 @@ pub struct ManagedClientConfig {
     startup_timeout: Duration,
     stop_timeout: Duration,
     health_check_timeout: Duration,
+    initial_readiness_interval: Duration,
+    max_readiness_interval: Duration,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
 }
@@ -66,6 +68,8 @@ impl ManagedClientConfig {
             startup_timeout: STARTUP_TIMEOUT,
             stop_timeout: STOP_TIMEOUT,
             health_check_timeout: HEALTH_CHECK_TIMEOUT,
+            initial_readiness_interval: Duration::from_millis(5),
+            max_readiness_interval: Duration::from_millis(50),
             initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
             max_recovery_backoff: MAX_RECOVERY_BACKOFF,
         })
@@ -94,6 +98,15 @@ impl ManagedClientConfig {
     /// shutdown settlement.
     pub fn with_health_check_timeout(mut self, timeout: Duration) -> Self {
         self.health_check_timeout = timeout;
+        self
+    }
+
+    /// Overrides startup polling: double the initial interval up to the cap.
+    /// Internal timing injection, independent of connection-loss recovery.
+    /// Clamp to at least one millisecond so zero cannot create a busy loop.
+    pub fn with_readiness_polling(mut self, initial: Duration, max: Duration) -> Self {
+        self.initial_readiness_interval = initial.max(Duration::from_millis(1));
+        self.max_readiness_interval = max.max(self.initial_readiness_interval);
         self
     }
 
