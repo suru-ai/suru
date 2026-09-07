@@ -127,21 +127,21 @@ impl ComposerMemory {
     }
 
     pub(super) fn highlight_selection(&self, buffer: &mut ratatui::buffer::Buffer) {
-        let Some(frame) = self.selection_frame() else {
-            return;
-        };
         let recorded = self.frame.borrow();
         let Some(recorded) = recorded.as_ref() else {
             return;
         };
-        if let Some(range) = self.selection_range(recorded.key.clone()) {
+        let Some(range) = self.selection_range(recorded.key.clone()) else {
+            return;
+        };
+        if let Some(frame) = self.selection_frame() {
             frame.highlight_range(range, buffer);
         }
     }
 
     pub(super) fn copy_selection(&self, key: ComposerKey) -> Option<String> {
-        let range = self.selection_range(key)?;
-        self.selection_frame()?.copy_range(range)
+        let range = self.selection_range(key.clone())?;
+        Some(super::selection::copy_text(self.text(key).get(range)?))
     }
 
     pub(super) fn hit(&self, key: ComposerKey, position: Position) -> Option<CursorTarget> {

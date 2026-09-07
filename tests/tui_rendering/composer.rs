@@ -2247,3 +2247,25 @@ fn composer_selection_escape_and_any_left_press_clear_the_mark() {
     );
     assert_composer_mark(&application, 100, "marked", false);
 }
+
+#[test]
+fn composer_selection_copies_after_a_resize_hides_the_composer() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "marked draft");
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "marked draft");
+    super::selection::drag(&mut application, start, (start.0 + 5, start.1));
+    application
+        .handle_terminal_event(InputEvent::Resize(5, 2))
+        .unwrap();
+    rendered_application_buffer(&application, 5, 2);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("marked".into())
+    );
+    application
+        .handle_terminal_event(InputEvent::Resize(100, 32))
+        .unwrap();
+    assert_composer_mark(&application, 100, "marked", false);
+}

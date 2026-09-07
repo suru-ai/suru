@@ -204,17 +204,6 @@ impl SelectionFrame {
         Some(range.end..range.end)
     }
 
-    pub(super) fn copy_range(&self, range: std::ops::Range<usize>) -> Option<String> {
-        Some(
-            self.text
-                .get(range)?
-                .split('\n')
-                .map(str::trim_end)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    }
-
     pub(super) fn highlight_range(&self, selected: std::ops::Range<usize>, buffer: &mut Buffer) {
         for y in self.area.y..self.area.bottom() {
             let Some(row) = self.rows.get(self.scroll + usize::from(y - self.area.y)) else {
@@ -297,31 +286,19 @@ impl SelectionFrame {
 
     pub(super) fn copy(&self, selection: TextSelection) -> Option<String> {
         let (start, end) = selection.ordered();
-        let offset = |cell: SelectionCell, inclusive: bool| {
-            let range = self.rows.get(cell.row)?;
-            let mut column = 0;
-            for (byte, glyph) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(
-                &self.text[range.clone()],
-                true,
-            ) {
-                column += glyph.width();
-                if cell.column < column {
-                    return Some(range.start + byte + if inclusive { glyph.len() } else { 0 });
-                }
-            }
-            Some(range.end)
-        };
-        let start = offset(start, false)?;
-        let end = offset(end, true)?;
-        Some(
-            self.text
-                .get(start..end)?
-                .split('\n')
-                .map(str::trim_end)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        let start = self.cell_range(start)?.start;
+        let end = self.cell_range(end)?.end;
+        Some(copy_text(self.text.get(start..end)?))
     }
+}
+
+/// Clipboard prose omits the trailing whitespace that selection highlighting
+/// leaves unpainted, while preserving written Line breaks.
+pub(super) fn copy_text(text: &str) -> String {
+    text.split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl SelectionSurface {
