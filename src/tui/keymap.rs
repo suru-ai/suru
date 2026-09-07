@@ -614,6 +614,12 @@ struct CommandBinding {
 
 const COMMAND_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::SelectAll,
+        label: "Ctrl+A",
+    },
+    CommandBinding {
         code: KeyCode::Left,
         modifiers: KeyModifiers::SHIFT,
         command: CommandId::ExtendSelectionLeft,

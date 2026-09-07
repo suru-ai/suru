@@ -210,10 +210,17 @@ impl SelectionFrame {
                 break;
             };
             let mut column = 0;
-            for (offset, glyph) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(
-                self.text[row.clone()].trim_end(),
-                true,
-            ) {
+            let text = &self.text[row.clone()];
+            // Composer rows map exactly to draft text: trailing spaces are editable
+            // characters too. Other surfaces may carry layout padding.
+            let text = if self.surface == SelectionSurface::Composer {
+                text
+            } else {
+                text.trim_end()
+            };
+            for (offset, glyph) in
+                unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+            {
                 let left = column;
                 column += glyph.width();
                 let start = row.start + offset;
@@ -292,8 +299,8 @@ impl SelectionFrame {
     }
 }
 
-/// Clipboard prose omits the trailing whitespace that selection highlighting
-/// leaves unpainted, while preserving written Line breaks.
+/// Clipboard prose omits trailing whitespace while preserving written Line breaks.
+/// Cutting draft text bypasses this normalization so every removed byte is copied.
 pub(super) fn copy_text(text: &str) -> String {
     text.split('\n')
         .map(str::trim_end)

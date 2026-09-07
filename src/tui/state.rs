@@ -2531,6 +2531,8 @@ pub enum CommandId {
     ExtendSelectionDown,
     ExtendSelectionLineStart,
     ExtendSelectionLineEnd,
+    SelectAll,
+    CutSelection,
     HistoryPrevious,
     HistoryNext,
     ScrollTranscriptPageUp,
@@ -3358,6 +3360,8 @@ impl Application {
             | CommandId::ExtendSelectionDown
             | CommandId::ExtendSelectionLineStart
             | CommandId::ExtendSelectionLineEnd
+            | CommandId::SelectAll
+            | CommandId::CutSelection
             | CommandId::HistoryPrevious
             | CommandId::HistoryNext) => Ok(self.handle_composer_command(command)),
             command @ (CommandId::ScrollTranscriptPageUp
@@ -3626,6 +3630,21 @@ impl Application {
                 self.state.text_selection.set(None);
                 self.state
                     .navigate_composer(|composers, key| composers.extend_selection(key, motion));
+            }
+            CommandId::SelectAll => {
+                if self.state.composers.select_all(self.state.composer_key()) {
+                    self.state.text_selection.set(None);
+                    self.state.sync_composer_completion();
+                }
+            }
+            CommandId::CutSelection => {
+                let mut copied = None;
+                self.state.edit_composer(|composers, key| {
+                    copied = composers.cut_selection(key);
+                });
+                if let Some(text) = copied {
+                    return ApplicationTransition::CopyToClipboard(text.into());
+                }
             }
             CommandId::MoveCursorLeft => self
                 .state
@@ -5933,7 +5952,22 @@ impl Application {
             return command_for_subagent_view_event(event);
         }
         match self.state.command_mode {
-            CommandMode::Composer => command_for_terminal_event(event),
+            CommandMode::Composer => {
+                if matches!(&event, InputEvent::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && key.code == KeyCode::Char('x')
+                        && key.modifiers == KeyModifiers::CONTROL)
+                    && self
+                        .state
+                        .composers
+                        .selection_range(self.state.composer_key())
+                        .is_some()
+                {
+                    Some(CommandId::CutSelection)
+                } else {
+                    command_for_terminal_event(event)
+                }
+            }
             CommandMode::Leader => command_for_leader_event(event),
             CommandMode::QueuedPrompts { .. } => command_for_queued_prompt_event(event),
             CommandMode::InterruptConfirmation { .. } => {

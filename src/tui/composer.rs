@@ -147,6 +147,23 @@ impl ComposerMemory {
         }
     }
 
+    /// Preserve the focus of an already whole selection, including reverse selections.
+    pub(super) fn select_all(&mut self, key: ComposerKey) -> bool {
+        let text_len = self.text(key.clone()).len();
+        if text_len == 0 || self.selection_range(key.clone()) == Some(0..text_len) {
+            return false;
+        }
+        self.select(key, 0, text_len);
+        true
+    }
+
+    pub(super) fn cut_selection(&mut self, key: ComposerKey) -> Option<String> {
+        let range = self.selection_range(key.clone())?;
+        let text = self.text(key.clone())[range].to_owned();
+        self.composer_mut(key).insert("");
+        Some(text)
+    }
+
     pub(super) fn copy_selection(&self, key: ComposerKey) -> Option<String> {
         let range = self.selection_range(key.clone())?;
         Some(super::selection::copy_text(self.text(key).get(range)?))

@@ -1882,7 +1882,13 @@ fn composer_selection_highlights_typed_text_and_not_the_padding_past_it() {
             .find(|x| !buffer[(*x, y)].symbol().trim().is_empty())
             .expect("each selected row holds typed text");
         assert!(last_text + 1 < border, "row {y} has no padding to check");
-        for x in last_text + 1..border {
+        // Each wrapped row retains the draft's single word-separating space.
+        // Only the cells after that character are layout padding.
+        let padding_start = last_text + if y < end.1 { 2 } else { 1 };
+        if y < end.1 {
+            assert!(reversed((last_text + 1, y)));
+        }
+        for x in padding_start..border {
             assert!(!reversed((x, y)), "padding lit at {x},{y}");
         }
     }
@@ -2809,4 +2815,200 @@ fn keyboard_selection_continues_mouse_anchor_and_escapes_before_completion_popup
             .join("\n")
             .contains(" Skills ")
     );
+}
+
+#[test]
+fn select_all_highlights_draft_spaces_without_padding_and_repeating_preserves_focus() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_terminal_event(InputEvent::Paste("alpha  \nbravo  ".to_owned()))
+        .unwrap();
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        ))),
+        Some(CommandId::SelectAll),
+    );
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    for line in ["alpha  ", "bravo  "] {
+        assert_composer_mark(&application, 100, line, true);
+        let buffer = rendered_application_buffer(&application, 100, 32);
+        let (x, y) = text_position(&buffer, line);
+        assert!(
+            !buffer[(x + line.len() as u16, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+    let selected = rendered_application_buffer(&application, 100, 32);
+    let focus = rendered_application_cursor_at(&application, 100, 32);
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert_eq!(rendered_application_buffer(&application, 100, 32), selected);
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+
+    // A whole draft selected backwards must retain its focus at the start.
+    composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    let focus = rendered_application_cursor_at(&application, 100, 32);
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("alpha\nbravo".into()),
+    );
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+    assert_composer_mark(&application, 100, "alpha", false);
+}
+
+#[test]
+fn select_all_empty_draft_preserves_transcript_selection_and_new_selection_replaces_it() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    enter_session(&mut application, workspace.path());
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let transcript = text_position(&buffer, "Initial Prompt");
+    super::selection::drag(
+        &mut application,
+        transcript,
+        (transcript.0 + 6, transcript.1),
+    );
+    let before = rendered_application_buffer(&application, 100, 32);
+    let focus = rendered_application_cursor_at(&application, 100, 32);
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert_eq!(rendered_application_buffer(&application, 100, 32), before);
+    assert_eq!(rendered_application_cursor_at(&application, 100, 32), focus);
+    type_terminal_text(&mut application, "draft");
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert_composer_mark(&application, 100, "Initial", false);
+    assert_composer_mark(&application, 100, "draft", true);
+}
+
+#[test]
+fn cut_copies_exact_plain_text_in_both_modes_and_without_selection_remains_leader() {
+    for copy in [
+        suru::protocol::TextSelectionCopy::Manual,
+        suru::protocol::TextSelectionCopy::Release,
+    ] {
+        let workspace = workspace_dir();
+        let mut application = connected_application(workspace.path());
+        let mut settings = suru::protocol::EffectiveSettings::default();
+        settings.text_selection.copy = copy;
+        crate::support::deliver_settings(&mut application, settings);
+        application
+            .handle_terminal_event(InputEvent::Paste("keep 界  \ntail  ".to_owned()))
+            .unwrap();
+        composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+        composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::SHIFT);
+        // Move focus forward while preserving the anchor at the draft's end.
+        for _ in 0..5 {
+            composer_selection_key(&mut application, KeyCode::Right, KeyModifiers::SHIFT);
+        }
+        let cut_key = InputEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(
+            application.command_for_terminal_input(cut_key.clone()),
+            Some(CommandId::CutSelection)
+        );
+        assert_eq!(
+            application.handle_terminal_event(cut_key.clone()).unwrap(),
+            ApplicationTransition::CopyToClipboard("界  \ntail  ".into())
+        );
+        assert_composer_mark(&application, 100, "keep ", false);
+        type_terminal_text(&mut application, "here");
+        assert_composer_mark(&application, 100, "keep here", false);
+        assert_eq!(
+            application.command_for_terminal_input(cut_key.clone()),
+            Some(CommandId::BeginLeader)
+        );
+        application.handle_terminal_event(cut_key).unwrap();
+        // The existing leader command opens the Theme picker.
+        composer_selection_key(&mut application, KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            rendered_application_rows(&application)
+                .join("\n")
+                .contains("Themes")
+        );
+    }
+}
+
+#[test]
+fn select_all_and_cut_work_with_completion_popup() {
+    let (_workspace, mut application) = application_with_skills(
+        vec![SkillDescriptor {
+            id: SkillId::new("review-id"),
+            name: "review".to_owned(),
+            description: "Review changes".to_owned(),
+            scope: None,
+        }],
+        None,
+    );
+    type_terminal_text(&mut application, "$rev");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    composer_selection_key(&mut application, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let focus = rendered_application_cursor_at(&application, 100, 32);
+    for x in focus.x - 4..focus.x {
+        assert!(
+            buffer[(x, focus.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('x'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("$rev".into())
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains(" Skills ")
+    );
+    type_terminal_text(&mut application, "replaced");
+    assert_composer_mark(&application, 100, "replaced", false);
+}
+
+#[test]
+fn select_all_and_cut_bindings_leave_sidebar_and_picker_ownership_alone() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    crate::support::deliver_settings(&mut application, settings);
+    type_terminal_text(&mut application, "draft");
+    composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::SHIFT);
+    for sidebar in [true, false] {
+        if sidebar {
+            composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        } else {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    suru::tui::SemanticCommandId::ThemeList,
+                )))
+                .unwrap();
+        }
+        for (key, command) in [('a', CommandId::SelectAll), ('x', CommandId::CutSelection)] {
+            assert_ne!(
+                application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::CONTROL
+                ))),
+                Some(command)
+            );
+            composer_selection_key(&mut application, KeyCode::Char(key), KeyModifiers::CONTROL);
+        }
+        if sidebar {
+            composer_selection_key(&mut application, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        } else {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::CloseThemePicker))
+                .unwrap();
+        }
+        assert_composer_mark(&application, 140, "draft", true);
+    }
 }
