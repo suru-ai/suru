@@ -54,9 +54,12 @@ fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() 
         sidebar_is_drawn(&rows),
         "the Sidebar takes a fixed 32-column left column, divided down the frame: {rows:?}"
     );
-    let landing = rendered_row(&rows, "What would you like to work on?");
+    let landing = rendered_row(&rows, "▀▀▀▀▀▀▀▀█▀▀▀▀▀");
     assert!(
-        rows[landing].find("What").expect("the question is drawn") > 31,
+        rows[landing]
+            .find("▀▀▀▀▀▀▀▀█▀▀▀▀▀")
+            .expect("the logo is drawn")
+            > 31,
         "the Landing lays itself out in the columns the Sidebar left: {:?}",
         rows[landing]
     );
@@ -774,9 +777,7 @@ fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
         "a terminal too narrow for the Sidebar plus a usable main view keeps the main view"
     );
     assert!(
-        squeezed
-            .iter()
-            .any(|row| row.contains("What would you like to work on?")),
+        squeezed.iter().any(|row| row.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀")),
         "the main view is drawn in full: {squeezed:?}"
     );
 
@@ -7553,7 +7554,7 @@ fn the_shell_a_session_opens_into_fabricates_nothing_from_its_listing_row() {
         "the listing's Title is drawn as though it were the Session's own: {main}"
     );
     assert!(
-        !main.contains("What would you like to work on?"),
+        !main.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "and a Session being opened is not the Landing: {main}"
     );
 }
@@ -7708,7 +7709,7 @@ fn opening_the_landing_while_a_session_loads_leaves_the_shell_behind() {
         "the client lets go of the Session it was opening"
     );
     assert!(
-        main_view(&application).contains("What would you like to work on?"),
+        main_view(&application).contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "and the reader is on the Landing"
     );
     assert!(

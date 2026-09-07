@@ -33,7 +33,7 @@ fn slash_autocomplete_invokes_new_session_from_a_description_match() {
         ApplicationTransition::DetachSession
     );
     let landing = rendered_application_rows(&application).join("\n");
-    assert!(landing.contains("What would you like to work on?"));
+    assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(landing.contains("Type a Prompt and press Enter"));
     assert!(!landing.contains("Long-running work"));
     assert!(!landing.contains("/new"));

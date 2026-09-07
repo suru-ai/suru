@@ -108,9 +108,7 @@ fn a_syntax_broken_config_document_notices_the_failure_and_points_at_the_log() {
         "the Notice points at the Log, where the whole diagnostic is: {notice:?}"
     );
     assert!(
-        landing
-            .join("\n")
-            .contains("What would you like to work on?"),
+        landing.join("\n").contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "the Notice sits above the Landing rather than replacing it: {landing:?}"
     );
 }

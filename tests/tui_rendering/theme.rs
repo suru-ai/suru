@@ -695,10 +695,23 @@ fn a_named_theme_paints_ordinary_text_with_its_own_foreground() {
         connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
     deliver_settings(&mut application, themed("catppuccin"));
 
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Theme sample".to_owned(),
+        )))
+        .expect("type sample text");
     let landing = rendered_application_buffer(&application, 100, 20);
     assert_eq!(
         landing
-            .cell(text_position(&landing, "What would you like to work on?"))
+            .cell(text_position(&landing, "▀▀▀▀▀▀▀▀█▀▀▀▀▀"))
+            .unwrap()
+            .fg,
+        Color::Rgb(137, 180, 250),
+        "the Landing logo keeps the primary accent"
+    );
+    assert_eq!(
+        landing
+            .cell(text_position(&landing, "Theme sample"))
             .unwrap()
             .fg,
         Color::Rgb(205, 214, 244)
@@ -722,11 +735,16 @@ fn a_two_variant_theme_repaints_when_mode_changes() {
         &mut application,
         themed_in_mode("catppuccin", AppearanceMode::Light),
     );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Theme sample".to_owned(),
+        )))
+        .expect("type sample text");
     let light = rendered_application_buffer(&application, 100, 20);
     assert_eq!(light.cell((99, 0)).unwrap().bg, Color::Rgb(239, 241, 245));
     assert_eq!(
         light
-            .cell(text_position(&light, "What would you like to work on?"))
+            .cell(text_position(&light, "Theme sample"))
             .unwrap()
             .fg,
         Color::Rgb(76, 79, 105)
@@ -1016,6 +1034,11 @@ fn a_named_theme_follows_the_terminals_truecolor_capability() {
         connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(false));
     deliver_settings(&mut indexed, themed("catppuccin"));
 
+    indexed
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Theme sample".to_owned(),
+        )))
+        .expect("type sample text");
     let indexed = rendered_application_buffer(&indexed, 100, 20);
     assert!(
         indexed.content().iter().all(|cell| {
@@ -1025,7 +1048,7 @@ fn a_named_theme_follows_the_terminals_truecolor_capability() {
     );
     assert_eq!(
         indexed
-            .cell(text_position(&indexed, "What would you like to work on?"))
+            .cell(text_position(&indexed, "Theme sample"))
             .unwrap()
             .fg,
         Color::Indexed(189),
@@ -1036,10 +1059,15 @@ fn a_named_theme_follows_the_terminals_truecolor_capability() {
         connected_application_with_terminal_facts(workspace.path(), TerminalFacts::unprobed(true));
     deliver_settings(&mut truecolor, themed("catppuccin"));
 
+    truecolor
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Theme sample".to_owned(),
+        )))
+        .expect("type sample text");
     let truecolor = rendered_application_buffer(&truecolor, 100, 20);
     assert_eq!(
         truecolor
-            .cell(text_position(&truecolor, "What would you like to work on?"))
+            .cell(text_position(&truecolor, "Theme sample"))
             .unwrap()
             .fg,
         Color::Rgb(205, 214, 244)
@@ -1055,10 +1083,15 @@ fn a_named_theme_quantizes_against_the_terminals_reported_indexed_colors() {
     let mut application = connected_application_with_terminal_facts(workspace.path(), facts);
     deliver_settings(&mut application, themed("catppuccin"));
 
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Theme sample".to_owned(),
+        )))
+        .expect("type sample text");
     let buffer = rendered_application_buffer(&application, 100, 20);
     assert_eq!(
         buffer
-            .cell(text_position(&buffer, "What would you like to work on?"))
+            .cell(text_position(&buffer, "Theme sample"))
             .unwrap()
             .fg,
         Color::Indexed(1),

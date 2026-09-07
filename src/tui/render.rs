@@ -57,7 +57,16 @@ use super::{
 const NARROW_TERMINAL_WIDTH: u16 = 44;
 const MINIMUM_TERMINAL_WIDTH: u16 = 28;
 const MINIMUM_TERMINAL_HEIGHT: u16 = 5;
-const LANDING_BRAND_MINIMUM_HEIGHT: u16 = 9;
+const LANDING_DETAILS_MINIMUM_HEIGHT: u16 = 9;
+const LANDING_LOGO: [&str; 7] = [
+    "        █          ▀▀▀▀▀▀▀█",
+    "▀▀▀▀▀▀▀▀█▀▀▀▀▀          ▄▀",
+    "     ▄▀▀█             ▄▀",
+    "     ▀▄▄█           ▄▀▀▀▀▀▄",
+    "        █          █       █",
+    "       ▄▀           ▄▀▀▄   █",
+    "     ▀▀             ▀▄▄▀▄▄▀",
+];
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 /// Rows of air the layout keeps below the Transcript, so its last entry never
 /// abuts whatever is docked underneath.
@@ -2846,8 +2855,7 @@ fn render_landing(
     theme: &Theme,
 ) -> RenderedComposer {
     let detail = ResponsiveDetail::for_width(area.width);
-    let show_brand = area.height >= LANDING_BRAND_MINIMUM_HEIGHT;
-    let footer_detail = detail.secondary_only_when(show_brand);
+    let footer_detail = detail.secondary_only_when(area.height >= LANDING_DETAILS_MINIMUM_HEIGHT);
     let footer_width = area
         .width
         .saturating_sub(horizontal_padding(area.width).saturating_mul(2));
@@ -2882,32 +2890,32 @@ fn render_landing(
         composer_cursor,
     );
     let error_height = u16::from(state.submission_error.is_some());
-    let show_question = state.submission_error.is_none()
-        || main.height
-            >= composer_height
-                .saturating_add(error_height)
-                .saturating_add(1);
+    let logo_width = LANDING_LOGO
+        .iter()
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(0) as u16;
+    let logo_height = LANDING_LOGO.len() as u16;
+    let brand_height = logo_height + 1;
+    let show_brand = content.width >= logo_width
+        && content.height >= composer_height + error_height + brand_height;
     let panel_height = composer_height
-        .saturating_add(u16::from(show_question))
-        .saturating_add(u16::from(show_brand))
+        .saturating_add(if show_brand { brand_height } else { 0 })
         .saturating_add(error_height);
     let panel = centered_rect(content, 72, panel_height);
     let mut row = panel.y;
     if show_brand {
         frame.render_widget(
-            Paragraph::new("Suru")
-                .alignment(Alignment::Center)
+            Paragraph::new(LANDING_LOGO.join("\n"))
                 .style(theme.accent.primary.add_modifier(Modifier::BOLD)),
-            Rect::new(panel.x, row, panel.width, 1),
+            Rect::new(
+                panel.x + (panel.width - logo_width) / 2,
+                row,
+                logo_width,
+                logo_height,
+            ),
         );
-        row = row.saturating_add(1);
-    }
-    if show_question {
-        frame.render_widget(
-            Paragraph::new("What would you like to work on?").alignment(Alignment::Center),
-            Rect::new(panel.x, row, panel.width, 1),
-        );
-        row = row.saturating_add(1);
+        row = row.saturating_add(brand_height);
     }
     if let Some(error) = &state.submission_error {
         frame.render_widget(
@@ -4063,7 +4071,7 @@ mod tests {
         ));
 
         let screen = rendered_rows(&application).join("\n");
-        assert!(screen.contains("What would you like to work on?"));
+        assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
         assert!(screen.contains("Connection failed"));
         assert!(screen.contains("unknown event type 'future_event'"));
     }
@@ -4187,9 +4195,9 @@ mod tests {
             .iter()
             .position(|row| row.contains("notice from an extension"))
             .unwrap();
-        let question = rows
+        let logo = rows
             .iter()
-            .position(|row| row.contains("What would you like to work on?"))
+            .position(|row| row.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"))
             .unwrap();
 
         assert!(
@@ -4197,7 +4205,7 @@ mod tests {
             "a failed contribution reports above the slot"
         );
         assert!(
-            notice < question,
+            notice < logo,
             "the Notice sits above the Landing rather than over it"
         );
     }

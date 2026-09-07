@@ -430,7 +430,7 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
         "the picker is done with: {landing}"
     );
     assert!(
-        landing.contains("What would you like to work on?"),
+        landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "the Landing stands in its place: {landing}"
     );
     assert!(
@@ -509,7 +509,7 @@ fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
     );
     let switched = rendered_application_rows_at(&application, 120, 20).join("\n");
     assert!(
-        switched.contains("What would you like to work on?"),
+        switched.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "a subsequent valid pick from the still-open picker closes it on a Landing: {switched}"
     );
     assert_eq!(
@@ -759,7 +759,7 @@ fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
     let rows = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
     let frame = rows.join("\n");
     assert!(
-        frame.contains("What would you like to work on?"),
+        frame.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "the Landing stands where the Session was, with nothing asked in between: {frame}"
     );
     assert!(
@@ -800,10 +800,7 @@ fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
         !landing.contains("Workspaces"),
         "the picker is done with: {landing}"
     );
-    assert!(
-        landing.contains("What would you like to work on?"),
-        "{landing}"
-    );
+    assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"), "{landing}");
     assert!(
         landing.contains(here.to_string_lossy().as_ref()),
         "and the Workspace is where it was: {landing}"

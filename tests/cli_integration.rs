@@ -1556,7 +1556,7 @@ async fn clean_tui_exit_restores_the_terminal() {
     timeout(Duration::from_secs(10), async {
         loop {
             assert!(tui.is_running(), "TUI exited before clean-exit input");
-            if String::from_utf8_lossy(&tui.shown()).contains("Suru") {
+            if String::from_utf8_lossy(&tui.shown()).contains("Prompt") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

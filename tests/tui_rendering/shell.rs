@@ -46,7 +46,7 @@ fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_g
 
     let landing = rendered_application_rows_at(&application, 100, 20).join("\n");
     assert!(
-        landing.contains("What would you like to work on?"),
+        landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "the client starts on the Workspace it cannot read: {landing:?}"
     );
     assert!(
@@ -79,7 +79,7 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
     assert_eq!(managed_transition, ApplicationTransition::Continue);
 
     let screen = rendered_application_rows(&application).join("\n");
-    assert!(screen.contains("What would you like to work on?"));
+    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
@@ -204,7 +204,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             .expect("handle managed event");
     }
     let landing = rendered_application_rows(&application).join("\n");
-    assert!(landing.contains("What would you like to work on?"));
+    assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(landing.contains("Prompt"));
 
     for character in "Explain this workspace".chars() {
@@ -357,7 +357,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(created)))
         .expect("ignore a queued event from the ended Session");
     let after_replacement = rendered_application_rows(&application).join("\n");
-    assert!(after_replacement.contains("What would you like to work on?"));
+    assert!(after_replacement.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(after_replacement.contains("Keep this unsent draft"));
     assert!(after_replacement.contains("Session ended because the shared server was replaced"));
     assert!(!after_replacement.contains("Explain this workspace"));
@@ -372,7 +372,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
     let screen = rendered_state_rows(&Application::default()).join("\n");
 
-    assert!(screen.contains("What would you like to work on?"));
+    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Type a Prompt and press Enter"));
     assert!(screen.contains("Connecting to Suru server..."));
 }
@@ -384,11 +384,46 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
     let state = connected_state(instance_id, 42_424);
 
     let screen = rendered_state_rows(&state).join("\n");
-    assert!(screen.contains("What would you like to work on?"));
+    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
+}
+
+#[test]
+fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
+    let workspace = workspace_dir();
+    for draft in ["", "one\ntwo\nthree\nfour"] {
+        let mut application = connected_application(workspace.path());
+        type_terminal_text(&mut application, draft);
+        for (width, height) in [(80, 20), (80, 21), (43, 20)] {
+            let rows = rendered_application_rows_at(&application, width, height);
+            let logo_top = rendered_row(&rows, "█          ▀▀▀▀▀▀▀█");
+            let logo_bottom = rendered_row(&rows, "▀▄▄▀▄▄▀");
+            let composer_top = rendered_row(&rows, "┌");
+            let composer_bottom = rendered_row(&rows, "└");
+            let footer = rendered_row(&rows, "Connected");
+            let below = footer - composer_bottom - 1;
+            assert!(
+                logo_top.abs_diff(below) <= 1,
+                "logo and composer share equal space above and below: {rows:?}"
+            );
+            assert_eq!(logo_bottom - logo_top, 6);
+            assert_eq!(composer_top - logo_bottom, 2, "one blank row before input");
+            let logo_left = rows[logo_top..=logo_bottom]
+                .iter()
+                .filter_map(|row| row.chars().position(|ch| ch != ' '))
+                .min()
+                .unwrap();
+            let logo_right = rows[logo_top..=logo_bottom]
+                .iter()
+                .map(|row| row.trim_end().chars().count())
+                .max()
+                .unwrap();
+            assert!(logo_left.abs_diff(width as usize - logo_right) <= 1);
+        }
+    }
 }
 
 #[test]
@@ -403,8 +438,6 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 
     let wide = rendered_application_rows_at(&application, 80, 16).join("\n");
     for content in [
-        "Suru",
-        "What would you like to work on?",
         "Keep the composer usable",
         "Agent unavailable",
         "Workspace",
@@ -417,19 +450,17 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
         );
     }
 
+    assert!(wide.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!wide.contains("What would you like to work on?"));
+
     let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
-    for core in [
-        "Suru",
-        "What would you like to work on?",
-        "Keep the composer usable",
-        "Agent unavailable",
-        "Connected",
-    ] {
+    for core in ["Keep the composer usable", "Agent unavailable", "Connected"] {
         assert!(
             narrow.contains(core),
             "narrow landing frame omitted {core:?}"
         );
     }
+    assert!(!narrow.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     for secondary in ["Workspace", "Provider", "Model", "Enter submit"] {
         assert!(
             !narrow.contains(secondary),
@@ -439,7 +470,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
 
     let short = rendered_application_rows_at(&application, 80, 6).join("\n");
     assert!(!short.contains("Suru"));
-    assert!(short.contains("What would you like to work on?"));
+    assert!(!short.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(short.contains("Keep the composer usable"));
     assert!(short.contains("Connected"));
 
@@ -813,7 +844,7 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
 
     let screen = rendered_state_rows(&state).join("\n");
 
-    assert!(screen.contains("What would you like to work on?"));
+    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Recovering"));
     assert!(screen.contains("pid 42424"));
 }
@@ -920,7 +951,7 @@ fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
         .expect("stop server");
 
     let screen = rendered_state_rows(&state).join("\n");
-    assert!(screen.contains("What would you like to work on?"));
+    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Shared server stopped intentionally"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));
