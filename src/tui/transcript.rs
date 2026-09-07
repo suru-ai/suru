@@ -705,6 +705,15 @@ static SEPARATOR_LINE: StyledLine = StyledLine {
     markdown: None,
 };
 
+/// One cell of a wrapped row that draws text: its row-local column, its
+/// width, and the byte offset of its grapheme in the line's written text.
+#[derive(Clone, Copy, Debug)]
+struct TextCell {
+    column: usize,
+    width: usize,
+    offset: usize,
+}
+
 /// What a Transcript row draws: a unit's separator, or one wrapped row of a
 /// projected line.
 enum RowAt<'a> {
@@ -922,7 +931,7 @@ impl TranscriptView {
             else {
                 continue;
             };
-            for (column, width, _) in self.text_cells(source, wrapped) {
+            for TextCell { column, width, .. } in self.text_cells(source, wrapped) {
                 let selected_from_start = row > start.row || column + width > start.column;
                 let selected_to_end = row < end.row || column <= end.column;
                 if !(selected_from_start && selected_to_end) {
@@ -1008,13 +1017,13 @@ impl TranscriptView {
                 continue;
             }
             let screen_row = first_row + index;
-            for (column, _, offset) in self.text_cells(source, &other.row) {
-                if !word.contains(&offset) {
+            for text_cell in self.text_cells(source, &other.row) {
+                if !word.contains(&text_cell.offset) {
                     continue;
                 }
                 let cell = SelectionCell {
                     row: screen_row,
-                    column,
+                    column: text_cell.column,
                 };
                 first.get_or_insert(cell);
                 last = Some(cell);
@@ -1023,11 +1032,10 @@ impl TranscriptView {
         Some((first?, last?))
     }
 
-    /// The cells of a wrapped row that draw text rather than chrome, each as
-    /// its row-local column, width, and byte offset into the line's text,
-    /// read the way the draw and the offset lookup read them: symbol by
-    /// symbol, span by span, past the indent.
-    fn text_cells(&self, source: &StyledLine, wrapped: &StyledRow) -> Vec<(usize, usize, usize)> {
+    /// The cells of a wrapped row that draw text rather than chrome, read the
+    /// way the draw and the offset lookup read them: symbol by symbol, span by
+    /// span, past the indent.
+    fn text_cells(&self, source: &StyledLine, wrapped: &StyledRow) -> Vec<TextCell> {
         use unicode_segmentation::UnicodeSegmentation;
         let maximum = usize::from(self.key.width);
         let mut cells = Vec::new();
@@ -1043,7 +1051,11 @@ impl TranscriptView {
                     continue;
                 }
                 if !span.chrome {
-                    cells.push((column, width, span_start + from + offset));
+                    cells.push(TextCell {
+                        column,
+                        width,
+                        offset: span_start + from + offset,
+                    });
                 }
                 column += width;
             }

@@ -8493,3 +8493,31 @@ fn the_word_gesture_is_a_semantic_command() {
         "text_selection.word"
     );
 }
+
+#[test]
+fn zz_probe_fold_marker() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let rows = rendered_application_rows_at(&application, 60, 24);
+    left_click_at(&mut application, rendered_row(&rows, "✓ cargo test") as u16).unwrap();
+    let peek = rendered_application_rows_at(&application, 60, 24);
+    for (i, r) in peek.iter().enumerate() {
+        eprintln!("{i:2}|{r}|");
+    }
+    left_click_at(&mut application, rendered_row(&peek, "… +6 lines") as u16).unwrap();
+    for (i, r) in rendered_application_rows_at(&application, 60, 24)
+        .iter()
+        .enumerate()
+    {
+        eprintln!("{i:2}|{r}|");
+    }
+}

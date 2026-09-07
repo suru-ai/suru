@@ -83,8 +83,7 @@ const CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// How far, in cells on either axis, a press may land from the previous one
 /// and still continue the click count.
 const CLICK_SLOP: u16 = 1;
-/// Click counts stop growing here: a fourth rapid click keeps what the third
-/// selected.
+/// Click counts stop growing here, so a fourth rapid click reads as a third.
 const CLICK_COUNT_LIMIT: u8 = 3;
 
 #[derive(Clone)]
@@ -2316,17 +2315,13 @@ struct LastClick {
 }
 
 impl LastClick {
-    fn continues(
-        &self,
-        surface: Option<SelectionSurface>,
-        position: Position,
-        at: Instant,
-        interval: Duration,
-    ) -> bool {
-        self.surface == surface
-            && at.saturating_duration_since(self.at) <= interval
-            && self.position.x.abs_diff(position.x) <= CLICK_SLOP
-            && self.position.y.abs_diff(position.y) <= CLICK_SLOP
+    /// Whether `next` continues this click's count: same surface, within the
+    /// interval, and within the slop on either axis.
+    fn continues(&self, next: &LastClick, interval: Duration) -> bool {
+        self.surface == next.surface
+            && next.at.saturating_duration_since(self.at) <= interval
+            && self.position.x.abs_diff(next.position.x) <= CLICK_SLOP
+            && self.position.y.abs_diff(next.position.y) <= CLICK_SLOP
     }
 }
 
@@ -3360,32 +3355,13 @@ impl Application {
                             .map(|cell| (cell, frame.epoch(), frame.surface))
                     })
                     .or_else(|| {
-                        if !self.state.overlay_owns_input()
-                            && !self.state.reconnect_overlay_visible
-                            && self.state.active_selection_overlay_area().is_none()
-                        {
-                            self.state
-                                .session_reference
-                                .as_ref()
-                                .and_then(|session| self.state.session_interaction(session))
-                                .and_then(|interaction| {
-                                    interaction.viewport.borrow().as_ref().and_then(|viewport| {
-                                        let row = viewport.transcript_row(position)?;
-                                        (row < self.state.transcript_cache.row_count()).then_some((
-                                            SelectionCell {
-                                                row,
-                                                column: usize::from(
-                                                    position.x - viewport.content_left,
-                                                ),
-                                            },
-                                            self.state.transcript_cache.selection_epoch(),
-                                            SelectionSurface::Transcript,
-                                        ))
-                                    })
-                                })
-                        } else {
-                            None
-                        }
+                        self.transcript_cell(position).map(|cell| {
+                            (
+                                cell,
+                                self.state.transcript_cache.selection_epoch(),
+                                SelectionSurface::Transcript,
+                            )
+                        })
                     });
 
                 self.state.left_press = Some(LeftPress {
@@ -3398,23 +3374,19 @@ impl Application {
                         .is_some_and(|area| !area.contains(position)),
                     selection_anchor,
                 });
-                let surface = selection_anchor.map(|(_, _, surface)| surface);
-                let now = self.state.presentation_clock.now();
-                let count = match self.state.last_click {
-                    Some(last)
-                        if last.continues(surface, position, now, self.state.click_interval) =>
-                    {
-                        last.count.saturating_add(1).min(CLICK_COUNT_LIMIT)
-                    }
-                    _ => 1,
-                };
-                self.state.last_click = Some(LastClick {
-                    count,
-                    surface,
+                let mut click = LastClick {
+                    count: 1,
+                    surface: selection_anchor.map(|(_, _, surface)| surface),
                     position,
-                    at: now,
-                });
-                if count >= 2 && surface == Some(SelectionSurface::Transcript) {
+                    at: self.state.presentation_clock.now(),
+                };
+                if let Some(last) = self.state.last_click
+                    && last.continues(&click, self.state.click_interval)
+                {
+                    click.count = last.count.saturating_add(1).min(CLICK_COUNT_LIMIT);
+                }
+                self.state.last_click = Some(click);
+                if click.count >= 2 && click.surface == Some(SelectionSurface::Transcript) {
                     self.invoke_semantic(SemanticInvocation {
                         id: SemanticCommandId::TextSelectionWord,
                         subject: SemanticSubject::ScreenPosition(position),
@@ -3456,29 +3428,30 @@ impl Application {
                     };
                 }
 
-                if let Some(press) = self.state.left_press.take()
-                    && !press.dragged
-                    && press.position == position
-                {
-                    let click = self.invoke_semantic(SemanticInvocation {
+                let Some(press) = self.state.left_press.take() else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                let mut transition = ApplicationTransition::Continue;
+                if !press.dragged && press.position == position {
+                    transition = self.invoke_semantic(SemanticInvocation {
                         id: SemanticCommandId::PointerClick,
                         subject: SemanticSubject::ScreenPosition(position),
                     })?;
-                    // A press that marked a word made a selection the way a
-                    // drag does, so its release copies the way a drag's does.
-                    if self.state.settings.text_selection.copy == TextSelectionCopy::Release
-                        && self.state.text_selection.get().is_some_and(|selection| {
-                            selection.granularity != SelectionGranularity::Cell
-                        })
-                    {
-                        let copy = self.invoke_semantic(SemanticCommandId::TextSelectionCopy)?;
-                        if matches!(copy, ApplicationTransition::CopyToClipboard(_)) {
-                            return Ok(copy);
-                        }
-                    }
-                    return Ok(click);
                 }
-                Ok(ApplicationTransition::Continue)
+                // A press that marked a word made a selection the way a drag
+                // does, so its release copies the way a drag's does; the copy
+                // is what the release reports when both happen.
+                if self.state.settings.text_selection.copy == TextSelectionCopy::Release
+                    && self.state.text_selection.get().is_some_and(|selection| {
+                        selection.granularity != SelectionGranularity::Cell
+                    })
+                {
+                    let copy = self.invoke_semantic(SemanticCommandId::TextSelectionCopy)?;
+                    if matches!(copy, ApplicationTransition::CopyToClipboard(_)) {
+                        return Ok(copy);
+                    }
+                }
+                Ok(transition)
             }
             CommandId::ClickAt { position } => self.handle_click(position),
             CommandId::OpenContextMenuAt { position } => {
@@ -4623,32 +4596,41 @@ impl Application {
         }
     }
 
-    /// Makes the word under a Transcript cell the standing Text Selection,
-    /// or leaves none when no word is there.
-    fn select_transcript_word(&mut self, position: Position) {
+    /// The Transcript cell under a screen position while the Transcript can
+    /// take the pointer: no overlay owns input and the position lies on a
+    /// projected row.
+    fn transcript_cell(&self, position: Position) -> Option<SelectionCell> {
         if self.state.overlay_owns_input()
             || self.state.reconnect_overlay_visible
             || self.state.active_selection_overlay_area().is_some()
         {
-            return;
+            return None;
         }
-        let Some(interaction) = self
+        let interaction = self
             .state
             .session_reference
             .as_ref()
-            .and_then(|session| self.state.session_interaction(session))
-        else {
-            return;
-        };
+            .and_then(|session| self.state.session_interaction(session))?;
         let viewport = interaction.viewport.borrow();
-        let Some(viewport) = viewport.as_ref() else {
+        let viewport = viewport.as_ref()?;
+        let row = viewport.transcript_row(position)?;
+        (row < self.state.transcript_cache.row_count()).then_some(SelectionCell {
+            row,
+            column: usize::from(position.x - viewport.content_left),
+        })
+    }
+
+    /// Makes the word under a Transcript cell the standing Text Selection,
+    /// or leaves none when no word is there.
+    fn select_transcript_word(&mut self, position: Position) {
+        let Some(cell) = self.transcript_cell(position) else {
             return;
         };
-        let Some(row) = viewport.transcript_row(position) else {
-            return;
-        };
-        let column = usize::from(position.x - viewport.content_left);
-        let Some((anchor, focus)) = self.state.transcript_cache.word_cells(row, column) else {
+        let Some((anchor, focus)) = self
+            .state
+            .transcript_cache
+            .word_cells(cell.row, cell.column)
+        else {
             return;
         };
         self.state.text_selection.set(Some(TextSelection {
