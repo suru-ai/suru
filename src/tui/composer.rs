@@ -239,6 +239,16 @@ impl ComposerMemory {
         self.composer_mut(key).move_right();
     }
 
+    pub(super) fn move_line_start(&mut self, key: ComposerKey) {
+        let composer = self.composer_mut(key);
+        composer.cursor = composer.line_start();
+    }
+
+    pub(super) fn move_line_end(&mut self, key: ComposerKey) {
+        let composer = self.composer_mut(key);
+        composer.cursor = composer.line_end();
+    }
+
     pub(super) fn history_previous(&mut self, key: ComposerKey) {
         self.composer_mut(key).history_previous();
     }

@@ -1956,3 +1956,92 @@ fn composer_selection_unwraps_without_moving_the_cursor_or_editing_the_draft() {
         buffer_rows(&buffer)
     );
 }
+
+#[test]
+fn composer_line_edges_resolve_through_application_and_stay_on_the_written_line() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let draft = "first\na🙂β middle wraps across rows\nlast";
+    application
+        .handle_terminal_event(InputEvent::Paste(draft.to_owned()))
+        .expect("paste a multiline draft");
+    for _ in 0..8 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .expect("move into the middle Line");
+    }
+
+    for (code, modifiers, command) in [
+        (
+            KeyCode::Home,
+            KeyModifiers::NONE,
+            Some(CommandId::MoveCursorLineStart),
+        ),
+        (
+            KeyCode::End,
+            KeyModifiers::NONE,
+            Some(CommandId::MoveCursorLineEnd),
+        ),
+        (
+            KeyCode::End,
+            KeyModifiers::CONTROL,
+            Some(CommandId::FollowLatest),
+        ),
+        (KeyCode::Home, KeyModifiers::CONTROL, None),
+    ] {
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(code, modifiers))),
+            command,
+        );
+    }
+    let buffer = rendered_application_buffer(&application, 80, 30);
+    let middle = text_position(&buffer, "a🙂");
+    for (code, column) in [(KeyCode::Home, 0), (KeyCode::End, 29), (KeyCode::Home, 0)] {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .expect("move to the written Line edge");
+        assert_eq!(
+            rendered_application_cursor_at(&application, 80, 30),
+            Position::new(middle.0 + column, middle.1),
+        );
+        assert_eq!(rendered_application_buffer(&application, 80, 30), buffer);
+    }
+    // A narrow terminal wraps the Line; its edges still mean the written Line.
+    let narrow = rendered_application_buffer(&application, 28, 30);
+    let start = text_position(&narrow, "a🙂");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )))
+        .expect("move past the wrapped row");
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Home,
+            KeyModifiers::NONE,
+        )))
+        .expect("return to the written Line start");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(start.0, start.1)
+    );
+
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("give the Sidebar the keys");
+    for code in [KeyCode::Home, KeyCode::End] {
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE
+            ))),
+            None
+        );
+    }
+}

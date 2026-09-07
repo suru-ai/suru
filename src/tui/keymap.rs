@@ -86,7 +86,7 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
                 (KeyCode::PageDown, KeyModifiers::NONE) => {
                     Some(CommandId::ScrollTranscriptPageDown)
                 }
-                (KeyCode::End, KeyModifiers::NONE) => Some(CommandId::FollowLatest),
+                (KeyCode::End, KeyModifiers::CONTROL) => Some(CommandId::FollowLatest),
                 (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                     Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
                 }
@@ -700,8 +700,20 @@ const COMMAND_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         code: KeyCode::End,
         modifiers: KeyModifiers::NONE,
-        command: CommandId::FollowLatest,
+        command: CommandId::MoveCursorLineEnd,
         label: "End",
+    },
+    CommandBinding {
+        code: KeyCode::Home,
+        modifiers: KeyModifiers::NONE,
+        command: CommandId::MoveCursorLineStart,
+        label: "Home",
+    },
+    CommandBinding {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::CONTROL,
+        command: CommandId::FollowLatest,
+        label: "Ctrl+End",
     },
     CommandBinding {
         code: KeyCode::Char('x'),

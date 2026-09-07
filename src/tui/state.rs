@@ -2511,6 +2511,8 @@ pub enum CommandId {
     DeleteForward,
     MoveCursorLeft,
     MoveCursorRight,
+    MoveCursorLineStart,
+    MoveCursorLineEnd,
     HistoryPrevious,
     HistoryNext,
     ScrollTranscriptPageUp,
@@ -3330,6 +3332,8 @@ impl Application {
             | CommandId::DeleteForward
             | CommandId::MoveCursorLeft
             | CommandId::MoveCursorRight
+            | CommandId::MoveCursorLineStart
+            | CommandId::MoveCursorLineEnd
             | CommandId::HistoryPrevious
             | CommandId::HistoryNext) => Ok(self.handle_composer_command(command)),
             command @ (CommandId::ScrollTranscriptPageUp
@@ -3580,6 +3584,12 @@ impl Application {
             CommandId::MoveCursorRight => self
                 .state
                 .navigate_composer(|composers, key| composers.move_right(key)),
+            CommandId::MoveCursorLineStart => self
+                .state
+                .navigate_composer(|composers, key| composers.move_line_start(key)),
+            CommandId::MoveCursorLineEnd => self
+                .state
+                .navigate_composer(|composers, key| composers.move_line_end(key)),
             CommandId::HistoryPrevious => self
                 .state
                 .restore_composer_history(|composers, key| composers.history_previous(key)),

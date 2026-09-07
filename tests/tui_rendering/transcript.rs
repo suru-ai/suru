@@ -1148,7 +1148,7 @@ fn streaming_command_updates_reuse_one_folded_projected_transcript_row() {
 }
 
 #[test]
-fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
+fn page_up_exposes_latest_and_control_end_resumes_following_the_transcript() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
     application
@@ -1195,17 +1195,29 @@ fn page_up_exposes_latest_and_end_resumes_following_the_transcript() {
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )))
-        .expect("page away again before using End");
+        .expect("page away again before using Ctrl+End");
     assert!(
         rendered_application_rows_at(&application, 72, 18)
             .join("\n")
             .contains("Latest")
     );
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )))
+        .expect("End moves in the composer");
+    assert!(
+        rendered_application_rows_at(&application, 72, 18)
+            .join("\n")
+            .contains("Latest ↓ · Ctrl+End"),
+        "End leaves the Transcript scrolled and the hint names Ctrl+End"
+    );
     assert_eq!(
         application
             .handle_terminal_event(InputEvent::Key(KeyEvent::new(
                 KeyCode::End,
-                KeyModifiers::NONE,
+                KeyModifiers::CONTROL,
             )))
             .expect("return to latest transcript content"),
         ApplicationTransition::Continue
@@ -1397,7 +1409,7 @@ fn transcript_navigation_remains_correct_beyond_the_terminal_scroll_limit() {
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::End,
-            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
         )))
         .expect("return to the very long tail");
     let resumed = rendered_application_rows_at(&application, 72, 18).join("\n");
@@ -1443,7 +1455,7 @@ fn transcript_navigation_reaches_tail_of_one_oversized_wrapped_line() {
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::End,
-            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
         )))
         .expect("return to the oversized wrapped line tail");
     let resumed = rendered_application_rows_at(&application, terminal_width, 18).join("\n");

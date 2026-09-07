@@ -604,3 +604,28 @@ fn escape_clears_text_selection_before_leaving_a_subagent() {
         ))
     );
 }
+
+#[test]
+fn subagent_view_follows_latest_on_control_end_and_has_no_composer_line_motion() {
+    let workspace = workspace_dir();
+    let child = child_session_snapshot(SessionId::new(), SessionId::new(), workspace.path());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach a Subagent's Session");
+    for (code, modifiers, command) in [
+        (
+            KeyCode::End,
+            KeyModifiers::CONTROL,
+            Some(CommandId::FollowLatest),
+        ),
+        (KeyCode::End, KeyModifiers::NONE, None),
+        (KeyCode::Home, KeyModifiers::NONE, None),
+        (KeyCode::Home, KeyModifiers::CONTROL, None),
+    ] {
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(code, modifiers))),
+            command,
+        );
+    }
+}
