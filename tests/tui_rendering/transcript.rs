@@ -5924,7 +5924,7 @@ fn settled_turn_session(
 }
 
 #[test]
-fn a_settled_turn_fold_marker_renders_duration_blended_tokens_and_cost() {
+fn a_settled_turn_fold_marker_renders_duration_without_tokens_or_cost() {
     let workspace = workspace_dir();
     let mut snapshot = settled_turn_session(
         workspace.path(),
@@ -5963,13 +5963,18 @@ fn a_settled_turn_fold_marker_renders_duration_blended_tokens_and_cost() {
     let rows = rendered_application_rows_at(&application, 80, 24).join("\n");
 
     assert!(
-        rows.contains("✓ Worked for 12s · 4.2K tokens · $0.03"),
-        "the marker renders the Turn's compact Usage and frozen Cost: {rows}"
+        rows.contains("✓ Worked for 12s"),
+        "the marker retains the Turn duration when usage is known: {rows}"
     );
     assert!(
-        !rows.contains("12.2K tokens"),
-        "cache traffic stays out of the blended count: {rows}"
+        !rows.contains("tokens"),
+        "token counts stay out of the fold marker: {rows}"
     );
+    let marker = rows
+        .lines()
+        .find(|line| line.contains("✓ Worked"))
+        .expect("settled Turn fold marker");
+    assert_eq!(marker.trim(), "✓ Worked for 12s");
     assert!(
         !rows.contains("3.25"),
         "the Provider-native premium-request meter has no Turn Fold surface: {rows}"

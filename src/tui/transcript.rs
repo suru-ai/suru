@@ -44,7 +44,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, Cost, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
+        Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
         MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
         SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, skill_marker_matches,
     },
@@ -56,7 +56,6 @@ use super::{
     slots::{SlotText, truncate_slot_text},
     spinner,
     text_layout::{StyledLayout, StyledLine, StyledRow, StyledSpan, TextLayout},
-    usage::{compact_cost, compact_count},
 };
 
 /// Source lines wrapping to more rows than this are split, so no one line's
@@ -1363,14 +1362,12 @@ impl RenderUnit<'_> {
                 hasher.finish()
             }
             // A Turn Fold's marker says how the Turn settled, how long it
-            // took, and the Usage and Cost it recorded; its fingerprint names
-            // every one so a newer Session revision cannot reuse stale lines.
+            // took, and whether it is folded; its fingerprint names each input
+            // so a newer Session revision cannot reuse stale lines.
             Self::TurnFold(marker) => {
                 let mut hasher = std::hash::DefaultHasher::new();
                 (marker.outcome as u64).hash(&mut hasher);
                 marker.duration_ms.hash(&mut hasher);
-                marker.blended_tokens.hash(&mut hasher);
-                marker.cost.hash(&mut hasher);
                 marker.folded.hash(&mut hasher);
                 hasher.finish()
             }
@@ -1629,8 +1626,6 @@ struct TurnMarker {
     /// How long the Turn ran, or `None` when it is missing either of its
     /// timestamps — which is every Turn stored before Suru recorded them.
     duration_ms: Option<u64>,
-    blended_tokens: Option<u64>,
-    cost: Option<Cost>,
     folded: bool,
 }
 
@@ -1642,11 +1637,6 @@ impl TurnMarker {
             turn_id: turn.id,
             outcome,
             duration_ms: turn_duration_ms(turn),
-            blended_tokens: turn
-                .usage
-                .as_ref()
-                .and_then(crate::protocol::Usage::blended_tokens),
-            cost: turn.cost.filter(|cost| !cost.is_zero()),
             folded,
         })
     }
@@ -1656,17 +1646,10 @@ impl TurnMarker {
     /// still says how it ended, just not how long it took.
     fn label(self) -> String {
         let (word, preposition) = self.outcome.phrasing();
-        let mut label = self.duration_ms.map_or_else(
+        self.duration_ms.map_or_else(
             || word.to_owned(),
             |duration_ms| format!("{word} {preposition} {}", humanized_duration(duration_ms)),
-        );
-        if let Some(tokens) = self.blended_tokens {
-            label.push_str(&format!(" · {} tokens", compact_count(tokens)));
-        }
-        if let Some(cost) = self.cost {
-            label.push_str(&format!(" · {}", compact_cost(cost)));
-        }
-        label
+        )
     }
 }
 
@@ -5646,7 +5629,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_fold_marker_says_the_turns_blended_tokens_and_cost_when_known() {
+    fn a_turn_fold_marker_omits_tokens_and_cost_when_known() {
         let mut entries = vec![Entry::Message(user_message("measure this work"))];
         entries.extend(hidden_work());
         let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
@@ -5670,12 +5653,8 @@ mod tests {
 
         assert_eq!(
             rows,
-            [
-                "┃ measure this work",
-                "",
-                "  ✓ Worked for 12s · 4.2K tokens · $0.03",
-            ],
-            "the compact token figure excludes cache traffic while Cost stays frozen"
+            ["┃ measure this work", "", "  ✓ Worked for 12s",],
+            "the marker shows duration without token count or cost"
         );
     }
 
@@ -6130,7 +6109,7 @@ mod tests {
     }
 
     #[test]
-    fn the_transcript_cache_rebuilds_a_turn_marker_when_usage_changes() {
+    fn the_transcript_marker_stays_unchanged_when_usage_changes() {
         let mut entries = vec![Entry::Message(user_message("run the tests"))];
         entries.extend(hidden_work());
         let (mut snapshot, _) = turn_snapshot(vec![(TurnStatus::Completed, entries)]);
@@ -6156,8 +6135,8 @@ mod tests {
 
         assert_eq!(before_rows[2], "  ✓ Worked for 12s");
         assert_eq!(
-            after_rows[2], "  ✓ Worked for 12s · 4.2K tokens · $0.03",
-            "the marker unit's cache key includes every newly rendered field"
+            after_rows, before_rows,
+            "usage and cost updates do not change the fold marker"
         );
     }
 
