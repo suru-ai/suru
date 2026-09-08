@@ -1,9 +1,9 @@
 //! Workspace Picker state: the Workspaces a Session listing puts on offer,
 //! ordered for choosing and narrowed by what the reader types.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::protocol::{Outlook, SessionListItem};
+use crate::protocol::{Outlook, SessionListItem, WorkspacePaths};
 
 use super::{
     SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
@@ -12,6 +12,7 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub(super) struct WorkspacePicker {
+    paths: Option<WorkspacePaths>,
     open: bool,
     /// The Sessions the offered Workspaces are derived from, and the
     /// conversation with the server that keeps them true. It asks across every
@@ -49,6 +50,7 @@ pub(super) struct WorkspacePickerRow {
 impl WorkspacePicker {
     pub(super) fn new(current_workspace: PathBuf) -> Self {
         Self {
+            paths: None,
             open: false,
             listing: SessionListing::scoped(
                 SessionListSurface::WorkspacePicker,
@@ -124,7 +126,19 @@ impl WorkspacePicker {
         self.listing.adopt_current_workspace(workspace);
     }
 
+    pub(super) fn adopt_workspace_paths(&mut self, paths: WorkspacePaths) {
+        self.paths = Some(paths);
+        self.keep_selection_offered();
+    }
+
+    fn name(&self, path: &Path) -> String {
+        self.paths
+            .as_ref()
+            .map_or_else(|| workspace_name(path), |paths| paths.name(path))
+    }
+
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
+        self.paths = None;
         self.listing.adopt_outlook(outlook);
         self.close();
     }
@@ -197,7 +211,7 @@ impl WorkspacePicker {
         self.offered()
             .into_iter()
             .map(|path| WorkspacePickerRow {
-                name: workspace_name(&path),
+                name: self.name(&path),
                 current: path == current,
                 selected: self.selected.as_ref() == Some(&path),
                 path,
@@ -228,7 +242,7 @@ impl WorkspacePicker {
             .listing
             .workspaces()
             .into_iter()
-            .filter(|path| fuzzy_matches(&self.query, &workspace_name(path)))
+            .filter(|path| fuzzy_matches(&self.query, &self.name(path)))
             .collect::<Vec<_>>();
         // A stable sort on "is this not where I am", so the current Workspace
         // takes the first row and the rest keep the order the listing derived

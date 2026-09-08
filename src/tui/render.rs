@@ -2,7 +2,6 @@
 //! and the shared text and layout helpers they draw with.
 
 use super::selection::{SelectionFrame, SelectionSurface};
-use std::path::Path;
 
 use ratatui::{
     Frame,
@@ -741,7 +740,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         let rows = state
             .session_picker
             .visible_rows(row_capacity, current)
-            .map(|row| session_picker_row_line(row, usize::from(content_width), now, theme))
+            .map(|row| session_picker_row_line(row, usize::from(content_width), now, theme, state))
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < usize::from(content_height).saturating_sub(footer_rows)
         {
@@ -837,7 +836,7 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
                 } else {
                     theme.text.primary
                 };
-                Line::styled(workspace_picker_row_text(&row, content_width), style)
+                Line::styled(workspace_picker_row_text(&row, content_width, state), style)
             })
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < content_height.saturating_sub(footer_rows) {
@@ -880,7 +879,7 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
 /// where the client is working, and the path spelled in full — truncated from
 /// the left where the row cannot hold it, so the directories that tell two
 /// Workspaces of the same name apart are what survives.
-fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize) -> String {
+fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &TuiState) -> String {
     let marker = if row.selected { "› " } else { "  " };
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let separator = if compact { " " } else { " · " };
@@ -894,7 +893,7 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize) -> String {
         .saturating_sub(separator.width());
     if path_budget > 0 {
         fields.push(truncate_from_left_to_width(
-            &legible_workspace(&row.path),
+            &state.workspace_label(&state.outlook, &row.path),
             path_budget,
         ));
     }
@@ -1626,6 +1625,7 @@ fn session_picker_row_text(
     row: SessionPickerRow<'_>,
     width: usize,
     now: u64,
+    state: &TuiState,
 ) -> (String, Option<(usize, usize)>) {
     let marker = if row.selected { "› " } else { "  " };
     if row.confirming_delete {
@@ -1690,7 +1690,7 @@ fn session_picker_row_text(
             .saturating_sub(separator.width());
         if path_budget > 0 {
             metadata.push(truncate_from_left_to_width(
-                &legible_workspace(workspace),
+                &state.workspace_label(row.origin, workspace),
                 path_budget,
             ));
         }
@@ -1719,8 +1719,9 @@ fn session_picker_row_line(
     width: usize,
     now: u64,
     theme: &Theme,
+    state: &TuiState,
 ) -> Line<'static> {
-    let (content, remote_tag) = session_picker_row_text(row, width, now);
+    let (content, remote_tag) = session_picker_row_text(row, width, now, state);
     let row_style = if row.selected {
         theme.selection.focused
     } else if row.unreadable {
@@ -2255,7 +2256,9 @@ fn sidebar_lines(
         .y
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
     lines.push(sidebar_selector_line(
-        &state.sidebar.selector(),
+        &state
+            .sidebar
+            .selector(&|path| state.workspace_name(&state.outlook, path)),
         width,
         driving,
         theme,
@@ -2288,9 +2291,12 @@ fn sidebar_lines(
         return (lines, rows, Vec::new());
     }
     let capacity = usize::from(content.height).saturating_sub(lines.len());
-    let entries = state
-        .sidebar
-        .visible_entries(capacity, state.open_session_reference());
+    let entries =
+        state
+            .sidebar
+            .visible_entries(capacity, state.open_session_reference(), &|path| {
+                state.workspace_name(&state.outlook, path)
+            });
     if entries.is_empty() {
         lines.extend(
             sidebar_empty_reading(&state.sidebar)
@@ -2307,7 +2313,7 @@ fn sidebar_lines(
         let standing = entry.standing();
         let focused = driving && entry.is_focused();
         let target = entry.target();
-        let drawn = sidebar_entry_lines(entry, width, now, driving, theme);
+        let drawn = sidebar_entry_lines(entry, width, now, driving, theme, state);
         let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
         if let Some(standing) = standing {
             rails.push(StandingRail {
@@ -2395,6 +2401,7 @@ fn sidebar_entry_lines(
     now: u64,
     driving: bool,
     theme: &Theme,
+    state: &TuiState,
 ) -> Vec<Line<'static>> {
     match entry {
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
@@ -2410,7 +2417,9 @@ fn sidebar_entry_lines(
                 working_since,
             } => sidebar_active_row_lines(
                 row,
-                workspace,
+                workspace
+                    .map(|path| state.workspace_name(&row.reference.origin, path))
+                    .unwrap_or_default(),
                 sidebar_active_slot(row.standing, working_since, updated_at, now),
                 width,
                 driving,
@@ -2478,31 +2487,6 @@ fn sidebar_selector_line(
 /// It is drawn as the search box is — a label and what the reader has typed,
 /// held to its end so the part of a long path that says which directory it is
 /// stays in view — with what their last path was refused for beneath it.
-/// A Workspace path as a frame says it. On Windows the canonical form — the
-/// one the client launches with and the server roots Sessions at — is
-/// verbatim (`\\?\C:\…`, `\\?\UNC\server\share\…`), a prefix no reader types
-/// and no shell needs, so what is said drops it while the path everything
-/// compares stays canonical. Everywhere else the display is the path.
-fn legible_workspace(path: &Path) -> String {
-    let spelled = path.to_string_lossy();
-    if cfg!(windows)
-        && let Some(dropped) = verbatim_prefix_dropped(&spelled)
-    {
-        return dropped;
-    }
-    spelled.into_owned()
-}
-
-/// The spelling with Windows's verbatim prefix dropped, and `None` where it
-/// carries none. Split from [`legible_workspace`]'s platform gate so every
-/// platform's tests exercise the dropping itself.
-fn verbatim_prefix_dropped(spelled: &str) -> Option<String> {
-    if let Some(share) = spelled.strip_prefix(r"\\?\UNC\") {
-        return Some(format!(r"\\{share}"));
-    }
-    spelled.strip_prefix(r"\\?\").map(str::to_owned)
-}
-
 fn sidebar_workspace_entry_lines(
     entry: &SidebarWorkspaceEntryView<'_>,
     width: usize,
@@ -2607,14 +2591,13 @@ fn sidebar_plain_line(
 /// it something to say.
 fn sidebar_active_row_lines(
     row: SidebarRow<'_>,
-    workspace: Option<&Path>,
+    workspace: String,
     slot: String,
     width: usize,
     driving: bool,
     theme: &Theme,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
     let highlight = sidebar_row_style(row, driving, theme);
-    let workspace = workspace.map(sidebar::workspace_name).unwrap_or_default();
     let label_style = highlight.unwrap_or(theme.text.subdued);
     [
         sidebar_slotted_line(&workspace, label_style, &slot, width, highlight, theme),
@@ -2864,7 +2847,7 @@ fn render_landing(
     let context = if footer_detail.shows_secondary() {
         format!(
             "{agent} · Workspace {}",
-            legible_workspace(&state.workspace)
+            state.workspace_label(&state.outlook, &state.workspace)
         )
     } else {
         agent
@@ -3540,7 +3523,7 @@ fn render_session_header(
         truncate_to_width(
             &format!(
                 " · Workspace {}",
-                legible_workspace(&snapshot.session.workspace.path)
+                state.workspace_label(&state.outlook, &snapshot.session.workspace.path)
             ),
             orientation_width,
         )
@@ -4052,7 +4035,7 @@ mod tests {
         },
         state::{Application, ApplicationEvent},
     };
-    use super::{legible_workspace, verbatim_prefix_dropped, working_indicator_elapsed};
+    use super::working_indicator_elapsed;
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
@@ -4202,47 +4185,6 @@ mod tests {
         assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
         assert!(screen.contains("Connection failed"));
         assert!(screen.contains("unknown event type 'future_event'"));
-    }
-
-    /// The canonical form a client and the server hold on Windows is verbatim,
-    /// and the prefix is display noise: no reader types it and no shell needs
-    /// it, so what a frame says drops it while the path everything compares
-    /// stays canonical.
-    #[test]
-    fn a_windows_verbatim_prefix_is_dropped_from_what_a_frame_says() {
-        assert_eq!(
-            verbatim_prefix_dropped(r"\\?\C:\Users\reader\suru"),
-            Some(r"C:\Users\reader\suru".to_owned()),
-            "a canonical drive path reads as the path a reader would type"
-        );
-        assert_eq!(
-            verbatim_prefix_dropped(r"\\?\UNC\server\share\suru"),
-            Some(r"\\server\share\suru".to_owned()),
-            "a canonical UNC path reads as the share a reader would type"
-        );
-        assert_eq!(
-            verbatim_prefix_dropped(r"C:\Users\reader\suru"),
-            None,
-            "a path with nothing to drop is left to read as it is"
-        );
-    }
-
-    /// Only Windows canonicalizes into verbatim form, so only there is the
-    /// prefix dropped: on every other platform a leading `\\?\` is just a
-    /// strange directory name, and the display is the path.
-    #[test]
-    fn a_workspace_reads_verbatim_everywhere_the_canonical_form_is_not() {
-        let spelled = if cfg!(windows) {
-            r"\\?\C:\Users\reader\suru"
-        } else {
-            "/home/reader/suru"
-        };
-        let expected = if cfg!(windows) {
-            r"C:\Users\reader\suru"
-        } else {
-            "/home/reader/suru"
-        };
-        assert_eq!(legible_workspace(std::path::Path::new(spelled)), expected);
     }
 
     #[test]

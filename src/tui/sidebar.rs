@@ -79,11 +79,11 @@ pub(super) enum SidebarListingScope {
 impl SidebarListingScope {
     /// What the selector calls this scope: the Workspace by the name a row
     /// gives it, or the words for all of them.
-    fn label(&self) -> String {
+    fn label(&self, name: &dyn Fn(&Path) -> String) -> String {
         match self {
             Self::Everywhere => EVERYWHERE.to_owned(),
             Self::AllWorkspaces => ALL_WORKSPACES.to_owned(),
-            Self::Workspace(workspace) => workspace_name(workspace),
+            Self::Workspace(workspace) => name(workspace),
         }
     }
 
@@ -1924,9 +1924,9 @@ impl Sidebar {
     }
 
     /// The selector as a frame draws it.
-    pub(super) fn selector(&self) -> SidebarSelectorView {
+    pub(super) fn selector(&self, name: &dyn Fn(&Path) -> String) -> SidebarSelectorView {
         SidebarSelectorView {
-            label: self.scope.label(),
+            label: self.scope.label(name),
             open: self.selector_open,
             focused: self.focus == Some(SidebarFocus::Selector),
             adding: self.focus == Some(SidebarFocus::AddWorkspace),
@@ -2001,8 +2001,9 @@ impl Sidebar {
         &self,
         capacity: usize,
         open: Option<&SessionReference>,
+        name: &dyn Fn(&Path) -> String,
     ) -> Vec<SidebarEntry<'_>> {
-        let entries = self.entries(open);
+        let entries = self.entries(open, name);
         let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
         let anchor = entries
             .iter()
@@ -2026,7 +2027,11 @@ impl Sidebar {
 
     /// The Sidebar's body as the frame draws it, which is [`Self::body`] with
     /// each entry given what its row says.
-    fn entries(&self, open: Option<&SessionReference>) -> Vec<SidebarEntry<'_>> {
+    fn entries(
+        &self,
+        open: Option<&SessionReference>,
+        name: &dyn Fn(&Path) -> String,
+    ) -> Vec<SidebarEntry<'_>> {
         self.body()
             .into_iter()
             .map(|entry| match entry {
@@ -2039,7 +2044,7 @@ impl Sidebar {
                     focused: self.focus == Some(SidebarFocus::Unreachable(outlook.clone())),
                 }),
                 BodyEntry::Scope(scope) => SidebarEntry::Scope(SidebarScopeEntry {
-                    label: scope.label(),
+                    label: scope.label(name),
                     chosen: scope == self.scope,
                     focused: self.focus == Some(SidebarFocus::Scope(scope.clone())),
                     scope,
@@ -2733,12 +2738,12 @@ mod tests {
             None,
         );
 
-        let local_entry = sidebar.entries(Some(&local_twin));
+        let local_entry = sidebar.entries(Some(&local_twin), &workspace_name);
         assert!(
             matches!(&local_entry[0], SidebarEntry::Row(row) if !row.open),
             "an equal Session ID from another Origin is not the open row"
         );
-        let remote_entry = sidebar.entries(Some(&reference));
+        let remote_entry = sidebar.entries(Some(&reference), &workspace_name);
         assert!(matches!(
             &remote_entry[0],
             SidebarEntry::Row(row) if row.open && row.remote.is_none()
@@ -3385,12 +3390,12 @@ mod tests {
     /// The Sidebar's whole body, top to bottom, as the Titles it draws — and,
     /// for the rows standing for no Session, what they say instead.
     fn drawn(sidebar: &Sidebar) -> Vec<String> {
-        entry_titles(sidebar.entries(None))
+        entry_titles(sidebar.entries(None, &workspace_name))
     }
 
     /// The Sidebar's body as a column `capacity` lines tall shows it.
     fn drawn_within(sidebar: &Sidebar, capacity: usize) -> Vec<String> {
-        entry_titles(sidebar.visible_entries(capacity, None))
+        entry_titles(sidebar.visible_entries(capacity, None, &workspace_name))
     }
 
     fn entry_titles(entries: Vec<SidebarEntry<'_>>) -> Vec<String> {
@@ -3413,7 +3418,7 @@ mod tests {
     /// Title at all.
     fn focused(sidebar: &Sidebar) -> Option<&str> {
         sidebar
-            .entries(None)
+            .entries(None, &workspace_name)
             .into_iter()
             .find_map(|entry| match entry {
                 SidebarEntry::Row(row) if row.focused => Some(row.title),

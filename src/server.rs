@@ -335,6 +335,7 @@ impl LandingAgentSelectionStore {
 
 #[derive(Clone)]
 struct AppState {
+    workspace_paths: crate::protocol::WorkspacePaths,
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
@@ -529,6 +530,7 @@ pub async fn spawn_with_providers_and_timings(
         settings.subscribe(),
     );
     let state = AppState {
+        workspace_paths: crate::protocol::WorkspacePaths::discover(),
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),
@@ -1025,7 +1027,9 @@ async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMa
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     Sse::new(session_catalog_event_stream(
-        state.sessions.subscribe_catalog(),
+        state
+            .sessions
+            .subscribe_catalog(state.workspace_paths.clone()),
         state.skill_catalog.subscribe(),
         shutdown,
         state.timings.sse_keepalive_interval,
@@ -1131,6 +1135,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         state
             .descriptor
             .health(state.shutdown.lifecycle())
+            .with_workspace_paths(state.workspace_paths.clone())
             .with_landing_agent_selection(state.landing_agent_selection.current()),
     )
     .into_response()

@@ -198,7 +198,10 @@ impl SessionStore {
         })
     }
 
-    pub(crate) fn subscribe_catalog(&self) -> SessionCatalogFeed {
+    pub(crate) fn subscribe_catalog(
+        &self,
+        workspace_paths: crate::protocol::WorkspacePaths,
+    ) -> SessionCatalogFeed {
         let state = self
             .state
             .lock()
@@ -222,6 +225,7 @@ impl SessionStore {
         let (revision, updates) = state.catalog.subscribe();
         SessionCatalogFeed {
             snapshot: SessionCatalogSnapshot {
+                workspace_paths,
                 revision,
                 session_ids,
             },

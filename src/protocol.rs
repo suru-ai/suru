@@ -8,7 +8,10 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 36;
+mod workspace_paths;
+pub use workspace_paths::{PathStyle, WorkspacePaths};
+
+pub const PROTOCOL_VERSION: u32 = 37;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
@@ -1834,6 +1837,7 @@ pub struct UnreadableSessionSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCatalogSnapshot {
+    pub workspace_paths: WorkspacePaths,
     pub revision: SessionCatalogRevision,
     pub session_ids: Vec<SessionId>,
 }
@@ -2617,6 +2621,7 @@ pub struct ServerIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Health {
+    pub workspace_paths: WorkspacePaths,
     pub lifecycle: LifecycleState,
     pub landing_agent_selection: Option<AgentSelection>,
     #[serde(flatten)]
@@ -2627,9 +2632,15 @@ impl Health {
     pub fn new(identity: ServerIdentity, lifecycle: LifecycleState) -> Self {
         Self {
             lifecycle,
+            workspace_paths: WorkspacePaths::default(),
             landing_agent_selection: None,
             identity,
         }
+    }
+
+    pub fn with_workspace_paths(mut self, workspace_paths: WorkspacePaths) -> Self {
+        self.workspace_paths = workspace_paths;
+        self
     }
 
     pub fn with_landing_agent_selection(
@@ -2658,6 +2669,7 @@ impl std::ops::DerefMut for Health {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthWire {
+    workspace_paths: WorkspacePaths,
     instance_id: Uuid,
     pid: u32,
     lifecycle: LifecycleState,
@@ -2682,7 +2694,8 @@ impl<'de> Deserialize<'de> for Health {
             },
             wire.lifecycle,
         )
-        .with_landing_agent_selection(wire.landing_agent_selection))
+        .with_landing_agent_selection(wire.landing_agent_selection)
+        .with_workspace_paths(wire.workspace_paths))
     }
 }
 

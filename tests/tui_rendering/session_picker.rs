@@ -252,6 +252,7 @@ fn reconnect_catalog_removes_a_missed_current_session_deletion() {
         application
             .handle_event(ApplicationEvent::Managed(
                 ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    workspace_paths: Default::default(),
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![remaining_id],
                 }),

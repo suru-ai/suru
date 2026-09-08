@@ -20,7 +20,7 @@ pub(super) struct Registration {
 
 pub(super) enum RegistrationInspection {
     Missing,
-    Live(Registration),
+    Live(Box<Registration>),
     Stale(String),
     Unreachable(String),
 }
@@ -51,10 +51,10 @@ pub(super) async fn inspect_registration(
         return Ok(RegistrationInspection::Stale(format!("{error:#}")));
     }
     match tokio::time::timeout(config.health_check_timeout, inspect_health(&descriptor)).await {
-        Ok(Ok(health)) => Ok(RegistrationInspection::Live(Registration {
+        Ok(Ok(health)) => Ok(RegistrationInspection::Live(Box::new(Registration {
             descriptor,
             health,
-        })),
+        }))),
         Ok(Err(HealthInspectionError::Stale(reason))) => Ok(RegistrationInspection::Stale(reason)),
         Ok(Err(HealthInspectionError::Unreachable(reason))) => {
             Ok(RegistrationInspection::Unreachable(reason))

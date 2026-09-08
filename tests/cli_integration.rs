@@ -2934,6 +2934,7 @@ fn empty_catalog_stream() -> Response {
 
 fn empty_catalog_snapshot() -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     let snapshot = SessionCatalogSnapshot {
+        workspace_paths: Default::default(),
         revision: SessionCatalogRevision::INITIAL,
         session_ids: Vec::new(),
     };

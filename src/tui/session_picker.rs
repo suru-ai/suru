@@ -77,6 +77,7 @@ pub(super) struct SessionPicker {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SessionPickerRow<'a> {
+    pub(super) origin: &'a Outlook,
     pub(super) title: &'a str,
     /// The Emoji this row draws for its Session, carried beside the Title
     /// rather than within it so the query never meets it. A Session whose
@@ -500,6 +501,7 @@ impl SessionPicker {
             .map(move |summary| {
                 let readable = summary.readable();
                 SessionPickerRow {
+                    origin: &summary.reference().origin,
                     pending_questionnaires: readable.map_or(0, |summary| {
                         summary.standing_inputs.pending_questionnaire_count()
                     }),

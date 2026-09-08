@@ -462,6 +462,7 @@ mod tests {
             reconcile_snapshot(
                 &mut known,
                 SessionCatalogSnapshot {
+                    workspace_paths: Default::default(),
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![retained, deleted],
                 },
@@ -487,6 +488,7 @@ mod tests {
             reconcile_snapshot(
                 &mut known,
                 SessionCatalogSnapshot {
+                    workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(4),
                     session_ids: vec![retained, created_after_connect],
                 },
@@ -503,6 +505,7 @@ mod tests {
         reconcile_snapshot(
             &mut known,
             SessionCatalogSnapshot {
+                workspace_paths: Default::default(),
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![listed],
             },

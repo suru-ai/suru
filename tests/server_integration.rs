@@ -35,6 +35,32 @@ struct SqliteCount {
     value: i64,
 }
 
+#[test]
+fn workspace_display_data_resolves_the_servers_home_and_handles_unknown_homes() {
+    use suru::protocol::{PathStyle, WorkspacePaths};
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("child")).unwrap();
+    let paths = WorkspacePaths::from_home(Some(&home.path().join("child").join("..")));
+    assert_eq!(
+        paths.home.as_deref(),
+        home.path().canonicalize().unwrap().to_str()
+    );
+    assert_eq!(
+        paths.style,
+        if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Unix
+        }
+    );
+    assert_eq!(WorkspacePaths::from_home(None).home, None);
+    assert_eq!(
+        WorkspacePaths::from_home(Some(&home.path().join("missing"))).home,
+        None
+    );
+}
+
 fn seed_database(path: &std::path::Path, sql: &str) {
     std::fs::create_dir_all(path.parent().expect("database has a parent directory"))
         .expect("create fixture data directory");
@@ -1382,7 +1408,25 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         .await
         .expect("Remote catalog snapshot arrives")
         .expect("Remote catalog stream remains open");
-    assert!(matches!(initial, ManagedEvent::SessionCatalogReconciled(_)));
+    let ManagedEvent::SessionCatalogReconciled(snapshot) = initial else {
+        panic!("Remote catalog starts with a snapshot");
+    };
+    let serving_descriptor = pair.serving.descriptor();
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", serving_descriptor.base_url))
+        .bearer_auth(&serving_descriptor.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Health>()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.workspace_paths, health.workspace_paths,
+        "the proxied catalog carries the owning Server's workspace display data"
+    );
 
     let created = remote
         .create_session(CreateSessionRequest {

@@ -417,6 +417,7 @@ pub struct TuiState {
     /// The origin-qualified reference of the projection above, and so `Some`
     /// exactly when it is.
     pub(super) session_reference: Option<SessionReference>,
+    workspace_paths: HashMap<Outlook, crate::protocol::WorkspacePaths>,
     outlook_landing_selections: HashMap<Outlook, Option<AgentSelection>>,
     landing_agent_selection: Option<AgentSelection>,
     confirmed_landing_agent_selection: Option<AgentSelection>,
@@ -551,6 +552,7 @@ impl TuiState {
             session: None,
             opening_error: None,
             session_reference: None,
+            workspace_paths: HashMap::new(),
             outlook_landing_selections: HashMap::from([(Outlook::Local, None)]),
             landing_agent_selection: None,
             confirmed_landing_agent_selection: None,
@@ -752,6 +754,9 @@ impl TuiState {
         self.sidebar.adopt_workspace(self.workspace.clone());
         self.session_picker.adopt_outlook(outlook.clone());
         self.workspace_picker.adopt_outlook(outlook.clone());
+        if let Some(paths) = self.workspace_paths.get(&outlook) {
+            self.workspace_picker.adopt_workspace_paths(paths.clone());
+        }
         adopt_sidebar(&mut self.sidebar, outlook);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
@@ -892,7 +897,36 @@ impl TuiState {
         self.composer_completion.dismiss_active();
     }
 
+    fn adopt_workspace_paths(&mut self, origin: &Outlook, event: &ManagedEvent) {
+        if let ManagedEvent::SessionCatalogReconciled(snapshot) = event {
+            if origin == &self.outlook {
+                self.workspace_picker
+                    .adopt_workspace_paths(snapshot.workspace_paths.clone());
+            }
+            self.workspace_paths
+                .insert(origin.clone(), snapshot.workspace_paths.clone());
+        }
+    }
+
+    pub(super) fn workspace_name(&self, origin: &Outlook, path: &Path) -> String {
+        self.workspace_paths.get(origin).map_or_else(
+            || super::sidebar::workspace_name(path),
+            |paths| paths.name(path),
+        )
+    }
+
+    pub(super) fn workspace_label(&self, origin: &Outlook, path: &Path) -> String {
+        match self.workspace_paths.get(origin) {
+            Some(paths) => paths.label(path),
+            None if origin == &Outlook::Local => {
+                crate::protocol::WorkspacePaths::default().label(path)
+            }
+            None => path.to_string_lossy().into_owned(),
+        }
+    }
+
     pub fn apply(&mut self, event: ManagedEvent) {
+        self.adopt_workspace_paths(&Outlook::Local, &event);
         self.reconcile_questionnaire_catalog(&Outlook::Local, &event);
         // The managed catalog stream belongs to the local Server. A Remote
         // Outlook has its own main view and pickers, but Everywhere still
@@ -915,6 +949,7 @@ impl TuiState {
     }
 
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+        self.adopt_workspace_paths(outlook, &event);
         self.reconcile_questionnaire_catalog(outlook, &event);
         if self.sidebar.includes_origin(outlook) {
             match &event {
@@ -989,6 +1024,12 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::Connected(health) => {
+                if self.outlook == Outlook::Local {
+                    self.workspace_picker
+                        .adopt_workspace_paths(health.workspace_paths.clone());
+                }
+                self.workspace_paths
+                    .insert(Outlook::Local, health.workspace_paths.clone());
                 self.outlook_landing_selections
                     .insert(Outlook::Local, health.landing_agent_selection.clone());
                 let replaced_server = self

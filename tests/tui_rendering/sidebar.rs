@@ -4759,6 +4759,51 @@ fn an_unreachable_remotes_context_menu_retries_it_now() {
 }
 
 #[test]
+fn everywhere_workspace_names_use_each_rows_origin_path_style() {
+    use suru::protocol::{PathStyle, WorkspacePaths};
+
+    let workspace = workspace_dir();
+    let remote_id = SessionId::new();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".into()),
+            event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                workspace_paths: WorkspacePaths {
+                    home: Some(r"C:\Users\Remote".into()),
+                    style: PathStyle::Windows,
+                },
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: vec![remote_id],
+            }),
+        })
+        .unwrap();
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    // A wire path, interpreted by the Remote's syntax on every test platform.
+    let remote_path = Path::new(r"C:\Users\Remote\suru");
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => Vec::new(),
+            Outlook::Remote(_) => vec![listed_as(remote_id, "Remote work", remote_path, 1)],
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .unwrap();
+    }
+    let rows = rendered_application_rows_at(&application, WIDE, 30);
+    let sidebar = rows
+        .iter()
+        .map(|row| sidebar_column(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(sidebar.contains("suru"), "{sidebar}");
+    assert!(!sidebar.contains(r"C:\Users\Remote"), "{sidebar}");
+}
+
+#[test]
 fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
     let workspace = workspace_dir();
     let remote_session = SessionId::new();
@@ -4798,6 +4843,7 @@ fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
             .handle_event(ApplicationEvent::OriginCatalog {
                 outlook: remote,
                 event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(2),
                     session_ids: vec![remote_session],
                 }),
@@ -6371,6 +6417,7 @@ fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
         (
             "a catalog reconciled",
             ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                workspace_paths: Default::default(),
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![listed_session],
             }),
@@ -6470,6 +6517,7 @@ fn a_reconnection_brings_the_sidebar_the_work_it_missed() {
         application
             .handle_event(ApplicationEvent::Managed(
                 ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                    workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(4),
                     session_ids: vec![kept, made_while_away],
                 }),

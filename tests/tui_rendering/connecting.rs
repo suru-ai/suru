@@ -695,7 +695,7 @@ fn open_connect(application: &mut Application) {
         .expect("open the Connect picker");
 }
 
-fn turn_to_studio(application: &mut Application) {
+pub(super) fn turn_to_studio(application: &mut Application) {
     open_connect(application);
     application
         .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))

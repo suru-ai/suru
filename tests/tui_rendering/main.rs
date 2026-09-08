@@ -26,6 +26,7 @@ mod subagent_view;
 mod support;
 mod theme;
 mod transcript;
+mod workspace_paths;
 mod workspace_picker;
 
 mod questionnaires;
