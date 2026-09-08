@@ -300,6 +300,7 @@ pub(super) fn record_work(count: usize) {
 
 fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
     let session = Session {
+        context_fill: None,
         id: SessionId::new(),
         workspace: Workspace {
             path: workspace.to_owned(),

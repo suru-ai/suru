@@ -612,6 +612,7 @@ mod tests {
 
             session
                 .start_turn(ProviderTurnInput {
+                    turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
                 })
@@ -658,6 +659,7 @@ mod tests {
             let session = scripted_session(&directory);
             session
                 .start_turn(ProviderTurnInput {
+                    turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
                 })
@@ -671,6 +673,7 @@ mod tests {
             assert!(session.shutdown_started.load(Ordering::Acquire));
             let error = session
                 .start_turn(ProviderTurnInput {
+                    turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Too late"),
                     selection: selection(Vec::new()),
                 })

@@ -3399,6 +3399,7 @@ mod tests {
             application
                 .handle_event(ApplicationEvent::SessionAttached(SessionSnapshot {
                     session: Session {
+                        context_fill: None,
                         id: SessionId::new(),
                         workspace: Workspace {
                             path: workspace.clone(),

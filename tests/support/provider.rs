@@ -831,6 +831,7 @@ async fn run_errand_through_a_session(
     let (_identity, _resume_state, session, mut events) = connection.into_parts();
     session
         .start_turn(ProviderTurnInput {
+            turn_id: suru::protocol::TurnId::new(),
             prompt: ProviderPrompt::plain(errand.prompt),
             selection: errand.selection,
         })

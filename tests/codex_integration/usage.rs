@@ -345,6 +345,13 @@ async fn codex_cumulative_readings_become_per_turn_deltas_priced_from_the_rate_t
 
     assert_eq!(first.turns[0].status, TurnStatus::Completed);
     assert_eq!(
+        first.session.context_fill,
+        Some(suru::protocol::ContextFill {
+            occupied_tokens: 1350,
+            capacity_tokens: Some(272_000)
+        })
+    );
+    assert_eq!(
         first.turns[0].usage,
         Some(first_turn_usage()),
         "a re-fired reading restates the same total rather than adding to it"
@@ -380,6 +387,13 @@ async fn codex_cumulative_readings_become_per_turn_deltas_priced_from_the_rate_t
             model_context_window: Some(272_000),
         }),
         "the second Turn consumed the distance the thread's running total travelled"
+    );
+    assert_eq!(
+        second.session.context_fill,
+        Some(suru::protocol::ContextFill {
+            occupied_tokens: 2450,
+            capacity_tokens: Some(272_000)
+        })
     );
     assert_eq!(second.turns[1].cost, Cost::from_usd(0.0046));
     assert_eq!(second.turns[1].cost_basis, Some(CostBasis::Estimated));
@@ -508,6 +522,8 @@ async fn a_child_threads_readings_land_in_the_subagents_own_session() {
         }),
         "the child's own readings fill the child Session's Turn"
     );
+    assert_eq!(parent.session.context_fill.unwrap().occupied_tokens, 1350);
+    assert_eq!(child.session.context_fill.unwrap().occupied_tokens, 600);
     assert_eq!(child.turns[0].cost, Cost::from_usd(0.0014));
     assert_eq!(child.turns[0].cost_basis, Some(CostBasis::Estimated));
 
@@ -592,6 +608,11 @@ async fn a_settled_turns_late_reading_does_not_truncate_the_turn_now_running() {
         .await
         .expect("admit second Prompt");
     let second = settled_turn(client, opened.session_id, 1).await;
+    assert_eq!(
+        second.session.context_fill.unwrap().occupied_tokens,
+        300,
+        "latest context can decrease without cumulative Usage decreasing"
+    );
 
     assert_eq!(
         second.turns[1].usage,
@@ -684,6 +705,8 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
         Some(first_turn_usage()),
         "the Turn's record was persisted as it was recorded"
     );
+    assert_eq!(restored.session.context_fill, before.session.context_fill);
+    assert!(restored.session.context_fill.is_some());
     assert_eq!(restored.turns[0].cost, Cost::from_usd(0.0029625));
     assert_eq!(restored.turns[0].cost_basis, Some(CostBasis::Estimated));
 
@@ -926,4 +949,41 @@ async fn pricing_recovers_during_turn(refresh: bool) {
     }
     opened.server.shutdown().await.unwrap();
     http.abort();
+}
+
+#[tokio::test]
+async fn codex_context_fill_distinguishes_zero_missing_and_nonpositive_capacity() {
+    for (last, capacity, expected) in [
+        ("0", "272000", Some((0, Some(272_000)))),
+        ("1350", "0", Some((1350, None))),
+        ("1350", "-1", Some((1350, None))),
+        ("null", "272000", None),
+    ] {
+        let script = METERED_TURNS_CODEX
+            .replace("__MODEL__", "priced-fixture")
+            .replace(
+                "\"last\":{\"totalTokens\":1350",
+                &format!("\"last\":{{\"totalTokens\":{last}"),
+            )
+            .replace(
+                "\"modelContextWindow\":272000",
+                &format!("\"modelContextWindow\":{capacity}"),
+            );
+        let fixture = ScriptedCodex::new(&script);
+        let opened = metered_session(&fixture, "codex-partial-context", "Read context").await;
+        let settled = settled_turn(&opened.client, opened.session_id, 0).await;
+        assert_eq!(
+            settled
+                .session
+                .context_fill
+                .map(|fill| (fill.occupied_tokens, fill.capacity_tokens)),
+            expected
+        );
+        assert_eq!(
+            settled.turns[0].usage.as_ref().unwrap().fresh_input_tokens,
+            Some(950),
+            "Usage remains independent of occupancy"
+        );
+        opened.server.shutdown().await.unwrap();
+    }
 }

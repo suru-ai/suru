@@ -536,6 +536,7 @@ impl ProviderSession for CodexSession {
                     return Err(codex_error("Codex Session is shutting down"));
                 }
                 correlation.begin_turn_start()?;
+                correlation.context_fill_turn = Some(input.turn_id);
             }
             // Read here rather than held from Session startup, so the Turn
             // about to run asks for the detail the Setting names now.

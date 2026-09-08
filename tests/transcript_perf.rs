@@ -39,6 +39,7 @@ fn command_output() -> String {
 fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: SessionId::new(),
             workspace: Workspace {
                 path: workspace.to_owned(),

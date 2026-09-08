@@ -435,6 +435,8 @@ pub struct ProviderSkillInvocation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTurnInput {
+    /// Correlates optional asynchronous Context Fill requests with this Turn.
+    pub turn_id: crate::protocol::TurnId,
     pub prompt: ProviderPrompt,
     pub selection: AgentSelection,
 }
@@ -477,6 +479,11 @@ pub enum ProviderSubagentStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    /// An ordered, Session-local measurement. Streamed reports may bind to the
+    /// currently routed Turn; asynchronous requests must retain their Turn ID.
+    ContextFill {
+        report: ContextFillReport,
+    },
     /// The Provider began a new native Turn without a Prompt. Unlike late
     /// output alone, this Turn has its own interrupt and terminal boundary.
     ContinuationStarted {
@@ -554,8 +561,8 @@ pub enum ProviderEvent {
         description: String,
     },
     /// The Provider reported a Subagent settling. This settles the Subagent's
-    /// row and its child Session's Turn together; events attributed to the
-    /// Subagent after it land nowhere.
+    /// row and its child Session's Turn together. Later output is discarded;
+    /// ordered Context Fill measurements may still refresh the child Session.
     SubagentCompleted {
         subagent_id: ProviderSubagentId,
         status: ProviderSubagentStatus,
@@ -575,6 +582,18 @@ pub enum ProviderEvent {
     TurnFailed {
         message: String,
     },
+}
+
+/// Reports replace the measurement, including when occupancy decreases.
+/// Allocate sequence numbers when observations/requests begin, not when an
+/// asynchronous response completes. Numbers must increase within each Turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextFillReport {
+    /// `None` binds a synchronous, ordered stream event to its routed Turn.
+    /// Delayed requests must use the ID from `ProviderTurnInput` instead.
+    pub turn_id: Option<crate::protocol::TurnId>,
+    pub sequence: u64,
+    pub fill: crate::protocol::ContextFill,
 }
 
 /// A Cost one Provider event carries, together with the Basis that says how

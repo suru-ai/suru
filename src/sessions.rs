@@ -81,6 +81,7 @@ struct SessionStoreState {
 }
 
 struct SessionRecord {
+    context_fill_order: Option<(TurnId, u64)>,
     snapshot: SessionSnapshot,
     summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,

@@ -3139,7 +3139,8 @@ fn render_session(
             theme.text.subdued,
         )
     };
-    let usage = session_usage_text(snapshot).map(|text| SlotText::new(text, theme.text.subdued));
+    let usage = session_usage_text(snapshot, content_width)
+        .map(|text| SlotText::new(text, theme.text.subdued));
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
             session_id,
@@ -3402,17 +3403,40 @@ fn render_session(
     }
 }
 
-/// What the Session in view has consumed, as its footer states it: the
-/// blended token figure and the Cost beside it, over the Session's own Turns
-/// and the Subagent subtree rolled up under them.
-fn session_usage_text(snapshot: &SessionSnapshot) -> Option<String> {
-    let total = snapshot.total_usage()?;
-    let mut text = compact_count(total.blended_tokens()?);
-    if let Some(cost) = total.cost.filter(|cost| !cost.is_zero()) {
-        text.push_str(" · ");
-        text.push_str(&compact_cost(cost));
-    }
-    Some(text)
+/// Context occupancy has priority over accumulated Cost under width pressure.
+fn session_usage_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
+    let cost = snapshot
+        .total_usage()
+        .and_then(|total| total.cost)
+        .filter(|cost| !cost.is_zero())
+        .map(compact_cost);
+    let (full, minimal) = match snapshot.session.context_fill {
+        Some(fill) => {
+            let count = compact_count(fill.occupied_tokens);
+            match fill.capacity_tokens.filter(|capacity| *capacity > 0) {
+                Some(capacity) => {
+                    // Integer arithmetic rounds halves up without losing large
+                    // counts to floating-point precision or capping the result.
+                    let rounded = (u128::from(fill.occupied_tokens) * 100
+                        + u128::from(capacity) / 2)
+                        / u128::from(capacity);
+                    let percent = format!("{rounded}%");
+                    (Some(format!("{count} ({percent})")), Some(percent))
+                }
+                None => (Some(count.clone()), Some(count)),
+            }
+        }
+        None => (None, None),
+    };
+    let combined = match (&full, cost) {
+        (Some(fill), Some(cost)) => Some(format!("{fill} · {cost}")),
+        (None, cost) => cost,
+        _ => None,
+    };
+    [combined, full, minimal]
+        .into_iter()
+        .flatten()
+        .find(|text| UnicodeWidthStr::width(text.as_str()) <= usize::from(width))
 }
 
 fn working_indicator_line(
@@ -4007,6 +4031,92 @@ mod tests {
         },
     };
 
+    /// Exercise the Session renderer directly: the enclosing terminal shell
+    /// shows its size notice below 28 columns, but slots must also behave in
+    /// smaller content areas supplied by a layout.
+    #[test]
+    fn context_fill_footer_drops_cost_then_count_and_hides_unfit_minimum() {
+        use crate::protocol::{ContextFill, Cost, UsageTotal};
+        for capacity in [Some(200_000), None] {
+            let workspace = tempfile::tempdir().unwrap();
+            let snapshot = SessionSnapshot {
+                session: Session {
+                    context_fill: Some(ContextFill {
+                        occupied_tokens: 12_400,
+                        capacity_tokens: capacity,
+                    }),
+                    id: SessionId::new(),
+                    workspace: Workspace {
+                        path: workspace.path().to_owned(),
+                    },
+                    agent_selection: None,
+                    agent_selection_availability: ModelAvailability::Available,
+                    status: SessionStatus::Active,
+                    working_since: None,
+                    parent: None,
+                },
+                revision: SessionRevision::INITIAL,
+                prompts: Vec::new(),
+                turns: Vec::new(),
+                messages: Vec::new(),
+                activities: Vec::new(),
+                transcript: Vec::new(),
+                subagent_questionnaires: Vec::new(),
+                subagent_usage: Some(UsageTotal {
+                    cost: Cost::from_usd(0.42),
+                    ..UsageTotal::default()
+                }),
+            };
+            let mut application = Application::default();
+            application
+                .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+                .unwrap();
+            let cases: &[(u16, &str)] = if capacity.is_some() {
+                &[
+                    (80, "12.4K (6%) · $0.42"),
+                    (17, "12.4K (6%)"),
+                    (9, "6%"),
+                    (3, ""),
+                ]
+            } else {
+                &[(80, "12.4K · $0.42"), (10, "12.4K"), (6, "")]
+            };
+            for &(width, expected) in cases {
+                let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        super::render_session(
+                            frame,
+                            &application.state,
+                            frame.area(),
+                            &application.slots,
+                            &application.theme,
+                            false,
+                        );
+                    })
+                    .unwrap();
+                let rows = rendered_rows_from_buffer(terminal.backend().buffer());
+                let footer = rows.last().unwrap();
+                assert!(
+                    footer.contains(expected),
+                    "width {width}: expected {expected}, got {footer}"
+                );
+                if width < 20 {
+                    assert!(!footer.contains('$'), "Cost drops first: {footer}");
+                }
+                if expected == "6%" {
+                    assert!(!footer.contains('K'));
+                }
+                if expected.is_empty() {
+                    assert!(
+                        !footer.contains('%') && !footer.contains('K'),
+                        "partial measurements stay hidden: {footer}"
+                    );
+                }
+            }
+        }
+    }
+
     fn rendered_buffer(application: &Application) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("create test terminal");
         terminal
@@ -4214,6 +4324,7 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     session: Session {
+                        context_fill: None,
                         id: session_id,
                         workspace: Workspace {
                             path: PathBuf::from("/workspace"),
@@ -4277,6 +4388,7 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     session: Session {
+                        context_fill: None,
                         id: session_id,
                         workspace: Workspace {
                             path: PathBuf::from("/workspace"),

@@ -460,6 +460,7 @@ mod tests {
     ) -> SessionSnapshot {
         SessionSnapshot {
             session: Session {
+                context_fill: None,
                 id: SessionId::new(),
                 workspace: Workspace {
                     path: PathBuf::from("/workspace"),

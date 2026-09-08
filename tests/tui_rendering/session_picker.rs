@@ -1696,6 +1696,7 @@ fn session_summary(
 ) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            context_fill: None,
             id: session_id,
             workspace: Workspace {
                 path: workspace.to_owned(),

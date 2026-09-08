@@ -311,6 +311,8 @@ impl ActiveProviderTurn {
 #[derive(Default)]
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
+    /// Context measurements can arrive after the child's output route settles.
+    context_routes: HashMap<ProviderSubagentId, (SessionId, TurnId)>,
     rows: HashMap<ProviderSubagentId, SubagentRow>,
     /// The Subagents Suru itself settled by stopping them. Their rows and
     /// routes are gone, but the Provider was not the one to close them, so
@@ -373,6 +375,12 @@ impl SubagentRoutes {
         subagent: &ProviderSubagentId,
         event: ProviderEvent,
     ) {
+        if let ProviderEvent::ContextFill { report } = event {
+            if let Some(&(session_id, turn_id)) = self.context_routes.get(subagent) {
+                let _ = updates.apply(|| sessions.report_context_fill(session_id, turn_id, report));
+            }
+            return;
+        }
         let Some(mut route) = self.routes.remove(subagent) else {
             return;
         };
@@ -397,6 +405,7 @@ impl SubagentRoutes {
     /// events — the settles the rows were owed included — can arrive once the
     /// connection is gone.
     fn fail_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate, message: &str) {
+        self.context_routes.clear();
         for (_, mut route) in self.routes.drain() {
             fail_active_turn(
                 sessions,
@@ -1072,6 +1081,17 @@ async fn run_provider_session(
                             attribution: ProviderEventAttribution::OwningSession,
                             event,
                         } => match event {
+                            ProviderEvent::ContextFill { report } => {
+                                if let Some(turn_id) = report.turn_id.or_else(|| {
+                                    sessions.snapshot(session_id).and_then(|snapshot| {
+                                        snapshot.turns.last().map(|turn| turn.id)
+                                    })
+                                }) {
+                                    let _ = updates.apply(|| {
+                                        sessions.report_context_fill(session_id, turn_id, report)
+                                    });
+                                }
+                            }
                             // With no Turn active there is nothing for a
                             // terminal or selection event to land on.
                             ProviderEvent::TurnCompleted
@@ -1954,6 +1974,7 @@ fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) 
     (
         turn_id,
         ProviderTurnInput {
+            turn_id,
             prompt: ProviderPrompt::from_user_prompt(
                 delivered.prompt.text,
                 delivered.prompt.skill_invocations,
@@ -2565,6 +2586,7 @@ fn project_provider_event(
                                     started: Instant::now(),
                                 },
                             );
+                            subagents.context_routes.insert(subagent_id.clone(), (spawned.session_id, spawned.turn_id));
                             subagents.routes.insert(
                                 subagent_id,
                                 SubagentRoute {
@@ -2618,6 +2640,9 @@ fn project_provider_event(
                 }
                 Some(settled) => settled.map(|()| ProviderEventProjection::Continue),
             },
+            ProviderEvent::ContextFill { report } => sessions
+                .report_context_fill(session_id, active.turn_id, report)
+                .map(|()| ProviderEventProjection::Continue),
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,

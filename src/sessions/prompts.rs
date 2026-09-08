@@ -210,6 +210,7 @@ impl SessionStore {
         };
         let snapshot = SessionSnapshot {
             session: Session {
+                context_fill: None,
                 id: session_id,
                 workspace: Workspace {
                     path: workspace_path.clone(),
@@ -266,6 +267,7 @@ impl SessionStore {
         state.sessions.insert(
             session_id,
             SessionRecord {
+                context_fill_order: None,
                 snapshot: snapshot.clone(),
                 summary,
                 updates,

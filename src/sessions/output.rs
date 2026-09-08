@@ -12,6 +12,48 @@ use crate::protocol::{
 use super::SessionStore;
 
 impl SessionStore {
+    /// Unlike streamed output, measurements can complete after settlement.
+    /// The latest Turn and request sequence gate them independently of status.
+    pub(crate) fn report_context_fill(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        report: crate::provider::ContextFillReport,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(record) = state.sessions.get_mut(&session_id) else {
+            return Ok(());
+        };
+        if report.turn_id.is_some_and(|origin| origin != turn_id)
+            || record.snapshot.turns.last().map(|turn| turn.id) != Some(turn_id)
+            || record
+                .context_fill_order
+                .is_some_and(|(previous_turn, sequence)| {
+                    previous_turn == turn_id && sequence >= report.sequence
+                })
+        {
+            return Ok(());
+        }
+        let mut fill = report.fill;
+        fill.capacity_tokens = fill.capacity_tokens.filter(|capacity| *capacity > 0);
+        state.commit(
+            &self.storage,
+            session_id,
+            vec![SessionChange::ContextFillChanged {
+                context_fill: Some(fill),
+            }],
+        )?;
+        state
+            .sessions
+            .get_mut(&session_id)
+            .expect("Session was just updated")
+            .context_fill_order = Some((turn_id, report.sequence));
+        Ok(())
+    }
+
     pub(crate) fn publish_agent_output(
         &self,
         session_id: SessionId,

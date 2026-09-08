@@ -14,10 +14,10 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId, SessionChange,
-        SessionId, SessionRevision, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
+        AgentSelection, ContextFill, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId,
+        SessionChange, SessionId, SessionRevision, SessionUpdate, SkillCatalog,
+        SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
+        SkillId, SkillPromptDelivery, Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::support::ready_health;
 
 #[test]
-fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
+fn session_composer_footer_uses_persisted_context_and_cost_across_all_turn_outcomes() {
     let workspace = workspace_dir();
     let mut snapshot = failed_session_snapshot(
         SessionId::new(),
@@ -64,6 +64,10 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
         cost_basis: Some(CostBasis::Reported),
     });
 
+    snapshot.session.context_fill = Some(ContextFill {
+        occupied_tokens: 12_400,
+        capacity_tokens: Some(200_000),
+    });
     let mut current_client = connected_application(workspace.path());
     current_client
         .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
@@ -80,7 +84,7 @@ fn session_composer_footer_sums_persisted_usage_across_all_turn_outcomes() {
         ("reloaded", reloaded_screen.as_str()),
     ] {
         assert!(
-            screen.contains("38K · $0.83"),
+            screen.contains("12.4K (6%) · $0.83"),
             "the {client} client totals failed and interrupted Turns from the snapshot: {screen}"
         );
         assert!(
@@ -109,25 +113,33 @@ fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost
             SessionUpdate {
                 session_id,
                 revision: SessionRevision(snapshot.revision.0 + 1),
-                changes: vec![SessionChange::TurnUsageChanged {
-                    turn_id,
-                    usage: Usage {
-                        fresh_input_tokens: Some(1_200),
-                        cache_read_tokens: Some(8_000),
-                        output_tokens: Some(900),
-                        reasoning_tokens: Some(2_100),
-                        ..Usage::default()
+                changes: vec![
+                    SessionChange::ContextFillChanged {
+                        context_fill: Some(ContextFill {
+                            occupied_tokens: 12_400,
+                            capacity_tokens: Some(200_000),
+                        }),
                     },
-                    cost: None,
-                    cost_basis: None,
-                }],
+                    SessionChange::TurnUsageChanged {
+                        turn_id,
+                        usage: Usage {
+                            fresh_input_tokens: Some(1_200),
+                            cache_read_tokens: Some(8_000),
+                            output_tokens: Some(900),
+                            reasoning_tokens: Some(2_100),
+                            ..Usage::default()
+                        },
+                        cost: None,
+                        cost_basis: None,
+                    },
+                ],
             },
         )))
         .expect("record active Turn Usage");
 
     let updated = rendered_application_rows(&application).join("\n");
     assert!(
-        updated.contains("4.2K"),
+        updated.contains("12.4K (6%)"),
         "the footer updates from the shared Session projection: {updated}"
     );
     assert!(!updated.contains("12.2K"));
@@ -138,7 +150,7 @@ fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost
 }
 
 #[test]
-fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
+fn session_composer_footer_retains_own_context_when_subagent_cost_rolls_up() {
     let workspace = workspace_dir();
     let mut snapshot = failed_session_snapshot(
         SessionId::new(),
@@ -146,6 +158,10 @@ fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
         "Delegate the reading",
         workspace.path(),
     );
+    snapshot.session.context_fill = Some(ContextFill {
+        occupied_tokens: 1000,
+        capacity_tokens: Some(10000),
+    });
     let session_id = snapshot.session.id;
     snapshot.turns[0].usage = Some(Usage {
         fresh_input_tokens: Some(10_000),
@@ -161,7 +177,7 @@ fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
         .expect("open the delegating Session");
     let before = rendered_application_rows(&application).join("\n");
     assert!(
-        before.contains("15K · $0.31"),
+        before.contains("1K (10%) · $0.31"),
         "the footer starts on what the Session itself consumed: {before}"
     );
 
@@ -185,7 +201,7 @@ fn session_composer_footer_counts_the_subagent_subtree_the_server_rolled_up() {
 
     let after = rendered_application_rows(&application).join("\n");
     assert!(
-        after.contains("20K · $0.43"),
+        after.contains("1K (10%) · $0.43"),
         "delegated work joins the total the footer states: {after}"
     );
     assert!(
@@ -3010,5 +3026,94 @@ fn select_all_and_cut_bindings_leave_sidebar_and_picker_ownership_alone() {
                 .unwrap();
         }
         assert_composer_mark(&application, 140, "draft", true);
+    }
+}
+
+#[test]
+fn context_fill_footer_formats_partial_zero_and_over_capacity_measurements() {
+    for (fill, cost, expected) in [
+        (
+            Some(ContextFill {
+                occupied_tokens: 12_400,
+                capacity_tokens: Some(200_000),
+            }),
+            Some(0.42),
+            Some("12.4K (6%) · $0.42"),
+        ),
+        (
+            Some(ContextFill {
+                occupied_tokens: 12_400,
+                capacity_tokens: None,
+            }),
+            None,
+            Some("12.4K"),
+        ),
+        (
+            Some(ContextFill {
+                occupied_tokens: 12_400,
+                capacity_tokens: Some(0),
+            }),
+            None,
+            Some("12.4K"),
+        ),
+        (
+            Some(ContextFill {
+                occupied_tokens: 0,
+                capacity_tokens: Some(100),
+            }),
+            Some(0.0),
+            Some("0 (0%)"),
+        ),
+        (
+            Some(ContextFill {
+                occupied_tokens: 126,
+                capacity_tokens: Some(100),
+            }),
+            None,
+            Some("126 (126%)"),
+        ),
+        (
+            Some(ContextFill {
+                occupied_tokens: 1,
+                capacity_tokens: Some(8),
+            }),
+            None,
+            Some("1 (13%)"),
+        ),
+        (None, Some(0.42), Some("$0.42")),
+        (None, Some(0.0), None),
+        (None, None, None),
+    ] {
+        let workspace = workspace_dir();
+        let mut snapshot = failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Read occupancy",
+            workspace.path(),
+        );
+        snapshot.session.context_fill = fill;
+        snapshot.turns[0].usage = Some(Usage {
+            fresh_input_tokens: Some(999_999),
+            ..Usage::default()
+        });
+        snapshot.turns[0].cost = cost.and_then(Cost::from_usd);
+        snapshot.turns[0].cost_basis = cost.map(|_| CostBasis::Reported);
+        let mut app = connected_application(workspace.path());
+        app.handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .unwrap();
+        let rows = rendered_application_rows(&app);
+        let footer = rows.last().unwrap();
+        assert!(
+            !footer.contains("1M"),
+            "cumulative Usage never fills missing occupancy: {footer}"
+        );
+        if let Some(expected) = expected {
+            assert!(footer.contains(expected), "expected {expected}: {footer}");
+        } else {
+            assert!(!footer.contains('$') && !footer.contains('%'));
+        }
+        if fill.is_none() {
+            assert!(!footer.contains('%'));
+        }
     }
 }

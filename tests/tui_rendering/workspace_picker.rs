@@ -1090,6 +1090,7 @@ fn workspace_in(root: &Path, name: &str) -> PathBuf {
 fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            context_fill: None,
             id: SessionId::new(),
             workspace: Workspace {
                 path: workspace.to_owned(),

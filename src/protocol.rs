@@ -1565,9 +1565,21 @@ impl Activity {
     }
 }
 
+/// A measured context occupancy, independent of cumulative Usage and Cost.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextFill {
+    pub occupied_tokens: u64,
+    /// The raw Model window; zero is treated as unknown by consumers.
+    pub capacity_tokens: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
+    /// The latest reported occupancy of this Session alone.
+    #[serde(default)]
+    pub context_fill: Option<ContextFill>,
     pub id: SessionId,
     pub workspace: Workspace,
     pub agent_selection: Option<AgentSelection>,
@@ -2333,6 +2345,9 @@ pub struct SessionUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionChange {
+    ContextFillChanged {
+        context_fill: Option<ContextFill>,
+    },
     AgentSelectionChanged {
         selection: AgentSelection,
     },

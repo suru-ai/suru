@@ -657,6 +657,7 @@ fn decode_notification(
             Ok(Some(NativeNotification::TokenUsage {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
+                context_fill: params.token_usage.context_fill(),
                 total: params.token_usage.into_cumulative(),
             }))
         }

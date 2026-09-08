@@ -868,6 +868,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
     let activity_id = ActivityId::new();
     SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: session_id,
             workspace: Workspace {
                 path: workspace.to_owned(),

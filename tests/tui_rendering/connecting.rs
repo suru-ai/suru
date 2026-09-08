@@ -435,6 +435,7 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    context_fill: None,
                     id: SessionId::new(),
                     workspace: Workspace {
                         path: remote_only.clone(),
@@ -539,6 +540,7 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    context_fill: None,
                     id: session_id,
                     workspace: Workspace { path: ".".into() },
                     agent_selection: None,
@@ -608,6 +610,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    context_fill: None,
                     id: SessionId::new(),
                     workspace: Workspace {
                         path: remote_only.clone(),

@@ -79,6 +79,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 prompt.status = *status;
             }
+            SessionChange::ContextFillChanged { context_fill } => {
+                next.session.context_fill = *context_fill;
+            }
             SessionChange::TurnAdded { turn } => {
                 if !turn.has_valid_cost_attribution() {
                     bail!("Session update added a Turn with a Cost lacking exactly one Cost Basis");
@@ -90,6 +93,18 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 if next.turns.iter().any(|existing| existing.id == turn.id) {
                     bail!("Session update reused a Turn identity");
+                }
+                let previous_model = next
+                    .turns
+                    .last()
+                    .and_then(|turn| turn.agent.as_ref())
+                    .map(|agent| (&agent.selection.provider, &agent.selection.model));
+                let new_model = turn
+                    .agent
+                    .as_ref()
+                    .map(|agent| (&agent.selection.provider, &agent.selection.model));
+                if previous_model != new_model {
+                    next.session.context_fill = None;
                 }
                 next.turns.push(turn.clone());
             }
@@ -107,6 +122,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     || current.selection.provider != agent.selection.provider
                 {
                     bail!("Session update changed the Provider identity of an active Turn");
+                }
+                if current.selection.model != agent.selection.model {
+                    next.session.context_fill = None;
                 }
                 turn.agent = Some(agent.clone());
             }
@@ -640,6 +658,7 @@ mod tests {
         let turn_id = TurnId::new();
         let mut snapshot = SessionSnapshot {
             session: Session {
+                context_fill: None,
                 id: session_id,
                 workspace: Workspace {
                     path: PathBuf::from("/workspace"),

@@ -51,6 +51,7 @@ impl SessionStore {
         let parent_session = &parent.snapshot.session;
         let snapshot = SessionSnapshot {
             session: Session {
+                context_fill: None,
                 id: session_id,
                 workspace: parent_session.workspace.clone(),
                 agent_selection: parent_session.agent_selection.clone(),
@@ -101,6 +102,7 @@ impl SessionStore {
         state.sessions.insert(
             session_id,
             SessionRecord {
+                context_fill_order: None,
                 snapshot: snapshot.clone(),
                 summary,
                 updates,

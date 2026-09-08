@@ -435,6 +435,7 @@ pub fn failed_session_snapshot(
     let transcript = delivered.transcript();
     SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: session_id,
             workspace: Workspace {
                 path: workspace.to_owned(),
@@ -481,6 +482,7 @@ pub fn selected_session_snapshot(
 ) -> SessionSnapshot {
     SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: session_id,
             workspace: Workspace {
                 path: workspace.to_owned(),
@@ -509,6 +511,7 @@ pub fn navigable_session_snapshot(
 ) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: session_id,
             workspace: Workspace {
                 path: workspace.to_owned(),

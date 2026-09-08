@@ -13,6 +13,7 @@ mod failing_provider_support;
 #[path = "../support/provider.rs"]
 mod provider_support;
 
+mod context_fill;
 mod continuations;
 mod hydration;
 mod managed_client;

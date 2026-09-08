@@ -71,6 +71,7 @@ fn child_session_snapshot(
     let message_id = MessageId::new();
     SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: child_id,
             workspace: Workspace {
                 path: workspace.to_owned(),
@@ -289,7 +290,7 @@ fn returning_to_the_parent_restores_the_readers_view_state() {
 }
 
 #[test]
-fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_child_too() {
+fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_child() {
     let workspace = workspace_dir();
     let (mut parent, child_id) =
         parent_with_subagent_row(workspace.path(), ActivityStatus::Active, None, true);
@@ -298,6 +299,10 @@ fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_c
         fresh_input_tokens: Some(10_000),
         output_tokens: Some(5_000),
         ..Usage::default()
+    });
+    parent.session.context_fill = Some(suru::protocol::ContextFill {
+        occupied_tokens: 12_400,
+        capacity_tokens: Some(200_000),
     });
     parent.turns[0].cost = Cost::from_usd(0.31);
     parent.turns[0].cost_basis = Some(CostBasis::Reported);
@@ -313,6 +318,10 @@ fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_c
         output_tokens: Some(1_000),
         ..Usage::default()
     });
+    child.session.context_fill = Some(suru::protocol::ContextFill {
+        occupied_tokens: 1000,
+        capacity_tokens: Some(100_000),
+    });
     child.turns[0].cost = Cost::from_usd(0.12);
     child.turns[0].cost_basis = Some(CostBasis::Reported);
 
@@ -322,7 +331,7 @@ fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_c
         .expect("attach the delegating Session");
     let delegating = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
     assert!(
-        delegating.contains("20K · $0.43"),
+        delegating.contains("12.4K (6%) · $0.43"),
         "the parent states its own work and the Subagent's together: {delegating}"
     );
 
@@ -331,7 +340,7 @@ fn a_subagent_sessions_view_states_its_own_total_where_its_parents_carries_the_c
         .expect("open the Subagent's Session");
     let delegated = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
     assert!(
-        delegated.contains("5K · $0.12"),
+        delegated.contains("1K (1%) · $0.12"),
         "the child states what it consumed itself: {delegated}"
     );
     assert!(

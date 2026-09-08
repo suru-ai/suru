@@ -76,6 +76,9 @@ pub(super) struct NativeCorrelation {
     metered_model: ModelId,
     /// Codex's running total for the Session's own thread.
     root_metering: ThreadMetering,
+    context_fill_sequence: u64,
+    pub(super) context_fill_turn: Option<crate::protocol::TurnId>,
+    context_native_turn: Option<String>,
     /// The streaming items open on the Session's own thread.
     root: ThreadInFlight,
     /// The spawned child threads Suru follows, by thread id — the identity
@@ -223,6 +226,9 @@ impl NativeCorrelation {
             settled_turns: HashSet::new(),
             metered_model,
             root_metering: ThreadMetering::default(),
+            context_fill_sequence: 0,
+            context_fill_turn: None,
+            context_native_turn: None,
             root: ThreadInFlight::default(),
             children: HashMap::new(),
             settled_children: HashSet::new(),
@@ -252,6 +258,7 @@ impl NativeCorrelation {
                 "Codex started a Turn while another native Turn was active",
             ));
         }
+        self.context_native_turn = None;
         self.turn_starting = true;
         Ok(())
     }
@@ -265,6 +272,7 @@ impl NativeCorrelation {
         self.turn_starting = false;
         match started {
             Ok(turn_id) if self.active_turn_id.is_none() => {
+                self.context_native_turn = Some(turn_id.clone());
                 self.active_turn_id = Some(turn_id);
                 self.metered_model = selection.model.clone();
                 self.effective_selection = Some(selection);
@@ -423,8 +431,8 @@ impl NativeCorrelation {
     }
 
     /// Settles one Subagent, dropping its thread from the followed set: the
-    /// settle closes the row and the child Session together, and nothing more
-    /// of the thread's can land after it. Like the spawn's counterparts on the
+    /// settle closes the row and the child Session together. Later output is
+    /// discarded, while Context Fill retains its attribution. Like the spawn's counterparts on the
     /// other Providers, the settle addresses the row by the Subagent's own
     /// identity and rides the owning conversation, so a nested Subagent's
     /// settle still lands after its spawner's own — order the wire does not
@@ -648,6 +656,8 @@ fn project_native_notification(
             let Some(selection) = correlation.effective_selection.clone() else {
                 return Ok(Vec::new());
             };
+            correlation.context_fill_turn = None;
+            correlation.context_native_turn = Some(turn_id.clone());
             correlation.active_turn_id = Some(turn_id);
             Ok(owning(vec![ProviderEvent::ContinuationStarted {
                 selection,
@@ -811,11 +821,13 @@ fn project_native_notification(
             thread_id,
             turn_id,
             total,
+            context_fill,
         } => Ok(project_token_usage(
             correlation,
             &thread_id,
             &turn_id,
             total,
+            context_fill,
         )),
         NativeNotification::TurnCompleted {
             thread_id,
@@ -1203,22 +1215,54 @@ fn project_token_usage(
     thread_id: &str,
     turn_id: &str,
     total: NativeCumulativeUsage,
+    context_fill: Option<crate::protocol::ContextFill>,
 ) -> Vec<AttributedProviderEvent> {
+    correlation.context_fill_sequence += 1;
+    let context_event = context_fill.map(|fill| ProviderEvent::ContextFill {
+        report: crate::provider::ContextFillReport {
+            turn_id: if correlation.thread_id == thread_id {
+                correlation.context_fill_turn
+            } else {
+                None
+            },
+            sequence: correlation.context_fill_sequence,
+            fill,
+        },
+    });
     if correlation.thread_id == thread_id {
         if correlation.active_turn_id.as_deref() != Some(turn_id) {
             correlation.root_metering.observe(total);
-            return Vec::new();
+            return if correlation.context_native_turn.as_deref() == Some(turn_id)
+                && !correlation.turn_starting
+            {
+                owning(context_event.into_iter().collect())
+            } else {
+                Vec::new()
+            };
         }
         let usage = correlation.root_metering.record(total, turn_id);
-        return owning(vec![ProviderEvent::Usage { usage, cost: None }]);
+        return owning(
+            std::iter::once(ProviderEvent::Usage { usage, cost: None })
+                .chain(context_event)
+                .collect(),
+        );
     }
     let Some(child) = correlation.children.get_mut(thread_id) else {
-        return Vec::new();
+        return if correlation.settled_children.contains(thread_id) {
+            attributed(
+                &ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+                context_event.into_iter().collect(),
+            )
+        } else {
+            Vec::new()
+        };
     };
     let usage = child.metering.record(total, CHILD_THREAD_TURN);
     attributed(
         &ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
-        vec![ProviderEvent::Usage { usage, cost: None }],
+        std::iter::once(ProviderEvent::Usage { usage, cost: None })
+            .chain(context_event)
+            .collect(),
     )
 }
 

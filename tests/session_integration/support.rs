@@ -168,6 +168,7 @@ pub async fn read_session_at_least_revision(
 /// the state every Subagent test starts from, because only a working Turn's
 /// Agent can spawn one.
 pub struct WorkingTurn {
+    _workspace: tempfile::TempDir,
     pub server: RunningServer,
     pub provider_session: ControlledProviderSession,
     /// The hosted runtime double itself, so a test can flip what the Provider
@@ -222,6 +223,7 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
         .expect("initial Turn reaches Provider")
         .succeed();
     WorkingTurn {
+        _workspace: workspace,
         server,
         provider_session,
         runtime,

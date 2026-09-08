@@ -1031,6 +1031,7 @@ mod tests {
     fn summary(title: &str, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(Box::new(SessionSummary {
             session: Session {
+                context_fill: None,
                 id: SessionId::new(),
                 workspace: Workspace {
                     path: root().join("workspace"),

@@ -35,7 +35,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260904000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260908000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -53,6 +53,7 @@ diesel::table! {
         status -> Text,
         revision -> BigInt,
         parent_session_id -> Nullable<Text>,
+        context_fill -> Nullable<Text>,
     }
 }
 

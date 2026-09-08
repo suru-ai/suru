@@ -5227,6 +5227,7 @@ mod tests {
         }
         SessionSnapshot {
             session: Session {
+                context_fill: None,
                 id: crate::protocol::SessionId::new(),
                 workspace: Workspace {
                     path: PathBuf::from("/workspace"),

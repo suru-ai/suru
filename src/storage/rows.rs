@@ -65,6 +65,7 @@ pub(super) struct SessionRow {
     status: String,
     revision: i64,
     parent_session_id: Option<String>,
+    context_fill: Option<String>,
 }
 
 #[derive(Insertable, Queryable, Selectable)]
@@ -291,6 +292,12 @@ impl SessionRow {
             status: encode(session_id, "Session status", &summary.session.status)?,
             revision: u64_to_i64(session_id, "revision", revision.0)?,
             parent_session_id: summary.session.parent.map(|parent| parent.to_string()),
+            context_fill: summary
+                .session
+                .context_fill
+                .as_ref()
+                .map(|fill| encode(session_id, "Context Fill", fill))
+                .transpose()?,
         })
     }
 
@@ -308,6 +315,11 @@ impl SessionRow {
             .map(AgentSelection::from);
         let summary = SessionSummary {
             session: Session {
+                context_fill: self
+                    .context_fill
+                    .as_deref()
+                    .map(|fill| decode(&session_id, "Context Fill", fill))
+                    .transpose()?,
                 id,
                 workspace: workspace.into(),
                 agent_selection,

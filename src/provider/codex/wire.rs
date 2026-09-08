@@ -803,13 +803,14 @@ pub(super) struct ThreadTokenUsageParams {
 }
 
 /// Codex's metering for one thread. `total` is the thread's running total
-/// since it opened; the `last` breakdown beside it is deliberately not read,
-/// because Codex re-announces an unchanged last call and summing those figures
-/// would count the same call twice.
+/// since it opened; `last` independently states current context occupancy.
+/// Repeated latest readings replace Context Fill and never accumulate Usage.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeThreadTokenUsage {
     pub(super) total: NativeTokenBreakdown,
+    #[serde(default)]
+    pub(super) last: NativeTokenBreakdown,
     #[serde(default)]
     pub(super) model_context_window: Option<i64>,
 }
@@ -821,6 +822,8 @@ pub(super) struct NativeThreadTokenUsage {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeTokenBreakdown {
+    #[serde(default)]
+    total_tokens: Option<i64>,
     #[serde(default)]
     input_tokens: Option<i64>,
     #[serde(default)]
@@ -834,6 +837,14 @@ pub(super) struct NativeTokenBreakdown {
 }
 
 impl NativeThreadTokenUsage {
+    pub(super) fn context_fill(&self) -> Option<crate::protocol::ContextFill> {
+        Some(crate::protocol::ContextFill {
+            occupied_tokens: reported_count(self.last.total_tokens)?,
+            capacity_tokens: reported_count(self.model_context_window)
+                .filter(|capacity| *capacity > 0),
+        })
+    }
+
     /// Suru's disjoint token parts for this reading. Codex's nested counts are
     /// made exclusive here — the cache parts leave `input_tokens`, Reasoning
     /// leaves `output_tokens` — so no consumer downstream ever subtracts, and
@@ -1082,6 +1093,7 @@ pub(super) enum NativeNotification {
         thread_id: String,
         turn_id: String,
         total: NativeCumulativeUsage,
+        context_fill: Option<crate::protocol::ContextFill>,
     },
     /// A collab tool call completing on `thread_id` — a spawn naming the child
     /// threads it opened, or any later call carrying Codex's view of the

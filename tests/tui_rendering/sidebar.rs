@@ -1046,6 +1046,7 @@ fn listed(
 ) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            context_fill: None,
             id: SessionId::new(),
             workspace: Workspace {
                 path: workspace.to_owned(),

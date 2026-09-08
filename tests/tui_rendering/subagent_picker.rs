@@ -92,6 +92,7 @@ fn child_with_working_subagent(
     let activity_id = ActivityId::new();
     let snapshot = SessionSnapshot {
         session: Session {
+            context_fill: None,
             id: child_id,
             workspace: Workspace {
                 path: workspace.to_owned(),

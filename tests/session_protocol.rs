@@ -211,6 +211,7 @@ fn agent_selection_round_trips_complete_typed_model_options() {
 fn session_summary_round_trips_with_discovery_metadata() {
     let summary = SessionSummary {
         session: Session {
+            context_fill: None,
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
             workspace: Workspace {
                 path: PathBuf::from("/work/suru"),
@@ -270,6 +271,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "agent_selection_availability": "available",
         "status": "active",
         "parent": null,
+        "context_fill": null,
         "created_at": 1_755_497_600_000_u64,
         "updated_at": 1_755_497_600_321_u64
     });
@@ -310,6 +312,10 @@ fn session_summary_round_trips_with_discovery_metadata() {
 fn provider_neutral_session_snapshot_round_trips_through_json() {
     let snapshot = SessionSnapshot {
         session: Session {
+            context_fill: Some(suru::protocol::ContextFill {
+                occupied_tokens: 12_400,
+                capacity_tokens: Some(200_000),
+            }),
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
             workspace: Workspace {
                 path: PathBuf::from("/work/suru"),
@@ -420,7 +426,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "agent_selection_availability": "unavailable",
             "status": "idle",
             "working_since": null,
-            "parent": null
+            "parent": null,
+            "context_fill": { "occupied_tokens": 12_400, "capacity_tokens": 200_000 }
         },
         "revision": 7,
         "prompts": [{
