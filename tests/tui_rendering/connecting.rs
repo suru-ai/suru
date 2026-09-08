@@ -85,13 +85,10 @@ fn choosing_a_remote_names_it_beside_the_workspace_on_landing_and_in_the_session
         .unwrap();
     let session = rendered_application_rows(&application).join("\n");
     assert!(
-        session
-            .lines()
-            .next()
-            .unwrap()
-            .contains("Suru · studio · ."),
+        session.lines().next().unwrap().contains("studio · ."),
         "{session}"
     );
+    assert!(!session.contains("Suru"), "{session}");
     assert!(!session.contains("Outlook "), "{session}");
     for width in [28, 43] {
         let narrow = rendered_application_rows_at(&application, width, 20);

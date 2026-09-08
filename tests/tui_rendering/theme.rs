@@ -871,10 +871,7 @@ fn system_theme_uses_a_locked_light_ramp_against_a_dark_terminal_background() {
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(37, 37, 37));
     assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::Rgb(60, 60, 60));
-    assert_eq!(
-        buffer.cell(composer_corner).unwrap().fg,
-        Color::Rgb(29, 29, 29)
-    );
+    assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
     assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
 }
 
@@ -890,10 +887,7 @@ fn system_paints_light_terminal_surfaces_borders_and_muted_text_light() {
 
     assert_eq!(buffer.cell((0, 0)).unwrap().bg, Color::Rgb(238, 238, 238));
     assert_eq!(buffer.cell(placeholder).unwrap().fg, Color::Rgb(75, 75, 75));
-    assert_eq!(
-        buffer.cell(composer_corner).unwrap().fg,
-        Color::Rgb(187, 187, 187)
-    );
+    assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
     assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
 }
 
@@ -912,10 +906,7 @@ fn system_paints_dark_terminal_surfaces_borders_and_muted_text_dark() {
         buffer.cell(placeholder).unwrap().fg,
         Color::Rgb(180, 180, 180)
     );
-    assert_eq!(
-        buffer.cell(composer_corner).unwrap().fg,
-        Color::Rgb(68, 68, 68)
-    );
+    assert_eq!(buffer.cell(composer_corner).unwrap().fg, Color::Cyan);
     assert_eq!(buffer.cell((99, 0)).unwrap().bg, Color::Reset);
 }
 

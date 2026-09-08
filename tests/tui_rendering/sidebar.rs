@@ -4494,9 +4494,10 @@ fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
         .expect("hydrate the foreign Session");
     let session = rendered_application_rows_at(&application, WIDE, 20).join("\n");
     assert!(
-        session.contains("Suru · studio ·"),
+        session.contains("studio ·"),
         "the hydrated Session's header names the Remote: {session:?}"
     );
+    assert!(!session.contains("Suru"), "{session}");
 }
 
 #[test]

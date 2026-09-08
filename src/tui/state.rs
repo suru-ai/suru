@@ -2132,10 +2132,8 @@ impl TuiState {
     pub(super) fn composer_border_style(&self, theme: &Theme) -> Style {
         if self.composers.skill_issue(self.composer_key()).is_some() {
             theme.form_field.invalid
-        } else if self.composer_focused() {
-            theme.form_field.border
         } else {
-            theme.border.subdued
+            theme.accent.primary
         }
     }
 

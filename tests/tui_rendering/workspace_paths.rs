@@ -59,10 +59,7 @@ fn local_workspace_labels_use_the_servers_home_on_landing_and_in_a_session() {
 
     let (_, snapshot) = enter_session(&mut application, &workspace);
     let session = screen(&application);
-    assert!(
-        session.lines().next().unwrap().contains(label),
-        "{session}"
-    );
+    assert!(session.lines().next().unwrap().contains(label), "{session}");
     assert!(!session.contains("Suru"), "{session}");
     assert!(!session.contains("Workspace "), "{session}");
     assert_eq!(snapshot.session.workspace.path, workspace);
