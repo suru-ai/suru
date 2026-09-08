@@ -26,6 +26,8 @@ mod support;
 
 #[path = "server_integration/checkouts.rs"]
 mod checkout_observation;
+#[path = "server_integration/preparation_recovery.rs"]
+mod preparation_recovery;
 
 #[allow(dead_code)]
 #[path = "support/provider.rs"]
@@ -1048,6 +1050,15 @@ async fn paired_servers_with_runtime(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
 ) -> PairedServers {
+    paired_servers_with_source_control(name, alternate, runtime, None).await
+}
+
+async fn paired_servers_with_source_control(
+    name: &str,
+    alternate: bool,
+    runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
+    source_control: Option<std::sync::Arc<dyn suru::source_control::SourceControl>>,
+) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
     let serving_channel = format!("{name}-serving");
@@ -1059,9 +1070,15 @@ async fn paired_servers_with_runtime(
         checkout_observation_interval: Duration::from_millis(15),
         ..ServerTimings::default()
     };
-    let serving = match runtime {
-        Some(runtime) => server::spawn_with_provider_and_timings(config, runtime, timings).await,
-        None => server::spawn_with_timings(config, timings).await,
+    let serving = match (runtime, source_control) {
+        (Some(runtime), Some(adapter)) => {
+            server::spawn_with_source_control(config, vec![runtime], timings, adapter).await
+        }
+        (Some(runtime), None) => {
+            server::spawn_with_provider_and_timings(config, runtime, timings).await
+        }
+        (None, None) => server::spawn_with_timings(config, timings).await,
+        (None, Some(_)) => panic!("source control fixture requires an explicit Provider"),
     }
     .expect("spawn Serving Server");
     let mut serving_client = ManagedClient::connect(

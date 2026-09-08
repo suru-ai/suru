@@ -1338,6 +1338,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
     // Stable ID allocation and persistence precede Git mutation. The repository
     // guard is also used by admission, and can cover recovery/removal operations.
     let _serial = state.preparations.serial.lock().await;
+    let mut planned_guard = None;
     let mut preparation = match state.preparations.load(request.id) {
         Ok(Some(plan)) => plan,
         Ok(None) => match state
@@ -1345,7 +1346,8 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
             .plan_checkout(&request, &state.preparations.channel)
             .await
         {
-            Ok(plan) => {
+            Ok((plan, guard)) => {
+                planned_guard = Some(guard);
                 if let Err(e) = state.preparations.save(&plan) {
                     return preparation_error(e);
                 }
@@ -1355,34 +1357,48 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         },
         Err(e) => return preparation_error(e),
     };
-    // A lost admission response is a read of admitted work, never another
-    // initialization pass through files an Agent may already be changing.
-    if let Err(e) = state.sessions.hydrate(preparation.intended_session).await {
-        return preparation_error(e.to_string());
+    let source =
+        std::fs::canonicalize(&request.source.path).unwrap_or_else(|_| request.source.path.clone());
+    if source != preparation.source.path && source != preparation.destination.path {
+        return preparation_error("Preparation identity belongs to another execution location");
     }
-    if state
-        .sessions
-        .snapshot(preparation.intended_session)
-        .is_some()
-    {
-        preparation.admitted_session = Some(preparation.intended_session);
-        let location = state
-            .source_control
-            .resolve(&preparation.destination.path, None)
-            .await;
-        return Json(PrepareCheckoutResult {
-            preparation,
-            location: Some(location),
-            error: None,
-        })
-        .into_response();
+    match rejoin_preparation(&state, &mut preparation).await {
+        Ok(Some(_)) => {
+            return Json(PrepareCheckoutResult {
+                preparation,
+                location: None,
+                error: None,
+            })
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Json(PrepareCheckoutResult {
+                preparation,
+                location: None,
+                error: Some(error),
+            })
+            .into_response();
+        }
     }
-    let _mutation = state
-        .source_control
-        .mutation_guard(&preparation.repository.id)
-        .await;
+    let _mutation = match planned_guard {
+        Some(guard) => guard,
+        None => {
+            state
+                .source_control
+                .mutation_guard(&preparation.repository.id)
+                .await
+        }
+    };
     let mut location = None;
     let operation = async {
+        state
+            .source_control
+            .checkpoint(
+                crate::source_control::PreparationCheckpoint::IntentPersisted,
+                &preparation,
+            )
+            .await?;
         let resolved = state.source_control.prepare_checkout(&preparation).await?;
         location = Some(resolved);
         preparation.checkout_created = true;
@@ -1390,6 +1406,13 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         state
             .source_control
             .initialize_checkout(&preparation)
+            .await?;
+        state
+            .source_control
+            .checkpoint(
+                crate::source_control::PreparationCheckpoint::SubmodulesReady,
+                &preparation,
+            )
             .await?;
         let catalog = tokio::time::timeout(
             state.timings.checkout_skill_timeout,
@@ -1416,7 +1439,12 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         }
     }
     .await;
-    let mut error = operation.err();
+    let mut error = operation.err().map(|error| {
+        format!(
+            "Worktree preparation at {}: {error}",
+            preparation.destination.path.display()
+        )
+    });
     preparation.ready = error.is_none();
     if let Err(e) = state.preparations.save(&preparation) {
         error = Some(e);
@@ -1427,6 +1455,101 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         error,
     })
     .into_response()
+}
+
+/// An admitted initial Prompt is immutable even if a Client edits its retry.
+/// Hydrate only this preparation's intended Session, never the catalog.
+async fn rejoin_preparation(
+    state: &AppState,
+    plan: &mut crate::protocol::PreparedCheckout,
+) -> Result<Option<crate::protocol::SessionSnapshot>, String> {
+    state
+        .sessions
+        .hydrate(plan.intended_session)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(snapshot) = state.sessions.snapshot(plan.intended_session) else {
+        return if plan.admitted_session.is_some() {
+            Err("The admitted Session no longer exists".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if snapshot.session.execution_directory != plan.destination {
+        return Err("Preparation Session has a conflicting execution location".into());
+    }
+    let pending = snapshot
+        .turns
+        .is_empty()
+        .then(|| {
+            snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.status == crate::protocol::PromptStatus::Pending)
+        })
+        .flatten();
+    if let Some(prompt) = pending
+        && !state.providers.has_session_actor(snapshot.session.id)
+    {
+        let guard = state
+            .source_control
+            .mutation_guard(&plan.repository.id)
+            .await;
+        state.source_control.prepare_checkout(plan).await?;
+        state.source_control.initialize_checkout(plan).await?;
+        let provider = snapshot
+            .session
+            .agent_selection
+            .as_ref()
+            .map(|s| s.provider.clone())
+            .or_else(|| state.hosted_providers.first().cloned());
+        if let Some(provider) = &provider {
+            let catalog = tokio::time::timeout(
+                state.timings.checkout_skill_timeout,
+                state.skill_catalog.refresh_current(SkillCatalogRequest {
+                    provider: provider.clone(),
+                    execution_directory: plan.destination.clone(),
+                }),
+            )
+            .await
+            .map_err(|_| "Destination Skill discovery timed out; retry".to_owned())?
+            .map_err(|error| format!("Destination Skills are unavailable; retry: {error:?}"))?;
+            if !matches!(
+                catalog.status,
+                crate::protocol::SkillCatalogStatus::Fresh { .. }
+            ) {
+                return Err(
+                    "Destination Skills are unavailable; Worktree retained for retry".into(),
+                );
+            }
+        }
+        let initial = crate::protocol::InitialPrompt {
+            id: prompt.id,
+            text: prompt.text.clone(),
+            skill_invocations: prompt.skill_invocations.clone(),
+        };
+        if !initial.skill_invocations.is_empty() {
+            let provider =
+                provider.ok_or("No Provider is selected for the admitted Skill Invocation")?;
+            // This Prompt is already known, but it has never started. Admission's
+            // idempotency bypass must not skip destination validation here.
+            state.skill_catalog.validate_prompt(provider, &plan.destination.path, &initial, SkillPromptDelivery::Initial)
+                .await.map_err(|error| format!("The admitted Prompt's destination Skills must be available before startup: {error:?}"))?;
+        }
+        state
+            .sessions
+            .persist_prepared_session(snapshot.session.id)
+            .map_err(|e| e.to_string())?;
+        state.providers.open_session(
+            snapshot.session.id,
+            plan.destination.path.clone(),
+            prompt.id,
+        );
+        retain_checkout_during_startup(state, snapshot.session.id, guard);
+    }
+    plan.admitted_session = Some(snapshot.session.id);
+    state.preparations.save(plan)?;
+    Ok(Some(snapshot))
 }
 
 /// Admission publishes an idle shell before the actor creates its first Turn.
@@ -1488,21 +1611,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         },
         None => None,
     };
-    if let Some(plan) = &preparation {
-        if let Err(e) = state.sessions.hydrate(plan.intended_session).await {
-            return preparation_error(e.to_string());
+    if let Some(plan) = &mut preparation {
+        if request.execution_directory != plan.destination {
+            return preparation_error("Preparation identity belongs to another execution location");
         }
-        if let Some(snapshot) = state.sessions.snapshot(plan.intended_session) {
-            return Json(snapshot).into_response();
-        }
-        if let Some(id) = plan.admitted_session {
-            if let Err(e) = state.sessions.hydrate(id).await {
-                return preparation_error(e.to_string());
-            }
-            return state.sessions.snapshot(id).map_or_else(
-                || preparation_error("The admitted Session no longer exists"),
-                |snapshot| Json(snapshot).into_response(),
-            );
+        match rejoin_preparation(&state, plan).await {
+            Ok(Some(snapshot)) => return Json(snapshot).into_response(),
+            Ok(None) => {}
+            Err(error) => return preparation_error(error),
         }
     }
     let mut mutation = if let Some(plan) = &preparation {
@@ -1601,6 +1717,19 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     match admission {
         Ok(StoreOutcome::Created(snapshot)) => {
             if let Some(plan) = &mut preparation {
+                if let Err(error) = state.sessions.persist_prepared_session(snapshot.session.id) {
+                    return preparation_error(error.to_string());
+                }
+                if let Err(error) = state
+                    .source_control
+                    .checkpoint(
+                        crate::source_control::PreparationCheckpoint::SessionPersisted,
+                        plan,
+                    )
+                    .await
+                {
+                    return preparation_error(error);
+                }
                 plan.admitted_session = Some(snapshot.session.id);
                 if let Err(e) = state.preparations.save(plan) {
                     tracing::warn!("Admitted preparation marker will require reconciliation: {e}");
@@ -1617,6 +1746,15 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             );
             if let Some(guard) = mutation.take() {
                 retain_checkout_during_startup(&state, snapshot.session.id, guard);
+            }
+            if let Some(plan) = &preparation {
+                if let Err(error) = state
+                    .source_control
+                    .checkpoint(crate::source_control::PreparationCheckpoint::Admitted, plan)
+                    .await
+                {
+                    return preparation_error(error);
+                }
             }
             // After the Turn is scheduled and never in front of it: a Title is
             // cosmetic and the user's actual work does not wait on one. Only a

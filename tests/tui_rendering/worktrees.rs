@@ -848,3 +848,42 @@ fn managed_preparation_requires_destination_skill_reselection_and_keeps_identity
         SkillId::new("destination-review")
     );
 }
+
+#[test]
+fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_edits() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Original draft");
+    let ApplicationTransition::PrepareCheckout { request, .. } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    app.handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+        ready_health(uuid::Uuid::new_v4(), 43_424),
+    )))
+    .unwrap();
+    assert!(text(&app).contains("Original draft"));
+    type_terminal_text(&mut app, " edited");
+    let ApplicationTransition::PrepareCheckout {
+        request: retry,
+        prompt_id,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("retry is usable after replacement")
+    };
+    assert_eq!(retry.id, request.id);
+    assert_eq!(retry.source, request.source);
+    assert!(retry.description.contains("edited"));
+    let mut result = prepared(&layout, &retry);
+    let intended = result.preparation.intended_session;
+    result.preparation.admitted_session = Some(intended);
+    result.location = None;
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap()
+    else {
+        panic!("admitted retry rejoins through existing creation")
+    };
+    assert_eq!(create.preparation_id, Some(request.id));
+}

@@ -153,6 +153,19 @@ impl SessionStore {
         self.create_in_with_identity(request, location, None)
     }
 
+    pub(crate) fn persist_prepared_session(&self, id: SessionId) -> anyhow::Result<()> {
+        let state = self.state.lock().unwrap();
+        let record = state
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Prepared Session no longer exists"))?;
+        // Observation or grouping may have advanced metadata while destination
+        // validation awaited. Persist the current record under its store lock.
+        self.storage
+            .location_changed(record.snapshot.session.clone(), record.snapshot.revision)?;
+        Ok(())
+    }
+
     pub(crate) fn create_in_with_identity(
         &self,
         request: CreateSessionRequest,

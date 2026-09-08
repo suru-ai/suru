@@ -617,6 +617,10 @@ impl ProviderOrchestrator {
         }
     }
 
+    pub(crate) fn has_session_actor(&self, id: SessionId) -> bool {
+        self.actors.lock().unwrap().entries.contains_key(&id)
+    }
+
     pub(crate) fn open_session(
         &self,
         session_id: SessionId,

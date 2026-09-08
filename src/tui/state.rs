@@ -1166,6 +1166,14 @@ impl TuiState {
                     .as_ref()
                     .is_some_and(|identity| identity.instance_id != health.instance_id);
                 if replaced_server {
+                    if self.new_worktree.is_some()
+                        && let Some(prompt_id) = self
+                            .pending_submission
+                            .as_ref()
+                            .map(|pending| pending.prompt.id)
+                    {
+                        self.fail_pending_submission(prompt_id, "Worktree preparation interrupted by Server replacement; submit again to resume the same preparation".into());
+                    }
                     self.questionnaires.discard_origin(&self.outlook);
                     if let Some(reference) = self.session_reference.clone() {
                         self.composers.recover_session_to_landing(reference.clone());
@@ -1178,8 +1186,11 @@ impl TuiState {
                     self.queued_agent_selection = None;
                     self.confirmed_agent_selection = None;
                     self.session_events_blocked = true;
-                    self.submission_error =
-                        Some("Session ended because the shared server was replaced".to_owned());
+                    self.submission_error = Some(if self.new_worktree.is_some() {
+                        "Worktree preparation interrupted by Server replacement; submit again to resume the same preparation".to_owned()
+                    } else {
+                        "Session ended because the shared server was replaced".to_owned()
+                    });
                     self.sync_composer_completion();
                 }
                 if self.session.is_none() && self.outlook == Outlook::Local {
@@ -3460,7 +3471,8 @@ impl Application {
                     .prompt
                     .clone();
                 // The destination is a new Skill authority even when names match.
-                let explicit_source = !prompt.skill_invocations.is_empty()
+                let explicit_source = result.preparation.admitted_session.is_none()
+                    && !prompt.skill_invocations.is_empty()
                     && intent
                         .as_ref()
                         .is_some_and(|intent| intent.source != result.preparation.destination);

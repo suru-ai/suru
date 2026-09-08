@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
+mod preparation;
 
 /// Git command execution stays on its owning Server. Timeouts and the executable
 /// are injectable so unavailable/hung installations need no global environment edits.
@@ -15,6 +16,7 @@ pub struct GitSourceControl {
     timeout: Duration,
     mutation_timeout: Duration,
     configuration_file: Option<PathBuf>,
+    observer: Option<std::sync::Arc<dyn super::PreparationObserver>>,
 }
 impl Default for GitSourceControl {
     fn default() -> Self {
@@ -28,7 +30,15 @@ impl GitSourceControl {
             timeout: Duration::from_secs(5),
             mutation_timeout: Duration::from_secs(120),
             configuration_file: None,
+            observer: None,
         }
+    }
+    pub fn with_preparation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn super::PreparationObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
     }
     /// An isolated Git user configuration, useful for embedded hosts and fixtures.
     pub fn with_configuration_file(mut self, path: impl Into<PathBuf>) -> Self {
@@ -53,12 +63,33 @@ impl GitSourceControl {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Output, String> {
+        self.command_with_input(directory, args, timeout, None)
+            .await
+    }
+    async fn command_with_input(
+        &self,
+        directory: &Path,
+        args: &[&str],
+        timeout: Duration,
+        input: Option<&str>,
+    ) -> Result<Output, String> {
+        use std::io::Write;
+        let stdin = if let Some(input) = input {
+            use std::io::{Seek, SeekFrom};
+            let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
+            file.write_all(input.as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            Stdio::from(file)
+        } else {
+            Stdio::null()
+        };
         let mut command = Command::new(&self.executable);
         command
             .arg("-C")
             .arg(directory)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .kill_on_drop(true);
         // Ambient Git overrides must not redirect discovery into another checkout.
         for name in [
@@ -118,19 +149,16 @@ impl GitSourceControl {
         {
             return Err("The prepared checkout no longer uses its intended branch".to_owned());
         }
-        if !plan.checkout_created {
-            let CheckoutPreparationPlan::Git { source_commit, .. } = &plan.plan;
-            if self
-                .text(
-                    &plan.destination.path,
-                    &["rev-parse", "--verify", "HEAD^{commit}"],
-                )
-                .await
-                .as_ref()
-                != Some(source_commit)
-            {
-                return Err("The destination does not contain the captured source commit; it was not overwritten".to_owned());
-            }
+        let CheckoutPreparationPlan::Git { source_commit, .. } = &plan.plan;
+        let commit = self
+            .text(
+                &plan.destination.path,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+            )
+            .await
+            .ok_or("Prepared checkout HEAD is unavailable; its branch may have been deleted")?;
+        if !plan.checkout_created && &commit != source_commit {
+            return Err("The destination does not contain the captured source commit; it was not overwritten".into());
         }
         Ok(())
     }
@@ -164,6 +192,17 @@ impl GitSourceControl {
 
 #[async_trait]
 impl SourceControl for GitSourceControl {
+    async fn checkpoint(
+        &self,
+        at: super::PreparationCheckpoint,
+        plan: &PreparedCheckout,
+    ) -> Result<(), String> {
+        if let Some(observer) = &self.observer {
+            observer.checkpoint(at, plan).await?;
+        }
+        Ok(())
+    }
+
     async fn plan_checkout(
         &self,
         id: PreparationId,
@@ -253,10 +292,6 @@ impl SourceControl for GitSourceControl {
         if self.common(root).await.as_ref() != Some(&plan.repository.metadata_directory) {
             return Err("Repository metadata is unavailable or has changed".to_owned());
         }
-        let CheckoutPreparationPlan::Git {
-            branch: name,
-            source_commit: commit,
-        } = &plan.plan;
         let destination = &plan.destination.path;
         // Reject aliases and replacement parents before creating or reusing files.
         let relative = destination
@@ -308,26 +343,8 @@ impl SourceControl for GitSourceControl {
             std::fs::write(&exclude, contents)
                 .map_err(|e| format!("Cannot update repository-local exclude: {e}"))?;
         }
-        if destination.exists() {
-            self.validate_prepared(plan).await?;
-        } else {
-            // Never reset or attach an existing branch when creating a new intention.
-            self.mutate(
-                root,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    name,
-                    destination
-                        .to_str()
-                        .ok_or("Git destination is not Unicode")?,
-                    commit,
-                ],
-            )
-            .await?;
-            self.validate_prepared(plan).await?;
-        }
+        self.claim_branch(plan).await?;
+        self.materialize_owned(plan).await?;
         Ok(self.discover(destination).await)
     }
     async fn initialize_checkout(&self, plan: &PreparedCheckout) -> Result<(), String> {

@@ -23,9 +23,16 @@ impl PreparationStore {
     pub(crate) fn load(&self, id: PreparationId) -> Result<Option<PreparedCheckout>, String> {
         let path = self.root.join(format!("{}.json", id.0));
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| format!("Cannot read Worktree preparation: {e}")),
+            Ok(bytes) => {
+                let preparation: PreparedCheckout = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
+                if preparation.id != id {
+                    return Err(
+                        "Stored preparation identity conflicts with the requested intention".into(),
+                    );
+                }
+                Ok(Some(preparation))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("Cannot read Worktree preparation: {e}")),
         }

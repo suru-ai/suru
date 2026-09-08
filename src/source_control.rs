@@ -14,8 +14,37 @@ mod preparation;
 pub use git::GitSourceControl;
 pub(crate) use preparation::PreparationStore;
 
+/// Observable preparation boundaries, injectable for interruption testing and hosts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparationCheckpoint {
+    IntentPersisted,
+    BranchCreated,
+    RegistrationCreated,
+    CheckoutCreated,
+    SubmodulesReady,
+    SessionPersisted,
+    Admitted,
+}
+
+#[async_trait]
+pub trait PreparationObserver: Send + Sync {
+    async fn checkpoint(
+        &self,
+        at: PreparationCheckpoint,
+        preparation: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String>;
+}
+
 #[async_trait]
 pub trait SourceControl: Send + Sync {
+    async fn checkpoint(
+        &self,
+        _at: PreparationCheckpoint,
+        _preparation: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
     async fn plan_checkout(
         &self,
@@ -97,15 +126,42 @@ impl SourceControlService {
             .clone();
         lock.lock_owned().await
     }
+    pub(crate) async fn checkpoint(
+        &self,
+        at: PreparationCheckpoint,
+        plan: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        self.adapter.checkpoint(at, plan).await
+    }
     pub(crate) async fn plan_checkout(
         &self,
         request: &crate::protocol::PrepareCheckoutRequest,
         channel: &str,
-    ) -> Result<crate::protocol::PreparedCheckout, String> {
+    ) -> Result<
+        (
+            crate::protocol::PreparedCheckout,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        String,
+    > {
         let source = self.resolve(&request.source.path, None).await;
-        self.adapter
-            .plan_checkout(request.id, &source, &request.description, channel)
-            .await
+        let repository = source
+            .workspace
+            .repository
+            .as_ref()
+            .ok_or("A Repository is required")?;
+        let guard = self.mutation_guard(&repository.id).await;
+        let current = self
+            .resolve(&request.source.path, Some(&source.workspace))
+            .await;
+        if current.workspace.repository.as_ref().map(|repo| &repo.id) != Some(&repository.id) {
+            return Err("Source Repository changed during preparation".into());
+        }
+        let plan = self
+            .adapter
+            .plan_checkout(request.id, &current, &request.description, channel)
+            .await?;
+        Ok((plan, guard))
     }
     pub(crate) async fn prepare_checkout(
         &self,

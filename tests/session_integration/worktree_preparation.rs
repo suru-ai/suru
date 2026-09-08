@@ -518,3 +518,6 @@ async fn branch_collision_does_not_reset_or_duplicate_intention_and_unknown_main
     assert!(!metadata.join(".suru-worktrees").exists());
     server.shutdown().await.unwrap();
 }
+
+#[path = "preparation_recovery.rs"]
+mod recovery;
