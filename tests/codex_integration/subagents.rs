@@ -10,7 +10,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, CreateSessionRequest, InitialPrompt,
-        MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Workspace,
+        MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -46,7 +46,7 @@ async fn opened_session(codex: &ScriptedCodex, name: &'static str, prompt: &str)
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

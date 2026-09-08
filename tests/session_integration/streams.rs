@@ -11,7 +11,7 @@ use suru::{
     protocol::{
         CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
         Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, SESSION_SNAPSHOT_EVENT,
-        SessionChange, SessionRevision, SessionSnapshot, Turn, TurnId, TurnStatus, Workspace,
+        SessionChange, SessionRevision, SessionSnapshot, Turn, TurnId, TurnStatus,
     },
     server::{AgentOutput, ServerConfig},
 };
@@ -33,7 +33,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -132,7 +132,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -312,7 +312,7 @@ async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

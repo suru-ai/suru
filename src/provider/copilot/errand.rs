@@ -81,7 +81,7 @@ fn errand_session_config(errand: &ProviderErrand) -> Result<SessionConfig, Provi
         // what gives the Session-scoped requests the CLI may issue mid-creation somewhere to land.
         .with_session_id(CopilotSessionId::new(uuid::Uuid::new_v4().to_string()))
         .with_client_name(COPILOT_CLIENT_NAME)
-        .with_working_directory(errand.workspace.clone())
+        .with_working_directory(errand.execution_directory.clone())
         .with_model(errand.selection.model.as_str())
         .with_available_tools(Vec::<String>::new())
         .deny_all_permissions()

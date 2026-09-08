@@ -17,7 +17,7 @@ use super::{
 use crate::{
     protocol::{
         ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillPromptDelivery, Workspace,
+        SkillId, SkillPromptDelivery,
     },
     provider::{ProviderError, ProviderPrompt, harness::ProcessRegistry},
 };
@@ -45,7 +45,7 @@ impl ClaudeSkills {
         &self,
         executable: OsString,
         processes: ProcessRegistry,
-        workspace: PathBuf,
+        execution_directory: PathBuf,
         request_timeout: Duration,
     ) -> Result<SkillCatalog, ProviderError> {
         let args = [
@@ -55,7 +55,7 @@ impl ClaudeSkills {
         let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
             &executable,
             args,
-            Some(workspace.clone()),
+            Some(execution_directory.clone()),
             None,
             processes,
             ClaudeSettingSources::PersonalAndProject,
@@ -138,7 +138,7 @@ impl ClaudeSkills {
         let mut descriptors = by_name
             .into_values()
             .map(|(skill, metadata)| {
-                let id = opaque_skill_id(&workspace, &skill, &metadata.scope);
+                let id = opaque_skill_id(&execution_directory, &skill, &metadata.scope);
                 native.insert(
                     id.clone(),
                     NativeEntry {
@@ -162,11 +162,16 @@ impl ClaudeSkills {
         self.catalogs
             .lock()
             .expect("Claude Skill store lock is not poisoned")
-            .insert(workspace.clone(), NativeCatalog { skills: native });
+            .insert(
+                execution_directory.clone(),
+                NativeCatalog { skills: native },
+            );
 
         Ok(SkillCatalog {
             provider: ProviderId::new(CLAUDE_PROVIDER_ID),
-            workspace: Workspace { path: workspace },
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory,
+            },
             skills: descriptors,
             capabilities: SkillCatalogCapabilities {
                 max_distinct_invocations: Some(MAX_DISTINCT_SKILLS as u32),
@@ -188,7 +193,7 @@ impl ClaudeSkills {
 
     pub(super) fn lower(
         &self,
-        workspace: &Path,
+        execution_directory: &Path,
         prompt: ProviderPrompt,
     ) -> Result<String, ProviderError> {
         if prompt.skill_invocations.is_empty() {
@@ -203,7 +208,7 @@ impl ClaudeSkills {
             .catalogs
             .lock()
             .expect("Claude Skill store lock is not poisoned");
-        let catalog = catalogs.get(workspace).ok_or_else(|| {
+        let catalog = catalogs.get(execution_directory).ok_or_else(|| {
             claude_error("Claude Skill identities are no longer valid in this Workspace")
         })?;
         let commands = prompt
@@ -272,10 +277,10 @@ fn scoped_metadata(description: &str) -> Option<SafeMetadata> {
     None
 }
 
-fn opaque_skill_id(workspace: &Path, skill: &NativeSkill, scope: &str) -> SkillId {
+fn opaque_skill_id(execution_directory: &Path, skill: &NativeSkill, scope: &str) -> SkillId {
     let mut hash = blake3::Hasher::new();
     hash.update(b"suru:claude-skill:v1\0");
-    hash.update(workspace.to_string_lossy().as_bytes());
+    hash.update(execution_directory.to_string_lossy().as_bytes());
     for component in [&skill.name, &skill.description, &skill.argument_hint, scope] {
         hash.update(b"\0");
         hash.update(component.as_bytes());

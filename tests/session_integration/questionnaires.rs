@@ -1188,7 +1188,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
     use suru::{
         protocol::{
             AdmitPromptRequest, AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt,
-            PromptDelivery, PromptId, Workspace,
+            PromptDelivery, PromptId,
         },
         server::{self, ServerConfig},
     };
@@ -1208,7 +1208,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

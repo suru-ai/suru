@@ -2344,7 +2344,7 @@ fn rebuild(
                 disclosure.folds,
                 theme,
                 width,
-                &snapshot.session.workspace.path,
+                &snapshot.session.execution_directory.path,
             )
         })
         .collect::<Vec<_>>();
@@ -5231,6 +5231,9 @@ mod tests {
             session: Session {
                 context_fill: None,
                 id: crate::protocol::SessionId::new(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: PathBuf::from("/workspace"),
+                },
                 workspace: Workspace {
                     path: PathBuf::from("/workspace"),
                 },
@@ -6840,7 +6843,7 @@ mod tests {
         let mut folds = TranscriptFolds::default();
         folds.expand(activity.id());
         let mut snapshot = transcript_snapshot(vec![Entry::Activity(activity)]);
-        snapshot.session.workspace.path = workspace;
+        snapshot.session.execution_directory.path = workspace;
         let stored = snapshot.clone();
         let cache = TranscriptCache::default();
         let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
@@ -6891,7 +6894,7 @@ mod tests {
                 Entry::Activity(activity),
                 Entry::Message(agent_message(&text)),
             ]);
-            snapshot.session.workspace.path = workspace.clone();
+            snapshot.session.execution_directory.path = workspace.clone();
             let cache = TranscriptCache::default();
             let view = projected_view(&cache, &snapshot, &folds, &TranscriptGroups::default());
             let rows: Vec<_> = view
@@ -6932,7 +6935,7 @@ mod tests {
                 }],
             };
             let mut snapshot = transcript_snapshot(vec![Entry::Activity(activity)]);
-            snapshot.session.workspace.path = workspace.into();
+            snapshot.session.execution_directory.path = workspace.into();
             let cache = TranscriptCache::default();
             let view = projected_view(
                 &cache,

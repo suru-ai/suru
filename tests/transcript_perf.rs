@@ -43,6 +43,9 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         session: Session {
             context_fill: None,
             id: SessionId::new(),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },

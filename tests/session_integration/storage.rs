@@ -15,7 +15,7 @@ use suru::{
         CostBasis, CreateSessionRequest, InitialPrompt, LatestTurnStatus, PromptDelivery, PromptId,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
         SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan,
-        TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
+        TurnStatus, UpdateAgentSelectionRequest, Usage,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
@@ -58,7 +58,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
         .bearer_auth(&original.descriptor().token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -161,7 +161,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -246,7 +246,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
 
     let create = |path: &std::path::Path, text: &str| CreateSessionRequest {
         agent_selection: None,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: path.to_owned(),
         },
         prompt: InitialPrompt {
@@ -359,7 +359,7 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: Some(initial_selection),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -461,7 +461,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -659,22 +659,61 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
 
 #[tokio::test]
 async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversation() {
-    resume_after_summary_mutation(None).await;
+    resume_after_summary_mutation(None, false, false).await;
 }
 
 #[tokio::test]
 async fn summary_mutation_of_an_unopened_session_preserves_opaque_resume_state_and_history() {
-    resume_after_summary_mutation(Some(serde_json::json!({
-        "opaque/provider-token": ["resume-session", {"generation": 3}],
-        "unknown_future_fields": {"keep": true}
-    })))
+    resume_after_summary_mutation(
+        Some(serde_json::json!({
+            "opaque/provider-token": ["resume-session", {"generation": 3}],
+            "unknown_future_fields": {"keep": true}
+        })),
+        false,
+        false,
+    )
     .await;
 }
 
-async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) {
+#[tokio::test]
+async fn legacy_path_only_session_preserves_exact_execution_directory_and_resume_state() {
+    resume_after_summary_mutation(
+        Some(serde_json::json!({"opaque": ["legacy", 7]})),
+        true,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn regrouped_session_resumes_in_its_exact_execution_directory() {
+    resume_after_summary_mutation(
+        Some(serde_json::json!({"opaque": ["regrouped", 9]})),
+        false,
+        true,
+    )
+    .await;
+}
+
+async fn resume_after_summary_mutation(
+    resume_state: Option<serde_json::Value>,
+    legacy: bool,
+    regroup: bool,
+) {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let execution_directory = workspace
+        .path()
+        .join("packages")
+        .join("nested agent directory");
+    std::fs::create_dir_all(&execution_directory).unwrap();
+    let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
+    let grouping_directory = if regroup {
+        std::fs::canonicalize(workspace.path()).unwrap()
+    } else {
+        execution_directory.clone()
+    };
     let config = ServerConfig::new(state_dir.path(), "missing-resume-state-test")
         .expect("configure original server")
         .with_data_dir(data_dir.path());
@@ -689,8 +728,8 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
-                path: workspace.path().to_owned(),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: execution_directory.clone(),
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
@@ -708,6 +747,7 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
         .expect("decode created Session");
     let original_start = original_provider.next_start().await;
     assert!(original_start.resume_state().is_none());
+    assert_eq!(original_start.execution_directory(), execution_directory);
     let mut original_session = original_start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-fresh", "low", "slow"),
@@ -723,6 +763,22 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
     .await;
     original.shutdown().await.expect("stop original server");
 
+    if legacy || regroup {
+        use diesel::RunQueryDsl;
+        let location = if legacy {
+            serde_json::json!({"path": execution_directory})
+        } else {
+            serde_json::json!({"path": grouping_directory, "execution_directory": {"path": execution_directory}})
+        };
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        diesel::sql_query("UPDATE sessions SET workspace = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(location.to_string())
+            .bind::<diesel::sql_types::Text, _>(created.session.id.to_string())
+            .execute(&mut database)
+            .unwrap();
+    }
     if let Some(payload) = &resume_state {
         use diesel::RunQueryDsl;
         let mut database =
@@ -739,6 +795,23 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
     let checkpoint = server::spawn_with_provider(config.clone(), checkpoint_runtime)
         .await
         .unwrap();
+    let listed = client
+        .get(format!("{}/v1/sessions", checkpoint.descriptor().base_url))
+        .bearer_auth(&checkpoint.descriptor().token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<SessionListItem>>()
+        .await
+        .unwrap();
+    let listed = readable_session_summaries(listed);
+    assert_eq!(
+        listed[0].session.execution_directory.path,
+        execution_directory
+    );
+    assert_eq!(listed[0].session.workspace.path, grouping_directory);
     client
         .post(format!(
             "{}/v1/sessions/{}/settlement",
@@ -787,6 +860,7 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
             .map(|state| state.payload()),
         resume_state.as_ref()
     );
+    assert_eq!(replacement_start.execution_directory(), execution_directory);
     let mut replacement_session = replacement_start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-fresh", "low", "slow"),
@@ -806,6 +880,11 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
         reopened.messages[0].content,
         "Persist without Provider Resume State"
     );
+    assert_eq!(
+        reopened.session.execution_directory.path,
+        execution_directory
+    );
+    assert_eq!(reopened.session.workspace.path, grouping_directory);
     assert_eq!(reopened.turns.len(), 2);
     assert_eq!(reopened.turns[1].status, TurnStatus::Completed);
 
@@ -834,7 +913,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
         .bearer_auth(&original.descriptor().token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -880,7 +959,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
         .await
         .unwrap();
     assert!(
-        matches!(&initial[..], [SessionListItem::Readable(summary)] if summary.session.id == created.session.id),
+        matches!(&initial[..], [SessionListItem::Readable(summary)] if summary.session.id == created.session.id && summary.session.execution_directory == created.session.execution_directory),
         "listing does not inspect unopened Prompt content"
     );
     replacement.shutdown().await.unwrap();
@@ -993,7 +1072,7 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1129,7 +1208,7 @@ async fn turn_usage_survives_a_restart() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1248,7 +1327,7 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

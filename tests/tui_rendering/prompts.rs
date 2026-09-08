@@ -86,7 +86,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         panic!("the first Prompt after /new should create a Session");
     };
     assert_eq!(request.prompt.text, "Next Prompt");
-    assert_eq!(request.workspace.path, workspace.path());
+    assert_eq!(request.execution_directory.path, workspace.path());
 }
 
 #[test]

@@ -254,13 +254,13 @@ impl SessionStore {
             .contains_key(&prompt_id)
     }
 
-    pub(crate) fn workspace(&self, session_id: SessionId) -> Option<PathBuf> {
+    pub(crate) fn execution_directory(&self, session_id: SessionId) -> Option<PathBuf> {
         self.state
             .lock()
             .expect("Session store lock is not poisoned")
             .sessions
             .get(&session_id)
-            .map(|record| record.snapshot.session.workspace.path.clone())
+            .map(|record| record.snapshot.session.execution_directory.path.clone())
     }
 
     /// The Provider the Session was selected with, or `None` while no Agent

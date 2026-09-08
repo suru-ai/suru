@@ -151,7 +151,7 @@ pub(super) async fn start_claude_session(
         questionnaires,
         executable,
         processes,
-        workspace: request.workspace,
+        execution_directory: request.execution_directory,
         provider_session_id,
         conversation,
         child: Mutex::new(ChildSlot {
@@ -221,7 +221,7 @@ struct ClaudeSession {
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     executable: OsString,
     processes: ProcessRegistry,
-    workspace: PathBuf,
+    execution_directory: PathBuf,
     /// The provider-session UUID Suru minted, which the child is spawned under.
     provider_session_id: String,
     /// Where every child this Session spawns delivers its conversation, so the Session's event
@@ -309,7 +309,7 @@ impl ProviderSession for ClaudeSession {
             const CONTEXT: &str = "Claude Turn startup failed";
             self.context
                 .begin_turn(input.turn_id, input.selection.model.as_str());
-            let prompt = self.skills.lower(&self.workspace, input.prompt)?;
+            let prompt = self.skills.lower(&self.execution_directory, input.prompt)?;
             let mut slot = self.child.lock().await;
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
@@ -341,7 +341,7 @@ impl ProviderSession for ClaudeSession {
                 let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
                     &self.executable,
                     args,
-                    Some(self.workspace.clone()),
+                    Some(self.execution_directory.clone()),
                     Some(self.conversation.clone()),
                     self.processes.clone(),
                     ClaudeSettingSources::PersonalAndProject,
@@ -601,7 +601,7 @@ mod tests {
                 ),
                 executable: executable.into(),
                 processes,
-                workspace: directory.path().to_owned(),
+                execution_directory: directory.path().to_owned(),
                 provider_session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
                 conversation,
                 child: Mutex::new(ChildSlot {

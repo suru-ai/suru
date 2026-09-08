@@ -523,6 +523,9 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
                 session: Session {
                     context_fill: None,
                     id: SessionId::new(),
+                    execution_directory: suru::protocol::ExecutionDirectory {
+                        path: remote_only.clone(),
+                    },
                     workspace: Workspace {
                         path: remote_only.clone(),
                     },
@@ -628,6 +631,7 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
                 session: Session {
                     context_fill: None,
                     id: session_id,
+                    execution_directory: suru::protocol::ExecutionDirectory { path: ".".into() },
                     workspace: Workspace { path: ".".into() },
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
@@ -698,6 +702,9 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
                 session: Session {
                     context_fill: None,
                     id: SessionId::new(),
+                    execution_directory: suru::protocol::ExecutionDirectory {
+                        path: remote_only.clone(),
+                    },
                     workspace: Workspace {
                         path: remote_only.clone(),
                     },

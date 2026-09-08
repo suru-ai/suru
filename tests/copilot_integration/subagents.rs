@@ -13,7 +13,7 @@ use suru::{
     managed_client::ManagedClient,
     protocol::{
         Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, SessionId,
-        SessionSnapshot, TurnStatus, Workspace,
+        SessionSnapshot, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -42,7 +42,7 @@ async fn opened_session(copilot: &ScriptedCopilot, name: &'static str, prompt: &
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

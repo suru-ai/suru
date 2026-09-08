@@ -11,7 +11,6 @@ use suru::{
     protocol::{
         CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
         ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
-        Workspace,
     },
     provider::ClaudeRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -746,7 +745,7 @@ pub async fn opened_session(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -803,7 +802,7 @@ impl LiveTurn {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {

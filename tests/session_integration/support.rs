@@ -9,7 +9,7 @@ use suru::{
         Activity, AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, InitialPrompt,
         ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, PromptId, ProviderId,
-        RuntimeDescriptor, SessionId, SessionRevision, SessionSnapshot, SessionUpdate, Workspace,
+        RuntimeDescriptor, SessionId, SessionRevision, SessionSnapshot, SessionUpdate,
     },
     server::{self, RunningServer, ServerConfig},
 };
@@ -194,7 +194,7 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

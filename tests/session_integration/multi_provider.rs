@@ -15,7 +15,7 @@ use suru::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId,
         CreateSessionRequest, InitialPrompt, ModelCatalog, PromptDelivery, PromptId,
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SessionError, SessionErrorCode,
-        TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        TurnStatus, UpdateAgentSelectionRequest,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig},
@@ -29,7 +29,7 @@ fn create_session_request(
 ) -> CreateSessionRequest {
     CreateSessionRequest {
         agent_selection: Some(hosted_selection(provider, model)),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {
@@ -296,7 +296,7 @@ async fn a_fresh_landing_defaults_to_the_first_provider_in_the_built_in_order() 
         &descriptor,
         &CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -313,7 +313,7 @@ async fn a_fresh_landing_defaults_to_the_first_provider_in_the_built_in_order() 
         "a fresh Landing defaults to the first hosted Provider's default Model"
     );
     assert!(
-        alpha.next_start().await.workspace()
+        alpha.next_start().await.execution_directory()
             == workspace
                 .path()
                 .canonicalize()
@@ -482,7 +482,7 @@ async fn a_stale_landing_selection_on_an_unhosted_provider_yields_to_the_built_i
         &replacement_descriptor,
         &CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -534,7 +534,7 @@ async fn the_landing_default_falls_to_the_next_provider_when_the_first_has_no_ca
         &descriptor,
         &CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -721,7 +721,7 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
         &descriptor,
         &CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -738,7 +738,7 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
         "a fresh Landing defaults past the Provider the user cannot use yet"
     );
     assert!(
-        beta.next_start().await.workspace()
+        beta.next_start().await.execution_directory()
             == workspace
                 .path()
                 .canonicalize()

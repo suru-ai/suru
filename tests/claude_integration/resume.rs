@@ -17,7 +17,7 @@ use suru::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         InitialPrompt, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
         ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
-        TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        TurnStatus, UpdateAgentSelectionRequest,
     },
     server::RunningServer,
 };
@@ -68,12 +68,15 @@ impl DurableSession {
     async fn start(claude: &ScriptedClaude, channel: &'static str) -> Self {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let execution_directory = workspace.path().join("packages/nested agent directory");
+        std::fs::create_dir_all(&execution_directory).unwrap();
+        let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
         let (server, client) = hosting(claude, channel, state_dir.path()).await;
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
-                    path: workspace.path().to_owned(),
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: execution_directory.clone(),
                 },
                 prompt: InitialPrompt {
                     id: PromptId::new(),
@@ -227,6 +230,16 @@ async fn a_session_reopened_after_a_restart_resumes_the_conversation_it_opened()
     );
 
     assert_second_child_resumed_the_first(&claude, "the restart");
+    let expected = std::fs::canonicalize(
+        restored
+            ._workspace
+            .path()
+            .join("packages/nested agent directory"),
+    )
+    .unwrap();
+    for flag in ["--session-id", "--resume"] {
+        assert_eq!(claude.launch_carrying(flag).working_directory, expected);
+    }
 
     restored.shutdown().await;
 }

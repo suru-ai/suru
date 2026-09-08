@@ -13,7 +13,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
         AdmitPromptRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt, NativeMeter,
-        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage, Workspace,
+        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -63,6 +63,9 @@ impl RestartedSession {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let data_dir = tempfile::tempdir().expect("create isolated data directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let execution_directory = workspace.path().join("packages/nested agent directory");
+        std::fs::create_dir_all(&execution_directory).unwrap();
+        let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
         let config = ServerConfig::new(state_dir.path(), channel)
             .expect("configure server")
             .with_data_dir(data_dir.path());
@@ -72,8 +75,8 @@ impl RestartedSession {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
-                    path: workspace.path().to_owned(),
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: execution_directory.clone(),
                 },
                 prompt: InitialPrompt {
                     id: PromptId::new(),
@@ -229,6 +232,23 @@ async fn a_reopened_session_resumes_its_persisted_copilot_session_after_a_restar
         "the replacement server handshakes a fresh process and resumes rather than creating"
     );
     let requests = copilot.requests();
+    let expected = std::fs::canonicalize(
+        restarted
+            ._workspace
+            .path()
+            .join("packages/nested agent directory"),
+    )
+    .unwrap();
+    for method in ["session.create", "session.resume"] {
+        let request = requests
+            .iter()
+            .find(|request| request["method"] == method)
+            .unwrap();
+        assert_eq!(
+            request["params"]["workingDirectory"],
+            expected.to_string_lossy().as_ref()
+        );
+    }
     assert_eq!(
         session_parameter(&requests, "session.create"),
         session_parameter(&requests, "session.resume"),

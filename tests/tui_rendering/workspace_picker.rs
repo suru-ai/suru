@@ -594,7 +594,7 @@ fn the_workspace_the_reader_chose_roots_the_sessions_they_make_next() {
     else {
         panic!("a Landing submission creates a Session");
     };
-    assert_eq!(request.workspace.path, atlas);
+    assert_eq!(request.execution_directory.path, atlas);
 }
 
 /// The Skills on offer are the picked Workspace's: the catalog the client was
@@ -686,7 +686,7 @@ fn a_relative_path_at_the_sidebars_entry_reads_from_the_chosen_workspace() {
         panic!("a Landing submission creates a Session");
     };
     assert_eq!(
-        request.workspace.path, notes,
+        request.execution_directory.path, notes,
         "the relative path was read from the Workspace the reader chose in the picker, \
          not from the one the client was launched in"
     );
@@ -1092,6 +1092,9 @@ fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
         session: Session {
             context_fill: None,
             id: SessionId::new(),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
@@ -1267,7 +1270,7 @@ fn application_choosing_skills(workspace: &Path) -> Application {
 fn load_skills(application: &mut Application, workspace: &Path, skill: &str) {
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
     };
@@ -1276,7 +1279,7 @@ fn load_skills(application: &mut Application, workspace: &Path, skill: &str) {
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider.clone(),
-                workspace: request.workspace.clone(),
+                execution_directory: request.execution_directory.clone(),
                 skills: vec![SkillDescriptor {
                     id: SkillId::new(skill),
                     name: skill.to_owned(),
@@ -1320,4 +1323,89 @@ fn sidebar_text(rows: &[String]) -> String {
         .map(|row| sidebar_column(row))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn an_open_sessions_execution_context_is_independent_of_grouping_and_landing() {
+    use suru::protocol::{Activity, ActivityStatus, FileChange, PromptId};
+    let root = workspace_dir();
+    let landing_root = workspace_in(root.path(), "landing");
+    let landing = workspace_in(&landing_root, "subdirectory");
+    let grouping = workspace_in(root.path(), "repository");
+    let linked = workspace_in(&grouping, "linked");
+    let execution = workspace_in(&linked, "nested");
+    let mut application = application_choosing_skills(&landing);
+    let mut snapshot = crate::support::failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Create a file",
+        &execution,
+    );
+    snapshot.session.workspace.path = grouping;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = suru::protocol::TurnStatus::Active;
+    snapshot.turns[0].settled_at = None;
+    snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-fixture"),
+        options: Vec::new(),
+    });
+    snapshot.activities[0] = Activity::FileChange {
+        id: snapshot.activities[0].id(),
+        turn_id: snapshot.turns[0].id,
+        status: ActivityStatus::Completed,
+        changes: vec![FileChange::Add {
+            path: execution.join("created.rs"),
+        }],
+    };
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    let transcript = rendered_application_rows(&application).join("\n");
+    assert!(transcript.contains("Created created.rs"), "{transcript}");
+
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        execution_directory: suru::protocol::ExecutionDirectory { path: execution },
+    };
+    application
+        .handle_event(ApplicationEvent::SkillsListed {
+            request: request.clone(),
+            catalog: SkillCatalog {
+                provider: request.provider.clone(),
+                execution_directory: request.execution_directory.clone(),
+                skills: Vec::new(),
+                capabilities: SkillCatalogCapabilities {
+                    max_distinct_invocations: None,
+                    supported_deliveries: vec![SkillPromptDelivery::Steer],
+                },
+                status: SkillCatalogStatus::Stale {
+                    message: "Refresh needed".to_owned(),
+                },
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+                "$".to_owned()
+            )))
+            .unwrap(),
+        ApplicationTransition::RefreshSkills(request)
+    );
+    press(&mut application, KeyCode::Esc);
+    show_sidebar(&mut application, Vec::new());
+    crate::support::press_add_workspace(&mut application);
+    type_terminal_text(&mut application, "notes");
+    let ApplicationTransition::ResolveWorkspace { request, .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("relative path entry is interpreted by the owning Server");
+    };
+    assert_eq!(request.path, PathBuf::from("notes"));
+    assert_eq!(request.base, Some(landing));
 }

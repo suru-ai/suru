@@ -23,7 +23,7 @@ use suru::{
     protocol::{
         AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId,
         PromptDelivery, PromptId, ProviderId, SessionCatalogChange, SessionId, SessionListItem,
-        SessionTitleChanged, Workspace,
+        SessionTitleChanged,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig, ServerTimings},
@@ -125,7 +125,7 @@ fn conversation_selection() -> AgentSelection {
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
         agent_selection: Some(conversation_selection()),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {

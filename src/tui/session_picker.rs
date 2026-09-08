@@ -402,12 +402,17 @@ impl SessionPicker {
         Some(selected)
     }
 
-    pub(super) fn workspace_of(&self, reference: &SessionReference) -> Option<PathBuf> {
+    pub(super) fn context_of(&self, reference: &SessionReference) -> Option<(PathBuf, PathBuf)> {
         self.sessions()
             .into_iter()
             .find(|session| session.reference() == reference)
-            .and_then(|session| session.workspace())
-            .map(|workspace| workspace.path.clone())
+            .and_then(|session| session.readable())
+            .map(|summary| {
+                (
+                    summary.session.workspace.path.clone(),
+                    summary.session.execution_directory.path.clone(),
+                )
+            })
     }
 
     pub(super) fn is_attaching(&self) -> bool {

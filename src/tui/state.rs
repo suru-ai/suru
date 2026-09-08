@@ -347,6 +347,7 @@ pub struct TuiState {
     pub(super) selection_overlay_area: Cell<Option<ratatui::layout::Rect>>,
     pub(super) outlook: Outlook,
     outlook_workspaces: HashMap<Outlook, PathBuf>,
+    outlook_execution_directories: HashMap<Outlook, PathBuf>,
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
     pub(super) identity: Option<ServerIdentity>,
@@ -355,6 +356,7 @@ pub struct TuiState {
     pub(super) manually_stopped: bool,
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: PathBuf,
+    pub(super) execution_directory: PathBuf,
     pub(super) composers: ComposerMemory,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
@@ -451,7 +453,10 @@ pub struct TuiState {
 
 enum OutlookTurn {
     Deliberate,
-    SessionRow { fallback_workspace: PathBuf },
+    SessionRow {
+        fallback_workspace: PathBuf,
+        fallback_execution_directory: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +531,7 @@ impl TuiState {
             selection_overlay_area: Cell::new(None),
             outlook: Outlook::Local,
             outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
+            outlook_execution_directories: HashMap::from([(Outlook::Local, workspace.clone())]),
             workspace_resolution_sequence: 0,
             pending_workspace_resolutions: HashMap::new(),
             identity: None,
@@ -533,6 +539,7 @@ impl TuiState {
             manually_stopped: false,
             fatal_error: None,
             workspace: workspace.clone(),
+            execution_directory: workspace.clone(),
             composers: ComposerMemory::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
@@ -600,6 +607,9 @@ impl TuiState {
         self.outlook_workspaces
             .insert(self.outlook.clone(), workspace.clone());
         self.workspace = workspace.clone();
+        self.execution_directory = workspace.clone();
+        self.outlook_execution_directories
+            .insert(self.outlook.clone(), workspace.clone());
         self.session_picker.adopt_workspace(workspace.clone());
         self.workspace_picker.adopt_workspace(workspace.clone());
         self.sidebar.adopt_workspace(workspace);
@@ -695,17 +705,25 @@ impl TuiState {
     /// Workspace is authoritative when this Client has not visited that
     /// Outlook before; unlike a deliberate Connect turn, no resolution is
     /// needed because the listing already came from that Origin.
-    fn turn_outlook_for_session(&mut self, target: SessionReference, workspace: PathBuf) {
+    fn turn_outlook_for_session(
+        &mut self,
+        target: SessionReference,
+        workspace: PathBuf,
+        execution_directory: PathBuf,
+    ) {
         let remembers_workspace = self.outlook_workspaces.contains_key(&target.origin);
         self.turn_outlook_with(
             target.origin.clone(),
             OutlookTurn::SessionRow {
                 fallback_workspace: workspace,
+                fallback_execution_directory: execution_directory,
             },
         );
         if !remembers_workspace {
             self.outlook_workspaces
                 .insert(target.origin.clone(), self.workspace.clone());
+            self.outlook_execution_directories
+                .insert(target.origin.clone(), self.execution_directory.clone());
         }
         self.open_session_route(target);
     }
@@ -714,11 +732,24 @@ impl TuiState {
         if self.outlook == outlook {
             return;
         }
-        let (fallback_workspace, adopt_sidebar): (PathBuf, fn(&mut Sidebar, Outlook)) = match turn {
-            OutlookTurn::Deliberate => (PathBuf::from("."), Sidebar::adopt_outlook),
-            OutlookTurn::SessionRow { fallback_workspace } => {
-                (fallback_workspace, Sidebar::adopt_outlook_from_row)
-            }
+        let (fallback_workspace, fallback_execution_directory, adopt_sidebar): (
+            PathBuf,
+            PathBuf,
+            fn(&mut Sidebar, Outlook),
+        ) = match turn {
+            OutlookTurn::Deliberate => (
+                PathBuf::from("."),
+                PathBuf::from("."),
+                Sidebar::adopt_outlook,
+            ),
+            OutlookTurn::SessionRow {
+                fallback_workspace,
+                fallback_execution_directory,
+            } => (
+                fallback_workspace,
+                fallback_execution_directory,
+                Sidebar::adopt_outlook_from_row,
+            ),
         };
         self.outlook_landing_selections
             .insert(self.outlook.clone(), self.landing_agent_selection.clone());
@@ -729,6 +760,11 @@ impl TuiState {
             .get(&outlook)
             .cloned()
             .unwrap_or(fallback_workspace);
+        self.execution_directory = self
+            .outlook_execution_directories
+            .get(&outlook)
+            .cloned()
+            .unwrap_or(fallback_execution_directory);
         self.leave_session_route();
         self.session_events_blocked = true;
         self.pending_submission = None;
@@ -752,6 +788,8 @@ impl TuiState {
         self.workspace_picker
             .adopt_workspace(self.workspace.clone());
         self.sidebar.adopt_workspace(self.workspace.clone());
+        self.sidebar
+            .adopt_execution_directory(self.execution_directory.clone());
         self.session_picker.adopt_outlook(outlook.clone());
         self.workspace_picker.adopt_outlook(outlook.clone());
         if let Some(paths) = self.workspace_paths.get(&outlook) {
@@ -827,24 +865,26 @@ impl TuiState {
 
     fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
         // A Session still loading says neither the Agent a Catalog is asked
-        // for nor the Workspace it is asked about, and the Landing it has
+        // for nor the Execution Directory it is asked about, and the Landing it has
         // already left answers for neither. Skill resolution waits with every
         // other act that needs the Session.
         if self.open_session_is_loading() {
             return None;
         }
         let selection = self.agent_selection()?;
-        let workspace = self.session.as_ref().map_or_else(
-            || self.workspace.clone(),
-            |session| session.snapshot().session.workspace.path.clone(),
+        let execution_directory = self.session.as_ref().map_or_else(
+            || self.execution_directory.clone(),
+            |session| session.snapshot().session.execution_directory.path.clone(),
         );
-        let workspace = match self.outlook {
-            Outlook::Local => workspace_reading(&workspace),
-            Outlook::Remote(_) => workspace,
+        let execution_directory = match self.outlook {
+            Outlook::Local => workspace_reading(&execution_directory),
+            Outlook::Remote(_) => execution_directory,
         };
         Some(SkillCatalogRequest {
             provider: selection.provider.clone(),
-            workspace: Workspace { path: workspace },
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory,
+            },
         })
     }
 
@@ -1083,7 +1123,7 @@ impl TuiState {
             ManagedEvent::SkillCatalogUpdated(catalog) => {
                 let request = SkillCatalogRequest {
                     provider: catalog.provider.clone(),
-                    workspace: catalog.workspace.clone(),
+                    execution_directory: catalog.execution_directory.clone(),
                 };
                 self.load_skill_catalog(request, catalog);
             }
@@ -4015,11 +4055,13 @@ impl Application {
                     self.state.open_session_route(target.clone());
                     return ApplicationTransition::ViewAndAttachSession(target);
                 }
-                let Some(workspace) = self.state.session_picker.workspace_of(&target) else {
+                let Some((workspace, execution_directory)) =
+                    self.state.session_picker.context_of(&target)
+                else {
                     return ApplicationTransition::Continue;
                 };
                 self.state
-                    .turn_outlook_for_session(target.clone(), workspace);
+                    .turn_outlook_for_session(target.clone(), workspace, execution_directory);
                 return ApplicationTransition::TurnOutlookAndViewAndAttach {
                     catalog_origins: self.state.catalog_origins(),
                     session: target,
@@ -4104,13 +4146,20 @@ impl Application {
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attachment follows it.
-                    SidebarActivation::Attach { session, workspace } => {
+                    SidebarActivation::Attach {
+                        session,
+                        workspace,
+                        execution_directory,
+                    } => {
                         if session.origin == self.state.outlook {
                             self.state.open_session_route(session.clone());
                             ApplicationTransition::ViewAndAttachSession(session)
                         } else {
-                            self.state
-                                .turn_outlook_for_session(session.clone(), workspace);
+                            self.state.turn_outlook_for_session(
+                                session.clone(),
+                                workspace,
+                                execution_directory,
+                            );
                             ApplicationTransition::TurnOutlookAndViewAndAttach {
                                 catalog_origins: self.state.catalog_origins(),
                                 session,
@@ -4417,8 +4466,8 @@ impl Application {
         });
         ApplicationTransition::CreateSession(CreateSessionRequest {
             agent_selection: self.state.landing_agent_selection.clone(),
-            workspace: Workspace {
-                path: self.state.workspace.clone(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: self.state.execution_directory.clone(),
             },
             prompt,
         })

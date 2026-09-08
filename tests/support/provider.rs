@@ -8,7 +8,7 @@ use serde_json::Value;
 use suru::protocol::{
     AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ProviderId, ProviderUnavailability,
     SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillPromptDelivery, Workspace,
+    SkillPromptDelivery,
 };
 use suru::provider::{
     AttributedProviderEvent, ProviderErrand, ProviderError, ProviderEvent,
@@ -379,8 +379,8 @@ impl ErrandRequest {
         &self.errand.selection
     }
 
-    pub fn workspace(&self) -> &std::path::Path {
-        &self.errand.workspace
+    pub fn execution_directory(&self) -> &std::path::Path {
+        &self.errand.execution_directory
     }
 
     pub fn succeed(self, reply: Value) {
@@ -397,8 +397,8 @@ impl ErrandRequest {
 }
 
 impl StartRequest {
-    pub fn workspace(&self) -> &std::path::Path {
-        &self.request.workspace
+    pub fn execution_directory(&self) -> &std::path::Path {
+        &self.request.execution_directory
     }
 
     pub fn resume_state(&self) -> Option<&suru::provider::ProviderResumeState> {
@@ -807,7 +807,7 @@ pub fn fixture_skill_catalog(provider: ProviderId, workspace: std::path::PathBuf
     .collect();
     SkillCatalog {
         provider,
-        workspace: Workspace { path: workspace },
+        execution_directory: suru::protocol::ExecutionDirectory { path: workspace },
         skills,
         capabilities: SkillCatalogCapabilities {
             max_distinct_invocations: None,
@@ -850,7 +850,7 @@ async fn run_errand_through_a_session(
     let connection = dispatch_start(
         starts,
         ProviderSessionRequest {
-            workspace: errand.workspace,
+            execution_directory: errand.execution_directory,
             resume_state: None,
         },
     )

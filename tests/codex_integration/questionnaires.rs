@@ -7,7 +7,7 @@ use suru::{
     protocol::{
         Activity, Answer, CreateSessionRequest, InitialPrompt, PromptId, QuestionAnswer,
         Questionnaire, QuestionnaireOutcome, QuestionnaireSubmission, SessionId, SessionSnapshot,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -64,7 +64,7 @@ impl Live {
         .unwrap();
         let created = client
             .create_session(CreateSessionRequest {
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 agent_selection: None,

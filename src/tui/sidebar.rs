@@ -117,6 +117,7 @@ impl SidebarListingScope {
 /// squeezes the Sidebar out forgets nothing.
 #[derive(Clone, Debug)]
 pub(super) struct Sidebar {
+    execution_directory: PathBuf,
     revealed: bool,
     /// Whether the reader is driving the Sidebar rather than the composer.
     /// Opening it themselves is what claims the keys; Esc, the toggle, and the
@@ -618,6 +619,7 @@ pub(super) enum SidebarActivation {
     Attach {
         session: SessionReference,
         workspace: PathBuf,
+        execution_directory: PathBuf,
     },
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
@@ -747,6 +749,7 @@ impl Sidebar {
     /// the initial-scope Setting's before that.
     pub(super) fn new(current_workspace: PathBuf) -> Self {
         Self {
+            execution_directory: current_workspace.clone(),
             // Down until the initial-visibility Setting raises it. A Sidebar with no
             // Settings in hand has not spoken to a server either, so it has
             // nothing to list; drawing one before the snapshot lands would put
@@ -1700,11 +1703,13 @@ impl Sidebar {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
-        let workspace = self
+        let context = &self
             .listed_session(&wanted)
-            .and_then(|session| session.workspace())
-            .map(|workspace| workspace.path.clone())
-            .expect("a readable Sidebar Session carries its Workspace");
+            .and_then(|session| session.readable())
+            .expect("a readable Sidebar Session carries its context")
+            .session;
+        let workspace = context.workspace.path.clone();
+        let execution_directory = context.execution_directory.path.clone();
         self.listing.clear_error();
         self.attaching = Some(wanted.clone());
         // The reader is done choosing the moment they choose: opening is
@@ -1714,6 +1719,7 @@ impl Sidebar {
         SidebarActivation::Attach {
             session: wanted,
             workspace,
+            execution_directory,
         }
     }
 
@@ -1760,7 +1766,7 @@ impl Sidebar {
             return self.refuse_workspace(NAME_A_DIRECTORY);
         }
         SidebarActivation::ResolveWorkspace(ResolveWorkspaceRequest {
-            base: Some(self.listing.current_workspace().to_owned()),
+            base: Some(self.execution_directory.clone()),
             path: PathBuf::from(named),
         })
     }
@@ -1798,7 +1804,12 @@ impl Sidebar {
     /// where they put it — switching Workspaces is navigation, and narrowing
     /// the column is a view they configured — so re-pointing it is the
     /// separate act [`Self::narrow_to_workspace`] is for.
+    pub(super) fn adopt_execution_directory(&mut self, execution_directory: PathBuf) {
+        self.execution_directory = execution_directory;
+    }
+
     pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
+        self.execution_directory = workspace.clone();
         self.listing.adopt_current_workspace(workspace);
     }
 
@@ -3464,6 +3475,9 @@ mod tests {
             session: Session {
                 context_fill: None,
                 id: SessionId::new(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: root().join("workspace"),
+                },
                 workspace: Workspace {
                     path: root().join("workspace"),
                 },

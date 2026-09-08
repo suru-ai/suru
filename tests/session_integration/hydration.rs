@@ -6,7 +6,7 @@ use suru::{
     protocol::{
         Activity, ActivityId, CreateSessionRequest, InitialPrompt, RuntimeDescriptor,
         SessionCatalogChange, SessionChange, SessionListItem, SessionRevision, SessionSnapshot,
-        SessionUpdate, Workspace,
+        SessionUpdate,
     },
     server::{RunningServer, ServerConfig},
 };
@@ -29,7 +29,7 @@ impl History {
                 server.descriptor(),
                 &CreateSessionRequest {
                     agent_selection: None,
-                    workspace: Workspace {
+                    execution_directory: suru::protocol::ExecutionDirectory {
                         path: root.path().to_owned(),
                     },
                     prompt: InitialPrompt {
@@ -267,7 +267,7 @@ async fn prompt_identity_in_an_unopened_session_cannot_be_reused_by_creation_or_
     let denied = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: owner.session.workspace.clone(),
+            execution_directory: owner.session.execution_directory.clone(),
             prompt: collision.clone(),
         })
         .send()

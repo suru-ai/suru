@@ -17,7 +17,7 @@ use suru::{
         AgentSelection, ContextFill, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId,
         SessionChange, SessionId, SessionRevision, SessionUpdate, SkillCatalog,
         SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillPromptDelivery, Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
+        SkillId, SkillPromptDelivery, Turn, TurnId, TurnStatus, Usage, UsageTotal,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -272,7 +272,7 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
         .expect("connect application");
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -287,7 +287,7 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider.clone(),
-                workspace: request.workspace.clone(),
+                execution_directory: request.execution_directory.clone(),
                 skills: vec![skill.clone()],
                 capabilities: SkillCatalogCapabilities {
                     max_distinct_invocations: None,
@@ -690,7 +690,7 @@ fn skill_bindings_follow_outside_edits_and_same_named_replacements_stay_stale() 
         .expect("paste a bound Prompt");
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -699,7 +699,7 @@ fn skill_bindings_follow_outside_edits_and_same_named_replacements_stay_stale() 
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider,
-                workspace: request.workspace,
+                execution_directory: request.execution_directory,
                 skills: vec![SkillDescriptor {
                     id: SkillId::new("review-replacement"),
                     name: "review".to_owned(),
@@ -1008,7 +1008,7 @@ fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
         .expect("connect application");
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -1038,7 +1038,7 @@ fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider.clone(),
-                workspace: request.workspace.clone(),
+                execution_directory: request.execution_directory.clone(),
                 skills: vec![stale_skill],
                 capabilities: SkillCatalogCapabilities {
                     max_distinct_invocations: None,
@@ -1086,7 +1086,7 @@ fn skill_completion_shows_live_catalog_states_and_retries_failed_discovery() {
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider,
-                workspace: request.workspace,
+                execution_directory: request.execution_directory,
                 skills: vec![SkillDescriptor {
                     id: SkillId::new("fresh-review-id"),
                     name: "review".to_owned(),
@@ -1579,7 +1579,7 @@ fn application_with_skills(
         .expect("connect application");
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -1588,7 +1588,7 @@ fn application_with_skills(
             request: request.clone(),
             catalog: SkillCatalog {
                 provider: request.provider,
-                workspace: request.workspace,
+                execution_directory: request.execution_directory,
                 skills,
                 capabilities: SkillCatalogCapabilities {
                     max_distinct_invocations,

@@ -19,7 +19,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         CreateSessionRequest, InitialPrompt, PromptId, ProviderId, SessionId, SessionTitleChanged,
-        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, SkillMarkerSpan, Workspace,
+        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, SkillMarkerSpan,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -144,7 +144,7 @@ async fn create_session(client: &ManagedClient, workspace: &std::path::Path) -> 
     client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
             prompt: InitialPrompt {
@@ -308,7 +308,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("codex"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -327,7 +327,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

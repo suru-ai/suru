@@ -15,7 +15,7 @@ use suru::{
         ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
         SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionRevision,
         SessionSnapshot, SessionStatus, SessionUpdate, SkillId, SkillInvocation, SkillMarkerSpan,
-        Turn, TurnId, TurnStatus, Workspace,
+        Turn, TurnId, TurnStatus,
     },
     provider::{ProviderEvent, ProviderSkillInvocation},
     server::{self, AgentOutput, ServerConfig},
@@ -42,7 +42,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace_parent.path().join(".").join("workspace"),
             },
             prompt: InitialPrompt {
@@ -119,7 +119,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
     let prompt_id = PromptId::new();
     let request = CreateSessionRequest {
         agent_selection: None,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
         prompt: InitialPrompt {
@@ -164,7 +164,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
     for conflicting in [
         CreateSessionRequest {
             agent_selection: None,
-            workspace: request.workspace.clone(),
+            execution_directory: request.execution_directory.clone(),
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: "Different content".to_owned(),
@@ -173,7 +173,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
         },
         CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: other_workspace.path().to_owned(),
             },
             prompt: request.prompt.clone(),
@@ -237,7 +237,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -474,7 +474,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -755,7 +755,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     let created = first
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1035,7 +1035,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1148,7 +1148,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1167,7 +1167,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1194,7 +1194,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().join("missing"),
             },
             prompt: InitialPrompt {

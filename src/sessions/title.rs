@@ -144,7 +144,7 @@ impl TitleDerivation {
     pub(crate) fn derive(
         &self,
         session_id: SessionId,
-        workspace: std::path::PathBuf,
+        execution_directory: std::path::PathBuf,
         provider: Option<ProviderId>,
         prompt: &Prompt,
     ) {
@@ -176,7 +176,7 @@ impl TitleDerivation {
                 prompt,
                 schema: reply_schema(),
                 selection,
-                workspace,
+                execution_directory: execution_directory,
             };
             let answer = match errands.run(errand).await {
                 Ok(answer) => answer,
@@ -496,12 +496,12 @@ mod tests {
     #[tokio::test]
     async fn a_derived_title_replaces_only_the_title_it_was_derived_from() {
         use crate::{
-            protocol::{CreateSessionRequest, InitialPrompt, PromptId, Workspace},
+            protocol::{CreateSessionRequest, InitialPrompt, PromptId},
             storage::{StorageRepository, StorageWriter},
         };
 
         let data_dir = tempfile::tempdir().expect("create isolated data directory");
-        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
@@ -510,8 +510,8 @@ mod tests {
         let created = store
             .create(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
-                    path: workspace.path().to_owned(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.path().to_owned(),
                 },
                 prompt: InitialPrompt {
                     id: PromptId::new(),

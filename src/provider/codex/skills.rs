@@ -15,7 +15,7 @@ use super::{
 use crate::{
     protocol::{
         ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillPromptDelivery, Workspace,
+        SkillId, SkillPromptDelivery,
     },
     provider::{ProviderError, ProviderPrompt, harness::ProcessRegistry},
 };
@@ -36,7 +36,7 @@ impl CodexSkills {
         &self,
         executable: &OsStr,
         processes: ProcessRegistry,
-        workspace: &Path,
+        execution_directory: &Path,
         force_reload: bool,
     ) -> Result<SkillCatalog, ProviderError> {
         let connection = JsonRpcTransport::launch(executable, processes).await?;
@@ -45,7 +45,7 @@ impl CodexSkills {
             .request(
                 "skills/list",
                 &SkillsListParams {
-                    cwds: [workspace],
+                    cwds: [execution_directory],
                     force_reload,
                 },
             )
@@ -61,7 +61,7 @@ impl CodexSkills {
         let entry = entries.next().ok_or_else(|| {
             codex_error("Codex returned no Workspace entry in its skills/list response")
         })?;
-        if entries.next().is_some() || entry.cwd != workspace {
+        if entries.next().is_some() || entry.cwd != execution_directory {
             return Err(codex_error(
                 "Codex returned a skills/list response for another Workspace",
             ));
@@ -78,7 +78,7 @@ impl CodexSkills {
         let mut skills = Vec::new();
         for skill in entry.skills.into_iter().filter(|skill| skill.enabled) {
             validate_native_skill(&skill)?;
-            let id = opaque_skill_id(workspace, &skill.path);
+            let id = opaque_skill_id(execution_directory, &skill.path);
             native.insert(
                 id.clone(),
                 NativeSkill {
@@ -103,11 +103,11 @@ impl CodexSkills {
         self.workspaces
             .lock()
             .expect("Codex Skill store lock is not poisoned")
-            .insert(workspace.to_owned(), native);
+            .insert(execution_directory.to_owned(), native);
         Ok(SkillCatalog {
             provider: ProviderId::new("codex"),
-            workspace: Workspace {
-                path: workspace.to_owned(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
             },
             skills,
             capabilities: SkillCatalogCapabilities {
@@ -124,14 +124,14 @@ impl CodexSkills {
 
     pub(super) fn lower(
         &self,
-        workspace: &Path,
+        execution_directory: &Path,
         prompt: ProviderPrompt,
     ) -> Result<Vec<UserInput>, ProviderError> {
         let workspaces = self
             .workspaces
             .lock()
             .expect("Codex Skill store lock is not poisoned");
-        let native = workspaces.get(workspace);
+        let native = workspaces.get(execution_directory);
         let mut input = vec![UserInput::Text { text: prompt.text }];
         for invocation in prompt.skill_invocations {
             let skill = native
@@ -174,10 +174,10 @@ fn safe_scope(scope: NativeSkillScope) -> &'static str {
     }
 }
 
-fn opaque_skill_id(workspace: &Path, native_path: &Path) -> SkillId {
+fn opaque_skill_id(execution_directory: &Path, native_path: &Path) -> SkillId {
     let mut hash = blake3::Hasher::new();
     hash.update(b"suru:codex-skill:v1\0");
-    hash.update(workspace.to_string_lossy().as_bytes());
+    hash.update(execution_directory.to_string_lossy().as_bytes());
     hash.update(b"\0");
     hash.update(native_path.to_string_lossy().as_bytes());
     SkillId::new(format!("codex-{}", hash.finalize().to_hex()))

@@ -114,8 +114,11 @@ impl ProviderRuntime for CopilotRuntime {
         })
     }
 
-    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
-        let workspace = workspace.to_owned();
+    fn skill_catalog(
+        &self,
+        execution_directory: &std::path::Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
+        let execution_directory = execution_directory.to_owned();
         Box::pin(async move {
             let handle = match self.harness.demand().await {
                 Ok(handle) => handle,
@@ -123,11 +126,11 @@ impl ProviderRuntime for CopilotRuntime {
                     if error.unavailability()
                         == Some(ProviderUnavailability::IncompatibleVersion) =>
                 {
-                    return Ok(CopilotSkills::incompatible_catalog(&workspace));
+                    return Ok(CopilotSkills::incompatible_catalog(&execution_directory));
                 }
                 Err(error) => return Err(error),
             };
-            self.skills.discover(&handle, &workspace).await
+            self.skills.discover(&handle, &execution_directory).await
         })
     }
 

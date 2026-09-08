@@ -7,7 +7,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
         PromptDelivery, PromptId, PromptStatus, SessionId, SessionSnapshot, SessionStatus, TurnId,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -124,7 +124,7 @@ impl SteeringFixture {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {
@@ -259,7 +259,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
     let created = author
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

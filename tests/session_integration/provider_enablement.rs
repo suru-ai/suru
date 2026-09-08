@@ -22,7 +22,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, CreateSessionRequest,
         InitialPrompt, ModelCatalog, PromptDelivery, PromptId, ProviderCatalogStatus, ProviderId,
-        RuntimeDescriptor, SessionId, SettingMutation, SettingsSnapshot, TurnStatus, Workspace,
+        RuntimeDescriptor, SessionId, SettingMutation, SettingsSnapshot, TurnStatus,
     },
     provider::ProviderEvent,
     server::{self, RunningServer, ServerConfig},
@@ -96,7 +96,7 @@ fn session_request(
 ) -> CreateSessionRequest {
     CreateSessionRequest {
         agent_selection: selection,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {
@@ -300,7 +300,7 @@ async fn a_fresh_landing_default_passes_over_a_disabled_provider() {
         "the built-in default order takes the first enabled Provider"
     );
     assert_eq!(
-        copilot.next_start().await.workspace(),
+        copilot.next_start().await.execution_directory(),
         workspace
             .path()
             .canonicalize()
@@ -423,7 +423,7 @@ async fn a_session_with_no_agent_selection_routes_to_the_first_enabled_runtime()
         "this Session reaches the orchestrator with no Agent Selection to route by"
     );
     assert_eq!(
-        copilot.next_start().await.workspace(),
+        copilot.next_start().await.execution_directory(),
         workspace
             .path()
             .canonicalize()

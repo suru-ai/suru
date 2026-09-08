@@ -9,7 +9,7 @@ use suru::{
         Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelAvailability, ModelId,
         ModelOptionChoiceId, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
         ModelOptionValue, PromptId, PromptStatus, ProviderCatalogStatus, ProviderId,
-        ProviderUnavailability, TurnStatus, Workspace,
+        ProviderUnavailability, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -253,7 +253,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
                     },
                 }],
             }),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -269,7 +269,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -427,7 +427,7 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(requested),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -538,7 +538,7 @@ async fn codex_materializes_thread_options_and_handles_native_omission_and_clear
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -659,7 +659,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
                     },
                 ],
             }),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -693,7 +693,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
                 model: ModelId::new("requested-model"),
                 options: Vec::new(),
             }),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -764,7 +764,7 @@ async fn codex_lowers_every_advertised_effort_and_tier_combination_independently
                             },
                         ],
                     }),
-                    workspace: Workspace {
+                    execution_directory: suru::protocol::ExecutionDirectory {
                         path: workspace.path().to_owned(),
                     },
                     prompt: InitialPrompt {
@@ -838,7 +838,7 @@ async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -935,7 +935,7 @@ async fn codex_option_rejection_never_falls_back_and_restores_the_prompt() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1024,7 +1024,7 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
                 model: ModelId::new("valid-model"),
                 options: Vec::new(),
             }),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

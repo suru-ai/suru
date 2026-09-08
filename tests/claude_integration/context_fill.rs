@@ -7,7 +7,7 @@ use suru::{
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, ContextFill,
         CreateSessionRequest, InitialPrompt, ModelId, PromptDelivery, PromptId, ProviderId,
-        SessionId, SessionSnapshot, TurnStatus, UpdateAgentSelectionRequest, Workspace,
+        SessionId, SessionSnapshot, TurnStatus, UpdateAgentSelectionRequest,
     },
     provider::ClaudeRuntime,
     server::RunningServer,
@@ -63,7 +63,7 @@ impl Session {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: prompt(),
@@ -595,7 +595,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
         .with_context_request_timeout(Duration::from_millis(100));
     let (identity, _, session, mut events) = runtime
         .start_session(ProviderSessionRequest {
-            workspace: workspace.path().to_owned(),
+            execution_directory: workspace.path().to_owned(),
             resume_state: None,
         })
         .await

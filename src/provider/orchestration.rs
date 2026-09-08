@@ -199,7 +199,7 @@ struct ProviderSessionContext {
     sessions: SessionStore,
     skill_catalog: SkillCatalogService,
     session_id: SessionId,
-    workspace: PathBuf,
+    execution_directory: PathBuf,
     updates: ProviderUpdateGate,
 }
 
@@ -620,11 +620,11 @@ impl ProviderOrchestrator {
     pub(crate) fn open_session(
         &self,
         session_id: SessionId,
-        workspace: PathBuf,
+        execution_directory: PathBuf,
         prompt_id: PromptId,
     ) {
         if let Ok(commands_tx) =
-            self.actor_commands_or_fail_prompt(session_id, workspace, prompt_id)
+            self.actor_commands_or_fail_prompt(session_id, execution_directory, prompt_id)
         {
             commands_tx
                 .send(ProviderCommand::StartPrompt { prompt_id })
@@ -721,7 +721,7 @@ impl ProviderOrchestrator {
     fn actor_commands_or_fail_prompt(
         &self,
         session_id: SessionId,
-        workspace: PathBuf,
+        execution_directory: PathBuf,
         prompt_id: PromptId,
     ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
         if let Some(message) = self.disabled_provider_failure(session_id) {
@@ -741,13 +741,13 @@ impl ProviderOrchestrator {
             Ok(runtime) => runtime,
             Err(message) => return Err(self.fail_prompt(session_id, prompt_id, message)),
         };
-        self.get_or_spawn_actor_commands(session_id, workspace, runtime)
+        self.get_or_spawn_actor_commands(session_id, execution_directory, runtime)
     }
 
     fn get_or_spawn_actor_commands(
         &self,
         session_id: SessionId,
-        workspace: PathBuf,
+        execution_directory: PathBuf,
         runtime: Arc<dyn ProviderRuntime>,
     ) -> Result<mpsc::UnboundedSender<ProviderCommand>> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -769,7 +769,7 @@ impl ProviderOrchestrator {
                 sessions,
                 skill_catalog: self.skill_catalog.clone(),
                 session_id,
-                workspace,
+                execution_directory,
                 updates: self.updates.clone(),
             },
             commands_rx,
@@ -790,11 +790,12 @@ impl ProviderOrchestrator {
     }
 
     pub(crate) fn schedule_prompt(&self, session_id: SessionId, prompt_id: PromptId) -> Result<()> {
-        let workspace = self
+        let execution_directory = self
             .sessions
-            .workspace(session_id)
+            .execution_directory(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session does not exist on this server instance"))?;
-        let Ok(commands) = self.actor_commands_or_fail_prompt(session_id, workspace, prompt_id)
+        let Ok(commands) =
+            self.actor_commands_or_fail_prompt(session_id, execution_directory, prompt_id)
         else {
             // The Prompt's Turn was already settled as failed; scheduling has
             // nothing left to deliver.
@@ -1006,7 +1007,7 @@ async fn run_provider_session(
         sessions,
         skill_catalog,
         session_id,
-        workspace,
+        execution_directory,
         updates,
     } = context;
     let mut provider: Option<ConnectedProviderSession> = None;
@@ -1246,7 +1247,7 @@ async fn run_provider_session(
                     biased;
                     _ = shutdown.wait() => break 'actor,
                     connection = runtime.start_session(ProviderSessionRequest {
-                        workspace: workspace.clone(),
+                        execution_directory: execution_directory.clone(),
                         resume_state: sessions.resume_state(session_id, &provider_id),
                     }) => connection,
                 };
@@ -1341,7 +1342,7 @@ async fn run_provider_session(
                 &sessions,
                 session_id,
                 &provider_id,
-                &workspace,
+                &execution_directory,
                 &prompt,
                 delivery,
             )
@@ -1528,7 +1529,7 @@ async fn run_provider_session(
                     &sessions,
                     session_id,
                     &provider_id,
-                    &workspace,
+                    &execution_directory,
                     &prompt,
                     SkillPromptDelivery::Steer,
                 )
@@ -1981,7 +1982,7 @@ async fn revalidate_prompt_skills(
     sessions: &SessionStore,
     session_id: SessionId,
     provider: &ProviderId,
-    workspace: &std::path::Path,
+    execution_directory: &std::path::Path,
     prompt: &Prompt,
     delivery: SkillPromptDelivery,
 ) -> Result<(), String> {
@@ -2000,7 +2001,7 @@ async fn revalidate_prompt_skills(
         skill_invocations: prompt.skill_invocations.clone(),
     };
     skill_catalog
-        .validate_prompt(provider.clone(), workspace, &prompt, delivery)
+        .validate_prompt(provider.clone(), execution_directory, &prompt, delivery)
         .await
         .map_err(skill_delivery_failure_message)
 }
@@ -2682,7 +2683,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
-        ModelId, SessionSnapshot, TurnStatus, Workspace,
+        ModelId, SessionSnapshot, TurnStatus,
     };
     use crate::sessions::StoreOutcome;
     use crate::storage::{StorageRepository, StorageWriter};
@@ -2702,14 +2703,18 @@ mod tests {
 
     async fn routed_sessions() -> RoutedSessions {
         let data_dir = tempfile::tempdir().expect("create isolated data directory");
-        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
         let (writer, storage) = StorageWriter::spawn(repository, &[]);
         let sessions = SessionStore::new(Default::default(), storage);
-        let owning = create_session(&sessions, workspace.path(), "The owning conversation");
-        let routed = create_session(&sessions, workspace.path(), "Delegated work");
+        let owning = create_session(
+            &sessions,
+            execution_directory.path(),
+            "The owning conversation",
+        );
+        let routed = create_session(&sessions, execution_directory.path(), "Delegated work");
         let routed_prompt = routed.prompts[0].id;
         let routed_id = routed.session.id;
         let delivered = sessions
@@ -2723,20 +2728,20 @@ mod tests {
             routed_turn: delivered.turn_id,
             _writer: writer,
             _data_dir: data_dir,
-            _workspace: workspace,
+            _workspace: execution_directory,
         }
     }
 
     fn create_session(
         sessions: &SessionStore,
-        workspace: &std::path::Path,
+        execution_directory: &std::path::Path,
         prompt: &str,
     ) -> SessionSnapshot {
         let created = sessions
             .create(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
-                    path: workspace.to_owned(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.to_owned(),
                 },
                 prompt: InitialPrompt {
                     id: PromptId::new(),

@@ -84,7 +84,7 @@ pub(super) async fn start_copilot_session(
     let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
         questionnaire_events,
     ));
-    let workspace = request.workspace.clone();
+    let execution_directory = request.execution_directory.clone();
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an
@@ -94,7 +94,7 @@ pub(super) async fn start_copilot_session(
         Some(session_id) => {
             let config = ResumeSessionConfig::new(session_id.clone())
                 .with_client_name(COPILOT_CLIENT_NAME)
-                .with_working_directory(request.workspace)
+                .with_working_directory(request.execution_directory)
                 .with_streaming(true)
                 // Pinned rather than left to the CLI's default: a Subagent's deltas are its
                 // child Session's whole Transcript.
@@ -118,7 +118,7 @@ pub(super) async fn start_copilot_session(
             let config = SessionConfig::default()
                 .with_session_id(session_id.clone())
                 .with_client_name(COPILOT_CLIENT_NAME)
-                .with_working_directory(request.workspace)
+                .with_working_directory(request.execution_directory)
                 .with_streaming(true)
                 // Pinned rather than left to the CLI's default: a Subagent's deltas are its
                 // child Session's whole Transcript.
@@ -190,7 +190,7 @@ pub(super) async fn start_copilot_session(
         correlation,
         selection: StdMutex::new(in_force),
         skills,
-        workspace,
+        execution_directory,
         interrupt_request_timeout,
     });
     Ok(ProviderSessionConnection::new(
@@ -317,7 +317,7 @@ struct CopilotSession {
     /// Model — which the next Turn switches away from when it was selected under a different one.
     selection: StdMutex<Option<AgentSelection>>,
     skills: CopilotSkills,
-    workspace: PathBuf,
+    execution_directory: PathBuf,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
     interrupt_request_timeout: Duration,
 }
@@ -434,7 +434,7 @@ impl ProviderSession for CopilotSession {
                     .skills
                     .expand(
                         &self.handle,
-                        &self.workspace,
+                        &self.execution_directory,
                         &self.native,
                         crate::protocol::SkillPromptDelivery::Initial,
                         input.prompt,
@@ -470,7 +470,7 @@ impl ProviderSession for CopilotSession {
                 .skills
                 .expand(
                     &self.handle,
-                    &self.workspace,
+                    &self.execution_directory,
                     &self.native,
                     crate::protocol::SkillPromptDelivery::Steer,
                     input.prompt,

@@ -192,7 +192,7 @@ mod tests {
                 model: ModelId::new("silent-model"),
                 options: Vec::new(),
             },
-            workspace: std::path::PathBuf::from("/workspace"),
+            execution_directory: std::path::PathBuf::from("/workspace"),
         }
     }
 

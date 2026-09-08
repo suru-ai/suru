@@ -15,7 +15,7 @@ use suru::{
         PromptDelivery, PromptId, PromptStatus, ProviderId, SessionError, SessionErrorCode,
         SessionRevision, SessionStatus, SettingMutation, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation,
-        SkillMarkerSpan, SkillPromptDelivery, TurnStatus, Workspace,
+        SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
     },
     server::{self, ServerConfig},
 };
@@ -81,7 +81,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         };
         let catalog = |skill: SkillDescriptor| SkillCatalog {
             provider: provider_id.clone(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace.clone(),
             },
             skills: vec![skill],
@@ -113,7 +113,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         crate::support::receive_managed_client_initial_state(&mut second).await;
         let catalog_request = SkillCatalogRequest {
             provider: provider_id.clone(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         };
@@ -134,7 +134,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         let created = first
             .create_session(CreateSessionRequest {
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {
@@ -274,7 +274,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         };
         let catalog = |skill: SkillDescriptor| SkillCatalog {
             provider: provider_id.clone(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace.clone(),
             },
             skills: vec![skill],
@@ -301,7 +301,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
             })
@@ -322,7 +322,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {
@@ -400,7 +400,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         };
         let catalog = |skill: SkillDescriptor| SkillCatalog {
             provider: provider_id.clone(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace.clone(),
             },
             skills: vec![skill],
@@ -427,7 +427,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
             })
@@ -442,7 +442,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {
@@ -567,7 +567,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
     };
     let catalog = |skill: SkillDescriptor| SkillCatalog {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: canonical_workspace.clone(),
         },
         skills: vec![skill],
@@ -595,7 +595,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
         client
             .list_skills(SkillCatalogRequest {
                 provider: ProviderId::new("codex"),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
             })
@@ -609,7 +609,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(hosted_selection("codex", "codex-model")),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -738,7 +738,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     };
     runtime.offer_skills(SkillCatalog {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: canonical_workspace.clone(),
         },
         skills: vec![original.clone()],
@@ -769,7 +769,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     crate::support::receive_managed_client_initial_state(&mut second).await;
     let request = SkillCatalogRequest {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -824,7 +824,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     runtime.clear_skill_discovery_failure();
     runtime.offer_skills(SkillCatalog {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: canonical_workspace,
         },
         skills: vec![replacement.clone()],
@@ -852,7 +852,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
         .bearer_auth(&server.descriptor().token)
         .json(&CreateSessionRequest {
             agent_selection: Some(hosted_selection("controlled", "controlled-model")),
-            workspace: request.workspace,
+            execution_directory: request.execution_directory,
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$review".to_owned(),
@@ -871,8 +871,9 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
 
     runtime.offer_skills(SkillCatalog {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
-            path: std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace"),
+        execution_directory: suru::protocol::ExecutionDirectory {
+            path: std::fs::canonicalize(workspace.path())
+                .expect("canonicalize suru::protocol::ExecutionDirectory"),
         },
         skills: vec![SkillDescriptor {
             id: SkillId::new("valid-partial-id"),
@@ -891,7 +892,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     first
         .refresh_skills(SkillCatalogRequest {
             provider: ProviderId::new("controlled"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -925,7 +926,7 @@ async fn force_refresh_during_discovery_discards_the_superseded_result() {
     );
     let catalog = |id: &str| SkillCatalog {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: canonical_workspace.clone(),
         },
         skills: vec![SkillDescriptor {
@@ -957,7 +958,7 @@ async fn force_refresh_during_discovery_discards_the_superseded_result() {
     crate::support::receive_managed_client_initial_state(&mut client).await;
     let request = SkillCatalogRequest {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -1019,7 +1020,7 @@ async fn catalog_cache_is_scoped_by_provider_and_canonical_workspace() {
     );
     let catalog = |provider: &str, workspace: std::path::PathBuf, id: &str| SkillCatalog {
         provider: ProviderId::new(provider),
-        workspace: Workspace { path: workspace },
+        execution_directory: suru::protocol::ExecutionDirectory { path: workspace },
         skills: vec![SkillDescriptor {
             id: SkillId::new(id),
             name: "review".to_owned(),
@@ -1044,13 +1045,13 @@ async fn catalog_cache_is_scoped_by_provider_and_canonical_workspace() {
     let client = reqwest::Client::new();
     let alpha_first = SkillCatalogRequest {
         provider: ProviderId::new("alpha"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace_parent.path().join(".").join("first"),
         },
     };
     let beta_first = SkillCatalogRequest {
         provider: ProviderId::new("beta"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: first_workspace.clone(),
         },
     };
@@ -1067,7 +1068,7 @@ async fn catalog_cache_is_scoped_by_provider_and_canonical_workspace() {
     alpha.offer_skills(catalog("alpha", second_canonical, "alpha-second"));
     let alpha_second = SkillCatalogRequest {
         provider: ProviderId::new("alpha"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: second_workspace,
         },
     };
@@ -1107,7 +1108,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
     };
     runtime.offer_skills(SkillCatalog {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: canonical_workspace.clone(),
         },
         skills: vec![descriptor.clone()],
@@ -1131,7 +1132,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         .bearer_auth(&server_descriptor.token)
         .json(&json!({
             "provider": "controlled",
-            "workspace": { "path": workspace_parent.path().join(".").join("workspace") }
+            "execution_directory": { "path": workspace_parent.path().join(".").join("workspace") }
         }))
         .send()
         .await
@@ -1144,7 +1145,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
     assert!(matches!(loading.status, SkillCatalogStatus::Loading));
     let request = SkillCatalogRequest {
         provider: ProviderId::new("controlled"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.clone(),
         },
     };
@@ -1154,7 +1155,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
     .await;
     let catalog_text = serde_json::to_string(&catalog).expect("encode safe Skill Catalog");
     assert!(!catalog_text.contains("SKILL.md"));
-    assert_eq!(catalog.workspace.path, canonical_workspace);
+    assert_eq!(catalog.execution_directory.path, canonical_workspace);
     assert_eq!(catalog.skills, vec![descriptor.clone()]);
 
     let invocation = SkillInvocation {
@@ -1169,7 +1170,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         .bearer_auth(&server_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: Some(selection.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.clone(),
             },
             prompt: InitialPrompt {
@@ -1213,7 +1214,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         .bearer_auth(&server_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: Some(hosted_selection("controlled", "controlled-model")),
-            workspace: Workspace { path: workspace },
+            execution_directory: suru::protocol::ExecutionDirectory { path: workspace },
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$über".to_owned(),
@@ -1273,7 +1274,7 @@ async fn disabled_providers_are_not_discovered_and_native_discovery_errors_are_r
         .expect("Codex disablement succeeds");
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -1327,7 +1328,7 @@ async fn disabled_providers_are_not_discovered_and_native_discovery_errors_are_r
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: Some(hosted_selection("codex", "controlled-model")),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1370,7 +1371,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         // The Provider steers no Skills: only a queued delivery is offered.
         runtime.offer_skills(SkillCatalog {
             provider: provider_id.clone(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace.clone(),
             },
             skills: vec![skill.clone()],
@@ -1396,7 +1397,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
             })
@@ -1411,7 +1412,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {

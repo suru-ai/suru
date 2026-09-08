@@ -1,7 +1,7 @@
 //! Native ephemeral context snapshots through Server updates and durable Session state.
 use crate::support::{conversation_fixture, hosting, session_where};
 use suru::protocol::{
-    Activity, ContextFill, CreateSessionRequest, InitialPrompt, PromptId, TurnStatus, Workspace,
+    Activity, ContextFill, CreateSessionRequest, InitialPrompt, PromptId, TurnStatus,
 };
 
 const CONTEXT_TIMELINE: &str = r#"      context_event() {
@@ -34,7 +34,7 @@ async fn ephemeral_context_is_live_independent_replaceable_and_durable() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -158,7 +158,7 @@ async fn context_tracks_a_continuation_and_its_post_idle_snapshot() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -267,7 +267,7 @@ async fn failed_start_keeps_context_invalidated(reject_send: bool) {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

@@ -59,6 +59,7 @@ impl SessionStore {
             session: Session {
                 context_fill: None,
                 id: session_id,
+                execution_directory: parent_session.execution_directory.clone(),
                 workspace: parent_session.workspace.clone(),
                 agent_selection: parent_session.agent_selection.clone(),
                 agent_selection_availability: parent_session.agent_selection_availability,

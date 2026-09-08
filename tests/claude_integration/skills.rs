@@ -11,7 +11,7 @@ use serde_json::Value;
 use suru::protocol::{
     Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole, PromptDelivery,
     PromptId, PromptStatus, ProviderId, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
-    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus, Workspace,
+    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
 };
 
 fn skill_catalog_arms() -> String {
@@ -60,7 +60,7 @@ async fn fresh_catalog(
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("claude"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
         })
@@ -82,7 +82,7 @@ async fn claude_discovers_native_skills_in_configured_short_lived_processes() {
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("claude"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -190,7 +190,7 @@ async fn claude_rejects_seven_distinct_skills_before_starting_native_input() {
     let rejected = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -259,7 +259,7 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -378,7 +378,7 @@ async fn claude_reports_native_skill_rejection_without_plain_text_retry() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -447,7 +447,7 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

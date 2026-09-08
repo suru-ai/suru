@@ -18,7 +18,7 @@ use crate::protocol::{
     AgentIdentity, AgentSelection, Cost, CostBasis, EffectiveSettings, FileChange, ModelDescriptor,
     ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog,
     SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan,
-    SkillPromptDelivery, Usage, Workspace,
+    SkillPromptDelivery, Usage,
 };
 
 mod claude;
@@ -317,7 +317,7 @@ impl Error for ProviderError {}
 /// harness ever read the identifier this used to carry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSessionRequest {
-    pub workspace: PathBuf,
+    pub execution_directory: PathBuf,
     pub resume_state: Option<ProviderResumeState>,
 }
 
@@ -334,10 +334,10 @@ pub struct ProviderErrand {
     pub prompt: String,
     pub schema: Value,
     pub selection: AgentSelection,
-    /// The directory the Errand runs in, so a Workspace's own agent
+    /// The directory the Errand runs in, so the Execution Directory's agent
     /// instructions can inform the answer and no harness refuses to run
     /// outside a repository.
-    pub workspace: PathBuf,
+    pub execution_directory: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -742,16 +742,16 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery>;
 
     /// Offers the effective user-invocable Skill Catalog for exactly one
-    /// Workspace. Discovery and native identifiers remain inside the Provider;
+    /// Execution Directory. Discovery and native identifiers remain inside the Provider;
     /// the generic boundary returns only opaque identities and safe metadata.
     /// Providers may inherit the unavailable catalog while their adapter has no
     /// Skill implementation, which keeps ordinary Prompt behavior independent
     /// of Skill discovery.
-    fn skill_catalog(&self, workspace: &Path) -> ProviderFuture<'_, SkillCatalog> {
+    fn skill_catalog(&self, execution_directory: &Path) -> ProviderFuture<'_, SkillCatalog> {
         let catalog = SkillCatalog {
             provider: self.provider_id(),
-            workspace: Workspace {
-                path: workspace.to_owned(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
             },
             skills: Vec::new(),
             capabilities: SkillCatalogCapabilities {
@@ -768,8 +768,11 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// Forces the Provider to refresh its native Skill authority. Providers
     /// without a native cache inherit ordinary discovery; adapters such as
     /// Codex override this to request their native force-refresh operation.
-    fn refresh_skill_catalog(&self, workspace: &Path) -> ProviderFuture<'_, SkillCatalog> {
-        self.skill_catalog(workspace)
+    fn refresh_skill_catalog(
+        &self,
+        execution_directory: &Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
+        self.skill_catalog(execution_directory)
     }
 
     /// Adds Provider-specific recovery guidance when a Skill delivery mode is unavailable.
@@ -784,7 +787,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
     /// Reports Provider-native Skill changes as invalidations. The generation
     /// value is deliberately opaque: the server refreshes every cached
-    /// Workspace for this Provider instead of interpreting native details.
+    /// Execution Directory for this Provider instead of interpreting native details.
     fn subscribe_skill_catalog_invalidations(&self) -> Option<watch::Receiver<u64>> {
         None
     }

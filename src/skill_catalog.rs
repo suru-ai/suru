@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, watch};
 use crate::{
     protocol::{
         InitialPrompt, ProviderId, SettingsSnapshot, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogRequest, SkillCatalogStatus, SkillId, SkillPromptDelivery, Workspace,
+        SkillCatalogRequest, SkillCatalogStatus, SkillId, SkillPromptDelivery,
         skill_marker_matches,
     },
     provider::ProviderRuntime,
@@ -36,7 +36,7 @@ struct SkillCatalogInner {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CatalogKey {
     provider: ProviderId,
-    workspace: PathBuf,
+    execution_directory: PathBuf,
 }
 
 struct CacheEntry {
@@ -156,7 +156,7 @@ impl SkillCatalogService {
     pub(crate) async fn validate_prompt(
         &self,
         provider: ProviderId,
-        workspace: &Path,
+        execution_directory: &Path,
         prompt: &InitialPrompt,
         delivery: SkillPromptDelivery,
     ) -> Result<(), SkillCatalogError> {
@@ -165,8 +165,8 @@ impl SkillCatalogService {
         }
         let key = self.resolve_key(SkillCatalogRequest {
             provider,
-            workspace: Workspace {
-                path: workspace.to_owned(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
             },
         })?;
         let catalog = self.await_current(key).await?;
@@ -212,7 +212,7 @@ impl SkillCatalogService {
                 .find(|skill| skill.id == invocation.skill_id)
                 .ok_or_else(|| {
                     SkillCatalogError::InvalidInvocation(format!(
-                        "Skill identity `{}` is not offered in this Provider and Workspace",
+                        "Skill identity `{}` is not offered in this Provider and Execution Directory",
                         invocation.skill_id
                     ))
                 })?;
@@ -249,8 +249,8 @@ impl SkillCatalogService {
         let mut catalog = self
             .list(SkillCatalogRequest {
                 provider: key.provider.clone(),
-                workspace: Workspace {
-                    path: key.workspace.clone(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: key.execution_directory.clone(),
                 },
             })
             .await?;
@@ -261,7 +261,7 @@ impl SkillCatalogService {
             match updates.recv().await {
                 Ok(update)
                     if update.provider == key.provider
-                        && update.workspace.path == key.workspace =>
+                        && update.execution_directory.path == key.execution_directory =>
                 {
                     catalog = update;
                 }
@@ -292,7 +292,7 @@ impl SkillCatalogService {
         self.runtime(&request.provider)?;
         Ok(CatalogKey {
             provider: request.provider,
-            workspace: canonical_workspace(&request.workspace.path)?,
+            execution_directory: canonical_execution_directory(&request.execution_directory.path)?,
         })
     }
 
@@ -397,8 +397,12 @@ impl SkillCatalogService {
         let service = self.clone();
         tokio::spawn(async move {
             let result = match mode {
-                DiscoveryMode::Cached => runtime.skill_catalog(&key.workspace).await,
-                DiscoveryMode::ForceRefresh => runtime.refresh_skill_catalog(&key.workspace).await,
+                DiscoveryMode::Cached => runtime.skill_catalog(&key.execution_directory).await,
+                DiscoveryMode::ForceRefresh => {
+                    runtime
+                        .refresh_skill_catalog(&key.execution_directory)
+                        .await
+                }
             };
             service.finish_discovery(key, generation, mode, result);
         });
@@ -412,7 +416,7 @@ impl SkillCatalogService {
         result: Result<SkillCatalog, crate::provider::ProviderError>,
     ) {
         let result = result.and_then(|catalog| {
-            validate_catalog(&catalog, &key.provider, &key.workspace)
+            validate_catalog(&catalog, &key.provider, &key.execution_directory)
                 .map(|()| catalog)
                 .map_err(|error| crate::provider::ProviderError::new(format!("{error:?}")))
         });
@@ -472,8 +476,8 @@ impl SkillCatalogService {
 fn loading_catalog(key: &CatalogKey) -> SkillCatalog {
     SkillCatalog {
         provider: key.provider.clone(),
-        workspace: Workspace {
-            path: key.workspace.clone(),
+        execution_directory: crate::protocol::ExecutionDirectory {
+            path: key.execution_directory.clone(),
         },
         skills: Vec::new(),
         capabilities: SkillCatalogCapabilities {
@@ -487,8 +491,8 @@ fn loading_catalog(key: &CatalogKey) -> SkillCatalog {
 fn unavailable_catalog(key: &CatalogKey, message: &str) -> SkillCatalog {
     SkillCatalog {
         provider: key.provider.clone(),
-        workspace: Workspace {
-            path: key.workspace.clone(),
+        execution_directory: crate::protocol::ExecutionDirectory {
+            path: key.execution_directory.clone(),
         },
         skills: Vec::new(),
         capabilities: SkillCatalogCapabilities {
@@ -501,27 +505,28 @@ fn unavailable_catalog(key: &CatalogKey, message: &str) -> SkillCatalog {
     }
 }
 
-fn canonical_workspace(workspace: &Path) -> Result<PathBuf, SkillCatalogError> {
-    let workspace = fs::canonicalize(workspace).map_err(|_| SkillCatalogError::InvalidWorkspace)?;
-    workspace
+fn canonical_execution_directory(execution_directory: &Path) -> Result<PathBuf, SkillCatalogError> {
+    let execution_directory =
+        fs::canonicalize(execution_directory).map_err(|_| SkillCatalogError::InvalidWorkspace)?;
+    execution_directory
         .is_dir()
-        .then_some(workspace)
+        .then_some(execution_directory)
         .ok_or(SkillCatalogError::InvalidWorkspace)
 }
 
 fn validate_catalog(
     catalog: &SkillCatalog,
     provider: &ProviderId,
-    workspace: &Path,
+    execution_directory: &Path,
 ) -> Result<(), SkillCatalogError> {
     if &catalog.provider != provider {
         return Err(SkillCatalogError::InvalidCatalog(
             "Provider returned a Skill Catalog owned by another Provider".to_owned(),
         ));
     }
-    if catalog.workspace.path != workspace {
+    if catalog.execution_directory.path != execution_directory {
         return Err(SkillCatalogError::InvalidCatalog(
-            "Provider returned a Skill Catalog for another Workspace".to_owned(),
+            "Provider returned a Skill Catalog for another Execution Directory".to_owned(),
         ));
     }
     let mut identities = HashSet::<&SkillId>::new();

@@ -3414,6 +3414,9 @@ mod tests {
                     session: Session {
                         context_fill: None,
                         id: SessionId::new(),
+                        execution_directory: crate::protocol::ExecutionDirectory {
+                            path: workspace.clone(),
+                        },
                         workspace: Workspace {
                             path: workspace.clone(),
                         },

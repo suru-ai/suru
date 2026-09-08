@@ -16,7 +16,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, ProviderId, SessionStatus, SkillCatalogRequest, SkillCatalogStatus,
-        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Workspace,
+        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -63,7 +63,7 @@ async fn an_incompatible_pinned_cli_reports_copilot_skills_actionably_unavailabl
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -198,7 +198,7 @@ async fn fresh_catalog(
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
         })
@@ -228,7 +228,7 @@ async fn copilot_lists_only_native_skills_with_stable_opaque_identity_and_one_sk
     let (_state_dir, workspace, server, mut client) = host_skills(&copilot, channel).await;
     let request = SkillCatalogRequest {
         provider: ProviderId::new("copilot"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -329,7 +329,7 @@ async fn a_partial_native_catalog_keeps_valid_skills_with_an_aggregate_warning()
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -393,7 +393,7 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {
@@ -468,7 +468,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -616,7 +616,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
     let loading = client
         .list_skills(SkillCatalogRequest {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
         })
@@ -634,7 +634,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
     let rejected = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -661,7 +661,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
     let ordinary = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -713,7 +713,7 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -775,7 +775,7 @@ async fn copilot_rejects_two_distinct_skills_before_opening_or_invoking_a_user_s
     let rejected = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -854,7 +854,7 @@ async fn native_skill_changes_refresh_identity_and_nonsteer_commands_do_not_adve
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

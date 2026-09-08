@@ -15,7 +15,7 @@ use suru::{
         Activity, AdmitPromptRequest, AgentSelection, Cost, CostBasis, CreateSessionRequest,
         InitialPrompt, MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId,
         ModelOptionSelection, ModelOptionValue, NativeMeter, PromptDelivery, PromptId,
-        PromptStatus, ProviderId, TurnStatus, Usage, Workspace,
+        PromptStatus, ProviderId, TurnStatus, Usage,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -89,7 +89,7 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -194,7 +194,7 @@ async fn copilot_cost_is_absent_when_an_applicable_cache_price_is_not_published(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -237,7 +237,7 @@ async fn a_prompt_streams_a_copilot_message_into_the_transcript_and_settles_the_
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -327,7 +327,7 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection("claude-fixture", "low", "long_context")),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -395,7 +395,7 @@ async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection("claude-fixture", "low", "long_context")),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -445,7 +445,7 @@ async fn a_modelless_session_with_no_chosen_selection_runs_under_the_catalog_def
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -500,7 +500,7 @@ async fn a_permission_request_is_answered_inside_the_harness() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -559,7 +559,7 @@ async fn a_copilot_error_settles_the_turn_as_failed_with_a_concise_reason() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -624,7 +624,7 @@ async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_resumes_
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -722,7 +722,7 @@ async fn a_prompt_queued_behind_a_failed_turn_runs_rather_than_settling_on_its_i
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

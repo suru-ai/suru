@@ -2939,7 +2939,7 @@ fn render_landing(
 
     frame.render_widget(
         Paragraph::new(truncate_to_width(
-            &workspace_context(state, &state.workspace, true),
+            &workspace_context(state, &state.execution_directory, true),
             usize::from(panel.width),
         ))
         .style(theme.text.subdued),
@@ -3547,7 +3547,7 @@ fn render_session_header(
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
     let workspace = workspace_context(
         state,
-        &snapshot.session.workspace.path,
+        &snapshot.session.execution_directory.path,
         detail.shows_secondary(),
     );
     let orientation = if !workspace.is_empty() {
@@ -4089,6 +4089,9 @@ mod tests {
                         capacity_tokens: capacity,
                     }),
                     id: SessionId::new(),
+                    execution_directory: crate::protocol::ExecutionDirectory {
+                        path: workspace.path().to_owned(),
+                    },
                     workspace: Workspace {
                         path: workspace.path().to_owned(),
                     },
@@ -4330,6 +4333,9 @@ mod tests {
                     session: Session {
                         context_fill: None,
                         id: session_id,
+                        execution_directory: crate::protocol::ExecutionDirectory {
+                            path: PathBuf::from("/workspace"),
+                        },
                         workspace: Workspace {
                             path: PathBuf::from("/workspace"),
                         },
@@ -4396,6 +4402,9 @@ mod tests {
                     session: Session {
                         context_fill: None,
                         id: session_id,
+                        execution_directory: crate::protocol::ExecutionDirectory {
+                            path: PathBuf::from("/workspace"),
+                        },
                         workspace: Workspace {
                             path: PathBuf::from("/workspace"),
                         },

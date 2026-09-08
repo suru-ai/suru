@@ -3,7 +3,7 @@ use std::sync::Arc;
 use suru::{
     protocol::{
         AgentSelection, ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus,
-        SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
+        SkillDescriptor, SkillId, SkillPromptDelivery,
     },
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
@@ -42,7 +42,7 @@ impl ProviderRuntime for FailingProviderRuntime {
         .collect();
         let catalog = SkillCatalog {
             provider: self.provider_id(),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
             skills,

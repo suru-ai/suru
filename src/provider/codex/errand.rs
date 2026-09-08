@@ -94,7 +94,7 @@ pub(super) async fn run(
         executable,
         args: arguments(&errand, &files)?,
         name: super::CODEX_ONE_SHOT_NAME.to_owned(),
-        cwd: Some(errand.workspace),
+        cwd: Some(errand.execution_directory),
     };
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await

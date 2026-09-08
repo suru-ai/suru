@@ -7,7 +7,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         Activity, CreateSessionRequest, InitialPrompt, PromptId, PromptStatus, SessionStatus,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -167,7 +167,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -347,7 +347,7 @@ async fn assert_provider_failure(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

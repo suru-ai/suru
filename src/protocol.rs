@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
@@ -440,6 +440,14 @@ pub struct Workspace {
     pub path: PathBuf,
 }
 
+/// The exact directory an Agent executes in, interpreted only by its owning Server.
+/// It is independent of Workspace grouping and is fixed when the first Turn begins.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDirectory {
+    pub path: PathBuf,
+}
+
 /// A path a Client asks its Outlook Server to interpret as a Workspace. A
 /// relative path is read from `base`, or from the Server process's current
 /// directory when no base is supplied.
@@ -498,26 +506,26 @@ pub enum SkillCatalogStatus {
 }
 
 /// The effective user-invocable Skills offered by one Provider in exactly one
-/// Workspace. Including both identities in the value makes crossing Provider
-/// or Workspace contexts visible at every caller boundary.
+/// Execution Directory. Including both identities makes crossing Provider
+/// or execution contexts visible at every caller boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalog {
     pub provider: ProviderId,
-    pub workspace: Workspace,
+    pub execution_directory: ExecutionDirectory,
     pub skills: Vec<SkillDescriptor>,
     pub capabilities: SkillCatalogCapabilities,
     pub status: SkillCatalogStatus,
 }
 
 /// The client context whose current Skill Catalog it wants. The server
-/// canonicalizes the Workspace before consulting the Provider, so spelling
+/// canonicalizes the Execution Directory before consulting the Provider, so spelling
 /// variants of one directory cannot create separate authority domains.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalogRequest {
     pub provider: ProviderId,
-    pub workspace: Workspace,
+    pub execution_directory: ExecutionDirectory,
 }
 
 /// The byte range occupied by one recognized `$skill-name` marker in the
@@ -1600,6 +1608,7 @@ pub struct Session {
     pub context_fill: Option<ContextFill>,
     pub id: SessionId,
     pub workspace: Workspace,
+    pub execution_directory: ExecutionDirectory,
     pub agent_selection: Option<AgentSelection>,
     pub agent_selection_availability: ModelAvailability,
     pub status: SessionStatus,
@@ -2513,7 +2522,7 @@ pub struct InitialPrompt {
 #[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
     pub agent_selection: Option<AgentSelection>,
-    pub workspace: Workspace,
+    pub execution_directory: ExecutionDirectory,
     pub prompt: InitialPrompt,
 }
 

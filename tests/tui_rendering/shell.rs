@@ -20,7 +20,6 @@ use suru::{
         Activity, AgentSelection, CreateSessionRequest, InitialPrompt, ModelAvailability,
         ModelCatalog, ModelId, PromptId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         ServerShutdown, SessionId, SessionStatus, SessionTimestamp, ShutdownReason, TurnStatus,
-        Workspace,
     },
     server::ServerConfig,
     tui::{
@@ -1026,7 +1025,7 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

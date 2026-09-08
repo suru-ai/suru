@@ -14,7 +14,7 @@ use suru::{
     managed_client::ManagedClient,
     protocol::{
         Activity, CreateSessionRequest, InitialPrompt, PromptId, ProviderCatalogStatus,
-        ProviderUnavailability, TurnStatus, Workspace,
+        ProviderUnavailability, TurnStatus,
     },
     provider::ClaudeRuntime,
     server::{self, ServerConfig},
@@ -346,7 +346,7 @@ async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

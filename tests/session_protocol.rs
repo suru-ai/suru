@@ -55,7 +55,7 @@ fn a_reported_zero_cost_is_known_while_an_unattributed_cost_is_rejected() {
 fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     let catalog = SkillCatalog {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: PathBuf::from("/work/suru"),
         },
         skills: vec![SkillDescriptor {
@@ -76,7 +76,7 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     };
     let expected = json!({
         "provider": "codex",
-        "workspace": { "path": "/work/suru" },
+        "execution_directory": { "path": "/work/suru" },
         "skills": [{
             "id": "01J-safe-opaque-id",
             "name": "code-review",
@@ -104,13 +104,13 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
 fn skill_catalog_request_round_trips_provider_and_workspace_context() {
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: PathBuf::from("workspace"),
         },
     };
     let encoded = json!({
         "provider": "codex",
-        "workspace": { "path": "workspace" }
+        "execution_directory": { "path": "workspace" }
     });
     assert_eq!(
         serde_json::to_value(&request).expect("encode request"),
@@ -213,6 +213,9 @@ fn session_summary_round_trips_with_discovery_metadata() {
         session: Session {
             context_fill: None,
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: PathBuf::from("/work/suru"),
+            },
             workspace: Workspace {
                 path: PathBuf::from("/work/suru"),
             },
@@ -263,6 +266,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "cost": 0.03
         },
         "workspace": { "path": "/work/suru" },
+        "execution_directory": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
             "model": "gpt-5",
@@ -319,6 +323,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 capacity_tokens: Some(200_000),
             }),
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: PathBuf::from("/work/suru"),
+            },
             workspace: Workspace {
                 path: PathBuf::from("/work/suru"),
             },
@@ -419,6 +426,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "workspace": { "path": "/work/suru" },
+            "execution_directory": { "path": "/work/suru" },
             "agent_selection": {
                 "provider": "codex",
                 "model": "gpt-5",
@@ -1125,7 +1133,7 @@ fn agent_selection_change_is_typed_and_replaceable() {
 fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
         agent_selection: None,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: PathBuf::from("/work/suru"),
         },
         prompt: InitialPrompt {
@@ -1136,7 +1144,7 @@ fn initial_session_command_round_trips_through_json() {
     };
     let expected = json!({
         "agent_selection": null,
-        "workspace": { "path": "/work/suru" },
+        "execution_directory": { "path": "/work/suru" },
         "prompt": {
             "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             "text": "Explain this workspace",

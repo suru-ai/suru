@@ -13,7 +13,7 @@ use suru::{
         AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
         RuntimeDescriptor, SessionCatalogChange, SessionError, SessionErrorCode, SessionId,
         SessionListItem, SessionSettlementChanged, SessionSummary, SessionTimestamp,
-        SettleSessionRequest, Workspace,
+        SettleSessionRequest,
     },
     server::ServerConfig,
 };
@@ -24,7 +24,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
         // No Agent Selection, so no Title Errand runs and the catalog stream
         // carries nothing but what settling puts on it.
         agent_selection: None,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {

@@ -62,7 +62,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
     let created = first_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -141,7 +141,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -223,7 +223,7 @@ async fn managed_clients_observe_durable_session_deletion() {
     let created = deleting_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -355,7 +355,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     let first = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -376,7 +376,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     let second = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -513,7 +513,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     let shared = first_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -527,7 +527,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     let isolated = first_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -872,6 +872,9 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         session: Session {
             context_fill: None,
             id: session_id,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },

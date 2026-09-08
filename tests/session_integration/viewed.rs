@@ -11,7 +11,7 @@ use suru::{
     protocol::{
         CreateSessionRequest, InitialPrompt, PromptId, SessionCatalogChange, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionStandingInputs, SessionSummary,
-        ViewSessionOperationId, ViewSessionRequest, Workspace,
+        ViewSessionOperationId, ViewSessionRequest,
     },
     server::ServerConfig,
 };
@@ -20,7 +20,7 @@ use tokio::time::{Duration, timeout};
 fn create_request(workspace: &std::path::Path) -> CreateSessionRequest {
     CreateSessionRequest {
         agent_selection: None,
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {

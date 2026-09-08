@@ -34,7 +34,7 @@ use suru::{
         Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery,
         PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId,
         SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot,
-        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage, Workspace,
+        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -613,7 +613,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

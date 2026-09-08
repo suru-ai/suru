@@ -321,7 +321,10 @@ impl SessionRow {
             workspace: encode(
                 session_id,
                 "Workspace",
-                &StoredWorkspace::from(summary.session.workspace),
+                &StoredSessionLocation {
+                    path: summary.session.workspace.path,
+                    execution_directory: Some(summary.session.execution_directory),
+                },
             )?,
             agent_selection: summary
                 .session
@@ -352,7 +355,7 @@ impl SessionRow {
     ) -> Result<(SessionSummary, SessionRevision), StorageError> {
         let session_id = self.id.clone();
         let id = parse_id(&session_id, "Session ID", SessionId::from_uuid)?;
-        let workspace: StoredWorkspace = decode(&session_id, "Workspace", &self.workspace)?;
+        let workspace: StoredSessionLocation = decode(&session_id, "Workspace", &self.workspace)?;
         let agent_selection = self
             .agent_selection
             .as_deref()
@@ -367,6 +370,7 @@ impl SessionRow {
                     .map(|fill| decode(&session_id, "Context Fill", fill))
                     .transpose()?,
                 id,
+                execution_directory: workspace.execution_directory(),
                 workspace: workspace.into(),
                 agent_selection,
                 agent_selection_availability: decode(
@@ -427,7 +431,7 @@ impl SessionRow {
             title: self.title.clone(),
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
-            workspace: serde_json::from_str::<StoredWorkspace>(&self.workspace)
+            workspace: serde_json::from_str::<StoredSessionLocation>(&self.workspace)
                 .ok()
                 .map(Workspace::from),
         })
@@ -630,21 +634,27 @@ fn transcript_identity(item: TranscriptItem) -> TranscriptIdentity {
     }
 }
 
+/// Session location metadata stays readable without opening its Transcript.
+/// Path-only records predate the grouping/execution split and retain that exact path.
 #[derive(Deserialize, Serialize)]
-struct StoredWorkspace {
+struct StoredSessionLocation {
     path: PathBuf,
+    #[serde(default)]
+    execution_directory: Option<crate::protocol::ExecutionDirectory>,
 }
 
-impl From<Workspace> for StoredWorkspace {
-    fn from(workspace: Workspace) -> Self {
-        Self {
-            path: workspace.path,
-        }
+impl StoredSessionLocation {
+    fn execution_directory(&self) -> crate::protocol::ExecutionDirectory {
+        self.execution_directory
+            .clone()
+            .unwrap_or_else(|| crate::protocol::ExecutionDirectory {
+                path: self.path.clone(),
+            })
     }
 }
 
-impl From<StoredWorkspace> for Workspace {
-    fn from(workspace: StoredWorkspace) -> Self {
+impl From<StoredSessionLocation> for Workspace {
+    fn from(workspace: StoredSessionLocation) -> Self {
         Self {
             path: workspace.path,
         }

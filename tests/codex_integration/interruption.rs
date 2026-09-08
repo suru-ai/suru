@@ -6,7 +6,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus, PromptId,
-        SessionStatus, TurnStatus, Workspace,
+        SessionStatus, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -75,7 +75,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -236,7 +236,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

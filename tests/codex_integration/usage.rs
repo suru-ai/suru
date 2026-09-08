@@ -9,7 +9,7 @@ use suru::{
     pricing::PricingSource,
     protocol::{
         Activity, AdmitPromptRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
-        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage, Workspace,
+        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -294,7 +294,7 @@ async fn metered_session_with_pricing(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -670,7 +670,7 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
     let created = original_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

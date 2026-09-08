@@ -11,7 +11,7 @@ use suru::{
     protocol::{
         CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
         ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TitleErrand, TurnId,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -540,7 +540,7 @@ impl LiveTurn {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {

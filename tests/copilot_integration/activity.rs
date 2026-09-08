@@ -7,7 +7,7 @@ use crate::support::{agent_messages, connect, conversation_fixture, settled_sess
 use suru::{
     protocol::{
         Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, TranscriptItem,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -55,7 +55,7 @@ async fn worked_session(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

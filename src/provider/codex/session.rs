@@ -167,29 +167,32 @@ impl ProviderRuntime for CodexRuntime {
         Box::pin(async move { discover_codex_models(executable, processes).await })
     }
 
-    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+    fn skill_catalog(
+        &self,
+        execution_directory: &std::path::Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         let skills = self.skills.clone();
-        let workspace = workspace.to_owned();
+        let execution_directory = execution_directory.to_owned();
         Box::pin(async move {
             skills
-                .discover(&executable, processes, &workspace, false)
+                .discover(&executable, processes, &execution_directory, false)
                 .await
         })
     }
 
     fn refresh_skill_catalog(
         &self,
-        workspace: &std::path::Path,
+        execution_directory: &std::path::Path,
     ) -> ProviderFuture<'_, SkillCatalog> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         let skills = self.skills.clone();
-        let workspace = workspace.to_owned();
+        let execution_directory = execution_directory.to_owned();
         Box::pin(async move {
             skills
-                .discover(&executable, processes, &workspace, true)
+                .discover(&executable, processes, &execution_directory, true)
                 .await
         })
     }
@@ -212,7 +215,7 @@ impl ProviderRuntime for CodexRuntime {
             reasoning_summary: self.reasoning_summary.clone(),
             skills: self.skills.clone(),
             skill_catalog_invalidations: self.skill_catalog_invalidations.clone(),
-            workspace: request.workspace.clone(),
+            execution_directory: request.execution_directory.clone(),
             pricing: self.pricing.clone(),
         };
         Box::pin(async move { start_codex_session(executable, request, processes, context).await })
@@ -312,7 +315,7 @@ struct SessionContext {
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
-    workspace: std::path::PathBuf,
+    execution_directory: std::path::PathBuf,
     pricing: Option<Arc<PricingSource>>,
 }
 
@@ -338,7 +341,7 @@ async fn start_codex_thread(
         warning: _,
     } = connection;
     let cwd = request
-        .workspace
+        .execution_directory
         .to_str()
         .ok_or_else(|| codex_error("Workspace path cannot be represented for Codex app-server"))?;
     let known_thread_id = request
@@ -553,7 +556,7 @@ impl ProviderSession for CodexSession {
                 selection: input.selection,
                 summary,
                 skills: self.context.skills.clone(),
-                workspace: self.context.workspace.clone(),
+                execution_directory: self.context.execution_directory.clone(),
                 transport: self.transport.clone(),
                 correlation: self.correlation.clone(),
                 turn_start_changed: self.turn_start_changed.clone(),
@@ -568,7 +571,7 @@ impl ProviderSession for CodexSession {
             let native_input = self
                 .context
                 .skills
-                .lower(&self.context.workspace, input.prompt)?;
+                .lower(&self.context.execution_directory, input.prompt)?;
             let turn_id = self
                 .correlation
                 .lock()
@@ -724,7 +727,7 @@ struct NativeTurnStartRequest {
     selection: AgentSelection,
     summary: &'static str,
     skills: CodexSkills,
-    workspace: std::path::PathBuf,
+    execution_directory: std::path::PathBuf,
     transport: JsonRpcTransport,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
@@ -737,14 +740,14 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
         selection,
         summary,
         skills,
-        workspace,
+        execution_directory,
         transport,
         correlation,
         turn_start_changed,
     } = request;
     let started = async {
         let options = lower_turn_options(&selection)?;
-        let native_input = skills.lower(&workspace, prompt)?;
+        let native_input = skills.lower(&execution_directory, prompt)?;
         let result = transport
             .request(
                 "turn/start",

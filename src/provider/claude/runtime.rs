@@ -133,15 +133,18 @@ impl ProviderRuntime for ClaudeRuntime {
         })
     }
 
-    fn skill_catalog(&self, workspace: &std::path::Path) -> ProviderFuture<'_, SkillCatalog> {
+    fn skill_catalog(
+        &self,
+        execution_directory: &std::path::Path,
+    ) -> ProviderFuture<'_, SkillCatalog> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();
         let skills = self.skills.clone();
-        let workspace = workspace.to_owned();
+        let execution_directory = execution_directory.to_owned();
         let request_timeout = self.control_request_timeout;
         Box::pin(async move {
             skills
-                .discover(executable, processes, workspace, request_timeout)
+                .discover(executable, processes, execution_directory, request_timeout)
                 .await
         })
     }

@@ -1312,7 +1312,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     if let Err(response) = validate_new_prompt_skills(
         &state,
         provider,
-        &request.workspace.path,
+        &request.execution_directory.path,
         &request.prompt,
         SkillPromptDelivery::Initial,
     )
@@ -1328,7 +1328,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             }
             state.providers.open_session(
                 snapshot.session.id,
-                snapshot.session.workspace.path.clone(),
+                snapshot.session.execution_directory.path.clone(),
                 snapshot.prompts[0].id,
             );
             // After the Turn is scheduled and never in front of it: a Title is
@@ -1338,7 +1338,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             // Session it already made and asks for nothing.
             state.title_derivation.derive(
                 snapshot.session.id,
-                snapshot.session.workspace.path.clone(),
+                snapshot.session.execution_directory.path.clone(),
                 snapshot
                     .session
                     .agent_selection
@@ -1499,7 +1499,7 @@ async fn admit_prompt(
         if let Err(response) = validate_new_prompt_skills(
             &state,
             provider,
-            &snapshot.session.workspace.path,
+            &snapshot.session.execution_directory.path,
             &request.prompt,
             delivery,
         )

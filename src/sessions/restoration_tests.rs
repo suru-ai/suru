@@ -302,6 +302,9 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
     let session = Session {
         context_fill: None,
         id: SessionId::new(),
+        execution_directory: crate::protocol::ExecutionDirectory {
+            path: workspace.to_owned(),
+        },
         workspace: Workspace {
             path: workspace.to_owned(),
         },

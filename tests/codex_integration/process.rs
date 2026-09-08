@@ -7,7 +7,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, AgentId, CreateSessionRequest, InitialPrompt, MessageRole,
         MessageStatus, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
-        SessionStatus, TurnStatus, Workspace,
+        SessionStatus, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -117,7 +117,7 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -413,7 +413,7 @@ impl RecoveryFixture {
         let created = client
             .create_session(CreateSessionRequest {
                 agent_selection: None,
-                workspace: Workspace {
+                execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },
                 prompt: InitialPrompt {

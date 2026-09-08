@@ -666,6 +666,9 @@ mod tests {
             session: Session {
                 context_fill: None,
                 id: session_id,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: PathBuf::from("/workspace"),
+                },
                 workspace: Workspace {
                     path: PathBuf::from("/workspace"),
                 },

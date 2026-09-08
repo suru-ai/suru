@@ -16,7 +16,7 @@ use suru::{
     protocol::{
         AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionId,
-        SessionListItem, SessionTitleChanged, Workspace,
+        SessionListItem, SessionTitleChanged,
     },
     provider::ClaudeRuntime,
     server::{self, RunningServer, ServerConfig, ServerTimings},
@@ -76,7 +76,7 @@ async fn titled_session_with_timings(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(conversation_selection()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
             prompt: InitialPrompt {

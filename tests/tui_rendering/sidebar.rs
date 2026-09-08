@@ -1048,6 +1048,9 @@ fn listed(
         session: Session {
             context_fill: None,
             id: SessionId::new(),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
@@ -5906,7 +5909,7 @@ fn the_workspace_the_reader_added_roots_the_sessions_they_make_next() {
         panic!("a Landing submission creates a Session");
     };
     assert_eq!(
-        request.workspace.path,
+        request.execution_directory.path,
         std::fs::canonicalize(&added).expect("canonicalize the directory the reader added"),
         "the Session is rooted in the Workspace the reader added, read the way the server \
          reads it: the server canonicalizes what it roots a Session at and what it narrows a \
@@ -6290,7 +6293,7 @@ fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
         panic!("a Landing submission creates a Session");
     };
     assert_eq!(
-        request.workspace.path, canonical,
+        request.execution_directory.path, canonical,
         "the spelling the reader typed is not what is taken"
     );
 

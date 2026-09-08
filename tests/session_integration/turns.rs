@@ -18,7 +18,6 @@ use suru::{
         SessionCatalogChange, SessionChange, SessionError, SessionErrorCode, SessionId,
         SessionListItem, SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus,
         SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus,
-        Workspace,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderEventAttribution,
@@ -72,7 +71,7 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -164,7 +163,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let created = first
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -206,7 +205,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let start = timeout(Duration::from_secs(1), provider.next_start())
         .await
         .expect("Provider startup begins asynchronously");
-    assert_eq!(start.workspace(), created.session.workspace.path);
+    assert_eq!(start.execution_directory(), created.session.workspace.path);
     let identity = AgentIdentity {
         agent: AgentId::new("codex"),
         selection: AgentSelection {
@@ -533,7 +532,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -771,7 +770,7 @@ async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -901,7 +900,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1021,7 +1020,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1151,7 +1150,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1304,7 +1303,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1532,7 +1531,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1717,7 +1716,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1893,7 +1892,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -2026,7 +2025,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
             // stream carries nothing but the creation and what the Turn puts
             // on it.
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -2143,7 +2142,7 @@ async fn events_attributed_to_an_unknown_subagent_leave_the_session_untouched() 
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

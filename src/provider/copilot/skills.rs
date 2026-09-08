@@ -24,7 +24,7 @@ use super::{
 use crate::{
     protocol::{
         ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
-        SkillId, SkillPromptDelivery, Workspace,
+        SkillId, SkillPromptDelivery,
     },
     provider::{ProviderError, ProviderPrompt, harness::SharedHarnessHandle},
 };
@@ -84,18 +84,18 @@ impl CopilotSkills {
         self.invalidations.send_replace(generation);
     }
 
-    fn begin_discovery(&self, workspace: &Path) -> u64 {
+    fn begin_discovery(&self, execution_directory: &Path) -> u64 {
         let mut store = self
             .store
             .lock()
             .expect("Copilot Skill store lock is not poisoned");
-        store.workspaces.remove(workspace);
+        store.workspaces.remove(execution_directory);
         store.generation
     }
 
     fn commit_discovery(
         &self,
-        workspace: &Path,
+        execution_directory: &Path,
         generation: u64,
         catalog: NativeCatalog,
     ) -> Result<(), ProviderError> {
@@ -108,21 +108,23 @@ impl CopilotSkills {
                 "Copilot Skills changed while their Catalog was being discovered",
             ));
         }
-        store.workspaces.insert(workspace.to_owned(), catalog);
+        store
+            .workspaces
+            .insert(execution_directory.to_owned(), catalog);
         Ok(())
     }
 
     pub(super) async fn discover(
         &self,
         handle: &SharedHarnessHandle<CopilotConnection>,
-        workspace: &Path,
+        execution_directory: &Path,
     ) -> Result<SkillCatalog, ProviderError> {
-        let generation = self.begin_discovery(workspace);
+        let generation = self.begin_discovery(execution_directory);
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let config = SessionConfig::default()
             .with_session_id(session_id.clone())
             .with_client_name(COPILOT_CLIENT_NAME)
-            .with_working_directory(workspace)
+            .with_working_directory(execution_directory)
             .with_streaming(false)
             .with_enable_config_discovery(true)
             .with_enable_skills(true)
@@ -177,7 +179,7 @@ impl CopilotSkills {
         }
 
         let (Some(commands), Some(skills)) = (commands?, skills?) else {
-            return Ok(Self::incompatible_catalog(workspace));
+            return Ok(Self::incompatible_catalog(execution_directory));
         };
         let mut commands = commands
             .commands
@@ -206,7 +208,7 @@ impl CopilotSkills {
                 invalid_entries += 1;
                 continue;
             }
-            let id = opaque_skill_id(workspace, &skill);
+            let id = opaque_skill_id(execution_directory, &skill);
             if native.contains_key(&id) {
                 invalid_entries += 1;
                 continue;
@@ -232,7 +234,7 @@ impl CopilotSkills {
                 .then_with(|| left.id.as_str().cmp(right.id.as_str()))
         });
         self.commit_discovery(
-            workspace,
+            execution_directory,
             generation,
             NativeCatalog {
                 skills: native,
@@ -241,8 +243,8 @@ impl CopilotSkills {
         )?;
         Ok(SkillCatalog {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
-                path: workspace.to_owned(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
             },
             skills: descriptors,
             capabilities: SkillCatalogCapabilities {
@@ -268,11 +270,11 @@ impl CopilotSkills {
         })
     }
 
-    pub(super) fn incompatible_catalog(workspace: &Path) -> SkillCatalog {
+    pub(super) fn incompatible_catalog(execution_directory: &Path) -> SkillCatalog {
         SkillCatalog {
             provider: ProviderId::new("copilot"),
-            workspace: Workspace {
-                path: workspace.to_owned(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
             },
             skills: Vec::new(),
             capabilities: SkillCatalogCapabilities {
@@ -288,7 +290,7 @@ impl CopilotSkills {
     pub(super) async fn expand(
         &self,
         handle: &SharedHarnessHandle<CopilotConnection>,
-        workspace: &Path,
+        execution_directory: &Path,
         session: &NativeSession,
         delivery: SkillPromptDelivery,
         prompt: ProviderPrompt,
@@ -300,7 +302,8 @@ impl CopilotSkills {
                 ));
             }
             let invocation = &prompt.skill_invocations[0];
-            let command_name = self.resolve_command(workspace, &invocation.skill_id, delivery)?;
+            let command_name =
+                self.resolve_command(execution_directory, &invocation.skill_id, delivery)?;
             let input = prompt.without_skill_markers("Copilot")?;
             let result = until_crash(
                 handle,
@@ -326,7 +329,7 @@ impl CopilotSkills {
 
     fn resolve_command(
         &self,
-        workspace: &Path,
+        execution_directory: &Path,
         skill_id: &SkillId,
         delivery: SkillPromptDelivery,
     ) -> Result<String, ProviderError> {
@@ -335,7 +338,7 @@ impl CopilotSkills {
             .lock()
             .expect("Copilot Skill store lock is not poisoned")
             .workspaces
-            .get(workspace)
+            .get(execution_directory)
             .map(|catalog| {
                 (
                     catalog.skills.get(skill_id).cloned(),
@@ -413,10 +416,10 @@ fn safe_scope(source: SkillSource) -> &'static str {
     }
 }
 
-fn opaque_skill_id(workspace: &Path, skill: &Skill) -> SkillId {
+fn opaque_skill_id(execution_directory: &Path, skill: &Skill) -> SkillId {
     let mut hash = blake3::Hasher::new();
     hash.update(b"suru:copilot-skill:v1\0");
-    hash.update(workspace.to_string_lossy().as_bytes());
+    hash.update(execution_directory.to_string_lossy().as_bytes());
     for component in [
         serde_json::to_string(&skill.source).expect("Copilot Skill source serializes"),
         skill.path.clone().unwrap_or_default(),
@@ -449,7 +452,7 @@ mod tests {
     #[test]
     fn native_change_revokes_every_binding_before_broadcasting_invalidation() {
         let skills = CopilotSkills::default();
-        let workspace = PathBuf::from("workspace");
+        let execution_directory = PathBuf::from("execution_directory");
         let id = SkillId::new("copilot-fixture");
         skills
             .store
@@ -457,7 +460,7 @@ mod tests {
             .expect("Copilot Skill store lock is not poisoned")
             .workspaces
             .insert(
-                workspace.clone(),
+                execution_directory.clone(),
                 NativeCatalog {
                     skills: HashMap::from([(
                         id.clone(),
@@ -486,22 +489,22 @@ mod tests {
 
     #[test]
     fn opaque_identity_is_stateless_workspace_scoped_and_source_sensitive() {
-        let workspace = Path::new("workspace-a");
+        let execution_directory = Path::new("execution_directory-a");
         let skill = native_skill("skill-location-a");
 
         assert_eq!(
-            opaque_skill_id(workspace, &skill),
-            opaque_skill_id(workspace, &skill),
+            opaque_skill_id(execution_directory, &skill),
+            opaque_skill_id(execution_directory, &skill),
             "reconstructed runtime state derives the same identity"
         );
         assert_ne!(
-            opaque_skill_id(workspace, &skill),
-            opaque_skill_id(Path::new("workspace-b"), &skill),
+            opaque_skill_id(execution_directory, &skill),
+            opaque_skill_id(Path::new("execution_directory-b"), &skill),
             "another Workspace has another identity namespace"
         );
         assert_ne!(
-            opaque_skill_id(workspace, &skill),
-            opaque_skill_id(workspace, &native_skill("skill-location-b")),
+            opaque_skill_id(execution_directory, &skill),
+            opaque_skill_id(execution_directory, &native_skill("skill-location-b")),
             "moving or replacing the native source changes identity"
         );
     }
@@ -509,7 +512,7 @@ mod tests {
     #[test]
     fn refreshed_binding_rechecks_native_delivery_support() {
         let skills = CopilotSkills::default();
-        let workspace = PathBuf::from("workspace");
+        let execution_directory = PathBuf::from("execution_directory");
         let id = SkillId::new("copilot-fixture");
         skills
             .store
@@ -517,7 +520,7 @@ mod tests {
             .expect("Copilot Skill store lock is not poisoned")
             .workspaces
             .insert(
-                workspace.clone(),
+                execution_directory.clone(),
                 NativeCatalog {
                     skills: HashMap::from([(
                         id.clone(),
@@ -531,11 +534,11 @@ mod tests {
 
         assert!(
             skills
-                .resolve_command(&workspace, &id, SkillPromptDelivery::Initial)
+                .resolve_command(&execution_directory, &id, SkillPromptDelivery::Initial)
                 .is_ok()
         );
         let error = skills
-            .resolve_command(&workspace, &id, SkillPromptDelivery::Steer)
+            .resolve_command(&execution_directory, &id, SkillPromptDelivery::Steer)
             .expect_err("refreshed non-steer binding rejects stale Steer admission");
         assert!(error.to_string().contains("Steer"));
     }
@@ -543,8 +546,8 @@ mod tests {
     #[test]
     fn discovery_revokes_only_the_workspace_being_refreshed() {
         let skills = CopilotSkills::default();
-        let refreshed = PathBuf::from("workspace-a");
-        let untouched = PathBuf::from("workspace-b");
+        let refreshed = PathBuf::from("execution_directory-a");
+        let untouched = PathBuf::from("execution_directory-b");
         let catalog = || NativeCatalog {
             skills: HashMap::new(),
             steer_supported: true,
@@ -572,12 +575,12 @@ mod tests {
     #[test]
     fn discovery_started_before_native_invalidation_cannot_restore_authority() {
         let skills = CopilotSkills::default();
-        let workspace = PathBuf::from("workspace");
-        let generation = skills.begin_discovery(&workspace);
+        let execution_directory = PathBuf::from("execution_directory");
+        let generation = skills.begin_discovery(&execution_directory);
         skills.native_catalog_changed();
 
         let committed = skills.commit_discovery(
-            &workspace,
+            &execution_directory,
             generation,
             NativeCatalog {
                 skills: HashMap::new(),

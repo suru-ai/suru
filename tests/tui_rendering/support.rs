@@ -439,6 +439,9 @@ pub fn failed_session_snapshot(
         session: Session {
             context_fill: None,
             id: session_id,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
@@ -488,6 +491,9 @@ pub fn selected_session_snapshot(
         session: Session {
             context_fill: None,
             id: session_id,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },
@@ -519,6 +525,9 @@ pub fn navigable_session_snapshot(
         session: Session {
             context_fill: None,
             id: session_id,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },

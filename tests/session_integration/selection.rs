@@ -15,7 +15,7 @@ use suru::{
         ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, PromptStatus,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, SessionChange, SessionRevision,
         SessionSnapshot, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        UpdateAgentSelectionRequest,
     },
     provider::{ProviderEvent, ProviderSkillInvocation},
     server::{self, ServerConfig},
@@ -46,7 +46,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -148,7 +148,7 @@ async fn session_creation_makes_the_landing_agent_selection_authoritative() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&serde_json::json!({
-            "workspace": { "path": workspace.path() },
+            "execution_directory": { "path": workspace.path() },
             "prompt": {
                 "id": PromptId::new(),
                 "text": "Begin with my landing selection",
@@ -191,7 +191,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: first_workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -258,7 +258,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
         .bearer_auth(&replacement_descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: second_workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -316,7 +316,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
     let created = first
         .create_session(CreateSessionRequest {
             agent_selection: Some(initial),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -525,7 +525,7 @@ async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients()
     let created = first
         .create_session(CreateSessionRequest {
             agent_selection: Some(opaque_cycling_selection("low")),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -740,7 +740,7 @@ async fn concurrent_clients_converge_in_server_acceptance_order() {
                 model: ModelId::new("initial"),
                 options: Vec::new(),
             }),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -852,7 +852,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(first_selection.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -993,7 +993,7 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(requested.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1127,7 +1127,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: Some(selection.clone()),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

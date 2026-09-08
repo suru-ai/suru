@@ -14,7 +14,7 @@ use suru::{
         LifecycleState, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId, RedeemInviteRequest,
         RemoteStatus, ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
-        SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, Workspace,
+        SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -1177,7 +1177,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1306,7 +1306,7 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
         .serving_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1447,7 +1447,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
     let created = remote
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1637,7 +1637,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let created = laptop_outlook
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1891,7 +1891,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
     let created = remote
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -1948,7 +1948,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
     let created = remote
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

@@ -96,6 +96,9 @@ fn child_with_working_subagent(
         session: Session {
             context_fill: None,
             id: child_id,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
             workspace: Workspace {
                 path: workspace.to_owned(),
             },

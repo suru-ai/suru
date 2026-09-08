@@ -1033,6 +1033,9 @@ mod tests {
             session: Session {
                 context_fill: None,
                 id: SessionId::new(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: root().join("workspace"),
+                },
                 workspace: Workspace {
                     path: root().join("workspace"),
                 },

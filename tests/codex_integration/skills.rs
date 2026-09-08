@@ -12,7 +12,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, SessionSnapshot, SessionStatus, SkillCatalogStatus,
-        SkillDescriptor, SkillInvocation, SkillMarkerSpan, Workspace,
+        SkillDescriptor, SkillInvocation, SkillMarkerSpan,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -177,7 +177,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
     ));
     let request = suru::protocol::SkillCatalogRequest {
         provider: suru::protocol::ProviderId::new("codex"),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
         },
     };
@@ -196,7 +196,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
     client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -257,7 +257,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
     let loading = client
         .list_skills(suru::protocol::SkillCatalogRequest {
             provider: suru::protocol::ProviderId::new("codex"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace,
             },
         })
@@ -321,7 +321,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -406,7 +406,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
     let loading = client
         .list_skills(suru::protocol::SkillCatalogRequest {
             provider: suru::protocol::ProviderId::new("codex"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace,
             },
         })
@@ -428,7 +428,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -604,7 +604,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
     let loading = client
         .list_skills(suru::protocol::SkillCatalogRequest {
             provider: suru::protocol::ProviderId::new("codex"),
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: canonical_workspace,
             },
         })
@@ -623,7 +623,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

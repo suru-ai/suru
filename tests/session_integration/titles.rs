@@ -16,7 +16,7 @@ use suru::{
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionCatalogChange,
-        SessionId, SessionListItem, SessionTitleChanged, TitleErrand, Workspace,
+        SessionId, SessionListItem, SessionTitleChanged, TitleErrand,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -33,7 +33,7 @@ const EFFORT_OPTION: &str = "reasoning_effort";
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
         agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
-        workspace: Workspace {
+        execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
         prompt: InitialPrompt {
@@ -190,7 +190,7 @@ async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
         "the Session's own Provider runs the Errand, at the default Model it declares nothing cheaper than"
     );
     assert_eq!(
-        errand.workspace(),
+        errand.execution_directory(),
         std::fs::canonicalize(workspace.path())
             .expect("canonicalize Workspace")
             .as_path(),
@@ -594,7 +594,7 @@ async fn a_session_with_no_agent_selection_asks_for_no_errand_at_all() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -987,7 +987,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {

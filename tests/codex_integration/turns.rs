@@ -13,7 +13,7 @@ use suru::{
         FileChange, InitialPrompt, MessageRole, MessageStatus, ModelId, PromptDelivery, PromptId,
         PromptStatus, ProviderId, ReasoningSummaryDetail, RuntimeDescriptor, SessionChange,
         SessionSnapshot, SessionStatus, SettingMutation, ShutdownReason, TranscriptItem,
-        TurnStatus, Workspace,
+        TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -192,7 +192,7 @@ async fn the_pinned_reasoning_summary_setting_is_what_a_turn_asks_codex_for() {
     client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -251,7 +251,7 @@ async fn a_mutated_reasoning_summary_setting_governs_the_next_turn() {
     client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -301,7 +301,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -652,7 +652,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     let boundary_created = boundary_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -728,7 +728,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     let idle_created = idle_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
@@ -824,6 +824,9 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let execution_directory = workspace.path().join("packages/nested agent directory");
+    std::fs::create_dir_all(&execution_directory).unwrap();
+    let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
     let channel = "codex-persisted-resume-state";
     let config = ServerConfig::new(state_dir.path(), channel)
         .expect("configure original server")
@@ -846,8 +849,8 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     let created = original_client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
-                path: workspace.path().to_owned(),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: execution_directory.clone(),
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
@@ -938,6 +941,16 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
         .find(|request| request["method"] == "thread/resume")
         .expect("replacement server resumes the persisted Codex Thread");
     assert_eq!(resume["params"]["threadId"], "persisted-thread");
+    for method in ["thread/start", "thread/resume"] {
+        let request = requests
+            .iter()
+            .find(|request| request["method"] == method)
+            .unwrap();
+        assert_eq!(
+            request["params"]["cwd"],
+            execution_directory.to_string_lossy().as_ref()
+        );
+    }
 
     drop(replacement_client);
     replacement
@@ -1054,7 +1067,7 @@ async fn run_terminal_fixture(
     let created = client
         .create_session(CreateSessionRequest {
             agent_selection: None,
-            workspace: Workspace {
+            execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
