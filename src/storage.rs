@@ -674,6 +674,13 @@ fn initialize_database(database_path: &Path) -> Result<(), StorageError> {
 }
 
 fn connect(database_path: &Path) -> Result<SqliteConnection, StorageError> {
+    connect_with_busy_timeout(database_path, std::time::Duration::from_secs(5))
+}
+
+fn connect_with_busy_timeout(
+    database_path: &Path,
+    busy_timeout: std::time::Duration,
+) -> Result<SqliteConnection, StorageError> {
     let database_url = database_path
         .to_str()
         .ok_or_else(|| StorageError::InvalidDatabasePath(database_path.to_owned()))?;
@@ -690,13 +697,13 @@ fn connect(database_path: &Path) -> Result<SqliteConnection, StorageError> {
             tracing::debug!(storage_query = 1_u64, "Session repository query");
         }
     });
-    // The busy timeout comes first: switching the journal mode takes a lock
-    // of its own, and a connection opened while another is mid-write must
-    // wait for it rather than fail to open at all.
+    // Journal-mode setup itself can encounter a concurrent writer, so install
+    // the busy handler before any operation that needs a database lock.
     connection
-        .batch_execute(
-            "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;",
-        )
+        .batch_execute(&format!(
+            "PRAGMA busy_timeout = {}; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;",
+            busy_timeout.as_millis()
+        ))
         .map_err(|error| StorageError::Open {
             path: database_path.to_owned(),
             message: error.to_string(),
@@ -755,4 +762,36 @@ where
             operation,
             message: error.to_string(),
         })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_setup_honors_busy_timeout_while_database_is_locked() {
+        let directory = tempfile::tempdir().expect("create database directory");
+        let path = directory.path().join("locked.db");
+        let mut owner = SqliteConnection::establish(path.to_str().expect("UTF-8 fixture path"))
+            .expect("open lock owner");
+        owner
+            .batch_execute("CREATE TABLE fixture (id INTEGER); BEGIN EXCLUSIVE;")
+            .expect("hold an exclusive database lock");
+
+        let wait = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let result = connect_with_busy_timeout(&path, wait);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(StorageError::Open { ref message, .. }) if message.contains("locked"))
+        );
+        assert!(
+            elapsed >= wait,
+            "connection setup must wait for the configured busy timeout; returned after {elapsed:?}"
+        );
+        owner
+            .batch_execute("ROLLBACK;")
+            .expect("release database lock");
+        connect_with_busy_timeout(&path, wait).expect("connect after the lock is released");
+    }
 }
