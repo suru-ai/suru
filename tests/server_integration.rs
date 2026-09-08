@@ -2021,6 +2021,8 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
 
     let resolved = remote
         .resolve_workspace(ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
             workspace_id: None,
             base: Some(root.path().to_owned()),
             path: "nested".into(),
@@ -2041,6 +2043,45 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
         resolved.checkouts[0].revision,
         Some(suru::protocol::CheckoutRevision::Branch { commit: None, .. })
     ));
+    let selected = remote
+        .resolve_workspace(ResolveWorkspaceRequest {
+            workspace_id: Some(resolved.workspace.id.clone()),
+            checkout_id: Some(resolved.checkouts[0].association.id.clone()),
+            remembered_execution_directory: None,
+            base: None,
+            path: resolved.workspace.path.clone(),
+        })
+        .await
+        .expect("select the Remote's main Worktree");
+    assert_eq!(
+        selected.execution_directory.as_ref().unwrap().path,
+        resolved.workspace.path
+    );
+    let created = remote
+        .create_session(CreateSessionRequest {
+            agent_selection: None,
+            execution_directory: selected.execution_directory.unwrap(),
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use selected Remote checkout".to_owned(),
+                skill_invocations: vec![],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.session.workspace.id, resolved.workspace.id);
+    assert_eq!(
+        created.session.execution_directory.path,
+        resolved.workspace.path
+    );
+    assert_eq!(remote.list_sessions(None).await.unwrap().len(), 1);
+    assert!(
+        pair.connecting_client
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     pair.shutdown().await;
 }
 

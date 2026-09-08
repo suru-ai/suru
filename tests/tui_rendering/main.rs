@@ -32,3 +32,5 @@ mod workspace_picker;
 mod questionnaires;
 
 mod selection;
+
+mod worktrees;

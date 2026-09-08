@@ -95,6 +95,121 @@ impl SourceControlService {
     ) -> Option<ResolvedWorkspace> {
         self.adapter.reuse_discovery(directory, previous)
     }
+    /// Selection has a different contract from explicit path entry: a Client's
+    /// remembered directory remains selected when unavailable, never substituted.
+    pub(crate) async fn resolve_selection(
+        &self,
+        named: &Path,
+        known: Option<&Workspace>,
+        request: &crate::protocol::ResolveWorkspaceRequest,
+    ) -> Result<ResolvedWorkspace, String> {
+        use crate::protocol::{
+            ExecutionDirectory, ExecutionDirectoryStatus, SourceControlAvailability,
+        };
+        if (request.checkout_id.is_some() || request.remembered_execution_directory.is_some())
+            && request.workspace_id.is_none()
+        {
+            return Err("Choose a Workspace before selecting an execution location".to_owned());
+        }
+        if request.checkout_id.is_some() && request.remembered_execution_directory.is_some() {
+            return Err("Choose one execution location".to_owned());
+        }
+        let path = std::fs::canonicalize(named).unwrap_or_else(|_| named.to_owned());
+        if request.workspace_id.is_none() && !path.is_dir() {
+            return Err(if path.exists() {
+                "Not a directory"
+            } else {
+                "No directory there"
+            }
+            .to_owned());
+        }
+        let mut resolved = self.resolve(&path, known).await;
+        if request
+            .workspace_id
+            .as_ref()
+            .is_some_and(|id| id != &resolved.workspace.id)
+        {
+            return Err("The selected directory no longer belongs to this Workspace".to_owned());
+        }
+        if let Some(id) = &request.checkout_id {
+            let checkout = resolved
+                .checkouts
+                .iter()
+                .find(|checkout| &checkout.association.id == id)
+                .ok_or_else(|| "This Worktree is no longer known to its Repository".to_owned())?;
+            if let SourceControlAvailability::Unavailable { reason } = &checkout.availability {
+                return Err(reason.clone());
+            }
+            let selected = self.resolve(&checkout.association.root, None).await;
+            if selected.workspace.id != resolved.workspace.id
+                || selected
+                    .checkout
+                    .as_ref()
+                    .is_none_or(|checkout| &checkout.id != id)
+                || selected
+                    .execution_directory
+                    .as_ref()
+                    .is_none_or(|directory| directory.path != checkout.association.root)
+            {
+                return Err(
+                    "The selected Worktree is missing or no longer belongs to this Repository"
+                        .to_owned(),
+                );
+            }
+            return Ok(selected);
+        }
+        if let Some(directory) = &request.remembered_execution_directory {
+            // Revalidate actual membership without restoring a durable association:
+            // an unrelated replacement directory must not inherit its old Repository.
+            let remembered = self.adapter.discover(&directory.path).await;
+            resolved.execution_directory = Some(ExecutionDirectory {
+                path: directory.path.clone(),
+            });
+            resolved.execution_status = if let ExecutionDirectoryStatus::Unavailable { reason } =
+                &remembered.execution_status
+            {
+                ExecutionDirectoryStatus::Unavailable {
+                    reason: reason.clone(),
+                }
+            } else if remembered.workspace.id != resolved.workspace.id {
+                ExecutionDirectoryStatus::Unavailable {
+                    reason: "The remembered directory no longer belongs to this Workspace"
+                        .to_owned(),
+                }
+            } else {
+                remembered.execution_status
+            };
+            resolved.checkout = if remembered.workspace.id == resolved.workspace.id {
+                remembered.checkout
+            } else {
+                None
+            };
+            // Keep the original spelling when missing, canonicalize only when
+            // the addressed Server could still read this exact directory.
+            if !matches!(
+                resolved.execution_status,
+                ExecutionDirectoryStatus::Unavailable { .. }
+            ) {
+                resolved.execution_directory = remembered.execution_directory;
+            }
+        }
+        if request.remembered_execution_directory.is_none()
+            && resolved.execution_directory.is_some()
+            && resolved.workspace.repository.is_some()
+        {
+            let actual = self.adapter.discover(&path).await;
+            if actual.workspace.id != resolved.workspace.id {
+                resolved.execution_status = ExecutionDirectoryStatus::Unavailable {
+                    reason:
+                        "The known main checkout is missing or no longer belongs to this Repository"
+                            .to_owned(),
+                };
+                resolved.checkout = None;
+            }
+        }
+        Ok(resolved)
+    }
+
     pub(crate) async fn resolve(
         &self,
         directory: &Path,

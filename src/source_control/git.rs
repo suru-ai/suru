@@ -201,6 +201,9 @@ impl SourceControl for GitSourceControl {
         let path = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
         let mut resolved = ResolvedWorkspace::directory(path.clone());
         if !path.is_dir() {
+            resolved.execution_status = ExecutionDirectoryStatus::Unavailable {
+                reason: "Execution Directory is missing or unreadable".to_owned(),
+            };
             resolved.workspace.source_control = SourceControlAvailability::Unavailable {
                 reason: "Execution Directory is missing or unreadable".to_owned(),
             };
@@ -380,6 +383,7 @@ impl SourceControl for GitSourceControl {
         // Repository metadata is a grouping context, never an execution fallback.
         if resolved.checkout.is_none() {
             resolved.execution_directory = None;
+            resolved.execution_status = ExecutionDirectoryStatus::RequiresWorkingCopy;
         }
         resolved.checkouts = checkouts;
         resolved

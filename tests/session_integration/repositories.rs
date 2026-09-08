@@ -65,6 +65,8 @@ async fn resolve(
 ) -> ResolvedWorkspace {
     request(descriptor, reqwest::Method::POST, "/v1/workspaces/resolve")
         .json(&ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
             workspace_id: id,
             base: None,
             path: path.to_owned(),

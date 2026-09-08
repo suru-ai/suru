@@ -147,7 +147,16 @@ pub struct CheckoutSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExecutionDirectoryStatus {
+    Available,
+    Unavailable { reason: String },
+    RequiresWorkingCopy,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResolvedWorkspace {
+    pub execution_status: ExecutionDirectoryStatus,
     pub workspace: Workspace,
     pub execution_directory: Option<ExecutionDirectory>,
     pub checkout: Option<CheckoutAssociation>,
@@ -157,6 +166,7 @@ pub struct ResolvedWorkspace {
 impl ResolvedWorkspace {
     pub fn directory(path: PathBuf) -> Self {
         Self {
+            execution_status: ExecutionDirectoryStatus::Available,
             workspace: Workspace::directory(path.clone()),
             execution_directory: Some(ExecutionDirectory { path }),
             checkout: None,

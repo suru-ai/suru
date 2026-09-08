@@ -99,6 +99,11 @@ pub enum SemanticCommandId {
     TranscriptTurnToggle,
     TranscriptTurnsToggle,
     WorkspaceList,
+    WorktreeList,
+    WorktreePrevious,
+    WorktreeNext,
+    WorktreeSelect,
+    WorktreeClose,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -325,6 +330,11 @@ impl SemanticCommandId {
             Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
             Self::TranscriptTurnsToggle => "transcript.turns.toggle",
             Self::WorkspaceList => "workspace.list",
+            Self::WorktreeList => "worktree.list",
+            Self::WorktreePrevious => "worktree.previous",
+            Self::WorktreeNext => "worktree.next",
+            Self::WorktreeSelect => "worktree.select",
+            Self::WorktreeClose => "worktree.close",
         }
     }
 }
@@ -618,6 +628,44 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X L",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorktreePrevious,
+        title: "Previous Worktree",
+        description: "Previous Worktree",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorktreeNext,
+        title: "Next Worktree",
+        description: "Next Worktree",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorktreeSelect,
+        title: "Select Worktree",
+        description: "Select Worktree",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorktreeClose,
+        title: "Close Worktree chooser",
+        description: "Close Worktree chooser",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorktreeList,
+        title: "Choose Worktree",
+        description: "Choose an existing Worktree or directory for a new Session",
+        slash: Some(SlashCommand {
+            name: "worktree",
+            aliases: &["checkout"],
+        }),
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorkspaceList,

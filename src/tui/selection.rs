@@ -159,6 +159,7 @@ pub(super) enum SelectionSurface {
     Connect,
     Sessions,
     Workspaces,
+    Worktrees,
     Models,
     Themes,
     ModelOptions,

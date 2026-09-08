@@ -1797,7 +1797,7 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
                     .find(|workspace| &workspace.id == id)
             })
         });
-    let base = match request.base {
+    let base = match request.base.clone() {
         Some(base) => base,
         None => match std::env::current_dir() {
             Ok(base) => base,
@@ -1811,35 +1811,23 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
         },
     };
     let named = known.as_ref().map_or_else(
-        || base.join(request.path),
+        || base.join(&request.path),
         |workspace| workspace.path.clone(),
     );
-    let Ok(path) = std::fs::canonicalize(named) else {
-        return session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "No directory there",
-        );
-    };
-    if !path.is_dir() {
-        return session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "Not a directory",
-        );
-    }
-    let resolved = state.source_control.resolve(&path, known.as_ref()).await;
-    if request
-        .workspace_id
-        .as_ref()
-        .is_some_and(|id| id != &resolved.workspace.id)
+    let resolved = match state
+        .source_control
+        .resolve_selection(&named, known.as_ref(), &request)
+        .await
     {
-        return session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "The selected directory no longer belongs to this Workspace",
-        );
-    }
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return session_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                SessionErrorCode::InvalidWorkspace,
+                reason,
+            );
+        }
+    };
     if let Err(error) = state
         .sessions
         .refresh_repository_labels(&state.source_control)

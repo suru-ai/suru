@@ -482,6 +482,10 @@ pub struct ExecutionDirectory {
 #[serde(deny_unknown_fields)]
 pub struct ResolveWorkspaceRequest {
     #[serde(default)]
+    pub checkout_id: Option<CheckoutId>,
+    #[serde(default)]
+    pub remembered_execution_directory: Option<ExecutionDirectory>,
+    #[serde(default)]
     pub workspace_id: Option<WorkspaceId>,
     pub base: Option<PathBuf>,
     pub path: PathBuf,

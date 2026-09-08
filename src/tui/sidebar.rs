@@ -1787,6 +1787,8 @@ impl Sidebar {
             return self.refuse_workspace(NAME_A_DIRECTORY);
         }
         SidebarActivation::ResolveWorkspace(ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
             workspace_id: None,
             base: self.execution_directory.clone(),
             path: PathBuf::from(named),

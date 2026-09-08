@@ -735,6 +735,8 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             surface: WorkspaceResolutionSurface::WorkspacePicker,
             request_id: 2,
             request: suru::protocol::ResolveWorkspaceRequest {
+                checkout_id: None,
+                remembered_execution_directory: None,
                 workspace_id: Some(suru::protocol::WorkspaceId::directory(&remote_only)),
                 base: None,
                 path: remote_only,

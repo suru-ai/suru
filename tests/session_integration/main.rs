@@ -36,3 +36,5 @@ mod viewed;
 
 mod questionnaires;
 mod repositories;
+
+mod worktree_navigation;

@@ -192,6 +192,8 @@ impl EverywhereListRequest {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum WorkspaceResolutionSurface {
+    WorktreeList,
+    WorktreeSelection,
     Outlook,
     WorkspacePicker,
     Sidebar,
@@ -348,6 +350,12 @@ impl TranscriptViewport {
 }
 
 #[derive(Clone, Debug)]
+struct RememberedExecutionContext {
+    directory: Option<PathBuf>,
+    status: crate::protocol::ExecutionDirectoryStatus,
+}
+
+#[derive(Clone, Debug)]
 pub struct TuiState {
     left_press: Option<LeftPress>,
     last_click: Option<LastClick>,
@@ -358,6 +366,10 @@ pub struct TuiState {
     pub(super) outlook: Outlook,
     outlook_workspaces: HashMap<Outlook, Workspace>,
     outlook_execution_directories: HashMap<Outlook, Option<PathBuf>>,
+    remembered_execution_directories:
+        HashMap<(Outlook, crate::protocol::WorkspaceId), RememberedExecutionContext>,
+    pub(super) execution_status: crate::protocol::ExecutionDirectoryStatus,
+    pub(super) worktree_picker: super::worktree_picker::WorktreePicker,
     initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
@@ -549,6 +561,9 @@ impl TuiState {
                 Outlook::Local,
                 Some(workspace.clone()),
             )]),
+            remembered_execution_directories: HashMap::new(),
+            execution_status: crate::protocol::ExecutionDirectoryStatus::Available,
+            worktree_picker: Default::default(),
             initial_context_resolved: false,
             workspace_resolution_sequence: 0,
             pending_workspace_resolutions: HashMap::new(),
@@ -622,6 +637,17 @@ impl TuiState {
     /// choose, and the path entry re-points it separately, so nothing here
     /// rearranges a column they configured.
     fn adopt_context(&mut self, context: crate::protocol::ResolvedWorkspace) {
+        self.execution_status = context.execution_status.clone();
+        self.remembered_execution_directories.insert(
+            (self.outlook.clone(), context.workspace.id.clone()),
+            RememberedExecutionContext {
+                directory: context
+                    .execution_directory
+                    .as_ref()
+                    .map(|directory| directory.path.clone()),
+                status: context.execution_status.clone(),
+            },
+        );
         self.execution_directory = context.execution_directory.map(|directory| directory.path);
         self.workspace = context.workspace.clone();
         self.outlook_workspaces
@@ -635,6 +661,7 @@ impl TuiState {
         self.sidebar.adopt_workspace(context.workspace);
         self.sidebar
             .adopt_execution_directory(self.execution_directory.clone());
+        self.sync_composer_completion();
     }
 
     fn abandon_pending_attachment(&mut self) {
@@ -717,6 +744,7 @@ impl TuiState {
 
     fn turn_outlook(&mut self, outlook: Outlook) {
         self.turn_outlook_with(outlook, OutlookTurn::Deliberate);
+        self.begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
     }
 
     /// Turns toward the Origin of a Session already present in a merged
@@ -774,11 +802,19 @@ impl TuiState {
             .insert(self.outlook.clone(), self.landing_agent_selection.clone());
         self.outlook = outlook.clone();
         self.pending_workspace_resolutions.clear();
+        self.worktree_picker.close();
         self.workspace = self
             .outlook_workspaces
             .get(&outlook)
             .cloned()
             .unwrap_or(fallback_workspace);
+        self.execution_status = self
+            .remembered_execution_directories
+            .get(&(outlook.clone(), self.workspace.id.clone()))
+            .map_or(
+                crate::protocol::ExecutionDirectoryStatus::Available,
+                |remembered| remembered.status.clone(),
+            );
         self.execution_directory = self
             .outlook_execution_directories
             .get(&outlook)
@@ -834,7 +870,10 @@ impl TuiState {
 
     fn begin_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> u64 {
         self.workspace_resolution_sequence = self.workspace_resolution_sequence.wrapping_add(1);
-        if surface != WorkspaceResolutionSurface::Outlook {
+        if !matches!(
+            surface,
+            WorkspaceResolutionSurface::Outlook | WorkspaceResolutionSurface::WorktreeList
+        ) {
             self.pending_workspace_resolutions
                 .remove(&WorkspaceResolutionSurface::Outlook);
         }
@@ -2148,6 +2187,8 @@ impl TuiState {
             Some(SelectionSurface::NumericEditor)
         } else if self.settings_panel.is_open() {
             Some(SelectionSurface::Settings)
+        } else if self.worktree_picker.open {
+            Some(SelectionSurface::Worktrees)
         } else if self.workspace_picker.is_open() {
             Some(SelectionSurface::Workspaces)
         } else if self.session_picker.is_open() {
@@ -2192,6 +2233,7 @@ impl TuiState {
             || self.model_options.is_open()
             || self.session_picker.is_open()
             || self.workspace_picker.is_open()
+            || self.worktree_picker.open
             || self.subagent_picker.is_open()
             || self.questionnaires.is_open(self.session_reference.as_ref())
     }
@@ -2723,6 +2765,8 @@ pub enum CommandId {
     PageNextWorkspaces,
     SelectWorkspace,
     CloseWorkspacePicker,
+    InsertWorktreeDirectory(String),
+    DeleteWorktreeDirectoryBackward,
     SelectPreviousSubagent,
     SelectNextSubagent,
     OpenSelectedSubagent,
@@ -3249,8 +3293,20 @@ impl Application {
                 }
                 match result {
                     Ok(workspace) => {
+                        if surface == WorkspaceResolutionSurface::WorktreeList {
+                            self.state.adopt_context(workspace.clone());
+                            self.state.worktree_picker.load(workspace);
+                            return Ok(ApplicationTransition::Continue);
+                        }
                         self.state.adopt_context(workspace.clone());
                         match surface {
+                            WorkspaceResolutionSurface::WorktreeList => {
+                                unreachable!("reading handled above")
+                            }
+                            WorkspaceResolutionSurface::WorktreeSelection => {
+                                self.state.worktree_picker.close();
+                                Ok(ApplicationTransition::Continue)
+                            }
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.sidebar.refresh_after_outlook_workspace();
                                 Ok(self.take_session_listing_transition())
@@ -3286,6 +3342,10 @@ impl Application {
                         match surface {
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.submission_error = Some(error);
+                            }
+                            WorkspaceResolutionSurface::WorktreeList
+                            | WorkspaceResolutionSurface::WorktreeSelection => {
+                                self.state.worktree_picker.fail(error);
                             }
                             WorkspaceResolutionSurface::WorkspacePicker => {
                                 self.state.workspace_picker.fail_resolution(error);
@@ -3658,6 +3718,18 @@ impl Application {
             | CommandId::PageNextWorkspaces
             | CommandId::SelectWorkspace
             | CommandId::CloseWorkspacePicker) => Ok(self.handle_workspace_picker_command(command)),
+            CommandId::InsertWorktreeDirectory(text) => {
+                if let Some(directory) = &mut self.state.worktree_picker.directory {
+                    directory.push_str(&text);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            CommandId::DeleteWorktreeDirectoryBackward => {
+                if let Some(directory) = &mut self.state.worktree_picker.directory {
+                    directory.pop();
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             command @ (CommandId::SelectPreviousSubagent
             | CommandId::SelectNextSubagent
             | CommandId::OpenSelectedSubagent
@@ -3889,8 +3961,139 @@ impl Application {
         }
     }
 
-    /// Handles the Workspace Picker's commands; any other command leaves the
-    /// picker alone.
+    /// Worktree choices affect the next Session's execution context only.
+    fn handle_worktree_command(&mut self, command: SemanticCommandId) -> ApplicationTransition {
+        use super::worktree_picker::WorktreeChoice;
+        match command {
+            SemanticCommandId::WorktreeList => {
+                if self.state.session_reference.is_some() {
+                    self.state.submission_error =
+                        Some("Start a new Session before choosing a Worktree".to_owned());
+                    return ApplicationTransition::Continue;
+                }
+                self.state.worktree_picker.open();
+                self.state.command_mode = CommandMode::Composer;
+                let request = self.current_workspace_request();
+                return self.resolve_worktree(WorkspaceResolutionSurface::WorktreeList, request);
+            }
+            SemanticCommandId::WorktreePrevious => self.state.worktree_picker.move_by(-1),
+            SemanticCommandId::WorktreeNext => self.state.worktree_picker.move_by(1),
+            SemanticCommandId::WorktreeClose => {
+                if self.state.worktree_picker.directory.take().is_some() {
+                    self.state.worktree_picker.loading = false;
+                    self.state.worktree_picker.error = None;
+                    return if self
+                        .state
+                        .cancel_workspace_resolution(WorkspaceResolutionSurface::WorktreeSelection)
+                    {
+                        ApplicationTransition::CancelWorkspaceResolution(
+                            WorkspaceResolutionSurface::WorktreeSelection,
+                        )
+                    } else {
+                        ApplicationTransition::Continue
+                    };
+                }
+                self.state.worktree_picker.close();
+                for surface in [
+                    WorkspaceResolutionSurface::WorktreeList,
+                    WorkspaceResolutionSurface::WorktreeSelection,
+                ] {
+                    if self.state.cancel_workspace_resolution(surface) {
+                        return ApplicationTransition::CancelWorkspaceResolution(surface);
+                    }
+                }
+            }
+            SemanticCommandId::WorktreeSelect => {
+                if let Some(path) = &self.state.worktree_picker.directory {
+                    if path.trim().is_empty() {
+                        self.state
+                            .worktree_picker
+                            .fail("Name a directory".to_owned());
+                        return ApplicationTransition::Continue;
+                    }
+                    let request = ResolveWorkspaceRequest {
+                        checkout_id: None,
+                        remembered_execution_directory: None,
+                        workspace_id: None,
+                        base: self.state.execution_directory.clone(),
+                        path: PathBuf::from(path),
+                    };
+                    self.state.worktree_picker.loading = true;
+                    return self
+                        .resolve_worktree(WorkspaceResolutionSurface::WorktreeSelection, request);
+                }
+                match self.state.worktree_picker.choice() {
+                    Some(WorktreeChoice::Current) => self.state.worktree_picker.close(),
+                    Some(WorktreeChoice::Directory) => {
+                        self.state.worktree_picker.directory = Some(String::new());
+                        self.state.worktree_picker.error = None;
+                    }
+                    Some(WorktreeChoice::Checkout(checkout)) => {
+                        if let crate::protocol::SourceControlAvailability::Unavailable { reason } =
+                            &checkout.availability
+                        {
+                            self.state.worktree_picker.fail(reason.clone());
+                            return ApplicationTransition::Continue;
+                        }
+                        let request = ResolveWorkspaceRequest {
+                            checkout_id: Some(checkout.association.id),
+                            remembered_execution_directory: None,
+                            workspace_id: Some(self.state.workspace.id.clone()),
+                            base: None,
+                            path: self.state.workspace.path.clone(),
+                        };
+                        self.state.worktree_picker.loading = true;
+                        return self.resolve_worktree(
+                            WorkspaceResolutionSurface::WorktreeSelection,
+                            request,
+                        );
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    fn resolve_worktree(
+        &mut self,
+        surface: WorkspaceResolutionSurface,
+        request: ResolveWorkspaceRequest,
+    ) -> ApplicationTransition {
+        let request_id = self.state.begin_workspace_resolution(surface);
+        ApplicationTransition::ResolveWorkspace {
+            outlook: self.state.outlook.clone(),
+            surface,
+            request_id,
+            request,
+        }
+    }
+
+    pub(super) fn current_workspace_request(&self) -> ResolveWorkspaceRequest {
+        let known = self
+            .state
+            .remembered_execution_directories
+            .contains_key(&(self.state.outlook.clone(), self.state.workspace.id.clone()));
+        ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: known
+                .then(|| self.state.execution_directory.clone())
+                .flatten()
+                .map(|path| crate::protocol::ExecutionDirectory { path }),
+            workspace_id: known.then(|| self.state.workspace.id.clone()),
+            base: None,
+            path: if known {
+                self.state.workspace.path.clone()
+            } else {
+                self.state
+                    .execution_directory
+                    .clone()
+                    .unwrap_or_else(|| self.state.workspace.path.clone())
+            },
+        }
+    }
+
     fn handle_workspace_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
         match command {
             CommandId::InsertWorkspaceSearch(text) => self.state.workspace_picker.insert(&text),
@@ -3925,6 +4128,13 @@ impl Application {
                         surface: WorkspaceResolutionSurface::WorkspacePicker,
                         request_id,
                         request: ResolveWorkspaceRequest {
+                            checkout_id: None,
+                            remembered_execution_directory: self
+                                .state
+                                .remembered_execution_directories
+                                .get(&(self.state.outlook.clone(), workspace.id.clone()))
+                                .and_then(|remembered| remembered.directory.clone())
+                                .map(|path| crate::protocol::ExecutionDirectory { path }),
                             workspace_id: Some(workspace.id),
                             base: None,
                             path: workspace.path,
@@ -4475,6 +4685,14 @@ impl Application {
                 Some("Choose a working copy before starting a Session".to_owned());
             return ApplicationTransition::Continue;
         }
+        if !matches!(key, ComposerKey::Session(_))
+            && let crate::protocol::ExecutionDirectoryStatus::Unavailable { reason } =
+                &self.state.execution_status
+        {
+            self.state.submission_error =
+                Some(format!("Execution Directory unavailable: {reason}"));
+            return ApplicationTransition::Continue;
+        }
         let prompt = self.state.composers.begin_submission(key.clone());
         self.state.sync_composer_completion();
         self.state.failed_submissions.remove(&prompt.id);
@@ -4541,6 +4759,8 @@ impl Application {
                         surface: WorkspaceResolutionSurface::Outlook,
                         request_id,
                         request: ResolveWorkspaceRequest {
+                            checkout_id: None,
+                            remembered_execution_directory: None,
                             workspace_id: None,
                             base: None,
                             path: self
@@ -5198,10 +5418,6 @@ impl Application {
                     return Ok(ApplicationTransition::Continue);
                 }
                 self.state.turn_outlook(outlook.clone());
-                if matches!(outlook, Outlook::Remote(_)) {
-                    self.state
-                        .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
-                }
                 let catalog_origins = self.state.catalog_origins();
                 Ok(ApplicationTransition::TurnOutlook {
                     outlook,
@@ -5400,6 +5616,11 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::WorktreeList
+            | SemanticCommandId::WorktreePrevious
+            | SemanticCommandId::WorktreeNext
+            | SemanticCommandId::WorktreeSelect
+            | SemanticCommandId::WorktreeClose => Ok(self.handle_worktree_command(command)),
             SemanticCommandId::WorkspaceList => {
                 let request = self.state.workspace_picker.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -6059,6 +6280,12 @@ impl Application {
                 return command_for_numeric_editor_event(event);
             }
             Some(SelectionSurface::Settings) => return command_for_settings_panel_event(event),
+            Some(SelectionSurface::Worktrees) => {
+                return super::keymap::command_for_worktree_picker_event(
+                    event,
+                    self.state.worktree_picker.directory.is_some(),
+                );
+            }
             Some(SelectionSurface::Workspaces) => return command_for_workspace_picker_event(event),
             Some(SelectionSurface::Sessions) => return command_for_session_picker_event(event),
             Some(SelectionSurface::SidebarMenu) => return command_for_sidebar_menu_event(event),

@@ -226,6 +226,9 @@ pub(super) fn render_with_slots(
     if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
         render_workspace_picker(frame, state, main, theme);
     }
+    if state.worktree_picker.open && !state.reconnect_overlay_visible {
+        render_worktree_picker(frame, state, main, theme);
+    }
     if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
         render_settings_panel(frame, state, main, theme);
         if state.settings_panel.numeric_editor().is_some() {
@@ -792,6 +795,106 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 /// over the main view, the query the reader is narrowing by, a loading line
 /// while the listing it derives from is on its way, then one row per Workspace
 /// on offer — or a line saying the query left none.
+fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+    let picker = &state.worktree_picker;
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(88),
+        main.height.saturating_sub(2).min(14),
+    );
+    let capacity = usize::from(area.height.saturating_sub(2));
+    let width = usize::from(area.width.saturating_sub(2));
+    let mut lines = Vec::new();
+    if let Some(directory) = &picker.directory {
+        lines.push(Line::styled(
+            truncate_to_width(&format!("Directory: {directory}"), width),
+            theme.text.primary,
+        ));
+        lines.push(Line::styled(
+            "Enter choose directory · Esc back",
+            theme.text.subdued,
+        ));
+    } else if picker.loading {
+        lines.push(Line::styled("Loading Worktrees…", theme.text.subdued));
+    } else if let Some(context) = &picker.context {
+        let current = context
+            .execution_directory
+            .as_ref()
+            .map(|directory| state.workspace_label(&state.outlook, &directory.path))
+            .unwrap_or_else(|| "No working copy selected".to_owned());
+        let mut rows = vec![format!("Current: {current}{}", picker.current_status())];
+        rows.extend(context.checkouts.iter().map(|checkout| {
+            let kind = match checkout.association.kind {
+                CheckoutKind::Main => "main",
+                CheckoutKind::Linked => "linked",
+            };
+            let revision = match &checkout.revision {
+                Some(CheckoutRevision::Branch { name, commit: None }) => format!("{name} (unborn)"),
+                Some(CheckoutRevision::Branch { name, .. }) => name.clone(),
+                Some(CheckoutRevision::Detached { commit }) => {
+                    format!("detached {}", commit.chars().take(8).collect::<String>())
+                }
+                None => "unknown revision".to_owned(),
+            };
+            let unavailable =
+                if matches!(checkout.availability, SourceControlAvailability::Available) {
+                    ""
+                } else {
+                    " · unavailable"
+                };
+            format!(
+                "{kind} · {revision} · {}{unavailable}",
+                state.workspace_label(&state.outlook, &checkout.association.root)
+            )
+        }));
+        rows.push("Choose directory…".to_owned());
+        let available_rows = capacity.saturating_sub(2).max(1);
+        let start = picker
+            .selected
+            .saturating_add(1)
+            .saturating_sub(available_rows);
+        for (index, row) in rows
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .take(available_rows)
+        {
+            lines.push(Line::styled(
+                truncate_to_width(
+                    &format!("{} {row}", if index == picker.selected { "›" } else { " " }),
+                    width,
+                ),
+                if index == picker.selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            ));
+        }
+        lines.push(Line::styled(
+            "Enter select · Esc close · New Worktree unavailable",
+            theme.text.subdued,
+        ));
+    }
+    if let Some(error) = &picker.error {
+        lines.push(Line::styled(
+            truncate_to_width(error, width),
+            theme.feedback.error,
+        ));
+    }
+    lines.truncate(capacity);
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Worktrees,
+        area,
+        lines,
+        " Worktrees ",
+        theme,
+    );
+}
+
 fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
         main,
@@ -2975,7 +3078,23 @@ fn render_landing(
     frame.render_widget(
         Paragraph::new(truncate_to_width(
             &match state.execution_directory.as_deref() {
-                Some(path) => workspace_context(state, path, true),
+                Some(path) => {
+                    let label = workspace_context(state, path, true);
+                    let status = if matches!(
+                        state.execution_status,
+                        crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
+                    ) {
+                        " · unavailable"
+                    } else {
+                        ""
+                    };
+                    let chooser = if state.workspace.repository.is_some() {
+                        " · /worktree choose"
+                    } else {
+                        ""
+                    };
+                    format!("{label}{status}{chooser}")
+                }
                 None => format!(
                     "{} · Choose a working copy to start a Session",
                     workspace_context(state, &state.workspace.path, true)

@@ -1465,6 +1465,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
             surface,
             request_id,
             result: Ok(ResolvedWorkspace {
+                execution_status: suru::protocol::ExecutionDirectoryStatus::Available,
                 workspace: unknown.clone(),
                 execution_directory: Some(suru::protocol::ExecutionDirectory {
                     path: execution.clone(),
@@ -1555,6 +1556,7 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
             surface,
             request_id,
             result: Ok(ResolvedWorkspace {
+                execution_status: suru::protocol::ExecutionDirectoryStatus::RequiresWorkingCopy,
                 workspace,
                 execution_directory: None,
                 checkout: None,

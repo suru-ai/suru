@@ -875,3 +875,43 @@ fn command_from_scoped_bindings(
         .find(|binding| binding.code == key.code && binding.modifiers == key.modifiers)
         .map(|binding| binding.command.clone())
 }
+
+/// Worktree navigation uses semantic actions; directory entry is explicit.
+pub(super) fn command_for_worktree_picker_event(
+    event: InputEvent,
+    directory: bool,
+) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) if directory => {
+            return Some(CommandId::InsertWorktreeDirectory(text));
+        }
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match key.code {
+        KeyCode::Esc => SemanticCommandId::WorktreeClose,
+        KeyCode::Enter => SemanticCommandId::WorktreeSelect,
+        KeyCode::Up if !directory => SemanticCommandId::WorktreePrevious,
+        KeyCode::Char('p') if !directory && key.modifiers == KeyModifiers::CONTROL => {
+            SemanticCommandId::WorktreePrevious
+        }
+        KeyCode::Down if !directory => SemanticCommandId::WorktreeNext,
+        KeyCode::Char('n') if !directory && key.modifiers == KeyModifiers::CONTROL => {
+            SemanticCommandId::WorktreeNext
+        }
+        KeyCode::Backspace if directory => return Some(CommandId::DeleteWorktreeDirectoryBackward),
+        KeyCode::Char(character)
+            if directory
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            return Some(CommandId::InsertWorktreeDirectory(character.to_string()));
+        }
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}

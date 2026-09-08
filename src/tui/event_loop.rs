@@ -196,7 +196,10 @@ impl SessionTasks {
         request: ResolveWorkspaceRequest,
         results: &UnboundedSender<WorkspaceResolutionResult>,
     ) {
-        if surface != WorkspaceResolutionSurface::Outlook {
+        if !matches!(
+            surface,
+            WorkspaceResolutionSurface::Outlook | WorkspaceResolutionSurface::WorktreeList
+        ) {
             self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
         }
         let task = spawn_workspace_resolution(
@@ -853,22 +856,16 @@ impl RunLoop {
             } => {
                 self.prepare_outlook_turn(catalog_origins);
                 self.dispatch_pending_listing_after_turn();
-                if matches!(outlook, Outlook::Remote(_)) {
-                    self.tasks.resolve_workspace(
-                        self.client.session_commands_for(outlook.clone()),
-                        outlook,
-                        WorkspaceResolutionSurface::Outlook,
-                        self.application
-                            .pending_workspace_resolution(WorkspaceResolutionSurface::Outlook)
-                            .expect("turning toward a remote begins Workspace resolution"),
-                        ResolveWorkspaceRequest {
-                            workspace_id: None,
-                            base: None,
-                            path: PathBuf::from("."),
-                        },
-                        &self.channels.workspaces,
-                    );
-                }
+                self.tasks.resolve_workspace(
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
+                    WorkspaceResolutionSurface::Outlook,
+                    self.application
+                        .pending_workspace_resolution(WorkspaceResolutionSurface::Outlook)
+                        .expect("turning Outlook begins Workspace resolution"),
+                    self.application.current_workspace_request(),
+                    &self.channels.workspaces,
+                );
             }
             ApplicationTransition::TurnOutlookAndViewAndAttach {
                 session,

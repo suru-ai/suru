@@ -31,6 +31,7 @@ mod theme_picker;
 mod transcript;
 mod usage;
 mod workspace_picker;
+mod worktree_picker;
 
 pub use crate::terminal::{TerminalColor, TerminalColorProbe, TerminalFacts};
 pub use clipboard::ClipboardContent;
