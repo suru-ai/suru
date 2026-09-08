@@ -1089,6 +1089,7 @@ fn workspace_in(root: &Path, name: &str) -> PathBuf {
 /// what the picker's ordering is derived from.
 fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
+        checkout_state: None,
         session: Session {
             checkout: None,
             context_fill: None,

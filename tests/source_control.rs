@@ -285,3 +285,42 @@ async fn symlinked_working_copy_canonicalizes_shared_identity() {
         adapter.discover(&link).await.workspace.id
     );
 }
+
+#[tokio::test]
+async fn checkout_observation_tracks_unborn_branch_detachment_missing_and_unreadable() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    let adapter = GitSourceControl::default();
+    let checkout = adapter.discover(&main).await.checkout.unwrap();
+    assert_eq!(
+        adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Branch {
+            name: "main".into(),
+            commit: None
+        })
+    );
+    commit(&main);
+    git(&main, &["checkout", "-b", "external"]);
+    assert!(matches!(adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Branch { name, commit: Some(_) }) if name == "external"));
+    git(&main, &["checkout", "--detach"]);
+    assert!(matches!(
+        adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Detached { .. })
+    ));
+    std::fs::rename(&main, root.join("moved")).unwrap();
+    let missing = adapter.observe(&checkout).await;
+    assert!(matches!(
+        missing.availability,
+        SourceControlAvailability::Unavailable { .. }
+    ));
+    assert_eq!(missing.revision, None);
+    init(&main);
+    // Existing directories with unreadable Git metadata remain explicitly unavailable.
+    std::fs::remove_file(main.join(".git").join("HEAD")).unwrap();
+    assert!(matches!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Unavailable { .. }
+    ));
+}

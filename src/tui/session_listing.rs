@@ -1052,6 +1052,7 @@ mod tests {
 
     fn summary(title: &str, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(Box::new(SessionSummary {
+            checkout_state: None,
             session: Session {
                 checkout: None,
                 context_fill: None,

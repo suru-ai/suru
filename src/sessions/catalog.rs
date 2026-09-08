@@ -40,6 +40,10 @@ impl SessionCatalogPublisher {
         }
     }
 
+    pub(super) fn has_subscribers(&self) -> bool {
+        self.inner.lock().unwrap().updates.receiver_count() > 0
+    }
+
     /// Announces one change under the next revision.
     pub(super) fn publish(&self, change: SessionCatalogChange) {
         let mut channel = self

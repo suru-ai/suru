@@ -62,6 +62,7 @@ pub type ServerConfig = RuntimeConfig;
 #[derive(Clone, Copy, Debug)]
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
+    pub checkout_observation_interval: Duration,
     /// How long an accepted shutdown keeps health and existing streams
     /// available so the final authenticated intent can reach clients before
     /// graceful transport closure.
@@ -78,6 +79,7 @@ impl Default for ServerTimings {
     fn default() -> Self {
         Self {
             sse_keepalive_interval: Duration::from_secs(10),
+            checkout_observation_interval: Duration::from_secs(1),
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
@@ -87,6 +89,11 @@ impl Default for ServerTimings {
 }
 
 impl ServerTimings {
+    pub fn with_checkout_observation_interval(mut self, interval: Duration) -> Self {
+        self.checkout_observation_interval = interval;
+        self
+    }
+
     /// Bounds how long an Errand may take; injectable so tests exercise a
     /// Provider that never answers without waiting out the default.
     pub fn with_errand_timeout(mut self, timeout: Duration) -> Self {
@@ -529,6 +536,11 @@ pub async fn spawn_with_source_control(
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let source_control = crate::source_control::SourceControlService::new(source_control);
     sessions.discover_workspaces(&source_control).await?;
+    sessions.observe_checkouts(
+        source_control.clone(),
+        timings.checkout_observation_interval,
+        provider_shutdown_rx.clone(),
+    );
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage.clone());
     let model_catalog = ModelCatalogService::new(

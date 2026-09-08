@@ -2415,6 +2415,7 @@ fn sidebar_entry_lines(
                 workspace,
                 updated_at,
                 working_since,
+                ..
             } => sidebar_active_row_lines(
                 row,
                 workspace
@@ -2586,9 +2587,7 @@ fn sidebar_plain_line(
 }
 
 /// One active Session, as three lines: where the work lives beside what its
-/// right slot reads, then what the work is, then a line saying nothing until
-/// the git awareness of <https://github.com/jake-tucker/suru/issues/169> gives
-/// it something to say.
+/// right slot reads, then what the work is, then its current checkout.
 fn sidebar_active_row_lines(
     row: SidebarRow<'_>,
     workspace: String,
@@ -2602,8 +2601,44 @@ fn sidebar_active_row_lines(
     [
         sidebar_slotted_line(&workspace, label_style, &slot, width, highlight, theme),
         sidebar_title_line(row, width, highlight, theme),
-        Line::styled(" ".repeat(width), highlight.unwrap_or_default()),
+        sidebar_plain_line(
+            &sidebar_checkout_label(row.shelf, width),
+            width,
+            highlight,
+            theme.text.subdued,
+        ),
     ]
+}
+
+fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
+    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+    let SidebarShelf::Active {
+        checkout_state: Some(reading),
+        ..
+    } = shelf
+    else {
+        return String::new();
+    };
+    let kind = match reading.association.kind {
+        CheckoutKind::Main => "main",
+        CheckoutKind::Linked => "linked",
+    };
+    let label = match &reading.availability {
+        SourceControlAvailability::NotDetected => return String::new(),
+        SourceControlAvailability::Unavailable { .. } => "[unavailable]".to_owned(),
+        SourceControlAvailability::Available => match &reading.revision {
+            Some(CheckoutRevision::Branch { name, .. }) => name.clone(),
+            Some(CheckoutRevision::Detached { commit }) => commit.chars().take(7).collect(),
+            None => "[unavailable]".to_owned(),
+        },
+    };
+    // Keep the Worktree kind visible even when a branch name is long.
+    let suffix = format!(" · {kind}");
+    format!(
+        "{}{}",
+        truncate_to_width(&label, width.saturating_sub(suffix.width())),
+        suffix
+    )
 }
 
 /// One Session set aside, as the single slim line the settled shelf gives it:

@@ -369,6 +369,7 @@ impl SessionRow {
             .transpose()?
             .map(AgentSelection::from);
         let summary = SessionSummary {
+            checkout_state: None,
             session: Session {
                 checkout: workspace.checkout.clone(),
                 context_fill: self

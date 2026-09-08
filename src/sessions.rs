@@ -21,6 +21,7 @@ use crate::provider::ProviderResumeState;
 use crate::storage::{DeferredSessions, RestoredSessions, StorageSink, StoredResumeState};
 
 mod catalog;
+mod checkouts;
 mod emoji;
 mod hydration;
 mod output;

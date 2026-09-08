@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 mod source_control;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
@@ -1737,6 +1737,9 @@ impl SessionStandingInputs {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSummary {
+    /// Ephemeral owning-Server reading, absent until checkout observation.
+    #[serde(default)]
+    pub checkout_state: Option<CheckoutSummary>,
     #[serde(flatten)]
     pub session: Session,
     pub title: String,

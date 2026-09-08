@@ -118,6 +118,9 @@ pub enum CheckoutKind {
 /// Durable association, not a Session-owned working copy or historical branch.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckoutAssociation {
+    /// Latest successful reading for recovery; never a live display value.
+    #[serde(default)]
+    pub recovery_revision: Option<CheckoutRevision>,
     pub id: CheckoutId,
     pub repository: RepositoryId,
     pub root: PathBuf,

@@ -520,6 +520,7 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
         .handle_event(ApplicationEvent::SessionsListed {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
+                checkout_state: None,
                 session: Session {
                     checkout: None,
                     context_fill: None,
@@ -627,6 +628,7 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
         .handle_event(ApplicationEvent::SessionsListed {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
+                checkout_state: None,
                 session: Session {
                     checkout: None,
                     context_fill: None,
@@ -699,6 +701,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
         .handle_event(ApplicationEvent::SessionsListed {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
+                checkout_state: None,
                 session: Session {
                     checkout: None,
                     context_fill: None,

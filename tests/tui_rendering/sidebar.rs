@@ -1045,6 +1045,7 @@ fn listed(
     updated_at: u64,
 ) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
+        checkout_state: None,
         session: Session {
             checkout: None,
             context_fill: None,
@@ -8137,4 +8138,133 @@ fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
     }
+}
+
+#[test]
+fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability() {
+    use suru::protocol::{
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
+        RepositoryId, SourceControlAvailability,
+    };
+    let workspace = workspace_dir();
+    let repository = RepositoryId::from_metadata("git", workspace.path());
+    let association = CheckoutAssociation {
+        id: CheckoutId::from_root(&repository, workspace.path()),
+        repository,
+        root: workspace.path().to_owned(),
+        kind: CheckoutKind::Linked,
+        recovery_revision: Some(CheckoutRevision::Branch {
+            name: "stale-recovery".into(),
+            commit: None,
+        }),
+    };
+    for (revision, availability, expected) in [
+        (
+            Some(CheckoutRevision::Branch {
+                name: "feature/a-very-long-branch-name-that-is-cut".into(),
+                commit: None,
+            }),
+            SourceControlAvailability::Available,
+            " · linked",
+        ),
+        (
+            Some(CheckoutRevision::Branch {
+                name: "feature".into(),
+                commit: Some("0123456789abcdef".into()),
+            }),
+            SourceControlAvailability::Available,
+            "feature · linked",
+        ),
+        (
+            Some(CheckoutRevision::Branch {
+                name: "unborn".into(),
+                commit: None,
+            }),
+            SourceControlAvailability::Available,
+            "unborn · linked",
+        ),
+        (
+            Some(CheckoutRevision::Detached {
+                commit: "0123456789abcdef".into(),
+            }),
+            SourceControlAvailability::Available,
+            "0123456 · linked",
+        ),
+        (
+            None,
+            SourceControlAvailability::Unavailable {
+                reason: "missing".into(),
+            },
+            "[unavailable] · linked",
+        ),
+    ] {
+        let SessionListItem::Readable(mut summary) =
+            listed("Checkout work", None, workspace.path(), now(), now())
+        else {
+            unreachable!()
+        };
+        summary.session.checkout = Some(association.clone());
+        summary.checkout_state = Some(CheckoutSummary {
+            association: association.clone(),
+            revision,
+            availability,
+        });
+        let application =
+            sidebar_showing(workspace.path(), vec![SessionListItem::Readable(summary)]);
+        let rows = rendered_application_rows_at(&application, WIDE, 20);
+        assert!(rows.iter().any(|row| row.contains(expected)), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("stale-recovery")));
+    }
+    let SessionListItem::Readable(mut summary) =
+        listed("Checkout work", None, workspace.path(), now(), now())
+    else {
+        unreachable!()
+    };
+    summary.session.checkout = Some(association);
+    let application = sidebar_showing(workspace.path(), vec![SessionListItem::Readable(summary)]);
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !rows.iter().any(|row| row.contains("stale-recovery")),
+        "remembered facts stay hidden before observation"
+    );
+}
+
+#[test]
+fn remote_checkout_line_keeps_its_origin_label_and_main_indicator() {
+    use suru::protocol::{
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
+        RepositoryId, SourceControlAvailability,
+    };
+    let workspace = workspace_dir();
+    let SessionListItem::Readable(mut summary) =
+        listed("Remote work", None, workspace.path(), now(), now())
+    else {
+        unreachable!()
+    };
+    let repository = RepositoryId::from_metadata("git", workspace.path());
+    summary.checkout_state = Some(CheckoutSummary {
+        association: CheckoutAssociation {
+            id: CheckoutId::from_root(&repository, workspace.path()),
+            repository,
+            root: workspace.path().to_owned(),
+            kind: CheckoutKind::Main,
+            recovery_revision: None,
+        },
+        revision: Some(CheckoutRevision::Branch {
+            name: "remote-branch".into(),
+            commit: None,
+        }),
+        availability: SourceControlAvailability::Available,
+    });
+    let (application, _) = everywhere_with_studio(
+        workspace.path(),
+        vec![],
+        vec![SessionListItem::Readable(summary)],
+    );
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("remote-branch · main")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("studio")), "{rows:?}");
 }

@@ -90,6 +90,7 @@ impl SessionStore {
             subagent_usage: None,
         };
         let summary = SessionSummary {
+            checkout_state: None,
             session: snapshot.session.clone(),
             title,
             // A child is titled from its spawn description alone: no Errand

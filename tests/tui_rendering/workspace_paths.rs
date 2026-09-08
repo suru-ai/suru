@@ -244,6 +244,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                 .handle_event(ApplicationEvent::SessionsListed {
                     request,
                     sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
+                        checkout_state: None,
                         session: snapshot.session,
                         title: "Remote work".into(),
                         emoji: None,

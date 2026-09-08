@@ -93,6 +93,83 @@ impl GitSourceControl {
 
 #[async_trait]
 impl SourceControl for GitSourceControl {
+    async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+        let mut reading = CheckoutSummary {
+            association: checkout.clone(),
+            revision: None,
+            availability: SourceControlAvailability::Unavailable {
+                reason: "The known checkout is missing or unreadable".to_owned(),
+            },
+        };
+        reading.association.recovery_revision = None;
+        let Some(common) = self.common(&checkout.root).await else {
+            return reading;
+        };
+        if RepositoryId::from_metadata("git", &common) != checkout.repository
+            || self.valid_root(&checkout.root, &common).await.as_ref() != Some(&checkout.root)
+        {
+            return reading;
+        }
+        let Ok(branch_output) = self
+            .command(&checkout.root, &["symbolic-ref", "--quiet", "HEAD"])
+            .await
+        else {
+            return reading;
+        };
+        let branch = if branch_output.status.success() {
+            let Ok(name) = String::from_utf8(branch_output.stdout) else {
+                return reading;
+            };
+            Some(name.trim_end_matches(['\r', '\n']).to_owned())
+        } else if branch_output.status.code() == Some(1) {
+            None // Detached HEAD is the documented quiet symbolic-ref miss.
+        } else {
+            return reading;
+        };
+        let Ok(commit_output) = self
+            .command(
+                &checkout.root,
+                &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            )
+            .await
+        else {
+            return reading;
+        };
+        let commit = if commit_output.status.success() {
+            let Ok(commit) = String::from_utf8(commit_output.stdout) else {
+                return reading;
+            };
+            Some(commit.trim_end_matches(['\r', '\n']).to_owned())
+        } else if let Some(branch) = &branch {
+            // Only a genuinely absent branch ref is unborn. A failed commit
+            // read from an existing ref must not erase retained recovery facts.
+            let Ok(reference) = self
+                .command(&checkout.root, &["show-ref", "--verify", "--quiet", branch])
+                .await
+            else {
+                return reading;
+            };
+            if reference.status.code() != Some(1) {
+                return reading;
+            }
+            None
+        } else {
+            return reading;
+        };
+        reading.revision = match (branch, commit) {
+            (Some(name), commit) => Some(CheckoutRevision::Branch {
+                name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned(),
+                commit,
+            }),
+            (None, Some(commit)) => Some(CheckoutRevision::Detached { commit }),
+            (None, None) => None,
+        };
+        if reading.revision.is_some() {
+            reading.availability = SourceControlAvailability::Available;
+        }
+        reading
+    }
+
     fn reuse_discovery(
         &self,
         directory: &Path,
@@ -231,6 +308,7 @@ impl SourceControl for GitSourceControl {
                     };
                     let valid = self.valid_root(&root, &common).await.is_some();
                     let association = CheckoutAssociation {
+                        recovery_revision: None,
                         id: CheckoutId::from_root(&id, &root),
                         repository: id.clone(),
                         root,
@@ -269,6 +347,7 @@ impl SourceControl for GitSourceControl {
                 .find(|checkout| checkout.association.root == top)
                 .map(|checkout| checkout.association.clone())
                 .unwrap_or_else(|| CheckoutAssociation {
+                    recovery_revision: None,
                     id: CheckoutId::from_root(&id, &top),
                     repository: id.clone(),
                     root: top,

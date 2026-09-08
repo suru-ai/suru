@@ -15,6 +15,25 @@ pub use git::GitSourceControl;
 #[async_trait]
 pub trait SourceControl: Send + Sync {
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
+    /// Read the known working copy, never replacing its identity with a new
+    /// repository that happens to occupy the same path.
+    async fn observe(
+        &self,
+        checkout: &crate::protocol::CheckoutAssociation,
+    ) -> crate::protocol::CheckoutSummary {
+        let resolved = self.discover(&checkout.root).await;
+        resolved
+            .checkouts
+            .into_iter()
+            .find(|reading| reading.association.id == checkout.id)
+            .unwrap_or_else(|| crate::protocol::CheckoutSummary {
+                association: checkout.clone(),
+                revision: None,
+                availability: SourceControlAvailability::Unavailable {
+                    reason: "The known checkout is missing or unreadable".to_owned(),
+                },
+            })
+    }
     /// Reuse a reading within one discovery batch only when the adapter can
     /// establish that this directory has the same nearest checkout.
     fn reuse_discovery(
@@ -38,6 +57,12 @@ impl SourceControlService {
             adapter,
             repositories: Default::default(),
         }
+    }
+    pub(crate) async fn observe(
+        &self,
+        checkout: &crate::protocol::CheckoutAssociation,
+    ) -> crate::protocol::CheckoutSummary {
+        self.adapter.observe(checkout).await
     }
     pub(crate) fn remember(&self, workspace: &Workspace) {
         if let Some(repository) = &workspace.repository {
@@ -150,6 +175,7 @@ impl SourceControlService {
             {
                 resolved.checkouts.push(crate::protocol::CheckoutSummary {
                     association: crate::protocol::CheckoutAssociation {
+                        recovery_revision: None,
                         id: crate::protocol::CheckoutId::from_root(&id, &root),
                         repository: id,
                         root,

@@ -262,6 +262,7 @@ impl SessionStore {
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let timestamp = state.next_timestamp();
         let summary = SessionSummary {
+            checkout_state: None,
             session: snapshot.session.clone(),
             title,
             // A Session begins with none: the Emoji beside its Title arrives

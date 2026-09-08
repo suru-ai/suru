@@ -341,6 +341,7 @@ pub(super) enum SidebarShelf<'a> {
     /// Work still active, drawn in full so a reader can tell one Session from
     /// another at a glance.
     Active {
+        checkout_state: Option<&'a crate::protocol::CheckoutSummary>,
         /// The Workspace this Session is rooted in, drawn by its last
         /// component. A Session Suru could not read may not know its Workspace
         /// at all.
@@ -2116,6 +2117,9 @@ impl Sidebar {
                         }),
                     }),
                     SidebarShelf::Active {
+                        checkout_state: session
+                            .readable()
+                            .and_then(|summary| summary.checkout_state.as_ref()),
                         workspace: session
                             .workspace()
                             .map(|workspace| workspace.path.as_path()),
@@ -3504,6 +3508,7 @@ mod tests {
 
     fn summary(title: &str, created_at: u64, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(Box::new(SessionSummary {
+            checkout_state: None,
             session: Session {
                 checkout: None,
                 context_fill: None,

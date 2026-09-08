@@ -85,12 +85,19 @@ impl SessionStore {
         &self,
         id: SessionId,
         workspace: Workspace,
-        checkout: Option<crate::protocol::CheckoutAssociation>,
+        mut checkout: Option<crate::protocol::CheckoutAssociation>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         let Some(record) = state.sessions.get_mut(&id) else {
             return Ok(());
         };
+        if let Some(checkout) = &mut checkout
+            && checkout.recovery_revision.is_none()
+            && let Some(previous) = &record.snapshot.session.checkout
+            && previous.id == checkout.id
+        {
+            checkout.recovery_revision = previous.recovery_revision.clone();
+        }
         if record.snapshot.session.workspace == workspace
             && record.snapshot.session.checkout == checkout
         {

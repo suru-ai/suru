@@ -210,6 +210,7 @@ fn agent_selection_round_trips_complete_typed_model_options() {
 #[test]
 fn session_summary_round_trips_with_discovery_metadata() {
     let summary = SessionSummary {
+        checkout_state: None,
         session: Session {
             checkout: None,
             context_fill: None,
@@ -244,6 +245,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
     let expected = json!({
+        "checkout_state": null,
         "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "title": "Explain this workspace",
         "emoji": "\u{1F5FA}\u{FE0F}",

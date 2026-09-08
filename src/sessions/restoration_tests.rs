@@ -315,6 +315,7 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
     };
     PersistedSession {
         summary: SessionSummary {
+            checkout_state: None,
             session: session.clone(),
             title: "restoration fixture".into(),
             emoji: None,

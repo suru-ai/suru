@@ -24,6 +24,9 @@ use tokio::time::{Duration, timeout};
 #[allow(dead_code)]
 mod support;
 
+#[path = "server_integration/checkouts.rs"]
+mod checkout_observation;
+
 #[allow(dead_code)]
 #[path = "support/provider.rs"]
 mod provider_support;
@@ -1053,6 +1056,7 @@ async fn paired_servers_with_runtime(
         .with_config_dir(serving_config_root.path());
     let timings = ServerTimings {
         shutdown_grace: Duration::from_millis(5),
+        checkout_observation_interval: Duration::from_millis(15),
         ..ServerTimings::default()
     };
     let serving = match runtime {
