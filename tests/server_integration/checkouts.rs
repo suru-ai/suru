@@ -532,3 +532,133 @@ async fn discovery_persists_branch_and_detached_recovery_before_any_catalog_inte
     drop(client);
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
+    use suru::{
+        protocol::*,
+        provider::{ProviderEvent, ProviderResumeState},
+    };
+    let (runtime, mut provider) = provider_support::ControlledProvider::new();
+    let pair = paired_servers_with_runtime("remote-shared-recovery", false, Some(runtime)).await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let main = root.join("main");
+    let linked = root.join("external");
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init", "-b", "main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".into()));
+    let mut catalog = remote.subscribe_catalog();
+    let mut originals = Vec::new();
+    let mut old_connections = Vec::new();
+    let identity = || AgentIdentity {
+        agent: AgentId::new("remote-recovery"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("test"),
+            options: vec![],
+        },
+    };
+    let resume = ProviderResumeState::new(serde_json::json!({"remote-context":"preserve"}));
+    for _ in 0..2 {
+        let id = create(&remote, &linked).await;
+        let start = timeout(Duration::from_secs(2), provider.next_start())
+            .await
+            .unwrap();
+        let mut connection = start.succeed_with_resume(identity(), Some(resume.clone()));
+        timeout(Duration::from_secs(2), connection.next_turn())
+            .await
+            .unwrap()
+            .succeed();
+        connection.emit(ProviderEvent::TurnCompleted);
+        let mut feed = remote.subscribe_session(id).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if remote
+                    .read_session(id)
+                    .await
+                    .unwrap()
+                    .turns
+                    .iter()
+                    .any(|t| t.status == TurnStatus::Completed)
+                {
+                    break;
+                }
+                feed.next().await.unwrap().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        originals.push(id);
+        old_connections.push(connection);
+    }
+    observed(&remote, &mut catalog, 2, |r| branch(r, "topic")).await;
+    std::fs::remove_dir_all(&linked).unwrap();
+    observed(&remote, &mut catalog, 2, |r| {
+        matches!(
+            r.availability,
+            SourceControlAvailability::Unavailable { .. }
+        )
+    })
+    .await;
+    let request = || AdmitPromptRequest {
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: "Recover remotely".into(),
+            skill_invocations: vec![],
+        },
+        delivery: PromptDelivery::Steer,
+    };
+    let client_a = remote.clone();
+    let id_a = originals[0];
+    let a = tokio::spawn(async move { client_a.admit_prompt(id_a, request()).await });
+    let client_b = remote.clone();
+    let id_b = originals[1];
+    let b = tokio::spawn(async move { client_b.admit_prompt(id_b, request()).await });
+    let mut new_connections = Vec::new();
+    for _ in 0..2 {
+        let start = timeout(Duration::from_secs(3), provider.next_start())
+            .await
+            .unwrap();
+        assert_eq!(start.execution_directory(), linked);
+        assert_eq!(start.resume_state(), Some(&resume));
+        let mut connection = start.succeed_with_resume(identity(), Some(resume.clone()));
+        timeout(Duration::from_secs(2), connection.next_turn())
+            .await
+            .unwrap()
+            .succeed();
+        connection.emit(ProviderEvent::TurnCompleted);
+        new_connections.push(connection);
+    }
+    a.await.unwrap().unwrap();
+    b.await.unwrap().unwrap();
+    observed(&remote, &mut catalog, 2, |r| branch(r, "topic")).await;
+    assert!(
+        pair.connecting_client
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(remote.list_sessions(None).await.unwrap().len(), 2);
+    drop(catalog);
+    drop(remote);
+    pair.shutdown().await;
+}

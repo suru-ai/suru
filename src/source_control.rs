@@ -68,6 +68,27 @@ pub trait SourceControl: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+    /// Validate a retained working copy, restoring an absent one when supported.
+    /// Report recreation after all adapter-owned initialization succeeds, including
+    /// when resuming a partial attempt, so every native connection can reconnect.
+    async fn recover_checkout(
+        &self,
+        _repository: &Repository,
+        checkout: &crate::protocol::CheckoutAssociation,
+    ) -> Result<crate::protocol::CheckoutRecovery, String> {
+        let reading = self.observe(checkout).await;
+        if matches!(reading.availability, SourceControlAvailability::Available) {
+            Ok(crate::protocol::CheckoutRecovery {
+                checkout: checkout.clone(),
+                recreated: false,
+            })
+        } else {
+            Err(
+                "Working-copy recovery is unsupported; restore the known checkout before retrying"
+                    .to_owned(),
+            )
+        }
+    }
     /// Read the known working copy, never replacing its identity with a new
     /// repository that happens to occupy the same path.
     async fn observe(
@@ -103,6 +124,7 @@ pub(crate) struct SourceControlService {
     adapter: Arc<dyn SourceControl>,
     repositories: Arc<Mutex<HashMap<RepositoryId, Repository>>>,
     mutations: Arc<Mutex<HashMap<RepositoryId, Arc<tokio::sync::Mutex<()>>>>>,
+    incarnations: Arc<Mutex<HashMap<crate::protocol::CheckoutId, u64>>>,
 }
 
 impl SourceControlService {
@@ -111,6 +133,7 @@ impl SourceControlService {
             adapter,
             repositories: Default::default(),
             mutations: Default::default(),
+            incarnations: Default::default(),
         }
     }
     pub(crate) async fn mutation_guard(
@@ -125,6 +148,81 @@ impl SourceControlService {
             .or_default()
             .clone();
         lock.lock_owned().await
+    }
+    pub(crate) async fn prepare_execution(
+        &self,
+        session: &crate::protocol::Session,
+        guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<ExecutionLease, String> {
+        use crate::protocol::*;
+        let Some(checkout) = &session.checkout else {
+            return Ok(ExecutionLease {
+                reading: None,
+                guard,
+                incarnation: 0,
+                recreated: false,
+            });
+        };
+        let repository = session
+            .workspace
+            .repository
+            .as_ref()
+            .ok_or("Known checkout has no Repository association")?;
+        let guard = match guard {
+            Some(guard) => guard,
+            None => self.mutation_guard(&repository.id).await,
+        };
+        let recovered = if checkout.kind == CheckoutKind::Linked {
+            self.adapter.recover_checkout(repository, checkout).await?
+        } else {
+            // Main working copies are validated by exact discovery below;
+            // background observation is reserved for catalog interest.
+            CheckoutRecovery {
+                checkout: checkout.clone(),
+                recreated: false,
+            }
+        };
+        // Every Session sharing this root must see a recreation even if the
+        // triggering Session subsequently fails its own subdirectory check.
+        let incarnation = {
+            let mut incarnations = self.incarnations.lock().unwrap();
+            let incarnation = incarnations.entry(checkout.id.clone()).or_default();
+            if recovered.recreated {
+                *incarnation = incarnation.saturating_add(1);
+            }
+            *incarnation
+        };
+        let path = std::fs::canonicalize(&session.execution_directory.path).map_err(|_| format!("The exact Execution Directory {} is unavailable after Worktree recovery; choose another Session or restore this subdirectory", session.execution_directory.path.display()))?;
+        if !path.is_dir()
+            || !path.starts_with(&checkout.root)
+            || path != session.execution_directory.path
+        {
+            return Err(
+                "The Session's exact Execution Directory changed; execution was not redirected"
+                    .to_owned(),
+            );
+        }
+        let exact = self.adapter.discover(&path).await;
+        if exact.workspace.id != session.workspace.id
+            || exact
+                .checkout
+                .as_ref()
+                .is_none_or(|actual| actual.id != checkout.id)
+        {
+            return Err("The exact Execution Directory now belongs to a different Repository or checkout; execution was not redirected".to_owned());
+        }
+        let association = exact.checkout.expect("validated checkout identity");
+        let reading = CheckoutSummary {
+            revision: association.recovery_revision.clone(),
+            association,
+            availability: SourceControlAvailability::Available,
+        };
+        Ok(ExecutionLease {
+            reading: Some(reading),
+            guard: Some(guard),
+            incarnation,
+            recreated: recovered.recreated,
+        })
     }
     pub(crate) async fn checkpoint(
         &self,
@@ -442,4 +540,12 @@ pub(crate) fn repository_workspace(repository: &Repository) -> Workspace {
         repository: Some(repository.clone()),
         source_control: repository.availability.clone(),
     }
+}
+
+/// Holds the Repository mutation barrier through one native admission.
+pub(crate) struct ExecutionLease {
+    pub(crate) reading: Option<crate::protocol::CheckoutSummary>,
+    pub(crate) guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    pub(crate) incarnation: u64,
+    pub(crate) recreated: bool,
 }

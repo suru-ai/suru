@@ -791,8 +791,10 @@ async fn a_prompt_queued_behind_a_failed_turn_runs_rather_than_settling_on_its_i
 #[tokio::test]
 async fn managed_worktree_native_copilot_starts_at_prepared_root() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         crate::support::conversation_arms(),
+        crate::support::resume_session_arm(),
+        crate::support::skills_reload_arm(),
         crate::support::destroy_session_arm(),
         crate::support::delete_session_arm(),
         r#"
@@ -831,6 +833,16 @@ async fn managed_worktree_native_copilot_starts_at_prepared_root() {
         .unwrap();
     assert_eq!(
         request["params"]["workingDirectory"].as_str(),
+        prepared.destination.path.to_str()
+    );
+    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    let resumed = copilot
+        .requests()
+        .into_iter()
+        .find(|r| r["method"] == "session.resume")
+        .expect("recovered native connection resumes");
+    assert_eq!(
+        resumed["params"]["workingDirectory"].as_str(),
         prepared.destination.path.to_str()
     );
     server.shutdown().await.unwrap();

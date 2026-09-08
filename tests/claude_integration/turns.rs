@@ -724,5 +724,10 @@ async fn managed_worktree_native_claude_starts_at_prepared_root() {
         claude.launch_carrying("--session-id").working_directory,
         prepared.destination.path
     );
+    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    assert_eq!(
+        claude.launch_carrying("--resume").working_directory,
+        prepared.destination.path
+    );
     server.shutdown().await.unwrap();
 }

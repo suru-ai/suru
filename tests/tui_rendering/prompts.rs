@@ -715,3 +715,43 @@ fn failed_admission_drops_the_intervening_drafts_selection_before_restoring_text
             .contains("old draft appended")
     );
 }
+
+#[test]
+fn unavailable_worktree_admission_preserves_actionable_error_and_exact_prompt_retry() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_session(&mut application, workspace.path());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Continue retained work".to_owned(),
+        )))
+        .unwrap();
+    let ApplicationTransition::AdmitPrompt { session, request } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .unwrap()
+    else {
+        panic!("admit");
+    };
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionFailed {
+            session: session.clone(),
+            prompt_id: request.prompt.id,
+            error: "Worktree unavailable: retained branch is occupied; resolve it and retry"
+                .to_owned(),
+        })
+        .unwrap();
+    let rows = rendered_application_rows(&application).join("\n");
+    assert!(rows.contains("Continue retained work"));
+    assert!(rows.contains("Worktree unavailable"), "{rows}");
+    let ApplicationTransition::AdmitPrompt {
+        session: destination,
+        request: retry,
+    } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .unwrap()
+    else {
+        panic!("retry");
+    };
+    assert_eq!(destination, session);
+    assert_eq!(retry, request);
+}

@@ -40,3 +40,5 @@ mod repositories;
 mod worktree_navigation;
 
 mod worktree_preparation;
+
+mod worktree_recovery;

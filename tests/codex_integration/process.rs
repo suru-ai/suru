@@ -506,7 +506,7 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
       cwd=$(printf '%s' "$line" | sed 's/.*"cwds":\[\(.*\)\],"forceReload".*/\1/')
       printf '%s\n' '{"id":2,"result":{"data":[{"cwd":'"$cwd"',"skills":[],"errors":[]}]}}'
       ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"prepared"},"model":"gpt-fixture"}}' ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"prepared"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"prepared-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"prepared","turn":{"id":"prepared-turn","status":"completed","items":[]}}}'
@@ -533,7 +533,7 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
             .iter()
             .any(|r| r["method"] == "thread/start")
     );
-    client
+    let created = client
         .create_session(crate::managed_worktree::creation(&prepared))
         .await
         .unwrap();
@@ -547,5 +547,16 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
         request["params"]["cwd"].as_str(),
         prepared.destination.path.to_str()
     );
+    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    let resumed = codex
+        .requests()
+        .into_iter()
+        .find(|r| r["method"] == "thread/resume")
+        .expect("recovered native connection resumes");
+    assert_eq!(
+        resumed["params"]["cwd"].as_str(),
+        prepared.destination.path.to_str()
+    );
+    assert_eq!(resumed["params"]["threadId"], "prepared");
     server.shutdown().await.unwrap();
 }

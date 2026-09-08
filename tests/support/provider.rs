@@ -406,6 +406,14 @@ impl StartRequest {
     }
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
+        self.succeed_with_resume(identity, None)
+    }
+
+    pub fn succeed_with_resume(
+        self,
+        identity: AgentIdentity,
+        resume: Option<suru::provider::ProviderResumeState>,
+    ) -> ControlledProviderSession {
         let (questionnaires_tx, questionnaires_rx) = mpsc::unbounded_channel();
         let gate_questionnaires = Arc::new(AtomicBool::new(false));
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
@@ -425,7 +433,7 @@ impl StartRequest {
         self.response
             .send(Ok(ProviderSessionConnection::new(
                 identity,
-                None,
+                resume,
                 Arc::new(ControlledSessionHandle {
                     questionnaires: questionnaires_tx,
                     gate_questionnaires: gate_questionnaires.clone(),

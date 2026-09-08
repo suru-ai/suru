@@ -65,13 +65,11 @@ impl SessionStore {
         });
     }
 
-    fn record_checkout(&self, mut reading: CheckoutSummary) -> anyhow::Result<()> {
+    pub(crate) fn record_checkout(&self, mut reading: CheckoutSummary) -> anyhow::Result<()> {
         // Recovery fields are never part of the live reading.
         reading.association.recovery_revision = None;
         let mut state = self.state.lock().unwrap();
-        if !state.catalog.has_subscribers() {
-            return Ok(());
-        }
+        let observed = state.catalog.has_subscribers();
         let mut changed = Vec::new();
         for record in state.sessions.values_mut() {
             let Some(checkout) = record.summary.session.checkout.as_ref() else {
@@ -112,8 +110,9 @@ impl SessionStore {
                 record.summary.session = record.snapshot.session.clone();
                 let _ = record.updates.send(update);
             }
-            if record.summary.checkout_state.as_ref() != Some(&reading) || recovery_changed {
-                record.summary.checkout_state = Some(reading.clone());
+            let live = observed.then(|| reading.clone());
+            if record.summary.checkout_state != live || recovery_changed {
+                record.summary.checkout_state = live;
                 if record.summary.session.parent.is_none() {
                     changed.push(record.summary.session.id);
                 }

@@ -569,6 +569,8 @@ pub async fn spawn_with_source_control(
         provider_updates,
         settings.subscribe(),
         skill_catalog.clone(),
+        source_control.clone(),
+        timings.checkout_skill_timeout,
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
@@ -1540,49 +1542,18 @@ async fn rejoin_preparation(
             .sessions
             .persist_prepared_session(snapshot.session.id)
             .map_err(|e| e.to_string())?;
+        state
+            .providers
+            .hold_checkout_guard(snapshot.session.id, prompt.id, guard);
         state.providers.open_session(
             snapshot.session.id,
             plan.destination.path.clone(),
             prompt.id,
         );
-        retain_checkout_during_startup(state, snapshot.session.id, guard);
     }
     plan.admitted_session = Some(snapshot.session.id);
     state.preparations.save(plan)?;
     Ok(Some(snapshot))
-}
-
-/// Admission publishes an idle shell before the actor creates its first Turn.
-/// Keep the repository protected across that gap; thereafter the Working guard
-/// used by working-copy mutations can read the ordinary Session projection.
-fn retain_checkout_during_startup(
-    state: &AppState,
-    id: SessionId,
-    guard: tokio::sync::OwnedMutexGuard<()>,
-) {
-    let Some(mut feed) = state.sessions.subscribe(id) else {
-        return;
-    };
-    let sessions = state.sessions.clone();
-    let mut shutdown = state.shutdown.subscribe_to_intent();
-    tokio::spawn(async move {
-        let _guard = guard;
-        loop {
-            if sessions.snapshot(id).is_none_or(|snapshot| {
-                !snapshot.turns.is_empty()
-                    || snapshot
-                        .prompts
-                        .iter()
-                        .all(|p| p.status != crate::protocol::PromptStatus::Pending)
-            }) {
-                break;
-            }
-            tokio::select! {
-                _ = shutdown.changed() => break,
-                result = feed.updates.recv() => if matches!(result, Err(broadcast::error::RecvError::Closed)) { break; },
-            }
-        }
-    });
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
@@ -1739,14 +1710,18 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             if let Some(selection) = snapshot.session.agent_selection.clone() {
                 state.landing_agent_selection.confirm(selection);
             }
+            if let Some(guard) = mutation.take() {
+                state.providers.hold_checkout_guard(
+                    snapshot.session.id,
+                    snapshot.prompts[0].id,
+                    guard,
+                );
+            }
             state.providers.open_session(
                 snapshot.session.id,
                 snapshot.session.execution_directory.path.clone(),
                 snapshot.prompts[0].id,
             );
-            if let Some(guard) = mutation.take() {
-                retain_checkout_during_startup(&state, snapshot.session.id, guard);
-            }
             if let Some(plan) = &preparation {
                 if let Err(error) = state
                     .source_control
@@ -1899,6 +1874,69 @@ async fn admit_prompt(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    let mut execution = None;
+    if !state.sessions.knows_prompt(request.prompt.id)
+        && let Some(snapshot) = state.sessions.snapshot(session_id)
+    {
+        if snapshot.session.checkout.is_some() {
+            let lease = match state
+                .source_control
+                .prepare_execution(&snapshot.session, None)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(e) => {
+                    return preparation_error(format!(
+                        "Worktree unavailable; retry after resolving recovery: {e}"
+                    ));
+                }
+            };
+            if let Some(reading) = lease.reading.clone()
+                && let Err(error) = state.sessions.record_checkout(reading)
+            {
+                return preparation_error(format!(
+                    "Cannot persist current checkout recovery facts: {error}"
+                ));
+            }
+            if snapshot
+                .session
+                .checkout
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
+            {
+                let provider = snapshot
+                    .session
+                    .agent_selection
+                    .as_ref()
+                    .map(|s| s.provider.clone())
+                    .or_else(|| state.hosted_providers.first().cloned());
+                if let Some(provider) = provider {
+                    match tokio::time::timeout(
+                        state.timings.checkout_skill_timeout,
+                        state.skill_catalog.refresh_current(SkillCatalogRequest {
+                            provider,
+                            execution_directory: snapshot.session.execution_directory.clone(),
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(catalog))
+                            if matches!(
+                                catalog.status,
+                                crate::protocol::SkillCatalogStatus::Fresh { .. }
+                            ) => {}
+                        _ => {
+                            return preparation_error(
+                                "Destination Skills are unavailable; Worktree retained, retry after restoring the catalog",
+                            );
+                        }
+                    }
+                }
+            }
+            execution = Some(lease);
+        }
+    }
+
     if !request.prompt.skill_invocations.is_empty()
         && !state.sessions.knows_prompt(request.prompt.id)
     {
@@ -1934,13 +1972,37 @@ async fn admit_prompt(
         }
     }
 
+    // Recovery and catalog refresh await external work. Admission must use the
+    // current Turn state, and the actor repeats this check at native steering.
+    if let Some(lease) = &execution
+        && let Some(current) = state.sessions.snapshot(session_id)
+        && crate::sessions::effective_delivery(&current, request.delivery)
+            == crate::protocol::PromptDelivery::Steer
+        && current.session.working_since.is_some()
+        && state
+            .providers
+            .connected_incarnation(session_id)
+            .is_some_and(|incarnation| incarnation != lease.incarnation)
+    {
+        return preparation_error(
+            "The Worktree was recreated while this Agent is still Working; wait for it to settle before retrying",
+        );
+    }
+
     match state.sessions.admit(session_id, request) {
         Ok(StoreOutcome::Created(admission)) => {
             match admission.disposition {
-                PromptAdmissionDisposition::StartImmediately => state
-                    .providers
-                    .schedule_prompt(session_id, admission.prompt.id)
-                    .expect("stored Sessions retain their Provider actor"),
+                PromptAdmissionDisposition::StartImmediately => {
+                    if let Some(guard) = execution.as_mut().and_then(|lease| lease.guard.take()) {
+                        state
+                            .providers
+                            .hold_checkout_guard(session_id, admission.prompt.id, guard);
+                    }
+                    state
+                        .providers
+                        .schedule_prompt(session_id, admission.prompt.id)
+                        .expect("stored Sessions retain their Provider actor");
+                }
                 PromptAdmissionDisposition::SteerActive => state
                     .providers
                     .schedule_steer(session_id)

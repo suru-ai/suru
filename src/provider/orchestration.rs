@@ -88,6 +88,10 @@ pub(crate) struct ProviderOrchestrator {
     /// a Session, so no process starts on its behalf.
     settings: watch::Receiver<SettingsSnapshot>,
     skill_catalog: SkillCatalogService,
+    source_control: crate::source_control::SourceControlService,
+    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
+    checkout_skill_timeout: Duration,
 }
 
 struct ProviderActors {
@@ -189,12 +193,17 @@ enum ProviderCommand {
 }
 
 struct ConnectedProviderSession {
+    incarnation: u64,
     identity: AgentIdentity,
     session: Arc<dyn ProviderSession>,
     events: ProviderEventStream,
 }
 
 struct ProviderSessionContext {
+    source_control: crate::source_control::SourceControlService,
+    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
+    checkout_skill_timeout: Duration,
     runtime: Arc<dyn ProviderRuntime>,
     sessions: SessionStore,
     skill_catalog: SkillCatalogService,
@@ -596,6 +605,8 @@ impl ProviderOrchestrator {
         updates: ProviderUpdateGate,
         settings: watch::Receiver<SettingsSnapshot>,
         skill_catalog: SkillCatalogService,
+        source_control: crate::source_control::SourceControlService,
+        checkout_skill_timeout: Duration,
     ) -> Self {
         assert!(
             !runtimes.is_empty(),
@@ -614,7 +625,30 @@ impl ProviderOrchestrator {
             shutdown_complete,
             settings,
             skill_catalog,
+            source_control,
+            checkout_skill_timeout,
+            checkout_guards: Default::default(),
+            connected_incarnations: Default::default(),
         }
+    }
+
+    pub(crate) fn hold_checkout_guard(
+        &self,
+        session: SessionId,
+        prompt: PromptId,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        self.checkout_guards
+            .lock()
+            .unwrap()
+            .insert((session, prompt), guard);
+    }
+    pub(crate) fn connected_incarnation(&self, session: SessionId) -> Option<u64> {
+        self.connected_incarnations
+            .lock()
+            .unwrap()
+            .get(&session)
+            .copied()
     }
 
     pub(crate) fn has_session_actor(&self, id: SessionId) -> bool {
@@ -630,9 +664,16 @@ impl ProviderOrchestrator {
         if let Ok(commands_tx) =
             self.actor_commands_or_fail_prompt(session_id, execution_directory, prompt_id)
         {
-            commands_tx
+            if commands_tx
                 .send(ProviderCommand::StartPrompt { prompt_id })
-                .expect("new Provider actor accepts its initial Prompt");
+                .is_err()
+            {
+                let _ = self.fail_prompt(
+                    session_id,
+                    prompt_id,
+                    "Session Provider actor stopped unexpectedly".to_owned(),
+                );
+            }
         }
     }
 
@@ -648,6 +689,10 @@ impl ProviderOrchestrator {
         prompt_id: PromptId,
         message: String,
     ) -> anyhow::Error {
+        self.checkout_guards
+            .lock()
+            .unwrap()
+            .remove(&(session_id, prompt_id));
         let reported = message.clone();
         let _ = self.updates.apply(|| {
             self.sessions.deliver_prompt(
@@ -746,6 +791,7 @@ impl ProviderOrchestrator {
             Err(message) => return Err(self.fail_prompt(session_id, prompt_id, message)),
         };
         self.get_or_spawn_actor_commands(session_id, execution_directory, runtime)
+            .map_err(|error| self.fail_prompt(session_id, prompt_id, error.to_string()))
     }
 
     fn get_or_spawn_actor_commands(
@@ -769,6 +815,10 @@ impl ProviderOrchestrator {
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_provider_session(
             ProviderSessionContext {
+                source_control: self.source_control.clone(),
+                checkout_guards: self.checkout_guards.clone(),
+                connected_incarnations: self.connected_incarnations.clone(),
+                checkout_skill_timeout: self.checkout_skill_timeout,
                 runtime,
                 sessions,
                 skill_catalog: self.skill_catalog.clone(),
@@ -794,10 +844,16 @@ impl ProviderOrchestrator {
     }
 
     pub(crate) fn schedule_prompt(&self, session_id: SessionId, prompt_id: PromptId) -> Result<()> {
-        let execution_directory = self
-            .sessions
-            .execution_directory(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session does not exist on this server instance"))?;
+        let execution_directory =
+            self.sessions
+                .execution_directory(session_id)
+                .ok_or_else(|| {
+                    self.checkout_guards
+                        .lock()
+                        .unwrap()
+                        .remove(&(session_id, prompt_id));
+                    anyhow::anyhow!("Session does not exist on this server instance")
+                })?;
         let Ok(commands) =
             self.actor_commands_or_fail_prompt(session_id, execution_directory, prompt_id)
         else {
@@ -805,9 +861,17 @@ impl ProviderOrchestrator {
             // nothing left to deliver.
             return Ok(());
         };
-        commands
+        if commands
             .send(ProviderCommand::StartPrompt { prompt_id })
-            .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
+            .is_err()
+        {
+            let _ = self.fail_prompt(
+                session_id,
+                prompt_id,
+                "Session Provider actor stopped unexpectedly".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn schedule_steer(&self, session_id: SessionId) -> Result<()> {
@@ -940,6 +1004,14 @@ impl ProviderOrchestrator {
     }
 
     pub(crate) async fn close_session(&self, session_id: SessionId) {
+        self.checkout_guards
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != session_id);
+        self.connected_incarnations
+            .lock()
+            .unwrap()
+            .remove(&session_id);
         let task = {
             let mut actors = self
                 .actors
@@ -997,7 +1069,29 @@ impl ProviderOrchestrator {
             futures_util::future::join_all(self.runtimes.iter().map(|runtime| runtime.shutdown())),
         )
         .await;
+        self.checkout_guards.lock().unwrap().clear();
+        self.connected_incarnations.lock().unwrap().clear();
         self.shutdown_complete.send_replace(true);
+    }
+}
+
+/// An actor owns every pending startup lease and native incarnation it publishes.
+/// Drop also handles cancellation or a panic before the normal shutdown path.
+struct CheckoutActorCleanup {
+    session_id: SessionId,
+    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
+}
+impl Drop for CheckoutActorCleanup {
+    fn drop(&mut self) {
+        self.checkout_guards
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != self.session_id);
+        self.connected_incarnations
+            .lock()
+            .unwrap()
+            .remove(&self.session_id);
     }
 }
 
@@ -1007,6 +1101,10 @@ async fn run_provider_session(
     mut shutdown: ProviderShutdown,
 ) {
     let ProviderSessionContext {
+        source_control,
+        checkout_guards,
+        connected_incarnations,
+        checkout_skill_timeout,
         runtime,
         sessions,
         skill_catalog,
@@ -1014,6 +1112,11 @@ async fn run_provider_session(
         execution_directory,
         updates,
     } = context;
+    let _checkout_cleanup = CheckoutActorCleanup {
+        session_id,
+        checkout_guards: checkout_guards.clone(),
+        connected_incarnations: connected_incarnations.clone(),
+    };
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
     let mut subagents = SubagentRoutes::default();
@@ -1246,6 +1349,110 @@ async fn run_provider_session(
                 }
                 ProviderCommand::SteerPrompt => continue,
             };
+            let Some(snapshot) = sessions.snapshot(session_id) else {
+                break;
+            };
+            let Some(pending) = snapshot
+                .prompts
+                .iter()
+                .find(|p| p.id == prompt_id && p.status == PromptStatus::Pending)
+            else {
+                checkout_guards
+                    .lock()
+                    .unwrap()
+                    .remove(&(session_id, prompt_id));
+                defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                continue;
+            };
+            let inherited = checkout_guards
+                .lock()
+                .unwrap()
+                .remove(&(session_id, prompt_id));
+            let preparation = tokio::select! {
+                _ = shutdown.wait() => break 'actor,
+                result = source_control.prepare_execution(&snapshot.session, inherited) => result,
+            };
+            let preparation = preparation.and_then(|lease| {
+                if let Some(reading) = lease.reading.clone() {
+                    sessions
+                        .record_checkout(reading)
+                        .map_err(|e| format!("Cannot persist checkout recovery facts: {e}"))?;
+                }
+                Ok(lease)
+            });
+            let lease = match preparation {
+                Ok(lease) => lease,
+                Err(message) => {
+                    let _ = updates.apply(|| sessions.deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Failed { message: format!("Worktree unavailable; restore the checkout or retry recovery: {message}") }));
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                    continue;
+                }
+            };
+            let reconnect = provider
+                .as_ref()
+                .is_some_and(|p| p.incarnation != lease.incarnation);
+            if reconnect && (!subagents.routes.is_empty() || !subagents.rows.is_empty()) {
+                let _ = updates.apply(|| sessions.deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Failed { message: "The Worktree was recreated while Subagents still use the previous working copy; wait for their work to finish before retrying".to_owned() }));
+                defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                continue;
+            }
+            if reconnect {
+                if let Some(previous) = provider.take() {
+                    let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
+                }
+                connected_incarnations.lock().unwrap().remove(&session_id);
+            }
+            if snapshot
+                .session
+                .checkout
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
+                && (provider.is_none() || lease.recreated)
+            {
+                let refreshed = tokio::select! {
+                    _ = shutdown.wait() => break 'actor,
+                    result = timeout(checkout_skill_timeout, skill_catalog.refresh_current(crate::protocol::SkillCatalogRequest { provider: provider_id.clone(), execution_directory: snapshot.session.execution_directory.clone() })) => result,
+                };
+                let error = match refreshed {
+                    Ok(Ok(catalog))
+                        if matches!(
+                            catalog.status,
+                            crate::protocol::SkillCatalogStatus::Fresh { .. }
+                        ) =>
+                    {
+                        None
+                    }
+                    Ok(result) => Some(format!(
+                        "Destination Skills are unavailable; retry after restoring them: {result:?}"
+                    )),
+                    Err(_) => Some(
+                        "Destination Skill discovery timed out; retry Worktree execution"
+                            .to_owned(),
+                    ),
+                };
+                let initial = crate::protocol::InitialPrompt {
+                    id: pending.id,
+                    text: pending.text.clone(),
+                    skill_invocations: pending.skill_invocations.clone(),
+                };
+                let error = if error.is_none() {
+                    skill_catalog.validate_prompt(provider_id.clone(), &execution_directory, &initial, skill_prompt_delivery(pending)).await.err().map(|e| format!("Destination Skills must be revalidated before native execution: {e:?}"))
+                } else {
+                    error
+                };
+                if let Some(message) = error {
+                    let _ = updates.apply(|| {
+                        sessions.deliver_prompt(
+                            session_id,
+                            prompt_id,
+                            None,
+                            DeliveredTurnStatus::Failed { message },
+                        )
+                    });
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                    continue;
+                }
+            }
             if provider.is_none() {
                 let connection = tokio::select! {
                     biased;
@@ -1318,7 +1525,12 @@ async fn run_provider_session(
                     defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     continue;
                 }
+                connected_incarnations
+                    .lock()
+                    .unwrap()
+                    .insert(session_id, lease.incarnation);
                 provider = Some(ConnectedProviderSession {
+                    incarnation: lease.incarnation,
                     identity,
                     session,
                     events,
@@ -1373,6 +1585,7 @@ async fn run_provider_session(
             }) else {
                 break;
             };
+            drop(lease);
             let delivered = match delivered {
                 Ok(Some(delivered)) => delivered,
                 Ok(None) => {
@@ -1527,6 +1740,46 @@ async fn run_provider_session(
                 let prompt = match sessions.next_pending_steer(session_id, current.turn_id) {
                     Ok(Some(prompt)) => prompt,
                     Ok(None) | Err(_) => continue,
+                };
+                let Some(snapshot) = sessions.snapshot(session_id) else {
+                    continue;
+                };
+                let checkout = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'actor,
+                    lease = source_control.prepare_execution(&snapshot.session, None) => lease,
+                };
+                let checkout = checkout.and_then(|lease| {
+                    if let Some(reading) = lease.reading.clone() {
+                        sessions
+                            .record_checkout(reading)
+                            .map_err(|e| format!("Cannot persist checkout recovery facts: {e}"))?;
+                    }
+                    Ok(lease)
+                });
+                let _checkout_lease = match checkout {
+                    Ok(lease)
+                        if provider
+                            .as_ref()
+                            .is_some_and(|p| p.incarnation == lease.incarnation) =>
+                    {
+                        lease
+                    }
+                    result => {
+                        let message = match result {
+                            Err(message) => format!("Worktree unavailable; retry after resolving recovery: {message}"),
+                            Ok(_) => "The Worktree was recreated while this Agent is still Working; wait for it to settle before retrying".to_owned(),
+                        };
+                        let _ = updates.apply(|| {
+                            sessions.fail_skill_steer(
+                                session_id,
+                                current.turn_id,
+                                prompt.id,
+                                message,
+                            )
+                        });
+                        continue;
+                    }
                 };
                 if let Err(message) = revalidate_prompt_skills(
                     &skill_catalog,

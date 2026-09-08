@@ -224,3 +224,10 @@ pub enum CheckoutPreparationPlan {
         source_commit: String,
     },
 }
+
+/// Owning-Server validation/recreation result for a retained working copy.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckoutRecovery {
+    pub checkout: CheckoutAssociation,
+    pub recreated: bool,
+}

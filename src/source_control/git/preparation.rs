@@ -16,6 +16,29 @@ fn token(plan: &PreparedCheckout) -> String {
     format!("suru-preparation:{}", blake3::hash(&identity).to_hex())
 }
 impl GitSourceControl {
+    pub(super) async fn populate_unfinished_checkout(
+        &self,
+        destination: &Path,
+        metadata: &Path,
+    ) -> Result<(), String> {
+        if metadata.join("index").exists()
+            && !self
+                .command(destination, &["diff", "--cached", "--quiet", "HEAD"])
+                .await?
+                .status
+                .success()
+        {
+            return Err(
+                "Incomplete checkout has staged changes; preparation will not overwrite them"
+                    .into(),
+            );
+        }
+        // read-tree -m refuses conflicting tracked/untracked user changes. A
+        // retry with an already populated index does not reset working files.
+        self.mutate(destination, &["read-tree", "-m", "-u", "HEAD"])
+            .await?;
+        Ok(())
+    }
     pub(super) async fn claim_branch(&self, plan: &PreparedCheckout) -> Result<(), String> {
         let CheckoutPreparationPlan::Git {
             branch,
@@ -224,21 +247,7 @@ impl GitSourceControl {
             }
             return Ok(());
         }
-        if metadata.join("index").exists()
-            && !self
-                .command(destination, &["diff", "--cached", "--quiet", "HEAD"])
-                .await?
-                .status
-                .success()
-        {
-            return Err(
-                "Incomplete checkout has staged changes; preparation will not overwrite them"
-                    .into(),
-            );
-        }
-        // read-tree -m refuses conflicting tracked/untracked user changes. A
-        // retry with an already populated index does not reset working files.
-        self.mutate(destination, &["read-tree", "-m", "-u", "HEAD"])
+        self.populate_unfinished_checkout(destination, &metadata)
             .await?;
         let mut marker = tempfile::NamedTempFile::new_in(&metadata).map_err(|e| e.to_string())?;
         marker

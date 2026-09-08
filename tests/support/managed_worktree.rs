@@ -56,3 +56,46 @@ pub fn creation(plan: &PreparedCheckout) -> CreateSessionRequest {
         },
     }
 }
+
+pub async fn settled(client: &ManagedClient, session: SessionId, index: usize) -> SessionSnapshot {
+    let mut feed = client.subscribe_session(session).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let snapshot = client.read_session(session).await.unwrap();
+            if let Some(turn) = snapshot.turns.get(index)
+                && turn.status != TurnStatus::Active
+            {
+                assert_eq!(
+                    turn.status,
+                    TurnStatus::Completed,
+                    "{:?}",
+                    snapshot.activities
+                );
+                return snapshot;
+            }
+            feed.next().await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("native recovered Turn settles")
+}
+pub async fn recover(client: &ManagedClient, session: SessionId, checkout: &Path) {
+    settled(client, session, 0).await;
+    std::fs::remove_dir_all(checkout).unwrap();
+    client
+        .admit_prompt(
+            session,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Resume after Worktree recovery".to_owned(),
+                    skill_invocations: vec![],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .unwrap();
+    settled(client, session, 1).await;
+    assert!(checkout.is_dir());
+}
