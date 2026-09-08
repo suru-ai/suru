@@ -37,7 +37,7 @@ fn show(application: &mut Application, snapshot: &SessionSnapshot) {
 fn header(application: &Application, width: u16) -> String {
     rendered_application_rows_at(application, width, 20)
         .into_iter()
-        .find(|row| row.contains("Suru"))
+        .find(|row| row.contains("Connected"))
         .expect("Session header")
 }
 
@@ -57,10 +57,8 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
             Some((usize::from(width) - 5) / 2),
             "{row}"
         );
-        assert!(
-            row.contains("Workspace") && row.contains("Connected"),
-            "{row}"
-        );
+        assert!(row.contains("Connected"), "{row}");
+        assert!(!row.contains("Workspace") && !row.contains("Suru"), "{row}");
     }
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::Updated(

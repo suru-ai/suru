@@ -280,7 +280,7 @@ fn session_surfaces_share_the_column_while_the_header_keeps_terminal_width() {
         );
     }
 
-    let header = row_containing(&rows, "Suru");
+    let header = row_containing(&rows, "Connected");
     assert_eq!(occupied_columns(header), (2, 117));
 
     application

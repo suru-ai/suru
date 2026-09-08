@@ -50,9 +50,10 @@ fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_g
         "the client starts on the Workspace it cannot read: {landing:?}"
     );
     assert!(
-        landing.contains(&format!("Workspace {}", missing.to_string_lossy())),
+        landing.contains(missing.to_string_lossy().as_ref()),
         "and the footer says where, by the spelling the client was given: {landing:?}"
     );
+    assert!(!landing.contains("Workspace "), "{landing}");
 }
 
 fn connected_state(instance_id: Uuid, pid: u32) -> Application {
@@ -464,17 +465,13 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
         .expect("type a landing draft");
 
     let wide = rendered_application_rows_at(&application, 80, 16).join("\n");
-    for content in [
-        "Keep the composer usable",
-        "Agent unavailable",
-        "Workspace",
-        "Connected",
-    ] {
+    for content in ["Keep the composer usable", "Agent unavailable", "Connected"] {
         assert!(
             wide.contains(content),
             "wide landing frame omitted {content:?}"
         );
     }
+    assert!(!wide.contains("Workspace "), "{wide}");
 
     assert!(wide.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(!wide.contains("What would you like to work on?"));
@@ -785,8 +782,6 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
 
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
     for content in [
-        "Suru",
-        "Workspace",
         workspace.path().to_string_lossy().as_ref(),
         "Connected",
         "Keep the transcript visible",
@@ -800,10 +795,13 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
             "wide Session frame omitted {content:?}"
         );
     }
+    assert!(
+        !wide.contains("Workspace ") && !wide.contains("Suru"),
+        "{wide}"
+    );
 
     let narrow = rendered_application_rows_at(&application, 43, 10).join("\n");
     for core in [
-        "Suru",
         "Connected",
         "Keep the draft visible",
         "Working (",

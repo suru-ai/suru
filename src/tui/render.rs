@@ -2846,7 +2846,7 @@ fn render_landing(
     let agent = agent_selection_context(state, footer_detail);
     let context = if footer_detail.shows_secondary() {
         format!(
-            "{agent} · Workspace {}",
+            "{agent} · {}",
             state.workspace_label(&state.outlook, &state.workspace)
         )
     } else {
@@ -3517,22 +3517,17 @@ fn render_session_header(
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
-    let brand = truncate_to_width("Suru", left_width);
-    let orientation_width = left_width.saturating_sub(brand.width());
     let orientation = if detail.shows_secondary() {
         truncate_to_width(
-            &format!(
-                " · Workspace {}",
-                state.workspace_label(&state.outlook, &snapshot.session.workspace.path)
-            ),
-            orientation_width,
+            &state.workspace_label(&state.outlook, &snapshot.session.workspace.path),
+            left_width,
         )
     } else {
         String::new()
     };
     // Reserve the same space on both sides to keep the Title at the exact
     // center, while leaving both indicators and a separating cell intact.
-    let side_width = (brand.width() + orientation.width()).max(connection_width) + 1;
+    let side_width = orientation.width().max(connection_width) + 1;
     let title_width = usize::from(area.width).saturating_sub(side_width.saturating_mul(2));
     let title = snapshot
         .title
@@ -3550,13 +3545,10 @@ fn render_session_header(
         _ => title,
     };
     let title = truncate_to_width(&title, title_width);
-    let spacing = " ".repeat(
-        usize::from(area.width)
-            .saturating_sub(brand.width() + orientation.width() + connection_width),
-    );
+    let spacing =
+        " ".repeat(usize::from(area.width).saturating_sub(orientation.width() + connection_width));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(brand, theme.accent.primary.add_modifier(Modifier::BOLD)),
             Span::styled(orientation, theme.text.subdued),
             Span::raw(spacing),
             Span::styled(connection, status_style(state, theme)),

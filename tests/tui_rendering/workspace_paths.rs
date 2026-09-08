@@ -51,11 +51,19 @@ fn local_workspace_labels_use_the_servers_home_on_landing_and_in_a_session() {
         "~/Projects/suru"
     };
     let landing = screen(&application);
-    assert!(landing.contains(&format!("Workspace {label}")), "{landing}");
+    assert!(landing.contains(label), "{landing}");
+    assert!(
+        !landing.contains(&format!("Workspace {label}")),
+        "{landing}"
+    );
 
     let (_, snapshot) = enter_session(&mut application, &workspace);
     let session = screen(&application);
-    assert!(session.contains(&format!("Workspace {label}")), "{session}");
+    assert!(session.contains(label), "{session}");
+    assert!(
+        !session.contains(&format!("Workspace {label}")),
+        "{session}"
+    );
     assert_eq!(snapshot.session.workspace.path, workspace);
 }
 
@@ -159,8 +167,12 @@ fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
             .unwrap();
         let rendered = screen(&application);
         assert!(
-            rendered.contains(&format!("Workspace {expected} ")),
+            rendered.contains(&format!("{expected} ")),
             "{path}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("Workspace {expected}")),
+            "{rendered}"
         );
     }
 }
@@ -333,8 +345,9 @@ fn symlinked_homes_shorten_resolved_workspaces_but_links_outside_home_stay_absol
             )))
             .unwrap();
         let rendered = screen(&application);
+        assert!(rendered.contains(&format!("{expected} ")), "{rendered}");
         assert!(
-            rendered.contains(&format!("Workspace {expected} ")),
+            !rendered.contains(&format!("Workspace {expected}")),
             "{rendered}"
         );
     }
