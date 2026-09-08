@@ -440,6 +440,10 @@ impl ProviderSession for CopilotSession {
                         input.prompt,
                     )
                     .await?;
+                self.correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .context_prompt_ready(input.turn_id);
                 until_crash(
                     &self.handle,
                     "Copilot Turn startup failed",

@@ -13,8 +13,9 @@
 //! Subagent under the instance identity its work is attributed with, and `subagent.completed` or
 //! `subagent.failed` — addressed by the spawning tool call — settles it. The spawning tool
 //! execution itself projects no Command row while the Subagent row answers for the delegation
-//! ([`SPAWN_TOOL`]). Main-conversation events that arrive outside a Turn Suru is running are
-//! dropped, events that contradict the recorded state fail the Session, and everything else
+//! ([`SPAWN_TOOL`]). Main-conversation content outside a Turn Suru is running is
+//! dropped unless owed a Continuation; context snapshots can refresh idle Sessions.
+//! Events that contradict the recorded state fail the Session, and everything else
 //! becomes the Provider events a Session consumes.
 //!
 //! Only the agent Message is strict about that: a Message the Transcript shows the reader as the
@@ -59,11 +60,12 @@ use super::{
     pricing::CopilotPricing, skills::CopilotSkills, tools::command_text,
     transport::CopilotConnection,
 };
-use crate::protocol::{NativeMeter, Usage};
+use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
 use crate::provider::{
-    AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
-    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
-    ProviderSubagentStatus, ReportedTurnMetering, concise_remote_message, exclusive_count,
+    AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
+    ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
+    ProviderSubagentId, ProviderSubagentStatus, ReportedTurnMetering, concise_remote_message,
+    exclusive_count,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     reported_count,
@@ -98,6 +100,15 @@ pub(super) struct CopilotCorrelation {
     /// updates this on catalog discovery; each usage event reads it once while
     /// the call still belongs to an active Turn.
     pricing: CopilotPricing,
+    /// Last Prompt delivered to this native timeline. Retained through idle so context
+    /// observations can refresh a settled Session without opening a Continuation.
+    context_turn: Option<TurnId>,
+    context_sequence: u64,
+    /// The latest projected stretch is a Continuation rather than the captured Prompt.
+    context_continuation: bool,
+    /// Admission has begun but may fail before delivery; old Continuations cannot
+    /// rebind observations to this new (possibly Model-invalidated) Turn.
+    context_prompt_pending: bool,
 }
 
 /// One stretch of Copilot's loop that Suru reads as a Turn, and the main conversation's state
@@ -197,6 +208,10 @@ impl CopilotCorrelation {
             delegations: HashSet::new(),
             late_settle_owes_continuation: false,
             pricing,
+            context_turn: None,
+            context_sequence: 0,
+            context_continuation: false,
+            context_prompt_pending: false,
         }
     }
 
@@ -219,9 +234,49 @@ impl CopilotCorrelation {
                 ));
             }
         }
+        self.context_continuation = false;
+        self.context_prompt_pending = true;
         self.turn = Some(ActiveTurn::new());
         self.late_settle_owes_continuation = false;
         Ok(())
+    }
+
+    /// Bind observations at receipt, before the projection queue can fall behind a
+    /// later Prompt or Model change. Startup reports during selection still belong
+    /// to the previous Turn until the new Prompt is ready to be sent.
+    pub(super) fn context_prompt_ready(&mut self, turn_id: TurnId) {
+        self.context_prompt_pending = false;
+        self.context_turn = Some(turn_id);
+        self.context_continuation = false;
+    }
+
+    fn context_report(&mut self, event: &SessionEvent) -> Option<AttributedProviderEvent> {
+        if event.parsed_type() != SessionEventType::SessionUsageInfo {
+            return None;
+        }
+        let occupied_tokens = event.data.get("currentTokens")?.as_u64()?;
+        let turn_id = if event.agent_id.is_some() {
+            // Child Turn IDs are assigned by orchestration, under the native agent ID.
+            None
+        } else {
+            Some(self.context_turn?)
+        };
+        self.context_sequence = self.context_sequence.saturating_add(1);
+        Some(attributed(
+            event.agent_id.as_deref(),
+            ProviderEvent::ContextFill {
+                report: ContextFillReport {
+                    turn_id,
+                    sequence: self.context_sequence,
+                    fill: ContextFill {
+                        occupied_tokens,
+                        // Native tokenLimit is not verified as the raw Model window.
+                        // See docs/validation/0299-copilot-context-fill.md.
+                        capacity_tokens: None,
+                    },
+                },
+            },
+        ))
     }
 
     /// Gives up the Turn opened by [`Self::begin_turn`] when the Prompt never reached Copilot.
@@ -251,6 +306,7 @@ impl CopilotCorrelation {
                 return None;
             }
             self.turn = Some(ActiveTurn::continuation());
+            self.context_continuation = true;
             self.late_settle_owes_continuation = false;
         }
         self.turn.as_mut().map(|turn| &mut turn.streams)
@@ -274,6 +330,7 @@ pub(super) fn provider_events(
         subscription,
         events_tx,
         drain.clone(),
+        correlation.clone(),
     ));
     Box::pin(stream::unfold(
         CopilotEvents {
@@ -292,13 +349,24 @@ pub(super) fn provider_events(
 /// Moves Copilot's timeline off the SDK's bounded subscription as it arrives.
 async fn drain_session_timeline(
     mut subscription: EventSubscription,
-    events: mpsc::UnboundedSender<Result<SessionEvent, ProviderError>>,
+    events: mpsc::UnboundedSender<Result<TimelineEvent, ProviderError>>,
     drain: EventDrainCheckpoint,
+    correlation: Arc<StdMutex<CopilotCorrelation>>,
 ) {
     loop {
         match subscription.recv().await {
             Ok(event) => {
                 let event_id = event.id.clone();
+                // Ephemeral context reports use the same lossless drain as durable
+                // events, and keep their originating Turn while waiting for projection.
+                let context = correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .context_report(&event);
+                let event = match context {
+                    Some(context) => TimelineEvent::Context(context),
+                    None => TimelineEvent::Native(event),
+                };
                 if events.send(Ok(event)).is_err() {
                     return;
                 }
@@ -317,8 +385,13 @@ async fn drain_session_timeline(
     }
 }
 
+enum TimelineEvent {
+    Native(SessionEvent),
+    Context(AttributedProviderEvent),
+}
+
 struct CopilotEvents {
-    events: mpsc::UnboundedReceiver<Result<SessionEvent, ProviderError>>,
+    events: mpsc::UnboundedReceiver<Result<TimelineEvent, ProviderError>>,
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
     drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
@@ -375,7 +448,29 @@ async fn next_provider_event(
     }
 }
 
-fn queue_projected(events: &mut CopilotEvents, event: SessionEvent) {
+fn queue_projected(events: &mut CopilotEvents, event: TimelineEvent) {
+    let event = match event {
+        TimelineEvent::Context(mut context) => {
+            let correlation = events
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned");
+            if let ProviderEvent::ContextFill { report } = &mut context.event
+                && context.attribution == ProviderEventAttribution::OwningSession
+                && !correlation.context_prompt_pending
+                && correlation.context_continuation
+                && report.turn_id == correlation.context_turn
+            {
+                // Preceding native content opened a Continuation in this same Prompt
+                // generation. Its Turn ID belongs to orchestration, so bind in stream
+                // order. A queued report from an older Prompt retains its explicit ID.
+                report.turn_id = None;
+            }
+            events.pending.push_back(Ok(context));
+            return;
+        }
+        TimelineEvent::Native(event) => event,
+    };
     if matches!(
         event.parsed_type(),
         SessionEventType::CommandsChanged | SessionEventType::SessionSkillsLoaded

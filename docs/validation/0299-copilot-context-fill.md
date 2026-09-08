@@ -1,0 +1,76 @@
+# Copilot Context Fill (#299)
+
+Verified 2026-09-08 against GitHub Copilot CLI **1.0.83**, the pinned
+`github-copilot-sdk` **1.0.12-preview.0**, and the official SDK checkout at
+`1644e74578db3637bc7527951bac227aabbc0584`.
+
+## Native evidence and denominator decision
+
+The official SDK documents `session.usage_info` as an **ephemeral** Session
+snapshot with `currentTokens`, `tokenLimit`, and `messagesLength`:
+[Streaming events](https://github.com/github/copilot-sdk/blob/1644e74578db3637bc7527951bac227aabbc0584/docs/features/streaming-events.md#sessionusage_info).
+Its usage documentation says the runtime emits this event whenever context size
+changes:
+[Usage and billing](https://github.com/github/copilot-sdk/blob/1644e74578db3637bc7527951bac227aabbc0584/docs/features/usage-and-billing.md#live-updates-with-sessionusage_info).
+The native envelope carries optional `agentId` attribution independently of the
+ephemeral flag; Suru's SDK preserves both.
+
+These sources describe `tokenLimit` as the maximum context-window tokens, but do
+**not** establish that it excludes effective prompt limits, reserved output space,
+or compaction buffers. Inspection of the installed CLI's `app.js` confirms it
+consumes `session.usage_info`, while the context calculation lives behind its
+native runtime binding. That inspection does not prove a raw-window denominator.
+No authenticated live model call was performed. Therefore **capacity stays
+unknown**, including when `tokenLimit` is positive. The footer shows the known
+occupancy alone. We also do not substitute `assistant.usage.maxPromptTokens`,
+output limits, a guessed catalog capacity, or accumulated Usage.
+
+## Adapter behavior
+
+The existing lossless SDK timeline drain observes ephemeral context reports,
+accepting a nonnegative integer `currentTokens` even if other native fields are
+missing. Missing, negative, or malformed occupancy is ignored. Zero is a real
+measurement. The generic Context Fill contract handles client updates, replacement,
+persistence, presentation, and parent/child isolation. Reports attributed to an
+unknown child remain unrouted; settled known children can still receive context.
+
+The drain allocates an increasing sequence and captures the last delivered
+Prompt's Suru Turn ID before a report waits in the projection queue. Model
+selection and skill expansion keep the old identity until the new Prompt is ready
+for delivery. Reports already queued under an older Prompt therefore retain their
+old identity when a later Model invalidates it. Native events have no Model or
+Turn identifier, so correlation relies on Copilot's ordered Session timeline;
+there is no inference from cumulative metering.
+
+Continuation IDs are owned by orchestration. Once preceding native content has
+opened a Continuation, context from that same captured Prompt generation binds
+in stream order to the Continuation, including after its idle. An older Prompt's
+queued report is never rebound to a newer Prompt generation. Context reports do
+not themselves open Continuations. Admission immediately disables Continuation
+rebinding, including when Model selection fails before the Prompt can be sent.
+
+## Validation
+
+The existing Unix-gated scripted CLI integration harness verifies ephemeral live
+updates, missing capacity, invalid/missing occupancy, replacement after idle,
+parent/child isolation, unknown-child rejection, settled-child zero, restart
+persistence, and unchanged Usage and Cost. A second native timeline exercises
+context during a Continuation and after its settlement. A third exercises failed
+Model startup after a Continuation: a later child update confirms the stale parent
+report crossed projection before checking that invalidated context stayed absent.
+The pre-existing metering
+test explicitly verifies that Usage alone leaves Context Fill unknown.
+
+Portable shared Session tests cover Model-change invalidation and old/out-of-order
+report rejection, child ownership, persistence, and replacement. Existing footer
+rendering tests cover the shared formatting and width policy. No separate Copilot
+rendering path or Setting is introduced. Fixture waits use the existing release
+barrier with a 10ms polling interval; workspace and state paths use temporary
+platform-native directories.
+
+Final checks: `cargo nextest run --test copilot_integration --test
+session_integration --lib --status-level fail` passed **708/708** tests (including
+shared footer tests), with `src/lib.rs` touched inside the shared cargo lock to
+force this worktree's library rebuild. `cargo fmt --check` and `git diff --check`
+also passed. All builds used `/home/jake/Projects/suru/target` under
+`/tmp/suru-198-cargo.lock`.

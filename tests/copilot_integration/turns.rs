@@ -119,6 +119,10 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
         }),
         "both calls are summed into the first Turn with disjoint token parts"
     );
+    assert_eq!(
+        first.session.context_fill, None,
+        "Usage is never a context fallback"
+    );
     assert_eq!(first.turns[0].cost, Cost::from_usd(0.05325));
     assert_eq!(first.turns[0].cost_basis, Some(CostBasis::Reported));
     assert_eq!(
