@@ -3216,19 +3216,19 @@ fn subagent_rows_render_working_settled_failed_and_stopped_states() {
         (
             ActivityStatus::Active,
             None,
-            "⠋ Explore: Map the provider seams",
+            "⠋ Subagent: Explore: Map the provider seams",
             Color::Cyan,
         ),
         (
             ActivityStatus::Completed,
             Some(12_000),
-            "✓ Explore: Map the provider seams · 12s",
+            "✓ Subagent: Explore: Map the provider seams · 12s",
             Color::DarkGray,
         ),
         (
             ActivityStatus::Failed,
             Some(3_000),
-            "× Explore: Map the provider seams · 3s",
+            "× Subagent: Explore: Map the provider seams · 3s",
             Color::Red,
         ),
         // Stopped on request wears the interrupted Turn's own face, so a stop
@@ -3236,7 +3236,7 @@ fn subagent_rows_render_working_settled_failed_and_stopped_states() {
         (
             ActivityStatus::Interrupted,
             Some(8_000),
-            "× Explore: Map the provider seams · 8s",
+            "× Subagent: Explore: Map the provider seams · 8s",
             Color::Yellow,
         ),
     ];
@@ -3281,7 +3281,7 @@ fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
 
     let working = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
-        working.contains("⠋ Explore: Map the provider seams"),
+        working.contains("⠋ Subagent: Explore: Map the provider seams"),
         "a working Subagent wears the Marker's Spinner: {working}"
     );
 
@@ -3302,13 +3302,13 @@ fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let settled_rows = rendered_application_rows_at(&application, 80, 22);
     assert_eq!(
         settled_rows[rendered_row(&settled_rows, "Explore: Map the provider seams")].trim_end(),
-        "    ✓ Explore: Map the provider seams · 1m 12s",
+        "    ✓ Subagent: Explore: Map the provider seams · 1m 12s",
         "the settled row swaps its Spinner for the outcome glyph and states its duration"
     );
 }
 
 #[test]
-fn a_subagent_asked_without_a_description_heads_with_its_name_alone() {
+fn a_subagent_asked_without_a_description_heads_with_its_prefixed_name() {
     let workspace = workspace_dir();
     let (snapshot, _) =
         subagent_activity_session(workspace.path(), ActivityStatus::Active, "", None);
@@ -3319,8 +3319,8 @@ fn a_subagent_asked_without_a_description_heads_with_its_name_alone() {
 
     let rows = rendered_application_rows_at(&application, 80, 22);
     assert_eq!(
-        rows[rendered_row(&rows, "⠋ Explore")].trim_end(),
-        "    ⠋ Explore",
+        rows[rendered_row(&rows, "⠋ Subagent: Explore")].trim_end(),
+        "    ⠋ Subagent: Explore",
         "no separator trails a name with nothing to separate it from"
     );
 }

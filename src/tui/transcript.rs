@@ -3817,7 +3817,7 @@ fn push_subagent_activity(
         // stop reads as a stop rather than as the Subagent going wrong.
         ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
     };
-    let mut header = name.to_owned();
+    let mut header = format!("Subagent: {name}");
     if !description.trim().is_empty() {
         header.push_str(": ");
         header.push_str(description);
