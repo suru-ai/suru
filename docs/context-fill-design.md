@@ -1,6 +1,6 @@
 # Context Fill — issue #198
 
-The user confirmed shared understanding of the design. Implementation has not begun.
+The confirmed design is implemented through #298 (shared behavior and Codex), #299 (Copilot), and #300 (Claude). See the [implementation review](validation/0198-context-fill.md) for verification results and Provider reporting boundaries.
 
 ## Settled decisions
 
@@ -16,7 +16,7 @@ The user confirmed shared understanding of the design. Implementation has not be
 - Show known Cost independently when Context Fill is unknown, and Context Fill independently when Cost is absent. Separate them with ` · ` when both appear.
 - Under width pressure, drop Cost first, then the context token count, retaining the percentage longest: `12.4K (6%) · $0.42` → `12.4K (6%)` → `6%`. If capacity is unknown, retain the token count instead. Hide the readout when its minimal form cannot fit.
 
-## Findings
+## Findings at specification time
 
 The issue's original assertion that this needs display work only is incorrect. The current protocol carries some context capacity but no distinct occupancy snapshot. Existing Usage aggregates consumption and merges capacity by maximum, which cannot represent current Context Fill after compaction or a change to a smaller Model.
 
@@ -32,4 +32,4 @@ The issue's original assertion that this needs display work only is incorrect. T
 - Verify missing data, whole-number percentages above 100%, independent Cost rendering, and footer width fallback. Treat a nonpositive capacity as unavailable for division.
 - Exercise Claude request failures and timeouts without blocking Turn completion, using injectable short timings in tests.
 
-No open product decisions remain. Native-wire compatibility is an implementation verification item.
+No open product decisions remain. Native-wire verification is recorded in the [Copilot](validation/0299-copilot-context-fill.md) and [Claude](validation/0300-claude-context-fill.md) implementation reports.
