@@ -47,6 +47,7 @@ impl Layout {
             .into_iter()
             .map(|(root, kind)| CheckoutSummary {
                 association: CheckoutAssociation {
+                    recovery_revision: None,
                     id: CheckoutId::from_root(&id, root),
                     repository: id.clone(),
                     root: root.clone(),
@@ -149,6 +150,7 @@ fn open(app: &mut Application, context: ResolvedWorkspace) {
 }
 fn summary(context: &ResolvedWorkspace, title: &str) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
+        checkout_state: None,
         session: Session {
             id: SessionId::new(),
             workspace: context.workspace.clone(),
