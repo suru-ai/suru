@@ -393,3 +393,139 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
     );
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn discovery_persists_branch_and_detached_recovery_before_any_catalog_interest() {
+    let state = tempfile::tempdir().unwrap();
+    let config_root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    let branched = root.path().join("branched");
+    let detached = root.path().join("detached");
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init", "-b", "main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "retained",
+            branched.to_str().unwrap(),
+        ],
+    );
+    git(
+        &main,
+        &["worktree", "add", "--detach", detached.to_str().unwrap()],
+    );
+    let config = ServerConfig::new(state.path(), "discovery-recovery")
+        .unwrap()
+        .with_config_dir(config_root.path());
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..Default::default()
+    }
+    .with_checkout_observation_interval(Duration::from_millis(15));
+    let server = server::spawn_with_timings(config.clone(), timings)
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let mut remembered = Vec::new();
+    for path in [&branched, &detached] {
+        // No ManagedClient exists: this request opens no catalog interest, so
+        // recovery must be captured by discovery itself, not a polling tick.
+        let created = http
+            .post(format!("{}/v1/sessions", server.descriptor().base_url))
+            .bearer_auth(&server.descriptor().token)
+            .json(&CreateSessionRequest {
+                agent_selection: None,
+                execution_directory: suru::protocol::ExecutionDirectory { path: path.clone() },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Retain discovered checkout".into(),
+                    skill_invocations: vec![],
+                },
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<SessionSnapshot>()
+            .await
+            .unwrap();
+        remembered.push((created.session.id, created.session.checkout.unwrap()));
+    }
+    assert!(
+        matches!(&remembered[0].1.recovery_revision, Some(CheckoutRevision::Branch { name, commit: Some(_) }) if name == "retained")
+    );
+    assert!(matches!(
+        remembered[1].1.recovery_revision,
+        Some(CheckoutRevision::Detached { .. })
+    ));
+    server.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&branched).unwrap();
+    std::fs::remove_dir_all(&detached).unwrap();
+
+    let server = server::spawn_with_timings(config, timings).await.unwrap();
+    let initial = http
+        .get(format!("{}/v1/sessions", server.descriptor().base_url))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<SessionListItem>>()
+        .await
+        .unwrap();
+    assert_eq!(initial.len(), 2);
+    for summary in initial.iter().map(|item| item.readable().unwrap()) {
+        let (_, checkout) = remembered
+            .iter()
+            .find(|(id, _)| *id == summary.session.id)
+            .unwrap();
+        assert_eq!(summary.session.checkout.as_ref(), Some(checkout));
+        assert_eq!(
+            summary.checkout_state, None,
+            "remembered discovery is not a fresh reading"
+        );
+    }
+    let client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "discovery-recovery").unwrap(),
+    )
+    .await
+    .unwrap();
+    let local = client.outlook(Outlook::Local);
+    let mut subscription = local.subscribe_catalog();
+    let unavailable = observed(&local, &mut subscription, 2, |reading| {
+        matches!(
+            reading.availability,
+            SourceControlAvailability::Unavailable { .. }
+        )
+    })
+    .await;
+    for summary in unavailable {
+        let (_, checkout) = remembered
+            .iter()
+            .find(|(id, _)| *id == summary.session.id)
+            .unwrap();
+        assert_eq!(summary.session.checkout.as_ref(), Some(checkout));
+        assert_eq!(summary.checkout_state.unwrap().revision, None);
+    }
+    drop(subscription);
+    drop(local);
+    drop(client);
+    server.shutdown().await.unwrap();
+}

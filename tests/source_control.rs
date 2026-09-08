@@ -255,6 +255,10 @@ async fn deleted_worktree_replaced_by_plain_directory_is_unavailable_and_git_abs
         SourceControlAvailability::Unavailable { .. }
     ));
     assert_eq!(
+        linked.association.recovery_revision, None,
+        "unavailable discovery must not promote retained Git listing data to recovery facts"
+    );
+    assert_eq!(
         discovered.workspace.source_control,
         SourceControlAvailability::Available
     );

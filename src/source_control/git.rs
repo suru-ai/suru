@@ -308,7 +308,10 @@ impl SourceControl for GitSourceControl {
                     };
                     let valid = self.valid_root(&root, &common).await.is_some();
                     let association = CheckoutAssociation {
-                        recovery_revision: None,
+                        // Discovery is already a successful reading. Preserve it
+                        // before any Client starts live observation, but never
+                        // promote stale Git listing data for an unavailable root.
+                        recovery_revision: if valid { entry.revision.clone() } else { None },
                         id: CheckoutId::from_root(&id, &root),
                         repository: id.clone(),
                         root,
