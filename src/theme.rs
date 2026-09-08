@@ -647,6 +647,7 @@ built_in_themes!(
     "orng",
     "osaka-jade",
     "palenight",
+    "panda",
     "rosepine",
     "solarized",
     "synthwave84",
@@ -1390,7 +1391,7 @@ mod tests {
     #[test]
     fn every_vendored_theme_resolves() {
         let themes = built_in_themes();
-        assert_eq!(themes.len(), 33);
+        assert_eq!(themes.len(), 34);
         for (name, source) in themes {
             for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
                 Theme::from_document(source, variant).unwrap_or_else(|error| {
