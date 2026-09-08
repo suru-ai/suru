@@ -319,7 +319,7 @@ pub fn answer_workspace_resolution(
         .map_err(|_| "No directory there".to_owned())
         .and_then(|path| {
             path.is_dir()
-                .then_some(suru::protocol::Workspace { path })
+                .then_some(suru::protocol::ResolvedWorkspace::directory(path))
                 .ok_or_else(|| "Not a directory".to_owned())
         });
     application
@@ -437,14 +437,13 @@ pub fn failed_session_snapshot(
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: None,
             id: session_id,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
@@ -489,14 +488,13 @@ pub fn selected_session_snapshot(
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: None,
             id: session_id,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: Some(selection),
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
@@ -523,14 +521,13 @@ pub fn navigable_session_snapshot(
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: None,
             id: session_id,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,

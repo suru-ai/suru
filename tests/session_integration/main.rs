@@ -35,3 +35,4 @@ mod usage;
 mod viewed;
 
 mod questionnaires;
+mod repositories;

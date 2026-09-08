@@ -94,14 +94,13 @@ fn child_with_working_subagent(
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: None,
             id: child_id,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Active,

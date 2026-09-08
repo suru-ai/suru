@@ -11,11 +11,13 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
+mod source_control;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
 };
+pub use source_control::*;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
@@ -437,7 +439,32 @@ impl SessionTimestamp {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
+    pub id: WorkspaceId,
+    /// Presentation only: identity is unchanged when a main root becomes known.
     pub path: PathBuf,
+    pub repository: Option<Repository>,
+    pub source_control: SourceControlAvailability,
+}
+
+impl Workspace {
+    pub fn directory(path: PathBuf) -> Self {
+        Self {
+            id: WorkspaceId::directory(&path),
+            path,
+            repository: None,
+            source_control: SourceControlAvailability::NotDetected,
+        }
+    }
+    pub fn main_unknown(&self) -> bool {
+        self.repository
+            .as_ref()
+            .is_some_and(|repo| matches!(repo.location, RepositoryLocation::UnknownMain))
+    }
+}
+impl From<PathBuf> for Workspace {
+    fn from(path: PathBuf) -> Self {
+        Self::directory(path)
+    }
 }
 
 /// The exact directory an Agent executes in, interpreted only by its owning Server.
@@ -454,6 +481,8 @@ pub struct ExecutionDirectory {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveWorkspaceRequest {
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
     pub base: Option<PathBuf>,
     pub path: PathBuf,
 }
@@ -1609,6 +1638,7 @@ pub struct Session {
     pub id: SessionId,
     pub workspace: Workspace,
     pub execution_directory: ExecutionDirectory,
+    pub checkout: Option<CheckoutAssociation>,
     pub agent_selection: Option<AgentSelection>,
     pub agent_selection_availability: ModelAvailability,
     pub status: SessionStatus,
@@ -2375,6 +2405,10 @@ pub struct SessionUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionChange {
+    WorkspaceChanged {
+        workspace: Workspace,
+        checkout: Option<CheckoutAssociation>,
+    },
     TitleChanged {
         title: String,
         emoji: Option<String>,

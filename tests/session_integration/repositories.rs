@@ -1,0 +1,532 @@
+//! Repository grouping through the owning Server's authenticated boundaries.
+use crate::{
+    failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
+    support,
+};
+use diesel::{Connection, RunQueryDsl};
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
+use suru::{
+    protocol::*,
+    server::{self, ServerConfig, ServerTimings},
+    source_control::GitSourceControl,
+};
+
+pub(super) fn git(directory: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Suru Test")
+        .env("GIT_AUTHOR_EMAIL", "suru@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Suru Test")
+        .env("GIT_COMMITTER_EMAIL", "suru@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn init(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    git(root, &["init", "-b", "main"]);
+    git(
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+}
+fn request(
+    descriptor: &RuntimeDescriptor,
+    method: reqwest::Method,
+    path: &str,
+) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+}
+async fn resolve(
+    descriptor: &RuntimeDescriptor,
+    path: &Path,
+    id: Option<WorkspaceId>,
+) -> ResolvedWorkspace {
+    request(descriptor, reqwest::Method::POST, "/v1/workspaces/resolve")
+        .json(&ResolveWorkspaceRequest {
+            workspace_id: id,
+            base: None,
+            path: path.to_owned(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+async fn create(descriptor: &RuntimeDescriptor, path: &Path) -> SessionSnapshot {
+    let created = support::create_session(
+        descriptor,
+        &CreateSessionRequest {
+            agent_selection: None,
+            execution_directory: ExecutionDirectory {
+                path: path.to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Retain this exact working directory".to_owned(),
+                skill_invocations: vec![],
+            },
+        },
+    )
+    .await;
+    support::read_session_at_least_revision(
+        &reqwest::Client::new(),
+        descriptor,
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await
+}
+async fn list(descriptor: &RuntimeDescriptor, id: Option<&WorkspaceId>) -> Vec<SessionListItem> {
+    let mut request = request(descriptor, reqwest::Method::GET, "/v1/sessions");
+    if let Some(id) = id {
+        request = request.query(&[("workspace_id", &id.0)]);
+    }
+    request
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[tokio::test]
+async fn main_linked_and_subdirectory_sessions_share_authenticated_listing_and_identity_filters() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main repo");
+    init(&main);
+    let linked = root.join("external checkout");
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let main_subdir = main.join("packages");
+    let linked_subdir = linked.join("src");
+    std::fs::create_dir(&main_subdir).unwrap();
+    std::fs::create_dir(&linked_subdir).unwrap();
+    let server =
+        spawn_with_failing_provider(ServerConfig::new(root.join("state"), "repo-api").unwrap())
+            .await
+            .unwrap();
+    let descriptor = server.descriptor();
+    let mut sessions = vec![];
+    for path in [&main, &linked, &main_subdir, &linked_subdir] {
+        let created = create(descriptor, path).await;
+        assert_eq!(&created.session.execution_directory.path, path);
+        assert_eq!(created.session.workspace.path, main);
+        sessions.push(created);
+    }
+    let id = &sessions[0].session.workspace.id;
+    assert!(
+        sessions
+            .iter()
+            .all(|session| &session.session.workspace.id == id)
+    );
+    let listing = list(descriptor, Some(id)).await;
+    assert_eq!(
+        listing.iter().map(SessionListItem::id).collect::<Vec<_>>(),
+        sessions
+            .iter()
+            .rev()
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>()
+    );
+    let via_path: Vec<SessionListItem> = request(descriptor, reqwest::Method::GET, "/v1/sessions")
+        .query(&[("workspace", linked_subdir.to_str().unwrap())])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(via_path, listing);
+    let resolved = resolve(descriptor, &linked_subdir, None).await;
+    assert_eq!(&resolved.workspace.id, id);
+    assert_eq!(resolved.execution_directory.unwrap().path, linked_subdir);
+    let outside = root.join("plain directory");
+    std::fs::create_dir(&outside).unwrap();
+    let plain = create(descriptor, &outside).await;
+    assert_ne!(&plain.session.workspace.id, id);
+    assert_eq!(
+        plain.session.workspace.source_control,
+        SourceControlAvailability::NotDetected
+    );
+    assert_eq!(list(descriptor, Some(id)).await.len(), 4);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn learning_separate_main_updates_streamed_presentation_without_splitting_workspace_identity()
+{
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main checkout");
+    let metadata = root.join("separate metadata");
+    git(
+        &root,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+            main.to_str().unwrap(),
+        ],
+    );
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = root.join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let server =
+        spawn_with_failing_provider(ServerConfig::new(root.join("state"), "repo-label").unwrap())
+            .await
+            .unwrap();
+    let descriptor = server.descriptor();
+    let original = create(descriptor, &linked).await;
+    assert!(original.session.workspace.main_unknown());
+    let mut catalog = request(descriptor, reqwest::Method::GET, "/v1/session-events")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream()
+        .eventsource();
+    let initial = tokio::time::timeout(std::time::Duration::from_secs(2), catalog.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.event, SESSION_CATALOG_SNAPSHOT_EVENT);
+    let known = resolve(descriptor, &main, None).await;
+    assert_eq!(known.workspace.id, original.session.workspace.id);
+    assert_eq!(known.workspace.path, main);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = catalog.next().await.unwrap().unwrap();
+            if event.event == SESSION_CATALOG_UPDATED_EVENT {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let update: SessionCatalogUpdate = serde_json::from_str(&event.data).unwrap();
+    assert_eq!(
+        update.change,
+        SessionCatalogChange::Invalidated {
+            session_id: original.session.id
+        }
+    );
+    let relabeled = support::read_session(descriptor, original.session.id).await;
+    assert_eq!(relabeled.session.workspace, known.workspace);
+    assert_eq!(
+        relabeled.session.execution_directory,
+        original.session.execution_directory
+    );
+    assert_eq!(relabeled.prompts, original.prompts);
+    assert_eq!(relabeled.turns, original.turns);
+    let selected = resolve(descriptor, &linked, Some(known.workspace.id.clone())).await;
+    assert_eq!(selected.workspace.path, main);
+    assert!(
+        selected
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.association.root == main
+                && checkout.association.kind == CheckoutKind::Main)
+    );
+    assert_eq!(list(descriptor, Some(&known.workspace.id)).await.len(), 1);
+    std::fs::remove_dir_all(&main).unwrap();
+    let missing_main = resolve(descriptor, &linked, None).await;
+    assert_eq!(missing_main.workspace.id, known.workspace.id);
+    assert!(
+        missing_main
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.association.root == main
+                && matches!(
+                    checkout.availability,
+                    SourceControlAvailability::Unavailable { .. }
+                ))
+    );
+    drop(catalog);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bare_root_is_grouping_only_while_missing_git_leaves_ordinary_session_creation_usable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let bare = root.join("bare.git");
+    git(&root, &["init", "--bare", bare.to_str().unwrap()]);
+    let config = ServerConfig::new(root.join("state"), "bare-api").unwrap();
+    let server = spawn_with_failing_provider(config).await.unwrap();
+    assert!(
+        resolve(server.descriptor(), &bare, None)
+            .await
+            .execution_directory
+            .is_none()
+    );
+    let response = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            execution_directory: ExecutionDirectory { path: bare.clone() },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Never start here".to_owned(),
+                skill_invocations: vec![],
+            },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(list(server.descriptor(), None).await.is_empty());
+    server.shutdown().await.unwrap();
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(root.join("no-git-state"), "no-git").unwrap(),
+        vec![Arc::new(FailingProviderRuntime)],
+        ServerTimings::default(),
+        Arc::new(GitSourceControl::new(root.join("absent-git"))),
+    )
+    .await
+    .unwrap();
+    let ordinary = create(server.descriptor(), &root).await;
+    assert!(
+        matches!(ordinary.session.workspace.source_control, SourceControlAvailability::Unavailable { ref reason } if reason.contains("not installed"))
+    );
+    assert_eq!(ordinary.session.execution_directory.path, root);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main");
+    init(&main);
+    let linked = root.join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let missing = root.join("missing legacy");
+    std::fs::create_dir(&missing).unwrap();
+    let config = ServerConfig::new(root.join("state"), "legacy-repositories").unwrap();
+    let original = spawn_with_failing_provider(config.clone()).await.unwrap();
+    let readable = create(original.descriptor(), &main).await;
+    let corrupt_history = create(original.descriptor(), &linked).await;
+    let missing_legacy = create(original.descriptor(), &missing).await;
+    original.shutdown().await.unwrap();
+    let mut db =
+        diesel::SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+            .unwrap();
+    for snapshot in [&readable, &corrupt_history, &missing_legacy] {
+        diesel::sql_query("UPDATE sessions SET workspace = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(
+                serde_json::json!({"path": snapshot.session.execution_directory.path}).to_string(),
+            )
+            .bind::<diesel::sql_types::Text, _>(snapshot.session.id.to_string())
+            .execute(&mut db)
+            .unwrap();
+    }
+    diesel::sql_query("UPDATE prompts SET payload = '{' WHERE session_id = ?")
+        .bind::<diesel::sql_types::Text, _>(corrupt_history.session.id.to_string())
+        .execute(&mut db)
+        .unwrap();
+    std::fs::remove_dir(&missing).unwrap();
+    let resumed = spawn_with_failing_provider(config.clone()).await.unwrap();
+    let rows = list(resumed.descriptor(), Some(&readable.session.workspace.id)).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row, SessionListItem::Readable(_))),
+        "discovery must not hydrate malformed history"
+    );
+    let restored = support::read_session(resumed.descriptor(), readable.session.id).await;
+    assert_eq!(restored.prompts, readable.prompts);
+    assert_eq!(restored.turns, readable.turns);
+    assert_eq!(
+        restored.session.execution_directory,
+        readable.session.execution_directory
+    );
+    assert_eq!(restored.session.checkout, readable.session.checkout);
+    let unresolved = list(
+        resumed.descriptor(),
+        Some(&WorkspaceId::directory(&missing)),
+    )
+    .await;
+    assert_eq!(unresolved.len(), 1);
+    let SessionListItem::Readable(unresolved) = &unresolved[0] else {
+        panic!("legacy summary remains readable")
+    };
+    assert!(unresolved.session.workspace.repository.is_none());
+    assert_eq!(
+        request(
+            resumed.descriptor(),
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}", corrupt_history.session.id)
+        )
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    resumed.shutdown().await.unwrap();
+    let restarted = spawn_with_failing_provider(config).await.unwrap();
+    let restored = support::read_session(restarted.descriptor(), readable.session.id).await;
+    assert_eq!(restored.session.workspace, readable.session.workspace);
+    assert_eq!(restored.prompts, readable.prompts);
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_known_checkout_does_not_poison_readable_repository_on_restart() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main");
+    init(&main);
+    let linked = root.join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let config = ServerConfig::new(root.join("state"), "missing-checkout").unwrap();
+    let server = spawn_with_failing_provider(config.clone()).await.unwrap();
+    let main_session = create(server.descriptor(), &main).await;
+    let linked_session = create(server.descriptor(), &linked).await;
+    server.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&linked).unwrap();
+    let server = spawn_with_failing_provider(config.clone()).await.unwrap();
+    for row in list(
+        server.descriptor(),
+        Some(&main_session.session.workspace.id),
+    )
+    .await
+    {
+        let SessionListItem::Readable(row) = row else {
+            panic!("readable summary")
+        };
+        assert_eq!(
+            row.session.workspace.source_control,
+            SourceControlAvailability::Available
+        );
+    }
+    let known = support::read_session(server.descriptor(), linked_session.session.id).await;
+    assert_eq!(known.session.execution_directory.path, linked);
+    let resolution = resolve(server.descriptor(), &main, None).await;
+    assert!(
+        resolution
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.association.root == linked
+                && matches!(
+                    checkout.availability,
+                    SourceControlAvailability::Unavailable { .. }
+                ))
+    );
+    server.shutdown().await.unwrap();
+    std::fs::rename(main.join(".git"), root.join("moved-metadata")).unwrap();
+    let server = spawn_with_failing_provider(config).await.unwrap();
+    let rows = list(
+        server.descriptor(),
+        Some(&main_session.session.workspace.id),
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| matches!(row, SessionListItem::Readable(summary) if matches!(summary.session.workspace.source_control, SourceControlAvailability::Unavailable { .. }))));
+    // An ordinary Session can still execute in the surviving filesystem directory.
+    assert_eq!(
+        create(server.descriptor(), &main)
+            .await
+            .session
+            .execution_directory
+            .path,
+        main
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_creation_rejects_execution_directory_that_changed_since_discovery() {
+    struct PreviousDirectory(PathBuf);
+    #[async_trait::async_trait]
+    impl suru::source_control::SourceControl for PreviousDirectory {
+        async fn discover(&self, _directory: &Path) -> ResolvedWorkspace {
+            ResolvedWorkspace::directory(self.0.clone())
+        }
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let before = root.join("before");
+    let after = root.join("after");
+    std::fs::create_dir(&before).unwrap();
+    std::fs::create_dir(&after).unwrap();
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(root.join("state"), "changed-execution").unwrap(),
+        vec![Arc::new(FailingProviderRuntime)],
+        ServerTimings::default(),
+        Arc::new(PreviousDirectory(before)),
+    )
+    .await
+    .unwrap();
+    let response = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
+        .json(&CreateSessionRequest {
+            agent_selection: None,
+            execution_directory: ExecutionDirectory { path: after },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Do not mix directory contexts".to_owned(),
+                skill_invocations: vec![],
+            },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(list(server.descriptor(), None).await.is_empty());
+    server.shutdown().await.unwrap();
+}

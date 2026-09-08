@@ -514,7 +514,7 @@ fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
     );
     assert_eq!(
         session_picker_scope(&mut application),
-        SessionListScope::CurrentWorkspace(atlas),
+        SessionListScope::CurrentWorkspace((atlas).into()),
         "the subsequent valid pick switched normally"
     );
 }
@@ -565,7 +565,7 @@ fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
     );
     assert_eq!(
         session_picker_scope(&mut application),
-        SessionListScope::CurrentWorkspace(here.path().to_owned()),
+        SessionListScope::CurrentWorkspace((here.path().to_owned()).into()),
         "current-Workspace scope did not follow the refused path"
     );
 }
@@ -652,7 +652,7 @@ fn the_session_pickers_current_workspace_scope_comes_to_mean_the_chosen_workspac
 
     assert_eq!(
         session_picker_scope(&mut application),
-        SessionListScope::CurrentWorkspace(atlas),
+        SessionListScope::CurrentWorkspace((atlas).into()),
         "the picker's current-Workspace scope means the Workspace the reader chose"
     );
 }
@@ -1090,14 +1090,13 @@ fn workspace_in(root: &Path, name: &str) -> PathBuf {
 fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            checkout: None,
             context_fill: None,
             id: SessionId::new(),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
@@ -1408,4 +1407,174 @@ fn an_open_sessions_execution_context_is_independent_of_grouping_and_landing() {
     };
     assert_eq!(request.path, PathBuf::from("notes"));
     assert_eq!(request.base, Some(landing));
+}
+
+/// Server discovery owns grouping; the Client retains the precise launch
+/// directory and selects a Repository by identity even after its label changes.
+#[test]
+fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_context() {
+    use suru::protocol::{
+        Repository, RepositoryId, RepositoryLocation, ResolvedWorkspace, SourceControlAvailability,
+        SourceControlCapabilities,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let main = root.join("main");
+    let linked = root.join("linked");
+    let metadata = root.join("metadata");
+    std::fs::create_dir(&main).unwrap();
+    std::fs::create_dir(&linked).unwrap();
+    let execution = linked.join("nested");
+    std::fs::create_dir(&execution).unwrap();
+    let repository = Repository {
+        id: RepositoryId::from_metadata("git", &metadata),
+        system: "git".to_owned(),
+        metadata_directory: metadata.clone(),
+        location: RepositoryLocation::UnknownMain,
+        availability: SourceControlAvailability::Available,
+        capabilities: SourceControlCapabilities::discovery_only(),
+    };
+    let unknown = Workspace {
+        id: repository.id.workspace_id(),
+        path: metadata,
+        repository: Some(repository.clone()),
+        source_control: SourceControlAvailability::Available,
+    };
+    let mut known = unknown.clone();
+    known.path = main.clone();
+    known.repository.as_mut().unwrap().location = RepositoryLocation::Main { root: main.clone() };
+    let mut application = Application::new(&execution, Default::default());
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        request,
+    } = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424),
+        )))
+        .unwrap()
+    else {
+        panic!("launch context resolves on the owning Server")
+    };
+    assert_eq!(request.path, execution);
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(ResolvedWorkspace {
+                workspace: unknown.clone(),
+                execution_directory: Some(suru::protocol::ExecutionDirectory {
+                    path: execution.clone(),
+                }),
+                checkout: None,
+                checkouts: vec![],
+            }),
+        })
+        .unwrap();
+    let mut first = rooted("Linked Session", &execution, 20);
+    let SessionListItem::Readable(summary) = &mut first else {
+        unreachable!()
+    };
+    summary.session.workspace = unknown.clone();
+    open_picker_with(&mut application, vec![first.clone()]);
+    let rows = picker_rows_at(&application, 140, 18);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].contains("main checkout unknown"));
+    press(&mut application, KeyCode::Esc);
+    let mut second = rooted("Main Session", &main, 30);
+    let SessionListItem::Readable(summary) = &mut second else {
+        unreachable!()
+    };
+    summary.session.workspace = known.clone();
+    open_picker_with(&mut application, vec![second, first]);
+    let rows = picker_rows_at(&application, 140, 18);
+    assert_eq!(rows.len(), 1, "known and unknown main are one Repository");
+    assert!(rows[0].contains("[current]"));
+    let ApplicationTransition::ResolveWorkspace { request, .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    else {
+        panic!("selection resolves on the owning Server")
+    };
+    assert_eq!(request.workspace_id, Some(unknown.id));
+    assert_eq!(request.path, main);
+    // Merely receiving newer grouping labels did not change execution context.
+    press(&mut application, KeyCode::Esc);
+    assert!(
+        rendered_application_rows_at(&application, 180, 25)
+            .join("\n")
+            .contains("nested")
+    );
+}
+
+#[test]
+fn bare_repository_landing_requires_working_copy_before_creating_session() {
+    use suru::protocol::{
+        Repository, RepositoryId, RepositoryLocation, ResolvedWorkspace, SourceControlAvailability,
+        SourceControlCapabilities,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let repository = Repository {
+        id: RepositoryId::from_metadata("git", &root),
+        system: "git".to_owned(),
+        metadata_directory: root.clone(),
+        location: RepositoryLocation::Bare { root: root.clone() },
+        availability: SourceControlAvailability::Available,
+        capabilities: SourceControlCapabilities::discovery_only(),
+    };
+    let workspace = Workspace {
+        id: repository.id.workspace_id(),
+        path: root.clone(),
+        repository: Some(repository),
+        source_control: SourceControlAvailability::Available,
+    };
+    let mut application = Application::new(&root, Default::default());
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        ..
+    } = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424),
+        )))
+        .unwrap()
+    else {
+        panic!("resolve launch")
+    };
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(ResolvedWorkspace {
+                workspace,
+                execution_directory: None,
+                checkout: None,
+                checkouts: vec![],
+            }),
+        })
+        .unwrap();
+    assert!(
+        rendered_application_rows_at(&application, 160, 25)
+            .join("\n")
+            .contains("Choose a working copy")
+    );
+    type_terminal_text(&mut application, "Keep this draft");
+    let transition = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert_eq!(transition, ApplicationTransition::Continue);
+    let rendered = rendered_application_rows_at(&application, 160, 25).join("\n");
+    assert!(rendered.contains("Keep this draft"));
+    assert!(rendered.contains("working copy"));
 }

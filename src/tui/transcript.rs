@@ -5229,14 +5229,13 @@ mod tests {
             title: String::new(),
             emoji: None,
             session: Session {
+                checkout: None,
                 context_fill: None,
                 id: crate::protocol::SessionId::new(),
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: PathBuf::from("/workspace"),
                 },
-                workspace: Workspace {
-                    path: PathBuf::from("/workspace"),
-                },
+                workspace: Workspace::directory(PathBuf::from("/workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,

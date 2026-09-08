@@ -76,7 +76,14 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
             ready_health(instance_id, 42_424),
         )))
         .expect("handle connected event");
-    assert_eq!(managed_transition, ApplicationTransition::Continue);
+    assert!(matches!(
+        &managed_transition,
+        ApplicationTransition::ResolveWorkspace {
+            outlook: suru::protocol::Outlook::Local,
+            ..
+        }
+    ));
+    crate::support::answer_workspace_resolution(&mut application, managed_transition);
 
     let screen = rendered_application_rows(&application).join("\n");
     assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));

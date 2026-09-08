@@ -95,6 +95,11 @@ impl SessionStore {
             match loaded {
                 Ok(Some(mut persisted)) => {
                     let record = state.sessions.get(&id).expect("existence checked");
+                    // Preserve grouping learned without opening this history.
+                    persisted.snapshot.session.workspace =
+                        record.snapshot.session.workspace.clone();
+                    persisted.snapshot.session.checkout = record.snapshot.session.checkout.clone();
+                    persisted.snapshot.revision = record.snapshot.revision;
                     // Preserve the derived subtree reading and startup summary.
                     persisted.summary = record.summary.clone();
                     persisted.snapshot.session.working_since =

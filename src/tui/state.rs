@@ -115,16 +115,26 @@ enum OpeningLoadingState {
     Visible,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq)]
 pub enum SessionListScope {
-    CurrentWorkspace(PathBuf),
+    CurrentWorkspace(Workspace),
     AllWorkspaces,
 }
 
+impl PartialEq for SessionListScope {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::CurrentWorkspace(left), Self::CurrentWorkspace(right)) => left.id == right.id,
+            (Self::AllWorkspaces, Self::AllWorkspaces) => true,
+            _ => false,
+        }
+    }
+}
+
 impl SessionListScope {
-    pub(super) fn workspace_filter(&self) -> Option<&Path> {
+    pub(super) fn workspace_filter(&self) -> Option<&crate::protocol::WorkspaceId> {
         match self {
-            Self::CurrentWorkspace(workspace) => Some(workspace),
+            Self::CurrentWorkspace(workspace) => Some(&workspace.id),
             Self::AllWorkspaces => None,
         }
     }
@@ -133,7 +143,7 @@ impl SessionListScope {
     /// the client runs in — the flip a reader makes when a listing scoped to
     /// where they stand is too narrow, or too wide, for what they are after.
     #[cfg(test)]
-    pub(super) fn toggled(&self, current_workspace: &Path) -> Self {
+    pub(super) fn toggled(&self, current_workspace: &Workspace) -> Self {
         match self {
             Self::CurrentWorkspace(_) => Self::AllWorkspaces,
             Self::AllWorkspaces => Self::CurrentWorkspace(current_workspace.to_owned()),
@@ -346,8 +356,9 @@ pub struct TuiState {
     pub(super) selection_frames: RefCell<Vec<SelectionFrame>>,
     pub(super) selection_overlay_area: Cell<Option<ratatui::layout::Rect>>,
     pub(super) outlook: Outlook,
-    outlook_workspaces: HashMap<Outlook, PathBuf>,
-    outlook_execution_directories: HashMap<Outlook, PathBuf>,
+    outlook_workspaces: HashMap<Outlook, Workspace>,
+    outlook_execution_directories: HashMap<Outlook, Option<PathBuf>>,
+    initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
     pub(super) identity: Option<ServerIdentity>,
@@ -355,8 +366,8 @@ pub struct TuiState {
     /// Manual stop preserves the last confirmed identity as useful final context.
     pub(super) manually_stopped: bool,
     pub(super) fatal_error: Option<String>,
-    pub(super) workspace: PathBuf,
-    pub(super) execution_directory: PathBuf,
+    pub(super) workspace: Workspace,
+    pub(super) execution_directory: Option<PathBuf>,
     pub(super) composers: ComposerMemory,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
@@ -454,7 +465,7 @@ pub struct TuiState {
 enum OutlookTurn {
     Deliberate,
     SessionRow {
-        fallback_workspace: PathBuf,
+        fallback_workspace: Workspace,
         fallback_execution_directory: PathBuf,
     },
 }
@@ -530,16 +541,23 @@ impl TuiState {
             selection_frames: RefCell::new(Vec::new()),
             selection_overlay_area: Cell::new(None),
             outlook: Outlook::Local,
-            outlook_workspaces: HashMap::from([(Outlook::Local, workspace.clone())]),
-            outlook_execution_directories: HashMap::from([(Outlook::Local, workspace.clone())]),
+            outlook_workspaces: HashMap::from([(
+                Outlook::Local,
+                Workspace::directory(workspace.clone()),
+            )]),
+            outlook_execution_directories: HashMap::from([(
+                Outlook::Local,
+                Some(workspace.clone()),
+            )]),
+            initial_context_resolved: false,
             workspace_resolution_sequence: 0,
             pending_workspace_resolutions: HashMap::new(),
             identity: None,
             recovery: None,
             manually_stopped: false,
             fatal_error: None,
-            workspace: workspace.clone(),
-            execution_directory: workspace.clone(),
+            workspace: Workspace::directory(workspace.clone()),
+            execution_directory: Some(workspace.clone()),
             composers: ComposerMemory::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
@@ -603,21 +621,22 @@ impl TuiState {
     /// Adoption is all this is. The Sidebar's own scope is the reader's to
     /// choose, and the path entry re-points it separately, so nothing here
     /// rearranges a column they configured.
-    fn adopt_workspace(&mut self, workspace: PathBuf) {
+    fn adopt_context(&mut self, context: crate::protocol::ResolvedWorkspace) {
+        self.execution_directory = context.execution_directory.map(|directory| directory.path);
+        self.workspace = context.workspace.clone();
         self.outlook_workspaces
-            .insert(self.outlook.clone(), workspace.clone());
-        self.workspace = workspace.clone();
-        self.execution_directory = workspace.clone();
+            .insert(self.outlook.clone(), context.workspace.clone());
         self.outlook_execution_directories
-            .insert(self.outlook.clone(), workspace.clone());
-        self.session_picker.adopt_workspace(workspace.clone());
-        self.workspace_picker.adopt_workspace(workspace.clone());
-        self.sidebar.adopt_workspace(workspace);
+            .insert(self.outlook.clone(), self.execution_directory.clone());
+        self.session_picker
+            .adopt_workspace(context.workspace.clone());
+        self.workspace_picker
+            .adopt_workspace(context.workspace.clone());
+        self.sidebar.adopt_workspace(context.workspace);
+        self.sidebar
+            .adopt_execution_directory(self.execution_directory.clone());
     }
 
-    /// Stops waiting on a Session being opened, on every surface that can be
-    /// waiting. The work itself is the run loop's to let go of; this is the
-    /// presentation that went with it.
     fn abandon_pending_attachment(&mut self) {
         self.sidebar.abandon_attachment();
         self.session_picker.abandon_attachment();
@@ -708,7 +727,7 @@ impl TuiState {
     fn turn_outlook_for_session(
         &mut self,
         target: SessionReference,
-        workspace: PathBuf,
+        workspace: Workspace,
         execution_directory: PathBuf,
     ) {
         let remembers_workspace = self.outlook_workspaces.contains_key(&target.origin);
@@ -733,12 +752,12 @@ impl TuiState {
             return;
         }
         let (fallback_workspace, fallback_execution_directory, adopt_sidebar): (
-            PathBuf,
+            Workspace,
             PathBuf,
             fn(&mut Sidebar, Outlook),
         ) = match turn {
             OutlookTurn::Deliberate => (
-                PathBuf::from("."),
+                Workspace::directory(PathBuf::from(".")),
                 PathBuf::from("."),
                 Sidebar::adopt_outlook,
             ),
@@ -764,7 +783,7 @@ impl TuiState {
             .outlook_execution_directories
             .get(&outlook)
             .cloned()
-            .unwrap_or(fallback_execution_directory);
+            .unwrap_or(Some(fallback_execution_directory));
         self.leave_session_route();
         self.session_events_blocked = true;
         self.pending_submission = None;
@@ -872,10 +891,11 @@ impl TuiState {
             return None;
         }
         let selection = self.agent_selection()?;
-        let execution_directory = self.session.as_ref().map_or_else(
-            || self.execution_directory.clone(),
-            |session| session.snapshot().session.execution_directory.path.clone(),
-        );
+        let execution_directory = self
+            .session
+            .as_ref()
+            .map(|session| session.snapshot().session.execution_directory.path.clone())
+            .or_else(|| self.execution_directory.clone())?;
         let execution_directory = match self.outlook {
             Outlook::Local => workspace_reading(&execution_directory),
             Outlook::Remote(_) => execution_directory,
@@ -2600,7 +2620,7 @@ pub enum ApplicationEvent {
         outlook: Outlook,
         surface: WorkspaceResolutionSurface,
         request_id: u64,
-        result: std::result::Result<Workspace, String>,
+        result: std::result::Result<crate::protocol::ResolvedWorkspace, String>,
     },
 }
 
@@ -3229,7 +3249,7 @@ impl Application {
                 }
                 match result {
                     Ok(workspace) => {
-                        self.state.adopt_workspace(workspace.path.clone());
+                        self.state.adopt_context(workspace.clone());
                         match surface {
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.sidebar.refresh_after_outlook_workspace();
@@ -3240,7 +3260,12 @@ impl Application {
                                 Ok(self.open_landing())
                             }
                             WorkspaceResolutionSurface::Sidebar => {
-                                match self.state.sidebar.accept_workspace(workspace.path) {
+                                let activation =
+                                    self.state.sidebar.accept_workspace(workspace.workspace);
+                                self.state.sidebar.adopt_execution_directory(
+                                    self.state.execution_directory.clone(),
+                                );
+                                match activation {
                                     SidebarActivation::CatalogOriginsChanged => {
                                         Ok(ApplicationTransition::ReconcileCatalogOrigins {
                                             catalog_origins: self.state.catalog_origins(),
@@ -3900,8 +3925,9 @@ impl Application {
                         surface: WorkspaceResolutionSurface::WorkspacePicker,
                         request_id,
                         request: ResolveWorkspaceRequest {
+                            workspace_id: Some(workspace.id),
                             base: None,
-                            path: workspace,
+                            path: workspace.path,
                         },
                     };
                 }
@@ -4444,6 +4470,11 @@ impl Application {
             self.state.composer_completion.dismiss_active();
             return ApplicationTransition::Continue;
         }
+        if !matches!(key, ComposerKey::Session(_)) && self.state.execution_directory.is_none() {
+            self.state.submission_error =
+                Some("Choose a working copy before starting a Session".to_owned());
+            return ApplicationTransition::Continue;
+        }
         let prompt = self.state.composers.begin_submission(key.clone());
         self.state.sync_composer_completion();
         self.state.failed_submissions.remove(&prompt.id);
@@ -4467,7 +4498,11 @@ impl Application {
         ApplicationTransition::CreateSession(CreateSessionRequest {
             agent_selection: self.state.landing_agent_selection.clone(),
             execution_directory: crate::protocol::ExecutionDirectory {
-                path: self.state.execution_directory.clone(),
+                path: self
+                    .state
+                    .execution_directory
+                    .clone()
+                    .expect("Landing execution checked before submission"),
             },
             prompt,
         })
@@ -4490,9 +4525,32 @@ impl Application {
                 Ok(ApplicationTransition::Exit)
             }
             event => {
+                let resolve_launch = matches!(&event, ManagedEvent::Connected(_))
+                    && !self.state.initial_context_resolved
+                    && self.state.outlook == Outlook::Local;
                 let had_session = self.state.session.is_some();
                 self.state.apply(event);
                 self.state.reconcile_command_mode();
+                if resolve_launch {
+                    self.state.initial_context_resolved = true;
+                    let request_id = self
+                        .state
+                        .begin_workspace_resolution(WorkspaceResolutionSurface::Outlook);
+                    return Ok(ApplicationTransition::ResolveWorkspace {
+                        outlook: Outlook::Local,
+                        surface: WorkspaceResolutionSurface::Outlook,
+                        request_id,
+                        request: ResolveWorkspaceRequest {
+                            workspace_id: None,
+                            base: None,
+                            path: self
+                                .state
+                                .execution_directory
+                                .clone()
+                                .unwrap_or_else(|| self.state.workspace.path.clone()),
+                        },
+                    });
+                }
                 if had_session && self.state.session.is_none() {
                     Ok(ApplicationTransition::SessionEnded)
                 } else {

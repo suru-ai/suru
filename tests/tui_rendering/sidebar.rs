@@ -1046,14 +1046,13 @@ fn listed(
 ) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            checkout: None,
             context_fill: None,
             id: SessionId::new(),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,
@@ -1536,9 +1535,7 @@ fn unreadable_from(title: &str, workspace: &Path, created_at: u64) -> SessionLis
         title: title.to_owned(),
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(now()),
-        workspace: Some(Workspace {
-            path: workspace.to_owned(),
-        }),
+        workspace: Some(Workspace::directory(workspace.to_owned())),
     })
 }
 
@@ -2795,9 +2792,7 @@ fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
                 title: "Unreadable work".to_owned(),
                 created_at: SessionTimestamp(days_ago(90)),
                 updated_at: SessionTimestamp(days_ago(60)),
-                workspace: Some(Workspace {
-                    path: workspace.path().to_owned(),
-                }),
+                workspace: Some(Workspace::directory(workspace.path().to_owned())),
             }),
             listed("Left alone", None, workspace.path(), 1, days_ago(5)),
         ],
@@ -4555,7 +4550,7 @@ fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook
     };
     assert_eq!(
         request.scope(),
-        &SessionListScope::CurrentWorkspace(first_workspace.clone())
+        &SessionListScope::CurrentWorkspace((first_workspace.clone()).into())
     );
     application
         .handle_event(ApplicationEvent::Command(CommandId::CloseSessionPicker))
@@ -4585,7 +4580,7 @@ fn a_pointer_turn_uses_the_sessions_workspace_then_remembers_it_for_that_outlook
     };
     assert_eq!(
         request.scope(),
-        &SessionListScope::CurrentWorkspace(first_workspace),
+        &SessionListScope::CurrentWorkspace((first_workspace).into()),
         "returning to an Outlook keeps its remembered Workspace instead of adopting another row's"
     );
 }
@@ -6099,7 +6094,7 @@ fn esc_cancels_a_workspace_resolution_still_in_flight() {
             outlook,
             surface,
             request_id,
-            result: Ok(Workspace { path: added }),
+            result: Ok(suru::protocol::ResolvedWorkspace::directory(added)),
         })
         .expect("deliver the result that lost the cancellation race");
 
@@ -6177,9 +6172,7 @@ fn hiding_the_sidebar_cancels_its_workspace_resolution() {
             outlook,
             surface,
             request_id,
-            result: Ok(Workspace {
-                path: added.clone(),
-            }),
+            result: Ok(suru::protocol::ResolvedWorkspace::directory(added.clone())),
         })
         .expect("deliver the result that lost the hide race");
     let ApplicationTransition::ListSessions(request) = application
@@ -6190,7 +6183,10 @@ fn hiding_the_sidebar_cancels_its_workspace_resolution() {
     else {
         panic!("opening the Session picker asks for its Sessions");
     };
-    assert_ne!(request.scope(), &SessionListScope::CurrentWorkspace(added));
+    assert_ne!(
+        request.scope(),
+        &SessionListScope::CurrentWorkspace((added).into())
+    );
 }
 
 /// The arrows reach the affordance as they reach the selector beside it: the
@@ -6365,7 +6361,7 @@ fn the_session_picker_narrows_to_the_workspace_the_reader_added() {
     };
     assert_eq!(
         request.scope(),
-        &SessionListScope::CurrentWorkspace(canonical),
+        &SessionListScope::CurrentWorkspace((canonical).into()),
         "the picker asks for the Workspace the reader now works in"
     );
 }

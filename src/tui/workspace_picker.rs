@@ -23,10 +23,10 @@ pub(super) struct WorkspacePicker {
     /// against each one's name the way the session picker reads its own query
     /// against a Title.
     query: String,
-    /// The Workspace the reader is on, held as its path rather than as a row
+    /// The Workspace the reader is on, held by identity rather than as a row
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
-    selected: Option<PathBuf>,
+    selected: Option<crate::protocol::WorkspaceId>,
     /// Why the selected Workspace could not be read when the reader chose it.
     /// It belongs to the picker rather than to the listing: the row is still
     /// true of past work even when its directory has since disappeared.
@@ -48,7 +48,7 @@ pub(super) struct WorkspacePickerRow {
 }
 
 impl WorkspacePicker {
-    pub(super) fn new(current_workspace: PathBuf) -> Self {
+    pub(super) fn new(current_workspace: impl Into<crate::protocol::Workspace>) -> Self {
         Self {
             paths: None,
             open: false,
@@ -122,7 +122,7 @@ impl WorkspacePicker {
 
     /// Takes the Workspace this client has moved to, so the picker marks as
     /// current — and stands first — where the reader now is.
-    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
+    pub(super) fn adopt_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
         self.listing.adopt_current_workspace(workspace);
     }
 
@@ -182,8 +182,10 @@ impl WorkspacePicker {
     /// The Workspace the row the reader is on names, which is the one choosing
     /// takes. There is none while the listing is on its way: no row is marked,
     /// so Enter names nothing rather than naming whatever would stand first.
-    pub(super) fn offer_selected(&mut self) -> Option<PathBuf> {
-        self.selected.clone()
+    pub(super) fn offer_selected(&mut self) -> Option<crate::protocol::Workspace> {
+        self.offered()
+            .into_iter()
+            .find(|workspace| Some(&workspace.id) == self.selected.as_ref())
     }
 
     pub(super) fn fail_resolution(&mut self, error: String) {
@@ -210,11 +212,15 @@ impl WorkspacePicker {
         let current = self.listing.current_workspace().to_owned();
         self.offered()
             .into_iter()
-            .map(|path| WorkspacePickerRow {
-                name: self.name(&path),
-                current: path == current,
-                selected: self.selected.as_ref() == Some(&path),
-                path,
+            .map(|workspace| WorkspacePickerRow {
+                name: if workspace.main_unknown() {
+                    format!("{} (main checkout unknown)", self.name(&workspace.path))
+                } else {
+                    self.name(&workspace.path)
+                },
+                current: workspace.id == current.id,
+                selected: self.selected.as_ref() == Some(&workspace.id),
+                path: workspace.path,
             })
             .collect()
     }
@@ -236,18 +242,18 @@ impl WorkspacePicker {
     /// A query takes rows away and never rearranges the ones it leaves, so a
     /// reader narrowing the list goes on reading it in the order they learned
     /// it in.
-    fn offered(&self) -> Vec<PathBuf> {
+    fn offered(&self) -> Vec<crate::protocol::Workspace> {
         let current = self.listing.current_workspace().to_owned();
         let mut offered = self
             .listing
             .workspaces()
             .into_iter()
-            .filter(|path| fuzzy_matches(&self.query, &self.name(path)))
+            .filter(|path| fuzzy_matches(&self.query, &self.name(&path.path)))
             .collect::<Vec<_>>();
         // A stable sort on "is this not where I am", so the current Workspace
         // takes the first row and the rest keep the order the listing derived
         // them in, which is already newest work first.
-        offered.sort_by_key(|path| *path != current);
+        offered.sort_by_key(|path| path.id != current.id);
         offered
     }
 
@@ -261,11 +267,11 @@ impl WorkspacePicker {
         let current = self
             .selected
             .as_ref()
-            .and_then(|selected| offered.iter().position(|path| path == selected))
+            .and_then(|selected| offered.iter().position(|path| &path.id == selected))
             .unwrap_or(0);
         let length = offered.len() as isize;
         let next = (current as isize + distance).rem_euclid(length) as usize;
-        self.selected = Some(offered[next].clone());
+        self.selected = Some(offered[next].id.clone());
     }
 
     /// Puts the reader on a row that is still offered: the one they were on
@@ -277,10 +283,10 @@ impl WorkspacePicker {
         if self
             .selected
             .as_ref()
-            .is_some_and(|selected| offered.contains(selected))
+            .is_some_and(|selected| offered.iter().any(|workspace| &workspace.id == selected))
         {
             return;
         }
-        self.selected = offered.first().cloned();
+        self.selected = offered.first().map(|workspace| workspace.id.clone());
     }
 }

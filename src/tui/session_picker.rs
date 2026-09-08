@@ -97,7 +97,7 @@ pub(super) struct SessionPickerRow<'a> {
 }
 
 impl SessionPicker {
-    pub(super) fn new(current_workspace: PathBuf) -> Self {
+    pub(super) fn new(current_workspace: impl Into<crate::protocol::Workspace>) -> Self {
         Self {
             open: false,
             listing: SessionListing::new(SessionListSurface::SessionPicker, current_workspace),
@@ -130,7 +130,7 @@ impl SessionPicker {
 
     /// Takes the Workspace this client has moved to, so the picker's own
     /// narrowing to "where I am" narrows to where the reader now is.
-    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
+    pub(super) fn adopt_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
         self.listing.adopt_current_workspace(workspace);
     }
 
@@ -402,14 +402,17 @@ impl SessionPicker {
         Some(selected)
     }
 
-    pub(super) fn context_of(&self, reference: &SessionReference) -> Option<(PathBuf, PathBuf)> {
+    pub(super) fn context_of(
+        &self,
+        reference: &SessionReference,
+    ) -> Option<(crate::protocol::Workspace, PathBuf)> {
         self.sessions()
             .into_iter()
             .find(|session| session.reference() == reference)
             .and_then(|session| session.readable())
             .map(|summary| {
                 (
-                    summary.session.workspace.path.clone(),
+                    summary.session.workspace.clone(),
                     summary.session.execution_directory.path.clone(),
                 )
             })

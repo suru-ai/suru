@@ -41,14 +41,13 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: None,
             id: SessionId::new(),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status: SessionStatus::Idle,

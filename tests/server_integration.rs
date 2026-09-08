@@ -1998,6 +1998,17 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
 async fn outlook_client_resolves_workspace_paths_on_its_remote() {
     let pair = paired_servers("remote-workspace-resolution").await;
     let root = tempfile::tempdir().expect("create Remote Workspace root");
+    let initialized = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root.path())
+        .args(["init", "-b", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
     let nested = root.path().join("nested");
     std::fs::create_dir(&nested).expect("create nested Remote Workspace");
     let remote = pair
@@ -2006,6 +2017,7 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
 
     let resolved = remote
         .resolve_workspace(ResolveWorkspaceRequest {
+            workspace_id: None,
             base: Some(root.path().to_owned()),
             path: "nested".into(),
         })
@@ -2013,9 +2025,18 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
         .expect("resolve the path on the Remote");
 
     assert_eq!(
-        resolved.path,
-        std::fs::canonicalize(nested).expect("read canonical fixture path")
+        resolved.workspace.path,
+        std::fs::canonicalize(root.path()).expect("read canonical Repository root")
     );
+    assert_eq!(
+        resolved.execution_directory.unwrap().path,
+        std::fs::canonicalize(nested).unwrap()
+    );
+    assert!(resolved.workspace.repository.is_some());
+    assert!(matches!(
+        resolved.checkouts[0].revision,
+        Some(suru::protocol::CheckoutRevision::Branch { commit: None, .. })
+    ));
     pair.shutdown().await;
 }
 

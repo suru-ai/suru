@@ -546,7 +546,7 @@ impl OutlookClient {
     pub async fn resolve_workspace(
         &self,
         request: ResolveWorkspaceRequest,
-    ) -> Result<crate::protocol::Workspace> {
+    ) -> Result<crate::protocol::ResolvedWorkspace> {
         self.commands.resolve_workspace(request).await
     }
 
@@ -668,7 +668,7 @@ impl SessionCommandClient {
     pub(crate) async fn resolve_workspace(
         &self,
         request: ResolveWorkspaceRequest,
-    ) -> Result<crate::protocol::Workspace> {
+    ) -> Result<crate::protocol::ResolvedWorkspace> {
         self.post_session_command("/v1/workspaces/resolve", &request, "Workspace resolution")
             .await
     }
@@ -1073,6 +1073,29 @@ impl SessionCommandClient {
             &format!("/v1/sessions/{session_id}/viewed"),
             &request,
             "Session viewed",
+        )
+        .await
+    }
+
+    pub(crate) async fn list_workspace_sessions(
+        &self,
+        workspace: Option<&crate::protocol::WorkspaceId>,
+    ) -> Result<Vec<SessionListItem>> {
+        let descriptor = self.descriptor.borrow().clone();
+        let mut request = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/sessions",
+            )?)
+            .bearer_auth(&descriptor.token);
+        if let Some(workspace) = workspace {
+            request = request.query(&[("workspace_id", &workspace.0)]);
+        }
+        decode_api_response(
+            request.send().await.context("send Session listing")?,
+            "Session listing",
         )
         .await
     }

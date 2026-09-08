@@ -1,0 +1,126 @@
+use super::SessionStore;
+use crate::{
+    protocol::{SessionChange, SessionId, Workspace, WorkspaceId},
+    source_control::SourceControlService,
+};
+
+impl SessionStore {
+    pub(crate) fn known_workspace(&self, id: &WorkspaceId) -> Option<Workspace> {
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .find(|record| &record.summary.session.workspace.id == id)
+            .map(|record| record.summary.session.workspace.clone())
+    }
+    pub(crate) async fn discover_workspaces(
+        &self,
+        source_control: &SourceControlService,
+    ) -> anyhow::Result<()> {
+        let sessions = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .map(|record| record.snapshot.session.clone())
+            .collect::<Vec<_>>();
+        for session in &sessions {
+            source_control.remember(&session.workspace);
+        }
+        let mut discovered: std::collections::HashMap<
+            std::path::PathBuf,
+            crate::protocol::ResolvedWorkspace,
+        > = std::collections::HashMap::new();
+        for session in sessions {
+            let resolution =
+                if let Some(resolution) = discovered.get(&session.execution_directory.path) {
+                    resolution.clone()
+                } else if let Some(resolution) = discovered.values().find_map(|resolution| {
+                    source_control.reuse_discovery(&session.execution_directory.path, resolution)
+                }) {
+                    discovered.insert(session.execution_directory.path.clone(), resolution.clone());
+                    resolution
+                } else {
+                    let resolution = source_control
+                        .resolve(&session.execution_directory.path, Some(&session.workspace))
+                        .await;
+                    discovered.insert(session.execution_directory.path.clone(), resolution.clone());
+                    resolution
+                };
+            self.regroup(
+                session.id,
+                resolution.workspace,
+                resolution.checkout.or(session.checkout),
+            )?;
+        }
+        self.refresh_repository_labels(source_control)
+    }
+    pub(crate) fn refresh_repository_labels(
+        &self,
+        source_control: &SourceControlService,
+    ) -> anyhow::Result<()> {
+        let workspaces = source_control.workspaces();
+        let changes = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .filter_map(|record| {
+                let session = &record.snapshot.session;
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == session.workspace.id)
+                    .map(|workspace| (session.id, workspace.clone(), session.checkout.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (id, workspace, checkout) in changes {
+            self.regroup(id, workspace, checkout)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn regroup(
+        &self,
+        id: SessionId,
+        workspace: Workspace,
+        checkout: Option<crate::protocol::CheckoutAssociation>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let Some(record) = state.sessions.get_mut(&id) else {
+            return Ok(());
+        };
+        if record.snapshot.session.workspace == workspace
+            && record.snapshot.session.checkout == checkout
+        {
+            return Ok(());
+        }
+        let update = crate::protocol::SessionUpdate {
+            session_id: id,
+            revision: crate::protocol::SessionRevision(
+                record
+                    .snapshot
+                    .revision
+                    .0
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Session revision exhausted"))?,
+            ),
+            changes: vec![SessionChange::WorkspaceChanged {
+                workspace,
+                checkout,
+            }],
+        };
+        crate::session_projection::apply_update(&mut record.snapshot, &update)?;
+        record.summary.session = record.snapshot.session.clone();
+        self.storage
+            .location_changed(record.snapshot.session.clone(), record.snapshot.revision)?;
+        let _ = record.updates.send(update);
+        if record.snapshot.session.parent.is_none() {
+            state.publish_catalog_change(crate::protocol::SessionCatalogChange::Invalidated {
+                session_id: id,
+            });
+        }
+        Ok(())
+    }
+}

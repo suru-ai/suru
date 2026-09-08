@@ -90,7 +90,7 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
         );
         assert_eq!(snapshot.revision, SessionRevision(7));
     }
-    let listed = store.list(None).unwrap();
+    let listed = store.list(None);
     assert_eq!(listed.len(), 3);
     for item in listed {
         let crate::protocol::SessionListItem::Readable(summary) = item else {
@@ -161,7 +161,7 @@ async fn restore_tree(wide: bool) {
             .output_tokens,
         Some(1)
     );
-    assert_eq!(store.list(None).unwrap().len(), 1);
+    assert_eq!(store.list(None).len(), 1);
     writer.shutdown().await.unwrap();
 }
 
@@ -289,7 +289,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
         },
         sink,
     );
-    assert_eq!(store.list(None).unwrap().len(), 1);
+    assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
     writer.shutdown().await.unwrap();
 }
@@ -300,14 +300,13 @@ pub(super) fn record_work(count: usize) {
 
 fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
     let session = Session {
+        checkout: None,
         context_fill: None,
         id: SessionId::new(),
         execution_directory: crate::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
         },
-        workspace: Workspace {
-            path: workspace.to_owned(),
-        },
+        workspace: Workspace::directory(workspace.to_owned()),
         agent_selection: None,
         agent_selection_availability: ModelAvailability::Unavailable,
         status: SessionStatus::Idle,
@@ -356,7 +355,7 @@ async fn restoring_independent_roots_does_linear_relationship_work() {
     WORK.set(0);
     let store = SessionStore::new(restored, sink);
     let work = WORK.get();
-    assert_eq!(store.list(None).unwrap().len(), 128);
+    assert_eq!(store.list(None).len(), 128);
     assert!(
         work <= 128 * 8,
         "128 roots required {work} restoration operations"

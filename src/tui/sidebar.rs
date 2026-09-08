@@ -69,11 +69,23 @@ const NAME_A_DIRECTORY: &str = "Name a directory";
 /// the same type, or a later hand would be free to send this one — and the
 /// selector would empty itself the first time it was used. The initial-scope
 /// Setting seeds it and the selector moves it; nothing writes it back.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq)]
 pub(super) enum SidebarListingScope {
     Everywhere,
     AllWorkspaces,
-    Workspace(PathBuf),
+    Workspace(crate::protocol::Workspace),
+}
+
+impl PartialEq for SidebarListingScope {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Workspace(left), Self::Workspace(right)) => left.id == right.id,
+            (Self::Everywhere, Self::Everywhere) | (Self::AllWorkspaces, Self::AllWorkspaces) => {
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl SidebarListingScope {
@@ -83,7 +95,14 @@ impl SidebarListingScope {
         match self {
             Self::Everywhere => EVERYWHERE.to_owned(),
             Self::AllWorkspaces => ALL_WORKSPACES.to_owned(),
-            Self::Workspace(workspace) => name(workspace),
+            Self::Workspace(workspace) => {
+                let name = name(&workspace.path);
+                if workspace.main_unknown() {
+                    format!("{name} (main checkout unknown)")
+                } else {
+                    name
+                }
+            }
         }
     }
 
@@ -101,7 +120,7 @@ impl SidebarListingScope {
             Self::Everywhere | Self::AllWorkspaces => true,
             Self::Workspace(workspace) => session
                 .workspace()
-                .is_none_or(|rooted| rooted.path == *workspace),
+                .is_none_or(|rooted| rooted.id == workspace.id),
         }
     }
 }
@@ -117,7 +136,7 @@ impl SidebarListingScope {
 /// squeezes the Sidebar out forgets nothing.
 #[derive(Clone, Debug)]
 pub(super) struct Sidebar {
-    execution_directory: PathBuf,
+    execution_directory: Option<PathBuf>,
     revealed: bool,
     /// Whether the reader is driving the Sidebar rather than the composer.
     /// Opening it themselves is what claims the keys; Esc, the toggle, and the
@@ -618,7 +637,7 @@ pub(super) enum SidebarActivation {
     RetryCatalogOrigin(SessionListRequest),
     Attach {
         session: SessionReference,
-        workspace: PathBuf,
+        workspace: crate::protocol::Workspace,
         execution_directory: PathBuf,
     },
     /// The reader named a directory to work in. It is the client's current
@@ -747,9 +766,10 @@ impl Sidebar {
     /// A Sidebar listing every Workspace's Sessions, which is the whole body of
     /// work a reader has. Narrowing to one of them is the selector's job, and
     /// the initial-scope Setting's before that.
-    pub(super) fn new(current_workspace: PathBuf) -> Self {
+    pub(super) fn new(current_workspace: impl Into<crate::protocol::Workspace>) -> Self {
+        let current_workspace = current_workspace.into();
         Self {
-            execution_directory: current_workspace.clone(),
+            execution_directory: Some(current_workspace.path.clone()),
             // Down until the initial-visibility Setting raises it. A Sidebar with no
             // Settings in hand has not spoken to a server either, so it has
             // nothing to list; drawing one before the snapshot lands would put
@@ -1708,7 +1728,7 @@ impl Sidebar {
             .and_then(|session| session.readable())
             .expect("a readable Sidebar Session carries its context")
             .session;
-        let workspace = context.workspace.path.clone();
+        let workspace = context.workspace.clone();
         let execution_directory = context.execution_directory.path.clone();
         self.listing.clear_error();
         self.attaching = Some(wanted.clone());
@@ -1766,7 +1786,8 @@ impl Sidebar {
             return self.refuse_workspace(NAME_A_DIRECTORY);
         }
         SidebarActivation::ResolveWorkspace(ResolveWorkspaceRequest {
-            base: Some(self.execution_directory.clone()),
+            workspace_id: None,
+            base: self.execution_directory.clone(),
             path: PathBuf::from(named),
         })
     }
@@ -1780,7 +1801,11 @@ impl Sidebar {
         SidebarActivation::Answered
     }
 
-    pub(super) fn accept_workspace(&mut self, workspace: PathBuf) -> SidebarActivation {
+    pub(super) fn accept_workspace(
+        &mut self,
+        workspace: impl Into<crate::protocol::Workspace>,
+    ) -> SidebarActivation {
+        let workspace = workspace.into();
         let left_everywhere = self.scope == SidebarListingScope::Everywhere;
         self.hand_back_keys();
         self.adopt_workspace(workspace.clone());
@@ -1804,12 +1829,13 @@ impl Sidebar {
     /// where they put it — switching Workspaces is navigation, and narrowing
     /// the column is a view they configured — so re-pointing it is the
     /// separate act [`Self::narrow_to_workspace`] is for.
-    pub(super) fn adopt_execution_directory(&mut self, execution_directory: PathBuf) {
+    pub(super) fn adopt_execution_directory(&mut self, execution_directory: Option<PathBuf>) {
         self.execution_directory = execution_directory;
     }
 
-    pub(super) fn adopt_workspace(&mut self, workspace: PathBuf) {
-        self.execution_directory = workspace.clone();
+    pub(super) fn adopt_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
+        let workspace = workspace.into();
+        self.execution_directory = Some(workspace.path.clone());
         self.listing.adopt_current_workspace(workspace);
     }
 
@@ -1862,7 +1888,8 @@ impl Sidebar {
     /// the composer, and row focus went with them: what the column says now is
     /// which Session is open and which Workspace it is narrowed to, neither of
     /// which is a claim about where Enter would land.
-    pub(super) fn narrow_to_workspace(&mut self, workspace: PathBuf) {
+    pub(super) fn narrow_to_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
+        let workspace = workspace.into();
         self.choose_scope(SidebarListingScope::Workspace(workspace));
     }
 
@@ -1937,7 +1964,12 @@ impl Sidebar {
     /// The selector as a frame draws it.
     pub(super) fn selector(&self, name: &dyn Fn(&Path) -> String) -> SidebarSelectorView {
         SidebarSelectorView {
-            label: self.scope.label(name),
+            label: self
+                .scopes()
+                .into_iter()
+                .find(|scope| scope == &self.scope)
+                .unwrap_or_else(|| self.scope.clone())
+                .label(name),
             open: self.selector_open,
             focused: self.focus == Some(SidebarFocus::Selector),
             adding: self.focus == Some(SidebarFocus::AddWorkspace),
@@ -2174,7 +2206,7 @@ impl Sidebar {
         // population by which held work most recently; the divergence is
         // deliberate — a persistent list wants entries that stay put, a
         // choose-and-dismiss picker wants the likeliest target near the top.
-        workspaces.sort_unstable();
+        workspaces.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         [
             SidebarListingScope::Everywhere,
             SidebarListingScope::AllWorkspaces,
@@ -3473,14 +3505,13 @@ mod tests {
     fn summary(title: &str, created_at: u64, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(Box::new(SessionSummary {
             session: Session {
+                checkout: None,
                 context_fill: None,
                 id: SessionId::new(),
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: root().join("workspace"),
                 },
-                workspace: Workspace {
-                    path: root().join("workspace"),
-                },
+                workspace: Workspace::directory(root().join("workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,

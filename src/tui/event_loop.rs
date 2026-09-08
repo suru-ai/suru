@@ -21,7 +21,7 @@ use crate::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         ModelCatalog, Outlook, PromptId, ResolveWorkspaceRequest, SessionId, SessionListItem,
         SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, SkillCatalog,
-        SkillCatalogRequest, UpdateAgentSelectionRequest, Workspace,
+        SkillCatalogRequest, UpdateAgentSelectionRequest,
     },
 };
 use anyhow::{Result, anyhow};
@@ -862,6 +862,7 @@ impl RunLoop {
                             .pending_workspace_resolution(WorkspaceResolutionSurface::Outlook)
                             .expect("turning toward a remote begins Workspace resolution"),
                         ResolveWorkspaceRequest {
+                            workspace_id: None,
                             base: None,
                             path: PathBuf::from("."),
                         },
@@ -1011,9 +1012,13 @@ impl RunLoop {
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
             // The shutdown state is worth one last frame before the screen goes.
             ApplicationTransition::Exit => return Ok(ControlFlow::Break(Exit::AfterFinalFrame)),
-            // The one command a managed event issues: the effective-settings
-            // snapshot decides whether the Sidebar opens, and a Sidebar that
-            // opens wants the Sessions it lists.
+            // Connecting resolves the exact launch context on its owning
+            // Server before subsequent Workspace filters use its identity.
+            transition @ ApplicationTransition::ResolveWorkspace { .. } => {
+                let _ = self.dispatch_transition(transition);
+            }
+            // Effective settings decide whether the Sidebar opens, and an
+            // open Sidebar asks for the Sessions it lists.
             ApplicationTransition::ListSessions(request) => self.list_sessions(request),
             ApplicationTransition::ReconcileCatalogOrigins {
                 catalog_origins,
@@ -1056,7 +1061,6 @@ impl RunLoop {
             | ApplicationTransition::RedeemInvite(_)
             | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
-            | ApplicationTransition::ResolveWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");
             }
@@ -1675,7 +1679,7 @@ struct WorkspaceResolutionResult {
     outlook: Outlook,
     surface: WorkspaceResolutionSurface,
     request_id: u64,
-    result: std::result::Result<Workspace, String>,
+    result: std::result::Result<crate::protocol::ResolvedWorkspace, String>,
 }
 
 fn spawn_workspace_resolution(
@@ -2224,7 +2228,7 @@ fn spawn_session_listing(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let result = match commands
-            .list_sessions(request.scope.workspace_filter())
+            .list_workspace_sessions(request.scope.workspace_filter())
             .await
         {
             Ok(sessions) => SessionPickerResult::Listed { request, sessions },
@@ -3412,14 +3416,13 @@ mod tests {
                     title: String::new(),
                     emoji: None,
                     session: Session {
+                        checkout: None,
                         context_fill: None,
                         id: SessionId::new(),
                         execution_directory: crate::protocol::ExecutionDirectory {
                             path: workspace.clone(),
                         },
-                        workspace: Workspace {
-                            path: workspace.clone(),
-                        },
+                        workspace: Workspace::directory(workspace.clone()),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
                         status: SessionStatus::Idle,

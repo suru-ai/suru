@@ -267,7 +267,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
     assert_eq!(request.outlook(), &Outlook::Local);
     assert_eq!(
         request.scope(),
-        &suru::tui::SessionListScope::CurrentWorkspace(local_workspace)
+        &suru::tui::SessionListScope::CurrentWorkspace((local_workspace).into())
     );
 }
 
@@ -521,14 +521,13 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    checkout: None,
                     context_fill: None,
                     id: SessionId::new(),
                     execution_directory: suru::protocol::ExecutionDirectory {
                         path: remote_only.clone(),
                     },
-                    workspace: Workspace {
-                        path: remote_only.clone(),
-                    },
+                    workspace: Workspace::directory(remote_only.clone()),
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
                     status: SessionStatus::Idle,
@@ -567,9 +566,9 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
                 outlook,
                 surface,
                 request_id,
-                result: Ok(Workspace {
-                    path: remote_only.clone(),
-                }),
+                result: Ok(suru::protocol::ResolvedWorkspace::directory(
+                    remote_only.clone()
+                )),
             })
             .unwrap(),
         ApplicationTransition::Continue
@@ -585,7 +584,7 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
     };
     assert_ne!(
         request.scope(),
-        &suru::tui::SessionListScope::CurrentWorkspace(remote_only)
+        &suru::tui::SessionListScope::CurrentWorkspace((remote_only).into())
     );
 }
 
@@ -629,10 +628,11 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    checkout: None,
                     context_fill: None,
                     id: session_id,
                     execution_directory: suru::protocol::ExecutionDirectory { path: ".".into() },
-                    workspace: Workspace { path: ".".into() },
+                    workspace: Workspace::directory(".".into()),
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
                     status: SessionStatus::Idle,
@@ -700,14 +700,13 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             request,
             sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                 session: Session {
+                    checkout: None,
                     context_fill: None,
                     id: SessionId::new(),
                     execution_directory: suru::protocol::ExecutionDirectory {
                         path: remote_only.clone(),
                     },
-                    workspace: Workspace {
-                        path: remote_only.clone(),
-                    },
+                    workspace: Workspace::directory(remote_only.clone()),
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
                     status: SessionStatus::Idle,
@@ -733,6 +732,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             surface: WorkspaceResolutionSurface::WorkspacePicker,
             request_id: 2,
             request: suru::protocol::ResolveWorkspaceRequest {
+                workspace_id: Some(suru::protocol::WorkspaceId::directory(&remote_only)),
                 base: None,
                 path: remote_only,
             },

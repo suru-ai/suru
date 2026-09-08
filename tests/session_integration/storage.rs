@@ -695,6 +695,16 @@ async fn regrouped_session_resumes_in_its_exact_execution_directory() {
     .await;
 }
 
+#[tokio::test]
+async fn legacy_worktree_session_regroups_without_changing_opaque_resume_or_exact_directory() {
+    resume_after_summary_mutation(
+        Some(serde_json::json!({"opaque": ["legacy-worktree", 17]})),
+        true,
+        true,
+    )
+    .await;
+}
+
 async fn resume_after_summary_mutation(
     resume_state: Option<serde_json::Value>,
     legacy: bool,
@@ -703,8 +713,30 @@ async fn resume_after_summary_mutation(
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let execution_directory = workspace
-        .path()
+    let execution_root = if regroup {
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        crate::repositories::git(&root, &["init", "-b", "main"]);
+        crate::repositories::git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let linked = root.join("external checkout");
+        crate::repositories::git(
+            &root,
+            &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+        );
+        linked
+    } else {
+        workspace.path().to_owned()
+    };
+    let execution_directory = execution_root
         .join("packages")
         .join("nested agent directory");
     std::fs::create_dir_all(&execution_directory).unwrap();

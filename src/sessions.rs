@@ -3,8 +3,7 @@
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +35,7 @@ mod settlement;
 mod subagents;
 mod title;
 mod viewed;
+mod workspaces;
 
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
@@ -103,11 +103,6 @@ pub(crate) struct SessionFeed {
 pub(crate) struct SessionCatalogFeed {
     pub(crate) snapshot: SessionCatalogSnapshot,
     pub(crate) updates: broadcast::Receiver<SessionCatalogUpdate>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ListSessionsError {
-    InvalidWorkspace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,16 +374,8 @@ impl SessionStore {
 
     pub(crate) fn list(
         &self,
-        workspace: Option<&Path>,
-    ) -> Result<Vec<SessionListItem>, ListSessionsError> {
-        let workspace = workspace
-            .map(fs::canonicalize)
-            .transpose()
-            .map_err(|_| ListSessionsError::InvalidWorkspace)?;
-        if workspace.as_ref().is_some_and(|path| !path.is_dir()) {
-            return Err(ListSessionsError::InvalidWorkspace);
-        }
-
+        workspace: Option<&crate::protocol::WorkspaceId>,
+    ) -> Vec<SessionListItem> {
         let state = self
             .state
             .lock()
@@ -403,7 +390,7 @@ impl SessionStore {
             .filter(|summary| {
                 workspace
                     .as_ref()
-                    .is_none_or(|path| summary.session.workspace.path == *path)
+                    .is_none_or(|path| summary.session.workspace.id == **path)
             })
             .map(|summary| SessionListItem::Readable(Box::new(summary)))
             .chain(
@@ -416,7 +403,7 @@ impl SessionStore {
                             summary
                                 .workspace
                                 .as_ref()
-                                .is_none_or(|workspace| workspace.path == *path)
+                                .is_none_or(|workspace| workspace.id == **path)
                         })
                     })
                     .cloned()
@@ -424,7 +411,7 @@ impl SessionStore {
             )
             .collect::<Vec<_>>();
         summaries.sort_unstable_by_key(|summary| Reverse(summary.updated_at()));
-        Ok(summaries)
+        summaries
     }
 }
 

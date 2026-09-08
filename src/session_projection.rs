@@ -604,6 +604,13 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 turn.status = *status;
                 turn.settled_at = *settled_at;
             }
+            SessionChange::WorkspaceChanged {
+                workspace,
+                checkout,
+            } => {
+                next.session.workspace = workspace.clone();
+                next.session.checkout = checkout.clone();
+            }
             SessionChange::SessionStatusChanged { status } => next.session.status = *status,
         }
     }
@@ -664,14 +671,13 @@ mod tests {
             title: String::new(),
             emoji: None,
             session: Session {
+                checkout: None,
                 context_fill: None,
                 id: session_id,
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: PathBuf::from("/workspace"),
                 },
-                workspace: Workspace {
-                    path: PathBuf::from("/workspace"),
-                },
+                workspace: Workspace::directory(PathBuf::from("/workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,

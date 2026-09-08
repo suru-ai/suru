@@ -305,7 +305,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         outlook,
                         surface,
                         request_id,
-                        result: Ok(suru::protocol::Workspace { path: request.path }),
+                        result: Ok(suru::protocol::ResolvedWorkspace::directory(request.path)),
                     })
                     .unwrap();
                 let rows =

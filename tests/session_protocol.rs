@@ -211,14 +211,13 @@ fn agent_selection_round_trips_complete_typed_model_options() {
 fn session_summary_round_trips_with_discovery_metadata() {
     let summary = SessionSummary {
         session: Session {
+            checkout: None,
             context_fill: None,
             id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: PathBuf::from("/work/suru"),
             },
-            workspace: Workspace {
-                path: PathBuf::from("/work/suru"),
-            },
+            workspace: Workspace::directory(PathBuf::from("/work/suru")),
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new("gpt-5"),
@@ -265,7 +264,8 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "reasoning_tokens": null,
             "cost": 0.03
         },
-        "workspace": { "path": "/work/suru" },
+        "workspace": Workspace::directory(std::path::PathBuf::from("/work/suru")),
+        "checkout": null,
         "execution_directory": { "path": "/work/suru" },
         "agent_selection": {
             "provider": "codex",
@@ -318,6 +318,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         title: String::new(),
         emoji: None,
         session: Session {
+            checkout: None,
             context_fill: Some(suru::protocol::ContextFill {
                 occupied_tokens: 12_400,
                 capacity_tokens: Some(200_000),
@@ -326,9 +327,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: PathBuf::from("/work/suru"),
             },
-            workspace: Workspace {
-                path: PathBuf::from("/work/suru"),
-            },
+            workspace: Workspace::directory(PathBuf::from("/work/suru")),
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
                 model: ModelId::new("gpt-5"),
@@ -425,7 +424,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "emoji": null,
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
-            "workspace": { "path": "/work/suru" },
+            "workspace": Workspace::directory(std::path::PathBuf::from("/work/suru")),
+        "checkout": null,
             "execution_directory": { "path": "/work/suru" },
             "agent_selection": {
                 "provider": "codex",

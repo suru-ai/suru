@@ -35,6 +35,11 @@ pub(crate) struct StorageWriter {
 }
 
 enum WriterCommand {
+    LocationChanged {
+        session: Box<crate::protocol::Session>,
+        revision: crate::protocol::SessionRevision,
+        durability: std_mpsc::SyncSender<Result<(), String>>,
+    },
     Create(Box<PersistedSession>),
     Hydrate(Box<PersistedSession>),
     /// Catalog-only metadata, such as whether a Session is set aside or viewed,
@@ -102,6 +107,24 @@ impl StorageWriter {
                                 dirty: true,
                             },
                         );
+                    }
+                    Ok(WriterCommand::LocationChanged {
+                        session,
+                        revision,
+                        durability,
+                    }) => {
+                        let result = if let Some(state) = sessions.get_mut(&session.id) {
+                            state.persisted.snapshot.session = (*session).clone();
+                            state.persisted.snapshot.revision = revision;
+                            state.persisted.summary.session = (*session).clone();
+                            state.dirty = true;
+                            flush_sessions(&repository, &mut sessions, Some(session.id))
+                        } else {
+                            repository.save_location(&session, revision)
+                        };
+                        let _ = durability
+                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        result?;
                     }
                     Ok(WriterCommand::SummaryChanged(summary)) => {
                         // A Session the writer does not know is one already
@@ -210,6 +233,27 @@ impl StorageWriter {
 }
 
 impl StorageSink {
+    pub(crate) fn location_changed(
+        &self,
+        session: crate::protocol::Session,
+        revision: crate::protocol::SessionRevision,
+    ) -> Result<(), StorageError> {
+        let (durability, receipt) = std_mpsc::sync_channel(0);
+        self.commands
+            .send(WriterCommand::LocationChanged {
+                session: Box::new(session),
+                revision,
+                durability,
+            })
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
+        receipt
+            .recv()
+            .map_err(|_| {
+                StorageError::WriterTask("writer stopped before location persistence".to_owned())
+            })?
+            .map_err(StorageError::WriterTask)
+    }
+
     pub(crate) fn hydrated(&self, persisted: PersistedSession) -> Result<(), StorageError> {
         self.commands
             .send(WriterCommand::Hydrate(Box::new(persisted)))

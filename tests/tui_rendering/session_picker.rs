@@ -41,7 +41,7 @@ fn sessions_command_opens_a_loading_picker_for_the_current_workspace() {
                 KeyModifiers::NONE,
             )))
             .expect("select /sessions"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
 
     let picker = rendered_application_rows(&application).join("\n");
@@ -66,7 +66,7 @@ fn the_current_workspace_scope_asks_in_the_servers_reading_of_the_launch_directo
                 KeyModifiers::NONE,
             )))
             .expect("select /sessions"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
 }
 
@@ -84,7 +84,7 @@ fn session_picker_orders_marks_focuses_and_wraps_live_sessions() {
                 suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     application
         .handle_event(ApplicationEvent::SessionsListed {
@@ -407,7 +407,7 @@ fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
                 KeyModifiers::NONE,
             )))
             .expect("invoke Ctrl+X L"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     let gamma_id = SessionId::new();
     application
@@ -527,7 +527,7 @@ fn session_picker_scope_cycles_through_current_all_and_everywhere() {
         .expect("open the Session picker");
     expect_session_list_request(
         current,
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     assert!(
         rendered_application_rows(&application)
@@ -581,7 +581,7 @@ fn session_picker_scope_cycles_through_current_all_and_everywhere() {
     assert_eq!(requests[0].outlook(), &Outlook::Local);
     assert_eq!(
         requests[0].scope(),
-        &SessionListScope::CurrentWorkspace(workspace.path().to_owned())
+        &SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into())
     );
     assert!(
         rendered_application_rows(&application)
@@ -601,7 +601,7 @@ fn everywhere_picker_asks_each_origin_and_draws_one_tagged_recency_order() {
         .expect("open the Session picker");
     expect_session_list_request(
         current,
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     expect_session_list_request(
         application
@@ -809,7 +809,7 @@ fn choosing_a_foreign_picker_row_turns_and_opens_without_moving_sidebar_scope() 
         .expect("open the Session picker");
     expect_session_list_request(
         current,
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     expect_session_list_request(
         application
@@ -1129,7 +1129,7 @@ fn session_picker_stays_searchable_at_supported_small_terminal_sizes() {
                 suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     let loading = rendered_application_rows_at(&application, 28, 5).join("\n");
     assert!(loading.contains("Sessions"));
@@ -1249,9 +1249,7 @@ fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
             title: format!("Unreadable Session {index}"),
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(100 - index),
-            workspace: Some(Workspace {
-                path: workspace.path().to_owned(),
-            }),
+            workspace: Some(Workspace::directory(workspace.path().to_owned())),
         })
     }));
     open_session_picker_with(&mut application, sessions);
@@ -1303,7 +1301,7 @@ fn session_picker_reserves_required_metadata_before_truncating_long_titles() {
                 suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
-        SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+        SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
     );
     let all_request = expect_session_list_request(
         application
@@ -1697,14 +1695,13 @@ fn session_summary(
 ) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         session: Session {
+            checkout: None,
             context_fill: None,
             id: session_id,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
             },
-            workspace: Workspace {
-                path: workspace.to_owned(),
-            },
+            workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
             status,
@@ -1797,7 +1794,7 @@ fn open_session_picker_with(application: &mut Application, sessions: Vec<Session
                 suru::tui::SemanticCommandId::SessionList,
             )))
             .expect("open Session picker"),
-        SessionListScope::CurrentWorkspace(workspace),
+        SessionListScope::CurrentWorkspace((workspace).into()),
     );
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })

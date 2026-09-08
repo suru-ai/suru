@@ -14,7 +14,7 @@ use crate::protocol::{
     CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
     Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session, SessionCatalogChange,
     SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-    SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus, Workspace,
+    SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
 };
 
 use super::{
@@ -135,9 +135,20 @@ fn steerable_turn(snapshot: &SessionSnapshot) -> Option<TurnId> {
 }
 
 impl SessionStore {
+    #[cfg(test)]
     pub(crate) fn create(
         &self,
         request: CreateSessionRequest,
+    ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
+        let path = fs::canonicalize(&request.execution_directory.path)
+            .unwrap_or_else(|_| request.execution_directory.path.clone());
+        self.create_in(request, crate::protocol::ResolvedWorkspace::directory(path))
+    }
+
+    pub(crate) fn create_in(
+        &self,
+        request: CreateSessionRequest,
+        location: crate::protocol::ResolvedWorkspace,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         if request.prompt.text.trim().is_empty() {
             return Err(CreateSessionError::EmptyPrompt);
@@ -198,6 +209,18 @@ impl SessionStore {
             return Err(CreateSessionError::PromptConflict);
         }
 
+        // Discovery and Skill validation happen before admission. A path may
+        // have been retargeted meanwhile; never pair another directory's
+        // Repository association with the directory the Agent will execute in.
+        if location
+            .execution_directory
+            .as_ref()
+            .map(|directory| &directory.path)
+            != Some(&execution_path)
+        {
+            return Err(CreateSessionError::InvalidWorkspace);
+        }
+
         let title = request.prompt.text.trim().to_owned();
         let session_id = SessionId::new();
         let prompt = Prompt {
@@ -212,14 +235,13 @@ impl SessionStore {
             title: title.clone(),
             emoji: None,
             session: Session {
+                checkout: location.checkout,
                 context_fill: None,
                 id: session_id,
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: execution_path.clone(),
                 },
-                workspace: Workspace {
-                    path: execution_path.clone(),
-                },
+                workspace: location.workspace,
                 agent_selection: request.agent_selection.clone(),
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,

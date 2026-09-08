@@ -2,12 +2,7 @@
 //! Workspace scope, and catalog reconciliation that every surface listing
 //! Sessions needs, held in one place so no surface reimplements them.
 
-use std::{
-    cmp::Reverse,
-    collections::HashMap,
-    ops::Deref,
-    path::{Path, PathBuf},
-};
+use std::{cmp::Reverse, collections::HashMap, ops::Deref};
 
 use crate::protocol::{
     Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference,
@@ -34,7 +29,7 @@ pub(super) struct SessionListing {
     outlook: Outlook,
     /// The Workspace `CurrentWorkspace` scope means, kept so narrowing back to
     /// it needs nothing from the caller.
-    current_workspace: PathBuf,
+    current_workspace: crate::protocol::Workspace,
     scope: SessionListScope,
     origins: HashMap<Outlook, OriginListing>,
 }
@@ -105,7 +100,11 @@ pub(super) fn everywhere_origins(remotes: Vec<Remote>) -> Vec<Outlook> {
 
 impl SessionListing {
     /// A listing scoped, as it opens, to the Workspace this client runs in.
-    pub(super) fn new(surface: SessionListSurface, current_workspace: PathBuf) -> Self {
+    pub(super) fn new(
+        surface: SessionListSurface,
+        current_workspace: impl Into<crate::protocol::Workspace>,
+    ) -> Self {
+        let current_workspace = current_workspace.into();
         let scope = SessionListScope::CurrentWorkspace(current_workspace.clone());
         Self::scoped(surface, current_workspace, scope)
     }
@@ -114,14 +113,14 @@ impl SessionListing {
     /// whose opening scope is not the Workspace the client runs in.
     pub(super) fn scoped(
         surface: SessionListSurface,
-        current_workspace: PathBuf,
+        current_workspace: impl Into<crate::protocol::Workspace>,
         scope: SessionListScope,
     ) -> Self {
         Self {
             surface,
             outlook: Outlook::Local,
             scope,
-            current_workspace,
+            current_workspace: current_workspace.into(),
             origins: HashMap::new(),
         }
     }
@@ -485,17 +484,20 @@ impl SessionListing {
     /// recency has that order already. One wanting another sorts what it
     /// derives. The Workspace this client works in, having no Session of its
     /// own to date it, comes last where the listing does not already name it.
-    pub(super) fn workspaces(&self) -> Vec<PathBuf> {
-        let mut workspaces = Vec::new();
+    pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        let mut workspaces: Vec<crate::protocol::Workspace> = Vec::new();
         for session in self.sessions() {
             let Some(workspace) = session.workspace() else {
                 continue;
             };
-            if !workspaces.contains(&workspace.path) {
-                workspaces.push(workspace.path.clone());
+            if !workspaces.iter().any(|known| known.id == workspace.id) {
+                workspaces.push(workspace.clone());
             }
         }
-        if !workspaces.contains(&self.current_workspace) {
+        if !workspaces
+            .iter()
+            .any(|known| known.id == self.current_workspace.id)
+        {
             workspaces.push(self.current_workspace.clone());
         }
         workspaces
@@ -521,7 +523,7 @@ impl SessionListing {
 
     /// The Workspace this client runs in, which is what `CurrentWorkspace`
     /// scope means and what a surface narrowing to "where I am" narrows to.
-    pub(super) fn current_workspace(&self) -> &Path {
+    pub(super) fn current_workspace(&self) -> &crate::protocol::Workspace {
         &self.current_workspace
     }
 
@@ -531,7 +533,11 @@ impl SessionListing {
     /// for the new one and is left alone. Nothing is asked of the server here:
     /// a surface that wants its listing to answer for the new Workspace asks
     /// for it.
-    pub(super) fn adopt_current_workspace(&mut self, workspace: PathBuf) {
+    pub(super) fn adopt_current_workspace(
+        &mut self,
+        workspace: impl Into<crate::protocol::Workspace>,
+    ) {
+        let workspace = workspace.into();
         if matches!(self.scope, SessionListScope::CurrentWorkspace(_)) {
             self.scope = SessionListScope::CurrentWorkspace(workspace.clone());
         }
@@ -715,7 +721,7 @@ mod tests {
 
         assert_eq!(
             narrowed.scope(),
-            &SessionListScope::CurrentWorkspace(workspace.path().to_owned()),
+            &SessionListScope::CurrentWorkspace((workspace.path().to_owned()).into()),
             "narrowing returns to the Workspace the listing was made for"
         );
     }
@@ -957,7 +963,11 @@ mod tests {
         );
 
         assert_eq!(
-            listing.workspaces(),
+            listing
+                .workspaces()
+                .into_iter()
+                .map(|workspace| workspace.path)
+                .collect::<Vec<_>>(),
             vec![
                 root().join("elsewhere"),
                 root().join("there"),
@@ -979,7 +989,14 @@ mod tests {
 
         listing.load(&request, vec![rooted("Work here", &root().join("here"), 4)]);
 
-        assert_eq!(listing.workspaces(), vec![root().join("here")]);
+        assert_eq!(
+            listing
+                .workspaces()
+                .into_iter()
+                .map(|workspace| workspace.path)
+                .collect::<Vec<_>>(),
+            vec![root().join("here")]
+        );
     }
 
     /// A Session listed without a Workspace says nothing about where it was
@@ -1005,7 +1022,14 @@ mod tests {
             })],
         );
 
-        assert_eq!(listing.workspaces(), vec![root().join("here")]);
+        assert_eq!(
+            listing
+                .workspaces()
+                .into_iter()
+                .map(|workspace| workspace.path)
+                .collect::<Vec<_>>(),
+            vec![root().join("here")]
+        );
     }
 
     fn titles(listing: &SessionListing) -> Vec<&str> {
@@ -1022,23 +1046,20 @@ mod tests {
         let SessionListItem::Readable(mut listed) = summary(title, updated_at) else {
             unreachable!("the fixture builds a readable Session");
         };
-        listed.session.workspace = Workspace {
-            path: workspace.to_owned(),
-        };
+        listed.session.workspace = Workspace::directory(workspace.to_owned());
         SessionListItem::Readable(listed)
     }
 
     fn summary(title: &str, updated_at: u64) -> SessionListItem {
         SessionListItem::Readable(Box::new(SessionSummary {
             session: Session {
+                checkout: None,
                 context_fill: None,
                 id: SessionId::new(),
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: root().join("workspace"),
                 },
-                workspace: Workspace {
-                    path: root().join("workspace"),
-                },
+                workspace: Workspace::directory(root().join("workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
                 status: SessionStatus::Idle,

@@ -318,14 +318,7 @@ impl SessionRow {
                 .transpose()?,
             created_at: u64_to_i64(session_id, "created_at", summary.created_at.0)?,
             updated_at: u64_to_i64(session_id, "updated_at", summary.updated_at.0)?,
-            workspace: encode(
-                session_id,
-                "Workspace",
-                &StoredSessionLocation {
-                    path: summary.session.workspace.path,
-                    execution_directory: Some(summary.session.execution_directory),
-                },
-            )?,
+            workspace: Self::location_payload(&summary.session)?,
             agent_selection: summary
                 .session
                 .agent_selection
@@ -350,6 +343,19 @@ impl SessionRow {
         })
     }
 
+    pub(super) fn location_payload(session: &Session) -> Result<String, StorageError> {
+        encode(
+            session.id,
+            "Session location",
+            &StoredSessionLocation {
+                path: session.workspace.path.clone(),
+                workspace: Some(session.workspace.clone()),
+                execution_directory: Some(session.execution_directory.clone()),
+                checkout: session.checkout.clone(),
+            },
+        )
+    }
+
     pub(super) fn into_summary_and_revision(
         self,
     ) -> Result<(SessionSummary, SessionRevision), StorageError> {
@@ -364,6 +370,7 @@ impl SessionRow {
             .map(AgentSelection::from);
         let summary = SessionSummary {
             session: Session {
+                checkout: workspace.checkout.clone(),
                 context_fill: self
                     .context_fill
                     .as_deref()
@@ -640,6 +647,10 @@ fn transcript_identity(item: TranscriptItem) -> TranscriptIdentity {
 struct StoredSessionLocation {
     path: PathBuf,
     #[serde(default)]
+    workspace: Option<Workspace>,
+    #[serde(default)]
+    checkout: Option<crate::protocol::CheckoutAssociation>,
+    #[serde(default)]
     execution_directory: Option<crate::protocol::ExecutionDirectory>,
 }
 
@@ -655,9 +666,9 @@ impl StoredSessionLocation {
 
 impl From<StoredSessionLocation> for Workspace {
     fn from(workspace: StoredSessionLocation) -> Self {
-        Self {
-            path: workspace.path,
-        }
+        workspace
+            .workspace
+            .unwrap_or_else(|| Workspace::directory(workspace.path))
     }
 }
 

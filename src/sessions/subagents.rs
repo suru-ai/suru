@@ -57,6 +57,7 @@ impl SessionStore {
             title: title.clone(),
             emoji: None,
             session: Session {
+                checkout: parent_session.checkout.clone(),
                 context_fill: None,
                 id: session_id,
                 execution_directory: parent_session.execution_directory.clone(),

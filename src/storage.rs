@@ -366,6 +366,29 @@ impl StorageRepository {
         Ok(())
     }
 
+    fn save_location(
+        &self,
+        session: &crate::protocol::Session,
+        revision: crate::protocol::SessionRevision,
+    ) -> Result<(), StorageError> {
+        let mut connection = connect(&self.database_path)?;
+        let revision = i64::try_from(revision.0).map_err(|error| StorageError::Write {
+            session_id: session.id,
+            message: error.to_string(),
+        })?;
+        diesel::update(sessions::table.filter(sessions::id.eq(session.id.to_string())))
+            .set((
+                sessions::workspace.eq(SessionRow::location_payload(session)?),
+                sessions::revision.eq(revision),
+            ))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::Write {
+                session_id: session.id,
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
     fn delete_session(&self, session_id: SessionId) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
         diesel::delete(sessions::table.filter(sessions::id.eq(session_id.to_string())))

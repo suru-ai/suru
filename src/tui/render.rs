@@ -2939,7 +2939,13 @@ fn render_landing(
 
     frame.render_widget(
         Paragraph::new(truncate_to_width(
-            &workspace_context(state, &state.execution_directory, true),
+            &match state.execution_directory.as_deref() {
+                Some(path) => workspace_context(state, path, true),
+                None => format!(
+                    "{} · Choose a working copy to start a Session",
+                    workspace_context(state, &state.workspace.path, true)
+                ),
+            },
             usize::from(panel.width),
         ))
         .style(theme.text.subdued),
@@ -4084,6 +4090,7 @@ mod tests {
                 title: String::new(),
                 emoji: None,
                 session: Session {
+                    checkout: None,
                     context_fill: Some(ContextFill {
                         occupied_tokens: 12_400,
                         capacity_tokens: capacity,
@@ -4092,9 +4099,7 @@ mod tests {
                     execution_directory: crate::protocol::ExecutionDirectory {
                         path: workspace.path().to_owned(),
                     },
-                    workspace: Workspace {
-                        path: workspace.path().to_owned(),
-                    },
+                    workspace: Workspace::directory(workspace.path().to_owned()),
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
                     status: SessionStatus::Active,
@@ -4331,14 +4336,13 @@ mod tests {
                     title: String::new(),
                     emoji: None,
                     session: Session {
+                        checkout: None,
                         context_fill: None,
                         id: session_id,
                         execution_directory: crate::protocol::ExecutionDirectory {
                             path: PathBuf::from("/workspace"),
                         },
-                        workspace: Workspace {
-                            path: PathBuf::from("/workspace"),
-                        },
+                        workspace: Workspace::directory(PathBuf::from("/workspace")),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
                         status: SessionStatus::Active,
@@ -4400,14 +4404,13 @@ mod tests {
                     title: String::new(),
                     emoji: None,
                     session: Session {
+                        checkout: None,
                         context_fill: None,
                         id: session_id,
                         execution_directory: crate::protocol::ExecutionDirectory {
                             path: PathBuf::from("/workspace"),
                         },
-                        workspace: Workspace {
-                            path: PathBuf::from("/workspace"),
-                        },
+                        workspace: Workspace::directory(PathBuf::from("/workspace")),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
                         status: SessionStatus::Idle,

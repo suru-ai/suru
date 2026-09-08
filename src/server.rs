@@ -48,9 +48,8 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
-    InterruptSessionError, ListSessionsError, PromptAdmissionDisposition, PromptMutationError,
-    SessionCatalogFeed, SessionFeed, SessionStore, SettleSessionError, StoreOutcome,
-    TitleDerivation,
+    InterruptSessionError, PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed,
+    SessionFeed, SessionStore, SettleSessionError, StoreOutcome, TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -335,6 +334,7 @@ impl LandingAgentSelectionStore {
 
 #[derive(Clone)]
 struct AppState {
+    source_control: crate::source_control::SourceControlService,
     workspace_paths: crate::protocol::WorkspacePaths,
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
@@ -415,6 +415,22 @@ pub async fn spawn_with_providers_and_timings(
     config: ServerConfig,
     runtimes: Vec<Arc<dyn ProviderRuntime>>,
     timings: ServerTimings,
+) -> Result<RunningServer> {
+    spawn_with_source_control(
+        config,
+        runtimes,
+        timings,
+        Arc::new(crate::source_control::GitSourceControl::default()),
+    )
+    .await
+}
+
+/// Installs source control through its own interface, independent of Agent Providers.
+pub async fn spawn_with_source_control(
+    config: ServerConfig,
+    runtimes: Vec<Arc<dyn ProviderRuntime>>,
+    timings: ServerTimings,
+    source_control: Arc<dyn crate::source_control::SourceControl>,
 ) -> Result<RunningServer> {
     anyhow::ensure!(
         !runtimes.is_empty(),
@@ -511,6 +527,8 @@ pub async fn spawn_with_providers_and_timings(
     };
     let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
+    let source_control = crate::source_control::SourceControlService::new(source_control);
+    sessions.discover_workspaces(&source_control).await?;
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage.clone());
     let model_catalog = ModelCatalogService::new(
@@ -543,6 +561,7 @@ pub async fn spawn_with_providers_and_timings(
         settings.subscribe(),
     );
     let state = AppState {
+        source_control,
         workspace_paths: crate::protocol::WorkspacePaths::discover(),
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
@@ -1304,6 +1323,27 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             .or_else(|| state.model_catalog.default_selection());
     }
 
+    let location = state
+        .source_control
+        .resolve(&request.execution_directory.path, None)
+        .await;
+    if location.execution_directory.is_none() {
+        return session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "Choose a working copy before starting a Session; repository metadata is not an Execution Directory",
+        );
+    }
+    if let Err(error) = state
+        .sessions
+        .refresh_repository_labels(&state.source_control)
+    {
+        return session_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SessionErrorCode::InvalidCommand,
+            error.to_string(),
+        );
+    }
     let provider = request
         .agent_selection
         .as_ref()
@@ -1321,7 +1361,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         return response;
     }
 
-    match state.sessions.create(request) {
+    match state.sessions.create_in(request, location) {
         Ok(StoreOutcome::Created(snapshot)) => {
             if let Some(selection) = snapshot.session.agent_selection.clone() {
                 state.landing_agent_selection.confirm(selection);
@@ -1732,6 +1772,19 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
         Ok(request) => request,
         Err(response) => return response,
     };
+    let known = request
+        .workspace_id
+        .as_ref()
+        .and_then(|id| state.sessions.known_workspace(id))
+        .or_else(|| {
+            request.workspace_id.as_ref().and_then(|id| {
+                state
+                    .source_control
+                    .workspaces()
+                    .into_iter()
+                    .find(|workspace| &workspace.id == id)
+            })
+        });
     let base = match request.base {
         Some(base) => base,
         None => match std::env::current_dir() {
@@ -1745,7 +1798,10 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
             }
         },
     };
-    let named = base.join(request.path);
+    let named = known.as_ref().map_or_else(
+        || base.join(request.path),
+        |workspace| workspace.path.clone(),
+    );
     let Ok(path) = std::fs::canonicalize(named) else {
         return session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1760,12 +1816,35 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
             "Not a directory",
         );
     }
-    Json(crate::protocol::Workspace { path }).into_response()
+    let resolved = state.source_control.resolve(&path, known.as_ref()).await;
+    if request
+        .workspace_id
+        .as_ref()
+        .is_some_and(|id| id != &resolved.workspace.id)
+    {
+        return session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            "The selected directory no longer belongs to this Workspace",
+        );
+    }
+    if let Err(error) = state
+        .sessions
+        .refresh_repository_labels(&state.source_control)
+    {
+        return session_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SessionErrorCode::InvalidCommand,
+            error.to_string(),
+        );
+    }
+    Json(resolved).into_response()
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListSessionsQuery {
+    workspace_id: Option<String>,
     workspace: Option<PathBuf>,
 }
 
@@ -1777,14 +1856,35 @@ async fn list_sessions(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.sessions.list(query.workspace.as_deref()) {
-        Ok(summaries) => Json(summaries).into_response(),
-        Err(ListSessionsError::InvalidWorkspace) => session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "Workspace filter must be an existing local directory",
-        ),
-    }
+    let workspace = match (query.workspace_id, query.workspace) {
+        (Some(id), None) => Some(crate::protocol::WorkspaceId(id)),
+        (None, Some(path)) => {
+            let Ok(path) = std::fs::canonicalize(path) else {
+                return session_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    SessionErrorCode::InvalidWorkspace,
+                    "Workspace filter must be an existing local directory",
+                );
+            };
+            if !path.is_dir() {
+                return session_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    SessionErrorCode::InvalidWorkspace,
+                    "Workspace filter must be an existing local directory",
+                );
+            }
+            Some(state.source_control.resolve(&path, None).await.workspace.id)
+        }
+        (None, None) => None,
+        _ => {
+            return session_error_response(
+                StatusCode::BAD_REQUEST,
+                SessionErrorCode::InvalidCommand,
+                "Choose a Workspace identity or directory filter",
+            );
+        }
+    };
+    Json(state.sessions.list(workspace.as_ref())).into_response()
 }
 
 /// All Session-specific HTTP operations enter through one hydration boundary.
