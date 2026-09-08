@@ -3139,7 +3139,7 @@ fn render_session(
             theme.text.subdued,
         )
     };
-    let usage = session_usage_text(snapshot, content_width)
+    let usage = session_footer_metrics_text(snapshot, content_width)
         .map(|text| SlotText::new(text, theme.text.subdued));
     let footer = slots.prompt_footer(
         &PromptFooterSlotContext {
@@ -3404,7 +3404,7 @@ fn render_session(
 }
 
 /// Context occupancy has priority over accumulated Cost under width pressure.
-fn session_usage_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
+fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
     let cost = snapshot
         .total_usage()
         .and_then(|total| total.cost)

@@ -87,9 +87,34 @@ pub(super) struct NativeCorrelation {
     /// Child threads whose Subagents settled. A spawn item repeating one of
     /// them re-opens nothing, because the settle already closed its Session.
     settled_children: HashSet<String>,
+    /// Context ordering survives child settlement, independently of output
+    /// routing and the cumulative Usage baseline.
+    child_context_turns: HashMap<String, ChildContextTurns>,
     /// Child threads spawned but not yet attached; the event pump drains this
     /// and requests each thread's stream.
     pending_attaches: Vec<String>,
+}
+
+/// Native Turn IDs have no sortable order. Once a newly observed Turn
+/// supersedes one, later echoes of that old ID cannot refresh occupancy.
+#[derive(Default)]
+struct ChildContextTurns {
+    current: Option<String>,
+    superseded: HashSet<String>,
+}
+
+impl ChildContextTurns {
+    fn observe(&mut self, turn_id: &str) -> bool {
+        if turn_id.is_empty() || self.superseded.contains(turn_id) {
+            return false;
+        }
+        if self.current.as_deref() != Some(turn_id)
+            && let Some(previous) = self.current.replace(turn_id.to_owned())
+        {
+            self.superseded.insert(previous);
+        }
+        true
+    }
 }
 
 /// The streaming items one followed thread has open.
@@ -232,6 +257,7 @@ impl NativeCorrelation {
             root: ThreadInFlight::default(),
             children: HashMap::new(),
             settled_children: HashSet::new(),
+            child_context_turns: HashMap::new(),
             pending_attaches: Vec::new(),
         }
     }
@@ -322,6 +348,9 @@ impl NativeCorrelation {
             }
             return None;
         }
+        if let Some(turns) = self.child_context_turns.get_mut(thread_id) {
+            turns.observe(turn_id);
+        }
         self.children.get_mut(thread_id).map(|child| {
             child.latest_turn_id = Some(turn_id.to_owned());
             (
@@ -395,6 +424,8 @@ impl NativeCorrelation {
                 ..AttachedChild::default()
             },
         );
+        self.child_context_turns
+            .insert(child_thread_id.clone(), ChildContextTurns::default());
         self.pending_attaches.push(child_thread_id.clone());
         vec![AttributedProviderEvent {
             attribution: spawner,
@@ -639,6 +670,9 @@ fn project_native_notification(
 ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
     match notification {
         NativeNotification::TurnStarted { thread_id, turn_id } => {
+            if let Some(turns) = correlation.child_context_turns.get_mut(&thread_id) {
+                turns.observe(&turn_id);
+            }
             if thread_id != correlation.thread_id
                 || correlation.settled_turns.contains(&turn_id)
                 || correlation.active_turn_id.as_deref() == Some(&turn_id)
@@ -835,6 +869,9 @@ fn project_native_notification(
             outcome,
             final_agent_message,
         } => {
+            if let Some(turns) = correlation.child_context_turns.get_mut(&thread_id) {
+                turns.observe(&turn_id);
+            }
             let withdrawn = correlation.questionnaires.end_turn(&thread_id, &turn_id);
             if thread_id == correlation.thread_id {
                 project_turn_completed(
@@ -1217,6 +1254,15 @@ fn project_token_usage(
     total: NativeCumulativeUsage,
     context_fill: Option<crate::protocol::ContextFill>,
 ) -> Vec<AttributedProviderEvent> {
+    let context_fill = if correlation.thread_id != thread_id {
+        let current = correlation
+            .child_context_turns
+            .get_mut(thread_id)
+            .is_some_and(|turns| turns.observe(turn_id));
+        context_fill.filter(|_| current)
+    } else {
+        context_fill
+    };
     correlation.context_fill_sequence += 1;
     let context_event = context_fill.map(|fill| ProviderEvent::ContextFill {
         report: crate::provider::ContextFillReport {

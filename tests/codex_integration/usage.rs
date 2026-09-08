@@ -987,3 +987,80 @@ async fn codex_context_fill_distinguishes_zero_missing_and_nonpositive_capacity(
         opened.server.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn superseded_child_native_turns_cannot_replace_current_or_settled_context() {
+    fn report(turn: &str, occupied: u64, cumulative_input: u64) -> String {
+        let event = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "child-thread", "turnId": turn,
+                "tokenUsage": {
+                    "total": { "totalTokens": cumulative_input + 100, "inputTokens": cumulative_input,
+                        "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 100, "reasoningOutputTokens": 20 },
+                    "last": { "totalTokens": occupied }, "modelContextWindow": 272000
+                }
+            }
+        });
+        format!("      printf '%s\\n' '{event}'")
+    }
+    for after_settlement in [false, true] {
+        let original_report = DELEGATED_METERING_CODEX
+            .lines()
+            .find(|line| {
+                line.contains("thread/tokenUsage/updated") && line.contains("child-thread")
+            })
+            .expect("fixture meters its child");
+        let newer_turn = r#"      printf '%s\n' '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn-2","status":"inProgress","items":[]}}}'"#;
+        let script = DELEGATED_METERING_CODEX.replace(
+            original_report,
+            &format!(
+                "{original_report}\n{newer_turn}\n{}\n{}",
+                report("child-turn-2", 300, 900),
+                report("child-turn", 9999, 1000),
+            ),
+        );
+        let script = if after_settlement {
+            let settle = script
+                .lines()
+                .find(|line| line.contains("activity-completed"))
+                .unwrap();
+            script.replace(
+                settle,
+                &format!(
+                    "{settle}\n{}\n{}",
+                    report("child-turn-2", 100, 1100),
+                    report("child-turn", 99_999, 1200)
+                ),
+            )
+        } else {
+            script
+        };
+        let fixture = ScriptedCodex::new_multiprocess(&script);
+        let opened =
+            metered_session(&fixture, "codex-child-context-order", "Observe child Turns").await;
+        // The root settles after all child reports, providing a wire-order barrier.
+        let parent = settled_turn(&opened.client, opened.session_id, 0).await;
+        let child_id = parent
+            .activities
+            .iter()
+            .find_map(|activity| match activity {
+                Activity::Subagent { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .unwrap();
+        let child = settled_turn(&opened.client, child_id, 0).await;
+        assert_eq!(
+            child.session.context_fill.unwrap().occupied_tokens,
+            if after_settlement { 100 } else { 300 }
+        );
+        assert_eq!(parent.session.context_fill.unwrap().occupied_tokens, 1350);
+        assert_eq!(
+            child.turns[0].usage.as_ref().unwrap().fresh_input_tokens,
+            Some(1000),
+            "Context ordering leaves existing cumulative child Usage admission unchanged"
+        );
+        assert_eq!(parent.turns[0].usage, Some(first_turn_usage()));
+        opened.server.shutdown().await.unwrap();
+    }
+}
