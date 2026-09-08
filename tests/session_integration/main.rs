@@ -17,6 +17,7 @@ mod context_fill;
 mod continuations;
 mod hydration;
 mod managed_client;
+mod model_catalog;
 mod multi_provider;
 mod prompts;
 mod provider_enablement;

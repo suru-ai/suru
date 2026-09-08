@@ -18,7 +18,7 @@ use suru::{
 };
 
 #[test]
-fn restored_selection_label_stays_stable_when_its_catalog_arrives() {
+fn restored_selection_label_takes_the_name_its_catalog_gives_it() {
     let workspace = workspace_dir();
     let selection = AgentSelection {
         provider: ProviderId::new("fixture-provider"),
@@ -70,8 +70,11 @@ fn restored_selection_label_stays_stable_when_its_catalog_arrives() {
         .expect("close Model picker without changing the selection");
 
     let after = rendered_application_rows_at(&application, 100, 16).join("\n");
-    assert!(after.contains("fixture-provider · model-native-id"));
-    assert!(!after.contains("Friendly Model Name"));
+    assert!(
+        after.contains("Friendly Model Name"),
+        "the catalog names the restored Model as soon as it is heard: {after}"
+    );
+    assert!(!after.contains("fixture-provider · model-native-id"));
 }
 
 #[test]

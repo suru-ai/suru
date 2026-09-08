@@ -26,9 +26,10 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, start_server,
     },
     protocol::{
-        Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-        SESSION_CATALOG_SNAPSHOT_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown,
-        SessionCatalogRevision, SessionCatalogSnapshot, SettingsSnapshot, ShutdownReason,
+        Health, LifecycleState, MODEL_CATALOG_EVENT, ModelCatalog, PROTOCOL_VERSION,
+        RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
+        SETTINGS_SNAPSHOT_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+        SessionCatalogSnapshot, SettingsSnapshot, ShutdownReason,
     },
     server::{self, ServerConfig},
 };
@@ -2637,6 +2638,9 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
             fixture_settings_snapshot_event(),
         ))))
+        .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
+            fixture_model_catalog_event(),
+        ))))
     };
     let response = match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
@@ -2712,6 +2716,15 @@ fn fixture_settings_snapshot_event() -> Event {
         .event(SETTINGS_SNAPSHOT_EVENT)
         .json_data(SettingsSnapshot::default())
         .expect("serialize fixture settings snapshot")
+}
+
+fn fixture_model_catalog_event() -> Event {
+    Event::default()
+        .event(MODEL_CATALOG_EVENT)
+        .json_data(ModelCatalog {
+            providers: Vec::new(),
+        })
+        .expect("serialize fixture Model Catalog")
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -2897,6 +2910,9 @@ async fn build_replacement_events(
         stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
             .chain(stream::once(async move {
                 Ok::<_, Infallible>(fixture_settings_snapshot_event())
+            }))
+            .chain(stream::once(async move {
+                Ok::<_, Infallible>(fixture_model_catalog_event())
             }));
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),

@@ -333,4 +333,5 @@ pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
         client.next().await,
         Some(suru::managed_client::ManagedEvent::SettingsSnapshot(_))
     ));
+    crate::server_support::receive_model_catalog(client).await;
 }

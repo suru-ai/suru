@@ -236,7 +236,54 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
 }
 
 #[test]
-fn returning_to_an_outlook_restores_its_stable_selection_presentation() {
+fn a_pushed_catalog_names_the_landing_model_without_opening_the_picker() {
+    let selection = AgentSelection {
+        provider: ProviderId::new("generic-provider"),
+        model: ModelId::new("native-model-id"),
+        options: Vec::new(),
+    };
+    let mut application = Application::default();
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424)
+                .with_landing_agent_selection(Some(selection)),
+        )))
+        .expect("restore the local Landing selection");
+    let before = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(
+        before.contains("native-model-id"),
+        "with no catalog the Model goes by its wire identifier: {before}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+            ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("generic-provider"),
+                    display_name: "Generic Provider".to_owned(),
+                    models: vec![model_descriptor(
+                        "generic-provider",
+                        "native-model-id",
+                        "Friendly Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        )))
+        .expect("take in the pushed Model Catalog");
+
+    let after = rendered_application_rows_at(&application, 100, 16).join("\n");
+    assert!(
+        after.contains("Friendly Model"),
+        "the pushed catalog names the Model in the header: {after}"
+    );
+    assert!(!after.contains("native-model-id"));
+}
+
+#[test]
+fn a_model_is_called_what_the_latest_catalog_calls_it_across_outlook_turns() {
     let selection = AgentSelection {
         provider: ProviderId::new("generic-provider"),
         model: ModelId::new("native-model-id"),
@@ -302,8 +349,11 @@ fn returning_to_an_outlook_restores_its_stable_selection_presentation() {
     );
 
     let local_again = rendered_application_rows_at(&application, 100, 16).join("\n");
-    assert!(local_again.contains("generic-provider · native-model-id"));
-    assert!(!local_again.contains("Friendly Model"));
+    assert!(
+        local_again.contains("Friendly Model"),
+        "returning to the Outlook keeps the name its catalog gave the Model: {local_again}"
+    );
+    assert!(!local_again.contains("native-model-id"));
 }
 
 #[test]

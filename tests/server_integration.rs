@@ -3857,6 +3857,15 @@ async fn managed_client_connects_without_periodic_domain_events() {
         "the one-time settings snapshot follows the connection"
     );
     assert!(
+        matches!(
+            timeout(Duration::from_secs(1), client.next())
+                .await
+                .expect("Model Catalog arrives"),
+            Some(ManagedEvent::ModelCatalog(_))
+        ),
+        "the Model Catalog follows the settings snapshot"
+    );
+    assert!(
         timeout(Duration::from_millis(1_100), client.next())
             .await
             .is_err(),
@@ -3911,12 +3920,12 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let text = String::from_utf8(raw).expect("SSE response is UTF-8");
     assert!(text.contains(": connected\n\n"));
     assert!(text.contains(": keep-alive\n\n"));
-    assert_eq!(
-        text.matches("event:").count(),
-        1,
-        "only the one-time settings snapshot is an event; keepalives stay comment-only"
+    assert!(
+        !text.contains("event: keep-alive"),
+        "keepalives stay comment-only"
     );
     assert!(text.contains("event: settings_snapshot\n"));
+    assert!(text.contains("event: model_catalog\n"));
     assert!(!text.contains("id:"));
 
     server.shutdown().await.expect("shut down server");

@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::{
+    model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
         SessionUpdate,
@@ -49,6 +50,7 @@ enum WriterCommand {
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
     SaveLandingAgentSelection(AgentSelection),
+    SaveModelCatalog(RememberedProviderCatalog),
     SaveResumeState {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
@@ -153,6 +155,14 @@ impl StorageWriter {
                     }
                     Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
                         repository.save_landing_agent_selection(selection)?;
+                    }
+                    // A remembered catalog is a nicety the next process starts
+                    // from; failing to write one must not cost this process its
+                    // Session persistence.
+                    Ok(WriterCommand::SaveModelCatalog(remembered)) => {
+                        if let Err(error) = repository.save_model_catalog(remembered) {
+                            tracing::warn!("could not remember the Model Catalog: {error}");
+                        }
                     }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
                         let result =
@@ -261,6 +271,14 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::SaveLandingAgentSelection(selection));
+    }
+
+    /// Remembers what a Provider just served, off the discovery's own path: a
+    /// catalog is worth serving the moment it is known, not once it is stored.
+    pub(crate) fn save_model_catalog(&self, remembered: RememberedProviderCatalog) {
+        let _ = self
+            .commands
+            .send(WriterCommand::SaveModelCatalog(remembered));
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

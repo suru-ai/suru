@@ -6,8 +6,8 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::protocol::{
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerShutdown,
-    SettingsSnapshot, ShutdownReason,
+    MODEL_CATALOG_EVENT, ModelCatalog, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, ServerShutdown, SettingsSnapshot, ShutdownReason,
 };
 
 use super::ManagedEvent;
@@ -67,6 +67,11 @@ fn decode_event(event: Event, expected_instance_id: uuid::Uuid) -> Result<Manage
             let snapshot: SettingsSnapshot =
                 serde_json::from_str(&event.data).context("decode settings snapshot")?;
             Ok(ManagedEvent::SettingsSnapshot(snapshot))
+        }
+        MODEL_CATALOG_EVENT => {
+            let catalog: ModelCatalog =
+                serde_json::from_str(&event.data).context("decode Model Catalog")?;
+            Ok(ManagedEvent::ModelCatalog(catalog))
         }
         SERVER_SHUTDOWN_EVENT => {
             let shutdown: ServerShutdown =

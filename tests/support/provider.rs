@@ -52,6 +52,7 @@ pub struct ControlledProviderRuntime {
     skill_catalog: Arc<Mutex<Option<SkillCatalog>>>,
     skill_catalog_error: Arc<Mutex<Option<String>>>,
     skill_discovery_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    model_discovery_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     skill_catalog_invalidations: watch::Sender<u64>,
     /// Whether this Provider declares the per-Subagent stop capability. On by
     /// default, so the neutral suite exercises the capable path; a test proves
@@ -190,6 +191,7 @@ impl ControlledProvider {
                 skill_catalog: Arc::new(Mutex::new(None)),
                 skill_catalog_error: Arc::new(Mutex::new(None)),
                 skill_discovery_gate: Arc::new(Mutex::new(None)),
+                model_discovery_gate: Arc::new(Mutex::new(None)),
                 skill_catalog_invalidations,
                 subagent_stop_offered: Arc::new(AtomicBool::new(true)),
                 starts: starts_tx,
@@ -296,6 +298,23 @@ impl ControlledProviderRuntime {
         assert!(
             replaced.is_none(),
             "only one Skill discovery may be blocked"
+        );
+        release
+    }
+
+    /// Holds the next Model discovery open until the returned sender is used
+    /// or dropped, so a test can see what Suru serves while a Provider has not
+    /// yet answered.
+    pub fn block_next_model_discovery(&self) -> oneshot::Sender<()> {
+        let (release, blocked) = oneshot::channel();
+        let replaced = self
+            .model_discovery_gate
+            .lock()
+            .expect("controlled Provider Model gate lock is not poisoned")
+            .replace(blocked);
+        assert!(
+            replaced.is_none(),
+            "only one Model discovery may be blocked"
         );
         release
     }
@@ -664,8 +683,16 @@ impl ProviderRuntime for ControlledProviderRuntime {
             .unavailable
             .lock()
             .expect("controlled Provider availability lock is not poisoned");
+        let blocked = self
+            .model_discovery_gate
+            .lock()
+            .expect("controlled Provider Model gate lock is not poisoned")
+            .take();
         let provider = self.provider.clone();
         Box::pin(async move {
+            if let Some(blocked) = blocked {
+                let _ = blocked.await;
+            }
             match unavailable {
                 Some(reason) => Err(ProviderError::unavailable(
                     reason,

@@ -16,6 +16,7 @@ use diesel::{
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 use crate::{
+    model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, PromptId, ProviderId, SessionId, SessionSnapshot, SessionSummary,
         TranscriptItem, UnreadableSessionSummary,
@@ -30,12 +31,12 @@ mod writer;
 pub(crate) use writer::{StorageSink, StorageWriter};
 
 use rows::{
-    ActivityRow, LandingAgentSelectionRow, MessageRow, PromptRow, ProviderResumeStateRow,
-    SessionRow, StoredRows, TurnRow,
+    ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
+    ProviderResumeStateRow, SessionRow, StoredRows, TurnRow,
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260908000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260909000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -61,6 +62,14 @@ diesel::table! {
     landing_agent_selection (singleton) {
         singleton -> Integer,
         selection -> Text,
+    }
+}
+
+diesel::table! {
+    model_catalog (provider) {
+        provider -> Text,
+        payload -> Text,
+        discovered_at -> BigInt,
     }
 }
 
@@ -168,6 +177,7 @@ pub(crate) enum StorageError {
         message: String,
     },
     WriteLandingAgentSelection(String),
+    WriteModelCatalog(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -208,6 +218,9 @@ impl fmt::Display for StorageError {
             } => write!(formatter, "save Session {session_id}: {message}"),
             Self::WriteLandingAgentSelection(message) => {
                 write!(formatter, "save landing Agent Selection: {message}")
+            }
+            Self::WriteModelCatalog(message) => {
+                write!(formatter, "save remembered Model Catalog: {message}")
             }
             Self::BlockingTask { operation, message } => write!(
                 formatter,
@@ -298,6 +311,44 @@ impl StorageRepository {
             Ok(row.and_then(LandingAgentSelectionRow::into_selection))
         })
         .await
+    }
+
+    /// The Model Catalog each Provider served the last time discovery
+    /// succeeded, as remembered across restarts. A row that no longer decodes
+    /// is left out rather than failing startup: the Provider is asked again as
+    /// soon as a client connects.
+    pub(crate) async fn model_catalog(
+        &self,
+    ) -> Result<Vec<RememberedProviderCatalog>, StorageError> {
+        let database_path = self.database_path.as_ref().clone();
+        on_blocking_task("reading remembered Model Catalog", move || {
+            let mut connection = connect(&database_path)?;
+            let rows = model_catalog::table
+                .select(ModelCatalogRow::as_select())
+                .load::<ModelCatalogRow>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .filter_map(ModelCatalogRow::into_remembered)
+                .collect())
+        })
+        .await
+    }
+
+    fn save_model_catalog(
+        &self,
+        remembered: RememberedProviderCatalog,
+    ) -> Result<(), StorageError> {
+        let row = ModelCatalogRow::from_remembered(remembered)?;
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(model_catalog::table)
+            .values(&row)
+            .on_conflict(model_catalog::provider)
+            .do_update()
+            .set(&row)
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteModelCatalog(error.to_string()))?;
+        Ok(())
     }
 
     fn save_sessions(&self, persisted: Vec<PersistedSession>) -> Result<(), StorageError> {
@@ -639,9 +690,12 @@ fn connect(database_path: &Path) -> Result<SqliteConnection, StorageError> {
             tracing::debug!(storage_query = 1_u64, "Session repository query");
         }
     });
+    // The busy timeout comes first: switching the journal mode takes a lock
+    // of its own, and a connection opened while another is mid-write must
+    // wait for it rather than fail to open at all.
     connection
         .batch_execute(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+            "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;",
         )
         .map_err(|error| StorageError::Open {
             path: database_path.to_owned(),

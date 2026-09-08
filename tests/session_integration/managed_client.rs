@@ -1201,19 +1201,28 @@ async fn reconnecting_fixture_catalog_events(
 }
 
 /// The lifecycle-stream opening every conforming server sends: the connected
-/// comment followed by the effective-settings snapshot.
+/// comment, the effective-settings snapshot, then the Model Catalog.
 fn fixture_lifecycle_stream()
 -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static {
-    stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) }).chain(
-        stream::once(async move {
+    stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
+        .chain(stream::once(async move {
             Ok::<_, Infallible>(
                 Event::default()
                     .event(suru::protocol::SETTINGS_SNAPSHOT_EVENT)
                     .json_data(suru::protocol::SettingsSnapshot::default())
                     .expect("serialize fixture settings snapshot"),
             )
-        }),
-    )
+        }))
+        .chain(stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(suru::protocol::MODEL_CATALOG_EVENT)
+                    .json_data(suru::protocol::ModelCatalog {
+                        providers: Vec::new(),
+                    })
+                    .expect("serialize fixture Model Catalog"),
+            )
+        }))
 }
 
 fn fixture_catalog_events_response(

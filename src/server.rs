@@ -28,18 +28,18 @@ use uuid::Uuid;
 use crate::RuntimeConfig;
 use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
-use crate::model_catalog::ModelCatalogService;
+use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-    IssueInviteRequest, LifecycleState, Message, MessageId, MessageRole, MessageStatus,
-    PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote, ResolveWorkspaceRequest,
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT,
-    SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity, ServerShutdown,
-    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, TurnId,
-    UpdateAgentSelectionRequest, ViewSessionRequest,
+    IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole,
+    MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote,
+    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
+    SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity,
+    ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
+    SessionId, SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot,
+    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery,
+    TurnId, UpdateAgentSelectionRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -461,6 +461,10 @@ pub async fn spawn_with_providers_and_timings(
         .landing_agent_selection()
         .await
         .context("load persisted landing Agent Selection")?;
+    let remembered_model_catalog = repository
+        .model_catalog()
+        .await
+        .context("load remembered Model Catalog")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -508,8 +512,17 @@ pub async fn spawn_with_providers_and_timings(
     let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
     let sessions = SessionStore::new(persisted_sessions, storage.clone());
     let landing_agent_selection =
-        LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage);
-    let model_catalog = ModelCatalogService::new(runtimes.iter().cloned(), settings.subscribe());
+        LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage.clone());
+    let model_catalog = ModelCatalogService::new(
+        runtimes.iter().cloned(),
+        settings.subscribe(),
+        CatalogMemory {
+            remembered: remembered_model_catalog,
+            remember: Some(Arc::new(move |remembered| {
+                storage.save_model_catalog(remembered);
+            })),
+        },
+    );
     let runtimes = Arc::new(runtimes);
     let skill_catalog = SkillCatalogService::new(runtimes.clone(), settings.subscribe());
     let providers = ProviderOrchestrator::new(
@@ -566,6 +579,7 @@ pub async fn spawn_with_providers_and_timings(
         )
         .route("/v1/models", get(list_models))
         .route("/v1/models/refresh", post(refresh_models))
+        .route("/v1/models/warm", post(warm_models))
         .route("/v1/skills", post(list_skills))
         .route("/v1/skills/refresh", post(refresh_skills))
         .route(
@@ -690,6 +704,18 @@ async fn refresh_models(State(state): State<AppState>, headers: HeaderMap) -> Re
     Json(state.model_catalog.refresh().await).into_response()
 }
 
+/// What a client connecting says to a server that may so far serve only what
+/// it remembered: ask each Provider this process has not yet heard from. The
+/// answer arrives on the events stream as each discovery settles, so this
+/// returns as soon as the asking has begun.
+async fn warm_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.model_catalog.warm();
+    StatusCode::ACCEPTED.into_response()
+}
+
 async fn list_skills(State(state): State<AppState>, request: Request) -> Response {
     let request = match decode_session_command::<SkillCatalogRequest>(
         &state,
@@ -735,6 +761,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     Sse::new(event_stream(
         state.shutdown.subscribe_to_intent(),
         state.settings.subscribe(),
+        state.model_catalog.clone(),
         state.timings.sse_keepalive_interval,
     ))
     .into_response()
@@ -743,6 +770,11 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
 struct EventStreamState {
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     settings: watch::Receiver<SettingsSnapshot>,
+    model_catalog: ModelCatalogService,
+    catalog_changes: watch::Receiver<u64>,
+    /// The catalog this stream last pushed, so a change that leaves the
+    /// catalog as the client already has it is not pushed again.
+    pushed_catalog: ModelCatalog,
     keepalive: tokio::time::Interval,
     finished: bool,
 }
@@ -750,20 +782,34 @@ struct EventStreamState {
 fn event_stream(
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     mut settings: watch::Receiver<SettingsSnapshot>,
+    model_catalog: ModelCatalogService,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     // Every connecting client receives the effective-settings snapshot before
     // any other protocol event; later replacements re-push through the watch.
     let snapshot = settings_snapshot_event(&settings.borrow_and_update());
+    // The Model Catalog as the server holds it follows the Settings snapshot;
+    // the change watch is read first so an answer landing between here and
+    // the snapshot is pushed rather than lost.
+    let mut catalog_changes = model_catalog.subscribe();
+    catalog_changes.mark_unchanged();
+    let pushed_catalog = model_catalog.current();
+    let catalog = model_catalog_event(&pushed_catalog);
     let first = stream::once(async move {
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     })
     .chain(stream::once(async move {
         Ok::<_, std::convert::Infallible>(snapshot)
+    }))
+    .chain(stream::once(async move {
+        Ok::<_, std::convert::Infallible>(catalog)
     }));
     let state = EventStreamState {
         shutdown,
         settings,
+        model_catalog,
+        catalog_changes,
+        pushed_catalog,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
@@ -774,33 +820,50 @@ fn event_stream(
         if state.finished {
             return None;
         }
-        tokio::select! {
-            biased;
-            changed = state.shutdown.changed() => {
-                if changed.is_err() {
-                    return None;
+        loop {
+            tokio::select! {
+                biased;
+                changed = state.shutdown.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let shutdown = state.shutdown.borrow_and_update().clone()?;
+                    let event = Event::default()
+                        .event(SERVER_SHUTDOWN_EVENT)
+                        .json_data(shutdown)
+                        .expect("server shutdown intents always serialize");
+                    state.finished = true;
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
-                let shutdown = state.shutdown.borrow_and_update().clone()?;
-                let event = Event::default()
-                    .event(SERVER_SHUTDOWN_EVENT)
-                    .json_data(shutdown)
-                    .expect("server shutdown intents always serialize");
-                state.finished = true;
-                Some((Ok::<_, std::convert::Infallible>(event), state))
-            }
-            changed = state.settings.changed() => {
-                if changed.is_err() {
-                    return None;
+                changed = state.settings.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let event = settings_snapshot_event(&state.settings.borrow_and_update());
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
-                let event = settings_snapshot_event(&state.settings.borrow_and_update());
-                Some((Ok::<_, std::convert::Infallible>(event), state))
+                changed = state.catalog_changes.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    // A change that leaves the catalog as this client already
+                    // has it — a discovery settling on the very Models it was
+                    // shown mid-refresh — is not worth a push.
+                    let catalog = state.model_catalog.current();
+                    if catalog == state.pushed_catalog {
+                        continue;
+                    }
+                    let event = model_catalog_event(&catalog);
+                    state.pushed_catalog = catalog;
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
+                }
+                _ = state.keepalive.tick() => return Some((
+                    Ok::<_, std::convert::Infallible>(
+                        Event::default().comment("keep-alive"),
+                    ),
+                    state,
+                )),
             }
-            _ = state.keepalive.tick() => Some((
-                Ok::<_, std::convert::Infallible>(
-                    Event::default().comment("keep-alive"),
-                ),
-                state,
-            )),
         }
     });
 
@@ -1009,6 +1072,13 @@ async fn adopt_settings(
     let serving_result = serving.adopt(snapshot.settings.serving).await;
     settings.send_replace(snapshot.clone());
     serving_result
+}
+
+fn model_catalog_event(catalog: &ModelCatalog) -> Event {
+    Event::default()
+        .event(MODEL_CATALOG_EVENT)
+        .json_data(catalog)
+        .expect("Model Catalogs always serialize")
 }
 
 fn settings_snapshot_event(snapshot: &SettingsSnapshot) -> Event {
@@ -2132,14 +2202,18 @@ mod tests {
     async fn lifecycle_streams_receive_shutdown_intent_independently() {
         let (shutdown, _) = watch::channel(None);
         let (settings, _) = watch::channel(SettingsSnapshot::default());
+        let model_catalog =
+            ModelCatalogService::new([], settings.subscribe(), CatalogMemory::none());
         let first = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
+            model_catalog.clone(),
             Duration::from_secs(60),
         );
         let second = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
+            model_catalog,
             Duration::from_secs(60),
         );
         pin_mut!(first);
@@ -2153,6 +2227,7 @@ mod tests {
             first.next().await.is_some(),
             "first settings snapshot arrives"
         );
+        assert!(first.next().await.is_some(), "first Model Catalog arrives");
         assert!(
             second.next().await.is_some(),
             "second connected comment arrives"
@@ -2160,6 +2235,10 @@ mod tests {
         assert!(
             second.next().await.is_some(),
             "second settings snapshot arrives"
+        );
+        assert!(
+            second.next().await.is_some(),
+            "second Model Catalog arrives"
         );
 
         let intent = ServerShutdown {

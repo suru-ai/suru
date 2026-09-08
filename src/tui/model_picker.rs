@@ -1,5 +1,7 @@
 //! Searchable Model picker state and stable catalog reconciliation.
 
+use std::collections::HashMap;
+
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
     ModelOptionRole, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
@@ -60,10 +62,10 @@ struct ProviderModels {
 }
 
 /// The presentation metadata known when an Outlook's current Agent Selection
-/// becomes the one in force. Catalog discovery is deliberately not allowed to
-/// rewrite it: opening a catalog-consuming surface must not make an unchanged
-/// Agent look as though it renamed itself. An actual selection change captures
-/// the best metadata then available.
+/// became the one in force. It is the fallback a summary uses while no catalog
+/// the picker holds names the Model — after an Outlook turn clears the caches,
+/// most of all. Whenever a catalog does name it, the catalog wins, so a Model
+/// is always called what its Provider calls it now.
 #[derive(Clone, Debug)]
 struct SelectionPresentation {
     outlook: Outlook,
@@ -87,7 +89,11 @@ pub(super) struct ModelPicker {
     opened_on: Option<AgentSelection>,
     provider_scope: Option<ProviderId>,
     query: String,
-    cached_providers: Vec<ProviderModels>,
+    /// The latest catalog heard for each Outlook, whether a listing this
+    /// picker asked for or one the server pushed. Kept per Outlook so turning
+    /// back to one names its Models again without waiting to hear the catalog
+    /// anew.
+    cached_providers: HashMap<Outlook, Vec<ProviderModels>>,
     providers: Vec<ProviderModels>,
     /// One current presentation per Outlook, retained while another Outlook is
     /// visible so returning to it restores the label it previously showed.
@@ -137,7 +143,7 @@ impl ModelPicker {
         if let Some(current) = current {
             return self.cached_model(&current.provider, &current.model);
         }
-        let mut defaults = self.cached_providers.iter().filter_map(default_model);
+        let mut defaults = self.cache().iter().filter_map(default_model);
         let model = defaults.next()?;
         defaults.next().is_none().then(|| model.clone())
     }
@@ -147,7 +153,7 @@ impl ModelPicker {
         provider: &ProviderId,
         model: &ModelId,
     ) -> Option<ModelDescriptor> {
-        self.cached_providers
+        self.cache()
             .iter()
             .find(|catalog| &catalog.provider == provider)?
             .models
@@ -170,9 +176,15 @@ impl ModelPicker {
         self.outlook = outlook;
         self.close();
         self.active_request = None;
-        self.cached_providers.clear();
         self.providers.clear();
         self.provider_scope = None;
+    }
+
+    /// The latest catalog heard for the current Outlook, or nothing yet.
+    fn cache(&self) -> &[ProviderModels] {
+        self.cached_providers
+            .get(&self.outlook)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub(super) fn is_active_request(&self, request: &ModelListRequest) -> bool {
@@ -190,7 +202,7 @@ impl ModelPicker {
         self.purpose = purpose;
         self.opened_on = current.cloned();
         self.provider_scope = provider_scope;
-        self.providers.clone_from(&self.cached_providers);
+        self.providers = self.cache().to_vec();
         self.cursor_moved = false;
         let request = self.begin_refresh();
         self.focus(current, false);
@@ -249,11 +261,17 @@ impl ModelPicker {
     /// picker has heard — the live list first, then the cache. A Provider no
     /// catalog has named yet goes by its wire identifier, the only name known.
     pub(super) fn provider_display_name<'a>(&'a self, provider: &'a ProviderId) -> &'a str {
+        self.listed_provider(provider)
+            .map_or(provider.as_str(), |candidate| &candidate.display_name)
+    }
+
+    /// The Provider as the latest catalog lists it: the live list first, then
+    /// the current Outlook's cache. Nothing while no catalog has named it.
+    fn listed_provider(&self, provider: &ProviderId) -> Option<&ProviderModels> {
         self.providers
             .iter()
-            .chain(self.cached_providers.iter())
+            .chain(self.cache().iter())
             .find(|candidate| &candidate.provider == provider)
-            .map_or(provider.as_str(), |candidate| &candidate.display_name)
     }
 
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
@@ -274,7 +292,8 @@ impl ModelPicker {
             return;
         }
         let providers = normalize_catalog(catalog.providers);
-        self.cached_providers.clone_from(&providers);
+        self.cached_providers
+            .insert(self.outlook.clone(), providers.clone());
         if self.providers.is_empty() {
             self.providers = providers;
         } else {
@@ -297,6 +316,15 @@ impl ModelPicker {
         }
         let in_force = self.selection_in_force(current);
         self.focus(in_force.as_ref(), self.cursor_moved);
+    }
+
+    /// Takes in a catalog a server pushed unasked, for the Outlook it serves.
+    /// It feeds the cache every summary and Provider name is read from, and
+    /// nothing else: the rows of a picker already open keep answering to the
+    /// listing it asked for.
+    pub(super) fn adopt_catalog(&mut self, outlook: Outlook, catalog: ModelCatalog) {
+        self.cached_providers
+            .insert(outlook, normalize_catalog(catalog.providers));
     }
 
     pub(super) fn finish(&mut self, request: &ModelListRequest) {
@@ -407,12 +435,26 @@ impl ModelPicker {
         let presentation = self.selection_presentations.iter().find(|presentation| {
             presentation.outlook == self.outlook && presentation.selection == *selection
         });
-        let Some(model) = presentation.and_then(|presentation| presentation.model.as_ref()) else {
-            let provider = presentation.map_or(selection.provider.as_str(), |presentation| {
-                presentation.provider_display_name.as_str()
-            });
+        // The latest catalog names the Model; the presentation frozen when the
+        // selection came into force stands in only while no catalog does.
+        let listed = self.listed_provider(&selection.provider);
+        let provider_display_name = listed
+            .map(|provider| provider.display_name.as_str())
+            .or_else(|| {
+                presentation.map(|presentation| presentation.provider_display_name.as_str())
+            })
+            .unwrap_or(selection.provider.as_str());
+        let model = listed
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == selection.model)
+            })
+            .or_else(|| presentation.and_then(|presentation| presentation.model.as_ref()));
+        let Some(model) = model else {
             return if detailed {
-                format!("{provider} · {}", selection.model)
+                format!("{provider_display_name} · {}", selection.model)
             } else {
                 selection.model.to_string()
             };
@@ -420,13 +462,7 @@ impl ModelPicker {
         if !detailed {
             return model.display_name.clone();
         }
-        let mut parts = vec![
-            presentation
-                .expect("a remembered Model has remembered Provider presentation")
-                .provider_display_name
-                .clone(),
-            model.display_name.clone(),
-        ];
+        let mut parts = vec![provider_display_name.to_owned(), model.display_name.clone()];
         for role in [
             ModelOptionRole::ReasoningEffort,
             ModelOptionRole::Context,
@@ -459,11 +495,11 @@ impl ModelPicker {
         parts.join(" · ")
     }
 
-    /// Freezes the best presentation currently available beside the durable
-    /// selection. A missing catalog has an explicit ID fallback; later catalog
-    /// loads can serve pickers and new selections without mutating an unchanged
-    /// one. A real selection change replaces the Outlook's presentation, and
-    /// an interval with no selection ends it so reselecting the same Agent can
+    /// Keeps the best presentation currently available beside the durable
+    /// selection, as the fallback a summary reads when no catalog the picker
+    /// holds names the Model. A missing catalog has an explicit ID fallback. A
+    /// real selection change replaces the Outlook's presentation, and an
+    /// interval with no selection ends it so reselecting the same Agent can
     /// capture metadata learned in the meantime.
     pub(super) fn remember_selection(&mut self, selection: Option<&AgentSelection>) {
         let Some(selection) = selection else {
@@ -480,11 +516,7 @@ impl ModelPicker {
         {
             return;
         }
-        let provider = self
-            .providers
-            .iter()
-            .chain(self.cached_providers.iter())
-            .find(|provider| provider.provider == selection.provider);
+        let provider = self.listed_provider(&selection.provider);
         let provider_display_name = provider.map_or_else(
             || selection.provider.to_string(),
             |provider| provider.display_name.clone(),

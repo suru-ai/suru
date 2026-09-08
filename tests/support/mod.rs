@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{
-        Health, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
+        Health, ModelCatalog, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
         SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged, ShutdownReason,
         SkillCatalog, TitleErrand,
     },
@@ -51,7 +51,22 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
         matches!(settings, ManagedEvent::SettingsSnapshot(_)),
         "expected settings snapshot event, got {settings:?}"
     );
+    receive_model_catalog(client).await;
     identity
+}
+
+/// Reads the Model Catalog that follows every connect's Settings snapshot.
+/// A managed client connecting asks nothing of any Provider — a TUI does, by
+/// a request of its own — so this is the whole of the connect-time catalog.
+pub async fn receive_model_catalog(client: &mut ManagedClient) -> ModelCatalog {
+    let event = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("Model Catalog arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::ModelCatalog(catalog) = event else {
+        panic!("expected Model Catalog event, got {event:?}");
+    };
+    catalog
 }
 
 pub async fn next_skill_catalog(client: &mut ManagedClient) -> SkillCatalog {

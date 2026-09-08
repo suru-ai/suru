@@ -35,15 +35,20 @@ async fn attach(state_dir: &Path, channel: &str) -> (ManagedClient, SettingsSnap
     (client, snapshot)
 }
 
+/// The next Settings snapshot, read past the Model Catalog the server pushes
+/// beside it: on every connect, and again when a Provider's Enablement turns.
 async fn next_snapshot(client: &mut ManagedClient) -> SettingsSnapshot {
-    let event = timeout(Duration::from_secs(1), client.next())
-        .await
-        .expect("settings snapshot arrives")
-        .expect("managed client remains open");
-    let ManagedEvent::SettingsSnapshot(snapshot) = event else {
-        panic!("expected a settings snapshot event, got {event:?}");
-    };
-    snapshot
+    loop {
+        let event = timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("settings snapshot arrives")
+            .expect("managed client remains open");
+        match event {
+            ManagedEvent::SettingsSnapshot(snapshot) => return snapshot,
+            ManagedEvent::ModelCatalog(_) => continue,
+            event => panic!("expected a settings snapshot event, got {event:?}"),
+        }
+    }
 }
 
 #[tokio::test]

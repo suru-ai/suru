@@ -17,7 +17,7 @@ The external product through which an agent operates, such as Codex, Copilot, or
 _Avoid_: Backend
 
 **Provider Availability**:
-Whether a Provider can be used at all right now, as Suru finds it: the external product installed, signed in to, and at a version Suru speaks. Availability is a fact about the environment rather than a choice, so every way a Provider can be unavailable names a condition the user fixes outside Suru, and Suru re-reads it only when the user asks for a Provider's Models again or turns to a surface that presents the Providers themselves. An unavailable Provider keeps its place wherever Providers are listed, with its reason on show, and none of its Models may be selected. Distinct from Provider Enablement, which is the user's own choice rather than something Suru discovers.
+Whether a Provider can be used at all right now, as Suru finds it: the external product installed, signed in to, and at a version Suru speaks. Availability is a fact about the environment rather than a choice, so every way a Provider can be unavailable names a condition the user fixes outside Suru, and Suru re-reads it only when the user asks for a Provider's Models again, turns to a surface that presents the Providers themselves, or connects to a server that has not yet asked that Provider since it started. An unavailable Provider keeps its place wherever Providers are listed, with its reason on show, and none of its Models may be selected. Distinct from Provider Enablement, which is the user's own choice rather than something Suru discovers.
 _Avoid_: Health, readiness, status
 
 **Provider Enablement**:
@@ -27,6 +27,10 @@ _Avoid_: Provider toggle, active, installed
 **Model**:
 The language model selected for an Agent through its Provider.
 _Avoid_: Engine
+
+**Model Catalog**:
+The Models each Provider currently offers, together with their names and Model Options, as Suru last learned them from the Provider. Suru remembers the last catalog it learned across restarts so it can present Models by name before asking the Provider again, and asks each Provider anew when a user connects to a server that has not yet asked it since it started. A remembered catalog is the same catalog, not a separate copy, and a Model's name always reflects the latest catalog. Distinct from Provider Availability, which is never remembered: Suru re-reads it rather than replaying a past condition.
+_Avoid_: Models cache, model list, snapshot
 
 **Model Option**:
 A Provider-advertised, Model-specific configuration dimension such as reasoning effort or speed. Model Options compose independently within an Agent Selection.

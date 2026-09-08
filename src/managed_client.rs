@@ -166,6 +166,10 @@ pub enum ManagedEvent {
     /// The server's effective-settings view: pushed right after every connect
     /// and again whenever the server replaces it.
     SettingsSnapshot(SettingsSnapshot),
+    /// The server's Model Catalog: pushed right after the Settings snapshot on
+    /// every connect, and again whenever a Provider's discovery settles or its
+    /// Enablement turns, so a client names Models without asking for them.
+    ModelCatalog(ModelCatalog),
     /// A server-authoritative Skill Catalog changed after discovery or
     /// invalidation. Every attached client receives the same state transition.
     SkillCatalogUpdated(SkillCatalog),
@@ -496,6 +500,13 @@ impl ManagedClient {
         self.session_commands().refresh_models().await
     }
 
+    /// Asks the server to discover the Models of every Provider it has not
+    /// yet heard from this process. The answer arrives as Model Catalog
+    /// events, not here.
+    pub async fn warm_models(&self) -> Result<()> {
+        self.session_commands().warm_models().await
+    }
+
     pub async fn list_skills(&self, request: SkillCatalogRequest) -> Result<SkillCatalog> {
         self.session_commands().list_skills(request).await
     }
@@ -729,6 +740,23 @@ impl SessionCommandClient {
             .await
             .context("send Model catalog refresh")?;
         decode_api_response(response, "Model catalog refresh").await
+    }
+
+    pub(crate) async fn warm_models(&self) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        self.http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/models/warm",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Model catalog warm-up")?
+            .error_for_status()
+            .context("Model catalog warm-up")?;
+        Ok(())
     }
     pub(crate) async fn create_session(
         &self,

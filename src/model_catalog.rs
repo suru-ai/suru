@@ -6,14 +6,53 @@ use tokio::sync::watch;
 use crate::{
     protocol::{
         AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ProviderCatalogStatus,
-        ProviderId, ProviderModelCatalog, ProviderUnavailability, SettingsSnapshot,
+        ProviderId, ProviderModelCatalog, ProviderUnavailability, SessionTimestamp,
+        SettingsSnapshot,
     },
     provider::{ProviderError, ProviderRuntime, validate_models},
 };
 
+/// The Model Catalog one Provider served the last time discovery succeeded,
+/// as Suru remembers it across restarts. Only a successful discovery is
+/// remembered: a failure or an unavailability is a fact about the environment
+/// Suru re-reads rather than replays.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RememberedProviderCatalog {
+    pub(crate) provider: ProviderId,
+    pub(crate) models: Vec<ModelDescriptor>,
+    pub(crate) warning: Option<String>,
+    pub(crate) discovered_at: SessionTimestamp,
+}
+
+/// Where a remembered catalog is kept: what was remembered before this
+/// process started, and where each successful discovery is written so the
+/// next process starts from it.
+pub(crate) struct CatalogMemory {
+    pub(crate) remembered: Vec<RememberedProviderCatalog>,
+    pub(crate) remember: Option<RememberCatalog>,
+}
+
+pub(crate) type RememberCatalog = Arc<dyn Fn(RememberedProviderCatalog) + Send + Sync>;
+
+impl CatalogMemory {
+    /// A memory that remembers nothing and is written nowhere, for a service
+    /// that lives only as long as its process.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            remembered: Vec::new(),
+            remember: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ModelCatalogService {
     providers: Arc<Vec<ProviderCatalog>>,
+    /// Bumped whenever what [`Self::current`] would answer changes: a
+    /// discovery settling, or a Provider's Enablement turning. A stream
+    /// pushing the catalog to clients waits on it.
+    changes: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -23,6 +62,8 @@ struct ProviderCatalog {
     display_name: String,
     state: Arc<Mutex<CatalogState>>,
     generation: watch::Sender<u64>,
+    changes: watch::Sender<u64>,
+    remember: Option<RememberCatalog>,
     /// The effective Settings in force, read whenever this catalog is about to
     /// consult its Provider. A Provider the user turned off is never asked for
     /// its Models, so no process starts on its behalf.
@@ -35,6 +76,22 @@ struct CatalogState {
     warning: Option<String>,
     failure: Option<CatalogFailure>,
     refreshing: bool,
+    /// Whether this process has heard the Provider's own answer yet, whatever
+    /// it was: a failure is an answer too, and one to re-read when the user
+    /// asks rather than on every connect. A remembered catalog serves Models
+    /// without setting this, which is what lets a connecting client ask for
+    /// the live answer exactly once.
+    discovered_live: bool,
+}
+
+impl CatalogState {
+    fn remembered(remembered: RememberedProviderCatalog) -> Self {
+        Self {
+            models: Some(remembered.models),
+            warning: remembered.warning,
+            ..Self::default()
+        }
+    }
 }
 
 /// How the last discovery failed: what it said, and — when it failed because
@@ -51,27 +108,99 @@ impl ModelCatalogService {
     /// construction rather than a step a caller takes afterwards, because a
     /// caller that forgot it would get a service that quietly never re-consults
     /// an enabled Provider; the cost is that this needs a reactor to spawn on.
+    ///
+    /// `memory` seeds each Provider with the catalog remembered from the last
+    /// process, so Models are served by name before any Provider is asked. A
+    /// remembered catalog that fails the same checks a live one must pass, or
+    /// names a Provider this server does not host, is dropped rather than
+    /// served.
     pub(crate) fn new(
         runtimes: impl IntoIterator<Item = Arc<dyn ProviderRuntime>>,
         settings: watch::Receiver<SettingsSnapshot>,
+        memory: CatalogMemory,
     ) -> Self {
+        let CatalogMemory {
+            mut remembered,
+            remember,
+        } = memory;
+        let (changes, _) = watch::channel(0);
         let service = Self {
             providers: Arc::new(
                 runtimes
                     .into_iter()
-                    .map(|runtime| ProviderCatalog {
-                        provider: runtime.provider_id(),
-                        display_name: runtime.display_name().to_owned(),
-                        runtime,
-                        state: Arc::new(Mutex::new(CatalogState::default())),
-                        generation: watch::channel(0).0,
-                        settings: settings.clone(),
+                    .map(|runtime| {
+                        let provider = runtime.provider_id();
+                        let state = remembered
+                            .iter()
+                            .position(|candidate| candidate.provider == provider)
+                            .map(|index| remembered.swap_remove(index))
+                            .filter(|candidate| {
+                                match admissible_discovery(&provider, &candidate.models) {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %provider,
+                                            "dropping the remembered Model Catalog: {error}"
+                                        );
+                                        false
+                                    }
+                                }
+                            })
+                            .map_or_else(CatalogState::default, CatalogState::remembered);
+                        ProviderCatalog {
+                            provider,
+                            display_name: runtime.display_name().to_owned(),
+                            runtime,
+                            state: Arc::new(Mutex::new(state)),
+                            generation: watch::channel(0).0,
+                            changes: changes.clone(),
+                            remember: remember.clone(),
+                            settings: settings.clone(),
+                        }
                     })
                     .collect(),
             ),
+            changes,
         };
         service.refresh_providers_as_they_are_enabled(settings);
         service
+    }
+
+    /// The catalog as it stands, without asking any Provider. What a
+    /// connecting client is shown first, and what it is shown again each time
+    /// [`Self::subscribe`] reports a change.
+    pub(crate) fn current(&self) -> ModelCatalog {
+        ModelCatalog {
+            providers: self
+                .providers
+                .iter()
+                .map(ProviderCatalog::current_or_disabled)
+                .collect(),
+        }
+    }
+
+    /// Announces every change to what [`Self::current`] answers.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Asks each enabled Provider for its Models if this process has not yet
+    /// heard its answer. A client connecting to a server that so far serves
+    /// only what it remembered is what calls this; a Provider already
+    /// discovered live is left alone, so reconnecting clients cost nothing.
+    pub(crate) fn warm(&self) {
+        for catalog in self.providers.iter() {
+            if !catalog.is_enabled() {
+                continue;
+            }
+            let mut state = catalog
+                .state
+                .lock()
+                .expect("Model catalog lock is not poisoned");
+            if !state.discovered_live {
+                catalog.begin_refresh_locked(&mut state);
+            }
+        }
     }
 
     /// Discovers a Provider's Models the moment the user turns it back on, so
@@ -91,12 +220,17 @@ impl ModelCatalogService {
                 .map(ProviderCatalog::is_enabled)
                 .collect::<Vec<_>>();
             while settings.changed().await.is_ok() {
+                let mut turned = false;
                 for (catalog, was_enabled) in service.providers.iter().zip(was_enabled.iter_mut()) {
                     let is_enabled = catalog.is_enabled();
                     if is_enabled && !*was_enabled {
                         catalog.begin_refresh();
                     }
+                    turned |= is_enabled != *was_enabled;
                     *was_enabled = is_enabled;
+                }
+                if turned {
+                    service.changes.send_modify(|changes| *changes += 1);
                 }
             }
         });
@@ -336,19 +470,21 @@ impl ProviderCatalog {
 
     async fn discover(&self) {
         let result = self.runtime.list_models().await.and_then(|discovery| {
-            validate_models(&discovery.models)?;
-            if discovery
-                .models
-                .iter()
-                .any(|model| model.provider != self.provider)
-            {
-                return Err(ProviderError::new(format!(
-                    "Provider `{}` returned a Model owned by another Provider",
-                    self.provider
-                )));
-            }
+            admissible_discovery(&self.provider, &discovery.models)?;
             Ok(discovery)
         });
+        // What to remember is decided before the lock and written after it:
+        // a memory is whatever the caller made it, and it must never run under
+        // the catalog's own lock.
+        let remembered = match (&self.remember, &result) {
+            (Some(_), Ok(discovery)) => Some(RememberedProviderCatalog {
+                provider: self.provider.clone(),
+                models: discovery.models.clone(),
+                warning: discovery.warning.clone(),
+                discovered_at: SessionTimestamp::now(),
+            }),
+            _ => None,
+        };
         let mut state = self
             .state
             .lock()
@@ -367,8 +503,22 @@ impl ProviderCatalog {
             }
         }
         state.refreshing = false;
+        state.discovered_live = true;
         drop(state);
+        if let (Some(remember), Some(remembered)) = (&self.remember, remembered) {
+            remember(remembered);
+        }
         self.generation.send_modify(|generation| *generation += 1);
+        self.changes.send_modify(|changes| *changes += 1);
+    }
+
+    /// What this Provider serves right now, or the disabled catalog while the
+    /// user has it off. Asks nothing of the Provider either way.
+    fn current_or_disabled(&self) -> ProviderModelCatalog {
+        if !self.is_enabled() {
+            return self.disabled_catalog();
+        }
+        self.current()
     }
 
     fn current(&self) -> ProviderModelCatalog {
@@ -392,6 +542,21 @@ impl ProviderCatalog {
             status,
         }
     }
+}
+
+/// The checks every catalog must pass before it is served, whether a Provider
+/// just answered with it or it was remembered from an earlier process.
+fn admissible_discovery(
+    provider: &ProviderId,
+    models: &[ModelDescriptor],
+) -> Result<(), ProviderError> {
+    validate_models(models)?;
+    if models.iter().any(|model| &model.provider != provider) {
+        return Err(ProviderError::new(format!(
+            "Provider `{provider}` returned a Model owned by another Provider"
+        )));
+    }
+    Ok(())
 }
 
 /// The Model a Provider serves as its default, and nothing when it serves no
@@ -582,6 +747,144 @@ mod tests {
         }
     }
 
+    fn remembered(display_name: &str) -> RememberedProviderCatalog {
+        RememberedProviderCatalog {
+            provider: ProviderId::new("stub"),
+            models: vec![ModelDescriptor {
+                provider: ProviderId::new("stub"),
+                id: ModelId::new("stub-model"),
+                display_name: display_name.to_owned(),
+                description: String::new(),
+                is_default: true,
+                availability: ModelAvailability::Available,
+                options: Vec::new(),
+            }],
+            warning: None,
+            discovered_at: SessionTimestamp(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_catalog_serves_models_before_any_discovery() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime.clone() as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory {
+                remembered: vec![remembered("Remembered Stub")],
+                remember: None,
+            },
+        );
+
+        let catalog = service.current();
+        assert_eq!(
+            catalog.providers[0].models[0].display_name,
+            "Remembered Stub"
+        );
+        assert_eq!(catalog.providers[0].status, ProviderCatalogStatus::Fresh);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service.default_selection().map(|selection| selection.model),
+            Some(ModelId::new("stub-model"))
+        );
+    }
+
+    #[tokio::test]
+    async fn warming_asks_each_provider_once_per_process() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime.clone() as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory {
+                remembered: vec![remembered("Remembered Stub")],
+                remember: None,
+            },
+        );
+        let mut changes = service.subscribe();
+
+        service.warm();
+        assert_eq!(
+            service.current().providers[0].status,
+            ProviderCatalogStatus::Refreshing
+        );
+        changes
+            .changed()
+            .await
+            .expect("the catalog announces the settled discovery");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let catalog = service.current();
+        assert_eq!(catalog.providers[0].status, ProviderCatalogStatus::Fresh);
+        assert_eq!(catalog.providers[0].models[0].display_name, "Stub");
+
+        service.warm();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            1,
+            "a Provider discovered live this process is not asked again on connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_discovery_failed_is_not_asked_again_on_connect() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime.clone() as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory::none(),
+        );
+        service.refresh().await;
+        assert_eq!(
+            service.refresh().await.providers[0].status,
+            ProviderCatalogStatus::Stale {
+                message: "temporary catalog outage".to_owned()
+            }
+        );
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+
+        service.warm();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            2,
+            "a failure is an answer this process has heard; the user asks again, not every connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_successful_discovery_is_remembered() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let (remembered_tx, mut remembered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = ModelCatalogService::new(
+            [Arc::new(FailingAfterFirstRuntime::new()) as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory {
+                remembered: Vec::new(),
+                remember: Some(Arc::new(move |catalog| {
+                    let _ = remembered_tx.send(catalog);
+                })),
+            },
+        );
+
+        service.refresh().await;
+        let remembered = remembered_rx
+            .recv()
+            .await
+            .expect("the first discovery succeeds and is remembered");
+        assert_eq!(remembered.provider, ProviderId::new("stub"));
+        assert_eq!(remembered.models[0].display_name, "Stub");
+        assert!(remembered.discovered_at.0 > 0);
+
+        service.refresh().await;
+        assert!(
+            remembered_rx.try_recv().is_err(),
+            "a failed discovery leaves what was remembered alone"
+        );
+    }
+
     /// Issue #83: `refresh` must report the settled status of the refresh it waited
     /// for, even when concurrent `list` calls immediately re-arm a new background
     /// refresh between the moment the awaited refresh settles and the moment the
@@ -592,6 +895,7 @@ mod tests {
         let service = ModelCatalogService::new(
             [Arc::new(FailingAfterFirstRuntime::new()) as Arc<dyn ProviderRuntime>],
             settings_rx,
+            CatalogMemory::none(),
         );
         assert_eq!(
             service.refresh().await.providers[0].status,

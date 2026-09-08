@@ -984,6 +984,17 @@ impl RunLoop {
         if matches!(&event, ManagedEvent::Connecting) {
             self.tasks.reset_skill_listing();
         }
+        // A TUI connecting is what asks the local server to discover the
+        // Models it has not yet heard from this process; the answer lands as
+        // Model Catalog events, so nothing waits on the request itself.
+        if matches!(&event, ManagedEvent::Connected(_)) {
+            let commands = self.client.session_commands();
+            tokio::spawn(async move {
+                if let Err(error) = commands.warm_models().await {
+                    tracing::warn!("could not warm the Model Catalog on connect: {error:#}");
+                }
+            });
+        }
         let was_recovering = self.application.is_recovering();
         let transition = self
             .application

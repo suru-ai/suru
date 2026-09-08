@@ -166,8 +166,11 @@ fn connected_application_uses_the_persisted_landing_agent_selection() {
         )))
         .expect("close the Model picker without changing the selection");
     let after_catalog = rendered_application_rows_at(&application, 100, 16).join("\n");
-    assert!(after_catalog.contains("codex · gpt-remembered"));
-    assert!(!after_catalog.contains("Remembered GPT"));
+    assert!(
+        after_catalog.contains("Remembered GPT"),
+        "the catalog names the persisted Model as soon as it is heard: {after_catalog}"
+    );
+    assert!(!after_catalog.contains("codex · gpt-remembered"));
 
     type_terminal_text(&mut application, "Use the remembered Agent");
     let ApplicationTransition::CreateSession(request) = application

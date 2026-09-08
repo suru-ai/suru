@@ -12,21 +12,67 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
+    model_catalog::RememberedProviderCatalog,
     protocol::{
         Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost,
-        CostBasis, FileChange, Message, MessageId, MessageRole, MessageStatus, ModelId,
-        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session, SessionId,
-        SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp, SkillInvocation,
-        TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace,
+        CostBasis, FileChange, Message, MessageId, MessageRole, MessageStatus, ModelDescriptor,
+        ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue,
+        Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
+        SessionId, SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp,
+        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
+        Workspace,
     },
     provider::ProviderResumeState,
 };
 
 use super::{
     PersistedSession, StorageError, StoredResumeState, activities, landing_agent_selection,
-    messages, prompts, provider_resume_states, sessions, turns,
+    messages, model_catalog, prompts, provider_resume_states, sessions, turns,
 };
+
+/// One Provider's remembered Model Catalog: the Models and warning it last
+/// served, as one JSON payload, beside when it served them.
+#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+#[diesel(table_name = model_catalog)]
+pub(super) struct ModelCatalogRow {
+    provider: String,
+    payload: String,
+    discovered_at: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ModelCatalogPayload {
+    models: Vec<ModelDescriptor>,
+    warning: Option<String>,
+}
+
+impl ModelCatalogRow {
+    pub(super) fn from_remembered(
+        remembered: RememberedProviderCatalog,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            provider: remembered.provider.to_string(),
+            payload: serde_json::to_string(&ModelCatalogPayload {
+                models: remembered.models,
+                warning: remembered.warning,
+            })
+            .map_err(|error| StorageError::WriteModelCatalog(error.to_string()))?,
+            discovered_at: i64::try_from(remembered.discovered_at.0).unwrap_or(i64::MAX),
+        })
+    }
+
+    /// Nothing for a payload this binary cannot read: a remembered catalog is
+    /// best-effort, and the Provider is asked again on the next connect.
+    pub(super) fn into_remembered(self) -> Option<RememberedProviderCatalog> {
+        let payload: ModelCatalogPayload = serde_json::from_str(&self.payload).ok()?;
+        Some(RememberedProviderCatalog {
+            provider: ProviderId::new(self.provider),
+            models: payload.models,
+            warning: payload.warning,
+            discovered_at: SessionTimestamp(u64::try_from(self.discovered_at).unwrap_or(0)),
+        })
+    }
+}
 
 #[derive(AsChangeset, Insertable, Queryable, Selectable)]
 #[diesel(table_name = landing_agent_selection)]

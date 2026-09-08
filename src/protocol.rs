@@ -11,13 +11,14 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
 };
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
+pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";

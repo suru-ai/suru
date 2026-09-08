@@ -1068,6 +1068,11 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::SettingsSnapshot(snapshot) => self.adopt_settings(snapshot),
+            // The lifecycle stream is the local server's, so the catalog it
+            // pushes is the Local Outlook's whichever Outlook is on screen.
+            ManagedEvent::ModelCatalog(catalog) => {
+                self.model_picker.adopt_catalog(Outlook::Local, catalog);
+            }
             ManagedEvent::SkillCatalogUpdated(catalog) => {
                 let request = SkillCatalogRequest {
                     provider: catalog.provider.clone(),
@@ -1188,6 +1193,7 @@ impl TuiState {
             ManagedEvent::Connecting
             | ManagedEvent::Connected(_)
             | ManagedEvent::SettingsSnapshot(_)
+            | ManagedEvent::ModelCatalog(_)
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
             | ManagedEvent::RemoteRecovered
@@ -1236,6 +1242,7 @@ impl TuiState {
             ManagedEvent::Connecting
             | ManagedEvent::Connected(_)
             | ManagedEvent::SettingsSnapshot(_)
+            | ManagedEvent::ModelCatalog(_)
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
             | ManagedEvent::RemoteRecovered
