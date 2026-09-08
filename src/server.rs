@@ -632,6 +632,11 @@ pub async fn spawn_with_source_control(
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/checkouts/prepare", post(prepare_checkout))
+        .route(
+            "/v1/checkouts/removal-preview",
+            post(preview_checkout_removal),
+        )
+        .route("/v1/checkouts/remove", post(remove_checkout))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .merge(
             Router::new()
@@ -1556,6 +1561,79 @@ async fn rejoin_preparation(
     Ok(Some(snapshot))
 }
 
+async fn removal_preview(
+    state: &AppState,
+    target: crate::protocol::CheckoutRemovalTarget,
+) -> Result<crate::protocol::CheckoutRemovalPreview, String> {
+    let inspection = state.source_control.inspect_removal(&target).await?;
+    let (affected_sessions, working_sessions) =
+        state.sessions.checkout_references(&target.checkout.id);
+    Ok(crate::protocol::CheckoutRemovalPreview {
+        target,
+        inspection,
+        affected_sessions,
+        working_sessions,
+    })
+}
+async fn preview_checkout_removal(State(state): State<AppState>, request: Request) -> Response {
+    let target = match decode_session_command::<crate::protocol::CheckoutRemovalTarget>(
+        &state,
+        request,
+        "Worktree removal preview",
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let _guard = state
+        .source_control
+        .mutation_guard(&target.repository.id)
+        .await;
+    match removal_preview(&state, target).await {
+        Ok(preview) => Json(preview).into_response(),
+        Err(e) => preparation_error(e),
+    }
+}
+async fn remove_checkout(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<crate::protocol::RemoveCheckoutRequest>(
+        &state,
+        request,
+        "Worktree removal",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let _guard = state
+        .source_control
+        .mutation_guard(&request.preview.target.repository.id)
+        .await;
+    let preview = match removal_preview(&state, request.preview.target.clone()).await {
+        Ok(preview) => preview,
+        Err(e) => return preparation_error(e),
+    };
+    let result = async {
+        if preview.working_sessions != 0 { return Err("A Session associated with this Worktree is Working on this Server; force cannot override it".to_owned()); }
+        if preview != request.preview { return Err("Worktree conditions or affected Sessions changed; review the updated preview and confirm again".to_owned()); }
+        if preview.inspection.requires_force() && !request.force { return Err("Git requires explicit force removal for these conditions; review and choose Force remove".to_owned()); }
+        state.sessions.record_checkout(preview.inspection.checkout.clone()).map_err(|e| format!("Cannot persist recovery facts before removal: {e}"))?;
+        if state.sessions.checkout_references(&preview.target.checkout.id).1 != 0 {
+            return Err("A Session became Working; Worktree removal is blocked".into());
+        }
+        state.source_control.remove_checkout(&preview.target, &preview.inspection, request.force).await?;
+        state.sessions.record_checkout(crate::protocol::CheckoutSummary { association: preview.target.checkout.clone(), revision: None, availability: crate::protocol::SourceControlAvailability::Unavailable { reason: "Worktree was explicitly removed; prompt a retained Session to recover it".into() } }).map_err(|e| e.to_string())?;
+        Ok::<_, String>(())
+    }.await;
+    Json(crate::protocol::RemoveCheckoutResult {
+        preview,
+        removed: result.is_ok(),
+        error: result.err(),
+    })
+    .into_response()
+}
+
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
     let mut request =
         match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
@@ -1640,10 +1718,27 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             .or_else(|| state.model_catalog.default_selection());
     }
 
-    let location = state
+    let mut location = state
         .source_control
         .resolve(&request.execution_directory.path, None)
         .await;
+    if mutation.is_none()
+        && let Some(repository) = &location.workspace.repository
+    {
+        mutation = Some(state.source_control.mutation_guard(&repository.id).await);
+        let current = state
+            .source_control
+            .resolve(&request.execution_directory.path, Some(&location.workspace))
+            .await;
+        if current.checkout.as_ref().map(|c| &c.id) != location.checkout.as_ref().map(|c| &c.id)
+            || current.execution_status != crate::protocol::ExecutionDirectoryStatus::Available
+        {
+            return preparation_error(
+                "Execution location changed before admission; choose or restore the Worktree and retry",
+            );
+        }
+        location = current;
+    }
     if location.execution_directory.is_none() {
         return session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,

@@ -45,6 +45,20 @@ pub trait SourceControl: Send + Sync {
         Ok(())
     }
 
+    async fn inspect_removal(
+        &self,
+        _target: &crate::protocol::CheckoutRemovalTarget,
+    ) -> Result<crate::protocol::CheckoutRemovalInspection, String> {
+        Err("Working-copy removal is unsupported".into())
+    }
+    async fn remove_checkout(
+        &self,
+        _target: &crate::protocol::CheckoutRemovalTarget,
+        _inspection: &crate::protocol::CheckoutRemovalInspection,
+        _force: bool,
+    ) -> Result<(), String> {
+        Err("Working-copy removal is unsupported".into())
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
     async fn plan_checkout(
         &self,
@@ -135,6 +149,22 @@ impl SourceControlService {
             mutations: Default::default(),
             incarnations: Default::default(),
         }
+    }
+    pub(crate) async fn inspect_removal(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+    ) -> Result<crate::protocol::CheckoutRemovalInspection, String> {
+        self.adapter.inspect_removal(target).await
+    }
+    pub(crate) async fn remove_checkout(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+        inspection: &crate::protocol::CheckoutRemovalInspection,
+        force: bool,
+    ) -> Result<(), String> {
+        self.adapter
+            .remove_checkout(target, inspection, force)
+            .await
     }
     pub(crate) async fn mutation_guard(
         &self,

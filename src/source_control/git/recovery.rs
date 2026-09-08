@@ -3,7 +3,7 @@ use super::*;
 use std::io::Write;
 
 impl GitSourceControl {
-    fn recovery_registration(
+    pub(super) fn recovery_registration(
         &self,
         repository: &Repository,
         checkout: &CheckoutAssociation,

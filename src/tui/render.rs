@@ -806,7 +806,55 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
     let capacity = usize::from(area.height.saturating_sub(2));
     let width = usize::from(area.width.saturating_sub(2));
     let mut lines = Vec::new();
-    if let Some(directory) = &picker.directory {
+    if let Some(preview) = &picker.removal {
+        lines.push(Line::styled(
+            format!(
+                "Remove linked Worktree on {}?",
+                match &state.outlook {
+                    crate::protocol::Outlook::Local => "Local Server",
+                    crate::protocol::Outlook::Remote(alias) => alias.as_str(),
+                }
+            ),
+            theme.text.primary,
+        ));
+        lines.push(Line::raw(
+            state.workspace_label(&state.outlook, &preview.target.checkout.root),
+        ));
+        lines.push(Line::raw(format!(
+            "{} affected Sessions on this Server · {} Working",
+            preview.affected_sessions, preview.working_sessions
+        )));
+        let facts = &preview.inspection;
+        lines.push(Line::raw(format!(
+            "Tracked changes: {} · untracked: {} · ignored: {}",
+            facts.tracked.len(),
+            facts.untracked.len(),
+            facts.ignored.len()
+        )));
+        if !facts.ignored.is_empty() {
+            lines.push(Line::raw(
+                "Ignored contents will also be deleted by ordinary removal",
+            ));
+        }
+        if let Some(lock) = &facts.lock {
+            lines.push(Line::raw(format!("Locked: {lock}")));
+        }
+        if !facts.initialized_submodules.is_empty() {
+            lines.push(Line::raw("Initialized submodules will be removed"));
+        }
+        lines.push(Line::raw(
+            "Branch and Session histories retained; uncommitted files cannot be recovered",
+        ));
+        lines.push(Line::raw(if picker.loading {
+            "Removing…"
+        } else if preview.working_sessions != 0 {
+            "Working Sessions block removal · Esc cancel"
+        } else if facts.requires_force() {
+            "F Force remove · Esc cancel"
+        } else {
+            "Enter Remove · Esc cancel"
+        }));
+    } else if let Some(directory) = &picker.directory {
         lines.push(Line::styled(
             truncate_to_width(&format!("Directory: {directory}"), width),
             theme.text.primary,
@@ -884,9 +932,13 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
                 },
             ));
         }
-        lines.push(Line::styled("Enter select · Esc close", theme.text.subdued));
+        lines.push(Line::styled(
+            "Enter select · d Remove linked Worktree · Esc close",
+            theme.text.subdued,
+        ));
     }
     if let Some(error) = &picker.error {
+        lines.truncate(capacity.saturating_sub(1));
         lines.push(Line::styled(
             truncate_to_width(error, width),
             theme.feedback.error,

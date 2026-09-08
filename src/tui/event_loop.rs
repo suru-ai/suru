@@ -666,6 +666,46 @@ impl RunLoop {
             ApplicationTransition::Exit => return ControlFlow::Break(Exit::Now),
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
             ApplicationTransition::DetachSession => self.tasks.leave_session(),
+            ApplicationTransition::PreviewCheckoutRemoval { request_id, target } => {
+                let outlook = self.application.outlook().clone();
+                let commands = self.client.session_commands_for(outlook.clone());
+                let results = self.channels.submissions.clone();
+                tokio::spawn(async move {
+                    let result = commands
+                        .preview_checkout_removal(target)
+                        .await
+                        .map(|preview| crate::protocol::RemoveCheckoutResult {
+                            preview,
+                            removed: false,
+                            error: None,
+                        })
+                        .map_err(|e| e.to_string());
+                    let _ = results.send(SubmissionResult::CheckoutRemoval {
+                        outlook,
+                        request_id,
+                        result,
+                    });
+                });
+            }
+            ApplicationTransition::RemoveCheckout {
+                request_id,
+                request,
+            } => {
+                let outlook = self.application.outlook().clone();
+                let commands = self.client.session_commands_for(outlook.clone());
+                let results = self.channels.submissions.clone();
+                tokio::spawn(async move {
+                    let result = commands
+                        .remove_checkout(request)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = results.send(SubmissionResult::CheckoutRemoval {
+                        outlook,
+                        request_id,
+                        result,
+                    });
+                });
+            }
             ApplicationTransition::PrepareCheckout { prompt_id, request } => {
                 let outlook = self.application.outlook().clone();
                 let commands = self.client.session_commands_for(outlook.clone());
@@ -1052,7 +1092,9 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::PrepareCheckout { .. }
+            ApplicationTransition::PreviewCheckoutRemoval { .. }
+            | ApplicationTransition::RemoveCheckout { .. }
+            | ApplicationTransition::PrepareCheckout { .. }
             | ApplicationTransition::CreateSession(_)
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
@@ -1236,6 +1278,16 @@ impl RunLoop {
         let submission = submission
             .ok_or_else(|| anyhow!("Prompt admission task channel stopped unexpectedly"))?;
         match submission {
+            SubmissionResult::CheckoutRemoval {
+                outlook,
+                request_id,
+                result,
+            } => {
+                if self.application.outlook() == &outlook {
+                    self.application
+                        .handle_event(ApplicationEvent::CheckoutRemoval { request_id, result })?;
+                }
+            }
             SubmissionResult::CheckoutPrepared {
                 outlook,
                 prompt_id,
@@ -2011,6 +2063,11 @@ fn spawn_prompt_delivery(
 }
 
 enum SubmissionResult {
+    CheckoutRemoval {
+        outlook: Outlook,
+        request_id: uuid::Uuid,
+        result: Result<crate::protocol::RemoveCheckoutResult, String>,
+    },
     CheckoutPrepared {
         outlook: Outlook,
         prompt_id: PromptId,

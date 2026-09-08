@@ -9,6 +9,7 @@ use std::{
 use tokio::process::Command;
 mod preparation;
 mod recovery;
+mod removal;
 
 /// Git command execution stays on its owning Server. Timeouts and the executable
 /// are injectable so unavailable/hung installations need no global environment edits.
@@ -370,6 +371,39 @@ impl SourceControl for GitSourceControl {
         }
         Err("Could not allocate a unique managed Worktree name".to_owned())
     }
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.inspect_linked_removal(target).await
+    }
+    async fn remove_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        force: bool,
+    ) -> Result<(), String> {
+        // The Server just validated these facts under its mutation guard and
+        // checked Working after inspection. No newer reading may silently
+        // broaden the user's confirmation here.
+        if inspection.requires_force() && !force {
+            return Err("Worktree contains changes, untracked contents, a lock, or initialized submodules; explicit force confirmation is required".into());
+        }
+        let root: PathBuf = target.checkout.root.components().collect();
+        let root = root
+            .to_str()
+            .ok_or("Worktree path cannot be passed to Git")?;
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        if force && inspection.lock.is_some() {
+            args.push("--force");
+        }
+        args.extend(["--", root]);
+        self.mutate(&target.repository.metadata_directory, &args)
+            .await
+    }
     async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
         let root = match &plan.repository.location {
             RepositoryLocation::Main { root } | RepositoryLocation::Bare { root } => root,
@@ -657,6 +691,7 @@ impl SourceControl for GitSourceControl {
         });
         let mut capabilities = SourceControlCapabilities::discovery_only();
         capabilities.recover_checkout = SourceControlCapability::Available;
+        capabilities.remove_checkout = SourceControlCapability::Available;
         capabilities.create_checkout = if matches!(location, RepositoryLocation::UnknownMain) {
             SourceControlCapability::Unsupported {
                 reason: "The main checkout location is unknown".to_owned(),

@@ -302,7 +302,7 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
     let config = ServerConfig::new(state.path(), "checkout-interest")
         .unwrap()
         .with_config_dir(config_root.path());
-    let (runtime, _provider) = provider_support::ControlledProvider::new();
+    let (runtime, mut provider) = provider_support::ControlledProvider::new();
     let server = server::spawn_with_source_control(
         config,
         vec![runtime],
@@ -316,7 +316,7 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
     .await
     .unwrap();
     for _ in 0..2 {
-        reqwest::Client::new()
+        let snapshot = reqwest::Client::new()
             .post(format!("{}/v1/sessions", server.descriptor().base_url))
             .bearer_auth(&server.descriptor().token)
             .json(&CreateSessionRequest {
@@ -335,7 +335,47 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
             .await
             .unwrap()
             .error_for_status()
+            .unwrap()
+            .json::<SessionSnapshot>()
+            .await
             .unwrap();
+        // Admission now retains the Repository barrier through native startup.
+        // Finish that unrelated startup before admitting the next Session;
+        // observation interest remains absent and must still cause no polls.
+        timeout(Duration::from_secs(1), provider.next_start())
+            .await
+            .unwrap()
+            .fail("Observation fixture has no native work");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let current = reqwest::Client::new()
+                    .get(format!(
+                        "{}/v1/sessions/{}",
+                        server.descriptor().base_url,
+                        snapshot.session.id
+                    ))
+                    .bearer_auth(&server.descriptor().token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json::<SessionSnapshot>()
+                    .await
+                    .unwrap();
+                if current.session.working_since.is_none()
+                    && current
+                        .turns
+                        .last()
+                        .is_some_and(|t| t.status == suru::protocol::TurnStatus::Failed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("controlled startup failed before observing");
     }
     assert!(
         calls_rx.try_recv().is_err(),
@@ -660,5 +700,92 @@ async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
     assert_eq!(remote.list_sessions(None).await.unwrap().len(), 2);
     drop(catalog);
     drop(remote);
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_removal_routes_to_owner_counts_its_catalog_and_streams_missing() {
+    use suru::{
+        protocol::*,
+        source_control::{GitSourceControl, SourceControl},
+    };
+    let (runtime, mut provider) = provider_support::ControlledProvider::new();
+    let pair = paired_servers_with_runtime("remote-removal", false, Some(runtime)).await;
+    let temp = tempfile::tempdir().unwrap();
+    let main = std::fs::canonicalize(temp.path()).unwrap();
+    git(&main, &["init", "-b", "main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = main.join("linked");
+    git(
+        &main,
+        &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
+    );
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".into()));
+    let local = pair.connecting_client.outlook(Outlook::Local);
+    let mut subscription = remote.subscribe_catalog();
+    let id = create(&remote, &linked).await;
+    let start = timeout(Duration::from_secs(2), provider.next_start())
+        .await
+        .unwrap();
+    let mut connection = start.succeed(AgentIdentity {
+        agent: AgentId::new("removal"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("test"),
+            options: vec![],
+        },
+    });
+    timeout(Duration::from_secs(2), connection.next_turn())
+        .await
+        .unwrap()
+        .succeed();
+    connection
+        .emit_and_wait_until_observed(suru::provider::ProviderEvent::TurnCompleted)
+        .await;
+    timeout(Duration::from_secs(2), async { loop { if remote.list_sessions(None).await.unwrap().iter().any(|s| matches!(s, SessionListItem::Readable(s) if s.session.id == id && s.session.working_since.is_none())) { break; } tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap();
+    create(&local, &linked).await;
+    observed(&remote, &mut subscription, 1, |r| branch(r, "topic")).await;
+    let location = GitSourceControl::default().discover(&linked).await;
+    let target = CheckoutRemovalTarget {
+        repository: location.workspace.repository.unwrap(),
+        checkout: location.checkout.unwrap(),
+    };
+    let facts = remote.preview_checkout_removal(target).await.unwrap();
+    assert_eq!(
+        facts.affected_sessions, 1,
+        "does not count connecting Server Session"
+    );
+    let result = remote
+        .remove_checkout(RemoveCheckoutRequest {
+            preview: facts,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert!(result.removed, "{:?}", result.error);
+    observed(&remote, &mut subscription, 1, |r| {
+        matches!(
+            r.availability,
+            SourceControlAvailability::Unavailable { .. }
+        )
+    })
+    .await;
+    assert_eq!(summaries(&local).await.len(), 1);
+    assert!(!linked.exists());
+    drop(subscription);
+    drop(remote);
+    drop(local);
     pair.shutdown().await;
 }

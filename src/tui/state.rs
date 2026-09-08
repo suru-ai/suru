@@ -2586,6 +2586,10 @@ pub enum ApplicationEvent {
         prompt_id: PromptId,
         error: String,
     },
+    CheckoutRemoval {
+        request_id: uuid::Uuid,
+        result: Result<crate::protocol::RemoveCheckoutResult, String>,
+    },
     CheckoutPrepared {
         prompt_id: PromptId,
         result: crate::protocol::PrepareCheckoutResult,
@@ -2843,6 +2847,14 @@ pub enum ApplicationTransition {
     SettleSession {
         session: SessionReference,
         settled: bool,
+    },
+    PreviewCheckoutRemoval {
+        request_id: uuid::Uuid,
+        target: crate::protocol::CheckoutRemovalTarget,
+    },
+    RemoveCheckout {
+        request_id: uuid::Uuid,
+        request: crate::protocol::RemoveCheckoutRequest,
     },
     PrepareCheckout {
         prompt_id: PromptId,
@@ -3436,6 +3448,68 @@ impl Application {
                     })
                 {
                     self.state.fail_pending_submission(prompt_id, error);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::CheckoutRemoval { request_id, result } => {
+                let picker = &mut self.state.worktree_picker;
+                if picker.removal_request == Some(request_id) {
+                    picker.removal_request = None;
+                    picker.loading = false;
+                    match result {
+                        Ok(result) if result.removed => {
+                            let checkout = &result.preview.target.checkout;
+                            let status = crate::protocol::ExecutionDirectoryStatus::Unavailable {
+                                reason: "Worktree removed; prompt a retained Session to recover it"
+                                    .into(),
+                            };
+                            if self.state.workspace.id == checkout.repository.workspace_id()
+                                && self
+                                    .state
+                                    .execution_directory
+                                    .as_ref()
+                                    .is_some_and(|path| path.starts_with(&checkout.root))
+                            {
+                                self.state.execution_status = status.clone();
+                            }
+                            if let Some(remembered) =
+                                self.state.remembered_execution_directories.get_mut(&(
+                                    self.state.outlook.clone(),
+                                    checkout.repository.workspace_id(),
+                                ))
+                                && remembered
+                                    .directory
+                                    .as_ref()
+                                    .is_some_and(|path| path.starts_with(&checkout.root))
+                            {
+                                remembered.status = status.clone();
+                            }
+                            if let Some(context) = &mut picker.context {
+                                if context
+                                    .checkout
+                                    .as_ref()
+                                    .is_some_and(|current| current.id == checkout.id)
+                                {
+                                    context.execution_status = status;
+                                }
+                                for reading in &mut context.checkouts {
+                                    if reading.association.id == result.preview.target.checkout.id {
+                                        reading.revision = None;
+                                        reading.availability = crate::protocol::SourceControlAvailability::Unavailable { reason: "Worktree removed; prompt a retained Session to recover it".into() };
+                                    }
+                                }
+                            }
+                            picker.removal = None;
+                            picker.error = Some(
+                                "Worktree removed. Branch and Session histories retained".into(),
+                            );
+                        }
+                        Ok(result) => {
+                            picker.removal = Some(result.preview);
+                            picker.error = result.error;
+                        }
+                        Err(error) => picker.error = Some(error),
+                    }
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -4064,6 +4138,63 @@ impl Application {
     fn handle_worktree_command(&mut self, command: SemanticCommandId) -> ApplicationTransition {
         use super::worktree_picker::WorktreeChoice;
         match command {
+            SemanticCommandId::WorktreeRemove | SemanticCommandId::WorktreeForceRemove => {
+                if self.state.worktree_picker.loading {
+                    return ApplicationTransition::Continue;
+                }
+                let picker = &mut self.state.worktree_picker;
+                let request_id = uuid::Uuid::new_v4();
+                if let Some(preview) = picker.removal.clone() {
+                    if preview.working_sessions != 0 {
+                        picker.error =
+                            Some("A Session is Working on this Server; removal is blocked".into());
+                        return ApplicationTransition::Continue;
+                    }
+                    let force = command == SemanticCommandId::WorktreeForceRemove;
+                    if preview.inspection.requires_force() && !force {
+                        picker.error = Some(
+                            "These conditions require the distinct Force remove action (F)".into(),
+                        );
+                        return ApplicationTransition::Continue;
+                    }
+                    picker.loading = true;
+                    picker.removal_request = Some(request_id);
+                    return ApplicationTransition::RemoveCheckout {
+                        request_id,
+                        request: crate::protocol::RemoveCheckoutRequest { preview, force },
+                    };
+                }
+                if command == SemanticCommandId::WorktreeForceRemove {
+                    return ApplicationTransition::Continue;
+                }
+                let checkout = match picker.choice() {
+                    Some(WorktreeChoice::Checkout(c)) => Some(c.association),
+                    Some(WorktreeChoice::Current) => {
+                        picker.context.as_ref().and_then(|c| c.checkout.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(checkout) = checkout
+                    && checkout.kind == crate::protocol::CheckoutKind::Linked
+                    && let Some(repository) = picker
+                        .context
+                        .as_ref()
+                        .and_then(|c| c.workspace.repository.clone())
+                {
+                    picker.loading = true;
+                    picker.removal_request = Some(request_id);
+                    picker.error = None;
+                    return ApplicationTransition::PreviewCheckoutRemoval {
+                        request_id,
+                        target: crate::protocol::CheckoutRemovalTarget {
+                            repository,
+                            checkout,
+                        },
+                    };
+                }
+                picker.error =
+                    Some("Main checkout cannot be removed. Select a linked Worktree".into());
+            }
             SemanticCommandId::WorktreeList => {
                 if self.state.session_reference.is_some() {
                     self.state.submission_error =
@@ -4078,6 +4209,21 @@ impl Application {
             SemanticCommandId::WorktreePrevious => self.state.worktree_picker.move_by(-1),
             SemanticCommandId::WorktreeNext => self.state.worktree_picker.move_by(1),
             SemanticCommandId::WorktreeClose => {
+                // Confirmation already sent is an operation in progress, not
+                // a cancellable preview. Keep its eventual result visible.
+                if self.state.worktree_picker.removal.is_some()
+                    && self.state.worktree_picker.loading
+                {
+                    return ApplicationTransition::Continue;
+                }
+                if self.state.worktree_picker.removal.take().is_some()
+                    || self.state.worktree_picker.removal_request.take().is_some()
+                {
+                    self.state.worktree_picker.removal_request = None;
+                    self.state.worktree_picker.loading = false;
+                    self.state.worktree_picker.error = None;
+                    return ApplicationTransition::Continue;
+                }
                 if self.state.worktree_picker.directory.take().is_some() {
                     self.state.worktree_picker.loading = false;
                     self.state.worktree_picker.error = None;
@@ -4103,6 +4249,9 @@ impl Application {
                 }
             }
             SemanticCommandId::WorktreeSelect => {
+                if self.state.worktree_picker.removal.is_some() {
+                    return self.handle_worktree_command(SemanticCommandId::WorktreeRemove);
+                }
                 if let Some(path) = &self.state.worktree_picker.directory {
                     if path.trim().is_empty() {
                         self.state
@@ -5781,6 +5930,8 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::WorktreeList
+            | SemanticCommandId::WorktreeRemove
+            | SemanticCommandId::WorktreeForceRemove
             | SemanticCommandId::WorktreePrevious
             | SemanticCommandId::WorktreeNext
             | SemanticCommandId::WorktreeSelect

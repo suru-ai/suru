@@ -6,6 +6,24 @@ use futures_util::{StreamExt, stream};
 use std::{collections::HashMap, time::Duration};
 
 impl SessionStore {
+    pub(crate) fn checkout_references(&self, id: &CheckoutId) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        let mut affected = 0;
+        let mut working = 0;
+        for record in state.sessions.values() {
+            let session = &record.summary.session;
+            if session
+                .checkout
+                .as_ref()
+                .is_some_and(|checkout| &checkout.id == id)
+            {
+                affected += 1;
+                working += usize::from(session.working_since.is_some());
+            }
+        }
+        (affected, working)
+    }
+
     pub(crate) fn observe_checkouts(
         &self,
         source_control: SourceControlService,

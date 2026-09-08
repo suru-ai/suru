@@ -231,3 +231,46 @@ pub struct CheckoutRecovery {
     pub checkout: CheckoutAssociation,
     pub recreated: bool,
 }
+
+/// Read-only removal facts, revalidated by the owning Server on confirmation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckoutRemovalInspection {
+    pub checkout: CheckoutSummary,
+    pub tracked: Vec<String>,
+    pub untracked: Vec<String>,
+    pub ignored: Vec<String>,
+    pub lock: Option<String>,
+    pub initialized_submodules: Vec<String>,
+}
+impl CheckoutRemovalInspection {
+    pub fn requires_force(&self) -> bool {
+        !self.tracked.is_empty()
+            || !self.untracked.is_empty()
+            || self.lock.is_some()
+            || !self.initialized_submodules.is_empty()
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckoutRemovalTarget {
+    pub repository: Repository,
+    pub checkout: CheckoutAssociation,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckoutRemovalPreview {
+    pub target: CheckoutRemovalTarget,
+    pub inspection: CheckoutRemovalInspection,
+    pub affected_sessions: usize,
+    pub working_sessions: usize,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveCheckoutRequest {
+    pub preview: CheckoutRemovalPreview,
+    pub force: bool,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemoveCheckoutResult {
+    pub preview: CheckoutRemovalPreview,
+    pub removed: bool,
+    pub error: Option<String>,
+}

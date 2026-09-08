@@ -887,3 +887,176 @@ fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_
     };
     assert_eq!(create.preparation_id, Some(request.id));
 }
+
+#[test]
+fn linked_removal_confirmation_warns_counts_cancel_is_read_only_and_force_is_distinct() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, layout.context.clone());
+    let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
+        key(&mut app, KeyCode::Char('d'))
+    else {
+        panic!("read-only preview");
+    };
+    let preview = CheckoutRemovalPreview {
+        target,
+        inspection: CheckoutRemovalInspection {
+            checkout: layout.context.checkouts[1].clone(),
+            tracked: vec!["tracked".into()],
+            untracked: vec![],
+            ignored: vec!["secret".into()],
+            lock: Some("owner lock".into()),
+            initialized_submodules: vec!["module".into()],
+        },
+        affected_sessions: 3,
+        working_sessions: 0,
+    };
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview: preview.clone(),
+            removed: false,
+            error: None,
+        }),
+    })
+    .unwrap();
+    let rendered = text(&app);
+    assert!(rendered.contains("3 affected Sessions"));
+    assert!(rendered.contains("Ignored contents"));
+    assert!(rendered.contains("owner lock"));
+    assert!(rendered.contains("Initialized submodules"));
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        ApplicationTransition::Continue
+    ));
+    let ApplicationTransition::RemoveCheckout {
+        request_id,
+        request,
+    } = key(&mut app, KeyCode::Char('F'))
+    else {
+        panic!("explicit force command");
+    };
+    assert!(request.force);
+    assert_eq!(request.preview, preview);
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview,
+            removed: false,
+            error: Some("Git refused removal".into()),
+        }),
+    })
+    .unwrap();
+    assert!(matches!(
+        key(&mut app, KeyCode::Esc),
+        ApplicationTransition::Continue
+    ));
+    assert!(!text(&app).contains("3 affected Sessions"));
+    assert!(layout.linked.exists());
+}
+#[test]
+fn main_removal_unavailable_and_canceled_preview_response_is_ignored() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, layout.context.clone());
+    key(&mut app, KeyCode::Down);
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('d')),
+        ApplicationTransition::Continue
+    ));
+    assert!(text(&app).contains("Main checkout cannot be removed"));
+    key(&mut app, KeyCode::Down);
+    let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
+        key(&mut app, KeyCode::Char('d'))
+    else {
+        panic!("preview linked");
+    };
+    key(&mut app, KeyCode::Esc);
+    let preview = CheckoutRemovalPreview {
+        target,
+        inspection: CheckoutRemovalInspection {
+            checkout: layout.context.checkouts[1].clone(),
+            tracked: vec![],
+            untracked: vec![],
+            ignored: vec![],
+            lock: None,
+            initialized_submodules: vec![],
+        },
+        affected_sessions: 0,
+        working_sessions: 0,
+    };
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview,
+            removed: false,
+            error: None,
+        }),
+    })
+    .unwrap();
+    assert!(!text(&app).contains("affected Sessions"));
+}
+
+#[test]
+fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_selected() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, layout.context.clone());
+    let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
+        key(&mut app, KeyCode::Char('d'))
+    else {
+        panic!("preview linked");
+    };
+    let preview = CheckoutRemovalPreview {
+        target,
+        inspection: CheckoutRemovalInspection {
+            checkout: layout.context.checkouts[1].clone(),
+            tracked: vec![],
+            untracked: vec![],
+            ignored: vec![],
+            lock: None,
+            initialized_submodules: vec![],
+        },
+        affected_sessions: 2,
+        working_sessions: 0,
+    };
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview: preview.clone(),
+            removed: false,
+            error: None,
+        }),
+    })
+    .unwrap();
+    let ApplicationTransition::RemoveCheckout {
+        request_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("ordinary removal confirmation");
+    };
+    assert!(!request.force);
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview,
+            removed: true,
+            error: None,
+        }),
+    })
+    .unwrap();
+    let rendered = text(&app);
+    assert!(rendered.contains("unavailable"));
+    assert!(rendered.contains("nested"));
+    key(&mut app, KeyCode::Esc);
+    type_terminal_text(&mut app, "Do not redirect my next Session");
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        ApplicationTransition::Continue
+    ));
+    assert!(text(&app).contains("Execution Directory unavailable"));
+}

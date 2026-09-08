@@ -773,3 +773,6 @@ async fn already_admitted_queued_prompt_recovers_at_native_start_and_revalidates
     let _new = restarted(&mut provider, &layout.linked).await;
     server.shutdown().await.unwrap();
 }
+
+#[path = "worktree_removal.rs"]
+mod removal;

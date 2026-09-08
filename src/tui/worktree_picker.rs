@@ -3,6 +3,8 @@ use crate::protocol::{CheckoutSummary, ExecutionDirectoryStatus, ResolvedWorkspa
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct WorktreePicker {
+    pub(super) removal: Option<crate::protocol::CheckoutRemovalPreview>,
+    pub(super) removal_request: Option<uuid::Uuid>,
     pub(super) open: bool,
     pub(super) loading: bool,
     pub(super) selected: usize,
@@ -39,7 +41,7 @@ impl WorktreePicker {
         self.error = Some(error);
     }
     pub(super) fn move_by(&mut self, delta: isize) {
-        if self.loading || self.directory.is_some() {
+        if self.loading || self.directory.is_some() || self.removal.is_some() {
             return;
         }
         let count = self

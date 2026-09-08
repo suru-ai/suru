@@ -892,6 +892,8 @@ pub(super) fn command_for_worktree_picker_event(
         return None;
     }
     let semantic = match key.code {
+        KeyCode::Char('d') if !directory => SemanticCommandId::WorktreeRemove,
+        KeyCode::Char('F') if !directory => SemanticCommandId::WorktreeForceRemove,
         KeyCode::Esc => SemanticCommandId::WorktreeClose,
         KeyCode::Enter => SemanticCommandId::WorktreeSelect,
         KeyCode::Up if !directory => SemanticCommandId::WorktreePrevious,

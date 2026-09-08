@@ -350,6 +350,20 @@ impl ManagedClient {
         }
     }
 
+    pub async fn preview_checkout_removal(
+        &self,
+        target: crate::protocol::CheckoutRemovalTarget,
+    ) -> Result<crate::protocol::CheckoutRemovalPreview> {
+        self.session_commands()
+            .preview_checkout_removal(target)
+            .await
+    }
+    pub async fn remove_checkout(
+        &self,
+        request: crate::protocol::RemoveCheckoutRequest,
+    ) -> Result<crate::protocol::RemoveCheckoutResult> {
+        self.session_commands().remove_checkout(request).await
+    }
     pub async fn prepare_checkout(
         &self,
         request: crate::protocol::PrepareCheckoutRequest,
@@ -546,6 +560,18 @@ impl OutlookClient {
         self.commands.subscribe_catalog()
     }
 
+    pub async fn preview_checkout_removal(
+        &self,
+        target: crate::protocol::CheckoutRemovalTarget,
+    ) -> Result<crate::protocol::CheckoutRemovalPreview> {
+        self.commands.preview_checkout_removal(target).await
+    }
+    pub async fn remove_checkout(
+        &self,
+        request: crate::protocol::RemoveCheckoutRequest,
+    ) -> Result<crate::protocol::RemoveCheckoutResult> {
+        self.commands.remove_checkout(request).await
+    }
     pub async fn prepare_checkout(
         &self,
         request: crate::protocol::PrepareCheckoutRequest,
@@ -771,6 +797,24 @@ impl SessionCommandClient {
             .error_for_status()
             .context("Model catalog warm-up")?;
         Ok(())
+    }
+    pub(crate) async fn preview_checkout_removal(
+        &self,
+        target: crate::protocol::CheckoutRemovalTarget,
+    ) -> Result<crate::protocol::CheckoutRemovalPreview> {
+        self.post_session_command(
+            "/v1/checkouts/removal-preview",
+            &target,
+            "Worktree removal preview",
+        )
+        .await
+    }
+    pub(crate) async fn remove_checkout(
+        &self,
+        request: crate::protocol::RemoveCheckoutRequest,
+    ) -> Result<crate::protocol::RemoveCheckoutResult> {
+        self.post_session_command("/v1/checkouts/remove", &request, "Worktree removal")
+            .await
     }
     pub(crate) async fn prepare_checkout(
         &self,
