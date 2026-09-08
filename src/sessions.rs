@@ -47,8 +47,7 @@ pub(crate) use prompts::{
 pub(crate) use selection::AgentSelectionMutationError;
 pub(crate) use settled::SettleSessionError;
 pub(crate) use settlement::{
-    InterruptSessionError, InterruptTarget, ProviderTurnOutcome, QueuedPromptDisposition,
-    TrailingCommandOutput,
+    InterruptSessionError, InterruptTarget, ProviderTurnOutcome, TrailingCommandOutput,
 };
 pub(crate) use title::TitleDerivation;
 pub(crate) use viewed::ViewSessionError;

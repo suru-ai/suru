@@ -542,6 +542,15 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
 
 #[tokio::test]
 async fn queued_validation_outcome_is_bound_to_the_prompt_that_was_checked() {
+    cancelled_validation_leaves_the_following_prompt_deliverable(true).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_prompt_during_valid_skill_refresh_does_not_stall_the_queue() {
+    cancelled_validation_leaves_the_following_prompt_deliverable(false).await;
+}
+
+async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_skill: bool) {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create Workspace");
     let canonical_workspace =
@@ -652,10 +661,15 @@ async fn queued_validation_outcome_is_bound_to_the_prompt_that_was_checked() {
         .await
         .expect("queue plain Prompt behind stale binding");
 
-    runtime.offer_skills(catalog(SkillDescriptor {
-        id: SkillId::new("replacement-racy-review"),
-        ..original
-    }));
+    let refreshed = if replace_skill {
+        SkillDescriptor {
+            id: SkillId::new("replacement-racy-review"),
+            ..original
+        }
+    } else {
+        original
+    };
+    runtime.offer_skills(catalog(refreshed));
     let release_refresh = runtime.block_next_skill_discovery();
     runtime.invalidate_skill_catalog();
     assert!(matches!(

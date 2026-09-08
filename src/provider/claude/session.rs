@@ -363,7 +363,7 @@ impl ProviderSession for ClaudeSession {
                 .running
                 .as_ref()
                 .expect("a Turn runs on the child that was just spawned for it");
-            self.turn.begin_turn();
+            self.turn.begin_turn(input.selection);
             self.context.ready();
             child
                 .transport

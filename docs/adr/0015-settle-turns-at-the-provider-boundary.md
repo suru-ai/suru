@@ -5,3 +5,7 @@ A Subagent may outlive the Turn that spawned it: every Provider Suru speaks emit
 ## Consequences
 
 A settled Turn still never accepts Provider output — Continuations preserve that invariant rather than weakening it, which is what lets Turn Folds, durations, and settlement code stay untouched. The price is that "the Session is busy" is no longer readable off the latest Turn alone: any surface saying Working must also consult the Session's running Subagents, and interrupt must reach them explicitly, since no Turn owns them once it has settled.
+
+A Provider may also resume its own loop when a background Command completes. That native work explicitly begins a Continuation even when no Subagent owes output: Claude's owning `message_start` after its previous result is such a boundary. Unlike late output alone, a resumed native loop must be interrupted and reach its terminal result before a new Prompt is delivered, so an open Activity cannot cross into the Prompt's Turn.
+
+Queued Prompt delivery follows settlement through the actor's normal validated delivery path, after ready Provider events are routed. This gives a buffered Continuation its own Turn before queued work can claim its output; the store's settlement operation therefore settles only the current Turn.

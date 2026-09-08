@@ -17,6 +17,8 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use crate::protocol::AgentSelection;
+
 #[derive(Default)]
 pub(super) struct TurnInFlight {
     state: Mutex<TurnState>,
@@ -24,8 +26,10 @@ pub(super) struct TurnInFlight {
 
 #[derive(Default)]
 struct TurnState {
-    /// Terminal results the CLI still owes the running Turn: one for the Prompt that began it, and
-    /// one more for every steer delivered into it. None owed means no Turn is running.
+    /// The running CLI's selection, retained for work it resumes without a Prompt.
+    selection: Option<AgentSelection>,
+    /// Terminal results the CLI still owes the running Turn: one for its Prompt or native
+    /// Continuation, and one more for every steer delivered into it. None owed means no Turn runs.
     owed_results: usize,
     /// The tasks the CLI has reported started and not yet reported settled.
     tasks: BTreeSet<String>,
@@ -44,8 +48,23 @@ impl TurnInFlight {
     /// one Turn at a time, so this is what the Turn is owed rather than something added to it: a
     /// count left over from a Turn that ended some way this Session never heard about belongs to
     /// nothing now.
-    pub(super) fn begin_turn(&self) {
-        self.state().owed_results = 1;
+    pub(super) fn begin_turn(&self, selection: AgentSelection) {
+        let mut state = self.state();
+        state.selection = Some(selection);
+        state.owed_results = 1;
+    }
+
+    /// A fresh native message after a result begins another loop, including when a background
+    /// command (rather than a Subagent) woke Claude. Its result and interrupt belong to that
+    /// loop before any of its blocks are projected.
+    pub(super) fn begin_continuation(&self) -> Option<AgentSelection> {
+        let mut state = self.state();
+        if state.owed_results != 0 {
+            return None;
+        }
+        let selection = state.selection.clone()?;
+        state.owed_results = 1;
+        Some(selection)
     }
 
     /// Accepts a steer into the running Turn, which will owe one result more. Answers `false` when
@@ -129,12 +148,21 @@ impl TurnInFlight {
 #[cfg(test)]
 mod tests {
     use super::TurnInFlight;
+    use crate::protocol::{AgentSelection, ModelId, ProviderId};
+
+    fn selection() -> AgentSelection {
+        AgentSelection {
+            provider: ProviderId::new("claude"),
+            model: ModelId::new("default"),
+            options: Vec::new(),
+        }
+    }
 
     #[test]
     fn a_turn_settles_on_the_one_result_its_prompt_owes() {
         let turn = TurnInFlight::new();
         assert!(!turn.is_running(), "a Session with no Turn runs none");
-        turn.begin_turn();
+        turn.begin_turn(selection());
         assert!(turn.is_running());
         assert!(turn.result_settles_turn());
         assert!(!turn.is_running());
@@ -143,7 +171,7 @@ mod tests {
     #[test]
     fn a_steered_turn_settles_only_on_the_result_its_steer_owes() {
         let turn = TurnInFlight::new();
-        turn.begin_turn();
+        turn.begin_turn(selection());
         assert!(turn.accept_steer());
         assert!(
             !turn.result_settles_turn(),
@@ -160,7 +188,7 @@ mod tests {
     fn a_session_with_no_turn_running_has_nothing_to_steer() {
         let turn = TurnInFlight::new();
         assert!(!turn.accept_steer());
-        turn.begin_turn();
+        turn.begin_turn(selection());
         turn.abandon_turn();
         assert!(!turn.accept_steer());
     }
@@ -168,7 +196,7 @@ mod tests {
     #[test]
     fn a_steer_the_cli_never_received_leaves_the_turn_owed_what_it_was() {
         let turn = TurnInFlight::new();
-        turn.begin_turn();
+        turn.begin_turn(selection());
         assert!(turn.accept_steer());
         turn.withdraw_prompt();
         assert!(turn.result_settles_turn(), "the Turn owes only its Prompt");
@@ -177,7 +205,7 @@ mod tests {
     #[test]
     fn a_result_an_abandoned_turn_never_waited_on_settles_nothing() {
         let turn = TurnInFlight::new();
-        turn.begin_turn();
+        turn.begin_turn(selection());
         assert!(turn.accept_steer());
         turn.abandon_turn();
         assert!(

@@ -31,9 +31,8 @@ use crate::protocol::{
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
-    ProviderTurnOutcome, QueuedPromptDisposition, SessionStore, TrailingCommandOutput,
-    command_output_changes, earliest_pending_prompt, message_content_changes,
-    reasoning_content_changes,
+    ProviderTurnOutcome, SessionStore, TrailingCommandOutput, command_output_changes,
+    earliest_pending_prompt, message_content_changes, reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 
@@ -392,9 +391,8 @@ impl SubagentRoutes {
             self,
             next_agent,
             event,
-            QueuedPromptDisposition::LeavePending,
         );
-        if !matches!(projection, ProviderEventProjection::Terminal(_)) {
+        if !matches!(projection, ProviderEventProjection::Terminal) {
             self.routes.insert(subagent.clone(), route);
         }
     }
@@ -458,7 +456,6 @@ impl SubagentRoutes {
         &mut self,
         sessions: &SessionStore,
         updates: &ProviderUpdateGate,
-        next_agent: &AgentIdentity,
         subagent: &ProviderSubagentId,
     ) {
         let mut targets = vec![subagent.clone()];
@@ -480,9 +477,7 @@ impl SubagentRoutes {
                     sessions.finish_provider_turn(
                         route.session_id,
                         route.turn.turn_id,
-                        next_agent.agent.clone(),
                         ProviderTurnOutcome::Interrupted { trailing_output },
-                        QueuedPromptDisposition::LeavePending,
                     )
                 });
             }
@@ -504,15 +499,10 @@ impl SubagentRoutes {
     /// reaches them all. Whatever output a settle was still owed is owed no
     /// longer — an interrupted stream's trailing output is discarded, as it
     /// always was — so this also stands down the Continuation.
-    fn stop_all(
-        &mut self,
-        sessions: &SessionStore,
-        updates: &ProviderUpdateGate,
-        next_agent: &AgentIdentity,
-    ) {
+    fn stop_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate) {
         let working = self.rows.keys().cloned().collect::<Vec<_>>();
         for subagent in working {
-            self.settle_stopped(sessions, updates, next_agent, &subagent);
+            self.settle_stopped(sessions, updates, &subagent);
         }
         self.late_settle_owes_continuation = false;
     }
@@ -548,7 +538,6 @@ impl SubagentRoutes {
     fn settle_subagent(
         &mut self,
         sessions: &SessionStore,
-        next_agent: &AgentIdentity,
         subagent: &ProviderSubagentId,
         status: ProviderSubagentStatus,
     ) -> Option<anyhow::Result<()>> {
@@ -569,13 +558,7 @@ impl SubagentRoutes {
                         trailing_output: route.turn.take_trailing_output(),
                     },
                 };
-                sessions.finish_provider_turn(
-                    route.session_id,
-                    route.turn.turn_id,
-                    next_agent.agent.clone(),
-                    outcome,
-                    QueuedPromptDisposition::LeavePending,
-                )?;
+                sessions.finish_provider_turn(route.session_id, route.turn.turn_id, outcome)?;
             }
             let duration_ms = u64::try_from(row.started.elapsed().as_millis()).ok();
             sessions.publish_agent_output(
@@ -602,7 +585,7 @@ enum ProviderInput {
 
 enum ProviderEventProjection {
     Continue,
-    Terminal(Option<DeliveredTurn>),
+    Terminal,
 }
 
 impl ProviderOrchestrator {
@@ -1040,18 +1023,24 @@ async fn run_provider_session(
             break;
         }
         if active.is_none() {
-            let input = if let Some(prompt_id) = pending_turn_starts
-                .pop_front()
-                .or_else(|| deferred_prompt_id.take())
-            {
-                ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
-            } else if let Some(connected) = provider.as_mut() {
+            let pending_prompt = pending_turn_starts.front().copied().or(deferred_prompt_id);
+            let input = if let Some(connected) = provider.as_mut() {
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => break,
                     event = connected.events.next() => ProviderInput::Event(event),
+                    _ = std::future::ready(()), if pending_prompt.is_some() => {
+                        let prompt_id = pending_turn_starts.pop_front()
+                            .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
+                        ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                    }
                     command = commands.recv() => ProviderInput::Command(command),
                 }
+            } else if let Some(prompt_id) = pending_turn_starts
+                .pop_front()
+                .or_else(|| deferred_prompt_id.take())
+            {
+                ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
             } else {
                 tokio::select! {
                     biased;
@@ -1116,12 +1105,7 @@ async fn run_provider_session(
                                 status,
                             } => {
                                 let _ = updates.apply(|| {
-                                    subagents.settle_subagent(
-                                        &sessions,
-                                        &identity,
-                                        &subagent_id,
-                                        status,
-                                    )
+                                    subagents.settle_subagent(&sessions, &subagent_id, status)
                                 });
                             }
                             // Anything else is late output. Owed to Subagents
@@ -1156,10 +1140,9 @@ async fn run_provider_session(
                                     &mut subagents,
                                     &identity,
                                     event,
-                                    QueuedPromptDisposition::LeavePending,
                                 );
                                 subagents.late_settle_owes_continuation = false;
-                                if !matches!(projection, ProviderEventProjection::Terminal(_)) {
+                                if !matches!(projection, ProviderEventProjection::Terminal) {
                                     active = Some(continuation);
                                 }
                             }
@@ -1212,7 +1195,6 @@ async fn run_provider_session(
                         .as_ref()
                         .expect("routed Subagents ride a live Provider connection");
                     let provider_session = connected.session.clone();
-                    let identity = connected.identity.clone();
                     let stopped = tokio::select! {
                         biased;
                         _ = shutdown.wait() => {
@@ -1226,7 +1208,7 @@ async fn run_provider_session(
                     };
                     match stopped {
                         Ok(()) => {
-                            subagents.stop_all(&sessions, &updates, &identity);
+                            subagents.stop_all(&sessions, &updates);
                             let _ = response.send(Ok(()));
                         }
                         Err(error) => {
@@ -1247,9 +1229,7 @@ async fn run_provider_session(
                     let _ = response.send(
                         stop_one_subagent(
                             &runtime,
-                            provider
-                                .as_ref()
-                                .map(|c| (c.session.clone(), c.identity.clone())),
+                            provider.as_ref().map(|c| c.session.clone()),
                             &mut subagents,
                             &sessions,
                             &updates,
@@ -1352,6 +1332,7 @@ async fn run_provider_session(
                     .find(|prompt| prompt.id == prompt_id && prompt.status == PromptStatus::Pending)
             });
             let Some(prompt) = prompt else {
+                defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                 continue;
             };
             let delivery = skill_prompt_delivery(&prompt);
@@ -1389,7 +1370,12 @@ async fn run_provider_session(
             };
             let delivered = match delivered {
                 Ok(Some(delivered)) => delivered,
-                Ok(None) => continue,
+                Ok(None) => {
+                    // Cancellation can win while Skill Catalog validation is awaited.
+                    // The selected Prompt is gone, but the queue may still hold work.
+                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
+                    continue;
+                }
                 Err(_) => continue,
             };
             let provider_session = provider
@@ -1426,6 +1412,13 @@ async fn run_provider_session(
             .session
             .clone();
         let input = {
+            let pending_native_continuation = active
+                .as_ref()
+                .is_some_and(|turn| turn.continuation == Some(ContinuationExecution::ProviderTurn));
+            let deliver_pending = active
+                .as_ref()
+                .is_some_and(|turn| turn.continuation.is_some() && !turn.interruption_acknowledged)
+                && (!pending_turn_starts.is_empty() || deferred_prompt_id.is_some());
             let events = &mut provider
                 .as_mut()
                 .expect("an active Provider Turn has a Provider Session")
@@ -1436,6 +1429,18 @@ async fn run_provider_session(
                 biased;
                 _ = shutdown.wait() => break 'actor,
                 event = events.next() => ProviderInput::Event(event),
+                _ = std::future::ready(()), if deliver_pending => {
+                    if pending_native_continuation {
+                        // Keep the queue in place while the native loop stops. Removing and
+                        // re-enqueuing its front would let later admissions overtake it.
+                        let (response, _) = oneshot::channel();
+                        ProviderInput::Command(Some(ProviderCommand::InterruptSession { response }))
+                    } else {
+                        let prompt_id = pending_turn_starts.pop_front()
+                            .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
+                        ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                    }
+                }
                 command = commands.recv() => ProviderInput::Command(command),
             }
         };
@@ -1464,25 +1469,18 @@ async fn run_provider_session(
                     // The next delivered Prompt settles a stale Continuation
                     // rather than steering it (ADR 0015): close it out as
                     // worked, then deliver the Prompt as its own Turn.
-                    let identity = provider
-                        .as_ref()
-                        .expect("Provider connection exists while its Turn is active")
-                        .identity
-                        .clone();
                     let trailing_output = current.take_trailing_output();
                     let Some(_) = updates.apply(|| {
                         sessions.finish_provider_turn(
                             session_id,
                             current.turn_id,
-                            identity.agent,
                             ProviderTurnOutcome::Completed { trailing_output },
-                            QueuedPromptDisposition::LeavePending,
                         )
                     }) else {
                         break;
                     };
                     active = None;
-                    deferred_prompt_id = Some(prompt_id);
+                    pending_turn_starts.push_front(prompt_id);
                 } else {
                     // Admission owed this Prompt a Turn of its own. Its
                     // command may arrive after the Continuation settled and
@@ -1587,11 +1585,6 @@ async fn run_provider_session(
                     let _ = response.send(Ok(()));
                     continue;
                 }
-                let identity = provider
-                    .as_ref()
-                    .expect("Provider connection exists while its Turn is active")
-                    .identity
-                    .clone();
                 if current.continuation == Some(ContinuationExecution::LateOutput) {
                     // A Continuation runs no Provider loop of its own — it is
                     // the Turn Suru opened for the output its Subagents still
@@ -1611,15 +1604,13 @@ async fn run_provider_session(
                     };
                     match stopped {
                         Ok(()) => {
-                            subagents.stop_all(&sessions, &updates, &identity);
+                            subagents.stop_all(&sessions, &updates);
                             let trailing_output = current.take_trailing_output();
                             let settled = updates.apply(|| {
                                 sessions.finish_provider_turn(
                                     session_id,
                                     current.turn_id,
-                                    identity.agent,
                                     ProviderTurnOutcome::Interrupted { trailing_output },
-                                    QueuedPromptDisposition::LeavePending,
                                 )
                             });
                             active = None;
@@ -1682,7 +1673,7 @@ async fn run_provider_session(
                         // the Subagents settle as stopped now, rather than
                         // waiting on notifications an ended loop may never
                         // deliver.
-                        subagents.stop_all(&sessions, &updates, &identity);
+                        subagents.stop_all(&sessions, &updates);
                         let _ = response.send(Ok(()));
                     }
                     Err(error) => {
@@ -1704,9 +1695,7 @@ async fn run_provider_session(
                 let _ = response.send(
                     stop_one_subagent(
                         &runtime,
-                        provider
-                            .as_ref()
-                            .map(|c| (c.session.clone(), c.identity.clone())),
+                        provider.as_ref().map(|c| c.session.clone()),
                         &mut subagents,
                         &sessions,
                         &updates,
@@ -1752,21 +1741,10 @@ async fn run_provider_session(
                             .expect("Provider connection exists while its Turn is active")
                             .identity
                             .clone();
-                        let queued_prompt_disposition = if provider_event_settles_turn(&event)
-                            && pending_turn_starts.is_empty()
-                        {
-                            queued_prompt_disposition(
-                                &skill_catalog,
-                                &sessions,
-                                session_id,
-                                &provider_id,
-                                &workspace,
-                            )
-                            .await
-                        } else {
-                            QueuedPromptDisposition::LeavePending
-                        };
-                        if let ProviderEventProjection::Terminal(next_turn) = project_provider_event(
+                        // Settle before delivering queued work. The next loop drains ready
+                        // Provider events first, so a buffered native Continuation establishes
+                        // ownership before a Prompt can take its output and terminal result.
+                        if let ProviderEventProjection::Terminal = project_provider_event(
                             &sessions,
                             &updates,
                             session_id,
@@ -1774,42 +1752,9 @@ async fn run_provider_session(
                             &mut subagents,
                             &identity,
                             event,
-                            queued_prompt_disposition,
                         ) {
                             active = None;
-                            if let Some(delivered) = next_turn {
-                                let (turn_id, input) = provider_turn_start(delivered);
-                                let started = tokio::select! {
-                                    biased;
-                                    _ = shutdown.wait() => break 'actor,
-                                    started = provider_session.start_turn(input) => started,
-                                };
-                                if let Err(error) = started {
-                                    let session_lost = error.is_session_lost();
-                                    let selection_rejected = error.is_selection_rejected();
-                                    project_turn_start_failure(
-                                        &sessions, &updates, session_id, turn_id, &error,
-                                    );
-                                    if session_lost {
-                                        lose_provider_connection(
-                                            &mut provider,
-                                            &mut subagents,
-                                            &sessions,
-                                            &updates,
-                                        );
-                                    }
-                                    if !selection_rejected {
-                                        defer_next_queued_prompt(
-                                            &mut deferred_prompt_id,
-                                            &sessions,
-                                            session_id,
-                                        );
-                                    }
-                                } else {
-                                    active = Some(ActiveProviderTurn::new(turn_id));
-                                    subagents.late_settle_owes_continuation = false;
-                                }
-                            } else if !selection_rejected {
+                            if !selection_rejected {
                                 defer_next_queued_prompt(
                                     &mut deferred_prompt_id,
                                     &sessions,
@@ -1860,10 +1805,8 @@ async fn run_provider_session(
 
     // The actor holds the only handle to its Turn's normalizers, so settle the Turn
     // here rather than dropping them: whatever stopped this actor also stopped the
-    // Turn, and nothing else will finish the streams it left in flight. It fails
-    // rather than settling an acknowledged interruption, because a Turn settled as
-    // interrupted delivers the next queued Prompt, and this actor is in no state to
-    // run it.
+    // Turn, and nothing else will finish the streams it left in flight. Losing the
+    // actor is a failure even if it had acknowledged an interrupt before it stopped.
     if let Some(mut current) = active {
         fail_active_turn(
             &sessions,
@@ -1910,7 +1853,7 @@ async fn ask_actor_or_find_nothing_running(
 /// the Provider would not stop is no reason to tear the Session down.
 async fn stop_one_subagent(
     runtime: &Arc<dyn ProviderRuntime>,
-    connection: Option<(Arc<dyn ProviderSession>, AgentIdentity)>,
+    connection: Option<Arc<dyn ProviderSession>>,
     subagents: &mut SubagentRoutes,
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
@@ -1922,11 +1865,10 @@ async fn stop_one_subagent(
     let Some(subagent) = subagents.subagent_for_session(target) else {
         return Ok(());
     };
-    let (provider_session, identity) =
-        connection.expect("routed Subagents ride a live Provider connection");
+    let provider_session = connection.expect("routed Subagents ride a live Provider connection");
     match provider_session.stop_subagent(subagent.clone()).await {
         Ok(()) => {
-            subagents.settle_stopped(sessions, updates, &identity, &subagent);
+            subagents.settle_stopped(sessions, updates, &subagent);
             Ok(())
         }
         Err(error) => Err(InterruptSessionError::ProviderFailure(failure_message(
@@ -2020,15 +1962,6 @@ fn skill_prompt_delivery(prompt: &Prompt) -> SkillPromptDelivery {
     }
 }
 
-fn provider_event_settles_turn(event: &ProviderEvent) -> bool {
-    matches!(
-        event,
-        ProviderEvent::TurnCompleted
-            | ProviderEvent::TurnInterrupted
-            | ProviderEvent::TurnFailed { .. }
-    )
-}
-
 fn next_queued_prompt(sessions: &SessionStore, session_id: SessionId) -> Option<Prompt> {
     sessions.snapshot(session_id).and_then(|snapshot| {
         earliest_pending_prompt(&snapshot.prompts, PromptDelivery::Queue).cloned()
@@ -2041,37 +1974,6 @@ fn defer_next_queued_prompt(
     session_id: SessionId,
 ) {
     *deferred_prompt_id = next_queued_prompt(sessions, session_id).map(|prompt| prompt.id);
-}
-
-async fn queued_prompt_disposition(
-    skill_catalog: &SkillCatalogService,
-    sessions: &SessionStore,
-    session_id: SessionId,
-    provider: &ProviderId,
-    workspace: &std::path::Path,
-) -> QueuedPromptDisposition {
-    let Some(prompt) = next_queued_prompt(sessions, session_id) else {
-        return QueuedPromptDisposition::LeavePending;
-    };
-    match revalidate_prompt_skills(
-        skill_catalog,
-        sessions,
-        session_id,
-        provider,
-        workspace,
-        &prompt,
-        SkillPromptDelivery::Queue,
-    )
-    .await
-    {
-        Ok(()) => QueuedPromptDisposition::Deliver {
-            prompt_id: prompt.id,
-        },
-        Err(message) => QueuedPromptDisposition::Fail {
-            prompt_id: prompt.id,
-            message,
-        },
-    }
 }
 
 async fn revalidate_prompt_skills(
@@ -2128,7 +2030,6 @@ fn project_provider_event(
     subagents: &mut SubagentRoutes,
     next_agent: &AgentIdentity,
     event: ProviderEvent,
-    queued_prompt_disposition: QueuedPromptDisposition,
 ) -> ProviderEventProjection {
     let Some(projected) = updates.apply(|| {
         let projection = match event {
@@ -2218,7 +2119,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider sent Agent Message content before starting a Message",
                     );
                 };
@@ -2236,7 +2136,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider completed an Agent Message before starting one",
                     );
                 };
@@ -2299,7 +2198,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider sent command output before starting the Activity",
                     );
                 };
@@ -2321,7 +2219,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider completed a command before starting the Activity",
                     );
                 };
@@ -2335,7 +2232,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         failure_message("Provider execution failed", &error),
                     );
                 }
@@ -2397,7 +2293,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider updated file changes before starting the Activity",
                     );
                 };
@@ -2422,7 +2317,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider completed file changes before starting the Activity",
                     );
                 };
@@ -2485,7 +2379,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider titled Reasoning before starting the Activity",
                     );
                 };
@@ -2508,7 +2401,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider sent Reasoning content before starting the Activity",
                     );
                 };
@@ -2526,7 +2418,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider completed Reasoning before starting the Activity",
                     );
                 };
@@ -2613,7 +2504,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider updated a Subagent before spawning it",
                     );
                 }
@@ -2622,7 +2512,7 @@ fn project_provider_event(
             ProviderEvent::SubagentCompleted {
                 subagent_id,
                 status,
-            } => match subagents.settle_subagent(sessions, next_agent, &subagent_id, status) {
+            } => match subagents.settle_subagent(sessions, &subagent_id, status) {
                 // The settle a stopped Subagent still owed arrives as a late
                 // echo: Suru already settled the row, so there is nothing
                 // left for the Provider's own account to close.
@@ -2634,7 +2524,6 @@ fn project_provider_event(
                         sessions,
                         session_id,
                         active,
-                        next_agent,
                         "Provider settled a Subagent before spawning it",
                     );
                 }
@@ -2672,13 +2561,11 @@ fn project_provider_event(
                         .finish_provider_turn(
                             session_id,
                             active.turn_id,
-                            next_agent.agent.clone(),
                             ProviderTurnOutcome::Completed {
                                 trailing_output: TrailingCommandOutput::new(),
                             },
-                            queued_prompt_disposition,
                         )
-                        .map(ProviderEventProjection::Terminal)
+                        .map(|()| ProviderEventProjection::Terminal)
                 }
             }
             ProviderEvent::TurnInterrupted => {
@@ -2687,11 +2574,9 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        next_agent.agent.clone(),
                         ProviderTurnOutcome::Interrupted { trailing_output },
-                        queued_prompt_disposition,
                     )
-                    .map(ProviderEventProjection::Terminal)
+                    .map(|()| ProviderEventProjection::Terminal)
             }
             ProviderEvent::AgentSelectionRejected { message } => {
                 let trailing_output = active.take_trailing_output();
@@ -2702,7 +2587,7 @@ fn project_provider_event(
                         trailing_output,
                         normalize_provider_text(&message),
                     )
-                    .map(|_| ProviderEventProjection::Terminal(None))
+                    .map(|_| ProviderEventProjection::Terminal)
             }
             ProviderEvent::TurnFailed { message } => {
                 let trailing_output = active.take_trailing_output();
@@ -2710,14 +2595,12 @@ fn project_provider_event(
                     .finish_provider_turn(
                         session_id,
                         active.turn_id,
-                        next_agent.agent.clone(),
                         ProviderTurnOutcome::Failed {
                             trailing_output,
                             message: normalize_provider_text(&message),
                         },
-                        queued_prompt_disposition,
                     )
-                    .map(ProviderEventProjection::Terminal)
+                    .map(|()| ProviderEventProjection::Terminal)
             }
         };
 
@@ -2726,12 +2609,11 @@ fn project_provider_event(
                 sessions,
                 session_id,
                 active,
-                next_agent,
                 failure_message("Provider execution failed", &error),
             )
         })
     }) else {
-        return ProviderEventProjection::Terminal(None);
+        return ProviderEventProjection::Terminal;
     };
     projected
 }
@@ -2762,14 +2644,12 @@ fn fail_invalid_provider_event(
     sessions: &SessionStore,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
-    next_agent: &AgentIdentity,
     message: &str,
 ) -> ProviderEventProjection {
     finish_invalid_provider_event(
         sessions,
         session_id,
         active,
-        next_agent,
         format!("Provider execution failed: {message}"),
     )
 }
@@ -2778,24 +2658,18 @@ fn finish_invalid_provider_event(
     sessions: &SessionStore,
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
-    next_agent: &AgentIdentity,
     message: String,
 ) -> ProviderEventProjection {
     let trailing_output = active.take_trailing_output();
-    let next_turn = sessions
-        .finish_provider_turn(
-            session_id,
-            active.turn_id,
-            next_agent.agent.clone(),
-            ProviderTurnOutcome::Failed {
-                trailing_output,
-                message,
-            },
-            QueuedPromptDisposition::LeavePending,
-        )
-        .ok()
-        .flatten();
-    ProviderEventProjection::Terminal(next_turn)
+    let _ = sessions.finish_provider_turn(
+        session_id,
+        active.turn_id,
+        ProviderTurnOutcome::Failed {
+            trailing_output,
+            message,
+        },
+    );
+    ProviderEventProjection::Terminal
 }
 
 /// The routing seam is proven here on its own terms, apart from the spawn

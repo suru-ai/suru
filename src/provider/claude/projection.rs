@@ -21,8 +21,10 @@
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
 //! the loop's own conversation: a subagent's streams live past it, which is what lets a Subagent
 //! outlive the Turn (ADR 0015), and the stretch the loop later runs to deliver its outcome ends
-//! with a result of its own. Every block kind this slice does not present is passed over rather
-//! than failed, because the wire grows freely (ADR 0010).
+//! with a result of its own. A fresh owning message after that boundary explicitly begins a
+//! native Continuation, including when a background Bash command woke the loop with no Subagent
+//! involved; its result and interrupt belong to that Continuation. Every block kind this slice
+//! does not present is passed over rather than failed, because the wire grows freely (ADR 0010).
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -458,6 +460,13 @@ impl ClaudeProjection {
         conversation.streamed = true;
         let mut projected = Vec::new();
         match event.kind.as_str() {
+            // Only a new owning message can begin a native loop; child messages and trailing
+            // block stops cannot revive a settled Turn.
+            "message_start" if owner.is_none() => {
+                if let Some(selection) = self.turn.begin_continuation() {
+                    projected.push(ProviderEvent::ContinuationStarted { selection });
+                }
+            }
             "content_block_start" => {
                 if let Some(block) = event.content_block {
                     // Blocks stream strictly one at a time within a conversation, so a start

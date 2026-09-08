@@ -20,6 +20,7 @@ mod provider_support;
 mod activity;
 mod availability;
 mod context_fill;
+mod continuations;
 mod errands;
 mod interruption;
 mod models;

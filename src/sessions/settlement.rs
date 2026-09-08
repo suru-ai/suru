@@ -6,19 +6,14 @@ use anyhow::anyhow;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, MessageRole, MessageStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, MessageRole, MessageStatus,
     PromptDelivery, PromptStatus, SessionChange, SessionId, SessionSnapshot, SessionUpdate, Turn,
     TurnId, TurnStatus,
 };
 
 use super::{
-    SessionStore,
-    output::command_output_changes,
-    projection::active_turn_id,
-    prompts::{
-        DeliveredTurn, append_steer_delivery_changes, earliest_pending_prompt,
-        prepare_prompt_delivery,
-    },
+    SessionStore, output::command_output_changes, projection::active_turn_id,
+    prompts::append_steer_delivery_changes,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,22 +60,6 @@ pub(crate) enum ProviderTurnOutcome {
     },
 }
 
-/// The authoritative decision made for the next queued Prompt immediately
-/// before the settle commit would deliver it. Keeping the decision explicit
-/// lets the Provider actor perform asynchronous Skill Catalog validation while
-/// the Session store still settles the old Turn and either starts or fails the
-/// queued Turn atomically for every attached client.
-pub(crate) enum QueuedPromptDisposition {
-    Deliver {
-        prompt_id: crate::protocol::PromptId,
-    },
-    Fail {
-        prompt_id: crate::protocol::PromptId,
-        message: String,
-    },
-    LeavePending,
-}
-
 /// The unterminated line each in-flight command's normalizer held back when its
 /// Turn settled, keyed by the command Activity it belongs to. Only the Provider
 /// actor holds those normalizers, while which streams are still in flight is the
@@ -124,9 +103,9 @@ impl SessionStore {
 
     /// Begins a Continuation: the one kind of Turn that starts without a
     /// Prompt, begun by Suru itself when Provider output arrives while no Turn
-    /// is active — owed to an earlier Turn's Subagents still working past its
-    /// settle (ADR 0015). It settles like any Turn, so nothing else about
-    /// settlement knows it exists.
+    /// is active — a native loop resumed, or earlier Subagents still owed
+    /// output past their Turn's settle (ADR 0015). It settles like any Turn,
+    /// so nothing else about settlement knows it exists.
     pub(crate) fn begin_continuation(
         &self,
         session_id: SessionId,
@@ -169,14 +148,14 @@ impl SessionStore {
         Ok(turn_id)
     }
 
+    /// Settles only this Turn. The Provider actor delivers queued Prompts separately, after
+    /// giving any buffered native Continuation its own Turn and interrupt boundary.
     pub(crate) fn finish_provider_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        agent_id: AgentId,
         outcome: ProviderTurnOutcome,
-        queued_prompt_disposition: QueuedPromptDisposition,
-    ) -> anyhow::Result<Option<DeliveredTurn>> {
+    ) -> anyhow::Result<()> {
         let mut state = self
             .state
             .lock()
@@ -193,7 +172,7 @@ impl SessionStore {
                 (trailing_output, None, TurnStatus::Interrupted)
             }
         };
-        let (pending_steers, next_queued_prompt, next_agent, settle_changes) = {
+        let (pending_steers, settle_changes) = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -207,10 +186,10 @@ impl SessionStore {
                 // that and discarding it unseen.
                 let salvaged = settle_in_flight_changes(&record.snapshot, turn_id, trailing_output);
                 if salvaged.is_empty() {
-                    return Ok(None);
+                    return Ok(());
                 }
                 state.commit(&self.storage, session_id, salvaged)?;
-                return Ok(None);
+                return Ok(());
             }
             // A Continuation's pending Prompts owe their own Turns. Keep
             // those admissions out of later prompted Turns' steer sweeps too.
@@ -232,21 +211,8 @@ impl SessionStore {
                 .cloned()
                 .collect::<Vec<_>>();
             pending_steers.sort_unstable_by_key(|prompt| prompt.admission_order);
-            let next_queued_prompt =
-                earliest_pending_prompt(&record.snapshot.prompts, PromptDelivery::Queue).cloned();
-            let next_agent = record
-                .snapshot
-                .session
-                .agent_selection
-                .clone()
-                .map(|selection| AgentIdentity {
-                    agent: agent_id,
-                    selection,
-                });
             (
                 pending_steers,
-                next_queued_prompt,
-                next_agent,
                 settle_in_flight_changes(&record.snapshot, turn_id, trailing_output),
             )
         };
@@ -271,33 +237,6 @@ impl SessionStore {
             settled_at: None,
         });
 
-        let next_turn = match (next_queued_prompt, queued_prompt_disposition) {
-            (Some(prompt), QueuedPromptDisposition::Deliver { prompt_id })
-                if prompt.id == prompt_id =>
-            {
-                let (delivered, delivery_changes) =
-                    prepare_prompt_delivery(prompt, next_agent, TurnStatus::Active);
-                changes.extend(delivery_changes);
-                Some(delivered)
-            }
-            (Some(prompt), QueuedPromptDisposition::Fail { prompt_id, message })
-                if prompt.id == prompt_id =>
-            {
-                let (delivered, delivery_changes) =
-                    prepare_prompt_delivery(prompt, next_agent, TurnStatus::Failed);
-                changes.extend(delivery_changes);
-                changes.push(SessionChange::ActivityAdded {
-                    activity: Activity::Error {
-                        id: ActivityId::new(),
-                        turn_id: delivered.turn_id,
-                        text: message,
-                    },
-                });
-                None
-            }
-            (None, _) | (Some(_), _) => None,
-        };
-
         state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
@@ -306,7 +245,7 @@ impl SessionStore {
         for prompt in pending_steers {
             record.steer_targets.remove(&prompt.id);
         }
-        Ok(next_turn)
+        Ok(())
     }
 
     pub(crate) fn interrupt_target(

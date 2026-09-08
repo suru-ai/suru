@@ -61,7 +61,7 @@ A unit of work that ordinarily begins when a Prompt is delivered while a Session
 _Avoid_: Request, exchange
 
 **Continuation**:
-The one kind of Turn that begins without a Prompt: Suru begins one itself when Provider output arrives while no Turn is active, owed to an earlier Turn's Subagents still working after that Turn Settled. A Continuation settles like any Turn, and one still open when the next Prompt is delivered settles then, so it never stands in that Prompt's way.
+The one kind of Turn that begins without a Prompt: the Provider resumes work after a prior Turn Settled, including work provoked by a background Command or Subagent, or Suru receives output owed to an earlier Turn's Subagents while no Turn is active. A Continuation settles like any Turn; one still open when the next Prompt is delivered settles first, interrupting any Provider work it owns before that Prompt begins.
 _Avoid_: Synthetic turn, background turn, ghost turn
 
 **Settle**:
