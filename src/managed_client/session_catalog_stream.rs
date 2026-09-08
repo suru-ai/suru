@@ -12,11 +12,11 @@ use tokio::{
 };
 
 use crate::protocol::{
-    Outlook, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange, SessionCatalogRevision,
-    SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated, SessionDeleted, SessionId,
-    SessionSettlementChanged, SessionStandingInputsChanged, SessionTitleChanged,
-    SessionUsageChanged, SessionWorkingChanged, SkillCatalog,
+    MODEL_CATALOG_EVENT, ModelCatalog, Outlook, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT,
+    SESSION_CATALOG_UPDATED_EVENT, SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange,
+    SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated,
+    SessionDeleted, SessionId, SessionSettlementChanged, SessionStandingInputsChanged,
+    SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SkillCatalog,
 };
 
 use super::{
@@ -43,8 +43,9 @@ async fn open_for_outlook(
     descriptor: &RuntimeDescriptor,
     outlook: &Outlook,
 ) -> std::result::Result<reqwest::Response, RemoteConnectionFailure> {
-    let url = server_url(&descriptor.base_url, outlook, "/v1/session-events")
+    let mut url = server_url(&descriptor.base_url, outlook, "/v1/session-events")
         .expect("a validated runtime descriptor builds a Server URL");
+    url.query_pairs_mut().append_pair("warm_models", "true");
     remote_connection::classify(http.get(url).bearer_auth(&descriptor.token).send().await).await
 }
 
@@ -178,7 +179,7 @@ async fn run_attached(
             }
         };
         let (hydrated, hydration) = oneshot::channel();
-        let consumption = consume(response, &events, &mut known_session_ids, hydrated);
+        let consumption = consume(response, &events, &mut known_session_ids, hydrated, true);
         tokio::pin!(consumption);
         tokio::pin!(hydration);
         let outcome = tokio::select! {
@@ -237,6 +238,7 @@ pub(super) async fn consume(
     events: &mpsc::Sender<ManagedEvent>,
     known_session_ids: &mut Option<HashSet<SessionId>>,
     hydrated: oneshot::Sender<()>,
+    forward_models: bool,
 ) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
     let mut revision = None;
@@ -278,6 +280,18 @@ pub(super) async fn consume(
                 let announced = apply_update(known_session_ids, update.change)?;
                 revision = Some(update.revision);
                 if events.send(announced).await.is_err() {
+                    return Ok(StreamOutcome::ReceiverClosed);
+                }
+            }
+            CatalogEvent::Models(catalog) => {
+                // The managed local connection already receives Models on
+                // its lifecycle stream, after Connected and Settings.
+                if forward_models
+                    && events
+                        .send(ManagedEvent::ModelCatalog(catalog))
+                        .await
+                        .is_err()
+                {
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
             }
@@ -406,6 +420,7 @@ enum CatalogEvent {
     Snapshot(SessionCatalogSnapshot),
     Update(SessionCatalogUpdate),
     Skill(SkillCatalog),
+    Models(ModelCatalog),
 }
 
 fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Result<CatalogEvent> {
@@ -428,6 +443,10 @@ fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Resul
                 bail!("Session catalog revision sequence is discontinuous");
             }
             Ok(CatalogEvent::Update(update))
+        }
+        MODEL_CATALOG_EVENT => {
+            let catalog = serde_json::from_str(&event.data).context("decode Model Catalog")?;
+            Ok(CatalogEvent::Models(catalog))
         }
         SKILL_CATALOG_UPDATED_EVENT => {
             let catalog: SkillCatalog =

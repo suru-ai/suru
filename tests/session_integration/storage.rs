@@ -818,9 +818,8 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>) 
 #[tokio::test]
 async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_invalidates_its_listing()
 {
-    use eventsource_stream::Eventsource;
     use futures_util::StreamExt;
-    use suru::protocol::{SessionCatalogChange, SessionCatalogUpdate};
+    use suru::protocol::SessionCatalogChange;
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -888,24 +887,8 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
     // A shutdown with no history access must not flush partial writer state
     // over the durable Prompt; its corruption must still be discovered below.
     let replacement = spawn_with_failing_provider(restart_config).await.unwrap();
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/session-events",
-            replacement.descriptor().base_url
-        ))
-        .bearer_auth(&replacement.descriptor().token)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-    let mut events = response.bytes_stream().eventsource();
-    let first = timeout(Duration::from_secs(1), events.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(first.event, suru::protocol::SESSION_CATALOG_SNAPSHOT_EVENT);
+    let (_, mut events) =
+        crate::support::open_catalog_stream_with_snapshot(replacement.descriptor()).await;
     let failed = reqwest::Client::new()
         .get(format!(
             "{}/v1/sessions/{}",
@@ -920,13 +903,9 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
     let changed = timeout(Duration::from_secs(1), events.next())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert_eq!(changed.event, suru::protocol::SESSION_CATALOG_UPDATED_EVENT);
     assert_eq!(
-        serde_json::from_str::<SessionCatalogUpdate>(&changed.data)
-            .unwrap()
-            .change,
+        changed.change,
         SessionCatalogChange::Invalidated {
             session_id: created.session.id
         }

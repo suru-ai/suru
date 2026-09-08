@@ -46,8 +46,16 @@ async fn open_events(
     descriptor: &RuntimeDescriptor,
 ) -> impl futures_util::Stream<Item = Result<Event, eventsource_stream::EventStreamError<reqwest::Error>>>
 {
+    open_events_at(descriptor, "/v1/events").await
+}
+
+async fn open_events_at(
+    descriptor: &RuntimeDescriptor,
+    path: &str,
+) -> impl futures_util::Stream<Item = Result<Event, eventsource_stream::EventStreamError<reqwest::Error>>>
+{
     reqwest::Client::new()
-        .get(format!("{}/v1/events", descriptor.base_url))
+        .get(format!("{}{path}", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .send()
         .await
@@ -161,6 +169,15 @@ async fn connecting_pushes_the_catalog_and_asks_each_provider_once_per_process()
 
 #[tokio::test]
 async fn a_restarted_server_serves_the_remembered_catalog_before_the_provider_answers() {
+    assert_remembered_catalog_is_pushed("/v1/events").await;
+}
+
+#[tokio::test]
+async fn session_catalog_stream_serves_remembered_models_before_the_provider_answers() {
+    assert_remembered_catalog_is_pushed("/v1/session-events").await;
+}
+
+async fn assert_remembered_catalog_is_pushed(path: &str) {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let (runtime, _provider) = provider(vec![named_model("fast", "Fast Model")]);
@@ -172,7 +189,7 @@ async fn a_restarted_server_serves_the_remembered_catalog_before_the_provider_an
     )
     .await;
     let descriptor = server.descriptor().clone();
-    let mut events = open_events(&descriptor).await;
+    let mut events = open_events_at(&descriptor, path).await;
     warm(&descriptor).await;
     loop {
         let catalog = next_model_catalog(&mut events).await;
@@ -194,7 +211,7 @@ async fn a_restarted_server_serves_the_remembered_catalog_before_the_provider_an
     .await;
     let descriptor = restarted.descriptor().clone();
 
-    let mut events = open_events(&descriptor).await;
+    let mut events = open_events_at(&descriptor, path).await;
     let remembered = next_model_catalog(&mut events).await;
     assert_eq!(
         remembered.providers[0].models[0].display_name, "Fast Model",

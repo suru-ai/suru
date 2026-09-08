@@ -24,6 +24,10 @@ use tokio::time::{Duration, timeout};
 #[allow(dead_code)]
 mod support;
 
+#[allow(dead_code)]
+#[path = "support/provider.rs"]
+mod provider_support;
+
 use support::{
     read_runtime_descriptor, receive_initial_state, request_server_shutdown,
     write_runtime_descriptor,
@@ -1033,19 +1037,28 @@ async fn paired_servers(name: &str) -> PairedServers {
 }
 
 async fn paired_servers_with_alternate_route(name: &str, alternate: bool) -> PairedServers {
+    paired_servers_with_runtime(name, alternate, None).await
+}
+
+async fn paired_servers_with_runtime(
+    name: &str,
+    alternate: bool,
+    runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
+) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
     let serving_channel = format!("{name}-serving");
-    let serving = server::spawn_with_timings(
-        ServerConfig::new(serving_state.path(), &serving_channel)
-            .expect("configure Serving Server")
-            .with_config_dir(serving_config_root.path()),
-        ServerTimings {
-            shutdown_grace: Duration::from_millis(5),
-            ..ServerTimings::default()
-        },
-    )
-    .await
+    let config = ServerConfig::new(serving_state.path(), &serving_channel)
+        .expect("configure Serving Server")
+        .with_config_dir(serving_config_root.path());
+    let timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        ..ServerTimings::default()
+    };
+    let serving = match runtime {
+        Some(runtime) => server::spawn_with_provider_and_timings(config, runtime, timings).await,
+        None => server::spawn_with_timings(config, timings).await,
+    }
     .expect("spawn Serving Server");
     let mut serving_client = ManagedClient::connect(
         ManagedClientConfig::new(serving_state.path(), &serving_channel)
@@ -1404,10 +1417,13 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    let initial = timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("Remote catalog snapshot arrives")
-        .expect("Remote catalog stream remains open");
+    let initial = timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("Remote catalog snapshot arrives")
+    .expect("Remote catalog stream remains open");
     let ManagedEvent::SessionCatalogReconciled(snapshot) = initial else {
         panic!("Remote catalog starts with a snapshot");
     };
@@ -1442,10 +1458,13 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         })
         .await
         .expect("create a Session on the Remote");
-    let announced = timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("Remote catalog update arrives")
-        .expect("Remote catalog stream remains open");
+    let announced = timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("Remote catalog update arrives")
+    .expect("Remote catalog stream remains open");
     assert!(matches!(
         announced,
         ManagedEvent::SessionCreated(created_event)
@@ -1491,10 +1510,13 @@ async fn successive_remote_requests_reuse_transport_while_an_outlook_holds_inter
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("Remote catalog snapshot arrives")
-        .expect("Remote catalog interest remains live");
+    timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("Remote catalog snapshot arrives")
+    .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     remote
@@ -1586,11 +1608,14 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
         .connecting_client
         .outlook(Outlook::Remote("laptop".to_owned()));
     let mut laptop_catalog = laptop_outlook.subscribe_catalog();
-    for catalog in [&mut workstation_catalog, &mut laptop_catalog] {
+    for mut catalog in [&mut workstation_catalog, &mut laptop_catalog] {
         assert!(matches!(
-            timeout(Duration::from_secs(1), catalog.next())
-                .await
-                .expect("Remote catalog snapshot arrives"),
+            timeout(
+                Duration::from_secs(1),
+                next_session_catalog_event(&mut catalog)
+            )
+            .await
+            .expect("Remote catalog snapshot arrives"),
             Some(ManagedEvent::SessionCatalogReconciled(_))
         ));
     }
@@ -1599,9 +1624,12 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
 
     pair.wire.set_online(false).await;
     assert!(matches!(
-        timeout(Duration::from_secs(1), workstation_catalog.next())
-            .await
-            .expect("workstation catalog announces recovery"),
+        timeout(
+            Duration::from_secs(1),
+            next_session_catalog_event(&mut workstation_catalog)
+        )
+        .await
+        .expect("workstation catalog announces recovery"),
         Some(ManagedEvent::Recovering(_))
     ));
     laptop_wire.wait_for_connections(1).await;
@@ -1621,7 +1649,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
         .await
         .expect("create a Session while the other Remote recovers");
     assert!(matches!(
-        timeout(Duration::from_secs(1), laptop_catalog.next())
+        timeout(Duration::from_secs(1), next_session_catalog_event(&mut laptop_catalog))
             .await
             .expect("the undisturbed laptop catalog reports its update"),
         Some(ManagedEvent::SessionCreated(event)) if event.session_id == created.session.id
@@ -1630,7 +1658,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     pair.wire.set_online(true).await;
     let recovered = timeout(Duration::from_secs(1), async {
         loop {
-            match workstation_catalog.next().await {
+            match next_session_catalog_event(&mut workstation_catalog).await {
                 Some(ManagedEvent::Recovering(_)) => {}
                 event => return event,
             }
@@ -1697,19 +1725,25 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
     assert!(matches!(
-        timeout(Duration::from_secs(1), catalog.next())
-            .await
-            .expect("Remote catalog snapshot arrives"),
+        timeout(
+            Duration::from_secs(1),
+            next_session_catalog_event(&mut catalog)
+        )
+        .await
+        .expect("Remote catalog snapshot arrives"),
         Some(ManagedEvent::SessionCatalogReconciled(_))
     ));
     pair.wire.wait_for_connections(1).await;
 
     pair.wire.set_online(false).await;
     assert_eq!(
-        timeout(Duration::from_secs(1), catalog.next())
-            .await
-            .expect("transient drop announces recovery")
-            .expect("Remote catalog interest remains live"),
+        timeout(
+            Duration::from_secs(1),
+            next_session_catalog_event(&mut catalog)
+        )
+        .await
+        .expect("transient drop announces recovery")
+        .expect("Remote catalog interest remains live"),
         ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
             attempt: 1,
             retry_in: Duration::from_millis(5),
@@ -1719,7 +1753,7 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
     pair.wire.set_online(true).await;
     let first_restored_event = timeout(Duration::from_secs(1), async {
         loop {
-            match catalog.next().await {
+            match next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::Recovering(_)) => {}
                 event => return event,
             }
@@ -1735,9 +1769,12 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
         "the recovered catalog snapshot lands before reconnect presentation clears"
     );
     assert!(matches!(
-        timeout(Duration::from_secs(1), catalog.next())
-            .await
-            .expect("reconnect presentation clears after catalog hydration"),
+        timeout(
+            Duration::from_secs(1),
+            next_session_catalog_event(&mut catalog)
+        )
+        .await
+        .expect("reconnect presentation clears after catalog hydration"),
         Some(ManagedEvent::RemoteRecovered)
     ));
     pair.wire.wait_for_connections(1).await;
@@ -1754,17 +1791,23 @@ async fn dropping_remote_catalog_interest_stops_its_retry_loop() {
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("Remote catalog snapshot arrives")
-        .expect("Remote catalog interest remains live");
+    timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("Remote catalog snapshot arrives")
+    .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     pair.wire.set_online(false).await;
     assert!(matches!(
-        timeout(Duration::from_secs(1), catalog.next())
-            .await
-            .expect("transient drop announces recovery"),
+        timeout(
+            Duration::from_secs(1),
+            next_session_catalog_event(&mut catalog)
+        )
+        .await
+        .expect("transient drop announces recovery"),
         Some(ManagedEvent::Recovering(_))
     ));
     drop(catalog);
@@ -1787,10 +1830,13 @@ async fn revocation_stops_remote_catalog_retries_and_surfaces_a_terminal_status(
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("Remote catalog snapshot arrives")
-        .expect("Remote catalog interest remains live");
+    timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("Remote catalog snapshot arrives")
+    .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
@@ -1798,7 +1844,7 @@ async fn revocation_stops_remote_catalog_retries_and_surfaces_a_terminal_status(
     let mut saw_recovery = false;
     let failure = timeout(Duration::from_secs(1), async {
         loop {
-            match catalog.next().await {
+            match next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::Recovering(_)) => saw_recovery = true,
                 Some(ManagedEvent::RemoteFailed { status, message }) => return (status, message),
                 Some(_) => {}
@@ -2184,10 +2230,13 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     let mut catalog = connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()))
         .subscribe_catalog();
-    let terminal = timeout(Duration::from_secs(1), catalog.next())
-        .await
-        .expect("protocol mismatch answers without retrying")
-        .expect("Remote catalog reports its terminal status");
+    let terminal = timeout(
+        Duration::from_secs(1),
+        next_session_catalog_event(&mut catalog),
+    )
+    .await
+    .expect("protocol mismatch answers without retrying")
+    .expect("Remote catalog reports its terminal status");
     assert!(matches!(
         terminal,
         ManagedEvent::RemoteFailed {
@@ -2196,10 +2245,13 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
         }
     ));
     assert!(
-        timeout(Duration::from_millis(30), catalog.next())
-            .await
-            .expect("terminal Remote catalog closes promptly")
-            .is_none(),
+        timeout(
+            Duration::from_millis(30),
+            next_session_catalog_event(&mut catalog)
+        )
+        .await
+        .expect("terminal Remote catalog closes promptly")
+        .is_none(),
         "a terminal protocol mismatch schedules no retry event"
     );
 
@@ -4017,4 +4069,99 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
         .run_until_ctrl_c()
         .await
         .expect("join replaced server");
+}
+
+// These tests assert Session movement and connection lifecycle; Models are
+// independently pushed on the same subscription and may arrive between them.
+async fn next_session_catalog_event(
+    subscription: &mut suru::managed_client::SessionCatalogSubscription,
+) -> Option<ManagedEvent> {
+    loop {
+        match subscription.next().await {
+            Some(ManagedEvent::ModelCatalog(_)) => continue,
+            event => return event,
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_catalog_delivers_model_names_and_updates_without_listing_models() {
+    use suru::protocol::{
+        ModelAvailability, ModelDescriptor, ModelId, ProviderCatalogStatus, ProviderId,
+    };
+
+    let (runtime, _provider) = provider_support::ControlledProvider::with_provider(
+        ProviderId::new("controlled"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("controlled"),
+            id: ModelId::new("native-id"),
+            display_name: "Friendly Remote Model".into(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let pair =
+        paired_servers_with_runtime("remote-model-catalog", false, Some(runtime.clone())).await;
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".into()));
+    let mut subscription = remote.subscribe_catalog();
+    let catalog = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await
+                && catalog.providers[0].status == ProviderCatalogStatus::Fresh
+            {
+                break catalog;
+            }
+        }
+    })
+    .await
+    .expect("connecting to a Remote discovers and pushes its Model names");
+    assert_eq!(
+        catalog.providers[0].models[0].display_name,
+        "Friendly Remote Model"
+    );
+    assert_eq!(runtime.model_discoveries(), 1);
+
+    drop(subscription);
+    let mut subscription = remote.subscribe_catalog();
+    let cached = timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await {
+                break catalog;
+            }
+        }
+    })
+    .await
+    .expect("reconnecting receives the catalog already discovered");
+    assert_eq!(
+        cached.providers[0].models[0].display_name,
+        "Friendly Remote Model"
+    );
+    assert_eq!(
+        runtime.model_discoveries(),
+        1,
+        "reconnecting does not rediscover Models"
+    );
+
+    runtime.set_unavailable(Some(suru::protocol::ProviderUnavailability::NotSignedIn));
+    pair.serving_client.refresh_models().await.unwrap();
+    timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await
+                && matches!(
+                    catalog.providers[0].status,
+                    ProviderCatalogStatus::Unavailable { .. }
+                )
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the Remote's subsequent Model Catalog changes are pushed");
+    drop(subscription);
+    pair.shutdown().await;
 }

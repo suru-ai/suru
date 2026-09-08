@@ -168,6 +168,7 @@ async fn run_managed_client(
             &events,
             &mut known_session_ids,
             catalog_hydrated,
+            false,
         );
         tokio::pin!(catalog);
         let stream_result = tokio::select! {

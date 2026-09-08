@@ -5,8 +5,8 @@ use futures_util::{StreamExt, future::join_all};
 use suru::{
     protocol::{
         Activity, ActivityId, CreateSessionRequest, InitialPrompt, RuntimeDescriptor,
-        SessionCatalogChange, SessionCatalogUpdate, SessionChange, SessionListItem,
-        SessionRevision, SessionSnapshot, SessionUpdate, Workspace,
+        SessionCatalogChange, SessionChange, SessionListItem, SessionRevision, SessionSnapshot,
+        SessionUpdate, Workspace,
     },
     server::{RunningServer, ServerConfig},
 };
@@ -435,23 +435,8 @@ async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_
     let initial = listing(server.descriptor()).await;
     assert!(matches!(&initial[..], [SessionListItem::Readable(summary)]
         if summary.session.id == before.session.id && summary.total_usage.unwrap().output_tokens == Some(7)));
-    let response = request(
-        server.descriptor(),
-        reqwest::Method::GET,
-        "/v1/session-events",
-    )
-    .send()
-    .await
-    .unwrap()
-    .error_for_status()
-    .unwrap();
-    let mut events = response.bytes_stream().eventsource();
-    let first = timeout(Duration::from_secs(1), events.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(first.event, suru::protocol::SESSION_CATALOG_SNAPSHOT_EVENT);
+    let (_, mut events) =
+        crate::support::open_catalog_stream_with_snapshot(server.descriptor()).await;
     let failed = request(
         server.descriptor(),
         reqwest::Method::GET,
@@ -464,12 +449,9 @@ async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_
     let changed = timeout(Duration::from_secs(1), events.next())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<SessionCatalogUpdate>(&changed.data)
-            .unwrap()
-            .change,
+        changed.change,
         SessionCatalogChange::Invalidated {
             session_id: before.session.id
         }

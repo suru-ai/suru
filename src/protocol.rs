@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,

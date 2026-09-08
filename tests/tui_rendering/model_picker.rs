@@ -18,6 +18,73 @@ use suru::{
 };
 
 #[test]
+fn remote_session_names_follow_its_pushed_catalog_without_opening_models() {
+    use suru::{managed_client::ManagedEvent, protocol::Outlook};
+
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    crate::connecting::turn_to_studio(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                AgentSelection {
+                    provider: ProviderId::new("fixture-provider"),
+                    model: ModelId::new("native-id"),
+                    options: Vec::new(),
+                },
+            ),
+        ))
+        .unwrap();
+
+    for name in ["Remembered Model", "Renamed Model"] {
+        application
+            .handle_event(ApplicationEvent::OriginCatalog {
+                outlook: Outlook::Remote("studio".into()),
+                event: ManagedEvent::ModelCatalog(ModelCatalog {
+                    providers: vec![ProviderModelCatalog {
+                        provider: ProviderId::new("fixture-provider"),
+                        display_name: "Remote Provider".into(),
+                        models: vec![model_descriptor(
+                            "fixture-provider",
+                            "native-id",
+                            name,
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    }],
+                }),
+            })
+            .unwrap();
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+                ModelCatalog {
+                    providers: vec![ProviderModelCatalog {
+                        provider: ProviderId::new("fixture-provider"),
+                        display_name: "Local Provider".into(),
+                        models: vec![model_descriptor(
+                            "fixture-provider",
+                            "native-id",
+                            "Local Model",
+                            true,
+                            ModelAvailability::Available,
+                        )],
+                        status: ProviderCatalogStatus::Fresh,
+                    }],
+                },
+            )))
+            .unwrap();
+        let rendered = rendered_application_rows_at(&application, 100, 16).join("\n");
+        assert!(
+            rendered.contains(&format!("Remote Provider · {name}")),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
 fn restored_selection_label_takes_the_name_its_catalog_gives_it() {
     let workspace = workspace_dir();
     let selection = AgentSelection {

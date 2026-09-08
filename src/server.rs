@@ -1088,7 +1088,17 @@ fn settings_snapshot_event(snapshot: &SettingsSnapshot) -> Event {
         .expect("settings snapshots always serialize")
 }
 
-async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Default, Deserialize)]
+struct SessionCatalogQuery {
+    #[serde(default)]
+    warm_models: bool,
+}
+
+async fn session_catalog_events(
+    State(state): State<AppState>,
+    Query(query): Query<SessionCatalogQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -1096,20 +1106,39 @@ async fn session_catalog_events(State(state): State<AppState>, headers: HeaderMa
     if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown.borrow().is_some() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    Sse::new(session_catalog_event_stream(
+    let events = session_catalog_event_stream(
         state
             .sessions
             .subscribe_catalog(state.workspace_paths.clone()),
         state.skill_catalog.subscribe(),
+        state.model_catalog.clone(),
         shutdown,
         state.timings.sse_keepalive_interval,
-    ))
-    .into_response()
+    );
+    // Capture the remembered catalog before asking Providers. Warming through
+    // the subscription keeps a Remote on one transport connection and never
+    // waits for discovery before delivering the snapshot.
+    if query.warm_models {
+        state.model_catalog.warm();
+    }
+    Sse::new(events).into_response()
+}
+
+struct SessionCatalogEventStreamState {
+    keepalive: tokio::time::Interval,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
+    sessions: broadcast::Receiver<crate::protocol::SessionCatalogUpdate>,
+    skills: broadcast::Receiver<SkillCatalog>,
+    delivered_revision: SessionCatalogRevision,
+    models: ModelCatalogService,
+    model_changes: watch::Receiver<u64>,
+    pushed_models: ModelCatalog,
 }
 
 fn session_catalog_event_stream(
     feed: SessionCatalogFeed,
     skills: broadcast::Receiver<SkillCatalog>,
+    models: ModelCatalogService,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
@@ -1119,81 +1148,84 @@ fn session_catalog_event_stream(
         .id(revision.event_id())
         .json_data(feed.snapshot)
         .expect("Session catalog snapshots always serialize");
-    stream::once(async move { Ok::<_, std::convert::Infallible>(snapshot) }).chain(
-        stream::unfold(
-            (
-                tokio::time::interval_at(
-                    Instant::now() + keepalive_interval,
-                    keepalive_interval,
-                ),
-                shutdown,
-                feed.updates,
-                skills,
-                revision,
-            ),
-            |(mut keepalive, mut shutdown, mut sessions, mut skills, delivered_revision)| async move {
-                if shutdown.borrow().is_some() {
+    // Subscribe before reading the snapshot so a discovery completing during
+    // connection setup cannot be missed.
+    let mut model_changes = models.subscribe();
+    model_changes.mark_unchanged();
+    let pushed_models = models.current();
+    let model_snapshot = model_catalog_event(&pushed_models);
+    let state = SessionCatalogEventStreamState {
+        keepalive: tokio::time::interval_at(
+            Instant::now() + keepalive_interval,
+            keepalive_interval,
+        ),
+        shutdown,
+        sessions: feed.updates,
+        skills,
+        delivered_revision: revision,
+        models,
+        model_changes,
+        pushed_models,
+    };
+    let updates = stream::unfold(state, |mut state| async move {
+        if state.shutdown.borrow().is_some() {
+            return None;
+        }
+        loop {
+            let event = tokio::select! {
+                biased;
+                changed = state.shutdown.changed() => {
+                    let _ = changed;
                     return None;
                 }
-                tokio::select! {
-                    biased;
-                    changed = shutdown.changed() => {
-                        let _ = changed;
-                        None
+                received = state.sessions.recv() => {
+                    let update = match received {
+                        Ok(update) => update,
+                        Err(broadcast::error::RecvError::Closed | broadcast::error::RecvError::Lagged(_)) => return None,
+                    };
+                    if !update.revision.immediately_follows(state.delivered_revision) {
+                        return None;
                     }
-                    received = sessions.recv() => {
-                        let update = match received {
-                            Ok(update) => update,
-                            Err(broadcast::error::RecvError::Closed | broadcast::error::RecvError::Lagged(_)) => return None,
-                        };
-                        if !update.revision.immediately_follows(delivered_revision) {
-                            return None;
-                        }
-                        let next_revision = update.revision;
-                        let event = Event::default()
-                            .event(SESSION_CATALOG_UPDATED_EVENT)
-                            .id(next_revision.event_id())
-                            .json_data(update)
-                            .expect("Session catalog updates always serialize");
-                        Some((
-                            Ok::<_, std::convert::Infallible>(event),
-                            (keepalive, shutdown, sessions, skills, next_revision),
-                        ))
-                    }
-                    received = skills.recv() => {
-                        match received {
-                            Ok(catalog) => {
-                                let event = Event::default()
-                                    .event(SKILL_CATALOG_UPDATED_EVENT)
-                                    .json_data(catalog)
-                                    .expect("Skill Catalog updates always serialize");
-                                Some((
-                                    Ok::<_, std::convert::Infallible>(event),
-                                    (keepalive, shutdown, sessions, skills, delivered_revision),
-                                ))
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(skipped, "client Skill Catalog event stream lagged");
-                                Some((
-                                    Ok::<_, std::convert::Infallible>(
-                                        Event::default().comment("skill-catalog-updates-lagged"),
-                                    ),
-                                    (keepalive, shutdown, sessions, skills, delivered_revision),
-                                ))
-                            }
-                            Err(broadcast::error::RecvError::Closed) => None,
-                        }
-                    }
-                    _ = keepalive.tick() => Some((
-                        Ok::<_, std::convert::Infallible>(
-                            Event::default().comment("keep-alive"),
-                        ),
-                        (keepalive, shutdown, sessions, skills, delivered_revision),
-                    )),
+                    state.delivered_revision = update.revision;
+                    Event::default()
+                        .event(SESSION_CATALOG_UPDATED_EVENT)
+                        .id(update.revision.event_id())
+                        .json_data(update)
+                        .expect("Session catalog updates always serialize")
                 }
-            },
-        ),
-    )
+                received = state.skills.recv() => {
+                    match received {
+                        Ok(catalog) => Event::default()
+                            .event(SKILL_CATALOG_UPDATED_EVENT)
+                            .json_data(catalog)
+                            .expect("Skill Catalog updates always serialize"),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "client Skill Catalog event stream lagged");
+                            Event::default().comment("skill-catalog-updates-lagged")
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+                changed = state.model_changes.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let catalog = state.models.current();
+                    if catalog == state.pushed_models {
+                        continue;
+                    }
+                    let event = model_catalog_event(&catalog);
+                    state.pushed_models = catalog;
+                    event
+                }
+                _ = state.keepalive.tick() => Event::default().comment("keep-alive"),
+            };
+            return Some((Ok::<_, std::convert::Infallible>(event), state));
+        }
+    });
+    stream::once(async move { Ok(snapshot) })
+        .chain(stream::once(async move { Ok(model_snapshot) }))
+        .chain(updates)
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

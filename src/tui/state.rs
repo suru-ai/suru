@@ -763,12 +763,15 @@ impl TuiState {
         self.sync_composer_completion();
     }
 
-    /// The union of Remote catalog streams required by independently scoped
-    /// Session surfaces. One surface narrowing must not release another
-    /// surface's Everywhere interest.
+    /// Remote catalog streams required by the current Outlook and independently
+    /// scoped Session surfaces. Narrowing a listing must not release the Model
+    /// Catalog of the Session on screen or another surface's interest.
     fn catalog_origins(&self) -> HashSet<Outlook> {
         let mut origins = self.sidebar.catalog_origins();
         origins.extend(self.session_picker.catalog_origins());
+        if matches!(self.outlook, Outlook::Remote(_)) {
+            origins.insert(self.outlook.clone());
+        }
         origins
     }
 
@@ -949,6 +952,10 @@ impl TuiState {
     }
 
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
+        if let ManagedEvent::ModelCatalog(catalog) = event {
+            self.model_picker.adopt_catalog(outlook.clone(), catalog);
+            return;
+        }
         self.adopt_workspace_paths(outlook, &event);
         self.reconcile_questionnaire_catalog(outlook, &event);
         if self.sidebar.includes_origin(outlook) {
@@ -4510,6 +4517,8 @@ impl Application {
         let listed_by_sidebar = self.state.sidebar.includes_origin(outlook);
         let listed_by_picker = self.state.session_picker.includes_origin(outlook);
         outlook == &self.state.outlook
+            || (matches!(event, ManagedEvent::ModelCatalog(_))
+                && (listed_by_sidebar || listed_by_picker))
             || (event.moves_the_session_catalog() && (listed_by_sidebar || listed_by_picker))
             || ((listed_by_sidebar || listed_by_picker)
                 && matches!(event, ManagedEvent::RemoteFailed { .. }))
