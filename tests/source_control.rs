@@ -93,7 +93,7 @@ async fn shared_metadata_groups_external_worktrees_and_subdirs_but_not_clones_or
     );
     assert!(matches!(
         a.workspace.repository.unwrap().capabilities.create_checkout,
-        SourceControlCapability::Unsupported { .. }
+        SourceControlCapability::Available
     ));
     let clone = root.join("clone");
     git(

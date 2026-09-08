@@ -193,6 +193,7 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

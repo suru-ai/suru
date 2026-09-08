@@ -1134,6 +1134,7 @@ fn agent_selection_change_is_typed_and_replaceable() {
 #[test]
 fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
+        preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {
             path: PathBuf::from("/work/suru"),
@@ -1145,6 +1146,7 @@ fn initial_session_command_round_trips_through_json() {
         },
     };
     let expected = json!({
+        "preparation_id": null,
         "agent_selection": null,
         "execution_directory": { "path": "/work/suru" },
         "prompt": {

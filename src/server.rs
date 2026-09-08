@@ -63,6 +63,7 @@ pub type ServerConfig = RuntimeConfig;
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
     pub checkout_observation_interval: Duration,
+    pub checkout_skill_timeout: Duration,
     /// How long an accepted shutdown keeps health and existing streams
     /// available so the final authenticated intent can reach clients before
     /// graceful transport closure.
@@ -80,6 +81,7 @@ impl Default for ServerTimings {
         Self {
             sse_keepalive_interval: Duration::from_secs(10),
             checkout_observation_interval: Duration::from_secs(1),
+            checkout_skill_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
@@ -89,6 +91,10 @@ impl Default for ServerTimings {
 }
 
 impl ServerTimings {
+    pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
+        self.checkout_skill_timeout = timeout;
+        self
+    }
     pub fn with_checkout_observation_interval(mut self, interval: Duration) -> Self {
         self.checkout_observation_interval = interval;
         self
@@ -341,6 +347,7 @@ impl LandingAgentSelectionStore {
 
 #[derive(Clone)]
 struct AppState {
+    preparations: crate::source_control::PreparationStore,
     source_control: crate::source_control::SourceControlService,
     workspace_paths: crate::protocol::WorkspacePaths,
     descriptor: Arc<RuntimeDescriptor>,
@@ -573,6 +580,10 @@ pub async fn spawn_with_source_control(
         settings.subscribe(),
     );
     let state = AppState {
+        preparations: crate::source_control::PreparationStore::new(
+            config.data_dir(),
+            config.channel(),
+        ),
         source_control,
         workspace_paths: crate::protocol::WorkspacePaths::discover(),
         descriptor: Arc::new(descriptor.clone()),
@@ -618,6 +629,7 @@ pub async fn spawn_with_source_control(
             put(confirm_landing_agent_selection),
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
+        .route("/v1/checkouts/prepare", post(prepare_checkout))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .merge(
             Router::new()
@@ -1300,6 +1312,156 @@ async fn confirm_landing_agent_selection(
     Json(selection).into_response()
 }
 
+fn preparation_error(error: impl Into<String>) -> Response {
+    session_error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        SessionErrorCode::InvalidWorkspace,
+        error,
+    )
+}
+
+async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Response {
+    use crate::protocol::{PrepareCheckoutRequest, PrepareCheckoutResult, SkillCatalogStatus};
+    let request = match decode_session_command::<PrepareCheckoutRequest>(
+        &state,
+        request,
+        "Worktree preparation",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.description.trim().is_empty() {
+        return preparation_error("Prompt must contain non-whitespace text");
+    }
+    // Stable ID allocation and persistence precede Git mutation. The repository
+    // guard is also used by admission, and can cover recovery/removal operations.
+    let _serial = state.preparations.serial.lock().await;
+    let mut preparation = match state.preparations.load(request.id) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => match state
+            .source_control
+            .plan_checkout(&request, &state.preparations.channel)
+            .await
+        {
+            Ok(plan) => {
+                if let Err(e) = state.preparations.save(&plan) {
+                    return preparation_error(e);
+                }
+                plan
+            }
+            Err(e) => return preparation_error(e),
+        },
+        Err(e) => return preparation_error(e),
+    };
+    // A lost admission response is a read of admitted work, never another
+    // initialization pass through files an Agent may already be changing.
+    if let Err(e) = state.sessions.hydrate(preparation.intended_session).await {
+        return preparation_error(e.to_string());
+    }
+    if state
+        .sessions
+        .snapshot(preparation.intended_session)
+        .is_some()
+    {
+        preparation.admitted_session = Some(preparation.intended_session);
+        let location = state
+            .source_control
+            .resolve(&preparation.destination.path, None)
+            .await;
+        return Json(PrepareCheckoutResult {
+            preparation,
+            location: Some(location),
+            error: None,
+        })
+        .into_response();
+    }
+    let _mutation = state
+        .source_control
+        .mutation_guard(&preparation.repository.id)
+        .await;
+    let mut location = None;
+    let operation = async {
+        let resolved = state.source_control.prepare_checkout(&preparation).await?;
+        location = Some(resolved);
+        preparation.checkout_created = true;
+        state.preparations.save(&preparation)?;
+        state
+            .source_control
+            .initialize_checkout(&preparation)
+            .await?;
+        let catalog = tokio::time::timeout(
+            state.timings.checkout_skill_timeout,
+            state.skill_catalog.refresh_current(SkillCatalogRequest {
+                provider: request.provider,
+                execution_directory: preparation.destination.clone(),
+            }),
+        )
+        .await
+        .map_err(|_| {
+            "Destination Skill discovery timed out; Worktree retained for retry".to_owned()
+        })?
+        .map_err(|e| {
+            format!("Destination Skills could not refresh; Worktree retained for retry: {e:?}")
+        })?;
+        match catalog.status {
+            SkillCatalogStatus::Fresh { .. } => Ok(()),
+            SkillCatalogStatus::Unavailable { message } | SkillCatalogStatus::Stale { message } => {
+                Err(format!(
+                    "Destination Skills could not refresh; Worktree retained for retry: {message}"
+                ))
+            }
+            _ => Err("Destination Skills are still loading; retry".to_owned()),
+        }
+    }
+    .await;
+    let mut error = operation.err();
+    preparation.ready = error.is_none();
+    if let Err(e) = state.preparations.save(&preparation) {
+        error = Some(e);
+    }
+    Json(PrepareCheckoutResult {
+        preparation,
+        location,
+        error,
+    })
+    .into_response()
+}
+
+/// Admission publishes an idle shell before the actor creates its first Turn.
+/// Keep the repository protected across that gap; thereafter the Working guard
+/// used by working-copy mutations can read the ordinary Session projection.
+fn retain_checkout_during_startup(
+    state: &AppState,
+    id: SessionId,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+) {
+    let Some(mut feed) = state.sessions.subscribe(id) else {
+        return;
+    };
+    let sessions = state.sessions.clone();
+    let mut shutdown = state.shutdown.subscribe_to_intent();
+    tokio::spawn(async move {
+        let _guard = guard;
+        loop {
+            if sessions.snapshot(id).is_none_or(|snapshot| {
+                !snapshot.turns.is_empty()
+                    || snapshot
+                        .prompts
+                        .iter()
+                        .all(|p| p.status != crate::protocol::PromptStatus::Pending)
+            }) {
+                break;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                result = feed.updates.recv() => if matches!(result, Err(broadcast::error::RecvError::Closed)) { break; },
+            }
+        }
+    });
+}
+
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
     let mut request =
         match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
@@ -1308,6 +1470,62 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Ok(request) => request,
             Err(response) => return response,
         };
+
+    let _preparation_serial = if request.preparation_id.is_some() {
+        Some(state.preparations.serial.lock().await)
+    } else {
+        None
+    };
+    let mut preparation = match request.preparation_id {
+        Some(id) => match state.preparations.load(id) {
+            Ok(Some(plan)) => Some(plan),
+            Ok(None) => {
+                return preparation_error(
+                    "Worktree preparation is unknown; prepare it before admission",
+                );
+            }
+            Err(e) => return preparation_error(e),
+        },
+        None => None,
+    };
+    if let Some(plan) = &preparation {
+        if let Err(e) = state.sessions.hydrate(plan.intended_session).await {
+            return preparation_error(e.to_string());
+        }
+        if let Some(snapshot) = state.sessions.snapshot(plan.intended_session) {
+            return Json(snapshot).into_response();
+        }
+        if let Some(id) = plan.admitted_session {
+            if let Err(e) = state.sessions.hydrate(id).await {
+                return preparation_error(e.to_string());
+            }
+            return state.sessions.snapshot(id).map_or_else(
+                || preparation_error("The admitted Session no longer exists"),
+                |snapshot| Json(snapshot).into_response(),
+            );
+        }
+    }
+    let mut mutation = if let Some(plan) = &preparation {
+        Some(
+            state
+                .source_control
+                .mutation_guard(&plan.repository.id)
+                .await,
+        )
+    } else {
+        None
+    };
+    if let Some(plan) = &preparation {
+        if !plan.ready || request.execution_directory != plan.destination {
+            return preparation_error("Prepare the intended Worktree before admitting this Prompt");
+        }
+        if let Err(e) = state.source_control.prepare_checkout(plan).await {
+            return preparation_error(e);
+        }
+        if let Err(e) = state.source_control.initialize_checkout(plan).await {
+            return preparation_error(e);
+        }
+    }
 
     if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
         tracing::warn!("Prompt owner hydration failed: {error}");
@@ -1373,8 +1591,22 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         return response;
     }
 
-    match state.sessions.create_in(request, location) {
+    let admission = if let Some(plan) = &preparation {
+        state
+            .sessions
+            .create_in_with_identity(request, location, Some(plan.intended_session))
+    } else {
+        state.sessions.create_in(request, location)
+    };
+    match admission {
         Ok(StoreOutcome::Created(snapshot)) => {
+            if let Some(plan) = &mut preparation {
+                plan.admitted_session = Some(snapshot.session.id);
+                if let Err(e) = state.preparations.save(plan) {
+                    tracing::warn!("Admitted preparation marker will require reconciliation: {e}");
+                }
+            }
+
             if let Some(selection) = snapshot.session.agent_selection.clone() {
                 state.landing_agent_selection.confirm(selection);
             }
@@ -1383,6 +1615,9 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 snapshot.session.execution_directory.path.clone(),
                 snapshot.prompts[0].id,
             );
+            if let Some(guard) = mutation.take() {
+                retain_checkout_during_startup(&state, snapshot.session.id, guard);
+            }
             // After the Turn is scheduled and never in front of it: a Title is
             // cosmetic and the user's actual work does not wait on one. Only a
             // freshly created Session reaches here, which is what makes the

@@ -666,6 +666,27 @@ impl RunLoop {
             ApplicationTransition::Exit => return ControlFlow::Break(Exit::Now),
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
             ApplicationTransition::DetachSession => self.tasks.leave_session(),
+            ApplicationTransition::PrepareCheckout { prompt_id, request } => {
+                let outlook = self.application.outlook().clone();
+                let commands = self.client.session_commands_for(outlook.clone());
+                let results = self.channels.submissions.clone();
+                tokio::spawn(async move {
+                    let result = match commands.prepare_checkout(request).await {
+                        Ok(result) => SubmissionResult::CheckoutPrepared {
+                            outlook,
+                            prompt_id,
+                            result,
+                        },
+                        Err(error) => SubmissionResult::PromptDeliveryFailed {
+                            outlook,
+                            session: None,
+                            prompt_id,
+                            error: error.to_string(),
+                        },
+                    };
+                    let _ = results.send(result);
+                });
+            }
             ApplicationTransition::CreateSession(request) => {
                 let outlook = self.application.outlook().clone();
                 spawn_session_creation(
@@ -1031,7 +1052,8 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::CreateSession(_)
+            ApplicationTransition::PrepareCheckout { .. }
+            | ApplicationTransition::CreateSession(_)
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
             | ApplicationTransition::SettleSession { .. }
@@ -1214,6 +1236,19 @@ impl RunLoop {
         let submission = submission
             .ok_or_else(|| anyhow!("Prompt admission task channel stopped unexpectedly"))?;
         match submission {
+            SubmissionResult::CheckoutPrepared {
+                outlook,
+                prompt_id,
+                result,
+            } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let transition = self
+                    .application
+                    .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })?;
+                return Ok(self.dispatch_transition(transition));
+            }
             SubmissionResult::SessionCreated { outlook, snapshot } => {
                 if self.application.outlook() != &outlook {
                     return Ok(ControlFlow::Continue(()));
@@ -1976,6 +2011,11 @@ fn spawn_prompt_delivery(
 }
 
 enum SubmissionResult {
+    CheckoutPrepared {
+        outlook: Outlook,
+        prompt_id: PromptId,
+        result: crate::protocol::PrepareCheckoutResult,
+    },
     SessionCreated {
         outlook: Outlook,
         snapshot: Box<SessionSnapshot>,

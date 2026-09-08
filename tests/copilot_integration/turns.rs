@@ -88,6 +88,7 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -193,6 +194,7 @@ async fn copilot_cost_is_absent_when_an_applicable_cache_price_is_not_published(
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -236,6 +238,7 @@ async fn a_prompt_streams_a_copilot_message_into_the_transcript_and_settles_the_
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -326,6 +329,7 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: Some(selection("claude-fixture", "low", "long_context")),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -394,6 +398,7 @@ async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: Some(selection("claude-fixture", "low", "long_context")),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -444,6 +449,7 @@ async fn a_modelless_session_with_no_chosen_selection_runs_under_the_catalog_def
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -499,6 +505,7 @@ async fn a_permission_request_is_answered_inside_the_harness() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -558,6 +565,7 @@ async fn a_copilot_error_settles_the_turn_as_failed_with_a_concise_reason() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -623,6 +631,7 @@ async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_resumes_
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -721,6 +730,7 @@ async fn a_prompt_queued_behind_a_failed_turn_runs_rather_than_settling_on_its_i
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -776,4 +786,52 @@ async fn a_prompt_queued_behind_a_failed_turn_runs_rather_than_settling_on_its_i
 
     drop(feed);
     server.shutdown().await.expect("shut the server down");
+}
+
+#[tokio::test]
+async fn managed_worktree_native_copilot_starts_at_prepared_root() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}",
+        crate::support::conversation_arms(),
+        crate::support::destroy_session_arm(),
+        crate::support::delete_session_arm(),
+        r#"
+    *'"method":"session.commands.list"'*) reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"commands":[]}}' ;;
+    *'"method":"session.skills.list"'*) reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"skills":[]}}' ;;
+"#,
+        send_arm(STREAMED_MESSAGE)
+    ));
+    let state = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(state.path(), "prepared-copilot").unwrap(),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+        server::ServerTimings::default()
+            .with_checkout_skill_timeout(tokio::time::Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    let client = connect(state.path(), "prepared-copilot").await;
+    let prepared = crate::managed_worktree::prepare(&client, source.path(), "copilot").await;
+    assert!(
+        !copilot
+            .requests()
+            .iter()
+            .any(|r| r["method"] == "session.send")
+    );
+    let created = client
+        .create_session(crate::managed_worktree::creation(&prepared))
+        .await
+        .unwrap();
+    settled_session(&client, created.session.id, 0).await;
+    let request = copilot
+        .requests()
+        .into_iter()
+        .find(|r| r["method"] == "session.create" && r["params"]["streaming"] == true)
+        .unwrap();
+    assert_eq!(
+        request["params"]["workingDirectory"].as_str(),
+        prepared.destination.path.to_str()
+    );
+    server.shutdown().await.unwrap();
 }

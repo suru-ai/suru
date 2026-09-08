@@ -29,6 +29,7 @@ fn git(root: &Path, args: &[&str]) {
 async fn create(client: &OutlookClient, path: &Path) -> SessionId {
     client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: path.to_owned(),
@@ -319,6 +320,7 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
             .post(format!("{}/v1/sessions", server.descriptor().base_url))
             .bearer_auth(&server.descriptor().token)
             .json(&CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
                     path: root.path().to_owned(),
@@ -449,6 +451,7 @@ async fn discovery_persists_branch_and_detached_recovery_before_any_catalog_inte
             .post(format!("{}/v1/sessions", server.descriptor().base_url))
             .bearer_auth(&server.descriptor().token)
             .json(&CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory { path: path.clone() },
                 prompt: InitialPrompt {

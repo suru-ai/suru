@@ -166,6 +166,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -346,6 +347,7 @@ async fn assert_provider_failure(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

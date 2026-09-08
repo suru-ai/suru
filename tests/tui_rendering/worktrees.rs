@@ -630,3 +630,221 @@ fn worktree_chooser_during_initial_discovery_uses_exact_launch_path_until_server
     };
     assert_eq!(request.execution_directory.path, layout.main);
 }
+
+fn choose_new(app: &mut Application, layout: &Layout) {
+    let mut context = layout.context.clone();
+    context
+        .workspace
+        .repository
+        .as_mut()
+        .unwrap()
+        .capabilities
+        .create_checkout = SourceControlCapability::Available;
+    open(app, context);
+    key(app, KeyCode::Up); // Last row is the semantic new-Worktree intent.
+    assert_eq!(key(app, KeyCode::Enter), ApplicationTransition::Continue);
+}
+fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckoutResult {
+    let destination = layout.main.join(".suru-worktrees/test/prepared");
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut location = layout.at(&destination);
+    let repository = location.workspace.repository.clone().unwrap();
+    location.checkout = Some(CheckoutAssociation {
+        recovery_revision: None,
+        id: CheckoutId::from_root(&repository.id, &destination),
+        repository: repository.id.clone(),
+        root: destination.clone(),
+        kind: CheckoutKind::Linked,
+    });
+    PrepareCheckoutResult {
+        preparation: PreparedCheckout {
+            id: request.id,
+            source: request.source.clone(),
+            repository,
+            destination: ExecutionDirectory { path: destination },
+            plan: CheckoutPreparationPlan::Git {
+                branch: "suru/prepared".to_owned(),
+                source_commit: "abc".to_owned(),
+            },
+            checkout_created: true,
+            ready: true,
+            intended_session: SessionId::new(),
+            admitted_session: None,
+        },
+        location: Some(location),
+        error: None,
+    }
+}
+
+#[test]
+fn new_worktree_intent_is_deferred_cancelable_and_first_prompt_automatically_admits_at_prepared_root()
+ {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    assert!(text(&app).contains("New Worktree on submit"));
+    assert!(!layout.main.join(".suru-worktrees").exists());
+    open(&mut app, layout.context.clone());
+    key(&mut app, KeyCode::Enter); // Current cancels the intention.
+    assert!(!text(&app).contains("New Worktree on submit"));
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Prepare and work");
+    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("first submit prepares")
+    };
+    assert_eq!(request.source.path, layout.nested);
+    let result = prepared(&layout, &request);
+    let destination = result.preparation.destination.clone();
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap()
+    else {
+        panic!("unbound Prompt automatically continues")
+    };
+    assert_eq!(create.preparation_id, Some(request.id));
+    assert_eq!(create.execution_directory, destination);
+    assert_eq!(create.prompt.id, prompt_id);
+}
+
+#[test]
+fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_deliberate_choice() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Retry this draft");
+    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    let mut result = prepared(&layout, &request);
+    result.error = Some("Submodule initialization failed; retry".to_owned());
+    result.preparation.ready = false;
+    app.handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap();
+    assert!(text(&app).contains("Retry this draft"));
+    assert!(text(&app).contains("Submodule initialization failed"));
+    type_terminal_text(&mut app, " corrected");
+    let ApplicationTransition::PrepareCheckout {
+        prompt_id: retry_id,
+        request: retry,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("retry")
+    };
+    assert_eq!(retry.id, request.id);
+    assert_ne!(retry_id, prompt_id);
+    open(&mut app, layout.at(&layout.main));
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.handle_event(ApplicationEvent::CheckoutPrepared {
+            prompt_id: retry_id,
+            result: prepared(&layout, &retry)
+        })
+        .unwrap(),
+        ApplicationTransition::Continue
+    );
+    let ApplicationTransition::CreateSession(create) = key(&mut app, KeyCode::Enter) else {
+        panic!("draft remains usable after changing destination")
+    };
+    assert_eq!(create.preparation_id, None);
+    assert_eq!(create.execution_directory.path, layout.main);
+}
+
+fn offer_review(app: &mut Application, path: &Path, id: &str) {
+    let request = SkillCatalogRequest {
+        provider: ProviderId::new("codex"),
+        execution_directory: ExecutionDirectory {
+            path: path.to_owned(),
+        },
+    };
+    app.handle_event(ApplicationEvent::SkillsListed {
+        request: request.clone(),
+        catalog: SkillCatalog {
+            provider: request.provider,
+            execution_directory: request.execution_directory,
+            skills: vec![SkillDescriptor {
+                id: SkillId::new(id),
+                name: "review".to_owned(),
+                description: "Review change".to_owned(),
+                scope: None,
+            }],
+            capabilities: SkillCatalogCapabilities {
+                max_distinct_invocations: None,
+                supported_deliveries: vec![SkillPromptDelivery::Initial],
+            },
+            status: SkillCatalogStatus::Fresh { warning: None },
+        },
+    })
+    .unwrap();
+}
+#[test]
+fn managed_preparation_requires_destination_skill_reselection_and_keeps_identity_after_correcting_draft()
+ {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    offer_review(&mut app, &layout.nested, "source-review");
+    app.handle_event(ApplicationEvent::Command(CommandId::InsertText(
+        "Please $rev".to_owned(),
+    )))
+    .unwrap();
+    app.handle_event(ApplicationEvent::Command(
+        CommandId::ConfirmSelectedCompletion,
+    ))
+    .unwrap();
+    choose_new(&mut app, &layout);
+    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("source bindings may prepare")
+    };
+    let result = prepared(&layout, &request);
+    let destination = result.preparation.destination.clone();
+    let ApplicationTransition::RefreshSkills(refresh) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap()
+    else {
+        panic!("explicit bindings require reselection")
+    };
+    assert_eq!(refresh.execution_directory, destination);
+    assert!(text(&app).contains("$review"));
+    assert_eq!(
+        key(&mut app, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    offer_review(&mut app, &destination.path, "destination-review");
+    app.handle_event(ApplicationEvent::Command(CommandId::SelectAll))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InsertText(
+        "Please $rev".to_owned(),
+    )))
+    .unwrap();
+    app.handle_event(ApplicationEvent::Command(
+        CommandId::ConfirmSelectedCompletion,
+    ))
+    .unwrap();
+    let ApplicationTransition::PrepareCheckout {
+        prompt_id: next_id,
+        request: next,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("reselection retries existing preparation")
+    };
+    assert_eq!(next.id, request.id);
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            prompt_id: next_id,
+            result: prepared(&layout, &next),
+        })
+        .unwrap()
+    else {
+        panic!("destination binding may be delivered")
+    };
+    assert_eq!(create.preparation_id, Some(request.id));
+    assert_eq!(
+        create.prompt.skill_invocations[0].skill_id,
+        SkillId::new("destination-review")
+    );
+}

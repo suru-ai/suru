@@ -104,6 +104,7 @@ async fn choosing_existing_detached_worktree_starts_multiple_agents_at_root_and_
         let snapshot = support::create_session(
             server.descriptor(),
             &CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: choice.execution_directory.clone().unwrap(),
                 prompt: InitialPrompt {

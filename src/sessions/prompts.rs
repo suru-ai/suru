@@ -150,6 +150,15 @@ impl SessionStore {
         request: CreateSessionRequest,
         location: crate::protocol::ResolvedWorkspace,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
+        self.create_in_with_identity(request, location, None)
+    }
+
+    pub(crate) fn create_in_with_identity(
+        &self,
+        request: CreateSessionRequest,
+        location: crate::protocol::ResolvedWorkspace,
+        intended_session: Option<SessionId>,
+    ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         if request.prompt.text.trim().is_empty() {
             return Err(CreateSessionError::EmptyPrompt);
         }
@@ -222,7 +231,7 @@ impl SessionStore {
         }
 
         let title = request.prompt.text.trim().to_owned();
-        let session_id = SessionId::new();
+        let session_id = intended_session.unwrap_or_else(SessionId::new);
         let prompt = Prompt {
             id: request.prompt.id,
             text: request.prompt.text.clone(),

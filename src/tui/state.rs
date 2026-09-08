@@ -369,6 +369,7 @@ pub struct TuiState {
     remembered_execution_directories:
         HashMap<(Outlook, crate::protocol::WorkspaceId), RememberedExecutionContext>,
     pub(super) execution_status: crate::protocol::ExecutionDirectoryStatus,
+    pub(super) new_worktree: Option<crate::protocol::PrepareCheckoutRequest>,
     pub(super) worktree_picker: super::worktree_picker::WorktreePicker,
     initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
@@ -563,6 +564,7 @@ impl TuiState {
             )]),
             remembered_execution_directories: HashMap::new(),
             execution_status: crate::protocol::ExecutionDirectoryStatus::Available,
+            new_worktree: None,
             worktree_picker: Default::default(),
             initial_context_resolved: false,
             workspace_resolution_sequence: 0,
@@ -623,6 +625,17 @@ impl TuiState {
         }
     }
 
+    fn cancel_worktree_intent(&mut self) {
+        if self.new_worktree.take().is_some()
+            && let Some(id) = self.pending_submission.as_ref().map(|p| p.prompt.id)
+        {
+            self.fail_pending_submission(
+                id,
+                "Worktree preparation left in its previous context; draft retained".to_owned(),
+            );
+        }
+    }
+
     /// Takes the Workspace this client works in, which the reader moved by
     /// choosing one in the Workspace Picker or by naming a directory in the
     /// Sidebar.
@@ -637,6 +650,13 @@ impl TuiState {
     /// choose, and the path entry re-points it separately, so nothing here
     /// rearranges a column they configured.
     fn adopt_context(&mut self, context: crate::protocol::ResolvedWorkspace) {
+        if self.workspace.id != context.workspace.id
+            || self.execution_directory.as_ref()
+                != context.execution_directory.as_ref().map(|d| &d.path)
+        {
+            self.cancel_worktree_intent();
+        }
+
         self.execution_status = context.execution_status.clone();
         self.remembered_execution_directories.insert(
             (self.outlook.clone(), context.workspace.id.clone()),
@@ -776,6 +796,9 @@ impl TuiState {
     }
 
     fn turn_outlook_with(&mut self, outlook: Outlook, turn: OutlookTurn) {
+        if self.outlook != outlook {
+            self.cancel_worktree_intent();
+        }
         if self.outlook == outlook {
             return;
         }
@@ -1534,6 +1557,7 @@ impl TuiState {
     }
 
     fn apply_created_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
+        self.new_worktree = None;
         self.session_events_blocked = false;
         self.apply_session(SessionEvent::snapshot(snapshot))
     }
@@ -2551,6 +2575,10 @@ pub enum ApplicationEvent {
         prompt_id: PromptId,
         error: String,
     },
+    CheckoutPrepared {
+        prompt_id: PromptId,
+        result: crate::protocol::PrepareCheckoutResult,
+    },
     SessionCreationFailed {
         prompt_id: PromptId,
         error: String,
@@ -2804,6 +2832,10 @@ pub enum ApplicationTransition {
     SettleSession {
         session: SessionReference,
         settled: bool,
+    },
+    PrepareCheckout {
+        prompt_id: PromptId,
+        request: crate::protocol::PrepareCheckoutRequest,
     },
     CreateSession(CreateSessionRequest),
     AdmitPrompt {
@@ -3395,6 +3427,61 @@ impl Application {
                     self.state.fail_pending_submission(prompt_id, error);
                 }
                 Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::CheckoutPrepared { prompt_id, result } => {
+                if self
+                    .state
+                    .pending_submission
+                    .as_ref()
+                    .is_none_or(|p| p.prompt.id != prompt_id)
+                    || self
+                        .state
+                        .new_worktree
+                        .as_ref()
+                        .is_none_or(|p| p.id != result.preparation.id)
+                {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let intent = self.state.new_worktree.take();
+                if let Some(location) = result.location {
+                    self.state.adopt_context(location);
+                }
+                self.state.new_worktree = intent.clone();
+                if let Some(error) = result.error {
+                    self.state.fail_pending_submission(prompt_id, error);
+                    self.state.sync_composer_completion();
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let prompt = self
+                    .state
+                    .pending_submission
+                    .as_ref()
+                    .unwrap()
+                    .prompt
+                    .clone();
+                // The destination is a new Skill authority even when names match.
+                let explicit_source = !prompt.skill_invocations.is_empty()
+                    && intent
+                        .as_ref()
+                        .is_some_and(|intent| intent.source != result.preparation.destination);
+                // Once moved, future bindings come from this actual destination.
+                if let Some(intent) = &mut self.state.new_worktree {
+                    intent.source = result.preparation.destination.clone();
+                }
+                if explicit_source {
+                    self.state.fail_pending_submission(prompt_id, "Worktree prepared. Reselect explicit Skills in the destination before submitting".to_owned());
+                    self.state.sync_composer_completion();
+                    return Ok(self.state.skill_catalog_request().map_or(
+                        ApplicationTransition::Continue,
+                        ApplicationTransition::RefreshSkills,
+                    ));
+                }
+                Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
+                    preparation_id: Some(result.preparation.id),
+                    agent_selection: self.state.landing_agent_selection.clone(),
+                    execution_directory: result.preparation.destination,
+                    prompt,
+                }))
             }
             ApplicationEvent::SessionCreationFailed { prompt_id, error } => {
                 if self
@@ -4023,7 +4110,54 @@ impl Application {
                         .resolve_worktree(WorkspaceResolutionSurface::WorktreeSelection, request);
                 }
                 match self.state.worktree_picker.choice() {
-                    Some(WorktreeChoice::Current) => self.state.worktree_picker.close(),
+                    Some(WorktreeChoice::Current) => {
+                        self.state.cancel_worktree_intent();
+                        self.state.worktree_picker.close();
+                    }
+                    Some(WorktreeChoice::New) => {
+                        let capability = self
+                            .state
+                            .worktree_picker
+                            .context
+                            .as_ref()
+                            .and_then(|c| c.workspace.repository.as_ref())
+                            .map(|r| &r.capabilities.create_checkout);
+                        if let Some(crate::protocol::SourceControlCapability::Unsupported {
+                            reason,
+                        }) = capability
+                        {
+                            self.state.worktree_picker.fail(reason.clone());
+                            return ApplicationTransition::Continue;
+                        }
+                        if capability.is_none() {
+                            self.state
+                                .worktree_picker
+                                .fail("A Repository is required".to_owned());
+                            return ApplicationTransition::Continue;
+                        }
+                        let Some(selection) = &self.state.landing_agent_selection else {
+                            self.state
+                                .worktree_picker
+                                .fail("Choose an Agent first".to_owned());
+                            return ApplicationTransition::Continue;
+                        };
+                        if self.state.new_worktree.is_none() {
+                            self.state.new_worktree =
+                                Some(crate::protocol::PrepareCheckoutRequest {
+                                    id: Default::default(),
+                                    source: crate::protocol::ExecutionDirectory {
+                                        path: self
+                                            .state
+                                            .execution_directory
+                                            .clone()
+                                            .unwrap_or_else(|| self.state.workspace.path.clone()),
+                                    },
+                                    description: String::new(),
+                                    provider: selection.provider.clone(),
+                                });
+                        }
+                        self.state.worktree_picker.close();
+                    }
                     Some(WorktreeChoice::Directory) => {
                         self.state.worktree_picker.directory = Some(String::new());
                         self.state.worktree_picker.error = None;
@@ -4675,12 +4809,19 @@ impl Application {
             return ApplicationTransition::Continue;
         }
         self.state.sync_composer_completion();
-        if let Some(error) = self.state.composers.skill_issue(key.clone()) {
+        if let Some(error) = self.state.composers.skill_issue(key.clone())
+            && self.state.new_worktree.as_ref().is_none_or(|intent| {
+                self.state.execution_directory.as_ref() == Some(&intent.source.path)
+            })
+        {
             self.state.submission_error = Some(error.to_owned());
             self.state.composer_completion.dismiss_active();
             return ApplicationTransition::Continue;
         }
-        if !matches!(key, ComposerKey::Session(_)) && self.state.execution_directory.is_none() {
+        if !matches!(key, ComposerKey::Session(_))
+            && self.state.new_worktree.is_none()
+            && self.state.execution_directory.is_none()
+        {
             self.state.submission_error =
                 Some("Choose a working copy before starting a Session".to_owned());
             return ApplicationTransition::Continue;
@@ -4713,7 +4854,18 @@ impl Application {
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
         });
+        if let Some(request) = &mut self.state.new_worktree {
+            request.description = prompt.text.clone();
+            if let Some(selection) = &self.state.landing_agent_selection {
+                request.provider = selection.provider.clone();
+            }
+            return ApplicationTransition::PrepareCheckout {
+                prompt_id: prompt.id,
+                request: request.clone(),
+            };
+        }
         ApplicationTransition::CreateSession(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: self.state.landing_agent_selection.clone(),
             execution_directory: crate::protocol::ExecutionDirectory {
                 path: self

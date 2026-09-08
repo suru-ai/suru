@@ -70,6 +70,7 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -162,6 +163,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
     let prompt_id = PromptId::new();
     let created = first
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -531,6 +533,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -769,6 +772,7 @@ async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -899,6 +903,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1019,6 +1024,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1149,6 +1155,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1302,6 +1309,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1530,6 +1538,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     let initial_prompt_id = PromptId::new();
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1715,6 +1724,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1891,6 +1901,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -2021,6 +2032,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             // No Agent Selection, so no Title Errand runs and the catalog
             // stream carries nothing but the creation and what the Turn puts
             // on it.
@@ -2141,6 +2153,7 @@ async fn events_attributed_to_an_unknown_subagent_leave_the_session_untouched() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

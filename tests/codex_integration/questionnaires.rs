@@ -64,6 +64,7 @@ impl Live {
         .unwrap();
         let created = client
             .create_session(CreateSessionRequest {
+                preparation_id: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
                 },

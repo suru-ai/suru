@@ -293,6 +293,7 @@ async fn metered_session_with_pricing(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -669,6 +670,7 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
     receive_initial_state(&mut original_client).await;
     let created = original_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

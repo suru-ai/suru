@@ -153,6 +153,16 @@ impl SkillCatalogService {
         Ok(self.begin_refresh(key, runtime, DiscoveryMode::ForceRefresh))
     }
 
+    /// Preparation needs a completed destination reading before first admission.
+    pub(crate) async fn refresh_current(
+        &self,
+        request: SkillCatalogRequest,
+    ) -> Result<SkillCatalog, SkillCatalogError> {
+        let key = self.resolve_key(request.clone())?;
+        self.refresh(request).await?;
+        self.await_current(key).await
+    }
+
     pub(crate) async fn validate_prompt(
         &self,
         provider: ProviderId,

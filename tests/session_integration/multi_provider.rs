@@ -28,6 +28,7 @@ fn create_session_request(
     model: &str,
 ) -> CreateSessionRequest {
     CreateSessionRequest {
+        preparation_id: None,
         agent_selection: Some(hosted_selection(provider, model)),
         execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
@@ -295,6 +296,7 @@ async fn a_fresh_landing_defaults_to_the_first_provider_in_the_built_in_order() 
     let created = create_session(
         &descriptor,
         &CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -481,6 +483,7 @@ async fn a_stale_landing_selection_on_an_unhosted_provider_yields_to_the_built_i
     let created = create_session(
         &replacement_descriptor,
         &CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -533,6 +536,7 @@ async fn the_landing_default_falls_to_the_next_provider_when_the_first_has_no_ca
     let created = create_session(
         &descriptor,
         &CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -720,6 +724,7 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
     let created = create_session(
         &descriptor,
         &CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

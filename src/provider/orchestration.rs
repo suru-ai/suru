@@ -2739,6 +2739,7 @@ mod tests {
     ) -> SessionSnapshot {
         let created = sessions
             .create(CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: execution_directory.to_owned(),

@@ -345,6 +345,7 @@ async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

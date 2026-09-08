@@ -174,3 +174,53 @@ impl ResolvedWorkspace {
         }
     }
 }
+
+/// Stable working-copy preparation identity; independent of edited Prompt IDs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PreparationId(pub uuid::Uuid);
+impl Default for PreparationId {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareCheckoutRequest {
+    pub id: PreparationId,
+    pub source: ExecutionDirectory,
+    pub description: String,
+    pub provider: super::ProviderId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PreparedCheckout {
+    pub id: PreparationId,
+    pub source: ExecutionDirectory,
+    pub repository: Repository,
+    pub destination: ExecutionDirectory,
+    /// Adapter-owned creation facts (Git uses a branch and immutable commit).
+    pub plan: CheckoutPreparationPlan,
+    pub checkout_created: bool,
+    pub ready: bool,
+    pub intended_session: super::SessionId,
+    pub admitted_session: Option<super::SessionId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PrepareCheckoutResult {
+    pub preparation: PreparedCheckout,
+    pub location: Option<ResolvedWorkspace>,
+    pub error: Option<String>,
+}
+
+/// Concrete adapter plans can evolve independently of shared preparation state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "system", rename_all = "snake_case")]
+pub enum CheckoutPreparationPlan {
+    Git {
+        branch: String,
+        source_commit: String,
+    },
+}

@@ -19,6 +19,7 @@ use tokio::time::{Duration, timeout};
 
 fn create_request(workspace: &std::path::Path) -> CreateSessionRequest {
     CreateSessionRequest {
+        preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),

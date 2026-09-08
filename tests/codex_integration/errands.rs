@@ -143,6 +143,7 @@ async fn running_server(
 async fn create_session(client: &ManagedClient, workspace: &std::path::Path) -> SessionId {
     client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.to_owned(),
@@ -326,6 +327,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

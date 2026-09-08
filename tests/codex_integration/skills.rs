@@ -195,6 +195,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
 
     client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -320,6 +321,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
     ];
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -427,6 +429,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -622,6 +625,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

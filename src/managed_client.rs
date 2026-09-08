@@ -350,6 +350,13 @@ impl ManagedClient {
         }
     }
 
+    pub async fn prepare_checkout(
+        &self,
+        request: crate::protocol::PrepareCheckoutRequest,
+    ) -> Result<crate::protocol::PrepareCheckoutResult> {
+        self.session_commands().prepare_checkout(request).await
+    }
+
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
         self.session_commands().create_session(request).await
     }
@@ -537,6 +544,13 @@ impl ManagedClient {
 impl OutlookClient {
     pub fn subscribe_catalog(&self) -> SessionCatalogSubscription {
         self.commands.subscribe_catalog()
+    }
+
+    pub async fn prepare_checkout(
+        &self,
+        request: crate::protocol::PrepareCheckoutRequest,
+    ) -> Result<crate::protocol::PrepareCheckoutResult> {
+        self.commands.prepare_checkout(request).await
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionSnapshot> {
@@ -758,6 +772,14 @@ impl SessionCommandClient {
             .context("Model catalog warm-up")?;
         Ok(())
     }
+    pub(crate) async fn prepare_checkout(
+        &self,
+        request: crate::protocol::PrepareCheckoutRequest,
+    ) -> Result<crate::protocol::PrepareCheckoutResult> {
+        self.post_session_command("/v1/checkouts/prepare", &request, "Worktree preparation")
+            .await
+    }
+
     pub(crate) async fn create_session(
         &self,
         request: CreateSessionRequest,

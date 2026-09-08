@@ -10,11 +10,35 @@ use std::{
     sync::{Arc, Mutex},
 };
 mod git;
+mod preparation;
 pub use git::GitSourceControl;
+pub(crate) use preparation::PreparationStore;
 
 #[async_trait]
 pub trait SourceControl: Send + Sync {
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
+    async fn plan_checkout(
+        &self,
+        _id: crate::protocol::PreparationId,
+        _source: &ResolvedWorkspace,
+        _description: &str,
+        _channel: &str,
+    ) -> Result<crate::protocol::PreparedCheckout, String> {
+        Err("Working-copy creation is unsupported".to_owned())
+    }
+    async fn prepare_checkout(
+        &self,
+        _plan: &crate::protocol::PreparedCheckout,
+    ) -> Result<ResolvedWorkspace, String> {
+        Err("Working-copy creation is unsupported".to_owned())
+    }
+
+    async fn initialize_checkout(
+        &self,
+        _plan: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Read the known working copy, never replacing its identity with a new
     /// repository that happens to occupy the same path.
     async fn observe(
@@ -49,6 +73,7 @@ pub trait SourceControl: Send + Sync {
 pub(crate) struct SourceControlService {
     adapter: Arc<dyn SourceControl>,
     repositories: Arc<Mutex<HashMap<RepositoryId, Repository>>>,
+    mutations: Arc<Mutex<HashMap<RepositoryId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl SourceControlService {
@@ -56,7 +81,43 @@ impl SourceControlService {
         Self {
             adapter,
             repositories: Default::default(),
+            mutations: Default::default(),
         }
+    }
+    pub(crate) async fn mutation_guard(
+        &self,
+        id: &RepositoryId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .mutations
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+    pub(crate) async fn plan_checkout(
+        &self,
+        request: &crate::protocol::PrepareCheckoutRequest,
+        channel: &str,
+    ) -> Result<crate::protocol::PreparedCheckout, String> {
+        let source = self.resolve(&request.source.path, None).await;
+        self.adapter
+            .plan_checkout(request.id, &source, &request.description, channel)
+            .await
+    }
+    pub(crate) async fn prepare_checkout(
+        &self,
+        plan: &crate::protocol::PreparedCheckout,
+    ) -> Result<ResolvedWorkspace, String> {
+        self.adapter.prepare_checkout(plan).await
+    }
+    pub(crate) async fn initialize_checkout(
+        &self,
+        plan: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        self.adapter.initialize_checkout(plan).await
     }
     pub(crate) async fn observe(
         &self,

@@ -1180,6 +1180,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .post(format!("{remote_api}/v1/sessions"))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1309,6 +1310,7 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
     let created = pair
         .serving_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1450,6 +1452,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
 
     let created = remote
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1640,6 +1643,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let workspace = tempfile::tempdir().expect("create laptop Workspace");
     let created = laptop_outlook
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1894,6 +1898,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let created = remote
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1951,6 +1956,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let created = remote
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -2059,6 +2065,7 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
     );
     let created = remote
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: selected.execution_directory.unwrap(),
             prompt: InitialPrompt {

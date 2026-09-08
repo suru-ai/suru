@@ -1207,6 +1207,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
     );
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

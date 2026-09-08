@@ -32,6 +32,7 @@ const EFFORT_OPTION: &str = "reasoning_effort";
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        preparation_id: None,
         agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
         execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),
@@ -593,6 +594,7 @@ async fn a_session_with_no_agent_selection_asks_for_no_errand_at_all() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -986,6 +988,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

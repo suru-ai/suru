@@ -41,6 +41,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace_parent.path().join(".").join("workspace"),
@@ -118,6 +119,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
     let client = reqwest::Client::new();
     let prompt_id = PromptId::new();
     let request = CreateSessionRequest {
+        preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.path().to_owned(),
@@ -163,6 +165,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
 
     for conflicting in [
         CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: request.execution_directory.clone(),
             prompt: InitialPrompt {
@@ -172,6 +175,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             },
         },
         CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: other_workspace.path().to_owned(),
@@ -236,6 +240,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -473,6 +478,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -754,6 +760,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
 
     let created = first
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1034,6 +1041,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1147,6 +1155,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
     let unauthenticated = client
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1166,6 +1175,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1193,6 +1203,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().join("missing"),

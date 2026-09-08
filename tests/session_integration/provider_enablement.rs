@@ -95,6 +95,7 @@ fn session_request(
     text: &str,
 ) -> CreateSessionRequest {
     CreateSessionRequest {
+        preparation_id: None,
         agent_selection: selection,
         execution_directory: suru::protocol::ExecutionDirectory {
             path: workspace.to_owned(),

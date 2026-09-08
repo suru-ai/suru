@@ -26,3 +26,6 @@ mod subagents;
 mod support;
 mod turns;
 mod usage;
+
+#[path = "../support/managed_worktree.rs"]
+mod managed_worktree;

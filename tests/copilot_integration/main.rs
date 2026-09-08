@@ -31,3 +31,6 @@ mod support;
 mod turns;
 
 mod questionnaires;
+
+#[path = "../support/managed_worktree.rs"]
+mod managed_worktree;

@@ -191,6 +191,7 @@ async fn the_pinned_reasoning_summary_setting_is_what_a_turn_asks_codex_for() {
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -250,6 +251,7 @@ async fn a_mutated_reasoning_summary_setting_governs_the_next_turn() {
         .expect("change the Setting over the protocol");
     client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -300,6 +302,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -651,6 +654,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     receive_initial_state(&mut boundary_client).await;
     let boundary_created = boundary_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -727,6 +731,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     receive_initial_state(&mut idle_client).await;
     let idle_created = idle_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -848,6 +853,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     receive_initial_state(&mut original_client).await;
     let created = original_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: execution_directory.clone(),
@@ -1066,6 +1072,7 @@ async fn run_terminal_fixture(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

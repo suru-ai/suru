@@ -28,6 +28,7 @@ impl History {
             let created = support::create_session(
                 server.descriptor(),
                 &CreateSessionRequest {
+                    preparation_id: None,
                     agent_selection: None,
                     execution_directory: suru::protocol::ExecutionDirectory {
                         path: root.path().to_owned(),
@@ -266,6 +267,7 @@ async fn prompt_identity_in_an_unopened_session_cannot_be_reused_by_creation_or_
     let server = history.start().await;
     let denied = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: owner.session.execution_directory.clone(),
             prompt: collision.clone(),

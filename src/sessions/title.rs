@@ -509,6 +509,7 @@ mod tests {
         let store = SessionStore::new(Default::default(), storage);
         let created = store
             .create(CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: crate::protocol::ExecutionDirectory {
                     path: execution_directory.path().to_owned(),

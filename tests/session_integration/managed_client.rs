@@ -61,6 +61,7 @@ async fn managed_clients_can_reconnect_to_a_session_that_outlives_its_first_clie
 
     let created = first_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -140,6 +141,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -222,6 +224,7 @@ async fn managed_clients_observe_durable_session_deletion() {
 
     let created = deleting_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -354,6 +357,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
 
     let first = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -375,6 +379,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     .await;
     let second = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -512,6 +517,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
 
     let shared = first_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -526,6 +532,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         .expect("create shared Session");
     let isolated = first_client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

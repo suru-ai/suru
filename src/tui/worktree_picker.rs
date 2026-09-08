@@ -15,6 +15,7 @@ pub(super) enum WorktreeChoice {
     Current,
     Checkout(CheckoutSummary),
     Directory,
+    New,
 }
 
 impl WorktreePicker {
@@ -44,7 +45,7 @@ impl WorktreePicker {
         let count = self
             .context
             .as_ref()
-            .map_or(2, |context| context.checkouts.len() + 2);
+            .map_or(3, |context| context.checkouts.len() + 3);
         self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
     }
     pub(super) fn choice(&self) -> Option<WorktreeChoice> {
@@ -58,8 +59,10 @@ impl WorktreePicker {
             Some(WorktreeChoice::Checkout(
                 context.checkouts[self.selected - 1].clone(),
             ))
-        } else {
+        } else if self.selected == context.checkouts.len() + 1 {
             Some(WorktreeChoice::Directory)
+        } else {
+            Some(WorktreeChoice::New)
         }
     }
     pub(super) fn current_status(&self) -> &str {

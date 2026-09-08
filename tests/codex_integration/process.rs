@@ -116,6 +116,7 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -412,6 +413,7 @@ impl RecoveryFixture {
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
                     path: workspace.path().to_owned(),
@@ -493,4 +495,57 @@ impl RecoveryFixture {
         drop(self.client);
         self.server.shutdown().await.expect("shut down server");
     }
+}
+
+#[tokio::test]
+async fn managed_worktree_native_codex_starts_at_prepared_root() {
+    let codex = ScriptedCodex::new_multiprocess(
+        r#"
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"skills/list"'*)
+      cwd=$(printf '%s' "$line" | sed 's/.*"cwds":\[\(.*\)\],"forceReload".*/\1/')
+      printf '%s\n' '{"id":2,"result":{"data":[{"cwd":'"$cwd"',"skills":[],"errors":[]}]}}'
+      ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"prepared"},"model":"gpt-fixture"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"prepared-turn"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"prepared","turn":{"id":"prepared-turn","status":"completed","items":[]}}}'
+      ;;
+    "#,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(state.path(), "prepared-codex").unwrap(),
+        Arc::new(CodexRuntime::new(codex.executable())),
+        server::ServerTimings::default().with_checkout_skill_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    let client =
+        ManagedClient::connect(ManagedClientConfig::new(state.path(), "prepared-codex").unwrap())
+            .await
+            .unwrap();
+    let prepared = crate::managed_worktree::prepare(&client, source.path(), "codex").await;
+    assert!(
+        !codex
+            .requests()
+            .iter()
+            .any(|r| r["method"] == "thread/start")
+    );
+    client
+        .create_session(crate::managed_worktree::creation(&prepared))
+        .await
+        .unwrap();
+    codex.wait_for_method_count("turn/start", 1).await;
+    let request = codex
+        .requests()
+        .into_iter()
+        .find(|r| r["method"] == "thread/start")
+        .unwrap();
+    assert_eq!(
+        request["params"]["cwd"].as_str(),
+        prepared.destination.path.to_str()
+    );
+    server.shutdown().await.unwrap();
 }

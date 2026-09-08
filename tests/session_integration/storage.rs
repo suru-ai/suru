@@ -57,6 +57,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
         .post(format!("{}/v1/sessions", original.descriptor().base_url))
         .bearer_auth(&original.descriptor().token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -160,6 +161,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -245,6 +247,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     let client = reqwest::Client::new();
 
     let create = |path: &std::path::Path, text: &str| CreateSessionRequest {
+        preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {
             path: path.to_owned(),
@@ -358,6 +361,7 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: Some(initial_selection),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -460,6 +464,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -759,6 +764,7 @@ async fn resume_after_summary_mutation(
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: execution_directory.clone(),
@@ -944,6 +950,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
         .post(format!("{}/v1/sessions", original.descriptor().base_url))
         .bearer_auth(&original.descriptor().token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1103,6 +1110,7 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1239,6 +1247,7 @@ async fn turn_usage_survives_a_restart() {
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
@@ -1358,6 +1367,7 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),

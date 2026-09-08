@@ -849,6 +849,18 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             )
         }));
         rows.push("Choose directory…".to_owned());
+        let reason = context
+            .workspace
+            .repository
+            .as_ref()
+            .map(|r| &r.capabilities.create_checkout);
+        rows.push(match reason {
+            Some(crate::protocol::SourceControlCapability::Available) => "New Worktree".to_owned(),
+            Some(crate::protocol::SourceControlCapability::Unsupported { reason }) => {
+                format!("New Worktree unavailable · {reason}")
+            }
+            None => "New Worktree unavailable · no Repository".to_owned(),
+        });
         let available_rows = capacity.saturating_sub(2).max(1);
         let start = picker
             .selected
@@ -872,10 +884,7 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
                 },
             ));
         }
-        lines.push(Line::styled(
-            "Enter select · Esc close · New Worktree unavailable",
-            theme.text.subdued,
-        ));
+        lines.push(Line::styled("Enter select · Esc close", theme.text.subdued));
     }
     if let Some(error) = &picker.error {
         lines.push(Line::styled(
@@ -3089,15 +3098,24 @@ fn render_landing(
                         ""
                     };
                     let chooser = if state.workspace.repository.is_some() {
-                        " · /worktree choose"
+                        if state.new_worktree.is_some() {
+                            " · New Worktree on submit"
+                        } else {
+                            " · /worktree choose"
+                        }
                     } else {
                         ""
                     };
                     format!("{label}{status}{chooser}")
                 }
                 None => format!(
-                    "{} · Choose a working copy to start a Session",
-                    workspace_context(state, &state.workspace.path, true)
+                    "{} · {}",
+                    workspace_context(state, &state.workspace.path, true),
+                    if state.new_worktree.is_some() {
+                        "New Worktree on submit"
+                    } else {
+                        "Choose a working copy to start a Session"
+                    }
                 ),
             },
             usize::from(panel.width),

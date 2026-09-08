@@ -13,6 +13,8 @@ use tokio::process::Command;
 pub struct GitSourceControl {
     executable: PathBuf,
     timeout: Duration,
+    mutation_timeout: Duration,
+    configuration_file: Option<PathBuf>,
 }
 impl Default for GitSourceControl {
     fn default() -> Self {
@@ -24,13 +26,33 @@ impl GitSourceControl {
         Self {
             executable: executable.into(),
             timeout: Duration::from_secs(5),
+            mutation_timeout: Duration::from_secs(120),
+            configuration_file: None,
         }
+    }
+    /// An isolated Git user configuration, useful for embedded hosts and fixtures.
+    pub fn with_configuration_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.configuration_file = Some(path.into());
+        self
+    }
+    pub fn with_mutation_timeout(mut self, timeout: Duration) -> Self {
+        self.mutation_timeout = timeout;
+        self
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
     async fn command(&self, directory: &Path, args: &[&str]) -> Result<Output, String> {
+        self.command_with_timeout(directory, args, self.timeout)
+            .await
+    }
+    async fn command_with_timeout(
+        &self,
+        directory: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<Output, String> {
         let mut command = Command::new(&self.executable);
         command
             .arg("-C")
@@ -49,12 +71,15 @@ impl GitSourceControl {
         ] {
             command.env_remove(name);
         }
+        if let Some(path) = &self.configuration_file {
+            command.env("GIT_CONFIG_GLOBAL", path);
+        }
         command
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0");
-        tokio::time::timeout(self.timeout, command.output())
+        tokio::time::timeout(timeout, command.output())
             .await
-            .map_err(|_| "Git discovery timed out".to_owned())?
+            .map_err(|_| "Git operation timed out".to_owned())?
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     "Git is not installed or cannot be found".to_owned()
@@ -62,6 +87,52 @@ impl GitSourceControl {
                     format!("Git could not run: {error}")
                 }
             })
+    }
+    async fn mutate(&self, directory: &Path, args: &[&str]) -> Result<(), String> {
+        let output = self
+            .command_with_timeout(directory, args, self.mutation_timeout)
+            .await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    }
+    async fn validate_prepared(&self, plan: &PreparedCheckout) -> Result<(), String> {
+        if std::fs::symlink_metadata(&plan.destination.path)
+            .is_ok_and(|m| m.file_type().is_symlink())
+            || self
+                .valid_root(&plan.destination.path, &plan.repository.metadata_directory)
+                .await
+                .as_ref()
+                != Some(&plan.destination.path)
+        {
+            return Err("The prepared destination is occupied by unrelated contents; it was not overwritten".to_owned());
+        }
+        let CheckoutPreparationPlan::Git { branch: name, .. } = &plan.plan;
+        if self
+            .text(&plan.destination.path, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .as_ref()
+            != Some(name)
+        {
+            return Err("The prepared checkout no longer uses its intended branch".to_owned());
+        }
+        if !plan.checkout_created {
+            let CheckoutPreparationPlan::Git { source_commit, .. } = &plan.plan;
+            if self
+                .text(
+                    &plan.destination.path,
+                    &["rev-parse", "--verify", "HEAD^{commit}"],
+                )
+                .await
+                .as_ref()
+                != Some(source_commit)
+            {
+                return Err("The destination does not contain the captured source commit; it was not overwritten".to_owned());
+            }
+        }
+        Ok(())
     }
     async fn text(&self, directory: &Path, args: &[&str]) -> Option<String> {
         self.command(directory, args)
@@ -93,6 +164,186 @@ impl GitSourceControl {
 
 #[async_trait]
 impl SourceControl for GitSourceControl {
+    async fn plan_checkout(
+        &self,
+        id: PreparationId,
+        source: &ResolvedWorkspace,
+        description: &str,
+        channel: &str,
+    ) -> Result<PreparedCheckout, String> {
+        let repository = source
+            .workspace
+            .repository
+            .as_ref()
+            .ok_or("A Repository is required")?;
+        let root = match &repository.location {
+            RepositoryLocation::Main { root } | RepositoryLocation::Bare { root } => root,
+            RepositoryLocation::UnknownMain => {
+                return Err("Managed creation requires the main checkout location".to_owned());
+            }
+        };
+        let source_path = source
+            .execution_directory
+            .as_ref()
+            .map(|d| d.path.as_path())
+            .unwrap_or(root);
+        if self.common(source_path).await.as_ref() != Some(&repository.metadata_directory) {
+            return Err("The source checkout no longer belongs to this Repository".to_owned());
+        }
+        let commit = self
+            .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await
+            .ok_or("A usable local source commit is required; this Repository may be unborn")?;
+        let description = portable_description(description);
+        // A Channel is part of a portable destination, never a caller supplied path.
+        if channel.is_empty()
+            || channel == "."
+            || channel == ".."
+            || channel.ends_with('.')
+            || !channel
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        {
+            return Err("Channel cannot be used as a managed directory name".to_owned());
+        }
+        for _ in 0..32 {
+            let name = format!(
+                "{description}-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            let branch = format!("suru/{name}");
+            let destination = root.join(".suru-worktrees").join(channel).join(&name);
+            if destination.exists()
+                || self
+                    .text(
+                        source_path,
+                        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+                    )
+                    .await
+                    .is_some()
+            {
+                continue;
+            }
+            return Ok(PreparedCheckout {
+                id,
+                source: ExecutionDirectory {
+                    path: source_path.to_owned(),
+                },
+                repository: repository.clone(),
+                destination: ExecutionDirectory { path: destination },
+                plan: CheckoutPreparationPlan::Git {
+                    branch,
+                    source_commit: commit,
+                },
+                checkout_created: false,
+                ready: false,
+                intended_session: SessionId::new(),
+                admitted_session: None,
+            });
+        }
+        Err("Could not allocate a unique managed Worktree name".to_owned())
+    }
+    async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
+        let root = match &plan.repository.location {
+            RepositoryLocation::Main { root } | RepositoryLocation::Bare { root } => root,
+            RepositoryLocation::UnknownMain => {
+                return Err("The main checkout location is unknown".to_owned());
+            }
+        };
+        if self.common(root).await.as_ref() != Some(&plan.repository.metadata_directory) {
+            return Err("Repository metadata is unavailable or has changed".to_owned());
+        }
+        let CheckoutPreparationPlan::Git {
+            branch: name,
+            source_commit: commit,
+        } = &plan.plan;
+        let destination = &plan.destination.path;
+        // Reject aliases and replacement parents before creating or reusing files.
+        let relative = destination
+            .strip_prefix(root)
+            .map_err(|_| "Managed destination escaped its Repository")?;
+        if relative.components().count() != 3
+            || relative
+                .components()
+                .next()
+                .is_none_or(|c| c.as_os_str() != ".suru-worktrees")
+        {
+            return Err("Invalid managed destination".to_owned());
+        }
+        let mut parent = root.clone();
+        for component in relative.components().take(2) {
+            parent.push(component);
+            match std::fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(
+                        "Managed destination parent is not an ordinary directory".to_owned()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&parent).map_err(|e| e.to_string())?
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let exclude = plan
+            .repository
+            .metadata_directory
+            .join("info")
+            .join("exclude");
+        let mut contents = match std::fs::read(&exclude) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        if !contents
+            .split(|b| *b == b'\n')
+            .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == b"/.suru-worktrees/")
+        {
+            if !contents.is_empty() && !contents.ends_with(b"\n") {
+                contents.push(b'\n');
+            }
+            contents.extend_from_slice(b"/.suru-worktrees/\n");
+            std::fs::create_dir_all(exclude.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(&exclude, contents)
+                .map_err(|e| format!("Cannot update repository-local exclude: {e}"))?;
+        }
+        if destination.exists() {
+            self.validate_prepared(plan).await?;
+        } else {
+            // Never reset or attach an existing branch when creating a new intention.
+            self.mutate(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    name,
+                    destination
+                        .to_str()
+                        .ok_or("Git destination is not Unicode")?,
+                    commit,
+                ],
+            )
+            .await?;
+            self.validate_prepared(plan).await?;
+        }
+        Ok(self.discover(destination).await)
+    }
+    async fn initialize_checkout(&self, plan: &PreparedCheckout) -> Result<(), String> {
+        self.validate_prepared(plan).await?;
+        self.mutate(
+            &plan.destination.path,
+            &["submodule", "update", "--init", "--recursive"],
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Worktree retained at {}. Submodule initialization failed; retry: {e}",
+                plan.destination.path.display()
+            )
+        })
+    }
     async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
         let mut reading = CheckoutSummary {
             association: checkout.clone(),
@@ -365,6 +616,23 @@ impl SourceControl for GitSourceControl {
                 })
         });
         let mut capabilities = SourceControlCapabilities::discovery_only();
+        capabilities.create_checkout = if matches!(location, RepositoryLocation::UnknownMain) {
+            SourceControlCapability::Unsupported {
+                reason: "The main checkout location is unknown".to_owned(),
+            }
+        } else if self
+            .text(&directory, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await
+            .is_none()
+        {
+            SourceControlCapability::Unsupported {
+                reason: "A usable local commit is required; this Repository may be unborn"
+                    .to_owned(),
+            }
+        } else {
+            SourceControlCapability::Available
+        };
+
         if let SourceControlAvailability::Unavailable { reason } = &availability {
             capabilities.list_checkouts = SourceControlCapability::Unsupported {
                 reason: reason.clone(),
@@ -457,4 +725,30 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Entry> {
         }
     }
     result
+}
+
+fn portable_description(prompt: &str) -> String {
+    let mut value = String::new();
+    for word in prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        if !value.is_empty() {
+            value.push('-');
+        }
+        value.extend(
+            word.to_ascii_lowercase()
+                .chars()
+                .take(40usize.saturating_sub(value.len())),
+        );
+        if value.len() >= 40 {
+            break;
+        }
+    }
+    let value = value.trim_matches('-');
+    if value.is_empty() {
+        "work".to_owned()
+    } else {
+        value.to_owned()
+    }
 }
