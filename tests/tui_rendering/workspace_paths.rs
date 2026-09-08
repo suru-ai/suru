@@ -51,19 +51,20 @@ fn local_workspace_labels_use_the_servers_home_on_landing_and_in_a_session() {
         "~/Projects/suru"
     };
     let landing = screen(&application);
-    assert!(landing.contains(label), "{landing}");
-    assert!(
-        !landing.contains(&format!("Workspace {label}")),
-        "{landing}"
-    );
+    let rows = landing.lines().collect::<Vec<_>>();
+    let composer_bottom = rows.iter().position(|row| row.contains('└')).unwrap();
+    assert_eq!(rows[composer_bottom + 1].trim(), label, "{landing}");
+    assert!(!rows.last().unwrap().contains(label), "{landing}");
+    assert!(!landing.contains("Workspace "), "{landing}");
 
     let (_, snapshot) = enter_session(&mut application, &workspace);
     let session = screen(&application);
-    assert!(session.contains(label), "{session}");
     assert!(
-        !session.contains(&format!("Workspace {label}")),
+        session.lines().next().unwrap().contains(label),
         "{session}"
     );
+    assert!(!session.contains("Suru"), "{session}");
+    assert!(!session.contains("Workspace "), "{session}");
     assert_eq!(snapshot.session.workspace.path, workspace);
 }
 
@@ -167,7 +168,7 @@ fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
             .unwrap();
         let rendered = screen(&application);
         assert!(
-            rendered.contains(&format!("{expected} ")),
+            rendered.contains(&format!("studio · {expected} ")),
             "{path}: {rendered}"
         );
         assert!(

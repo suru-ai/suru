@@ -57,7 +57,10 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
             Some((usize::from(width) - 5) / 2),
             "{row}"
         );
-        assert!(row.contains("Connected"), "{row}");
+        assert!(
+            row.contains(workspace.path().to_string_lossy().as_ref()) && row.contains("Connected"),
+            "{row}"
+        );
         assert!(!row.contains("Workspace") && !row.contains("Suru"), "{row}");
     }
     application

@@ -23,7 +23,7 @@ use suru::{
 };
 
 #[test]
-fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
+fn choosing_a_remote_names_it_beside_the_workspace_on_landing_and_in_the_session_header() {
     let mut application = Application::default();
     type_terminal_text(&mut application, "/connect");
     press(&mut application, KeyCode::Enter);
@@ -60,7 +60,23 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
 
     let landing = rendered_application_rows(&application).join("\n");
     assert!(!landing.contains("Paired Remotes"));
-    assert!(landing.contains("Outlook studio"));
+    assert!(landing.contains("studio · ."), "{landing}");
+    assert!(!landing.contains("Outlook "), "{landing}");
+    let rows = landing.lines().collect::<Vec<_>>();
+    let composer_bottom = rows.iter().position(|row| row.contains('└')).unwrap();
+    assert_eq!(rows[composer_bottom + 1].trim(), "studio · .");
+    assert!(!rows.last().unwrap().contains("studio"));
+    type_terminal_text(&mut application, "draft");
+    application
+        .handle_event(ApplicationEvent::SessionOperationFailed("refused".into()))
+        .unwrap();
+    for width in [28, 43, 80] {
+        let compact = rendered_application_rows_at(&application, width, 5);
+        let rendered = compact.join("\n");
+        assert!(rendered.contains("draft"), "{rendered}");
+        assert!(rendered.contains("refused"), "{rendered}");
+        assert!(rendered.contains("studio · ."), "{rendered}");
+    }
 
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -68,7 +84,30 @@ fn choosing_a_remote_turns_the_outlook_and_the_footer_names_it() {
         ))
         .unwrap();
     let session = rendered_application_rows(&application).join("\n");
-    assert!(session.contains("Outlook studio"));
+    assert!(
+        session
+            .lines()
+            .next()
+            .unwrap()
+            .contains("Suru · studio · ."),
+        "{session}"
+    );
+    assert!(!session.contains("Outlook "), "{session}");
+    for width in [28, 43] {
+        let narrow = rendered_application_rows_at(&application, width, 20);
+        assert!(narrow[0].contains("studio"), "width {width}: {narrow:?}");
+    }
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ServerShutdown(
+            suru::protocol::ServerShutdown {
+                instance_id: fixture_instance_id(),
+                reason: suru::protocol::ShutdownReason::Manual,
+            },
+        )))
+        .unwrap();
+    let failed = rendered_application_rows_at(&application, 28, 20);
+    assert!(failed[0].contains("studio"), "{failed:?}");
+    assert!(failed[0].contains("Server stopped"), "{failed:?}");
 
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -119,7 +158,7 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
         .unwrap();
     let recovered = rendered_application_rows(&application).join("\n");
     assert!(recovered.contains("unfinished thought"));
-    assert!(recovered.contains("Outlook studio"));
+    assert!(recovered.contains("studio ·"));
     assert!(!recovered.contains("Reconnecting to Suru…"));
 }
 
@@ -157,7 +196,7 @@ fn a_revoked_remote_returns_to_the_local_landing_with_the_session_composer_recov
     let landing = rendered_application_rows(&application).join("\n");
     assert!(landing.contains("words worth keeping"));
     assert!(landing.contains("Remote revoked this Pairing"));
-    assert!(!landing.contains("Outlook studio"));
+    assert!(!landing.contains("studio ·"));
 }
 
 #[test]
@@ -217,7 +256,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
-            .contains("Outlook studio")
+            .contains("studio ·")
     );
 
     let ApplicationTransition::ListSessions(request) = application

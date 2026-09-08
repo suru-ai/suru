@@ -51,7 +51,7 @@ fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_g
     );
     assert!(
         landing.contains(missing.to_string_lossy().as_ref()),
-        "and the footer says where, by the spelling the client was given: {landing:?}"
+        "and the label below the composer says where, by the spelling the client was given: {landing:?}"
     );
     assert!(!landing.contains("Workspace "), "{landing}");
 }
@@ -411,10 +411,10 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
             let composer_top = rendered_row(&rows, "┌");
             let composer_bottom = rendered_row(&rows, "└");
             let footer = rendered_row(&rows, "Connected");
-            let below = footer - composer_bottom - 1;
+            let below = footer - composer_bottom - 2;
             assert!(
                 logo_top.abs_diff(below) <= 1,
-                "logo and composer share equal space above and below: {rows:?}"
+                "logo, composer, and Workspace share equal space above and below: {rows:?}"
             );
             assert_eq!(logo_bottom - logo_top, 6);
             assert_eq!(composer_top - logo_bottom, 2, "one blank row before input");
@@ -446,7 +446,7 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
             let composer_top = rendered_row(&rows, "┌");
             let composer_bottom = rendered_row(&rows, "└");
             let footer = rendered_row(&rows, "Connected");
-            assert!(composer_top.abs_diff(footer - composer_bottom - 1) <= 1);
+            assert!(composer_top.abs_diff(footer - composer_bottom - 2) <= 1);
             for line in draft.lines() {
                 assert!(rows.iter().any(|row| row.contains(line)));
             }

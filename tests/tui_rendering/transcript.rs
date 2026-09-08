@@ -3542,7 +3542,7 @@ fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
             // The Session header spells the Workspace path, and a temp
             // directory's random name spells a Z often enough to be counted as
             // a row of output unless the header is left out of the count.
-            .filter(|row| !row.contains("Workspace"))
+            .skip(1)
             .filter(|row| row.contains('Z') || row.contains("… +"))
             .count()
     };

@@ -2844,17 +2844,19 @@ fn render_landing(
         .width
         .saturating_sub(horizontal_padding(area.width).saturating_mul(2));
     let agent = agent_selection_context(state, footer_detail);
-    let context = if footer_detail.shows_secondary() {
-        format!(
-            "{agent} · {}",
-            state.workspace_label(&state.outlook, &state.workspace)
-        )
-    } else {
-        agent
+    // At minimum height, the composer and Workspace need all four rows above
+    // the footer. Carry submission errors in the footer to keep input usable.
+    let footer_error = state
+        .submission_error
+        .as_deref()
+        .filter(|_| area.height == MINIMUM_TERMINAL_HEIGHT);
+    let context = match footer_error {
+        Some(error) => SlotText::new(format!("Error: {error}"), theme.form_field.invalid),
+        None => SlotText::new(agent, theme.text.subdued),
     };
     let footer = slots.landing_footer(&LandingFooterSlotContext {
         width: footer_width,
-        context: SlotText::new(context, theme.text.subdued),
+        context,
         connection: SlotText::new(
             connection_status_text(state, footer_detail),
             status_style(state, theme),
@@ -2873,7 +2875,18 @@ fn render_landing(
         composer_text,
         composer_cursor,
     );
-    let error_height = u16::from(state.submission_error.is_some());
+    let error = state
+        .submission_error
+        .as_deref()
+        .filter(|_| footer_error.is_none());
+    let error_height = u16::from(error.is_some());
+    let workspace_height = 1;
+    let composer_height = composer_height.min(
+        content
+            .height
+            .saturating_sub(error_height + workspace_height)
+            .max(1),
+    );
     let logo_width = LANDING_LOGO
         .iter()
         .map(|line| line.width())
@@ -2883,10 +2896,11 @@ fn render_landing(
     let brand_height = logo_height + 1;
     let show_brand = state.settings().appearance.landing_page == LandingPage::Fancy
         && content.width >= logo_width
-        && content.height >= composer_height + error_height + brand_height;
+        && content.height >= composer_height + error_height + workspace_height + brand_height;
     let panel_height = composer_height
         .saturating_add(if show_brand { brand_height } else { 0 })
-        .saturating_add(error_height);
+        .saturating_add(error_height)
+        .saturating_add(workspace_height);
     let panel = centered_rect(content, 72, panel_height);
     let mut row = panel.y;
     if show_brand {
@@ -2899,9 +2913,9 @@ fn render_landing(
         );
         row = row.saturating_add(brand_height);
     }
-    if let Some(error) = &state.submission_error {
+    if let Some(error) = error {
         frame.render_widget(
-            Paragraph::new(error.as_str())
+            Paragraph::new(error)
                 .alignment(Alignment::Center)
                 .style(theme.form_field.invalid),
             Rect::new(panel.x, row, panel.width, 1),
@@ -2922,6 +2936,20 @@ fn render_landing(
         state.composer_border_style(theme),
         theme,
     ));
+
+    frame.render_widget(
+        Paragraph::new(truncate_to_width(
+            &workspace_context(state, &state.workspace, true),
+            usize::from(panel.width),
+        ))
+        .style(theme.text.subdued),
+        Rect::new(
+            panel.x,
+            composer_area.bottom(),
+            panel.width,
+            workspace_height,
+        ),
+    );
 
     render_slot(
         frame,
@@ -3517,11 +3545,13 @@ fn render_session_header(
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
-    let orientation = if detail.shows_secondary() {
-        truncate_to_width(
-            &state.workspace_label(&state.outlook, &snapshot.session.workspace.path),
-            left_width,
-        )
+    let workspace = workspace_context(
+        state,
+        &snapshot.session.workspace.path,
+        detail.shows_secondary(),
+    );
+    let orientation = if !workspace.is_empty() {
+        truncate_to_width(&workspace, left_width)
     } else {
         String::new()
     };
@@ -3927,25 +3957,30 @@ fn rendered_slot_lines(
 }
 
 fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String {
-    let outlook = state
-        .outlook
-        .remote_name()
-        .map(|name| format!("Outlook {name} · "))
-        .unwrap_or_default();
     if detail.shows_secondary() {
-        return format!("{outlook}{}", status_text(state));
+        return status_text(state);
     }
     if state.fatal_error.is_some() {
-        format!("{outlook}Connection failed")
+        "Connection failed".to_owned()
     } else if state.manually_stopped {
-        format!("{outlook}Server stopped")
+        "Server stopped".to_owned()
     } else if state.recovery.is_some() {
-        format!("{outlook}Recovering")
+        "Recovering".to_owned()
     } else if state.identity.is_some() {
-        format!("{outlook}Connected")
+        "Connected".to_owned()
     } else {
-        format!("{outlook}Connecting")
+        "Connecting".to_owned()
     }
+}
+
+fn workspace_context(state: &TuiState, path: &std::path::Path, show_path: bool) -> String {
+    let remote = state.outlook.remote_name();
+    let path = show_path.then(|| state.workspace_label(&state.outlook, path));
+    remote
+        .into_iter()
+        .chain(path.as_deref())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
