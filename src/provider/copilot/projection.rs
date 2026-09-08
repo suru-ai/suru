@@ -282,6 +282,11 @@ impl CopilotCorrelation {
     /// Gives up the Turn opened by [`Self::begin_turn`] when the Prompt never reached Copilot.
     pub(super) fn abandon_turn(&mut self) {
         self.turn = None;
+        // Readiness precedes native.send, which can still reject the Prompt.
+        // Neither queued nor later observations may claim that failed delivery.
+        self.context_turn = None;
+        self.context_continuation = false;
+        self.context_prompt_pending = true;
     }
 
     /// Whether a Turn is running, which is what makes a Prompt delivered now a steer rather than
@@ -455,6 +460,12 @@ fn queue_projected(events: &mut CopilotEvents, event: TimelineEvent) {
                 .correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned");
+            if context.attribution == ProviderEventAttribution::OwningSession
+                && correlation.context_turn.is_none()
+            {
+                // Startup may have failed after this observation entered the drain.
+                return;
+            }
             if let ProviderEvent::ContextFill { report } = &mut context.event
                 && context.attribution == ProviderEventAttribution::OwningSession
                 && !correlation.context_prompt_pending

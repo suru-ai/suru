@@ -200,6 +200,15 @@ async fn context_tracks_a_continuation_and_its_post_idle_snapshot() {
 
 #[tokio::test]
 async fn a_failed_model_start_cannot_rebind_old_continuation_context() {
+    failed_start_keeps_context_invalidated(false).await;
+}
+
+#[tokio::test]
+async fn a_rejected_send_cannot_revive_context_after_switching_models() {
+    failed_start_keeps_context_invalidated(true).await;
+}
+
+async fn failed_start_keeps_context_invalidated(reject_send: bool) {
     use crate::support::{
         ScriptedCopilot, connect, conversation_arms, send_arm, titling_turned_off,
     };
@@ -211,12 +220,22 @@ async fn a_failed_model_start_cannot_rebind_old_continuation_context() {
         provider::CopilotRuntime,
         server::{self, ServerConfig},
     };
-    let failed_switch = r#"    *'"method":"session.model.switchTo"'*'incomplete-cache-fixture'*)
+    let failed_start = if reject_send {
+        r#"    *'"method":"session.send"'*'Use the other Model'*)
+      event queued_context session.usage_info '{"currentTokens":98000}'
+      reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32600,"message":"fixture refused prompt"}}'
+      event late_context session.usage_info '{"currentTokens":99000}'
+      agent_event child_barrier agent-1 session.usage_info '{"currentTokens":777}'
+      ;;
+    "#
+    } else {
+        r#"    *'"method":"session.model.switchTo"'*'incomplete-cache-fixture'*)
       event stale_context session.usage_info '{"currentTokens":99000}'
       agent_event child_barrier agent-1 session.usage_info '{"currentTokens":777}'
       reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32600,"message":"fixture refused model switch"}}'
       ;;
-    "#;
+    "#
+    };
     let timeline = r#"
       agent_event spawn agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout"}'
       event first_answer assistant.message '{"messageId":"m1","content":"Delegated"}'
@@ -227,7 +246,7 @@ async fn a_failed_model_start_cannot_rebind_old_continuation_context() {
       event continuation_idle session.idle '{}'
     "#;
     let copilot = ScriptedCopilot::new(&format!(
-        "{failed_switch}{}{}",
+        "{failed_start}{}{}",
         conversation_arms(),
         send_arm(timeline)
     ));

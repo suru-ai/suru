@@ -48,6 +48,10 @@ in stream order to the Continuation, including after its idle. An older Prompt's
 queued report is never rebound to a newer Prompt generation. Context reports do
 not themselves open Continuations. Admission immediately disables Continuation
 rebinding, including when Model selection fails before the Prompt can be sent.
+If native `session.send` rejects after readiness, abandoning startup clears the
+context origin. This also drops owning observations already queued during the
+failed send, without changing the previously accepted Session snapshot. Child
+reports remain independently attributable.
 
 ## Validation
 
@@ -58,6 +62,9 @@ persistence, and unchanged Usage and Cost. A second native timeline exercises
 context during a Continuation and after its settlement. A third exercises failed
 Model startup after a Continuation: a later child update confirms the stale parent
 report crossed projection before checking that invalidated context stayed absent.
+A fourth rejects native `session.send` after a successful Model switch, emitting
+context both before and after the rejection reply. Its child-update barrier
+confirms neither queued nor later context revives the invalidated reading.
 The pre-existing metering
 test explicitly verifies that Usage alone leaves Context Fill unknown.
 
@@ -68,9 +75,14 @@ rendering path or Setting is introduced. Fixture waits use the existing release
 barrier with a 10ms polling interval; workspace and state paths use temporary
 platform-native directories.
 
-Final checks: `cargo nextest run --test copilot_integration --test
+Initial combined checks: `cargo nextest run --test copilot_integration --test
 session_integration --lib --status-level fail` passed **708/708** tests (including
 shared footer tests), with `src/lib.rs` touched inside the shared cargo lock to
 force this worktree's library rebuild. `cargo fmt --check` and `git diff --check`
 also passed. All builds used `/home/jake/Projects/suru/target` under
 `/tmp/suru-198-cargo.lock`.
+
+After the rejected-send follow-up, a forced rebuild passed all **58/58** Copilot
+integration and shared Context Fill tests using `--test copilot_integration --test
+session_integration -E 'binary(copilot_integration) | test(context_fill)'`.
+Formatting and diff checks passed again.
