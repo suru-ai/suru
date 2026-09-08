@@ -46,7 +46,7 @@ fn a_launch_directory_that_cannot_be_canonicalized_still_starts_on_the_path_as_g
 
     let landing = rendered_application_rows_at(&application, 100, 20).join("\n");
     assert!(
-        landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
+        !landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"),
         "the client starts on the Workspace it cannot read: {landing:?}"
     );
     assert!(
@@ -79,7 +79,7 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
     assert_eq!(managed_transition, ApplicationTransition::Continue);
 
     let screen = rendered_application_rows(&application).join("\n");
-    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
@@ -204,7 +204,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             .expect("handle managed event");
     }
     let landing = rendered_application_rows(&application).join("\n");
-    assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(landing.contains("Type a prompt"));
 
     for character in "Explain this workspace".chars() {
@@ -357,7 +357,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(created)))
         .expect("ignore a queued event from the ended Session");
     let after_replacement = rendered_application_rows(&application).join("\n");
-    assert!(after_replacement.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!after_replacement.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(after_replacement.contains("Keep this unsent draft"));
     assert!(after_replacement.contains("Session ended because the shared server was replaced"));
     assert!(!after_replacement.contains("Explain this workspace"));
@@ -372,7 +372,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
 fn connecting_view_exposes_connection_state_before_a_snapshot_arrives() {
     let screen = rendered_state_rows(&Application::default()).join("\n");
 
-    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connecting to Suru server..."));
 }
@@ -384,7 +384,7 @@ fn connected_view_centers_the_landing_composer_and_shows_server_identity() {
     let state = connected_state(instance_id, 42_424);
 
     let screen = rendered_state_rows(&state).join("\n");
-    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Type a prompt"));
     assert!(screen.contains("Connected"));
     assert!(screen.contains("pid 42424"));
@@ -396,6 +396,9 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
     let workspace = workspace_dir();
     for draft in ["", "one\ntwo\nthree\nfour"] {
         let mut application = connected_application(workspace.path());
+        let mut settings = suru::protocol::EffectiveSettings::default();
+        settings.appearance.landing_page = suru::protocol::LandingPage::Fancy;
+        crate::support::deliver_settings(&mut application, settings);
         type_terminal_text(&mut application, draft);
         for (width, height) in [(80, 20), (80, 21), (43, 20)] {
             let rows = rendered_application_rows_at(&application, width, height);
@@ -426,6 +429,24 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
                 "the logo sits one column left of center for visual balance"
             );
         }
+
+        // A settings update removes the whole brand area and recenters the
+        // existing draft without changing its contents.
+        crate::support::deliver_settings(
+            &mut application,
+            suru::protocol::EffectiveSettings::default(),
+        );
+        for (width, height) in [(80, 20), (80, 21), (43, 20)] {
+            let rows = rendered_application_rows_at(&application, width, height);
+            assert!(!rows.join("\n").contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+            let composer_top = rendered_row(&rows, "┌");
+            let composer_bottom = rendered_row(&rows, "└");
+            let footer = rendered_row(&rows, "Connected");
+            assert!(composer_top.abs_diff(footer - composer_bottom - 1) <= 1);
+            for line in draft.lines() {
+                assert!(rows.iter().any(|row| row.contains(line)));
+            }
+        }
     }
 }
 
@@ -433,6 +454,9 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
 fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.appearance.landing_page = suru::protocol::LandingPage::Fancy;
+    crate::support::deliver_settings(&mut application, settings);
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "Keep the composer usable".to_owned(),
@@ -845,7 +869,7 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
 
     let screen = rendered_state_rows(&state).join("\n");
 
-    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Recovering"));
     assert!(screen.contains("pid 42424"));
 }
@@ -952,7 +976,7 @@ fn manual_stop_view_retains_the_landing_screen_and_last_server_identity() {
         .expect("stop server");
 
     let screen = rendered_state_rows(&state).join("\n");
-    assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(screen.contains("Shared server stopped intentionally"));
     assert!(screen.contains("pid 42424"));
     assert!(screen.contains("c2f03bd2"));

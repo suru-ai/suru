@@ -33,6 +33,7 @@ fn themed_in_mode(name: &str, mode: AppearanceMode) -> EffectiveSettings {
         appearance: AppearanceSettings {
             theme: name.to_owned(),
             mode,
+            landing_page: suru::protocol::LandingPage::Fancy,
         },
         ..EffectiveSettings::default()
     }

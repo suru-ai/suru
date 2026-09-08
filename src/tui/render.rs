@@ -16,8 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot,
-        SessionStatus, SessionTimestamp,
+        LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
+        SessionSnapshot, SessionStatus, SessionTimestamp,
     },
     theme::Theme,
 };
@@ -2898,7 +2898,8 @@ fn render_landing(
         .unwrap_or(0) as u16;
     let logo_height = LANDING_LOGO.len() as u16;
     let brand_height = logo_height + 1;
-    let show_brand = content.width >= logo_width
+    let show_brand = state.settings().appearance.landing_page == LandingPage::Fancy
+        && content.width >= logo_width
         && content.height >= composer_height + error_height + brand_height;
     let panel_height = composer_height
         .saturating_add(if show_brand { brand_height } else { 0 })
@@ -4166,7 +4167,7 @@ mod tests {
         ));
 
         let screen = rendered_rows(&application).join("\n");
-        assert!(screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+        assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
         assert!(screen.contains("Connection failed"));
         assert!(screen.contains("unknown event type 'future_event'"));
     }
@@ -4290,9 +4291,9 @@ mod tests {
             .iter()
             .position(|row| row.contains("notice from an extension"))
             .unwrap();
-        let logo = rows
+        let composer = rows
             .iter()
-            .position(|row| row.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"))
+            .position(|row| row.contains("Type a prompt"))
             .unwrap();
 
         assert!(
@@ -4300,7 +4301,7 @@ mod tests {
             "a failed contribution reports above the slot"
         );
         assert!(
-            notice < logo,
+            notice < composer,
             "the Notice sits above the Landing rather than over it"
         );
     }

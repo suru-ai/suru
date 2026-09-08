@@ -55,7 +55,7 @@ fn new_session_keybinding_defers_creation_until_the_next_prompt() {
         )))
         .expect("ignore a queued event from the detached Session");
     let landing = rendered_application_rows(&application).join("\n");
-    assert!(landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
+    assert!(!landing.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
     assert!(landing.contains("Type a prompt"));
     assert!(!landing.contains("discard this draft"));
     assert!(!landing.contains("Long-running work"));

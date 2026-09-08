@@ -595,6 +595,15 @@ pub enum AppearanceMode {
     Light,
 }
 
+/// Whether the Landing includes the Japanese Suru banner above its composer.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum LandingPage {
+    #[default]
+    Minimal,
+    Fancy,
+}
+
 /// The default Fold posture a Session view opens with.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -995,6 +1004,7 @@ pub struct SidebarSettings {
 pub struct AppearanceSettings {
     pub theme: String,
     pub mode: AppearanceMode,
+    pub landing_page: LandingPage,
 }
 
 impl Default for AppearanceSettings {
@@ -1002,6 +1012,7 @@ impl Default for AppearanceSettings {
         Self {
             theme: "system".to_owned(),
             mode: AppearanceMode::System,
+            landing_page: LandingPage::Minimal,
         }
     }
 }
@@ -1274,6 +1285,9 @@ pub enum SettingMutation {
     },
     AppearanceMode {
         value: Option<AppearanceMode>,
+    },
+    AppearanceLandingPage {
+        value: Option<LandingPage>,
     },
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,

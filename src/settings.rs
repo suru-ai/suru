@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use crate::protocol::{
     AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EffectiveSettings,
-    EmojiVisibility, FoldPosture, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
-    SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
+    EmojiVisibility, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
+    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
     TextSelectionCopy, TitleErrand,
 };
@@ -47,6 +47,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 // mutations that edit it can never drift apart.
 const APPEARANCE_THEME: &str = "appearance.theme";
 const APPEARANCE_MODE: &str = "appearance.mode";
+const APPEARANCE_LANDING_PAGE: &str = "appearance.landingPage";
 const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
@@ -458,6 +459,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
             value.as_ref() == Some(&settings.appearance.theme)
         }
         SettingMutation::AppearanceMode { value } => *value == Some(settings.appearance.mode),
+        SettingMutation::AppearanceLandingPage { value } => {
+            *value == Some(settings.appearance.landing_page)
+        }
         SettingMutation::TextSelectionCopy { value } => {
             *value == Some(settings.text_selection.copy)
         }
@@ -571,6 +575,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |mode| {
                 settings.appearance.mode = mode;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: APPEARANCE_LANDING_PAGE,
+        label: "Landing page",
+        description: "Minimal shows the composer alone; Fancy adds the Japanese Suru banner",
+        group: SettingGroup::Appearance,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "Minimal",
+                build_mutation: || SettingMutation::AppearanceLandingPage {
+                    value: Some(LandingPage::Minimal),
+                },
+            },
+            SettingChoice {
+                value: "Fancy",
+                build_mutation: || SettingMutation::AppearanceLandingPage {
+                    value: Some(LandingPage::Fancy),
+                },
+            },
+        ]),
+        reset: SettingMutation::AppearanceLandingPage { value: None },
+        apply: |settings, value| {
+            apply_value(value, |landing_page| {
+                settings.appearance.landing_page = landing_page;
             })
         },
     },
@@ -1238,6 +1269,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TextSelectionCopy { value } => (TEXT_SELECTION_COPY, pinned(value)),
         SettingMutation::AppearanceTheme { value } => (APPEARANCE_THEME, pinned(value)),
         SettingMutation::AppearanceMode { value } => (APPEARANCE_MODE, pinned(value)),
+        SettingMutation::AppearanceLandingPage { value } => {
+            (APPEARANCE_LANDING_PAGE, pinned(value))
+        }
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
         }
@@ -1767,6 +1801,7 @@ mod tests {
             vec![
                 "one of \"system\" or a Theme name".to_owned(),
                 "one of \"system\", \"dark\", or \"light\"".to_owned(),
+                "one of \"Minimal\" or \"Fancy\"".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),
