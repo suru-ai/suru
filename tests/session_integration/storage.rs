@@ -122,6 +122,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
     let cells = terminal.backend().buffer().content();
     let marker = cells
         .windows(7)
+        .rev()
         .find(|window| window.iter().map(|cell| cell.symbol()).collect::<String>() == "$review")
         .expect("restored recognized marker is visible");
     assert!(

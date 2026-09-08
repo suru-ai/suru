@@ -2295,6 +2295,8 @@ pub struct SubagentQuestionnaires {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
+    pub title: String,
+    pub emoji: Option<String>,
     pub session: Session,
     pub revision: SessionRevision,
     pub prompts: Vec<Prompt>,
@@ -2359,6 +2361,10 @@ pub struct SessionUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionChange {
+    TitleChanged {
+        title: String,
+        emoji: Option<String>,
+    },
     ContextFillChanged {
         context_fill: Option<ContextFill>,
     },

@@ -209,6 +209,8 @@ impl SessionStore {
             status: PromptStatus::Pending,
         };
         let snapshot = SessionSnapshot {
+            title: title.clone(),
+            emoji: None,
             session: Session {
                 context_fill: None,
                 id: session_id,

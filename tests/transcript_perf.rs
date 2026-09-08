@@ -38,6 +38,8 @@ fn command_output() -> String {
 
 fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: SessionId::new(),

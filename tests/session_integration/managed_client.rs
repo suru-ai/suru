@@ -867,6 +867,8 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
     let message_id = MessageId::new();
     let activity_id = ActivityId::new();
     SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: session_id,

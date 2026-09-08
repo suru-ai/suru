@@ -5226,6 +5226,8 @@ mod tests {
             }
         }
         SessionSnapshot {
+            title: String::new(),
+            emoji: None,
             session: Session {
                 context_fill: None,
                 id: crate::protocol::SessionId::new(),

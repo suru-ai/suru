@@ -29,8 +29,8 @@ use crate::{
     errands::ErrandRunner,
     model_catalog::ModelCatalogService,
     protocol::{
-        AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionId, SettingsSnapshot,
-        SkillInvocation, TitleErrand,
+        AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionChange, SessionId,
+        SettingsSnapshot, SkillInvocation, TitleErrand,
     },
     provider::ProviderErrand,
 };
@@ -254,9 +254,8 @@ impl SessionStore {
     /// set by other means while an Errand was outstanding is never overwritten
     /// by the answer to that Errand. Answers `true` when the Title changed.
     ///
-    /// The change rides the catalog stream and deliberately does not bump the
-    /// Session revision: that revision governs Transcript consistency, and a
-    /// Title alters nothing a Transcript reader is holding.
+    /// The change reaches both the open Session stream and the catalog, so
+    /// attached clients see the same Title as readers of Session listings.
     pub(crate) fn replace_derived_title(
         &self,
         session_id: SessionId,
@@ -268,18 +267,25 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let summary = {
+        {
             let Some(record) = state.sessions.get_mut(&session_id) else {
                 return false;
             };
             if record.summary.title != derived_from {
                 return false;
             }
-            record.summary.title = title.clone();
-            record.summary.emoji = emoji.clone();
-            record.summary.clone()
-        };
-        self.storage.summary_changed(summary);
+            if let Err(error) = record.commit_derived(
+                &self.storage,
+                session_id,
+                vec![SessionChange::TitleChanged {
+                    title: title.clone(),
+                    emoji: emoji.clone(),
+                }],
+            ) {
+                tracing::warn!(%session_id, %error, "Could not commit derived Title");
+                return false;
+            }
+        }
         state.publish_catalog_change(SessionCatalogChange::TitleChanged {
             session_id,
             title,

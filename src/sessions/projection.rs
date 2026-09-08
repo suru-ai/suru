@@ -409,11 +409,10 @@ impl SessionRecord {
     }
 
     /// Commits changes the server derived rather than a Provider or a reader
-    /// drove — the Subagent roll-up today. It moves the revision and persists
-    /// like any commit, but leaves `updated_at` alone: a Session's own moment
-    /// of last movement is about its own work, and nothing a listing orders
-    /// or draws by moves here, so a client holding the change holds the whole
-    /// of it.
+    /// drove — the Subagent roll-up and Title derivation. It moves the revision
+    /// and persists like any commit, but leaves `updated_at` alone: a Session's
+    /// own moment of last movement is about its own work. A client holding the
+    /// change holds the whole of it.
     pub(super) fn commit_derived(
         &mut self,
         storage: &StorageSink,
@@ -487,6 +486,8 @@ impl SessionRecord {
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
+        self.summary.title.clone_from(&self.snapshot.title);
+        self.summary.emoji.clone_from(&self.snapshot.emoji);
         self.summary
             .standing_inputs
             .subagent_questionnaires

@@ -459,6 +459,8 @@ mod tests {
         messages: Vec<Message>,
     ) -> SessionSnapshot {
         SessionSnapshot {
+            title: String::new(),
+            emoji: None,
             session: Session {
                 context_fill: None,
                 id: SessionId::new(),

@@ -323,6 +323,8 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
             updated_at: SessionTimestamp(2),
         },
         snapshot: SessionSnapshot {
+            title: "restoration fixture".into(),
+            emoji: None,
             session,
             revision: SessionRevision(7),
             prompts: vec![],

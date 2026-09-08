@@ -136,7 +136,7 @@ async fn connected_client(state_dir: &std::path::Path, channel: &str) -> Managed
 }
 
 #[tokio::test]
-async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touching_its_revision() {
+async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = titling_provider();
@@ -156,6 +156,23 @@ async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touchin
         .await
         .expect("create Session");
     let session_id = created.session.id;
+    assert_eq!(
+        created.title,
+        "the reasoning group flickers when a block settles mid-run"
+    );
+    let mut subscription = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe Session");
+    let initial = timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .expect("initial snapshot arrives")
+        .expect("stream open")
+        .expect("valid snapshot");
+    assert!(matches!(
+        initial,
+        suru::managed_client::SessionEvent::Snapshot(_)
+    ));
 
     let errand = timeout(Duration::from_secs(1), provider.next_errand())
         .await
@@ -204,15 +221,31 @@ async fn an_answered_errand_becomes_the_sessions_title_and_emoji_without_touchin
             Some("\u{1F41B}".to_owned())
         )
     );
-    assert_eq!(
-        client
-            .read_session(session_id)
-            .await
-            .expect("read the Session")
-            .revision,
-        created.revision,
-        "a Title alters nothing a Transcript reader holds, so it bumps no revision"
-    );
+    let titled = client
+        .read_session(session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(titled.title, "Fix reasoning group flicker");
+    assert_eq!(titled.emoji.as_deref(), Some("🐛"));
+    assert!(titled.revision.0 > created.revision.0);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = subscription
+                .next()
+                .await
+                .expect("stream remains open")
+                .expect("valid update");
+            if let suru::managed_client::SessionEvent::Updated(update) = event
+                && update.changes.iter().any(|change| matches!(change,
+                    suru::protocol::SessionChange::TitleChanged { title, emoji }
+                        if title == "Fix reasoning group flicker" && emoji.as_deref() == Some("🐛")
+                )) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Title update reaches the open Session stream");
 
     server.shutdown().await.expect("shut down server");
 }
@@ -790,6 +823,12 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
         ),
         "a derived Title and Emoji survive a restart"
     );
+    let reopened = client
+        .read_session(derived.session.id)
+        .await
+        .expect("reopen titled Session");
+    assert_eq!(reopened.title, "Explain the Provider seam");
+    assert_eq!(reopened.emoji.as_deref(), Some("🧵"));
     assert_eq!(
         listed_title(&client, undecided.session.id).await,
         ("Ship the picker".to_owned(), None),

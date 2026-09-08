@@ -311,6 +311,8 @@ fn session_summary_round_trips_with_discovery_metadata() {
 #[test]
 fn provider_neutral_session_snapshot_round_trips_through_json() {
     let snapshot = SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: Some(suru::protocol::ContextFill {
                 occupied_tokens: 12_400,
@@ -412,6 +414,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         }),
     };
     let expected = json!({
+        "title": "",
+        "emoji": null,
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "workspace": { "path": "/work/suru" },

@@ -22,6 +22,10 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     let next = snapshot;
     for change in &update.changes {
         match change {
+            SessionChange::TitleChanged { title, emoji } => {
+                next.title.clone_from(title);
+                next.emoji.clone_from(emoji);
+            }
             SessionChange::AgentSelectionChanged { selection } => {
                 next.session.agent_selection = Some(selection.clone());
             }
@@ -657,6 +661,8 @@ mod tests {
         let prompt_id = PromptId::new();
         let turn_id = TurnId::new();
         let mut snapshot = SessionSnapshot {
+            title: String::new(),
+            emoji: None,
             session: Session {
                 context_fill: None,
                 id: session_id,

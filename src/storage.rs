@@ -409,6 +409,8 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
             summary.standing_inputs.latest_turn =
                 crate::protocol::SessionStandingInputs::from_turns(&turns).latest_turn;
             let snapshot = SessionSnapshot {
+                title: summary.title.clone(),
+                emoji: summary.emoji.clone(),
                 session: summary.session.clone(),
                 revision,
                 turns,
@@ -521,6 +523,8 @@ fn load_session(
         .collect::<Vec<_>>();
     transcript.sort_unstable_by_key(|(order, _)| *order);
     let snapshot = SessionSnapshot {
+        title: summary.title.clone(),
+        emoji: summary.emoji.clone(),
         session: summary.session.clone(),
         revision,
         prompts,

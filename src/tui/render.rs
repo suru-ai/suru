@@ -3547,6 +3547,26 @@ fn render_session_header(
     } else {
         String::new()
     };
+    // Reserve the same space on both sides to keep the Title at the exact
+    // center, while leaving both indicators and a separating cell intact.
+    let side_width = (brand.width() + orientation.width()).max(connection_width) + 1;
+    let title_width = usize::from(area.width).saturating_sub(side_width.saturating_mul(2));
+    let title = snapshot
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = match state
+        .settings()
+        .session
+        .title
+        .emoji
+        .drawn_emoji(snapshot.emoji.as_deref())
+    {
+        Some(emoji) if !title.is_empty() => format!("{emoji} {title}"),
+        _ => title,
+    };
+    let title = truncate_to_width(&title, title_width);
     let spacing = " ".repeat(
         usize::from(area.width)
             .saturating_sub(brand.width() + orientation.width() + connection_width),
@@ -3560,6 +3580,16 @@ fn render_session_header(
         ])),
         area,
     );
+    if !title.is_empty() {
+        let width = title.width() as u16;
+        let title_area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y,
+            width,
+            area.height,
+        );
+        frame.render_widget(Paragraph::new(title).style(theme.text.primary), title_area);
+    }
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
@@ -4041,6 +4071,8 @@ mod tests {
         for capacity in [Some(200_000), None] {
             let workspace = tempfile::tempdir().unwrap();
             let snapshot = SessionSnapshot {
+                title: String::new(),
+                emoji: None,
                 session: Session {
                     context_fill: Some(ContextFill {
                         occupied_tokens: 12_400,
@@ -4324,6 +4356,8 @@ mod tests {
         application
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
+                    title: String::new(),
+                    emoji: None,
                     session: Session {
                         context_fill: None,
                         id: session_id,
@@ -4388,6 +4422,8 @@ mod tests {
         application
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
+                    title: String::new(),
+                    emoji: None,
                     session: Session {
                         context_fill: None,
                         id: session_id,

@@ -775,15 +775,20 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         "completion must preserve the stable Message row"
     );
 
-    let user_row = text_position(&completed, "Explain the stream").1;
+    let user_row = rows
+        .iter()
+        .position(|row| row.contains('┃') && row.contains("Explain the stream"))
+        .expect("the Prompt appears in the Transcript, as well as the header Title")
+        as u16;
     let error_row = text_position(&completed, "Error:").1;
     let status_row = text_position(&completed, "Reading files").1;
     let agent_row = text_position(&completed, "Streamed heading").1;
     let code_start_row = text_position(&completed, "fn main() {").1;
     let code_after_blank_row = text_position(&completed, "println!(\"hi\");").1;
-    let user_accent_column = text_position(&completed, "Explain the stream")
-        .0
-        .saturating_sub(2);
+    let user_accent_column = rows[usize::from(user_row)]
+        .chars()
+        .position(|ch| ch == '┃')
+        .expect("Prompt block accent") as u16;
     let normally_padded_width = completed.area.width.saturating_sub(4);
     let session_content_width = normally_padded_width.min(80);
     let user_block_right_edge = 2_u16
@@ -825,7 +830,13 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
         );
     }
     assert_eq!(text_cell(&completed, "┃").fg, Color::Cyan);
-    assert_eq!(text_cell(&completed, "Explain the stream").bg, Color::Reset);
+    assert_eq!(
+        completed
+            .cell((user_accent_column + 2, user_row))
+            .unwrap()
+            .bg,
+        Color::Reset
+    );
     assert_eq!(text_cell(&completed, "Error:").fg, Color::Red);
     assert_eq!(text_cell(&completed, "Reading files").fg, Color::DarkGray);
     assert_eq!(text_cell(&completed, "Streamed heading").fg, Color::Cyan);

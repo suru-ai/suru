@@ -36,10 +36,8 @@ pub(crate) struct StorageWriter {
 enum WriterCommand {
     Create(Box<PersistedSession>),
     Hydrate(Box<PersistedSession>),
-    /// A Session summary that changed without a Session update behind it. A
-    /// derived Title is the one such change: it alters nothing a Transcript
-    /// reader holds, so it neither carries changes nor bumps the revision, and
-    /// it therefore cannot ride [`WriterCommand::Update`].
+    /// Catalog-only metadata, such as whether a Session is set aside or viewed,
+    /// that changed without an update to the open Session.
     SummaryChanged(Box<SessionSummary>),
     Update {
         summary: Box<SessionSummary>,
@@ -218,10 +216,8 @@ impl StorageSink {
             })));
     }
 
-    /// Records a Session summary that changed on its own — a derived Title and
-    /// Emoji. Fire-and-forget on the same terms as [`Self::created`]: the next
-    /// idle flush lands it, and a Title lost to a crash is one the Session
-    /// simply never had.
+    /// Records catalog-only metadata. Fire-and-forget on the same terms as
+    /// [`Self::created`]: the next idle flush lands it.
     pub(crate) fn summary_changed(&self, summary: SessionSummary) {
         let _ = self
             .commands

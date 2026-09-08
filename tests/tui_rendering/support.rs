@@ -434,6 +434,8 @@ pub fn failed_session_snapshot(
     let delivered = FailedTurnFixture::new(prompt_id, text, PromptOrder::INITIAL);
     let transcript = delivered.transcript();
     SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: session_id,
@@ -481,6 +483,8 @@ pub fn selected_session_snapshot(
     selection: AgentSelection,
 ) -> SessionSnapshot {
     SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: session_id,
@@ -510,6 +514,8 @@ pub fn navigable_session_snapshot(
     section_count: usize,
 ) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: session_id,

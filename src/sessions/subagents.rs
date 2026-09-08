@@ -49,7 +49,13 @@ impl SessionStore {
             .get(&parent_id)
             .expect("Session existence was checked while holding the store lock");
         let parent_session = &parent.snapshot.session;
+        let title = match description.trim() {
+            "" => name.trim().to_owned(),
+            described => described.to_owned(),
+        };
         let snapshot = SessionSnapshot {
+            title: title.clone(),
+            emoji: None,
             session: Session {
                 context_fill: None,
                 id: session_id,
@@ -80,10 +86,6 @@ impl SessionStore {
             transcript: Vec::new(),
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
-        };
-        let title = match description.trim() {
-            "" => name.trim().to_owned(),
-            described => described.to_owned(),
         };
         let summary = SessionSummary {
             session: snapshot.session.clone(),

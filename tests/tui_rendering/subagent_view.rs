@@ -70,6 +70,8 @@ fn child_session_snapshot(
     let turn_id = TurnId::new();
     let message_id = MessageId::new();
     SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: child_id,

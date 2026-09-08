@@ -91,6 +91,8 @@ fn child_with_working_subagent(
     let grandchild_id = SessionId::new();
     let activity_id = ActivityId::new();
     let snapshot = SessionSnapshot {
+        title: String::new(),
+        emoji: None,
         session: Session {
             context_fill: None,
             id: child_id,

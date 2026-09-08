@@ -16,6 +16,7 @@ mod model_picker;
 mod prompts;
 mod reasoning_cycle;
 mod serving;
+mod session_header;
 mod session_picker;
 mod settings_panel;
 mod shell;
