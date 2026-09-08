@@ -106,6 +106,22 @@ struct TransportState {
     conversation: Option<ConversationSink>,
 }
 
+/// Cancellation must not leave an optional query registered indefinitely.
+struct PendingRequest<'a> {
+    state: &'a TransportState,
+    key: &'a str,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.state
+            .pending
+            .lock()
+            .expect("Claude pending request lock is not poisoned")
+            .remove(self.key);
+    }
+}
+
 /// A launched connection to one supervised Claude Code CLI process.
 pub(super) struct ClaudeConnection {
     pub(super) transport: StreamJsonTransport,
@@ -188,38 +204,33 @@ impl StreamJsonTransport {
             .lock()
             .expect("Claude pending request lock is not poisoned")
             .insert(key.clone(), response_tx);
-        if let Err(error) = write_json_line(
-            &self.writer,
-            &ControlRequestEnvelope::new(&key, request),
-            "write to Claude Code CLI",
-        )
+        // Remove correlation state on timeout or cancellation, including while stdin is busy.
+        let _pending = PendingRequest {
+            state: &self.state,
+            key: &key,
+        };
+        match timeout(request_timeout, async {
+            write_json_line(
+                &self.writer,
+                &ControlRequestEnvelope::new(&key, request),
+                "write to Claude Code CLI",
+            )
+            .await
+            .map_err(ControlFailure::Failed)?;
+            response_rx.await.unwrap_or_else(|_| {
+                Err(ControlFailure::Failed(
+                    claude_error("Claude Code CLI ended before the control request completed")
+                        .mark_session_lost(),
+                ))
+            })
+        })
         .await
         {
-            self.state
-                .pending
-                .lock()
-                .expect("Claude pending request lock is not poisoned")
-                .remove(&key);
-            return Err(ControlFailure::Failed(error));
-        }
-
-        match timeout(request_timeout, response_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ControlFailure::Failed(
-                claude_error("Claude Code CLI ended before the control request completed")
-                    .mark_session_lost(),
-            )),
-            Err(_) => {
-                self.state
-                    .pending
-                    .lock()
-                    .expect("Claude pending request lock is not poisoned")
-                    .remove(&key);
-                Err(ControlFailure::Failed(claude_error(format!(
-                    "Claude Code CLI timed out handling `{}`",
-                    request.subtype()
-                ))))
-            }
+            Ok(result) => result,
+            Err(_) => Err(ControlFailure::Failed(claude_error(format!(
+                "Claude Code CLI timed out handling `{}`",
+                request.subtype()
+            )))),
         }
     }
 

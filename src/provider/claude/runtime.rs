@@ -44,6 +44,7 @@ pub struct ClaudeRuntime {
     availability: ClaudeAvailability,
     control_request_timeout: Duration,
     interrupt_request_timeout: Duration,
+    context_request_timeout: Duration,
     skills: ClaudeSkills,
 }
 
@@ -55,6 +56,7 @@ impl ClaudeRuntime {
             availability: ClaudeAvailability::new(),
             control_request_timeout: CONTROL_REQUEST_TIMEOUT,
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
+            context_request_timeout: Duration::from_secs(5),
             skills: ClaudeSkills::default(),
         }
     }
@@ -78,6 +80,12 @@ impl ClaudeRuntime {
     /// wait out the default.
     pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
         self.interrupt_request_timeout = timeout;
+        self
+    }
+
+    /// Bounds the entire optional context query, including sending it to a busy CLI.
+    pub fn with_context_request_timeout(mut self, timeout: Duration) -> Self {
+        self.context_request_timeout = timeout;
         self
     }
 
@@ -156,6 +164,7 @@ impl ProviderRuntime for ClaudeRuntime {
         let timings = ClaudeTimings {
             control_request: self.control_request_timeout,
             interrupt_request: self.interrupt_request_timeout,
+            context_request: self.context_request_timeout,
         };
         let skills = self.skills.clone();
         Box::pin(async move {

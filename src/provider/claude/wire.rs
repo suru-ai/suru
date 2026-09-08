@@ -1,7 +1,8 @@
 //! The serde types Suru exchanges with a Claude Code CLI over its stream-json wire.
 //!
-//! Everything below is verified against Claude Code CLI 2.1.237 and the Agent SDK type definitions
-//! 0.3.241 — the wire is an SDK implementation detail rather than a documented surface, so drift is
+//! The baseline wire is verified against Claude Code CLI 2.1.237 and Agent SDK type definitions
+//! 0.3.241; optional get_context_usage is additionally verified against CLI 2.1.260 (see
+//! docs/validation/0300-claude-context-fill.md). The wire is an SDK implementation detail, so drift is
 //! ours to absorb (ADR 0010). Decoding tolerates fields and control-response subtypes it does not
 //! know, because the CLI grows both freely.
 
@@ -32,6 +33,8 @@ impl<'a> ControlRequestEnvelope<'a> {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub(super) enum ControlRequest {
     ListModels,
+    /// Optional snapshot of this process’s own conversation (CLI 2.1.260 verified).
+    GetContextUsage,
     /// Asks the CLI which version it is, which is what the availability probe checks against the
     /// suggested version ADR 0010 pins.
     GetBinaryVersion,
@@ -64,6 +67,7 @@ impl ControlRequest {
     pub(super) const fn subtype(&self) -> &'static str {
         match self {
             Self::ListModels => "list_models",
+            Self::GetContextUsage => "get_context_usage",
             Self::GetBinaryVersion => "get_binary_version",
             Self::Initialize => "initialize",
             Self::ReloadSkills => "reload_skills",

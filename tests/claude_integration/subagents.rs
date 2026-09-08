@@ -505,7 +505,11 @@ async fn interrupting_a_turn_stops_its_working_subagent_before_the_loop() {
     assert_eq!(child.turns[0].status, TurnStatus::Interrupted);
 
     assert_eq!(
-        claude.control_subtypes(),
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
         after_probe(["list_models", "stop_task", "interrupt"]),
         "the Subagent is stopped before the loop is, in the established ordering"
     );
@@ -591,7 +595,11 @@ async fn interrupting_with_no_turn_active_stops_the_outliving_subagent_without_a
     );
 
     assert_eq!(
-        claude.control_subtypes(),
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
         after_probe(["list_models", "stop_task"]),
         "with no loop running there is nothing to interrupt: the stop alone goes out"
     );
@@ -694,7 +702,11 @@ async fn stopping_one_subagent_by_its_session_leaves_the_other_working() {
     assert_eq!(stopped_child.turns[0].status, TurnStatus::Interrupted);
 
     assert_eq!(
-        claude.control_subtypes(),
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
         after_probe(["list_models", "stop_task"]),
         "one stop goes out, and no interrupt follows it"
     );

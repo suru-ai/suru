@@ -97,6 +97,7 @@ impl ProviderSessionSpawn {
 pub(super) struct ClaudeTimings {
     /// How long a control request waits for the CLI to answer it.
     pub(super) control_request: Duration,
+    pub(super) context_request: Duration,
     /// How long an interrupt — and each of the task stops that go ahead of it — waits.
     pub(super) interrupt_request: Duration,
 }
@@ -137,8 +138,16 @@ pub(super) async fn start_claude_session(
     let (conversation, messages) = tokio::sync::mpsc::unbounded_channel();
     let turn = TurnInFlight::new();
     let questionnaires = Arc::new(super::questionnaire::ClaudeQuestionnaires::default());
-    let events = provider_events(messages, turn.clone(), questionnaires.clone());
+    let (context, reports) = super::context::ContextQueries::new(timings.context_request);
+    let events = provider_events(
+        messages,
+        turn.clone(),
+        questionnaires.clone(),
+        context.clone(),
+        reports,
+    );
     let session = Arc::new(ClaudeSession {
+        context,
         questionnaires,
         executable,
         processes,
@@ -208,6 +217,7 @@ async fn default_selection(
 }
 
 struct ClaudeSession {
+    context: Arc<super::context::ContextQueries>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     executable: OsString,
     processes: ProcessRegistry,
@@ -297,6 +307,8 @@ impl ProviderSession for ClaudeSession {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn startup failed";
+            self.context
+                .begin_turn(input.turn_id, input.selection.model.as_str());
             let prompt = self.skills.lower(&self.workspace, input.prompt)?;
             let mut slot = self.child.lock().await;
             if self.shutdown_started.load(Ordering::Acquire) {
@@ -338,6 +350,7 @@ impl ProviderSession for ClaudeSession {
                 .map_err(|error| claude_error_context(launch_context, error))?;
                 // The conversation is the CLI's to keep from here on, so every later child resumes
                 // it rather than asking for it to be minted again.
+                self.context.connect(transport.clone());
                 self.questionnaires.connect(transport.clone());
                 slot.next_spawn = ProviderSessionSpawn::Resume;
                 slot.running = Some(ClaudeChild {
@@ -351,6 +364,7 @@ impl ProviderSession for ClaudeSession {
                 .as_ref()
                 .expect("a Turn runs on the child that was just spawned for it");
             self.turn.begin_turn();
+            self.context.ready();
             child
                 .transport
                 .send(&UserMessageEnvelope::text(&prompt))
@@ -358,6 +372,7 @@ impl ProviderSession for ClaudeSession {
                 .map_err(|error| {
                     // The Prompt never reached the CLI, so the Turn it would have begun is not
                     // running and is owed nothing.
+                    self.context.abandon();
                     self.turn.abandon_turn();
                     claude_error_context(CONTEXT, error)
                 })
@@ -489,6 +504,7 @@ impl ProviderSession for ClaudeSession {
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.shutdown_started.store(true, Ordering::Release);
+            self.context.disconnect();
             self.questionnaires.clear();
             let slot = self.child.lock().await;
             let Some(child) = slot.running.as_ref() else {
@@ -576,6 +592,10 @@ mod tests {
             processes.set_exit_grace(Duration::from_millis(200));
             let (conversation, _messages) = tokio::sync::mpsc::unbounded_channel();
             Arc::new(ClaudeSession {
+                context: crate::provider::claude::context::ContextQueries::new(
+                    Duration::from_millis(200),
+                )
+                .0,
                 questionnaires: Arc::new(
                     crate::provider::claude::questionnaire::ClaudeQuestionnaires::default(),
                 ),

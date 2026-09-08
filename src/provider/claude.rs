@@ -26,6 +26,7 @@
 
 mod availability;
 mod catalog;
+mod context;
 mod errand;
 mod projection;
 mod questionnaire;

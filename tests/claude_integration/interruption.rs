@@ -99,7 +99,11 @@ async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_in
     );
 
     assert_eq!(
-        claude.control_subtypes(),
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
         after_probe(["list_models", "stop_task", "interrupt"]),
         "the background work is stopped before the loop is, because an interrupt alone \
          leaves it running"
@@ -163,7 +167,11 @@ async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
 
     assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
     assert_eq!(
-        claude.control_subtypes(),
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
         after_probe(["list_models", "interrupt"]),
         "a Turn with nothing running in the background is stopped by the interrupt alone"
     );

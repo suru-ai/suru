@@ -71,9 +71,13 @@ pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     turn: Arc<TurnInFlight>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
+    context: Arc<super::context::ContextQueries>,
+    reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         EventReceiver {
+            context,
+            reports,
             questionnaires,
             messages,
             projection: ClaudeProjection::new(turn),
@@ -84,6 +88,8 @@ pub(super) fn provider_events(
 }
 
 struct EventReceiver {
+    context: Arc<super::context::ContextQueries>,
+    reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     projection: ClaudeProjection,
@@ -100,13 +106,22 @@ async fn next_provider_event(
         if let Some(event) = events.pending.pop_front() {
             return Some((event, events));
         }
-        let message = events.messages.recv().await?;
+        let message = tokio::select! {
+            message = events.messages.recv() => message?,
+            Some(report) = events.reports.recv() => {
+                if let Some(report) = events.context.route_report(report) {
+                    return Some((Ok(report), events));
+                }
+                continue;
+            },
+        };
         match message {
             Err(error) => {
                 events.questionnaires.clear();
                 return Some((Err(error), events));
             }
             Ok(message) => {
+                events.context.observe(&message);
                 match events
                     .questionnaires
                     .receive(
@@ -116,6 +131,9 @@ async fn next_provider_event(
                     .await
                 {
                     Ok(Some(projected)) => {
+                        events
+                            .context
+                            .observe_output(&projected, events.projection.turn.is_running());
                         events.pending.extend(projected.into_iter().map(Ok));
                         continue;
                     }
@@ -125,8 +143,10 @@ async fn next_provider_event(
                     }
                     Ok(None) => {}
                 }
+                let prompt_running = events.projection.turn.is_running();
                 match events.projection.project(message) {
                     Ok(projected) => {
+                        events.context.observe_output(&projected, prompt_running);
                         for event in &projected {
                             match &event.event {
                                 ProviderEvent::TurnCompleted
@@ -135,6 +155,7 @@ async fn next_provider_event(
                                     events.questionnaires.settle(&event.attribution);
                                     if event.attribution == ProviderEventAttribution::OwningSession
                                     {
+                                        events.context.request();
                                         events
                                             .projection
                                             .question_tools
