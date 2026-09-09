@@ -1233,7 +1233,7 @@ fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
     mouse(
         &mut application,
         MouseEventKind::Down(MouseButton::Left),
-        (34, prompt.1),
+        (33, prompt.1),
     );
     mouse(
         &mut application,
@@ -1244,7 +1244,7 @@ fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
         rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)
             .cell(prompt)
             .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED)),
-        "the main view still starts a Text Selection immediately beyond the edge padding"
+        "the first column past the three-column grab zone starts a Text Selection"
     );
     assert!(matches!(
         mouse(

@@ -5430,6 +5430,16 @@ impl Application {
             .and_then(|session| self.state.session_interaction(session))?;
         let viewport = interaction.viewport.borrow();
         let viewport = viewport.as_ref()?;
+        // The cell immediately past the edge's grab zone belongs to ordinary
+        // main-view Text Selection even though the Content Column's layout
+        // padding leaves its first painted cell one column farther right.
+        // Map only that boundary cell; the rest of a centered gutter remains
+        // inert as ADR 0012 requires.
+        let position = if self.state.sidebar.borders_edge_on_main_side(position) {
+            Position::new(viewport.content_left, position.y)
+        } else {
+            position
+        };
         let row = viewport.transcript_row(position)?;
         (row < self.state.transcript_cache.row_count()).then_some(SelectionCell {
             row,

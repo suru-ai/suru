@@ -1093,6 +1093,18 @@ impl Sidebar {
         self.edge_held
     }
 
+    /// Whether this cell is the first one beyond the grab zone in the main
+    /// view. The Session Content Column begins after layout padding, but this
+    /// boundary cell retains the ordinary Text Selection behavior promised
+    /// immediately outside the edge.
+    pub(super) fn borders_edge_on_main_side(&self, position: Position) -> bool {
+        self.geometry
+            .borrow()
+            .edge
+            .as_ref()
+            .is_some_and(|edge| position.x == edge.end)
+    }
+
     /// Releases a held edge and reports whether this release belonged to it.
     pub(super) fn release_edge(&mut self) -> bool {
         std::mem::take(&mut self.edge_held)
