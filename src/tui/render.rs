@@ -2789,10 +2789,6 @@ fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
     else {
         return String::new();
     };
-    let kind = match reading.association.kind {
-        CheckoutKind::Main => "main",
-        CheckoutKind::Linked => "linked",
-    };
     let label = match &reading.availability {
         SourceControlAvailability::NotDetected => return String::new(),
         SourceControlAvailability::Unavailable { .. } => "[unavailable]".to_owned(),
@@ -2802,8 +2798,20 @@ fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
             None => "[unavailable]".to_owned(),
         },
     };
-    // Keep the Worktree kind visible even when a branch name is long.
-    let suffix = format!(" · {kind}");
+    // Keep a linked Worktree visible even when a branch name is long. The main
+    // working copy needs no label of its own.
+    let suffix = match (
+        &reading.availability,
+        &reading.revision,
+        reading.association.kind,
+    ) {
+        (
+            SourceControlAvailability::Available,
+            Some(CheckoutRevision::Branch { .. }),
+            CheckoutKind::Linked,
+        ) => " (worktree)",
+        _ => "",
+    };
     format!(
         "{}{}",
         truncate_to_width(&label, width.saturating_sub(suffix.width())),
@@ -3781,11 +3789,18 @@ fn render_session_header(
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
-    let mut orientation = workspace_context(
-        state,
-        &snapshot.session.execution_directory.path,
-        detail.shows_secondary(),
-    );
+    let mut orientation = if detail.shows_secondary() {
+        state.workspace_name(&state.outlook, &snapshot.session.workspace.path)
+    } else {
+        String::new()
+    };
+    if let Some(remote) = state.outlook.remote_name() {
+        orientation = [remote, orientation.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
     if detail.shows_secondary()
         && let Some(checkout) = state
             .session_reference
@@ -3853,10 +3868,12 @@ fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Optio
     let CheckoutRevision::Branch { name, .. } = checkout.revision.as_ref()? else {
         return None;
     };
-    Some(match checkout.association.kind {
-        CheckoutKind::Main => name.clone(),
-        CheckoutKind::Linked => format!("{name} (worktree)"),
-    })
+    match checkout.association.kind {
+        CheckoutKind::Main if name == "main" => None,
+        CheckoutKind::Main => Some(name.clone()),
+        CheckoutKind::Linked if name == "main" => Some("(worktree)".to_owned()),
+        CheckoutKind::Linked => Some(format!("{name} (worktree)")),
+    }
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {

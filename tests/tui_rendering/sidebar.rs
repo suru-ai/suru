@@ -9248,7 +9248,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
                 commit: None,
             }),
             SourceControlAvailability::Available,
-            " · linked",
+            " (worktree)",
         ),
         (
             Some(CheckoutRevision::Branch {
@@ -9256,7 +9256,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
                 commit: Some("0123456789abcdef".into()),
             }),
             SourceControlAvailability::Available,
-            "feature · linked",
+            "feature (worktree)",
         ),
         (
             Some(CheckoutRevision::Branch {
@@ -9264,23 +9264,24 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
                 commit: None,
             }),
             SourceControlAvailability::Available,
-            "unborn · linked",
+            "unborn (worktree)",
         ),
         (
             Some(CheckoutRevision::Detached {
                 commit: "0123456789abcdef".into(),
             }),
             SourceControlAvailability::Available,
-            "0123456 · linked",
+            "0123456",
         ),
         (
             None,
             SourceControlAvailability::Unavailable {
                 reason: "missing".into(),
             },
-            "[unavailable] · linked",
+            "[unavailable]",
         ),
     ] {
+        let has_branch = matches!(&revision, Some(CheckoutRevision::Branch { .. }));
         let SessionListItem::Readable(mut summary) =
             listed("Checkout work", None, workspace.path(), now(), now())
         else {
@@ -9296,6 +9297,12 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
             sidebar_showing(workspace.path(), vec![SessionListItem::Readable(summary)]);
         let rows = rendered_application_rows_at(&application, WIDE, 20);
         assert!(rows.iter().any(|row| row.contains(expected)), "{rows:?}");
+        if !has_branch {
+            assert!(
+                !rows.iter().any(|row| row.contains("(worktree)")),
+                "{rows:?}"
+            );
+        }
         assert!(!rows.iter().any(|row| row.contains("stale-recovery")));
     }
     let SessionListItem::Readable(mut summary) =
@@ -9313,7 +9320,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
 }
 
 #[test]
-fn remote_checkout_line_keeps_its_origin_label_and_main_indicator() {
+fn remote_checkout_line_keeps_its_origin_label_without_a_main_indicator() {
     use suru::protocol::{
         CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
         RepositoryId, SourceControlAvailability,
@@ -9346,8 +9353,9 @@ fn remote_checkout_line_keeps_its_origin_label_and_main_indicator() {
     );
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
-        rows.iter().any(|row| row.contains("remote-branch · main")),
+        rows.iter().any(|row| row.contains("remote-branch")),
         "{rows:?}"
     );
+    assert!(!rows.iter().any(|row| row.contains(" · main")), "{rows:?}");
     assert!(rows.iter().any(|row| row.contains("studio")), "{rows:?}");
 }

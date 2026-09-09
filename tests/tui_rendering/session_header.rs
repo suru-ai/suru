@@ -89,7 +89,7 @@ fn application_with_checkout_branch(
 }
 
 #[test]
-fn branch_name_follows_the_workspace_path_in_the_session_header() {
+fn branch_name_follows_the_workspace_name_in_the_session_header() {
     let workspace = workspace_dir();
     let application = application_with_checkout_branch(
         workspace.path(),
@@ -102,15 +102,40 @@ fn branch_name_follows_the_workspace_path_in_the_session_header() {
     assert!(
         row.contains(&format!(
             "{} · feature/header-context",
-            workspace.path().to_string_lossy()
+            workspace.path().file_name().unwrap().to_string_lossy()
         )),
         "{row}"
+    );
+    assert!(
+        !row.contains(workspace.path().to_string_lossy().as_ref()),
+        "the header names the Workspace without showing its full path: {row}"
     );
     let narrow = header(&application, 40);
     assert!(
         !narrow.contains("feature/header-context") && !narrow.trim_start().starts_with('·'),
         "a hidden workspace path leaves no branch or orphan separator: {narrow}"
     );
+}
+
+#[test]
+fn main_branch_is_implicit_in_the_session_header() {
+    let workspace = workspace_dir();
+    let application =
+        application_with_checkout_branch(workspace.path(), CheckoutKind::Main, "main", false);
+
+    let row = header(&application, 240);
+    assert!(
+        row.contains(
+            workspace
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ),
+        "{row}"
+    );
+    assert!(!row.contains(" · main"), "{row}");
 }
 
 #[test]
@@ -127,7 +152,7 @@ fn linked_worktree_label_follows_the_branch_name_in_the_session_header() {
     assert!(
         row.contains(&format!(
             "{} · feature/worktree-context (worktree)",
-            workspace.path().to_string_lossy()
+            workspace.path().file_name().unwrap().to_string_lossy()
         )),
         "{row}"
     );
@@ -147,7 +172,7 @@ fn viewed_child_uses_the_branch_state_shared_by_its_worktree() {
     assert!(
         row.contains(&format!(
             "{} · feature/child-context (worktree)",
-            workspace.path().to_string_lossy()
+            workspace.path().file_name().unwrap().to_string_lossy()
         )),
         "{row}"
     );
@@ -170,7 +195,14 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
             "{row}"
         );
         assert!(
-            row.contains(workspace.path().to_string_lossy().as_ref()) && row.contains("Connected"),
+            row.contains(
+                workspace
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ) && row.contains("Connected"),
             "{row}"
         );
         assert!(!row.contains("Workspace") && !row.contains("Suru"), "{row}");

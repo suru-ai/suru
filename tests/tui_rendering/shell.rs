@@ -284,8 +284,10 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
     assert!(transcript.contains("No Provider runtime is configured"));
     assert!(
         transcript.contains(
-            std::fs::canonicalize(workspace.path())
-                .expect("canonicalize expected Workspace")
+            workspace
+                .path()
+                .file_name()
+                .expect("Workspace name")
                 .to_string_lossy()
                 .as_ref()
         )
@@ -814,7 +816,12 @@ fn session_shell_degrades_metadata_before_transcript_or_composer_content() {
 
     let wide = rendered_application_rows_at(&application, 100, 16).join("\n");
     for content in [
-        workspace.path().to_string_lossy().as_ref(),
+        workspace
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref(),
         "Connected",
         "Keep the transcript visible",
         "Keep the draft visible",

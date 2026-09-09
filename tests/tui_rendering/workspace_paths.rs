@@ -29,7 +29,7 @@ fn screen(application: &Application) -> String {
 }
 
 #[test]
-fn local_workspace_labels_use_the_servers_home_on_landing_and_in_a_session() {
+fn local_landing_uses_the_servers_home_while_a_session_uses_the_workspace_name() {
     let home = tempfile::tempdir().unwrap();
     let workspace = home.path().join("Projects").join("suru");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -59,14 +59,21 @@ fn local_workspace_labels_use_the_servers_home_on_landing_and_in_a_session() {
 
     let (_, snapshot) = enter_session(&mut application, &workspace);
     let session = screen(&application);
-    assert!(session.lines().next().unwrap().contains(label), "{session}");
+    assert!(
+        session.lines().next().unwrap().contains("suru"),
+        "{session}"
+    );
+    assert!(
+        !session.lines().next().unwrap().contains(label),
+        "{session}"
+    );
     assert!(!session.contains("Suru"), "{session}");
     assert!(!session.contains("Workspace "), "{session}");
     assert_eq!(snapshot.session.workspace.path, workspace);
 }
 
 #[test]
-fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
+fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
     use std::path::Path;
     use suru::protocol::{
         Outlook, PathStyle, SessionCatalogRevision, SessionCatalogSnapshot, SessionId,
@@ -74,61 +81,76 @@ fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
 
     // These are wire paths, deliberately exercising both remote platforms on
     // every host; none is resolved using the test machine's filesystem.
-    for (style, home, path, expected) in [
+    for (style, home, path, expected, expected_name) in [
         (
             PathStyle::Unix,
             Some("/home/remote"),
             "/home/remote/Projects/suru",
             "~/Projects/suru",
+            "suru",
         ),
         (
             PathStyle::Windows,
             Some(r"C:\Users\Remote"),
             r"\\?\C:\Users\Remote\Projects\suru",
             r"~\Projects\suru",
+            "suru",
         ),
         (
             PathStyle::Windows,
             Some(r"\\?\UNC\host\users\Remote"),
             r"\\host\users\Remote\suru",
             r"~\suru",
+            "suru",
         ),
         (
             PathStyle::Windows,
             None,
             r"\\?\UNC\host\users\Remote\suru",
             r"\\host\users\Remote\suru",
+            "suru",
         ),
-        (PathStyle::Unix, Some("/home/remote"), "/home/remote", "~"),
+        (
+            PathStyle::Unix,
+            Some("/home/remote"),
+            "/home/remote",
+            "~",
+            "remote",
+        ),
         (
             PathStyle::Unix,
             Some("/home/remote"),
             "/home/remote-other/suru",
             "/home/remote-other/suru",
+            "suru",
         ),
         (
             PathStyle::Windows,
             Some(r"C:\Users\Remote"),
             r"\\?\D:\Projects\suru",
             r"D:\Projects\suru",
+            "suru",
         ),
         (
             PathStyle::Unix,
             Some("/"),
             "/Projects/suru",
             "~/Projects/suru",
+            "suru",
         ),
         (
             PathStyle::Windows,
             Some(r"C:\"),
             r"C:\Projects\suru",
             r"~\Projects\suru",
+            "suru",
         ),
         (
             PathStyle::Unix,
             Some("/home/remote"),
             "/home/remote/../elsewhere/suru",
             "/home/remote/../elsewhere/suru",
+            "suru",
         ),
     ] {
         let mut application = Application::default();
@@ -166,8 +188,12 @@ fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
             .unwrap();
         let rendered = screen(&application);
         assert!(
-            rendered.contains(&format!("studio · {expected} ")),
+            rendered.contains(&format!("studio · {expected_name} ")),
             "{path}: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("studio · {expected} ")),
+            "{rendered}"
         );
         assert!(
             !rendered.contains(&format!("Workspace {expected}")),
