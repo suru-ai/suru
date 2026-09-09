@@ -3721,6 +3721,18 @@ impl Application {
             | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest) => self.handle_transcript_command(command),
             CommandId::PressAt { position } => {
+                // The edge is a pointer surface only in the plain
+                // Sidebar-beside-main state. Check it before any row,
+                // composer, or Text Selection can claim the press; overlays
+                // remain newer surfaces and keep their existing routing.
+                if self.state.top_selection_overlay().is_none()
+                    && !self.state.overlay_owns_input()
+                    && self.state.sidebar.hold_edge_at(position)
+                {
+                    self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
+                    self.state.left_press = None;
+                    return Ok(ApplicationTransition::Continue);
+                }
                 self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
                 let selection_anchor = self
                     .state
@@ -3792,6 +3804,13 @@ impl Application {
                 subject: SemanticSubject::ScreenPosition(position),
             }),
             CommandId::ReleaseAt { position } => {
+                if self.state.sidebar.release_edge() {
+                    // An edge press is never a click. Width movement and the
+                    // double-click reset are added by their own subissues;
+                    // this release merely ends the held paint.
+                    self.state.left_press = None;
+                    return Ok(ApplicationTransition::Continue);
+                }
                 if self
                     .state
                     .left_press
@@ -5641,6 +5660,9 @@ impl Application {
                     })
             }
             SemanticCommandId::PointerDrag => {
+                if self.state.sidebar.edge_is_held() {
+                    return Ok(ApplicationTransition::Continue);
+                }
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
                     self.update_text_selection_drag(position, 1);
                 }

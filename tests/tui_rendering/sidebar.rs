@@ -23,15 +23,15 @@ use ratatui::{buffer::Buffer, style::Color};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
-        AutoSettle, EffectiveSettings, EmojiVisibility, LatestTurnStatus, Message, MessageId,
-        MessageRole, MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus,
-        ServerShutdown, Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange,
-        SessionContentWidth, SessionCreated, SessionDeleted, SessionId, SessionListItem,
-        SessionReference, SessionRevision, SessionSettings, SessionSettlementChanged,
-        SessionStandingInputs, SessionStandingInputsChanged, SessionStatus, SessionSummary,
-        SessionTimestamp, SessionTitleChanged, SessionUpdate, SessionWorkingChanged,
-        ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings,
-        TurnStatus, UnreadableSessionSummary, Workspace,
+        Activity, ActivityId, ActivityStatus, AutoSettle, EffectiveSettings, EmojiVisibility,
+        LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session, SessionCatalogRevision,
+        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
+        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
+        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
+        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
+        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
+        TextSelectionCopy, TitleSettings, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -1102,6 +1102,329 @@ fn an_overlay_opens_over_the_main_view_and_never_over_the_sidebar() {
     assert!(
         rows.iter().any(|row| row.contains("Listed work")),
         "the Sidebar's own rows are still readable beside the overlay"
+    );
+}
+
+#[test]
+fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    for column in 30..=32 {
+        let mut application = sidebar_showing(
+            workspace.path(),
+            vec![listed(
+                "Work behind the grab",
+                None,
+                workspace.path(),
+                1,
+                now(),
+            )],
+        );
+        let row = drawn_at(&application, "Work behind the grab");
+        let before = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+        assert_eq!(before[(31, row)].fg, Color::DarkGray);
+
+        assert_eq!(
+            mouse(
+                &mut application,
+                MouseEventKind::Down(MouseButton::Left),
+                (column, row),
+            ),
+            ApplicationTransition::Continue
+        );
+        let held = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+        assert_eq!(
+            held[(31, row)].fg,
+            Color::Cyan,
+            "grab column {column} paints the edge in the Theme focus color"
+        );
+
+        assert_eq!(
+            mouse(
+                &mut application,
+                MouseEventKind::Up(MouseButton::Left),
+                (column, row),
+            ),
+            ApplicationTransition::Continue,
+            "release is neither a row click nor a Selection copy"
+        );
+        let released = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+        assert_eq!(released[(31, row)].fg, Color::DarkGray);
+        assert!(
+            crate::support::buffer_rows(&released)
+                .iter()
+                .any(|line| line.contains("Type a prompt")),
+            "even the grab over a row leaves the Landing open"
+        );
+    }
+}
+
+#[test]
+fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let sessions = vec![
+        listed("Nearest work", None, workspace.path(), 2, now()),
+        listed("Older work", None, workspace.path(), 1, now()),
+    ];
+    let mut composing = sidebar_showing(workspace.path(), sessions.clone());
+    rendered_application_buffer(&composing, WIDE, PRESS_HEIGHT);
+    mouse(
+        &mut composing,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    type_terminal_text(&mut composing, "composer keeps the keys");
+    assert!(
+        rendered_application_rows_at(&composing, WIDE, PRESS_HEIGHT)
+            .join("\n")
+            .contains("composer keeps the keys")
+    );
+    mouse(
+        &mut composing,
+        MouseEventKind::Up(MouseButton::Left),
+        (31, 0),
+    );
+
+    let mut browsing = sidebar_focused(workspace.path(), sessions);
+    step_onto_the_list(&mut browsing);
+    let focused_before = selected_sidebar_text(&browsing);
+    let older_row = drawn_at(&browsing, "Older work");
+    mouse(
+        &mut browsing,
+        MouseEventKind::Down(MouseButton::Left),
+        (30, older_row),
+    );
+    assert_eq!(selected_sidebar_text(&browsing), focused_before);
+    assert_eq!(
+        mouse(
+            &mut browsing,
+            MouseEventKind::Up(MouseButton::Left),
+            (30, older_row),
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(selected_sidebar_text(&browsing), focused_before);
+}
+
+#[test]
+fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
+    use super::selection::mouse;
+    use ratatui::style::Modifier;
+
+    let workspace = workspace_dir();
+    let mut application = sidebar_hydrated(
+        workspace.path(),
+        EffectiveSettings {
+            sidebar: shown(AutoSettle::default()),
+            text_selection: suru::protocol::TextSelectionSettings {
+                copy: TextSelectionCopy::Release,
+            },
+            ..EffectiveSettings::default()
+        },
+        Vec::new(),
+    );
+    enter_session(&mut application, workspace.path());
+    let buffer = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+    let prompt = text_position(&buffer, "Initial Prompt");
+
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (34, prompt.1),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Drag(MouseButton::Left),
+        (prompt.0 + 4, prompt.1),
+    );
+    assert!(
+        rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)
+            .cell(prompt)
+            .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED)),
+        "the main view still starts a Text Selection immediately beyond the edge padding"
+    );
+    assert!(matches!(
+        mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            (prompt.0 + 4, prompt.1),
+        ),
+        ApplicationTransition::CopyToClipboard(_)
+    ));
+
+    let blank_sidebar_row = PRESS_HEIGHT - 1;
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            (29, blank_sidebar_row),
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            (29, blank_sidebar_row),
+        ),
+        ApplicationTransition::Continue,
+        "one column beyond the grab zone inside the Sidebar remains inert"
+    );
+}
+
+#[test]
+fn overlays_keep_edge_presses_and_never_show_held_paint() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+
+    let mut settings = sidebar_showing(workspace.path(), Vec::new());
+    settings
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SettingsOpen,
+        )))
+        .expect("open Settings");
+    rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT);
+    mouse(
+        &mut settings,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    assert_eq!(
+        rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::DarkGray,
+        "Settings retains pointer ownership"
+    );
+    mouse(
+        &mut settings,
+        MouseEventKind::Up(MouseButton::Left),
+        (31, 0),
+    );
+    assert!(
+        !crate::support::buffer_rows(&rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT))
+            .join("\n")
+            .contains("Settings"),
+        "the overlay handles the outside click by dismissing itself"
+    );
+
+    let mut menu = sidebar_showing(
+        workspace.path(),
+        vec![listed("Menu subject", None, workspace.path(), 1, now())],
+    );
+    open_menu_on(&mut menu, "Menu subject");
+    rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT);
+    mouse(&mut menu, MouseEventKind::Down(MouseButton::Left), (31, 0));
+    assert_eq!(
+        rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::DarkGray,
+        "the Sidebar context menu retains pointer ownership"
+    );
+    mouse(&mut menu, MouseEventKind::Up(MouseButton::Left), (31, 0));
+    assert!(!menu_is_drawn(&menu), "the context menu handles the click");
+
+    let mut subagents = sidebar_showing(workspace.path(), Vec::new());
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Delegate this",
+        workspace.path(),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp::now());
+    snapshot.turns[0].status = TurnStatus::Active;
+    let turn_id = snapshot.turns[0].id;
+    snapshot.activities[0] = Activity::Subagent {
+        id: ActivityId::new(),
+        turn_id,
+        status: ActivityStatus::Active,
+        name: "Explore".to_owned(),
+        description: "Map the edge".to_owned(),
+        session_id: SessionId::new(),
+        duration_ms: None,
+    };
+    subagents
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a working Subagent");
+    subagents
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SubagentBrowse,
+        )))
+        .expect("open the Subagent picker");
+    let picker = rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT);
+    assert!(
+        crate::support::buffer_rows(&picker)
+            .join("\n")
+            .contains("Subagents")
+    );
+    mouse(
+        &mut subagents,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    assert_eq!(
+        rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::DarkGray,
+        "the Subagent picker retains pointer ownership"
+    );
+    mouse(
+        &mut subagents,
+        MouseEventKind::Up(MouseButton::Left),
+        (31, 0),
+    );
+    assert!(
+        !crate::support::buffer_rows(&rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT))
+            .join("\n")
+            .contains("Subagents"),
+        "the Subagent picker handles the outside click by dismissing itself"
+    );
+}
+
+#[test]
+fn hidden_and_squeezed_sidebars_leave_no_edge_grab_geometry() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let mut hidden = connected_application(workspace.path());
+    deliver_initial_visibility(&mut hidden, SidebarVisibility::Hidden);
+    rendered_application_buffer(&hidden, WIDE, PRESS_HEIGHT);
+    mouse(
+        &mut hidden,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    mouse(&mut hidden, MouseEventKind::Up(MouseButton::Left), (31, 0));
+    let request = expect_sidebar_listing(press_toggle(&mut hidden));
+    hidden
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: Vec::new(),
+        })
+        .expect("hydrate the shown Sidebar");
+    assert_eq!(
+        rendered_application_buffer(&hidden, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::Gray,
+        "the hidden frame supplied no stale grab zone"
+    );
+
+    let mut squeezed = sidebar_showing(workspace.path(), Vec::new());
+    rendered_application_buffer(&squeezed, 77, PRESS_HEIGHT);
+    mouse(
+        &mut squeezed,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    mouse(
+        &mut squeezed,
+        MouseEventKind::Up(MouseButton::Left),
+        (31, 0),
+    );
+    assert_eq!(
+        rendered_application_buffer(&squeezed, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::DarkGray,
+        "squeeze-out clears the previous frame's grab zone"
     );
 }
 

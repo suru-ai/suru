@@ -181,6 +181,9 @@ pub(super) struct Sidebar {
     /// its floor. Kept with the drawn width so widening at that boundary does
     /// not create a latent choice that appears only after a later resize.
     drawn_width_limit: Cell<Option<u16>>,
+    /// Whether the reader is holding the Sidebar's edge. This is pointer
+    /// interaction state, separate from both key ownership and row focus.
+    edge_held: bool,
     /// When a Session settles without anyone saying so. Adopted from every
     /// snapshot rather than seeded from the first, because unlike the two
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
@@ -564,6 +567,10 @@ pub(super) struct SidebarGeometry {
     /// The columns inside the Sidebar's own rule, so a press on the rule
     /// itself or out in the main view lands on nothing.
     columns: Range<u16>,
+    /// The edge's three-column grab zone: the rule and one column on either
+    /// side. It exists only in geometry recorded by a frame that drew the
+    /// Sidebar beside the main view.
+    edge: Option<Range<u16>>,
     /// The entries the body drew, top to bottom. The divider draws no span:
     /// it stands for nothing to press.
     rows: Vec<SidebarSpan>,
@@ -815,6 +822,7 @@ impl Sidebar {
             chosen_width: 32,
             drawn_width: Cell::new(None),
             drawn_width_limit: Cell::new(None),
+            edge_held: false,
             auto_settle: AutoSettle::default(),
             emoji: EmojiVisibility::default(),
             scope: SidebarListingScope::AllWorkspaces,
@@ -1054,10 +1062,40 @@ impl Sidebar {
 
     /// Takes the geometry the frame just drew its body in, which is the only
     /// account of the Sidebar a press can be resolved against.
-    pub(super) fn record_geometry(&self, columns: Range<u16>, rows: Vec<SidebarSpan>) {
+    pub(super) fn record_geometry(
+        &self,
+        columns: Range<u16>,
+        edge: Range<u16>,
+        rows: Vec<SidebarSpan>,
+    ) {
         let mut geometry = self.geometry.borrow_mut();
         geometry.columns = columns;
+        geometry.edge = Some(edge);
         geometry.rows = rows;
+    }
+
+    /// Begins holding the edge where the last frame drew its grab zone.
+    /// Returns false when that frame drew no Sidebar or the press missed it.
+    pub(super) fn hold_edge_at(&mut self, position: Position) -> bool {
+        let hit = self
+            .geometry
+            .borrow()
+            .edge
+            .as_ref()
+            .is_some_and(|edge| edge.contains(&position.x));
+        if hit {
+            self.edge_held = true;
+        }
+        hit
+    }
+
+    pub(super) const fn edge_is_held(&self) -> bool {
+        self.edge_held
+    }
+
+    /// Releases a held edge and reports whether this release belonged to it.
+    pub(super) fn release_edge(&mut self) -> bool {
+        std::mem::take(&mut self.edge_held)
     }
 
     /// Takes the geometry the frame drew the context menu in, which is drawn
@@ -1346,6 +1384,9 @@ impl Sidebar {
     /// again asks anyway.
     fn reveal(&mut self, revealed: bool) {
         self.revealed = revealed;
+        if !revealed {
+            self.edge_held = false;
+        }
         if revealed {
             // A reader opening the Sidebar can type into it before the next
             // frame is drawn: the run loop takes a whole run of terminal events
@@ -2879,6 +2920,7 @@ mod tests {
 
         sidebar.record_geometry(
             0..32,
+            30..33,
             vec![SidebarSpan {
                 rows: 1..4,
                 columns: None,

@@ -2198,12 +2198,14 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     );
     let [column, main] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
-    // The Sidebar's edge stands out while the reader is driving it, which is
-    // the same account of focus the composer's own border gives.
+    // Holding the edge is pointer feedback of its own. At rest the rule keeps
+    // the same key-ownership paint it had before it became draggable.
     let block = Block::default()
         .style(theme.surface.elevated)
         .borders(Borders::RIGHT)
-        .border_style(if state.sidebar_owns_input() {
+        .border_style(if state.sidebar.edge_is_held() {
+            theme.accent.primary
+        } else if state.sidebar_owns_input() {
             theme.border.default
         } else {
             theme.border.subdued
@@ -2226,9 +2228,10 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     // padding a row is inset by presses the row it insets. The spans the body
     // narrows to a run of one line are measured from the same edges, in
     // `sidebar_lines`.
+    let edge = column.right().saturating_sub(2)..column.right().saturating_add(1);
     state
         .sidebar
-        .record_geometry(inside.x..inside.right(), rows);
+        .record_geometry(inside.x..inside.right(), edge, rows);
     main
 }
 
