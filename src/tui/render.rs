@@ -4301,7 +4301,8 @@ mod tests {
         protocol::{
             EffectiveSettings, Health, LifecycleState, ModelAvailability, ServerIdentity, Session,
             SessionContentWidth, SessionId, SessionRevision, SessionSettings, SessionSnapshot,
-            SessionStatus, SessionTimestamp, SettingsSnapshot, Workspace,
+            SessionStatus, SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
+            Workspace,
         },
     };
 
@@ -4617,6 +4618,10 @@ mod tests {
                         session: SessionSettings {
                             content_width: SessionContentWidth::Maximum(60),
                             ..SessionSettings::default()
+                        },
+                        sidebar: SidebarSettings {
+                            initial_visibility: SidebarVisibility::Hidden,
+                            ..SidebarSettings::default()
                         },
                         ..EffectiveSettings::default()
                     },
