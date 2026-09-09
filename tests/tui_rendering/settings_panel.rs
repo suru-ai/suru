@@ -26,7 +26,7 @@ use suru::{
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
-        SidebarSettings, TitleErrand, TitleSettings, TranscriptSettings,
+        SidebarSettings, SidebarVisibility, TitleErrand, TitleSettings, TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -42,7 +42,15 @@ const SPINNER: char = '⠋';
 /// is the only place the panel reads a value from.
 fn client_showing(workspace: &Path, settings: EffectiveSettings, pinned: &[&str]) -> Application {
     let mut application = connected_application(workspace);
+    let sidebar_is_shown = settings.sidebar.initial_visibility == SidebarVisibility::Shown;
     deliver_snapshot(&mut application, settings, pinned);
+    if sidebar_is_shown {
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SidebarToggle,
+            )))
+            .expect("hide the fixture Sidebar without changing its effective Settings");
+    }
     application
 }
 
