@@ -1,10 +1,10 @@
 //! The session picker: ordering, search, scope, attachment, and deletion.
 
 use crate::support::{
-    connected_application, enter_active_session, failed_session_snapshot,
-    navigable_session_snapshot, noncanonical_spelling, rendered_application_buffer,
-    rendered_application_rows, rendered_application_rows_at, rendered_row, text_position,
-    type_terminal_text, workspace_dir,
+    connected_application, connected_application_homed, enter_active_session,
+    failed_session_snapshot, named_workspace_path, navigable_session_snapshot,
+    noncanonical_spelling, rendered_application_buffer, rendered_application_rows,
+    rendered_application_rows_at, rendered_row, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
@@ -394,6 +394,9 @@ fn session_picker_selection_opens_the_target_optimistically_and_keeps_the_old_dr
 #[test]
 fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
     let workspace = workspace_dir();
+    // A second Workspace this test only names, rooted the way the running
+    // platform roots one so the picker draws it back as spelled.
+    let other_workspace = named_workspace_path("ws-two");
     let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
@@ -469,7 +472,7 @@ fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
             request: all_request,
             sessions: vec![session_summary(
                 gamma_id,
-                std::path::Path::new("/ws-two"),
+                &other_workspace,
                 "Gamma migration",
                 SessionStatus::Idle,
                 30,
@@ -479,7 +482,7 @@ fn session_picker_searches_titles_and_remembers_all_workspace_scope() {
     assert!(
         rendered_application_rows(&application)
             .join("\n")
-            .contains("/ws-two")
+            .contains(other_workspace.to_string_lossy().as_ref())
     );
 
     application
@@ -594,7 +597,13 @@ fn session_picker_scope_cycles_through_current_all_and_everywhere() {
 #[test]
 fn everywhere_picker_asks_each_origin_and_draws_one_tagged_recency_order() {
     let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path(), Default::default());
+    // The picker's popup is a fixed width however wide the terminal is drawn,
+    // so a Workspace path long enough spends the columns these Titles are
+    // asserted on and truncates them away. Two things keep the paths short on
+    // every platform: the local Server reports the fixture root as its home, so
+    // its own Session labels `~`; and each foreign Session is given a Workspace
+    // on its own machine below, rather than borrowing the local tempdir.
+    let mut application = connected_application_homed(workspace.path());
     let current = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             suru::tui::SemanticCommandId::SessionList,
@@ -663,14 +672,14 @@ fn everywhere_picker_asks_each_origin_and_draws_one_tagged_recency_order() {
             )],
             Outlook::Remote(name) if name == "studio" => vec![session_summary(
                 SessionId::new(),
-                &workspace.path().join("studio"),
+                &named_workspace_path("studio"),
                 "X [studio]",
                 SessionStatus::Idle,
                 30,
             )],
             Outlook::Remote(name) if name == "sleeping" => vec![session_summary(
                 SessionId::new(),
-                &workspace.path().join("sleeping"),
+                &named_workspace_path("sleeping"),
                 "Sleeping oldest",
                 SessionStatus::Idle,
                 10,
@@ -784,7 +793,13 @@ fn everywhere_picker_asks_each_origin_and_draws_one_tagged_recency_order() {
 #[test]
 fn choosing_a_foreign_picker_row_turns_and_opens_without_moving_sidebar_scope() {
     let workspace = workspace_dir();
-    let foreign_workspace = workspace.path().join("studio-work");
+    // A Workspace on the studio machine, not a subdirectory of the local
+    // tempdir. A foreign Origin labels its own paths, and this fixture hands
+    // over no paths for `studio`, so its Workspace is drawn exactly as spelled
+    // — and the picker's popup is a fixed width however wide the terminal is
+    // drawn, so a forty-column Windows temp path here would spend the columns
+    // `Foreign work` is asserted on and truncate the Title away.
+    let foreign_workspace = named_workspace_path("studio-work");
     let target = SessionId::new();
     let mut application = Application::new(workspace.path(), Default::default());
     application
@@ -1642,6 +1657,9 @@ fn an_emoji_arriving_while_the_picker_is_open_lands_on_its_row() {
 #[test]
 fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
     let workspace = workspace_dir();
+    // A second Workspace this test only names, rooted the way the running
+    // platform roots one so the picker draws it back as spelled.
+    let other_workspace = named_workspace_path("ws-two");
     let mut application = client_showing_emojis(workspace.path());
     open_session_picker_with(
         &mut application,
@@ -1667,7 +1685,7 @@ fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
             request: all_workspaces,
             sessions: vec![emoji_session_summary(
                 SessionId::new(),
-                std::path::Path::new("/ws-two"),
+                &other_workspace,
                 "Ledger reconciliation",
                 "🧾",
                 20,
@@ -1681,9 +1699,9 @@ fn an_emoji_leaves_an_all_workspaces_row_room_for_its_workspace_path() {
         .expect("render an all-Workspaces row for a Session with an Emoji");
     assert!(row.contains('🧾'));
     assert!(
-        row.contains("/ws-two"),
+        row.contains(other_workspace.to_string_lossy().as_ref()),
         "an Emoji takes its columns from the Title rather than from the path \
-         that tells one Workspace's Session from another's"
+         that tells one Workspace's Session from another's: {row:?}"
     );
 }
 

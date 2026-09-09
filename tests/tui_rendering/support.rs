@@ -18,6 +18,7 @@ use suru::{
         PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity, Session,
         SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
         SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
+        WorkspacePaths,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, TerminalFacts},
 };
@@ -62,6 +63,25 @@ pub fn workspace_dir() -> WorkspaceDir {
 pub fn noncanonical_spelling(workspace: &WorkspaceDir) -> std::path::PathBuf {
     std::fs::create_dir_all(workspace.path().join("sub")).expect("create the spelling's waypoint");
     workspace.path().join("sub").join("..")
+}
+
+/// An absolute path for a Workspace a rendering test only ever *names* — one
+/// that stands in for another machine's working copy inside a `SessionSummary`
+/// and is never touched on disk, so it need only be absolute and survive
+/// `WorkspacePaths` spelling unchanged.
+///
+/// It is rooted per platform because both halves of "absolute path" are
+/// platform-defined. `Path::is_absolute` answers false for `/ws-two` on
+/// Windows, and the Windows path style rewrites `/` to `\`, so a POSIX literal
+/// baked into a fixture draws as `\ws-two` and an assertion naming the literal
+/// never matches. Rooting it here keeps the rendering — and the assertion that
+/// reads it — the same on all three platforms.
+pub fn named_workspace_path(name: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    let root = std::path::Path::new(r"C:\");
+    #[cfg(not(windows))]
+    let root = std::path::Path::new("/");
+    root.join(name)
 }
 
 pub fn rendered_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
@@ -198,6 +218,30 @@ pub fn connected_application_with_terminal_facts(
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(instance_id, 42_424),
+        )))
+        .expect("connect application");
+    application
+}
+
+/// A connected client whose Server reports `workspace` as the home it
+/// resolved, which is the isolated-home case `WorkspacePaths::from_home`
+/// already exists to serve.
+///
+/// Any rendering test that draws a Workspace path on a fixed-width surface
+/// wants this. `tempfile::tempdir` answers `/tmp/.tmpXXXXXX` on Linux —
+/// fifteen columns — but `C:\Users\you\AppData\Local\Temp\.tmpXXXXXX` on
+/// Windows, roughly forty. The Session picker's popup is a fixed width however
+/// wide the terminal is drawn, so it cannot be rescued by rendering wider: a
+/// long Workspace path simply spends the columns the Title needs, and the
+/// Title the assertion looks for truncates away. Declaring the fixture root as
+/// the Server's home abbreviates every path beneath it to `~`, `~/studio`, and
+/// so on — short, deterministic, and the same shape on all three platforms.
+pub fn connected_application_homed(workspace: &std::path::Path) -> Application {
+    let mut application = Application::new(workspace, TerminalFacts::default());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424)
+                .with_workspace_paths(WorkspacePaths::from_home(Some(workspace))),
         )))
         .expect("connect application");
     application
