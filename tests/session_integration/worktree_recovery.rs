@@ -1,4 +1,5 @@
 //! Recovery preserves retained conversation and working-copy identities.
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     repositories::git,
@@ -105,12 +106,12 @@ async fn open(
         },
     )
     .await;
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap();
     assert_eq!(start.execution_directory(), path);
     let mut connected = start.succeed_with_resume(identity(), Some(resume()));
-    timeout(Duration::from_secs(2), connected.next_turn())
+    timeout(PROGRESS_DEADLINE, connected.next_turn())
         .await
         .unwrap()
         .succeed();
@@ -151,13 +152,13 @@ async fn assert_success(response: reqwest::Response) {
     assert!(status.is_success(), "{status}: {body}");
 }
 async fn restarted(provider: &mut ControlledProvider, path: &Path) -> ControlledProviderSession {
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("native Session restarts after recovery");
     assert_eq!(start.execution_directory(), path);
     assert_eq!(start.resume_state(), Some(&resume()));
     let mut connected = start.succeed_with_resume(identity(), Some(resume()));
-    timeout(Duration::from_secs(2), connected.next_turn())
+    timeout(PROGRESS_DEADLINE, connected.next_turn())
         .await
         .unwrap()
         .succeed();
@@ -182,13 +183,7 @@ async fn two_warm_sessions_recover_one_external_worktree_from_current_branch_tip
     let descriptor = server.descriptor().clone();
     let task_a =
         tokio::spawn(async move { admit(&descriptor, a.session.id, prompt("Continue A")).await });
-    assert_success(
-        timeout(Duration::from_secs(2), task_a)
-            .await
-            .unwrap()
-            .unwrap(),
-    )
-    .await;
+    assert_success(timeout(PROGRESS_DEADLINE, task_a).await.unwrap().unwrap()).await;
     let _new_a = restarted(&mut provider, &layout.linked.join("nested")).await;
     let response = admit(server.descriptor(), b.session.id, prompt("Continue B")).await;
     assert_success(response).await;
@@ -532,7 +527,7 @@ async fn prompt_gate_persists_external_branch_switch_without_catalog_interest_be
         .await,
     )
     .await;
-    timeout(Duration::from_secs(2), connection.next_turn())
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
         .await
         .unwrap()
         .succeed();
@@ -663,7 +658,7 @@ async fn shared_recovery_does_not_interrupt_working_session_and_refuses_stale_na
     let (a, mut old_a) = open(&server, &mut provider, &layout.linked).await;
     let (b, _old_b) = open(&server, &mut provider, &layout.linked).await;
     assert_success(admit(server.descriptor(), a.session.id, prompt("Keep working")).await).await;
-    timeout(Duration::from_secs(2), old_a.next_turn())
+    timeout(PROGRESS_DEADLINE, old_a.next_turn())
         .await
         .unwrap()
         .succeed();
@@ -722,7 +717,7 @@ async fn already_admitted_queued_prompt_recovers_at_native_start_and_revalidates
         .await,
     )
     .await;
-    timeout(Duration::from_secs(2), connection.next_turn())
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
         .await
         .unwrap()
         .succeed();

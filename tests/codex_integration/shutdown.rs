@@ -1,5 +1,6 @@
 //! Server shutdown against cooperative, pending, and unresponsive Codex processes.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     server_support::request_server_shutdown,
     support::{ScriptedCodex, assert_process_exited, receive_initial_state},
@@ -200,7 +201,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
     assert_process_exited(fixture.child_pid()).await;
 
     drop(client);
-    timeout(Duration::from_secs(2), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("repeated shutdown request remains bounded")
         .expect("shut down server");
@@ -246,7 +247,7 @@ async fn server_shutdown_interrupts_a_turn_whose_start_response_is_pending() {
     let response = request_server_shutdown(&descriptor, ShutdownReason::Manual).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     fixture.release();
-    timeout(Duration::from_secs(2), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("pending Turn startup keeps shutdown bounded")
         .expect("shut down server");
@@ -301,7 +302,7 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
     fixture.wait_until_ready().await;
     wait_for_agent_output(&client, created.session.id).await;
 
-    timeout(Duration::from_secs(2), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("forced Provider termination bounds server shutdown")
         .expect("shut down server");
@@ -352,7 +353,7 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
         .expect("create Session while Provider starts");
     fixture.wait_for_method("initialize").await;
 
-    timeout(Duration::from_secs(2), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("pending startup RPC does not delay server shutdown")
         .expect("shut down server");
@@ -364,7 +365,7 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
 }
 
 async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) -> SessionSnapshot {
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)

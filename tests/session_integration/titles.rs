@@ -1,5 +1,6 @@
 //! Deriving a Session's Title and Emoji from its first Prompt, through an Errand.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     provider_support::ControlledProvider,
     server_support::{
@@ -165,7 +166,7 @@ async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
         .subscribe_session(session_id)
         .await
         .expect("subscribe Session");
-    let initial = timeout(Duration::from_secs(1), subscription.next())
+    let initial = timeout(PROGRESS_DEADLINE, subscription.next())
         .await
         .expect("initial snapshot arrives")
         .expect("stream open")
@@ -175,7 +176,7 @@ async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
         suru::managed_client::SessionEvent::Snapshot(_)
     ));
 
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
     assert!(
@@ -229,7 +230,7 @@ async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
     assert_eq!(titled.title, "Fix reasoning group flicker");
     assert_eq!(titled.emoji.as_deref(), Some("🐛"));
     assert!(titled.revision.0 > created.revision.0);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = subscription
                 .next()
@@ -273,7 +274,7 @@ async fn an_errand_runs_at_the_providers_declared_errand_selection() {
         .await
         .expect("create Session");
 
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
     assert_eq!(
@@ -305,7 +306,7 @@ async fn a_withdrawn_errand_model_falls_back_to_the_providers_default_model() {
         .create_session(create_request(workspace.path(), "Explain the seam"))
         .await
         .expect("create Session");
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
@@ -319,7 +320,7 @@ async fn a_withdrawn_errand_model_falls_back_to_the_providers_default_model() {
         .create_session(create_request(workspace.path(), "Ship the picker"))
         .await
         .expect("create the second Session");
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("a second Errand reaches the Provider");
     assert_eq!(
@@ -389,7 +390,7 @@ async fn a_long_first_prompt_reaches_the_errand_as_its_opening_alone() {
         .await
         .expect("create Session");
 
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
     assert!(errand.prompt().contains(&"o".repeat(2_000)));
@@ -420,7 +421,7 @@ async fn a_failed_errand_leaves_the_prompt_derived_title_standing() {
         .expect("create Session");
     let session_id = created.session.id;
 
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .fail("the Provider is signed out");
@@ -462,7 +463,7 @@ async fn an_errand_that_never_answers_leaves_the_prompt_derived_title_standing()
 
     // Held rather than answered: a wedged Provider is one that takes the
     // request and says nothing.
-    let _wedged = timeout(Duration::from_secs(1), provider.next_errand())
+    let _wedged = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
 
@@ -499,7 +500,7 @@ async fn an_errand_answering_outside_its_schema_yields_no_partial_title() {
         .expect("create Session");
     let session_id = created.session.id;
 
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "emoji": "\u{1F680}" }));
@@ -537,7 +538,7 @@ async fn a_badly_behaved_title_is_cleaned_up_before_it_is_stored() {
         .await
         .expect("create Session");
 
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({
@@ -545,7 +546,7 @@ async fn a_badly_behaved_title_is_cleaned_up_before_it_is_stored() {
             "emoji": ":-)",
         }));
 
-    let (title, emoji) = timeout(Duration::from_secs(2), async {
+    let (title, emoji) = timeout(PROGRESS_DEADLINE, async {
         loop {
             let listed = listed_title(&client, created.session.id).await;
             if listed.0 != "Explain the seam" {
@@ -638,20 +639,20 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
         .expect("create Session");
     let session_id = created.session.id;
 
-    let mut session = timeout(Duration::from_secs(1), provider.next_start())
+    let mut session = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("the first Turn starts a Provider Session")
         .succeed(AgentIdentity {
             agent: AgentId::new("controlled-agent"),
             selection: hosted_selection(PROVIDER, MODEL),
         });
-    timeout(Duration::from_secs(1), session.next_turn())
+    timeout(PROGRESS_DEADLINE, session.next_turn())
         .await
         .expect("the first Turn reaches the Provider")
         .succeed();
     // The interrupt needs the Turn on the record before it can name something
     // to stop, so the wait stays even though nothing reads the id any more.
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client.read_session(session_id).await.expect("read Session");
             if let Some(turn) = snapshot.turns.first() {
@@ -669,7 +670,7 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
     session.emit(ProviderEvent::TurnInterrupted);
 
     // The Prompt was still written, so it still deserves a Title.
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
@@ -710,7 +711,7 @@ async fn an_errand_run_through_a_provider_side_session_creates_no_suru_session()
         .expect("create Session");
     let session_id = created.session.id;
 
-    let errand_start = timeout(Duration::from_secs(1), provider.next_errand_start())
+    let errand_start = timeout(PROGRESS_DEADLINE, provider.next_errand_start())
         .await
         .expect("the Errand opens a Provider-side Session");
     assert!(
@@ -721,7 +722,7 @@ async fn an_errand_run_through_a_provider_side_session_creates_no_suru_session()
         agent: AgentId::new("controlled-agent"),
         selection: hosted_selection(PROVIDER, MODEL),
     });
-    let delivered = timeout(Duration::from_secs(1), errand_session.next_turn())
+    let delivered = timeout(PROGRESS_DEADLINE, errand_session.next_turn())
         .await
         .expect("the Errand's one Prompt is delivered");
     assert!(delivered.prompt().contains("Explain the seam"));
@@ -788,7 +789,7 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
         .await
         .expect("create the undecided Session");
     for _ in 0..2 {
-        let errand = timeout(Duration::from_secs(1), provider.next_errand())
+        let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
             .await
             .expect("an Errand reaches the Provider");
         if errand.prompt().contains("Explain the seam") {
@@ -848,14 +849,14 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
 /// derivation would have had to reach the Provider. What follows can then say
 /// no Errand was asked for without waiting out a deadline.
 async fn work_the_first_turn(provider: &mut ControlledProvider) {
-    let mut session = timeout(Duration::from_secs(1), provider.next_start())
+    let mut session = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("the first Turn starts a Provider Session")
         .succeed(AgentIdentity {
             agent: AgentId::new("controlled-agent"),
             selection: hosted_selection(PROVIDER, MODEL),
         });
-    timeout(Duration::from_secs(1), session.next_turn())
+    timeout(PROGRESS_DEADLINE, session.next_turn())
         .await
         .expect("the first Turn reaches the Provider")
         .succeed();
@@ -926,7 +927,7 @@ async fn a_pinned_selection_titles_a_session_whatever_that_session_converses_at(
         .await
         .expect("create Session");
 
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
     assert_eq!(
@@ -1003,7 +1004,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
         .expect("create Session");
     assert_eq!(created.session.agent_selection, None);
 
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider");
     assert_eq!(
@@ -1040,7 +1041,7 @@ async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model(
         .create_session(create_request(workspace.path(), "Explain the seam"))
         .await
         .expect("create Session");
-    timeout(Duration::from_secs(1), provider.next_errand())
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "title": "Explain the Provider seam", "emoji": "\u{1F9F5}" }));
@@ -1052,7 +1053,7 @@ async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model(
         .create_session(create_request(workspace.path(), "Ship the picker"))
         .await
         .expect("create the second Session");
-    let errand = timeout(Duration::from_secs(1), provider.next_errand())
+    let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("a second Errand reaches the Provider");
     assert_eq!(

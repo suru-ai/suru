@@ -1,5 +1,6 @@
 //! Native optional snapshots through the runtime, server, persistence and client contract.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::time::Duration;
 
 use suru::{
@@ -126,7 +127,7 @@ fn fill(tokens: u64, capacity: Option<u64>) -> Option<ContextFill> {
 }
 
 async fn wait_for_queries(claude: &ScriptedClaude, count: usize) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(PROGRESS_DEADLINE, async {
         while claude
             .control_subtypes()
             .iter()
@@ -610,7 +611,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(PROGRESS_DEADLINE, async {
         while let Some(event) = events.next().await {
             if matches!(event.unwrap().event, ProviderEvent::ContextFill { .. }) {
                 return;

@@ -1,5 +1,6 @@
 //! Prompt admission: ordering, idempotent retries, mutation, and rejection.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
@@ -278,7 +279,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         .error_for_status()
         .expect("Session stream authenticates");
     let mut events = response.bytes_stream().eventsource();
-    timeout(Duration::from_secs(1), events.next())
+    timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Session snapshot arrives")
         .expect("Session stream remains open")
@@ -317,7 +318,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
     assert_eq!(admitted.id, prompt_id);
     assert_eq!(admitted.status, PromptStatus::Pending);
 
-    let update_event = timeout(Duration::from_secs(1), events.next())
+    let update_event = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Session update arrives")
         .expect("Session stream remains open")
@@ -330,7 +331,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         |change| matches!(change, SessionChange::PromptAdded { prompt } if prompt.id == prompt_id)
     ));
 
-    let failure_event = timeout(Duration::from_secs(1), events.next())
+    let failure_event = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Provider failure update arrives")
         .expect("Session stream remains open")
@@ -897,7 +898,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     );
 
     provider_session.emit(ProviderEvent::TurnInterrupted);
-    let SessionEvent::Updated(interrupt_update) = timeout(Duration::from_secs(1), observer.next())
+    let SessionEvent::Updated(interrupt_update) = timeout(PROGRESS_DEADLINE, observer.next())
         .await
         .expect("interruption update arrives")
         .expect("observer stream remains open")
@@ -1003,7 +1004,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
     );
     queued_start.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = second
                 .read_session(session_id)
@@ -1079,7 +1080,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
         .error_for_status()
         .expect("Session stream authenticates");
     let mut events = response.bytes_stream().eventsource();
-    timeout(Duration::from_secs(1), events.next())
+    timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Session snapshot arrives")
         .expect("Session stream remains open")
@@ -1116,7 +1117,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
 
     let mut admitted_prompts = Vec::new();
     for offset in 1..=64 {
-        let event = timeout(Duration::from_secs(1), events.next())
+        let event = timeout(PROGRESS_DEADLINE, events.next())
             .await
             .expect("every consecutive Session update arrives")
             .expect("Session stream remains open")

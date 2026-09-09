@@ -1,3 +1,4 @@
+use crate::support::PROGRESS_DEADLINE;
 use base64::Engine as _;
 use diesel::{
     Connection, QueryableByName, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
@@ -224,7 +225,7 @@ async fn dial_with_unknown_certificate(
                 Err(error) => Err(error),
                 Ok(()) => {
                     let mut byte = [0];
-                    match timeout(Duration::from_secs(1), stream.read(&mut byte)).await {
+                    match timeout(PROGRESS_DEADLINE, stream.read(&mut byte)).await {
                         Ok(Err(error)) => Err(error),
                         Ok(Ok(0)) => Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
@@ -325,7 +326,7 @@ async fn open_paired_health_connection(
         .await
         .unwrap();
     let mut response = vec![0_u8; 4096];
-    let read = timeout(Duration::from_secs(1), stream.read(&mut response))
+    let read = timeout(PROGRESS_DEADLINE, stream.read(&mut response))
         .await
         .expect("paired health responds promptly")
         .expect("read paired health response");
@@ -588,7 +589,7 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
         .expect("turn Serving off through the still-attached local Client");
     assert_eq!(server.serving_address(), None);
     let mut byte = [0];
-    match timeout(Duration::from_secs(1), serving_connection.read(&mut byte))
+    match timeout(PROGRESS_DEADLINE, serving_connection.read(&mut byte))
         .await
         .expect("Serving connection is dropped promptly")
     {
@@ -1016,7 +1017,7 @@ async fn wait_for_counter(
     reached: fn(usize, usize) -> bool,
     description: &str,
 ) {
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if reached(*counter.borrow(), expected) {
                 return;
@@ -1243,7 +1244,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .expect("Remote Session stream succeeds");
     let mut events = response.bytes_stream().eventsource();
     pair.wire.wait_for_connections(1).await;
-    let snapshot = timeout(Duration::from_secs(1), events.next())
+    let snapshot = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Remote Session snapshot arrives")
         .expect("Remote Session stream remains open")
@@ -1279,7 +1280,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .json::<suru::protocol::Prompt>()
         .await
         .expect("decode admitted Remote Prompt");
-    let update = timeout(Duration::from_secs(1), async {
+    let update = timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = events
                 .next()
@@ -1355,7 +1356,7 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
         .error_for_status()
         .expect("the proxied Session stream succeeds");
     let mut events = response.bytes_stream().eventsource();
-    let snapshot = timeout(Duration::from_secs(1), events.next())
+    let snapshot = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Remote Session snapshot arrives")
         .expect("Remote Session stream remains open")
@@ -1440,13 +1441,10 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    let initial = timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("Remote catalog snapshot arrives")
-    .expect("Remote catalog stream remains open");
+    let initial = timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog stream remains open");
     let ManagedEvent::SessionCatalogReconciled(snapshot) = initial else {
         panic!("Remote catalog starts with a snapshot");
     };
@@ -1482,13 +1480,10 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         })
         .await
         .expect("create a Session on the Remote");
-    let announced = timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("Remote catalog update arrives")
-    .expect("Remote catalog stream remains open");
+    let announced = timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("Remote catalog update arrives")
+        .expect("Remote catalog stream remains open");
     assert!(matches!(
         announced,
         ManagedEvent::SessionCreated(created_event)
@@ -1511,7 +1506,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
         .subscribe_session(created.session.id)
         .await
         .expect("open the Remote Session stream");
-    let snapshot = timeout(Duration::from_secs(1), stream.next())
+    let snapshot = timeout(PROGRESS_DEADLINE, stream.next())
         .await
         .expect("Remote Session snapshot arrives")
         .expect("Remote Session stream remains open")
@@ -1534,13 +1529,10 @@ async fn successive_remote_requests_reuse_transport_while_an_outlook_holds_inter
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("Remote catalog snapshot arrives")
-    .expect("Remote catalog interest remains live");
+    timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     remote
@@ -1634,12 +1626,9 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let mut laptop_catalog = laptop_outlook.subscribe_catalog();
     for mut catalog in [&mut workstation_catalog, &mut laptop_catalog] {
         assert!(matches!(
-            timeout(
-                Duration::from_secs(1),
-                next_session_catalog_event(&mut catalog)
-            )
-            .await
-            .expect("Remote catalog snapshot arrives"),
+            timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+                .await
+                .expect("Remote catalog snapshot arrives"),
             Some(ManagedEvent::SessionCatalogReconciled(_))
         ));
     }
@@ -1649,7 +1638,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     pair.wire.set_online(false).await;
     assert!(matches!(
         timeout(
-            Duration::from_secs(1),
+            PROGRESS_DEADLINE,
             next_session_catalog_event(&mut workstation_catalog)
         )
         .await
@@ -1674,14 +1663,14 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
         .await
         .expect("create a Session while the other Remote recovers");
     assert!(matches!(
-        timeout(Duration::from_secs(1), next_session_catalog_event(&mut laptop_catalog))
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut laptop_catalog))
             .await
             .expect("the undisturbed laptop catalog reports its update"),
         Some(ManagedEvent::SessionCreated(event)) if event.session_id == created.session.id
     ));
 
     pair.wire.set_online(true).await;
-    let recovered = timeout(Duration::from_secs(1), async {
+    let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
             match next_session_catalog_event(&mut workstation_catalog).await {
                 Some(ManagedEvent::Recovering(_)) => {}
@@ -1750,25 +1739,19 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
     assert!(matches!(
-        timeout(
-            Duration::from_secs(1),
-            next_session_catalog_event(&mut catalog)
-        )
-        .await
-        .expect("Remote catalog snapshot arrives"),
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            .await
+            .expect("Remote catalog snapshot arrives"),
         Some(ManagedEvent::SessionCatalogReconciled(_))
     ));
     pair.wire.wait_for_connections(1).await;
 
     pair.wire.set_online(false).await;
     assert_eq!(
-        timeout(
-            Duration::from_secs(1),
-            next_session_catalog_event(&mut catalog)
-        )
-        .await
-        .expect("transient drop announces recovery")
-        .expect("Remote catalog interest remains live"),
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            .await
+            .expect("transient drop announces recovery")
+            .expect("Remote catalog interest remains live"),
         ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
             attempt: 1,
             retry_in: Duration::from_millis(5),
@@ -1776,7 +1759,7 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
     );
 
     pair.wire.set_online(true).await;
-    let first_restored_event = timeout(Duration::from_secs(1), async {
+    let first_restored_event = timeout(PROGRESS_DEADLINE, async {
         loop {
             match next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::Recovering(_)) => {}
@@ -1794,12 +1777,9 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
         "the recovered catalog snapshot lands before reconnect presentation clears"
     );
     assert!(matches!(
-        timeout(
-            Duration::from_secs(1),
-            next_session_catalog_event(&mut catalog)
-        )
-        .await
-        .expect("reconnect presentation clears after catalog hydration"),
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            .await
+            .expect("reconnect presentation clears after catalog hydration"),
         Some(ManagedEvent::RemoteRecovered)
     ));
     pair.wire.wait_for_connections(1).await;
@@ -1816,23 +1796,17 @@ async fn dropping_remote_catalog_interest_stops_its_retry_loop() {
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("Remote catalog snapshot arrives")
-    .expect("Remote catalog interest remains live");
+    timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     pair.wire.set_online(false).await;
     assert!(matches!(
-        timeout(
-            Duration::from_secs(1),
-            next_session_catalog_event(&mut catalog)
-        )
-        .await
-        .expect("transient drop announces recovery"),
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            .await
+            .expect("transient drop announces recovery"),
         Some(ManagedEvent::Recovering(_))
     ));
     drop(catalog);
@@ -1855,19 +1829,16 @@ async fn revocation_stops_remote_catalog_retries_and_surfaces_a_terminal_status(
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
     let mut catalog = remote.subscribe_catalog();
-    timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("Remote catalog snapshot arrives")
-    .expect("Remote catalog interest remains live");
+    timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("Remote catalog snapshot arrives")
+        .expect("Remote catalog interest remains live");
     pair.wire.wait_for_connections(1).await;
 
     let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
     pair.serving_client.remove_peer(&peer.id).await.unwrap();
     let mut saw_recovery = false;
-    let failure = timeout(Duration::from_secs(1), async {
+    let failure = timeout(PROGRESS_DEADLINE, async {
         loop {
             match next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::Recovering(_)) => saw_recovery = true,
@@ -1933,7 +1904,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
         .await
         .expect("attach Remote Session");
     assert!(matches!(
-        timeout(Duration::from_secs(1), session.next())
+        timeout(PROGRESS_DEADLINE, session.next())
             .await
             .expect("Remote Session snapshot arrives")
             .expect("Remote Session interest remains live")
@@ -1944,7 +1915,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
 
     let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
     pair.serving_client.remove_peer(&peer.id).await.unwrap();
-    let error = timeout(Duration::from_secs(1), session.next())
+    let error = timeout(PROGRESS_DEADLINE, session.next())
         .await
         .expect("revocation settles the Remote Session retry loop")
         .expect("terminal failure is delivered before the stream closes")
@@ -1990,7 +1961,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
         .attach_session(created.session.id)
         .await
         .expect("attach Remote Session");
-    timeout(Duration::from_secs(1), session.next())
+    timeout(PROGRESS_DEADLINE, session.next())
         .await
         .expect("Remote Session snapshot arrives")
         .expect("Remote Session interest remains live")
@@ -2004,7 +1975,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
         .await;
     pair.wire.set_online(true).await;
     assert!(matches!(
-        timeout(Duration::from_secs(1), session.next())
+        timeout(PROGRESS_DEADLINE, session.next())
             .await
             .expect("Remote Session reconnects when its route returns")
             .expect("Remote Session interest remains live")
@@ -2320,13 +2291,10 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     let mut catalog = connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()))
         .subscribe_catalog();
-    let terminal = timeout(
-        Duration::from_secs(1),
-        next_session_catalog_event(&mut catalog),
-    )
-    .await
-    .expect("protocol mismatch answers without retrying")
-    .expect("Remote catalog reports its terminal status");
+    let terminal = timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+        .await
+        .expect("protocol mismatch answers without retrying")
+        .expect("Remote catalog reports its terminal status");
     assert!(matches!(
         terminal,
         ManagedEvent::RemoteFailed {
@@ -2363,7 +2331,6 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
             .with_config_dir(serving_config_root.path()),
         ServerTimings {
             shutdown_grace: Duration::from_millis(5),
-            invite_ttl: Duration::from_millis(200),
             ..ServerTimings::default()
         },
     )
@@ -2490,13 +2457,56 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .expect_err("second redemption is rejected");
     assert_eq!(pairing_error_code(&error), SessionErrorCode::InviteSpent);
 
-    let expired = serving_client
+    // Expiry is the one error here that wants a short-lived Invite, and it wants
+    // one of its own. Every other Invite in this test has to outlive the
+    // redemptions and Server spawns between issuing it and using it, which takes
+    // longer on a loaded machine than any lifetime short enough to wait out, so
+    // pinning them all to the same brief `invite_ttl` made whichever redemption
+    // lost the race report an expired Invite instead of the error it names. This
+    // Server exists only to issue an Invite already past its lifetime; waiting
+    // longer than intended can only make it more expired.
+    let expiring_state = tempfile::tempdir().expect("create expiring state directory");
+    let expiring_config_root = tempfile::tempdir().expect("create expiring config directory");
+    let expiring = server::spawn_with_timings(
+        ServerConfig::new(expiring_state.path(), "invite-errors-expiring")
+            .expect("configure expiring Server")
+            .with_config_dir(expiring_config_root.path()),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            invite_ttl: Duration::from_millis(20),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .expect("spawn expiring Server");
+    let mut expiring_client = ManagedClient::connect(
+        ManagedClientConfig::new(expiring_state.path(), "invite-errors-expiring")
+            .expect("configure expiring Client"),
+    )
+    .await
+    .expect("attach expiring Client");
+    receive_initial_state(&mut expiring_client).await;
+    expiring_client
+        .mutate_setting(SettingMutation::ServingPort { value: Some(0) })
+        .await
+        .unwrap();
+    expiring_client
+        .mutate_setting(SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .expect("keep this test on the loopback address it dials");
+    expiring_client
+        .mutate_setting(SettingMutation::ServingEnabled { value: Some(true) })
+        .await
+        .unwrap();
+    let expired = expiring_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            addresses: vec![expiring.serving_address().unwrap()],
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(225)).await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
     let error = fresh_client
         .redeem_invite(RedeemInviteRequest {
             invite: expired.invite,
@@ -2548,9 +2558,11 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
 
     drop(connecting_client);
     drop(fresh_client);
+    drop(expiring_client);
     drop(serving_client);
     connecting.shutdown().await.unwrap();
     fresh.shutdown().await.unwrap();
+    expiring.shutdown().await.unwrap();
     serving.shutdown().await.unwrap();
 }
 
@@ -2704,12 +2716,9 @@ async fn removing_a_peer_closes_the_connection_that_enrolled_it() {
     serving_client.remove_peer(&peer.id).await.unwrap();
 
     let mut byte = [0_u8];
-    match timeout(
-        Duration::from_secs(1),
-        enrollment_connection.read(&mut byte),
-    )
-    .await
-    .expect("removing the Peer promptly closes its enrollment connection")
+    match timeout(PROGRESS_DEADLINE, enrollment_connection.read(&mut byte))
+        .await
+        .expect("removing the Peer promptly closes its enrollment connection")
     {
         Ok(0) | Err(_) => {}
         Ok(read) => panic!("revoked enrollment connection produced {read} unexpected bytes"),
@@ -2871,7 +2880,7 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         .expect("remove Peer through the Serving Server");
     assert!(serving_client.list_peers().await.unwrap().is_empty());
     let mut byte = [0_u8];
-    match timeout(Duration::from_secs(1), live_connection.read(&mut byte))
+    match timeout(PROGRESS_DEADLINE, live_connection.read(&mut byte))
         .await
         .expect("removing a Peer promptly ends its live connections")
     {
@@ -3566,7 +3575,7 @@ async fn authenticated_manual_stop_notifies_clients_and_removes_its_registration
         .expect("decode stopping health");
     assert_eq!(stopping.lifecycle, LifecycleState::Stopping);
 
-    let shutdown = match timeout(Duration::from_secs(1), managed.next())
+    let shutdown = match timeout(PROGRESS_DEADLINE, managed.next())
         .await
         .expect("managed client receives manual shutdown intent")
     {
@@ -3580,11 +3589,11 @@ async fn authenticated_manual_stop_notifies_clients_and_removes_its_registration
     assert_eq!(shutdown.instance_id, descriptor.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Manual);
     assert!(matches!(
-        timeout(Duration::from_secs(1), managed.next()).await,
+        timeout(PROGRESS_DEADLINE, managed.next()).await,
         Ok(None)
     ));
 
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         while config.descriptor_path().exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -3616,7 +3625,7 @@ async fn stop_waits_for_its_target_when_the_registration_is_replaced() {
     let stopping = tokio::spawn(async move { stop_server(&stop_config).await });
     let client = reqwest::Client::new();
 
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let health = client
                 .get(format!("{}/health", descriptor.base_url))
@@ -3975,12 +3984,12 @@ async fn managed_client_connects_without_periodic_domain_events() {
     .expect("connect managed client");
 
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
+        timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("connecting event arrives"),
         Some(ManagedEvent::Connecting)
     ));
-    let connected = timeout(Duration::from_secs(1), client.next())
+    let connected = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("connected event arrives")
         .expect("managed client remains open");
@@ -3991,7 +4000,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     assert_eq!(identity.pid, descriptor.pid);
     assert!(
         matches!(
-            timeout(Duration::from_secs(1), client.next())
+            timeout(PROGRESS_DEADLINE, client.next())
                 .await
                 .expect("settings snapshot arrives"),
             Some(ManagedEvent::SettingsSnapshot(_))
@@ -4000,7 +4009,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     );
     assert!(
         matches!(
-            timeout(Duration::from_secs(1), client.next())
+            timeout(PROGRESS_DEADLINE, client.next())
                 .await
                 .expect("Model Catalog arrives"),
             Some(ManagedEvent::ModelCatalog(_))
@@ -4042,7 +4051,7 @@ async fn sse_keepalive_comments_are_periodic_and_event_neutral() {
     let mut chunks = response.bytes_stream();
     let mut raw = Vec::new();
 
-    timeout(Duration::from_secs(5), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let chunk = chunks
                 .next()
@@ -4091,7 +4100,7 @@ async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery()
     receive_initial_state(&mut client).await;
 
     let observe_shutdown = async {
-        match timeout(Duration::from_secs(1), client.next())
+        match timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("shutdown intent arrives")
         {
@@ -4106,7 +4115,7 @@ async fn graceful_server_shutdown_emits_intent_without_starting_crash_recovery()
             None => panic!("managed client closed without shutdown intent"),
         }
         assert!(matches!(
-            timeout(Duration::from_secs(1), client.next()).await,
+            timeout(PROGRESS_DEADLINE, client.next()).await,
             Ok(None)
         ));
     };
@@ -4136,7 +4145,7 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
     let response = request_server_shutdown(&descriptor, ShutdownReason::Replacement).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
-    let event = timeout(Duration::from_secs(1), async {
+    let event = timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = events
                 .next()
@@ -4198,7 +4207,7 @@ async fn remote_catalog_delivers_model_names_and_updates_without_listing_models(
         .connecting_client
         .outlook(Outlook::Remote("workstation".into()));
     let mut subscription = remote.subscribe_catalog();
-    let catalog = timeout(Duration::from_millis(500), async {
+    let catalog = timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await
                 && catalog.providers[0].status == ProviderCatalogStatus::Fresh
@@ -4217,7 +4226,7 @@ async fn remote_catalog_delivers_model_names_and_updates_without_listing_models(
 
     drop(subscription);
     let mut subscription = remote.subscribe_catalog();
-    let cached = timeout(Duration::from_millis(500), async {
+    let cached = timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await {
                 break catalog;
@@ -4238,7 +4247,7 @@ async fn remote_catalog_delivers_model_names_and_updates_without_listing_models(
 
     runtime.set_unavailable(Some(suru::protocol::ProviderUnavailability::NotSignedIn));
     pair.serving_client.refresh_models().await.unwrap();
-    timeout(Duration::from_millis(500), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::ModelCatalog(catalog)) = subscription.next().await
                 && matches!(

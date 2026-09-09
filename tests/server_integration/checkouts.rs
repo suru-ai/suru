@@ -1,5 +1,6 @@
 //! Real external Git mutations enter via the owning Server's catalog stream.
 use super::*;
+use crate::support::PROGRESS_DEADLINE;
 use std::path::Path;
 use suru::{
     managed_client::{OutlookClient, SessionCatalogSubscription},
@@ -65,7 +66,7 @@ async fn observed(
     count: usize,
     expected: impl Fn(&CheckoutSummary) -> bool,
 ) -> Vec<SessionSummary> {
-    timeout(Duration::from_secs(3), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let listed = summaries(client).await;
             if listed.len() == count
@@ -158,14 +159,14 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     // every later creation in the same Repository. Answering also settles what
     // `updated_at` reads before the comparison below is taken.
     let a = create(&local, &linked).await;
-    let _first_session = timeout(Duration::from_secs(3), provider.next_start())
+    let _first_session = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("the first Session asks its Provider to start")
         .succeed(identity());
     let nested = linked.join("nested");
     std::fs::create_dir(&nested).unwrap();
     let b = create(&other, &nested).await;
-    let _second_session = timeout(Duration::from_secs(3), provider.next_start())
+    let _second_session = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("the second Session asks its Provider to start")
         .succeed(identity());
@@ -397,11 +398,11 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
         // Admission now retains the Repository barrier through native startup.
         // Finish that unrelated startup before admitting the next Session;
         // observation interest remains absent and must still cause no polls.
-        timeout(Duration::from_secs(1), provider.next_start())
+        timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .unwrap()
             .fail("Observation fixture has no native work");
-        timeout(Duration::from_secs(1), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 let current = reqwest::Client::new()
                     .get(format!(
@@ -450,15 +451,15 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
     let other = second.outlook(Outlook::Local);
     let mut one = local.subscribe_catalog();
     let mut two = other.subscribe_catalog();
-    timeout(Duration::from_secs(1), one.next())
+    timeout(PROGRESS_DEADLINE, one.next())
         .await
         .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(1), two.next())
+    timeout(PROGRESS_DEADLINE, two.next())
         .await
         .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(1), calls_rx.recv())
+    timeout(PROGRESS_DEADLINE, calls_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -470,7 +471,7 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
     observed(&local, &mut one, 2, |r| branch(r, "main")).await;
     observed(&other, &mut two, 2, |r| branch(r, "main")).await;
     // Block the next reading so dropping interest has a deterministic boundary.
-    timeout(Duration::from_secs(1), calls_rx.recv())
+    timeout(PROGRESS_DEADLINE, calls_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -674,17 +675,17 @@ async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
     let resume = ProviderResumeState::new(serde_json::json!({"remote-context":"preserve"}));
     for _ in 0..2 {
         let id = create(&remote, &linked).await;
-        let start = timeout(Duration::from_secs(2), provider.next_start())
+        let start = timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .unwrap();
         let mut connection = start.succeed_with_resume(identity(), Some(resume.clone()));
-        timeout(Duration::from_secs(2), connection.next_turn())
+        timeout(PROGRESS_DEADLINE, connection.next_turn())
             .await
             .unwrap()
             .succeed();
         connection.emit(ProviderEvent::TurnCompleted);
         let mut feed = remote.subscribe_session(id).await.unwrap();
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 if remote
                     .read_session(id)
@@ -729,13 +730,13 @@ async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
     let b = tokio::spawn(async move { client_b.admit_prompt(id_b, request()).await });
     let mut new_connections = Vec::new();
     for _ in 0..2 {
-        let start = timeout(Duration::from_secs(3), provider.next_start())
+        let start = timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .unwrap();
         assert_eq!(start.execution_directory(), linked);
         assert_eq!(start.resume_state(), Some(&resume));
         let mut connection = start.succeed_with_resume(identity(), Some(resume.clone()));
-        timeout(Duration::from_secs(2), connection.next_turn())
+        timeout(PROGRESS_DEADLINE, connection.next_turn())
             .await
             .unwrap()
             .succeed();
@@ -791,7 +792,7 @@ async fn remote_removal_routes_to_owner_counts_its_catalog_and_streams_missing()
     let local = pair.connecting_client.outlook(Outlook::Local);
     let mut subscription = remote.subscribe_catalog();
     let id = create(&remote, &linked).await;
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap();
     let mut connection = start.succeed(AgentIdentity {
@@ -802,14 +803,14 @@ async fn remote_removal_routes_to_owner_counts_its_catalog_and_streams_missing()
             options: vec![],
         },
     });
-    timeout(Duration::from_secs(2), connection.next_turn())
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
         .await
         .unwrap()
         .succeed();
     connection
         .emit_and_wait_until_observed(suru::provider::ProviderEvent::TurnCompleted)
         .await;
-    timeout(Duration::from_secs(2), async { loop { if remote.list_sessions(None).await.unwrap().iter().any(|s| matches!(s, SessionListItem::Readable(s) if s.session.id == id && s.session.working_since.is_none())) { break; } tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap();
+    timeout(PROGRESS_DEADLINE, async { loop { if remote.list_sessions(None).await.unwrap().iter().any(|s| matches!(s, SessionListItem::Readable(s) if s.session.id == id && s.session.working_since.is_none())) { break; } tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap();
     create(&local, &linked).await;
     observed(&remote, &mut subscription, 1, |r| branch(r, "topic")).await;
     let location = GitSourceControl::default().discover(&linked).await;

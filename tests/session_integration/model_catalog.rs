@@ -3,6 +3,7 @@
 //! connect, and remembered across restarts so Models are served by name
 //! before any Provider has answered.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -18,7 +19,7 @@ use suru::{
     },
     server::{self, RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 fn named_model(model: &str, display_name: &str) -> ModelDescriptor {
     ModelDescriptor {
@@ -85,7 +86,7 @@ async fn next_event(
     > + Unpin
          ),
 ) -> Event {
-    timeout(Duration::from_secs(2), events.next())
+    timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("an event arrives")
         .expect("the stream stays open")

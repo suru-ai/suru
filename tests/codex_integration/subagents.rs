@@ -3,6 +3,7 @@
 //! child completion arriving after the parent's turn completed settles the row rather than
 //! erroring, and a child's own spawns recurse one level down.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -79,7 +80,7 @@ async fn session_where(
         .subscribe_session(session_id)
         .await
         .expect("subscribe to Session SSE");
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)

@@ -1,5 +1,6 @@
 //! Per-Turn Usage and Estimated Cost derived from Codex's cumulative metering.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use axum::{Json, Router, routing::get};
 use serde_json::json;
@@ -317,7 +318,7 @@ async fn metered_session_with_pricing(
 }
 
 async fn settled_turn(client: &ManagedClient, session: SessionId, index: usize) -> SessionSnapshot {
-    timeout(Duration::from_secs(3), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session)
@@ -545,7 +546,7 @@ async fn an_interrupted_codex_turn_keeps_the_usage_it_had_accrued() {
     )
     .await;
     let client = &opened.client;
-    timeout(Duration::from_secs(3), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(opened.session_id)
@@ -803,7 +804,7 @@ async fn stalled_pricing_does_not_delay_turn(initially_warm: bool) {
     }
     let warming = pricing.clone();
     let prime = tokio::spawn(async move { warming.prime().await });
-    timeout(Duration::from_secs(1), entered.notified())
+    timeout(PROGRESS_DEADLINE, entered.notified())
         .await
         .unwrap();
     let fixture = ScriptedCodex::new(&METERED_TURNS_CODEX.replace("__MODEL__", "priced-fixture"));

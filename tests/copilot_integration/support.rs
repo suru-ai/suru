@@ -6,6 +6,7 @@
 //! test supplies, matched against the request body, with `$COPILOT_FIXTURE_ID` standing for the
 //! request's JSON-RPC ID and `reply` framing a response body.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
@@ -443,7 +444,7 @@ impl ScriptedCopilot {
 
     /// The first request the runtime made for `method`, once it has.
     pub async fn wait_for_request(&self, method: &str) -> serde_json::Value {
-        timeout(Duration::from_secs(5), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 if let Some(request) = self.requests().into_iter().find(|request| {
                     request.get("method").and_then(serde_json::Value::as_str) == Some(method)
@@ -463,7 +464,7 @@ impl ScriptedCopilot {
     }
 
     pub async fn wait_for_exit(&self) {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             while !self.exited.exists() {
                 tokio::task::yield_now().await;
             }
@@ -704,7 +705,7 @@ pub async fn session_where(
     what: &str,
     predicate: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)

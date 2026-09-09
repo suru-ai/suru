@@ -1,5 +1,6 @@
 //! Interrupting an active turn and settling what it left in flight.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use std::sync::Arc;
 use suru::{
@@ -129,7 +130,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
 
     fixture.release();
     let mut interrupted_transitions = 0;
-    let interrupted = timeout(Duration::from_secs(2), async {
+    let interrupted = timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = feed
                 .next()
@@ -265,7 +266,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     assert_eq!(active.turns[0].status, TurnStatus::Active);
 
     let error = timeout(
-        Duration::from_secs(2),
+        PROGRESS_DEADLINE,
         client.interrupt_session(created.session.id),
     )
     .await
@@ -276,7 +277,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
         "expected {expected_error:?} in {error:#}"
     );
 
-    let failed = timeout(Duration::from_secs(2), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             feed.next()
                 .await

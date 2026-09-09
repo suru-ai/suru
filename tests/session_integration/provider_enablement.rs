@@ -10,6 +10,7 @@
 //! the `enabled` Settings are a compile-time table keyed by them — a Provider
 //! the schema does not name has no Setting to turn off.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::{path::Path, sync::Arc};
 
 use crate::{
@@ -27,7 +28,7 @@ use suru::{
     provider::ProviderEvent,
     server::{self, RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 /// A Provider double serving one default Model, under a real Provider identity
 /// so its `enabled` Setting exists.
@@ -132,7 +133,7 @@ async fn admit_prompt(descriptor: &RuntimeDescriptor, session_id: SessionId, tex
 
 /// The text of the Error Activity a failed Turn carries, once it has settled.
 async fn failed_turn_error(descriptor: &RuntimeDescriptor, session_id: SessionId) -> String {
-    let snapshot = timeout(Duration::from_secs(1), async {
+    let snapshot = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session(descriptor, session_id).await;
             if snapshot
@@ -522,7 +523,7 @@ async fn disabling_mid_turn_lets_the_running_turn_settle_and_the_next_prompt_is_
 
     // The Turn that was already running settles as it always would.
     session.emit(ProviderEvent::TurnCompleted);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session(&descriptor, created.session.id).await;
             if snapshot
@@ -574,7 +575,7 @@ async fn enabling_a_provider_disabled_at_startup_produces_its_models_without_a_m
     )
     .await;
 
-    let models = timeout(Duration::from_secs(1), async {
+    let models = timeout(PROGRESS_DEADLINE, async {
         loop {
             let codex = provider_catalog(&list_catalog(&descriptor).await, "codex");
             if !codex.models.is_empty() {
@@ -628,7 +629,7 @@ async fn a_disable_enable_round_trip_costs_a_provider_that_already_discovered_it
         SettingMutation::ProviderCodexEnabled { value: None },
     )
     .await;
-    let restored = timeout(Duration::from_secs(1), async {
+    let restored = timeout(PROGRESS_DEADLINE, async {
         loop {
             let codex = provider_catalog(&list_catalog(&descriptor).await, "codex");
             if !codex.models.is_empty() {

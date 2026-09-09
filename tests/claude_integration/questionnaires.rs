@@ -1,4 +1,5 @@
 //! Native stdio can_use_tool requests under the unchanged full-auto Session posture.
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, flag_value, user_turn_arm,
 };
@@ -52,7 +53,7 @@ async fn pending(live: &mut LiveTurn) -> Questionnaire {
         .unwrap()
 }
 async fn native_response(fixture: &ScriptedClaude, id: &str) -> Value {
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(value) = fixture
                 .requests()

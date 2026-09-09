@@ -1,3 +1,4 @@
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{read_session_until, working_turn};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -75,7 +76,7 @@ async fn questionnaire_answer_crosses_the_public_client_and_is_readable_in_durab
         .await
         .unwrap();
     let received = timeout(
-        Duration::from_secs(1),
+        PROGRESS_DEADLINE,
         live.provider_session.next_questionnaire_submission(),
     )
     .await
@@ -299,7 +300,7 @@ async fn session_batch_validation_preserves_each_question_and_only_accepts_suppo
         .unwrap();
     assert_eq!(
         timeout(
-            Duration::from_secs(1),
+            PROGRESS_DEADLINE,
             live.provider_session.next_questionnaire_submission()
         )
         .await
@@ -340,7 +341,7 @@ async fn concurrent_questionnaires_keep_ids_order_and_catalog_attention_through_
             .emit(ProviderEvent::QuestionnaireRequested {
                 questionnaire: question.clone(),
             });
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 let SessionEvent::Updated(update) = feed.next().await.unwrap().unwrap() else { continue };
                 assert!(!update.changes.iter().any(|c| matches!(c, SessionChange::TurnAdded { .. })));
@@ -348,7 +349,7 @@ async fn concurrent_questionnaires_keep_ids_order_and_catalog_attention_through_
             }
         }).await.unwrap();
     }
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::SessionStandingInputsChanged(changed)) = client.next().await
                 && changed.inputs.pending_questionnaires == vec![first.id, second.id]
@@ -389,7 +390,7 @@ async fn concurrent_questionnaires_keep_ids_order_and_catalog_attention_through_
     assert!(snapshot.activities.iter().any(|a| matches!(a, Activity::Questionnaire { questionnaire, outcome: QuestionnaireOutcome::Pending, .. } if questionnaire.id == first.id)));
     live.provider_session
         .emit(ProviderEvent::QuestionnaireWithdrawn { id: first.id });
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::SessionStandingInputsChanged(changed)) = client.next().await
                 && changed.inputs.pending_questionnaires.is_empty()
@@ -416,7 +417,7 @@ async fn streamed_outcome(
     expected: QuestionnaireOutcome,
 ) {
     use suru::{managed_client::SessionEvent, protocol::SessionChange};
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             match feed.next().await.unwrap().unwrap() {
                 SessionEvent::Updated(update)
@@ -510,7 +511,7 @@ async fn racing_clients_publish_acceptance_and_one_outcome_without_duplicate_pro
             });
         }
         let delivery = timeout(
-            Duration::from_secs(2),
+            PROGRESS_DEADLINE,
             live.provider_session.next_questionnaire_delivery(),
         )
         .await
@@ -520,7 +521,7 @@ async fn racing_clients_publish_acceptance_and_one_outcome_without_duplicate_pro
         // The winner is still waiting at the Provider. The losing request must
         // already be rejected; an actor blocked on delivery would time out here.
         assert!(
-            timeout(Duration::from_secs(2), submissions.join_next())
+            timeout(PROGRESS_DEADLINE, submissions.join_next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -558,7 +559,7 @@ async fn racing_clients_publish_acceptance_and_one_outcome_without_duplicate_pro
             QuestionnaireSubmission::Decline => (QuestionnaireOutcome::Declined, None),
         };
         delivery.succeed();
-        timeout(Duration::from_secs(2), submissions.join_next())
+        timeout(PROGRESS_DEADLINE, submissions.join_next())
             .await
             .unwrap()
             .unwrap()
@@ -694,7 +695,7 @@ async fn gated_delivery_does_not_block_withdrawal_or_interruption_and_cannot_ove
                 .await
         });
         let delivery = timeout(
-            Duration::from_secs(2),
+            PROGRESS_DEADLINE,
             live.provider_session.next_questionnaire_delivery(),
         )
         .await
@@ -703,15 +704,12 @@ async fn gated_delivery_does_not_block_withdrawal_or_interruption_and_cannot_ove
             let interrupter = client.clone();
             let interruption =
                 tokio::spawn(async move { interrupter.interrupt_session(session_id).await });
-            timeout(
-                Duration::from_secs(2),
-                live.provider_session.next_interrupt(),
-            )
-            .await
-            .unwrap()
-            .succeed();
+            timeout(PROGRESS_DEADLINE, live.provider_session.next_interrupt())
+                .await
+                .unwrap()
+                .succeed();
             live.provider_session.emit(ProviderEvent::TurnInterrupted);
-            timeout(Duration::from_secs(2), interruption)
+            timeout(PROGRESS_DEADLINE, interruption)
                 .await
                 .unwrap()
                 .unwrap()
@@ -732,7 +730,7 @@ async fn gated_delivery_does_not_block_withdrawal_or_interruption_and_cannot_ove
         .await;
         delivery.succeed();
         assert!(
-            timeout(Duration::from_secs(2), submission)
+            timeout(PROGRESS_DEADLINE, submission)
                 .await
                 .unwrap()
                 .unwrap()
@@ -870,7 +868,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
         client.submit_questionnaire(child, first.id, submission.clone()),
         async {
             let delivery = timeout(
-                Duration::from_secs(2),
+                PROGRESS_DEADLINE,
                 live.provider_session.next_questionnaire_delivery(),
             )
             .await
@@ -881,7 +879,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
             // delivery is waiting, without blocking the actor on that delivery.
             assert!(
                 timeout(
-                    Duration::from_secs(2),
+                    PROGRESS_DEADLINE,
                     client.submit_questionnaire(child, first.id, QuestionnaireSubmission::Decline)
                 )
                 .await
@@ -910,7 +908,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
             .iter()
             .any(|a| matches!(a, Activity::Questionnaire { .. }))
     );
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let suru::managed_client::SessionEvent::Updated(update) = feed.next().await.unwrap().unwrap()
                 && update.changes.iter().any(|c| matches!(c, SessionChange::SubagentQuestionnairesChanged { subagent_questionnaires } if subagent_questionnaires.iter().map(|q| q.pending_questionnaires.len()).sum::<usize>() == 1)) { break; }
@@ -1018,7 +1016,7 @@ async fn definite_rejection_preserves_live_identity_for_explicit_retry_but_uncer
                 .await
         });
         let delivery = timeout(
-            Duration::from_secs(2),
+            PROGRESS_DEADLINE,
             live.provider_session.next_questionnaire_delivery(),
         )
         .await
@@ -1036,7 +1034,7 @@ async fn definite_rejection_preserves_live_identity_for_explicit_retry_but_uncer
         } else {
             drop(delivery);
         }
-        let error = timeout(Duration::from_secs(2), submission)
+        let error = timeout(PROGRESS_DEADLINE, submission)
             .await
             .unwrap()
             .unwrap()
@@ -1071,7 +1069,7 @@ async fn definite_rejection_preserves_live_identity_for_explicit_retry_but_uncer
                     .await
             });
             timeout(
-                Duration::from_secs(2),
+                PROGRESS_DEADLINE,
                 live.provider_session.next_questionnaire_delivery(),
             )
             .await
@@ -1136,7 +1134,7 @@ async fn lost_client_acknowledgement_reconciles_acceptance_without_duplicate_del
             .await
     });
     let delivery = timeout(
-        Duration::from_secs(2),
+        PROGRESS_DEADLINE,
         live.provider_session.next_questionnaire_delivery(),
     )
     .await
@@ -1225,7 +1223,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-restore", "high", "fast"),
     };
-    let mut native = timeout(Duration::from_secs(2), provider.next_start())
+    let mut native = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap()
         .succeed(identity.clone());
@@ -1269,7 +1267,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
             .submit_questionnaire(session_id, uncertain_id, QuestionnaireSubmission::Decline)
             .await
     });
-    let delivery = timeout(Duration::from_secs(2), native.next_questionnaire_delivery())
+    let delivery = timeout(PROGRESS_DEADLINE, native.next_questionnaire_delivery())
         .await
         .unwrap();
     submission.abort();
@@ -1331,11 +1329,11 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
         )
         .await
         .unwrap();
-    let mut native = timeout(Duration::from_secs(2), provider.next_start())
+    let mut native = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap()
         .succeed(identity);
-    timeout(Duration::from_secs(2), native.next_turn())
+    timeout(PROGRESS_DEADLINE, native.next_turn())
         .await
         .unwrap()
         .succeed();
@@ -1423,7 +1421,7 @@ async fn secret_questionnaire_answer_is_private_in_client_updates_and_persisted_
         live.provider_session.next_questionnaire_submission().await,
         (question.id, submission)
     );
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let SessionEvent::Updated(update) = observer.next().await.unwrap().unwrap() else {
                 continue;

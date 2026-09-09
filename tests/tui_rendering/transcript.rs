@@ -1,5 +1,6 @@
 //! Transcript projection, styling, and scroll navigation.
 
+use crate::deadlines::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
@@ -139,7 +140,7 @@ async fn apply_next_session_event(
     application: &mut Application,
     subscription: &mut SessionSubscription,
 ) -> SessionEvent {
-    let event = tokio::time::timeout(Duration::from_secs(1), subscription.next())
+    let event = tokio::time::timeout(PROGRESS_DEADLINE, subscription.next())
         .await
         .expect("Session event arrives")
         .expect("Session stream remains open")

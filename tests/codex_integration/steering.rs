@@ -1,5 +1,6 @@
 //! Queue admission and steering a turn that is already under way.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use std::sync::Arc;
 use suru::{
@@ -137,7 +138,7 @@ impl SteeringFixture {
             .await
             .expect("create Session");
         codex.wait_for_method("turn/start").await;
-        let active = timeout(Duration::from_secs(2), async {
+        let active = timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = client
                     .read_session(created.session.id)
@@ -183,7 +184,7 @@ impl SteeringFixture {
         description: &str,
         predicate: impl Fn(&SessionSnapshot) -> bool,
     ) -> SessionSnapshot {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 self.feed
                     .next()
@@ -841,7 +842,7 @@ async fn wait_for_session_snapshot(
     description: &str,
     predicate: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         let mut observed_revision = 0;
         loop {
             let snapshot = client

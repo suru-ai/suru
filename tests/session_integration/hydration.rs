@@ -1,4 +1,5 @@
 //! Lazy durable history through the server's public Session boundaries.
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{failing_provider_support::spawn_with_failing_provider, support};
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all};
@@ -10,7 +11,7 @@ use suru::{
     },
     server::{RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 struct History {
     _root: tempfile::TempDir,
@@ -126,7 +127,7 @@ async fn concurrent_first_readers_and_subscribers_keep_one_history_and_every_mut
         .error_for_status()
         .unwrap();
         let mut events = response.bytes_stream().eventsource();
-        let first = timeout(Duration::from_secs(1), events.next())
+        let first = timeout(PROGRESS_DEADLINE, events.next())
             .await
             .unwrap()
             .unwrap()
@@ -168,7 +169,7 @@ async fn concurrent_first_readers_and_subscribers_keep_one_history_and_every_mut
     for (snapshot, mut events) in feeds {
         let mut revision = snapshot.revision;
         while revision < final_update.revision {
-            let event = timeout(Duration::from_secs(1), events.next())
+            let event = timeout(PROGRESS_DEADLINE, events.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -448,7 +449,7 @@ async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_
     .await
     .unwrap();
     assert_eq!(failed.status(), reqwest::StatusCode::NOT_FOUND);
-    let changed = timeout(Duration::from_secs(1), events.next())
+    let changed = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .unwrap()
         .unwrap();

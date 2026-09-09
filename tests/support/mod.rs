@@ -1,3 +1,7 @@
+mod deadlines;
+
+pub use deadlines::PROGRESS_DEADLINE;
+
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use suru::{
@@ -8,7 +12,7 @@ use suru::{
         SkillCatalog, TitleErrand,
     },
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 pub fn write_runtime_descriptor(path: impl AsRef<std::path::Path>, descriptor: &RuntimeDescriptor) {
     let path = path.as_ref();
@@ -31,19 +35,19 @@ pub fn read_runtime_descriptor(path: impl AsRef<std::path::Path>) -> RuntimeDesc
 
 pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
+        timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("connecting event arrives"),
         Some(ManagedEvent::Connecting)
     ));
-    let connected = timeout(Duration::from_secs(1), client.next())
+    let connected = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("connected event arrives")
         .expect("managed client remains open");
     let ManagedEvent::Connected(identity) = connected else {
         panic!("expected connected event, got {connected:?}");
     };
-    let settings = timeout(Duration::from_secs(1), client.next())
+    let settings = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("settings snapshot arrives")
         .expect("managed client remains open");
@@ -59,7 +63,7 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
 /// A managed client connecting asks nothing of any Provider — a TUI does, by
 /// a request of its own — so this is the whole of the connect-time catalog.
 pub async fn receive_model_catalog(client: &mut ManagedClient) -> ModelCatalog {
-    let event = timeout(Duration::from_secs(1), client.next())
+    let event = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("Model Catalog arrives")
         .expect("managed client remains open");
@@ -70,7 +74,7 @@ pub async fn receive_model_catalog(client: &mut ManagedClient) -> ModelCatalog {
 }
 
 pub async fn next_skill_catalog(client: &mut ManagedClient) -> SkillCatalog {
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::SkillCatalogUpdated(catalog)) = client.next().await {
                 return catalog;
@@ -84,7 +88,7 @@ pub async fn next_skill_catalog(client: &mut ManagedClient) -> SkillCatalog {
 /// The next derived Title to reach this client, past whatever else the catalog announced first —
 /// the Session being made, most of all.
 pub async fn next_derived_title(client: &mut ManagedClient) -> SessionTitleChanged {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::SessionTitleChanged(changed)) = client.next().await {
                 return changed;
@@ -107,7 +111,7 @@ pub async fn assert_no_title_reaches(
         .delete_session(session_id)
         .await
         .expect("delete the Session");
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             match client.next().await.expect("the client stays connected") {
                 ManagedEvent::SessionTitleChanged(_) => panic!("{what}"),
@@ -168,7 +172,7 @@ pub async fn open_catalog_stream(
 pub async fn next_catalog_change(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
 ) -> SessionCatalogChange {
-    timeout(Duration::from_secs(5), catalog.next())
+    timeout(PROGRESS_DEADLINE, catalog.next())
         .await
         .expect("a catalog change arrives")
         .expect("the catalog stream stays open")
@@ -179,7 +183,7 @@ pub async fn next_catalog_change(
 pub async fn catalog_changes_through_title(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
 ) -> Vec<SessionCatalogChange> {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         let mut changes = Vec::new();
         while let Some(update) = catalog.next().await {
             let done = matches!(update.change, SessionCatalogChange::TitleChanged { .. });

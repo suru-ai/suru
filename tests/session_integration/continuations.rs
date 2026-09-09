@@ -3,6 +3,7 @@
 //! subtree, and late output owed to those Subagents begins a Continuation
 //! that the next delivered Prompt settles early.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     open_catalog_stream_with_snapshot, read_session_until, the_subagent_row, working_turn,
 };
@@ -14,7 +15,7 @@ use suru::{
     },
     provider::{ProviderEvent, ProviderSubagentId, ProviderSubagentStatus},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 /// Spawns one Subagent into the fixture's working Turn and returns the child
 /// Session the row names.
@@ -443,7 +444,7 @@ async fn the_next_delivered_prompt_settles_a_stale_continuation() {
 
     // The Prompt reaches the Provider as a fresh Turn — never as a steer of
     // the Continuation.
-    timeout(Duration::from_secs(1), fixture.provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
         .await
         .expect("the Prompt begins a Turn of its own")
         .succeed();
@@ -513,7 +514,7 @@ async fn a_prompt_begins_a_turn_while_an_earlier_turns_subagent_works_on() {
         .expect("submit the next Prompt")
         .error_for_status()
         .expect("the Prompt is accepted while the Subagent still works");
-    timeout(Duration::from_secs(1), fixture.provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
         .await
         .expect("the Prompt begins a Turn while the Subagent runs")
         .succeed();

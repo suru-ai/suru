@@ -1,5 +1,6 @@
 //! Agent selection: authority, convergence across clients, and turn-boundary capture.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     provider_support::ControlledProvider,
     support::{controlled_selection, next_session_update, receive_managed_client_initial_state},
@@ -1163,7 +1164,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     );
     turn.reject_selection("selected Model is unavailable");
 
-    let failed = timeout(Duration::from_secs(1), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -1218,7 +1219,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         )
         .await
         .expect("deliberately retry the same Model once");
-    let repeated = timeout(Duration::from_secs(1), provider_session.next_turn())
+    let repeated = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("first use of the operation schedules the restored Prompt");
     assert_eq!(repeated.prompt(), "$retry deliberately");
@@ -1228,7 +1229,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     );
     repeated.reject_selection("selected Model remains unavailable");
 
-    let failed_again = timeout(Duration::from_secs(1), async {
+    let failed_again = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -1284,7 +1285,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         )
         .await
         .expect("select an available Model for deliberate retry");
-    let retry = timeout(Duration::from_secs(1), provider_session.next_turn())
+    let retry = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("restored Prompt is scheduled after Agent Selection recovery");
     assert_eq!(retry.prompt(), "$retry deliberately");

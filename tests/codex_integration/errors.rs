@@ -1,5 +1,6 @@
 //! Protocol violations and launch failures surfaced as error activities.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use serde_json::Value;
 use std::sync::Arc;
@@ -184,7 +185,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
         .await
         .expect("subscribe to Session SSE");
 
-    let completed = timeout(Duration::from_secs(2), async {
+    let completed = timeout(PROGRESS_DEADLINE, async {
         loop {
             feed.next()
                 .await
@@ -365,7 +366,7 @@ async fn assert_provider_failure(
         .await
         .expect("subscribe to Session SSE");
 
-    let failed = timeout(Duration::from_secs(2), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             feed.next()
                 .await

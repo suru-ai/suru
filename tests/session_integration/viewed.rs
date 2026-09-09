@@ -1,5 +1,6 @@
 //! Server-owned Viewed state, exercised through the public session and catalog protocol.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     server_support::{next_catalog_change, open_catalog_stream},
@@ -184,7 +185,7 @@ async fn listed_summary(
 }
 
 async fn next_viewed(client: &mut ManagedClient, viewed_at: suru::protocol::SessionTimestamp) {
-    timeout(Duration::from_secs(5), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = client
                 .next()

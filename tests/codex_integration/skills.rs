@@ -1,5 +1,6 @@
 //! Codex-native Skill discovery and structured Prompt lowering.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -132,7 +133,7 @@ async fn wait_for_snapshot(
     description: &str,
     predicate: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)

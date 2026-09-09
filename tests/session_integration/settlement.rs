@@ -1,6 +1,7 @@
 //! A Session's own Settle: the reversible marker that sets it aside as done
 //! for now, mutated over the protocol and cleared by the next Prompt.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     server_support::{next_catalog_change, open_catalog_stream},
@@ -17,7 +18,7 @@ use suru::{
     },
     server::ServerConfig,
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
@@ -312,7 +313,7 @@ async fn settlement_changes_are_announced_on_the_session_catalog_stream() {
         .await
         .settled_at
         .expect("settling stamps the moment it happened");
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if next_catalog_change(&mut catalog).await
                 == (SessionCatalogChange::SettlementChanged {
@@ -377,7 +378,7 @@ async fn a_managed_client_hears_settlement_changes_for_sessions_it_never_opened(
         .expect("settling stamps the moment it happened");
 
     assert_eq!(
-        timeout(Duration::from_secs(5), client.next())
+        timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("the settlement reaches the client"),
         Some(ManagedEvent::SessionSettlementChanged(

@@ -6,6 +6,7 @@
 //! supplies, matched against the request line, with `$request_id` standing for the envelope's
 //! correlation ID.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
@@ -907,7 +908,7 @@ pub async fn session_where(
     what: &str,
     predicate: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)

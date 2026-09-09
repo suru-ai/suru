@@ -1,6 +1,7 @@
 //! Interrupting a Copilot Turn: the whole agentic loop stops, and everything it left running
 //! settles with it.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     LiveTurn, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, send_arm,
     silent_abort_arm,
@@ -144,7 +145,7 @@ async fn an_interrupt_copilot_never_answers_fails_the_turn_within_the_injected_t
     .await;
 
     let error = timeout(
-        Duration::from_secs(2),
+        PROGRESS_DEADLINE,
         live.client.interrupt_session(live.session_id),
     )
     .await

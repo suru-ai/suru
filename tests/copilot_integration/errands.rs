@@ -7,6 +7,7 @@
 //! these tests hold it to is that nothing of that Session survives — not in Suru's own Session
 //! listing, and not on the CLI as something still open.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -162,7 +163,7 @@ async fn request_where(
     what: &str,
     wanted: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(request) = copilot.requests().into_iter().find(&wanted) {
                 return request;
@@ -377,7 +378,7 @@ async fn an_errand_answered_outside_its_schema_leaves_the_prompt_derived_title_s
         .expect("delete the Session");
     assert!(
         !matches!(
-            timeout(Duration::from_secs(1), client.next())
+            timeout(PROGRESS_DEADLINE, client.next())
                 .await
                 .expect("the deletion reaches the client"),
             Some(ManagedEvent::SessionTitleChanged(

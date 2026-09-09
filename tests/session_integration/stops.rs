@@ -3,6 +3,7 @@
 //! single Subagent stops on its own where the Provider declares the
 //! capability, refusing cleanly where it does not.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     server_support::next_catalog_change,
     support::{
@@ -18,7 +19,7 @@ use suru::{
     },
     provider::{ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 /// Spawns one Subagent into the fixture's working Turn — under `name`, so a
 /// test can tell fan-out rows apart — and returns the child Session its row
@@ -119,7 +120,7 @@ async fn interrupting_with_no_turn_active_stops_every_subagent_and_clears_workin
         ),
         async {
             timeout(
-                Duration::from_secs(1),
+                PROGRESS_DEADLINE,
                 fixture.provider_session.next_subagents_stop(),
             )
             .await
@@ -164,7 +165,7 @@ async fn interrupting_with_no_turn_active_stops_every_subagent_and_clears_workin
     // Each settle may re-anchor the reading on the Subagents still left, so
     // the stream is read to the change that matters: Working clearing once
     // the last one stopped.
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             match next_catalog_change(&mut catalog).await {
                 SessionCatalogChange::WorkingChanged {
@@ -202,7 +203,7 @@ async fn stopping_one_subagent_names_it_to_the_provider_and_leaves_the_rest_work
         interrupt(&fixture.client, fixture.server.descriptor(), first_child),
         async {
             let stop = timeout(
-                Duration::from_secs(1),
+                PROGRESS_DEADLINE,
                 fixture.provider_session.next_subagent_stop(),
             )
             .await
@@ -289,7 +290,7 @@ async fn stopping_a_subagent_stops_whatever_it_delegated_in_turn() {
         interrupt(&fixture.client, fixture.server.descriptor(), outer_child),
         async {
             let stop = timeout(
-                Duration::from_secs(1),
+                PROGRESS_DEADLINE,
                 fixture.provider_session.next_subagent_stop(),
             )
             .await
@@ -382,13 +383,10 @@ async fn interrupting_a_turn_settles_its_subagents_and_discards_their_late_echoe
             fixture.session_id
         ),
         async {
-            timeout(
-                Duration::from_secs(1),
-                fixture.provider_session.next_interrupt(),
-            )
-            .await
-            .expect("the interrupt reaches the Provider")
-            .succeed();
+            timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
+                .await
+                .expect("the interrupt reaches the Provider")
+                .succeed();
         }
     );
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -488,7 +486,7 @@ async fn interrupting_a_continuation_stops_the_subagents_and_settles_it() {
         ),
         async {
             timeout(
-                Duration::from_secs(1),
+                PROGRESS_DEADLINE,
                 fixture.provider_session.next_subagents_stop(),
             )
             .await
@@ -570,7 +568,7 @@ async fn a_stop_the_provider_refuses_leaves_the_subagent_running_and_reports_why
         interrupt(&fixture.client, fixture.server.descriptor(), child_id),
         async {
             timeout(
-                Duration::from_secs(1),
+                PROGRESS_DEADLINE,
                 fixture.provider_session.next_subagent_stop(),
             )
             .await

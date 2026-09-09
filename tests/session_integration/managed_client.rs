@@ -1,5 +1,6 @@
 //! The managed client: attachment, reconnection, deletion, and stream recovery.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{read_session_at_least_revision, receive_managed_client_initial_state},
@@ -256,14 +257,14 @@ async fn managed_clients_observe_durable_session_deletion() {
     ));
 
     assert_eq!(
-        timeout(Duration::from_secs(1), observing_client.next())
+        timeout(PROGRESS_DEADLINE, observing_client.next())
             .await
             .expect("creation reaches connected client"),
         Some(ManagedEvent::SessionCreated(SessionCreated { session_id })),
         "a Session one client made is announced to every other client listing Sessions"
     );
     assert!(matches!(
-        timeout(Duration::from_secs(1), observing_client.next())
+        timeout(PROGRESS_DEADLINE, observing_client.next())
             .await
             .expect("the failed Turn outcome reaches the connected client"),
         Some(ManagedEvent::SessionStandingInputsChanged(changed))
@@ -279,12 +280,12 @@ async fn managed_clients_observe_durable_session_deletion() {
         .expect("delete Session through managed client");
 
     assert_eq!(
-        timeout(Duration::from_secs(1), observing_client.next())
+        timeout(PROGRESS_DEADLINE, observing_client.next())
             .await
             .expect("deletion reaches connected client"),
         Some(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
     );
-    let stream_error = timeout(Duration::from_secs(1), subscription.next())
+    let stream_error = timeout(PROGRESS_DEADLINE, subscription.next())
         .await
         .expect("deleted Session stream terminates")
         .expect("deleted Session stream reports its terminal rejection")
@@ -847,7 +848,7 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
         SessionEvent::snapshot(initial)
     );
     assert_eq!(
-        timeout(Duration::from_secs(1), attachment.next())
+        timeout(PROGRESS_DEADLINE, attachment.next())
             .await
             .expect("attachment reconnects")
             .expect("fresh Session snapshot arrives")

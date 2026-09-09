@@ -1,4 +1,5 @@
 use super::*;
+use crate::server_support::PROGRESS_DEADLINE;
 use suru::source_control::{GitSourceControl, SourceControl};
 async fn target(path: &Path) -> CheckoutRemovalTarget {
     let resolved = GitSourceControl::default().discover(path).await;
@@ -196,7 +197,7 @@ async fn removal_waits_for_native_startup_and_force_cannot_remove_surviving_suba
         },
     )
     .await;
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap();
     let connection = {
@@ -210,11 +211,11 @@ async fn removal_waits_for_native_startup_and_force_cannot_remove_surviving_suba
         );
         assert!(layout.linked.exists());
         let mut connection = start.succeed(identity());
-        timeout(Duration::from_secs(2), connection.next_turn())
+        timeout(PROGRESS_DEADLINE, connection.next_turn())
             .await
             .unwrap()
             .succeed();
-        let result = timeout(Duration::from_secs(2), pending).await.unwrap();
+        let result = timeout(PROGRESS_DEADLINE, pending).await.unwrap();
         assert!(!result.removed);
         assert!(result.error.unwrap().contains("Working"));
         connection

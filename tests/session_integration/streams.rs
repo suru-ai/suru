@@ -1,5 +1,6 @@
 //! The authenticated session SSE stream and its shutdown behaviour.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{read_session_at_least_revision, receive_managed_client_initial_state},
@@ -15,7 +16,7 @@ use suru::{
     },
     server::{AgentOutput, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot() {
@@ -72,7 +73,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .error_for_status()
         .expect("Session stream authenticates");
     let mut events = response.bytes_stream().eventsource();
-    let first = timeout(Duration::from_secs(1), events.next())
+    let first = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Session snapshot arrives")
         .expect("Session stream remains open")
@@ -94,7 +95,7 @@ async fn authenticated_session_stream_starts_with_a_complete_revisioned_snapshot
         .error_for_status()
         .expect("Session remains available after stream disconnect");
     let mut reconnected_events = reconnected.bytes_stream().eventsource();
-    let fresh_snapshot = timeout(Duration::from_secs(1), reconnected_events.next())
+    let fresh_snapshot = timeout(PROGRESS_DEADLINE, reconnected_events.next())
         .await
         .expect("fresh Session snapshot arrives")
         .expect("reconnected Session stream remains open")
@@ -161,7 +162,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         .await
         .expect("subscribe to Session");
     assert_eq!(
-        timeout(Duration::from_secs(1), subscription.next())
+        timeout(PROGRESS_DEADLINE, subscription.next())
             .await
             .expect("Session snapshot arrives")
             .expect("Session stream remains open")
@@ -217,7 +218,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         SessionRevision(settled.revision.0 + 1)
     );
     assert_eq!(
-        timeout(Duration::from_secs(1), subscription.next())
+        timeout(PROGRESS_DEADLINE, subscription.next())
             .await
             .expect("active Turn update arrives")
             .expect("Session stream remains open")
@@ -255,7 +256,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
     }
     for expected_update in published {
         assert_eq!(
-            timeout(Duration::from_secs(1), subscription.next())
+            timeout(PROGRESS_DEADLINE, subscription.next())
                 .await
                 .expect("Session update arrives")
                 .expect("Session stream remains open")
@@ -268,7 +269,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
         .subscribe_session(session_id)
         .await
         .expect("reconnect to completed Session");
-    let SessionEvent::Snapshot(completed) = timeout(Duration::from_secs(1), reconnected.next())
+    let SessionEvent::Snapshot(completed) = timeout(PROGRESS_DEADLINE, reconnected.next())
         .await
         .expect("fresh completed snapshot arrives")
         .expect("reconnected Session stream remains open")
@@ -344,18 +345,18 @@ async fn active_session_stream_does_not_delay_graceful_server_shutdown() {
         .error_for_status()
         .expect("Session stream authenticates");
     let mut events = response.bytes_stream().eventsource();
-    timeout(Duration::from_secs(1), events.next())
+    timeout(PROGRESS_DEADLINE, events.next())
         .await
         .expect("Session snapshot arrives")
         .expect("Session stream remains open")
         .expect("decode Session snapshot event");
 
-    timeout(Duration::from_secs(1), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("active Session stream does not delay graceful shutdown")
         .expect("shut down server");
     assert!(
-        timeout(Duration::from_secs(1), events.next())
+        timeout(PROGRESS_DEADLINE, events.next())
             .await
             .expect("Session stream closes on shutdown")
             .is_none()

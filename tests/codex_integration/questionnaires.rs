@@ -1,4 +1,5 @@
 //! Native app-server question correlation, supported answers, and secret exclusion.
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::ScriptedCodex;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -89,7 +90,7 @@ impl Live {
         }
     }
     async fn until(&mut self, predicate: impl Fn(&SessionSnapshot) -> bool) -> SessionSnapshot {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = self.client.read_session(self.id).await.unwrap();
                 if predicate(&snapshot) {
@@ -133,7 +134,7 @@ impl Live {
     }
 }
 async fn response(fixture: &ScriptedCodex, id: Value) -> Value {
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(response) = fixture
                 .requests()
@@ -408,7 +409,7 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
             .any(|message| message.content == "token: [redacted] done")
     );
     assert!(snapshot.activities.iter().any(|activity| matches!(activity, Activity::Command { output, .. } if output == "token: [redacted] done")));
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = observer.next().await.unwrap().unwrap();
             let updated = match event {
@@ -664,7 +665,7 @@ async fn codex_child_questions_before_and_after_parent_settlement_are_answered_i
     assert_eq!(parent.turns.len(), 1);
     assert_eq!(parent.turns[0].status, TurnStatus::Completed);
     fixture.release();
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if live
                 .client

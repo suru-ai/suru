@@ -3,8 +3,11 @@
 //! place, per the user configuration spec: a spawned server driven through the
 //! managed client over the real protocol, against temp config directories only.
 
-use std::{net::IpAddr, path::Path};
+#[path = "support/deadlines.rs"]
+mod deadlines;
 
+use crate::deadlines::PROGRESS_DEADLINE;
+use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
@@ -15,7 +18,7 @@ use suru::{
     },
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 async fn attach(state_dir: &Path, channel: &str) -> (ManagedClient, SettingsSnapshot) {
     let mut client = ManagedClient::connect(
@@ -39,7 +42,7 @@ async fn attach(state_dir: &Path, channel: &str) -> (ManagedClient, SettingsSnap
 /// beside it: on every connect, and again when a Provider's Enablement turns.
 async fn next_snapshot(client: &mut ManagedClient) -> SettingsSnapshot {
     loop {
-        let event = timeout(Duration::from_secs(1), client.next())
+        let event = timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("settings snapshot arrives")
             .expect("managed client remains open");

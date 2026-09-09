@@ -1,4 +1,5 @@
 use super::*;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -107,7 +108,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
         remote.create_session(create("Duplicate request"))
     );
     assert_eq!(one.unwrap().session.id, two.unwrap().session.id);
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .unwrap();
     assert_eq!(start.execution_directory(), a.preparation.destination.path);

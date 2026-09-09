@@ -1,6 +1,7 @@
 //! Several Provider runtimes hosted side by side: catalog listing, per-Session
 //! routing, hosted-set selection validation, and the built-in default order.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -20,7 +21,7 @@ use suru::{
     provider::ProviderEvent,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 fn create_session_request(
     workspace: &std::path::Path,
@@ -348,7 +349,7 @@ async fn a_stored_session_on_an_unhosted_provider_fails_its_next_prompt_legibly(
     });
     provider_session.next_turn().await.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session(&original_descriptor, session.session.id).await;
             if snapshot
@@ -392,7 +393,7 @@ async fn a_stored_session_on_an_unhosted_provider_fails_its_next_prompt_legibly(
         .error_for_status()
         .expect("Prompt admission succeeds");
 
-    let failed = timeout(Duration::from_secs(1), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session(&replacement_descriptor, session.session.id).await;
             if snapshot
@@ -775,7 +776,7 @@ async fn a_turn_that_starts_on_an_unavailable_provider_fails_with_the_typed_cond
         "could not launch the alpha CLI `alpha`: No such file or directory",
     );
 
-    let failed = timeout(Duration::from_secs(1), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session(&descriptor, session.session.id).await;
             if snapshot

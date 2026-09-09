@@ -1,4 +1,5 @@
 //! Real repository preparation shared by native Provider boundary checks.
+use crate::server_support::PROGRESS_DEADLINE;
 use std::path::Path;
 use suru::{managed_client::ManagedClient, protocol::*};
 
@@ -59,7 +60,7 @@ pub fn creation(plan: &PreparedCheckout) -> CreateSessionRequest {
 
 pub async fn settled(client: &ManagedClient, session: SessionId, index: usize) -> SessionSnapshot {
     let mut feed = client.subscribe_session(session).await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client.read_session(session).await.unwrap();
             if let Some(turn) = snapshot.turns.get(index)

@@ -1,5 +1,6 @@
 //! Turn execution, transcript projection, and durability across a restart.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     server_support::request_server_shutdown,
     support::{ScriptedCodex, receive_initial_state},
@@ -324,7 +325,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .subscribe_session(created.session.id)
         .await
         .expect("subscribe to Session SSE");
-    let initial_event = timeout(Duration::from_secs(2), feed.next())
+    let initial_event = timeout(PROGRESS_DEADLINE, feed.next())
         .await
         .expect("Session snapshot arrives")
         .expect("Session feed remains open")
@@ -344,7 +345,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     let mut streamed_file_changes = Vec::new();
     let mut file_change_update_count = 0;
     let mut saw_file_change_completion = false;
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = feed
                 .next()
@@ -667,7 +668,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         })
         .await
         .expect("create boundary Session");
-    let boundary_snapshot = timeout(Duration::from_secs(3), async {
+    let boundary_snapshot = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = boundary_client
                 .read_session(boundary_created.session.id)
@@ -745,7 +746,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         .await
         .expect("create idle-flush Session");
     idle_codex.wait_until_ready().await;
-    let idle_snapshot = timeout(Duration::from_secs(3), async {
+    let idle_snapshot = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = idle_client
                 .read_session(idle_created.session.id)
@@ -817,7 +818,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     );
 
     request_server_shutdown(&final_descriptor, ShutdownReason::Manual).await;
-    timeout(Duration::from_secs(3), final_process.wait())
+    timeout(PROGRESS_DEADLINE, final_process.wait())
         .await
         .expect("replacement server exits after graceful cleanup")
         .expect("reap replacement server");
@@ -866,7 +867,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
         })
         .await
         .expect("create original Session");
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = original_client
                 .read_session(created.session.id)
@@ -913,7 +914,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
         )
         .await
         .expect("admit Prompt to reopened Session");
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = replacement_client
                 .read_session(created.session.id)
@@ -1096,7 +1097,7 @@ async fn run_terminal_fixture(
     fixture.wait_for_method("turn/start").await;
     fixture.release();
 
-    let completed = timeout(Duration::from_secs(2), async {
+    let completed = timeout(PROGRESS_DEADLINE, async {
         loop {
             feed.next()
                 .await
@@ -1191,7 +1192,7 @@ async fn wait_for_descriptor(
     path: &std::path::Path,
     previous: Option<uuid::Uuid>,
 ) -> RuntimeDescriptor {
-    timeout(Duration::from_secs(3), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let descriptor = std::fs::File::open(path)
                 .ok()
@@ -1210,7 +1211,7 @@ async fn wait_for_descriptor(
 
 async fn kill_server_process(process: &mut Child) {
     process.start_kill().expect("kill server process abruptly");
-    timeout(Duration::from_secs(3), process.wait())
+    timeout(PROGRESS_DEADLINE, process.wait())
         .await
         .expect("killed server process exits")
         .expect("reap killed server process");

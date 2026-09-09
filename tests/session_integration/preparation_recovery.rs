@@ -1,5 +1,6 @@
 //! Reconciliation is exercised through API outcomes and real Git resources.
 use super::*;
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -195,7 +196,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
             .unwrap();
         assert_eq!(a.session.id, captured.intended_session);
         assert_eq!(a.session.id, b.session.id);
-        let start = timeout(Duration::from_secs(2), provider.next_start())
+        let start = timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .expect("one Provider startup");
         assert_eq!(start.execution_directory(), captured.destination.path);
@@ -232,7 +233,7 @@ async fn interrupted_request_and_server_replacement_keep_the_same_preparation_id
     let descriptor = server.descriptor().clone();
     let sent = request.clone();
     let task = tokio::spawn(async move { prepare(&descriptor, &sent).await });
-    timeout(Duration::from_secs(2), fault.reached.notified())
+    timeout(PROGRESS_DEADLINE, fault.reached.notified())
         .await
         .unwrap();
     let captured = fault.observed.lock().unwrap().clone().unwrap();
@@ -289,7 +290,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
     )
     .await;
     drop(
-        timeout(Duration::from_secs(2), provider.next_start())
+        timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .unwrap(),
     );
@@ -408,7 +409,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
     assert_eq!(rejoined.prompts.len(), 1);
     assert_eq!(rejoined.prompts[0].id, original.prompt.id);
     assert_eq!(rejoined.prompts[0].text, original.prompt.text);
-    let start = timeout(Duration::from_secs(2), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("one Provider startup");
     assert_eq!(
@@ -670,7 +671,7 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
     let initial = creation(&ready.preparation, "Deliver this exactly once");
     let response = create_response(server.descriptor(), &initial).await;
     assert!(!response.status().is_success());
-    let mut running = timeout(Duration::from_secs(2), provider.next_start())
+    let mut running = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("one Provider startup")
         .succeed(AgentIdentity {
@@ -681,7 +682,7 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
                 options: vec![],
             },
         });
-    let turn = timeout(Duration::from_secs(2), running.next_turn())
+    let turn = timeout(PROGRESS_DEADLINE, running.next_turn())
         .await
         .expect("one Provider Turn");
     assert_eq!(turn.prompt(), initial.prompt.text);
@@ -808,7 +809,7 @@ async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provide
     )
     .await;
     drop(
-        timeout(Duration::from_secs(2), provider.next_start())
+        timeout(PROGRESS_DEADLINE, provider.next_start())
             .await
             .unwrap(),
     );

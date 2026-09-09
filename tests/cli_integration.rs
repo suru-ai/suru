@@ -1,3 +1,4 @@
+use crate::support::PROGRESS_DEADLINE;
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::{
@@ -225,7 +226,7 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
 
     let response = request_server_shutdown(&descriptor, ShutdownReason::Replacement).await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         while !original.is_stopped() {
             tokio::task::yield_now().await;
         }
@@ -240,7 +241,7 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
     )
     .await;
 
-    let recovering = timeout(Duration::from_secs(2), attached.next())
+    let recovering = timeout(PROGRESS_DEADLINE, attached.next())
         .await
         .expect("old client processes replacement intent promptly")
         .expect("managed client remains open");
@@ -252,7 +253,7 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
         })
     ));
 
-    let fatal = timeout(Duration::from_secs(2), async {
+    let fatal = timeout(PROGRESS_DEADLINE, async {
         loop {
             match attached.next().await.expect("managed client remains open") {
                 ManagedEvent::Recovering(_) => {}
@@ -390,7 +391,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
         async move { start_server(&config).await }
     });
     let log_path = runtime_dir.join("server.log");
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             if std::fs::read_to_string(&log_path)
                 .is_ok_and(|log| log.contains("another server already owns this channel"))
@@ -411,7 +412,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
         lock,
     )
     .await;
-    let replacement = timeout(Duration::from_secs(3), launching)
+    let replacement = timeout(PROGRESS_DEADLINE, launching)
         .await
         .expect("launcher completes after replacing election winner")
         .expect("launcher task does not panic")
@@ -564,7 +565,7 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
 }
 
 async fn receive_recovered_state(client: &mut ManagedClient, previous_instance_id: Uuid) -> Health {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         let mut saw_recovering = false;
         loop {
             match client.next().await.expect("managed client remains open") {
@@ -647,7 +648,7 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
     .expect("connect managed client");
     receive_initial_state(&mut client).await;
 
-    let first = timeout(Duration::from_secs(1), client.next())
+    let first = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("first recovery state arrives")
         .expect("managed client remains open");
@@ -656,7 +657,7 @@ async fn dropping_a_recovering_client_cancels_its_next_network_attempt_promptly(
     };
     assert_eq!(status.attempt, 1);
     assert_eq!(status.retry_in, Duration::ZERO);
-    let second = timeout(Duration::from_secs(1), client.next())
+    let second = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("scheduled retry state arrives")
         .expect("managed client remains open");
@@ -713,7 +714,7 @@ async fn managed_client_surfaces_protocol_corruption_as_ordered_fatal_events() {
             client.next().await,
             Some(ManagedEvent::Connected(_))
         ));
-        let fatal = match timeout(Duration::from_secs(1), client.next())
+        let fatal = match timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("protocol corruption becomes a prompt fatal event")
             .expect("managed client remains open")
@@ -747,7 +748,7 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
     .expect("connect managed client");
     let identity = receive_initial_state(&mut client).await;
 
-    let shutdown = timeout(Duration::from_secs(1), client.next())
+    let shutdown = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("shutdown intent arrives")
         .expect("managed client reports shutdown intent");
@@ -757,7 +758,7 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
     assert_eq!(shutdown.instance_id, identity.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Manual);
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next()).await,
+        timeout(PROGRESS_DEADLINE, client.next()).await,
         Ok(None)
     ));
     assert_eq!(fixture.event_requests(), 1);
@@ -786,7 +787,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
         .path()
         .join(unrelated_channel)
         .join("runtime.json");
-    timeout(Duration::from_secs(2), async {
+    timeout(PROGRESS_DEADLINE, async {
         while !unrelated_descriptor.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -846,7 +847,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     unrelated
         .start_kill()
         .expect("terminate unrelated process fixture");
-    timeout(Duration::from_secs(2), unrelated.wait())
+    timeout(PROGRESS_DEADLINE, unrelated.wait())
         .await
         .expect("unrelated process fixture exits within 2s")
         .expect("wait for unrelated process fixture");
@@ -1077,7 +1078,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     assert!(stdout.contains(&descriptor.pid.to_string()));
     assert!(stdout.contains(&descriptor.instance_id.to_string()));
 
-    let shutdown = match timeout(Duration::from_secs(1), managed.next())
+    let shutdown = match timeout(PROGRESS_DEADLINE, managed.next())
         .await
         .expect("attached client receives manual stop intent")
     {
@@ -1091,7 +1092,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     assert_eq!(shutdown.instance_id, descriptor.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Manual);
     assert!(matches!(
-        timeout(Duration::from_secs(1), managed.next()).await,
+        timeout(PROGRESS_DEADLINE, managed.next()).await,
         Ok(None)
     ));
 
@@ -1447,14 +1448,14 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
     .await;
     let mut tui = AttachedTui::spawn(state_dir.path(), channel);
 
-    timeout(Duration::from_secs(5), async {
+    timeout(PROGRESS_DEADLINE, async {
         while !fixture.events_opened.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("TUI opens the corrupt event stream");
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1524,7 +1525,7 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
         "server stop failed: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1554,7 +1555,7 @@ async fn clean_tui_exit_restores_the_terminal() {
     // reaching the process as a signal. A re-rendering pseudo-console keeps
     // none of the escape sequences that entering the display writes, so the
     // frame is what the wait can look for on every platform.
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             assert!(tui.is_running(), "TUI exited before clean-exit input");
             if String::from_utf8_lossy(&tui.shown()).contains("Type a prompt") {
@@ -1569,7 +1570,7 @@ async fn clean_tui_exit_restores_the_terminal() {
     // arrive. ConPTY emulates colors itself; Application rendering tests cover
     // the same fallback-to-light transition on every platform.
     #[cfg(unix)]
-    timeout(Duration::from_secs(5), async {
+    timeout(PROGRESS_DEADLINE, async {
         while !String::from_utf8_lossy(&tui.shown()).contains("48;2;238;238;238") {
             assert!(tui.is_running(), "TUI exited before the color repaint");
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1578,7 +1579,7 @@ async fn clean_tui_exit_restores_the_terminal() {
     .await
     .expect("late colors repaint without reader input");
     tui.send(b"\x03");
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         while tui.is_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1721,7 +1722,7 @@ async fn build_profile_selects_isolated_default_state_and_data_roots() {
         .env("SURU_CONFIG_DIR", state_dir.path())
         .env_remove("SURU_CHANNEL")
         .kill_on_drop(true);
-    let output = match timeout(Duration::from_secs(5), process.output()).await {
+    let output = match timeout(PROGRESS_DEADLINE, process.output()).await {
         Ok(output) => output,
         Err(_) => {
             let registration = describe_test_registration(state_dir.path(), expected_channel);
@@ -1909,7 +1910,7 @@ async fn managed_client_waits_through_transitional_lifecycle_before_opening_even
         assert!(!fixture.events_opened.load(Ordering::SeqCst));
 
         *fixture.lifecycle.lock().expect("lock lifecycle") = LifecycleState::Ready;
-        let mut client = timeout(Duration::from_secs(1), connecting)
+        let mut client = timeout(PROGRESS_DEADLINE, connecting)
             .await
             .expect("managed client notices readiness")
             .expect("managed client task does not panic")
@@ -1930,7 +1931,7 @@ async fn managed_client_reports_a_registered_failed_lifecycle() {
         .expect("configure managed client")
         .with_server_executable(inert_server_executable(state_dir.path()));
 
-    let result = timeout(Duration::from_secs(1), ManagedClient::connect(config))
+    let result = timeout(PROGRESS_DEADLINE, ManagedClient::connect(config))
         .await
         .expect("failed lifecycle is reported promptly");
     let error = match result {
@@ -1958,7 +1959,7 @@ async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
         .expect("configure managed client")
         .with_server_executable(env!("CARGO_BIN_EXE_suru"));
 
-    let result = timeout(Duration::from_secs(2), ManagedClient::connect(config))
+    let result = timeout(PROGRESS_DEADLINE, ManagedClient::connect(config))
         .await
         .expect("startup failure is reported without waiting for the full deadline");
     let error = match result {
@@ -1995,7 +1996,7 @@ async fn managed_client_bounds_either_initial_stream_handshake_and_drops_the_sib
             .with_server_executable(inert_server_executable(state_dir.path()))
             .with_startup_timeout(Duration::from_millis(200));
 
-        let error = timeout(Duration::from_secs(1), ManagedClient::connect(config))
+        let error = timeout(PROGRESS_DEADLINE, ManagedClient::connect(config))
             .await
             .expect("initial streams use the startup deadline")
             .err()
@@ -2129,7 +2130,7 @@ async fn managed_client_reports_either_broken_handshake_and_closes_the_waiting_s
         let mut connecting = Box::pin(ManagedClient::connect(config));
         let sockets = tokio::select! {
             _ = &mut connecting => panic!("both handshake responses are held"),
-            sockets = timeout(Duration::from_secs(1), async {
+            sockets = timeout(PROGRESS_DEADLINE, async {
                 (received.recv().await.unwrap(), received.recv().await.unwrap())
             }) => sockets.expect("both handshake sockets reach the proxy"),
         };
@@ -2155,7 +2156,7 @@ async fn managed_client_reports_either_broken_handshake_and_closes_the_waiting_s
             "{error}"
         );
         let mut byte = [0];
-        let closed = timeout(Duration::from_secs(1), sibling.read(&mut byte))
+        let closed = timeout(PROGRESS_DEADLINE, sibling.read(&mut byte))
             .await
             .expect("the sibling TCP connection closes");
         assert!(
@@ -2271,15 +2272,11 @@ async fn managed_client_hydrates_catalog_before_connected_and_settings() {
     );
     fixture.catalog_handshake.body_ready.send_replace(true);
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .unwrap(),
+        timeout(PROGRESS_DEADLINE, client.next()).await.unwrap(),
         Some(ManagedEvent::Connected(_))
     ));
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
-            .await
-            .unwrap(),
+        timeout(PROGRESS_DEADLINE, client.next()).await.unwrap(),
         Some(ManagedEvent::SettingsSnapshot(_))
     ));
 }
@@ -2315,7 +2312,7 @@ impl FixtureHandshake {
     }
 
     async fn wait_requested(&self) {
-        timeout(Duration::from_secs(1), self.requested.acquire())
+        timeout(PROGRESS_DEADLINE, self.requested.acquire())
             .await
             .expect("server observes the handshake request")
             .expect("request signal remains open")
@@ -2324,7 +2321,7 @@ impl FixtureHandshake {
 
     async fn wait_streaming(&self) {
         timeout(
-            Duration::from_secs(1),
+            PROGRESS_DEADLINE,
             self.streaming.subscribe().wait_for(|started| *started),
         )
         .await
@@ -2333,7 +2330,7 @@ impl FixtureHandshake {
     }
 
     async fn wait_closed(&self) {
-        timeout(Duration::from_secs(1), self.closed.acquire())
+        timeout(PROGRESS_DEADLINE, self.closed.acquire())
             .await
             .expect("client drops the sibling request or response")
             .expect("close signal remains open")
@@ -3107,18 +3104,18 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
     .await
     .expect("connect to the environment-configured server");
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
+        timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("connecting event arrives"),
         Some(ManagedEvent::Connecting)
     ));
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next())
+        timeout(PROGRESS_DEADLINE, client.next())
             .await
             .expect("connected event arrives"),
         Some(ManagedEvent::Connected(_))
     ));
-    let event = timeout(Duration::from_secs(1), client.next())
+    let event = timeout(PROGRESS_DEADLINE, client.next())
         .await
         .expect("settings snapshot arrives")
         .expect("managed client remains open");
@@ -3140,7 +3137,7 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
     );
 
     let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
-    let log_contents = timeout(Duration::from_secs(5), async {
+    let log_contents = timeout(PROGRESS_DEADLINE, async {
         loop {
             let combined = std::fs::read_dir(&log_dir)
                 .ok()
@@ -3189,7 +3186,7 @@ async fn a_syntax_broken_config_document_reaches_the_log_and_the_server_still_st
     );
 
     let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
-    let log_contents = timeout(Duration::from_secs(5), async {
+    let log_contents = timeout(PROGRESS_DEADLINE, async {
         loop {
             let combined = std::fs::read_dir(&log_dir)
                 .ok()

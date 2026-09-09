@@ -1,5 +1,6 @@
 //! Skill Catalog discovery and authoritative Prompt admission.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -27,7 +28,7 @@ async fn list_skills_until(
     request: &SkillCatalogRequest,
     ready: impl Fn(&SkillCatalogStatus) -> bool,
 ) -> SkillCatalog {
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let catalog = client
                 .post(format!("{}/v1/skills", descriptor.base_url))
@@ -188,7 +189,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         assert_eq!(next_fresh_catalog(&mut second).await.skills, [replacement]);
 
         provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
-        let failed = timeout(Duration::from_secs(1), async {
+        let failed = timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = first
                     .read_session(created.session.id)
@@ -348,7 +349,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
             agent: AgentId::new(format!("{provider_name}-agent")),
             selection: hosted_selection(provider_name, &model_id),
         });
-        let failed = timeout(Duration::from_secs(1), async {
+        let failed = timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = client
                     .read_session(created.session.id)
@@ -493,7 +494,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         let _ = next_fresh_catalog(&mut client).await;
         initial_turn.succeed();
 
-        let failed = timeout(Duration::from_secs(1), async {
+        let failed = timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = client
                     .read_session(created.session.id)
@@ -690,7 +691,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
     assert_eq!(cancelled.status, PromptStatus::Cancelled);
     release_refresh.send(()).expect("release catalog refresh");
 
-    let next_turn = timeout(Duration::from_secs(1), provider_session.next_turn())
+    let next_turn = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("the next Prompt is revalidated after the queue changes");
     assert_eq!(next_turn.prompt(), following.text);
@@ -976,7 +977,7 @@ async fn force_refresh_during_discovery_discards_the_superseded_result() {
             .status,
         SkillCatalogStatus::Loading
     ));
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         while runtime.skill_discoveries() != 1 {
             tokio::task::yield_now().await;
         }
@@ -1439,7 +1440,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         });
         provider_session.next_turn().await.succeed();
         provider_session.emit(suru::provider::ProviderEvent::TurnCompleted);
-        timeout(Duration::from_secs(1), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = client
                     .read_session(created.session.id)
@@ -1481,7 +1482,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
             });
         assert_eq!(admitted.status, PromptStatus::Pending);
 
-        let turn = timeout(Duration::from_secs(1), provider_session.next_turn())
+        let turn = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
             .await
             .unwrap_or_else(|_| panic!("{provider_name} starts a Turn for the Skill Prompt"));
         assert_eq!(turn.prompt(), "Start $review now");

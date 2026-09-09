@@ -1,5 +1,6 @@
 //! The Codex process lifecycle: launching the real binary, loss, and resume.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use std::sync::Arc;
 use suru::{
@@ -177,7 +178,7 @@ async fn installed_codex_launches_runs_one_text_turn_and_shuts_down() {
 
     drop(feed);
     drop(client);
-    timeout(Duration::from_secs(2), server.shutdown())
+    timeout(PROGRESS_DEADLINE, server.shutdown())
         .await
         .expect("live Codex shutdown remains bounded")
         .expect("shut down live Codex server");
@@ -442,7 +443,7 @@ impl RecoveryFixture {
     }
 
     async fn wait_for_turn(&mut self, turn_index: usize, expected: TurnStatus) -> SessionSnapshot {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 let snapshot = self
                     .client

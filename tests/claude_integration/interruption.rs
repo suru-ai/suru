@@ -1,6 +1,7 @@
 //! Interrupting a Claude Turn: the background work the agent spawned is stopped first, then the
 //! loop itself, and the Turn Settles as interrupted on the result that follows.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, after_probe, agent_messages, discovery_arms,
     interrupt_arm, silent_interrupt_arm, stop_task_arm, user_turn_arm,
@@ -317,7 +318,7 @@ async fn an_interrupt_the_cli_never_answers_fails_the_turn_within_the_injected_t
     .await;
 
     let error = timeout(
-        Duration::from_secs(2),
+        PROGRESS_DEADLINE,
         live.client.interrupt_session(live.session_id),
     )
     .await

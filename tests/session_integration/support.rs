@@ -3,6 +3,7 @@
 use crate::provider_support::{
     ControlledProvider, ControlledProviderRuntime, ControlledProviderSession,
 };
+use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, SessionEvent},
     protocol::{
@@ -13,7 +14,7 @@ use suru::{
     },
     server::{self, RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 /// One Provider's default Model, named after the Provider that serves it, which
 /// is all any multi-Provider test needs of a catalog.
@@ -124,7 +125,7 @@ pub fn controlled_selection(model: &str, effort: &str, speed: &str) -> AgentSele
 pub async fn next_session_update(
     subscription: &mut suru::managed_client::SessionSubscription,
 ) -> SessionUpdate {
-    let SessionEvent::Updated(update) = timeout(Duration::from_secs(1), subscription.next())
+    let SessionEvent::Updated(update) = timeout(PROGRESS_DEADLINE, subscription.next())
         .await
         .expect("Session update arrives")
         .expect("Session stream remains open")
@@ -141,7 +142,7 @@ pub async fn read_session_at_least_revision(
     session_id: SessionId,
     revision: SessionRevision,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
@@ -212,14 +213,14 @@ pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> Working
         .json::<SessionSnapshot>()
         .await
         .expect("decode created Session");
-    let start = timeout(Duration::from_secs(1), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("Provider startup begins");
     let mut provider_session = start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-subagent", "high", "fast"),
     });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();
@@ -257,7 +258,7 @@ pub async fn read_session_until(
     described: &str,
     predicate: impl Fn(&SessionSnapshot) -> bool,
 ) -> SessionSnapshot {
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .get(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
@@ -301,7 +302,7 @@ pub async fn open_catalog_stream_with_snapshot(
         .expect("the catalog stream authenticates");
     let mut events = Box::pin(response.bytes_stream().eventsource());
     let snapshot = loop {
-        let event = timeout(Duration::from_secs(5), events.next())
+        let event = timeout(PROGRESS_DEADLINE, events.next())
             .await
             .expect("the catalog snapshot arrives")
             .expect("the catalog stream stays open")

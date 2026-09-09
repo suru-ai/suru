@@ -1,5 +1,6 @@
 //! Turn execution: provider streaming, steering, interruption, and failure isolation.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     provider_support::ControlledProvider,
     server_support::{next_catalog_change, open_catalog_stream},
@@ -25,7 +26,7 @@ use suru::{
     },
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them() {
@@ -195,7 +196,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .expect("subscribe second client");
     for feed in [&mut first_feed, &mut second_feed] {
         assert_eq!(
-            timeout(Duration::from_secs(1), feed.next())
+            timeout(PROGRESS_DEADLINE, feed.next())
                 .await
                 .expect("Session snapshot arrives")
                 .expect("Session stream remains open")
@@ -204,7 +205,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         );
     }
 
-    let start = timeout(Duration::from_secs(1), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("Provider startup begins asynchronously");
     assert_eq!(start.execution_directory(), created.session.workspace.path);
@@ -217,7 +218,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         },
     };
     let mut provider_session = start.succeed(identity.clone());
-    let turn_request = timeout(Duration::from_secs(1), provider_session.next_turn())
+    let turn_request = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Prompt reaches the Provider Session");
     assert_eq!(turn_request.prompt(), "Explain the provider seam");
@@ -553,14 +554,14 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
         .await
         .expect("decode created Session");
 
-    let start = timeout(Duration::from_secs(1), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("Provider startup begins");
     let mut provider_session = start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-normalized", "high", "fast"),
     });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();
@@ -823,7 +824,7 @@ async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a
         provider_session.emit(event);
     }
 
-    let completed = timeout(Duration::from_secs(1), async {
+    let completed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(session_id)
@@ -964,7 +965,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
     });
     acknowledged.expect("Provider acknowledges interruption");
     provider_session.emit(ProviderEvent::TurnInterrupted);
-    timeout(Duration::from_secs(1), async {
+    timeout(PROGRESS_DEADLINE, async {
         loop {
             let SessionEvent::Updated(update) = observer
                 .next()
@@ -1072,7 +1073,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
     }
     // The delta that carries the pending line is the one that publishes the line
     // before it, so its update arriving proves the normalizer holds the rest.
-    let command_activity_id = timeout(Duration::from_secs(1), async {
+    let command_activity_id = timeout(PROGRESS_DEADLINE, async {
         loop {
             for change in next_session_update(&mut observer).await.changes {
                 if let SessionChange::CommandOutputAppended { activity_id, .. } = change {
@@ -1089,7 +1090,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
         .await
         .expect("delete the Session its Provider actor still owns");
 
-    let settle_changes = timeout(Duration::from_secs(1), async {
+    let settle_changes = timeout(PROGRESS_DEADLINE, async {
         let mut changes = Vec::new();
         loop {
             changes.extend(next_session_update(&mut observer).await.changes);
@@ -1186,7 +1187,7 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         command: "report progress".to_owned(),
         cwd: Some(workspace.path().to_owned()),
     });
-    let running = timeout(Duration::from_secs(1), async {
+    let running = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = read_session_at_least_revision(
                 &http,
@@ -1556,7 +1557,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         .await
         .expect("subscribe to Session");
     assert_eq!(
-        timeout(Duration::from_secs(1), feed.next())
+        timeout(PROGRESS_DEADLINE, feed.next())
             .await
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
@@ -1742,7 +1743,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
         .await
         .expect("subscribe to Session");
     assert_eq!(
-        timeout(Duration::from_secs(1), feed.next())
+        timeout(PROGRESS_DEADLINE, feed.next())
             .await
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
@@ -1927,7 +1928,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         .await
         .expect("subscribe to Session");
     assert_eq!(
-        timeout(Duration::from_secs(1), feed.next())
+        timeout(PROGRESS_DEADLINE, feed.next())
             .await
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
@@ -2054,7 +2055,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
         .await
         .expect("subscribe to Session");
     assert_eq!(
-        timeout(Duration::from_secs(1), feed.next())
+        timeout(PROGRESS_DEADLINE, feed.next())
             .await
             .expect("initial snapshot arrives")
             .expect("Session stream remains open")
@@ -2173,14 +2174,14 @@ async fn events_attributed_to_an_unknown_subagent_leave_the_session_untouched() 
         .await
         .expect("decode created Session");
 
-    let start = timeout(Duration::from_secs(1), provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
         .await
         .expect("Provider startup begins");
     let mut provider_session = start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-attributed", "high", "fast"),
     });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();

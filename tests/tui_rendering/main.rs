@@ -3,6 +3,9 @@
 //! Each module below covers one area of the interface; `support` holds the fixtures
 //! and rendering helpers shared between them.
 
+#[path = "../support/deadlines.rs"]
+mod deadlines;
+
 #[path = "../support/failing_provider.rs"]
 mod failing_provider_support;
 

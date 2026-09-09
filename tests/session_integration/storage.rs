@@ -1,5 +1,6 @@
 //! Session persistence: discovery, restart recovery, and undecodable records.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
@@ -21,7 +22,7 @@ use suru::{
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary> {
@@ -484,14 +485,14 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
         .await
         .expect("decode created Session");
 
-    let start = timeout(Duration::from_secs(1), original_provider.next_start())
+    let start = timeout(PROGRESS_DEADLINE, original_provider.next_start())
         .await
         .expect("Provider startup begins");
     let mut provider_session = start.succeed(AgentIdentity {
         agent: AgentId::new("controlled-agent"),
         selection: controlled_selection("gpt-persisted", "high", "fast"),
     });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();
@@ -889,7 +890,7 @@ async fn resume_after_summary_mutation(
         .expect("admit Prompt to restored Session")
         .error_for_status()
         .expect("restored Session accepts a Prompt");
-    let replacement_start = timeout(Duration::from_secs(1), replacement_provider.next_start())
+    let replacement_start = timeout(PROGRESS_DEADLINE, replacement_provider.next_start())
         .await
         .expect("restored Session starts a Provider conversation");
     assert_eq!(
@@ -1018,7 +1019,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
         .await
         .unwrap();
     assert_eq!(failed.status(), reqwest::StatusCode::NOT_FOUND);
-    let changed = timeout(Duration::from_secs(1), events.next())
+    let changed = timeout(PROGRESS_DEADLINE, events.next())
         .await
         .unwrap()
         .unwrap();
@@ -1130,14 +1131,14 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .await
         .expect("decode created Session");
 
-    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+    let mut provider_session = timeout(PROGRESS_DEADLINE, original_provider.next_start())
         .await
         .expect("Provider startup begins")
         .succeed(AgentIdentity {
             agent: AgentId::new("controlled-agent"),
             selection: controlled_selection("gpt-timed", "high", "fast"),
         });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();
@@ -1267,14 +1268,14 @@ async fn turn_usage_survives_a_restart() {
         .await
         .expect("decode created Session");
 
-    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+    let mut provider_session = timeout(PROGRESS_DEADLINE, original_provider.next_start())
         .await
         .expect("Provider startup begins")
         .succeed(AgentIdentity {
             agent: AgentId::new("controlled-agent"),
             selection: controlled_selection("gpt-metered", "high", "fast"),
         });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();
@@ -1387,14 +1388,14 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         .await
         .expect("decode created Session");
 
-    let mut provider_session = timeout(Duration::from_secs(1), original_provider.next_start())
+    let mut provider_session = timeout(PROGRESS_DEADLINE, original_provider.next_start())
         .await
         .expect("Provider startup begins")
         .succeed(AgentIdentity {
             agent: AgentId::new("controlled-agent"),
             selection: controlled_selection("gpt-working", "high", "fast"),
         });
-    timeout(Duration::from_secs(1), provider_session.next_turn())
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
         .await
         .expect("initial Turn reaches Provider")
         .succeed();

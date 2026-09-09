@@ -1,6 +1,7 @@
 //! Scripted Codex programs and fixtures shared by more than one area of the tests.
 
 use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
+use crate::server_support::PROGRESS_DEADLINE;
 use serde_json::Value;
 use suru::managed_client::{ManagedClient, ManagedEvent};
 use sysinfo::{Pid, System};
@@ -35,11 +36,11 @@ const SHEBANG: &str = "#!/bin/sh\n";
 
 pub async fn receive_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next()).await,
+        timeout(PROGRESS_DEADLINE, client.next()).await,
         Ok(Some(ManagedEvent::Connecting))
     ));
     assert!(matches!(
-        timeout(Duration::from_secs(1), client.next()).await,
+        timeout(PROGRESS_DEADLINE, client.next()).await,
         Ok(Some(ManagedEvent::Connected(_)))
     ));
 }
@@ -48,7 +49,7 @@ pub async fn receive_initial_state(client: &mut ManagedClient) {
 /// deadline. Used wherever Suru claims to have taken a Codex process down —
 /// server shutdown, and a wait abandoned at an Errand's deadline.
 pub async fn assert_process_exited(pid: u32) {
-    if timeout(Duration::from_secs(1), async {
+    if timeout(PROGRESS_DEADLINE, async {
         loop {
             if System::new_all().process(Pid::from_u32(pid)).is_none() {
                 return;
@@ -165,7 +166,7 @@ impl ScriptedCodex {
     }
 
     pub async fn wait_for_method_count(&self, expected: &str, count: usize) {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             loop {
                 if self
                     .requests()
@@ -203,7 +204,7 @@ impl ScriptedCodex {
     }
 
     pub async fn wait_for_exit(&self) {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             while !self.exited.exists() {
                 tokio::task::yield_now().await;
             }
@@ -213,7 +214,7 @@ impl ScriptedCodex {
     }
 
     pub async fn wait_until_ready(&self) {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             while !self.ready.exists() {
                 tokio::task::yield_now().await;
             }
@@ -241,7 +242,7 @@ impl ScriptedCodex {
     /// Waits until a one-shot Errand run has recorded everything about itself,
     /// so a test may read all of it back without racing the fixture's writes.
     pub async fn wait_for_errand(&self) {
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_DEADLINE, async {
             while !self.errand_file("recorded").exists() {
                 tokio::task::yield_now().await;
             }

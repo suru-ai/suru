@@ -1,4 +1,5 @@
 //! Repository grouping through the owning Server's authenticated boundaries.
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     support,
@@ -237,7 +238,7 @@ async fn learning_separate_main_updates_streamed_presentation_without_splitting_
         .unwrap()
         .bytes_stream()
         .eventsource();
-    let initial = tokio::time::timeout(std::time::Duration::from_secs(2), catalog.next())
+    let initial = tokio::time::timeout(PROGRESS_DEADLINE, catalog.next())
         .await
         .unwrap()
         .unwrap()
@@ -246,7 +247,7 @@ async fn learning_separate_main_updates_streamed_presentation_without_splitting_
     let known = resolve(descriptor, &main, None).await;
     assert_eq!(known.workspace.id, original.session.workspace.id);
     assert_eq!(known.workspace.path, main);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let event = tokio::time::timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = catalog.next().await.unwrap().unwrap();
             if event.event == SESSION_CATALOG_UPDATED_EVENT {

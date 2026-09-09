@@ -1,6 +1,7 @@
 //! Claude's Errands: a Session started on Claude titled by a print-mode call, at the Model Claude
 //! declares its own Errands run at, carrying no Tools and leaving nothing resumable behind.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
@@ -94,7 +95,7 @@ async fn titled_session_with_timings(
 /// Waits until the Errand has reached the CLI, so a test that goes on to prove no Title arrived is
 /// proving something about an Errand Suru actually made.
 async fn errand_reaches_the_cli(claude: &ScriptedClaude) {
-    timeout(Duration::from_secs(10), async {
+    timeout(PROGRESS_DEADLINE, async {
         while !claude
             .exact_launches()
             .iter()

@@ -1,5 +1,6 @@
 //! Model catalog paging and normalization, and lowering a selection onto a thread.
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use serde_json::Value;
 use std::sync::Arc;
@@ -451,7 +452,7 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
     assert_eq!(turn_start["params"]["effort"], "high");
     assert_eq!(turn_start["params"]["serviceTier"], "fast");
 
-    let completed = timeout(Duration::from_secs(2), async {
+    let completed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -553,7 +554,7 @@ async fn codex_materializes_thread_options_and_handles_native_omission_and_clear
         })
         .await
         .expect("create default Codex Session");
-    let completed = timeout(Duration::from_secs(2), async {
+    let completed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -857,7 +858,7 @@ async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
         })
         .await
         .expect("create selected Codex Session");
-    let failed = timeout(Duration::from_secs(2), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -955,7 +956,7 @@ async fn codex_option_rejection_never_falls_back_and_restores_the_prompt() {
         })
         .await
         .expect("create selected Codex Session");
-    let failed = timeout(Duration::from_secs(2), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)
@@ -1045,7 +1046,7 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
         })
         .await
         .expect("create selected Codex Session");
-    let failed = timeout(Duration::from_secs(2), async {
+    let failed = timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client
                 .read_session(created.session.id)

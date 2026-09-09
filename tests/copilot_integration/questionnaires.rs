@@ -1,3 +1,4 @@
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{LiveTurn, ScriptedCopilot, conversation_arms, send_arm};
 use suru::{
     protocol::{Activity, Answer, QuestionAnswer, QuestionnaireOutcome, QuestionnaireSubmission},
@@ -99,7 +100,7 @@ async fn copilot_native_questionnaire_maps_selected_freeform_and_decline_results
             .submit_questionnaire(live.session_id, questionnaire.id, submission)
             .await
             .unwrap();
-        let response = timeout(Duration::from_secs(2), async {
+        let response = timeout(PROGRESS_DEADLINE, async {
             loop {
                 if let Some(response) = fixture.requests().into_iter().find(|r| r["id"] == 9001) {
                     break response;
