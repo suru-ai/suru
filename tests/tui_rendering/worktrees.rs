@@ -13,6 +13,7 @@ use suru::{
 
 struct Layout {
     _temporary: tempfile::TempDir,
+    root: PathBuf,
     main: PathBuf,
     linked: PathBuf,
     nested: PathBuf,
@@ -77,11 +78,31 @@ impl Layout {
         };
         Self {
             _temporary: temporary,
+            root,
             main,
             linked,
             nested,
             context,
         }
+    }
+    /// The Health an owning Server would answer for this Layout, naming the
+    /// fixture root as the home it resolved.
+    ///
+    /// Declaring a home is what keeps these renderings independent of where a
+    /// platform puts its temp directory. `tempfile::tempdir` answers
+    /// `/tmp/.tmpXXXXXX` on Linux but `C:\Users\you\AppData\Local\Temp\.tmpXXXXXX`
+    /// on Windows — roughly forty columns rather than fifteen — and the
+    /// landing's Workspace line is a fixed 72 columns wide however wide the
+    /// terminal is, so rendering wider cannot buy it room. An unabbreviated
+    /// Windows temp path eats the columns the hint beside it needs and
+    /// truncates the hint away entirely. Rooting the Server's home at the
+    /// fixture root abbreviates every path here to a `~`-relative label —
+    /// `~/main`, `~/linked/nested`, spelled with the platform's own separator —
+    /// short and the same shape on all three platforms, so these tests assert
+    /// the hint rather than the accident of a temp path's length.
+    fn health(&self, instance_id: uuid::Uuid, pid: u32) -> Health {
+        ready_health(instance_id, pid)
+            .with_workspace_paths(WorkspacePaths::from_home(Some(&self.root)))
     }
     fn at(&self, path: &Path) -> ResolvedWorkspace {
         let mut context = self.context.clone();
@@ -100,13 +121,12 @@ impl Layout {
         let mut app = Application::new(&self.nested, Default::default());
         let transition = app
             .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-                ready_health(fixture_instance_id(), 42_424).with_landing_agent_selection(Some(
-                    AgentSelection {
+                self.health(fixture_instance_id(), 42_424)
+                    .with_landing_agent_selection(Some(AgentSelection {
                         provider: ProviderId::new("codex"),
                         model: ModelId::new("test"),
                         options: vec![],
-                    },
-                )),
+                    })),
             )))
             .unwrap();
         answer(&mut app, transition, self.context.clone());
@@ -533,7 +553,7 @@ fn bare_landing_offers_working_copies_and_choosing_one_makes_next_prompt_executa
     let mut app = Application::new(&layout.main, Default::default());
     let transition = app
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(fixture_instance_id(), 42_424),
+            layout.health(fixture_instance_id(), 42_424),
         )))
         .unwrap();
     answer(&mut app, transition, bare.clone());
@@ -600,7 +620,7 @@ fn worktree_chooser_during_initial_discovery_uses_exact_launch_path_until_server
     let mut app = Application::new(&layout.nested, Default::default());
     let initial = app
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(fixture_instance_id(), 42_424),
+            layout.health(fixture_instance_id(), 42_424),
         )))
         .unwrap();
     let transition = command(&mut app, SemanticCommandId::WorktreeList);
@@ -860,7 +880,7 @@ fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_
         panic!("prepare")
     };
     app.handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-        ready_health(uuid::Uuid::new_v4(), 43_424),
+        layout.health(uuid::Uuid::new_v4(), 43_424),
     )))
     .unwrap();
     assert!(text(&app).contains("Original draft"));
