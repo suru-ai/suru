@@ -1515,21 +1515,16 @@ fn project_command_completed(
             "Codex completed a command before starting the Activity",
         ));
     };
-    let remaining = match aggregated_output {
-        Some(output) => match output.strip_prefix(&command.streamed_output) {
-            Some(remaining) => remaining.to_owned(),
-            // Codex caps the completed item's aggregate independently of its
-            // live deltas. Once the stream extends that retained prefix, it is
-            // already the fuller account and completion carries only status.
-            None if command.streamed_output.starts_with(&output) => String::new(),
-            None => {
-                return Err(codex_error(
-                    "Codex completed a command with output that did not match its stream",
-                ));
-            }
-        },
-        None => String::new(),
-    };
+    // The live deltas are the account of record: Codex emits them chronologically
+    // across stdout and stderr, while the completed item's aggregate concatenates
+    // the two streams and caps each independently. The aggregate extends the
+    // stream only when deltas stopped carrying output, so it settles what the
+    // stream never said and otherwise leaves the stream alone.
+    let remaining = aggregated_output
+        .as_deref()
+        .and_then(|output| output.strip_prefix(command.streamed_output.as_str()))
+        .unwrap_or_default()
+        .to_owned();
     let status = match status {
         NativeCommandStatus::Completed => ProviderCommandStatus::Completed,
         NativeCommandStatus::Failed | NativeCommandStatus::Declined => {
@@ -2010,6 +2005,85 @@ mod tests {
                 status: ProviderCommandStatus::Completed,
                 exit_status: Some(0),
             }]
+        );
+    }
+
+    /// Codex streams a command's deltas chronologically across stdout and
+    /// stderr but aggregates the completed item as stdout followed by stderr.
+    /// A command that interleaves the two ends with an aggregate the stream
+    /// can neither extend nor be extended by, and the Turn must survive it.
+    #[test]
+    fn an_out_of_order_final_command_aggregate_settles_the_live_stream() {
+        let mut correlation = reasoning_turn();
+        project(&mut correlation, command_started("cargo test"));
+        for delta in [
+            "   Compiling suru\n",
+            "running 1 test\n",
+            "error: test failed\n",
+        ] {
+            project(
+                &mut correlation,
+                NativeNotification::CommandOutputDelta {
+                    thread_id: THREAD.to_owned(),
+                    turn_id: TURN.to_owned(),
+                    item_id: ITEM.to_owned(),
+                    delta: delta.to_owned(),
+                },
+            );
+        }
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                NativeNotification::CommandCompleted {
+                    thread_id: THREAD.to_owned(),
+                    turn_id: TURN.to_owned(),
+                    item_id: ITEM.to_owned(),
+                    aggregated_output: Some(
+                        "running 1 test\n   Compiling suru\nerror: test failed\n".to_owned(),
+                    ),
+                    exit_status: Some(101),
+                    status: NativeCommandStatus::Failed,
+                },
+            ),
+            vec![ProviderEvent::CommandCompleted {
+                activity_id: ProviderActivityId::new(ITEM),
+                status: ProviderCommandStatus::Failed,
+                exit_status: Some(101),
+            }]
+        );
+    }
+
+    /// Nothing streamed leaves the completed item's aggregate as the only
+    /// account of the command's output, so it must still reach the transcript.
+    #[test]
+    fn an_unstreamed_command_takes_its_output_from_the_final_aggregate() {
+        let mut correlation = reasoning_turn();
+        project(&mut correlation, command_started("find the answer"));
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                NativeNotification::CommandCompleted {
+                    thread_id: THREAD.to_owned(),
+                    turn_id: TURN.to_owned(),
+                    item_id: ITEM.to_owned(),
+                    aggregated_output: Some("the whole answer\n".to_owned()),
+                    exit_status: Some(0),
+                    status: NativeCommandStatus::Completed,
+                },
+            ),
+            vec![
+                ProviderEvent::CommandOutputDelta {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    content: "the whole answer\n".to_owned(),
+                },
+                ProviderEvent::CommandCompleted {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    status: ProviderCommandStatus::Completed,
+                    exit_status: Some(0),
+                },
+            ]
         );
     }
 
