@@ -4,8 +4,8 @@ use std::path::Path;
 use suru::{
     managed_client::{OutlookClient, SessionCatalogSubscription},
     protocol::{
-        CheckoutRevision, CheckoutSummary, SessionId, SessionListItem, SessionSummary,
-        SourceControlAvailability,
+        AgentId, AgentIdentity, AgentSelection, CheckoutRevision, CheckoutSummary, ModelId,
+        ProviderId, SessionId, SessionListItem, SessionSummary, SourceControlAvailability,
     },
 };
 
@@ -120,7 +120,16 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
         ..Default::default()
     }
     .with_checkout_observation_interval(Duration::from_millis(15));
-    let server = server::spawn_with_timings(config.clone(), timings)
+    // A Provider double stands in for the built-in runtimes, which launch the
+    // real harness CLIs. Codex runs an Errand as `codex exec` started in the
+    // Session's own Execution Directory — deliberately, so that Workspace's
+    // agent instructions inform the answer — and Windows pins the directory a
+    // running process started in. On a machine with Codex installed that Errand
+    // outlives the point below where this test deletes the checkout out from
+    // under the Server, and the deletion fails with a sharing violation. What
+    // is under test is the observation loop, which no Provider takes part in.
+    let (runtime, mut provider) = provider_support::ControlledProvider::new();
+    let server = server::spawn_with_providers_and_timings(config.clone(), vec![runtime], timings)
         .await
         .unwrap();
     let first =
@@ -135,10 +144,31 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     let other = second.outlook(Outlook::Local);
     let mut one = local.subscribe_catalog();
     let mut two = other.subscribe_catalog();
+    let identity = || AgentIdentity {
+        agent: AgentId::new("checkout-stream"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("test"),
+            options: vec![],
+        },
+    };
+    // Each startup is answered before the next Session is created. Creation
+    // takes the Repository's mutation guard and hands it to the Provider actor,
+    // which holds it across startup, so a Session left starting would stall
+    // every later creation in the same Repository. Answering also settles what
+    // `updated_at` reads before the comparison below is taken.
     let a = create(&local, &linked).await;
+    let _first_session = timeout(Duration::from_secs(3), provider.next_start())
+        .await
+        .expect("the first Session asks its Provider to start")
+        .succeed(identity());
     let nested = linked.join("nested");
     std::fs::create_dir(&nested).unwrap();
     let b = create(&other, &nested).await;
+    let _second_session = timeout(Duration::from_secs(3), provider.next_start())
+        .await
+        .expect("the second Session asks its Provider to start")
+        .succeed(identity());
     let before = observed(&local, &mut one, 2, |r| branch(r, "feature")).await;
     observed(&other, &mut two, 2, |r| branch(r, "feature")).await;
     let mut late =
@@ -229,7 +259,10 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
         &database,
         "UPDATE prompts SET payload = '{invalid history';",
     );
-    let server = server::spawn_with_timings(config, timings).await.unwrap();
+    let (runtime, _provider) = provider_support::ControlledProvider::new();
+    let server = server::spawn_with_providers_and_timings(config, vec![runtime], timings)
+        .await
+        .unwrap();
     let client =
         ManagedClient::connect(ManagedClientConfig::new(state.path(), "checkout-stream").unwrap())
             .await
