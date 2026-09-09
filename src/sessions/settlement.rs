@@ -45,10 +45,12 @@ pub(crate) enum InterruptTarget {
 
 pub(crate) enum ProviderTurnOutcome {
     Completed {
-        /// A Turn the Provider completes has no command stream open, but a
-        /// Continuation settled early by the next Prompt — or a Subagent's
-        /// Turn settled by the Provider's own settle signal — may, and its
-        /// normalizers' pending lines still deserve storing.
+        /// A Turn may reach its completion with command streams still open —
+        /// a Provider that completed its Turn without settling them, a
+        /// Continuation settled early by the next Prompt, or a Subagent's Turn
+        /// settled by the Provider's own settle signal. The Turn's settle
+        /// closes those streams, and the pending line each one's normalizer
+        /// held back still deserves storing.
         trailing_output: TrailingCommandOutput,
     },
     Failed {

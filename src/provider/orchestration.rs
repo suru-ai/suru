@@ -2802,29 +2802,25 @@ fn project_provider_event(
                 )
                 .map(|_| ProviderEventProjection::Continue),
             ProviderEvent::TurnCompleted => {
+                // A Provider may reach its own boundary with streams it never
+                // settled — Codex completes a Turn without the `item/completed`
+                // an open command or Agent Message was owed. Settling the Turn
+                // settles them, the way an interruption does: the Turn is the
+                // outer boundary, and losing it over a stream the reader
+                // already watched arrive would cost them the answer it led to.
+                //
                 // A Subagent still working holds nothing open here: the Turn
                 // settles at the Provider's own boundary (ADR 0015), and the
                 // rows and routes live on at the connection until each
                 // Subagent's own settle arrives.
-                if active.streaming_message.is_some()
-                    || !active.command_activities.is_empty()
-                    || !active.file_change_activities.is_empty()
-                    || !active.reasoning_activities.is_empty()
-                {
-                    Err(anyhow::anyhow!(
-                        "Provider completed the Turn before completing its streamed output"
-                    ))
-                } else {
-                    sessions
-                        .finish_provider_turn(
-                            session_id,
-                            active.turn_id,
-                            ProviderTurnOutcome::Completed {
-                                trailing_output: TrailingCommandOutput::new(),
-                            },
-                        )
-                        .map(|()| ProviderEventProjection::Terminal)
-                }
+                let trailing_output = active.take_trailing_output();
+                sessions
+                    .finish_provider_turn(
+                        session_id,
+                        active.turn_id,
+                        ProviderTurnOutcome::Completed { trailing_output },
+                    )
+                    .map(|()| ProviderEventProjection::Terminal)
             }
             ProviderEvent::TurnInterrupted => {
                 let trailing_output = active.take_trailing_output();
@@ -3152,6 +3148,92 @@ mod tests {
             routed.revision,
             "an event for a dropped route lands nowhere"
         );
+    }
+
+    /// A Provider may reach its own Turn boundary with streams it never
+    /// settled — Codex completes a Turn without the `item/completed` its open
+    /// command or Agent Message was owed. Those streams are Suru's to close,
+    /// the way an interruption closes them; losing the Turn over them would
+    /// cost the reader the answer it already watched arrive.
+    #[tokio::test]
+    async fn a_turn_the_provider_completes_settles_the_streams_it_left_open() {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let identity = provider_identity();
+        let subagent = ProviderSubagentId::new("delegation-1");
+        let mut routes = SubagentRoutes::default();
+        route_to(&mut routes, &subagent, &fixture);
+        let command = super::super::ProviderActivityId::new("exec-1");
+
+        for event in [
+            ProviderEvent::CommandStarted {
+                activity_id: command.clone(),
+                command: "cargo test".to_owned(),
+                cwd: None,
+            },
+            ProviderEvent::CommandOutputDelta {
+                activity_id: command.clone(),
+                // The second line is unterminated, so only this actor's
+                // normalizer holds it when the Turn settles.
+                content: "   Compiling suru
+running 1 test"
+                    .to_owned(),
+            },
+            ProviderEvent::AgentMessageStarted,
+            ProviderEvent::AgentMessageDelta {
+                content: "The tests pass.".to_owned(),
+            },
+            ProviderEvent::TurnCompleted,
+        ] {
+            routes.project_event(&fixture.sessions, &updates, &identity, &subagent, event);
+        }
+
+        let routed = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("routed Session exists");
+        let turn = routed
+            .turns
+            .iter()
+            .find(|turn| turn.id == fixture.routed_turn)
+            .expect("the routed Turn exists");
+        assert_eq!(
+            turn.status,
+            TurnStatus::Completed,
+            "an unsettled stream does not cost the Turn"
+        );
+        assert!(
+            !routed
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Error { .. })),
+            "nothing failed, so the Transcript says nothing failed"
+        );
+        let Some(Activity::Command { status, output, .. }) = routed
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Command { .. }))
+        else {
+            panic!("the command the Provider left open is in the Transcript");
+        };
+        assert_ne!(
+            *status,
+            ActivityStatus::Active,
+            "the Turn's settle closes the command stream"
+        );
+        assert_eq!(
+            output,
+            "   Compiling suru
+running 1 test",
+            "the line only this actor held is stored before the stream closes"
+        );
+        let message = routed
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Agent)
+            .expect("the Agent Message the Provider left open is in the Transcript");
+        assert_eq!(message.status, MessageStatus::Completed);
+        assert_eq!(message.content, "The tests pass.");
     }
 
     #[tokio::test]
