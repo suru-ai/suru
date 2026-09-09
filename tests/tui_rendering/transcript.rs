@@ -2476,10 +2476,14 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
 /// reader's action after that.
 fn session_opened_under(
     workspace: &std::path::Path,
-    settings: EffectiveSettings,
+    mut settings: EffectiveSettings,
     pinned: &[&str],
     snapshot: suru::protocol::SessionSnapshot,
 ) -> Application {
+    // These fixtures exercise Transcript behavior at their stated frame
+    // widths. Keep the adjacent Sidebar out of that width unless a test is
+    // explicitly about composing the two surfaces.
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
     let mut application = connected_application(workspace);
     deliver_settings(&mut application, settings, pinned);
     application
@@ -2534,9 +2538,13 @@ fn session_opened_at(
 /// row, Group, or Fold presents starts by turning it on.
 fn client_showing_reasoning(workspace: &std::path::Path) -> Application {
     let mut application = connected_application(workspace);
+    let mut settings = settings_with_reasoning(ReasoningVisibility::Shown);
+    // Initial visibility is seeded by the first Settings snapshot, so hide
+    // the Sidebar here rather than trying to correct the fixture later.
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
     deliver_settings(
         &mut application,
-        settings_with_reasoning(ReasoningVisibility::Shown),
+        settings,
         &["transcript.reasoningVisibility"],
     );
     application
