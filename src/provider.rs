@@ -177,19 +177,19 @@ fn executable_shadowed_by_windows_app_alias(
             if !candidate.is_file() {
                 continue;
             }
-            if !found_app_alias {
-                if candidate
-                    .parent()
-                    .is_some_and(|parent| windows_paths_equal(parent, &windows_apps))
-                {
-                    found_app_alias = true;
-                    continue;
-                }
-                // The normal lookup found a command before WindowsApps, so there is no alias to
-                // bypass and Command should retain its native lookup behavior.
-                return None;
+            if candidate
+                .parent()
+                .is_some_and(|parent| windows_paths_equal(parent, windows_apps))
+            {
+                found_app_alias = true;
+                continue;
             }
-            return Some(candidate.into_os_string());
+            if found_app_alias {
+                return Some(candidate.into_os_string());
+            }
+            // The normal lookup found a command before WindowsApps, so there is no alias to bypass
+            // and Command should retain its native lookup behavior.
+            return None;
         }
     }
     None
@@ -1210,7 +1210,7 @@ mod tests {
         std::fs::write(windows_apps.join("copilot.exe"), []).expect("write app alias fixture");
         let cli = cli_directory.join("copilot.exe");
         std::fs::write(&cli, []).expect("write CLI executable fixture");
-        let path = std::env::join_paths([&windows_apps, &cli_directory])
+        let path = std::env::join_paths([&windows_apps, &windows_apps, &cli_directory])
             .expect("join executable lookup fixture PATH");
 
         assert_eq!(
