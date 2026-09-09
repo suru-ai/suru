@@ -33,13 +33,19 @@ fn local_landing_uses_the_servers_home_while_a_session_uses_the_workspace_name()
     let home = tempfile::tempdir().unwrap();
     let workspace = home.path().join("Projects").join("suru");
     std::fs::create_dir_all(&workspace).unwrap();
-    let workspace = workspace.canonicalize().unwrap();
+    let workspace = suru::paths::canonical(&workspace).unwrap();
     let mut application = connected_application(&workspace);
     hide_sidebar(&mut application);
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(fixture_instance_id(), 42).with_workspace_paths(WorkspacePaths {
-                home: Some(home.path().canonicalize().unwrap().to_str().unwrap().into()),
+                home: Some(
+                    suru::paths::canonical(home.path())
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                ),
                 ..WorkspacePaths::default()
             }),
         )))
@@ -361,7 +367,11 @@ fn symlinked_homes_shorten_resolved_workspaces_but_links_outside_home_stay_absol
         (alias.join("suru"), "~/suru".to_owned()),
         (
             alias.join("linked"),
-            outside.canonicalize().unwrap().to_str().unwrap().to_owned(),
+            suru::paths::canonical(&outside)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
         ),
     ] {
         let mut application = connected_application(&workspace);

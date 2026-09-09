@@ -3488,7 +3488,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
 
         let directory = tempfile::tempdir().unwrap();
-        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
         for mode in [TextSelectionCopy::Manual, TextSelectionCopy::Release] {
             let mut application = Application::new(&workspace, Default::default());
             let mut settings = EffectiveSettings::default();

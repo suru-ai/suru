@@ -53,7 +53,7 @@ fn workspace_display_data_resolves_the_servers_home_and_handles_unknown_homes() 
     let paths = WorkspacePaths::from_home(Some(&home.path().join("child").join("..")));
     assert_eq!(
         paths.home.as_deref(),
-        home.path().canonicalize().unwrap().to_str()
+        suru::paths::canonical(home.path()).unwrap().to_str()
     );
     assert_eq!(
         paths.style,
@@ -2055,11 +2055,11 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
 
     assert_eq!(
         resolved.workspace.path,
-        std::fs::canonicalize(root.path()).expect("read canonical Repository root")
+        suru::paths::canonical(root.path()).expect("read canonical Repository root")
     );
     assert_eq!(
         resolved.execution_directory.unwrap().path,
-        std::fs::canonicalize(nested).unwrap()
+        suru::paths::canonical(nested).unwrap()
     );
     assert!(resolved.workspace.repository.is_some());
     assert!(matches!(

@@ -32,7 +32,7 @@ impl WorkspacePaths {
     pub fn from_home(home: Option<&Path>) -> Self {
         Self {
             home: home
-                .and_then(|home| std::fs::canonicalize(home).ok())
+                .and_then(|home| crate::paths::canonical(home).ok())
                 .and_then(|home| home.into_os_string().into_string().ok()),
             ..Self::default()
         }

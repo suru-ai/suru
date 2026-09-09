@@ -1379,8 +1379,8 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         checkout_created = preparation.checkout_created,
         "Worktree preparation started"
     );
-    let source =
-        std::fs::canonicalize(&request.source.path).unwrap_or_else(|_| request.source.path.clone());
+    let source = crate::paths::canonical(&request.source.path)
+        .unwrap_or_else(|_| request.source.path.clone());
     if source != preparation.source.path && source != preparation.destination.path {
         return progress.reject(preparation_error(
             "Preparation identity belongs to another execution location",
@@ -2492,7 +2492,7 @@ async fn list_sessions(
     let workspace = match (query.workspace_id, query.workspace) {
         (Some(id), None) => Some(crate::protocol::WorkspaceId(id)),
         (None, Some(path)) => {
-            let Ok(path) = std::fs::canonicalize(path) else {
+            let Ok(path) = crate::paths::canonical(path) else {
                 return session_error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     SessionErrorCode::InvalidWorkspace,

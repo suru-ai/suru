@@ -2414,8 +2414,8 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     for workspace in [&here, &atlas] {
         std::fs::create_dir(workspace).expect("create the Workspace fixture");
     }
-    let here = std::fs::canonicalize(&here).expect("canonicalize the Workspace fixture");
-    let atlas = std::fs::canonicalize(&atlas).expect("canonicalize the Workspace fixture");
+    let here = suru::paths::canonical(&here).expect("canonicalize the Workspace fixture");
+    let atlas = suru::paths::canonical(&atlas).expect("canonicalize the Workspace fixture");
     let wanted = SessionId::new();
     let mut application =
         sidebar_focused(&here, vec![listed_as(wanted, "The work wanted", &here, 1)]);
@@ -6465,7 +6465,7 @@ fn a_client_launched_through_a_symlink_narrows_to_the_workspace_the_server_repor
     std::fs::create_dir(&real).expect("create the Workspace directory");
     let link = root.path().join("link");
     std::os::unix::fs::symlink(&real, &link).expect("reach the Workspace through a symlink");
-    let canonical = std::fs::canonicalize(&real).expect("canonicalize the Workspace fixture");
+    let canonical = suru::paths::canonical(&real).expect("canonicalize the Workspace fixture");
 
     let application = sidebar_scoped(
         &link,
@@ -6987,7 +6987,7 @@ fn the_workspace_the_reader_added_roots_the_sessions_they_make_next() {
     };
     assert_eq!(
         request.execution_directory.path,
-        std::fs::canonicalize(&added).expect("canonicalize the directory the reader added"),
+        suru::paths::canonical(&added).expect("canonicalize the directory the reader added"),
         "the Session is rooted in the Workspace the reader added, read the way the server \
          reads it: the server canonicalizes what it roots a Session at and what it narrows a \
          listing by, and a client holding some other spelling would narrow past its own work"
@@ -7344,7 +7344,7 @@ fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
     let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let canonical = std::fs::canonicalize(&added).expect("canonicalize it");
+    let canonical = suru::paths::canonical(&added).expect("canonicalize it");
     std::fs::create_dir(workspace.path().join("suru")).expect("create a Workspace beside it");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
 
@@ -7428,7 +7428,7 @@ fn the_session_picker_narrows_to_the_workspace_the_reader_added() {
     let workspace = workspace_dir();
     let added = workspace.path().join("notes");
     std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let canonical = std::fs::canonicalize(&added).expect("canonicalize it");
+    let canonical = suru::paths::canonical(&added).expect("canonicalize it");
     let mut application = sidebar_showing(workspace.path(), Vec::new());
 
     add_workspace(&mut application, &added.to_string_lossy());

@@ -13,7 +13,7 @@ impl GitSourceControl {
         {
             return Err("Only the selected linked Worktree can be removed; the main checkout cannot be removed".into());
         }
-        let common = std::fs::canonicalize(&repository.metadata_directory)
+        let common = crate::paths::canonical(&repository.metadata_directory)
             .map_err(|_| "Repository metadata is unavailable")?;
         if RepositoryId::from_metadata("git", &common) != repository.id
             || self.common(&common).await.as_ref() != Some(&common)

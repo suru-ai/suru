@@ -21,7 +21,7 @@ struct Layout {
 impl Layout {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let root = suru::paths::canonical(temp.path()).unwrap();
         let main = root.join("main");
         let linked = root.join("external worktree");
         std::fs::create_dir(&main).unwrap();

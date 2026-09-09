@@ -77,7 +77,7 @@ async fn claude_discovers_native_skills_in_configured_short_lived_processes() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let (server, mut client) = hosting(&claude, "claude-skill-catalog", state_dir.path()).await;
 
     let loading = client

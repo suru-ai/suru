@@ -316,10 +316,7 @@ async fn a_fresh_landing_defaults_to_the_first_provider_in_the_built_in_order() 
     );
     assert!(
         alpha.next_start().await.execution_directory()
-            == workspace
-                .path()
-                .canonicalize()
-                .expect("canonicalize Workspace"),
+            == suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the defaulted Session routes to the first hosted Provider"
     );
 
@@ -744,10 +741,7 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
     );
     assert!(
         beta.next_start().await.execution_directory()
-            == workspace
-                .path()
-                .canonicalize()
-                .expect("canonicalize Workspace"),
+            == suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the defaulted Session routes to the first available Provider"
     );
 

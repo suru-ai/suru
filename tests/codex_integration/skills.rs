@@ -153,7 +153,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let workspace_json = serde_json::to_string(&canonical_workspace).expect("encode Workspace");
     let fixture = ScriptedCodex::new_multiprocess(
         &CHANGING_SKILL_CODEX.replace("$SKILL_WORKSPACE", &workspace_json),
@@ -238,7 +238,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let workspace_json = serde_json::to_string(&canonical_workspace).expect("encode Workspace");
     let fixture =
         ScriptedCodex::new_multiprocess(&SKILL_CODEX.replace("$SKILL_WORKSPACE", &workspace_json));
@@ -385,7 +385,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let fixture = ScriptedCodex::new(&skill_operation_script(
         &canonical_workspace,
         DELIVER_SKILL_TURNS,
@@ -584,7 +584,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let fixture = ScriptedCodex::new(&skill_operation_script(
         &canonical_workspace,
         REJECT_SKILL_TURN,

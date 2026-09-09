@@ -604,7 +604,7 @@ async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
     let (runtime, mut provider) = provider_support::ControlledProvider::new();
     let pair = paired_servers_with_runtime("remote-shared-recovery", false, Some(runtime)).await;
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     let linked = root.join("external");
     std::fs::create_dir(&main).unwrap();
@@ -734,7 +734,7 @@ async fn remote_removal_routes_to_owner_counts_its_catalog_and_streams_missing()
     let (runtime, mut provider) = provider_support::ControlledProvider::new();
     let pair = paired_servers_with_runtime("remote-removal", false, Some(runtime)).await;
     let temp = tempfile::tempdir().unwrap();
-    let main = std::fs::canonicalize(temp.path()).unwrap();
+    let main = suru::paths::canonical(temp.path()).unwrap();
     git(&main, &["init", "-b", "main"]);
     git(
         &main,

@@ -65,7 +65,7 @@ impl RestartedSession {
         let workspace = tempfile::tempdir().expect("create valid Workspace");
         let execution_directory = workspace.path().join("packages/nested agent directory");
         std::fs::create_dir_all(&execution_directory).unwrap();
-        let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
+        let execution_directory = suru::paths::canonical(execution_directory).unwrap();
         let config = ServerConfig::new(state_dir.path(), channel)
             .expect("configure server")
             .with_data_dir(data_dir.path());
@@ -233,7 +233,7 @@ async fn a_reopened_session_resumes_its_persisted_copilot_session_after_a_restar
         "the replacement server handshakes a fresh process and resumes rather than creating"
     );
     let requests = copilot.requests();
-    let expected = std::fs::canonicalize(
+    let expected = suru::paths::canonical(
         restarted
             ._workspace
             .path()

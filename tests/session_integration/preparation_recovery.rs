@@ -69,7 +69,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
         Point::SubmodulesReady,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let root = suru::paths::canonical(temp.path()).unwrap();
         let main = root.join("main");
         committed(&main);
         let config = ServerConfig::new(root.join("state"), "restart-preparation").unwrap();
@@ -208,7 +208,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
 #[tokio::test]
 async fn interrupted_request_and_server_replacement_keep_the_same_preparation_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let config = ServerConfig::new(root.join("state"), "interrupted-client").unwrap();
@@ -258,7 +258,7 @@ async fn interrupted_request_and_server_replacement_keep_the_same_preparation_id
 #[tokio::test]
 async fn persisted_initial_session_shell_resumes_original_prompt_once_after_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let config = ServerConfig::new(root.join("state"), "pending-admission").unwrap();
@@ -444,7 +444,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
 #[tokio::test]
 async fn ambiguous_checkout_proof_external_locks_and_deleted_ready_branches_are_not_overwritten() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let (runtime, mut provider) = ControlledProvider::new();
@@ -499,7 +499,7 @@ async fn ambiguous_checkout_proof_external_locks_and_deleted_ready_branches_are_
 #[tokio::test]
 async fn matching_branch_commit_and_destination_do_not_prove_external_checkout_ownership() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let (runtime, mut provider) = ControlledProvider::new();
@@ -591,7 +591,7 @@ impl PreparationObserver for FailMetadataSave {
 #[tokio::test]
 async fn real_metadata_write_failure_after_git_success_recovers_same_checkout_on_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let config = ServerConfig::new(root.join("state"), "metadata-failure").unwrap();
@@ -650,7 +650,7 @@ async fn real_metadata_write_failure_after_git_success_recovers_same_checkout_on
 #[tokio::test]
 async fn lost_admission_response_rejoins_delivered_work_without_another_provider_turn() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let config = ServerConfig::new(root.join("state"), "lost-admission").unwrap();
@@ -731,7 +731,7 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
 #[tokio::test]
 async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provider_until_ready() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     let module = root.join("module-source");
     committed(&main);

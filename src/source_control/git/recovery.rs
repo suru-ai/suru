@@ -36,7 +36,7 @@ impl GitSourceControl {
         if checkout.kind != CheckoutKind::Linked || checkout.repository != repository.id {
             return Err("Only this Repository's known linked Worktree can be recovered".to_owned());
         }
-        let common = std::fs::canonicalize(&repository.metadata_directory)
+        let common = crate::paths::canonical(&repository.metadata_directory)
             .map_err(|_| "Repository metadata is missing or unreadable")?;
         if RepositoryId::from_metadata("git", &common) != repository.id
             || self.common(&common).await.as_ref() != Some(&common)
@@ -139,7 +139,7 @@ impl GitSourceControl {
                 return Err("Original Worktree parent resolves to a different location".to_owned());
             }
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            if std::fs::canonicalize(parent).map_err(|e| e.to_string())? != parent {
+            if crate::paths::canonical(parent).map_err(|e| e.to_string())? != parent {
                 return Err("Original Worktree parent resolves to a different location".to_owned());
             }
             let mut args = vec![

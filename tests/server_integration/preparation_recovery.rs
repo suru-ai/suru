@@ -33,7 +33,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
     )
     .await;
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
             .arg("-C")

@@ -69,7 +69,7 @@ fn committed(root: &Path) {
 async fn choosing_existing_detached_worktree_starts_multiple_agents_at_root_and_preserves_explicit_subdir()
  {
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let linked = root.join("external detached");
@@ -150,7 +150,7 @@ async fn choosing_existing_detached_worktree_starts_multiple_agents_at_root_and_
 async fn remembered_missing_and_replaced_directories_stay_selected_without_membership_or_main_fallback()
  {
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let linked = root.join("linked");
@@ -220,7 +220,7 @@ async fn remembered_missing_and_replaced_directories_stay_selected_without_membe
 async fn bare_and_unknown_main_workspaces_offer_existing_working_copies_without_executing_metadata()
 {
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     let source = root.join("source");
     committed(&source);
     let bare = root.join("bare.git");

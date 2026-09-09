@@ -192,7 +192,7 @@ async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
     );
     assert_eq!(
         errand.execution_directory(),
-        std::fs::canonicalize(workspace.path())
+        suru::paths::canonical(workspace.path())
             .expect("canonicalize Workspace")
             .as_path(),
         "the Errand runs in the Session's Workspace"

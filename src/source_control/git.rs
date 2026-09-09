@@ -127,7 +127,7 @@ impl GitSourceControl {
         };
         if known.common.is_dir()
             && RepositoryId::from_metadata("git", &known.common) == checkout.repository
-            && std::fs::canonicalize(&checkout.root).ok().as_ref() == Some(&checkout.root)
+            && crate::paths::canonical(&checkout.root).ok().as_ref() == Some(&checkout.root)
             && git_marker(&checkout.root).as_ref() == Some(&known.marker)
         {
             return true;
@@ -352,12 +352,12 @@ impl GitSourceControl {
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )
             .await?;
-        std::fs::canonicalize(path).ok()
+        crate::paths::canonical(path).ok()
     }
     async fn valid_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
         let root = self.text(path, &["rev-parse", "--show-toplevel"]).await?;
-        let root = std::fs::canonicalize(root).ok()?;
-        let path = std::fs::canonicalize(path).ok()?;
+        let root = crate::paths::canonical(root).ok()?;
+        let path = crate::paths::canonical(path).ok()?;
         if root != path || self.common(&root).await.as_deref() != Some(common) {
             return None;
         }
@@ -608,7 +608,7 @@ impl SourceControl for GitSourceControl {
         Some(reading)
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
-        let path = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
+        let path = crate::paths::canonical(directory).unwrap_or_else(|_| directory.to_owned());
         let mut resolved = ResolvedWorkspace::directory(path.clone());
         if !path.is_dir() {
             resolved.execution_status = ExecutionDirectoryStatus::Unavailable {
@@ -650,7 +650,7 @@ impl SourceControl for GitSourceControl {
         }
         let common = match String::from_utf8(probe.stdout)
             .ok()
-            .and_then(|text| std::fs::canonicalize(text.trim_end_matches(['\r', '\n'])).ok())
+            .and_then(|text| crate::paths::canonical(text.trim_end_matches(['\r', '\n'])).ok())
         {
             Some(path) => path,
             None => {
@@ -670,11 +670,11 @@ impl SourceControl for GitSourceControl {
         let git_dir = self
             .text(&path, &["rev-parse", "--absolute-git-dir"])
             .await
-            .and_then(|path| std::fs::canonicalize(path).ok());
+            .and_then(|path| crate::paths::canonical(path).ok());
         let top = self
             .text(&path, &["rev-parse", "--show-toplevel"])
             .await
-            .and_then(|path| std::fs::canonicalize(path).ok());
+            .and_then(|path| crate::paths::canonical(path).ok());
         let mut location = if bare {
             RepositoryLocation::Bare {
                 root: common.clone(),
@@ -826,7 +826,7 @@ impl SourceControl for GitSourceControl {
 fn canonical_checkout_path(path: &Path) -> PathBuf {
     path.ancestors()
         .find_map(|ancestor| {
-            let root = std::fs::canonicalize(ancestor).ok()?;
+            let root = crate::paths::canonical(ancestor).ok()?;
             Some(root.join(path.strip_prefix(ancestor).ok()?))
         })
         .unwrap_or_else(|| path.to_owned())

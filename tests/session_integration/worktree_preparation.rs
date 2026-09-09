@@ -72,7 +72,7 @@ fn creation(preparation: &PreparedCheckout, text: &str) -> CreateSessionRequest 
 #[tokio::test]
 async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_admitted_session() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("repo");
     committed(&main);
     let linked = root.join("linked");
@@ -187,7 +187,7 @@ async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_
 #[tokio::test]
 async fn naming_bare_storage_and_destination_validation_preserve_existing_resources() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("repo");
     committed(&main);
     let bare = root.join("bare");
@@ -252,7 +252,7 @@ async fn naming_bare_storage_and_destination_validation_preserve_existing_resour
 async fn recursive_local_submodules_and_destination_skills_finish_before_startup_and_retry_reuses_progress()
  {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let leaf = root.join("leaf");
     committed(&leaf);
     let middle = root.join("middle");
@@ -359,7 +359,7 @@ async fn recursive_local_submodules_and_destination_skills_finish_before_startup
 #[tokio::test]
 async fn preparation_is_durable_and_unborn_creation_returns_reason_without_mutation() {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let state = root.join("state");
@@ -442,7 +442,7 @@ impl suru::source_control::SourceControl for CollisionAdapter {
 async fn branch_collision_does_not_reset_or_duplicate_intention_and_unknown_main_disables_creation()
 {
     let temp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
     committed(&main);
     let (runtime, mut provider) = ControlledProvider::new();

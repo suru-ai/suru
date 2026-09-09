@@ -243,7 +243,7 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     );
     assert_eq!(
         codex.errand_cwd(),
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace"),
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the Errand runs in the Session's Workspace"
     );
     assert!(
@@ -289,7 +289,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
 
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let workspace_json =
         serde_json::to_string(&canonical_workspace).expect("encode Workspace path");
     let skill_arm = format!(

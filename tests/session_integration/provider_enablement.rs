@@ -302,10 +302,7 @@ async fn a_fresh_landing_default_passes_over_a_disabled_provider() {
     );
     assert_eq!(
         copilot.next_start().await.execution_directory(),
-        workspace
-            .path()
-            .canonicalize()
-            .expect("canonicalize Workspace"),
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the defaulted Session routes to the Provider the user left on"
     );
 
@@ -425,10 +422,7 @@ async fn a_session_with_no_agent_selection_routes_to_the_first_enabled_runtime()
     );
     assert_eq!(
         copilot.next_start().await.execution_directory(),
-        workspace
-            .path()
-            .canonicalize()
-            .expect("canonicalize Workspace"),
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the Session takes the first enabled runtime, not the first hosted one"
     );
     assert!(

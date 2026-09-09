@@ -63,7 +63,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         .expect("decode created Session snapshot");
     assert_eq!(
         snapshot.session.workspace.path,
-        std::fs::canonicalize(&workspace).expect("canonicalize expected Workspace")
+        suru::paths::canonical(&workspace).expect("canonicalize expected Workspace")
     );
     assert_eq!(snapshot.session.agent_selection, None);
     assert_eq!(snapshot.session.status, SessionStatus::Idle);

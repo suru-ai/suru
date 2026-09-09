@@ -28,7 +28,7 @@ fn git(directory: &Path, args: &[&str]) {
 }
 fn root() -> (tempfile::TempDir, PathBuf) {
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     (temporary, root)
 }
 fn init(root: &Path) {

@@ -6884,7 +6884,7 @@ impl Application {
 /// not a reason to refuse to work in it, so the path stands as given where
 /// canonicalizing fails.
 fn workspace_reading(workspace: &Path) -> PathBuf {
-    std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned())
+    crate::paths::canonical(workspace).unwrap_or_else(|_| workspace.to_owned())
 }
 
 /// Whether a terminal event is the reader acting rather than the terminal

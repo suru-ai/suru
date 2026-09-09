@@ -27,8 +27,10 @@ use uuid::Uuid;
 /// — the one a launching client holds and the server roots Sessions at — so
 /// an assertion comparing it against either means the same on every platform.
 /// A raw tempdir path is canonical on Linux only by luck: macOS spells
-/// `/var/folders/…` for `/private/var/folders/…`, and Windows's canonical
-/// form carries a verbatim prefix no tempdir path does.
+/// `/var/folders/…` for `/private/var/folders/…`, and Windows resolves the
+/// short 8.3 names a temporary directory is often reached through. It reads
+/// through [`suru::paths::canonical`] so the fixture cannot answer a spelling
+/// the Server would never store.
 pub struct WorkspaceDir {
     /// Held only to keep the directory on disk for the fixture's lifetime.
     _directory: tempfile::TempDir,
@@ -46,7 +48,7 @@ impl WorkspaceDir {
 pub fn workspace_dir() -> WorkspaceDir {
     let directory = tempfile::tempdir().expect("create Workspace");
     let canonical =
-        std::fs::canonicalize(directory.path()).expect("canonicalize the Workspace fixture");
+        suru::paths::canonical(directory.path()).expect("canonicalize the Workspace fixture");
     WorkspaceDir {
         _directory: directory,
         canonical,
@@ -56,7 +58,7 @@ pub fn workspace_dir() -> WorkspaceDir {
 /// A spelling of `workspace` that is not its canonical reading on any
 /// platform — `..` survives `Path` comparison where `.` does not — the way a
 /// path reached through a symlink, or Windows's own `current_dir`, never
-/// matches what `fs::canonicalize` answers.
+/// matches what [`suru::paths::canonical`] answers.
 pub fn noncanonical_spelling(workspace: &WorkspaceDir) -> std::path::PathBuf {
     std::fs::create_dir_all(workspace.path().join("sub")).expect("create the spelling's waypoint");
     workspace.path().join("sub").join("..")
@@ -315,7 +317,7 @@ pub fn answer_workspace_resolution(
         .base
         .unwrap_or_else(|| std::env::current_dir().expect("read test current directory"));
     let named = base.join(request.path);
-    let result = std::fs::canonicalize(named)
+    let result = suru::paths::canonical(named)
         .map_err(|_| "No directory there".to_owned())
         .and_then(|path| {
             path.is_dir()

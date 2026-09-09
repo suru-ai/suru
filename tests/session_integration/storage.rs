@@ -336,7 +336,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
     assert_eq!(filtered[0].title, "First Session");
     assert_eq!(
         filtered[0].session.workspace.path,
-        std::fs::canonicalize(first_workspace).expect("canonicalize expected Workspace")
+        suru::paths::canonical(first_workspace).expect("canonicalize expected Workspace")
     );
 
     server.shutdown().await.expect("shut down server");
@@ -416,7 +416,7 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
     );
     assert_eq!(
         before_restart[0].session.workspace.path,
-        std::fs::canonicalize(workspace.path()).expect("canonicalize expected Workspace")
+        suru::paths::canonical(workspace.path()).expect("canonicalize expected Workspace")
     );
     assert!(before_restart[0].created_at < before_restart[0].updated_at);
     original.shutdown().await.expect("stop original server");
@@ -719,7 +719,7 @@ async fn resume_after_summary_mutation(
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let execution_root = if regroup {
-        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let root = suru::paths::canonical(workspace.path()).unwrap();
         crate::repositories::git(&root, &["init", "-b", "main"]);
         crate::repositories::git(
             &root,
@@ -745,9 +745,9 @@ async fn resume_after_summary_mutation(
         .join("packages")
         .join("nested agent directory");
     std::fs::create_dir_all(&execution_directory).unwrap();
-    let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
+    let execution_directory = suru::paths::canonical(execution_directory).unwrap();
     let grouping_directory = if regroup {
-        std::fs::canonicalize(workspace.path()).unwrap()
+        suru::paths::canonical(workspace.path()).unwrap()
     } else {
         execution_directory.clone()
     };

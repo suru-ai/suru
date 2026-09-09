@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -140,7 +139,7 @@ impl SessionStore {
         &self,
         request: CreateSessionRequest,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
-        let path = fs::canonicalize(&request.execution_directory.path)
+        let path = crate::paths::canonical(&request.execution_directory.path)
             .unwrap_or_else(|_| request.execution_directory.path.clone());
         self.create_in(request, crate::protocol::ResolvedWorkspace::directory(path))
     }
@@ -195,13 +194,14 @@ impl SessionStore {
             }
         };
 
-        let execution_path = fs::canonicalize(&request.execution_directory.path).map_err(|_| {
-            if retry_execution_directory.is_some() {
-                CreateSessionError::PromptConflict
-            } else {
-                CreateSessionError::InvalidWorkspace
-            }
-        })?;
+        let execution_path =
+            crate::paths::canonical(&request.execution_directory.path).map_err(|_| {
+                if retry_execution_directory.is_some() {
+                    CreateSessionError::PromptConflict
+                } else {
+                    CreateSessionError::InvalidWorkspace
+                }
+            })?;
         if let Some(expected) = retry_execution_directory {
             if execution_path != expected {
                 return Err(CreateSessionError::PromptConflict);

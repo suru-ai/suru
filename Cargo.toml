@@ -16,6 +16,8 @@ crossterm = "0.28.1"
 dirs = "6.0.0"
 diesel = { version = "2", features = ["sqlite"] }
 diesel_migrations = "2"
+# Canonicalizes without the Windows verbatim prefix Git refuses; see `src/paths.rs`.
+dunce = "1.0.5"
 eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
 futures-util = "0.3.31"

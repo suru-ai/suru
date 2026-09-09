@@ -186,7 +186,7 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
     );
     assert_eq!(
         errand.working_directory,
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace"),
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),
         "the Errand runs in the Session's Workspace"
     );
 

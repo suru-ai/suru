@@ -21,7 +21,7 @@ struct Layout {
 impl Layout {
     fn new() -> Self {
         let temporary = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let root = suru::paths::canonical(temporary.path()).unwrap();
         let main = root.join("main");
         let linked = root.join("linked");
         let nested = linked.join("nested");

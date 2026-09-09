@@ -1081,7 +1081,7 @@ fn workspace(components: &[&str]) -> PathBuf {
 fn workspace_in(root: &Path, name: &str) -> PathBuf {
     let workspace = root.join(name);
     std::fs::create_dir(&workspace).expect("create the Workspace fixture");
-    std::fs::canonicalize(workspace).expect("canonicalize the Workspace fixture")
+    suru::paths::canonical(workspace).expect("canonicalize the Workspace fixture")
 }
 
 /// A listed Session rooted at the Workspace named, last active when the test
@@ -1419,7 +1419,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
         SourceControlCapabilities,
     };
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     let main = root.join("main");
     let linked = root.join("linked");
     let metadata = root.join("metadata");
@@ -1521,7 +1521,7 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
         SourceControlCapabilities,
     };
     let temporary = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
     let repository = Repository {
         id: RepositoryId::from_metadata("git", &root),
         system: "git".to_owned(),

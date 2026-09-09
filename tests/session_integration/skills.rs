@@ -66,7 +66,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create Workspace");
         let canonical_workspace =
-            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+            suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
         let provider_id = ProviderId::new(provider_name);
         let model_id = format!("{provider_name}-model");
         let (runtime, mut provider) = ControlledProvider::with_provider(
@@ -260,7 +260,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create Workspace");
         let canonical_workspace =
-            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+            suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
         let provider_id = ProviderId::new(provider_name);
         let model_id = format!("{provider_name}-model");
         let (runtime, mut provider) = ControlledProvider::with_provider(
@@ -387,7 +387,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create Workspace");
         let canonical_workspace =
-            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+            suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
         let provider_id = ProviderId::new(provider_name);
         let model_id = format!("{provider_name}-model");
         let (runtime, mut provider) = ControlledProvider::with_provider(
@@ -557,7 +557,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let (runtime, mut provider) = ControlledProvider::with_provider(
         ProviderId::new("codex"),
         vec![hosted_model("codex", "codex-model")],
@@ -729,7 +729,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let (runtime, _provider) = ControlledProvider::with_provider(
         ProviderId::new("controlled"),
         vec![hosted_model("controlled", "controlled-model")],
@@ -877,7 +877,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     runtime.offer_skills(SkillCatalog {
         provider: ProviderId::new("controlled"),
         execution_directory: suru::protocol::ExecutionDirectory {
-            path: std::fs::canonicalize(workspace.path())
+            path: suru::paths::canonical(workspace.path())
                 .expect("canonicalize suru::protocol::ExecutionDirectory"),
         },
         skills: vec![SkillDescriptor {
@@ -924,7 +924,7 @@ async fn force_refresh_during_discovery_discards_the_superseded_result() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create Workspace");
     let canonical_workspace =
-        std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
     let (runtime, _provider) = ControlledProvider::with_provider(
         ProviderId::new("controlled"),
         vec![hosted_model("controlled", "controlled-model")],
@@ -1012,9 +1012,9 @@ async fn catalog_cache_is_scoped_by_provider_and_canonical_workspace() {
     std::fs::create_dir(&first_workspace).expect("create first Workspace");
     std::fs::create_dir(&second_workspace).expect("create second Workspace");
     let first_canonical =
-        std::fs::canonicalize(&first_workspace).expect("canonicalize first Workspace");
+        suru::paths::canonical(&first_workspace).expect("canonicalize first Workspace");
     let second_canonical =
-        std::fs::canonicalize(&second_workspace).expect("canonicalize second Workspace");
+        suru::paths::canonical(&second_workspace).expect("canonicalize second Workspace");
     let (alpha, _alpha_provider) = ControlledProvider::with_provider(
         ProviderId::new("alpha"),
         vec![hosted_model("alpha", "alpha-model")],
@@ -1100,7 +1100,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
     let workspace_parent = tempfile::tempdir().expect("create Workspace parent");
     let workspace = workspace_parent.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create Workspace");
-    let canonical_workspace = std::fs::canonicalize(&workspace).expect("canonicalize Workspace");
+    let canonical_workspace = suru::paths::canonical(&workspace).expect("canonicalize Workspace");
     let model = hosted_model("controlled", "controlled-model");
     let selection = hosted_selection("controlled", "controlled-model");
     let (runtime, mut provider) =
@@ -1363,7 +1363,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create Workspace");
         let canonical_workspace =
-            std::fs::canonicalize(workspace.path()).expect("canonicalize Workspace");
+            suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
         let provider_id = ProviderId::new(provider_name);
         let model_id = format!("{provider_name}-model");
         let (runtime, mut provider) = ControlledProvider::with_provider(

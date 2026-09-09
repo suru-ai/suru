@@ -2,7 +2,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -516,8 +515,8 @@ fn unavailable_catalog(key: &CatalogKey, message: &str) -> SkillCatalog {
 }
 
 fn canonical_execution_directory(execution_directory: &Path) -> Result<PathBuf, SkillCatalogError> {
-    let execution_directory =
-        fs::canonicalize(execution_directory).map_err(|_| SkillCatalogError::InvalidWorkspace)?;
+    let execution_directory = crate::paths::canonical(execution_directory)
+        .map_err(|_| SkillCatalogError::InvalidWorkspace)?;
     execution_directory
         .is_dir()
         .then_some(execution_directory)

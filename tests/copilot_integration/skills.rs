@@ -293,7 +293,7 @@ async fn copilot_lists_only_native_skills_with_stable_opaque_identity_and_one_sk
     assert_eq!(creates.len(), 2);
     assert!(creates.iter().all(|request| {
         request["params"]["workingDirectory"].as_str()
-            == std::fs::canonicalize(workspace.path())
+            == suru::paths::canonical(workspace.path())
                 .expect("canonicalize Workspace")
                 .to_str()
     }));

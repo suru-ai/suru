@@ -121,7 +121,7 @@ async fn list(descriptor: &RuntimeDescriptor, id: Option<&WorkspaceId>) -> Vec<S
         .unwrap()
 }
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap()
+    suru::paths::canonical(path).unwrap()
 }
 
 #[tokio::test]

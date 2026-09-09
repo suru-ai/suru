@@ -222,7 +222,7 @@ impl SourceControlService {
             }
             *incarnation
         };
-        let path = std::fs::canonicalize(&session.execution_directory.path).map_err(|_| format!("The exact Execution Directory {} is unavailable after Worktree recovery; choose another Session or restore this subdirectory", session.execution_directory.path.display()))?;
+        let path = crate::paths::canonical(&session.execution_directory.path).map_err(|_| format!("The exact Execution Directory {} is unavailable after Worktree recovery; choose another Session or restore this subdirectory", session.execution_directory.path.display()))?;
         if !path.is_dir()
             || !path.starts_with(&checkout.root)
             || path != session.execution_directory.path
@@ -359,7 +359,7 @@ impl SourceControlService {
         if request.checkout_id.is_some() && request.remembered_execution_directory.is_some() {
             return Err("Choose one execution location".to_owned());
         }
-        let path = std::fs::canonicalize(named).unwrap_or_else(|_| named.to_owned());
+        let path = crate::paths::canonical(named).unwrap_or_else(|_| named.to_owned());
         if request.workspace_id.is_none() && !path.is_dir() {
             return Err(if path.exists() {
                 "Not a directory"

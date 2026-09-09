@@ -831,7 +831,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let execution_directory = workspace.path().join("packages/nested agent directory");
     std::fs::create_dir_all(&execution_directory).unwrap();
-    let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
+    let execution_directory = suru::paths::canonical(execution_directory).unwrap();
     let channel = "codex-persisted-resume-state";
     let config = ServerConfig::new(state_dir.path(), channel)
         .expect("configure original server")

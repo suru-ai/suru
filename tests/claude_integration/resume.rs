@@ -70,7 +70,7 @@ impl DurableSession {
         let workspace = tempfile::tempdir().expect("create valid Workspace");
         let execution_directory = workspace.path().join("packages/nested agent directory");
         std::fs::create_dir_all(&execution_directory).unwrap();
-        let execution_directory = std::fs::canonicalize(execution_directory).unwrap();
+        let execution_directory = suru::paths::canonical(execution_directory).unwrap();
         let (server, client) = hosting(claude, channel, state_dir.path()).await;
         let created = client
             .create_session(CreateSessionRequest {
@@ -231,7 +231,7 @@ async fn a_session_reopened_after_a_restart_resumes_the_conversation_it_opened()
     );
 
     assert_second_child_resumed_the_first(&claude, "the restart");
-    let expected = std::fs::canonicalize(
+    let expected = suru::paths::canonical(
         restored
             ._workspace
             .path()
