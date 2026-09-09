@@ -140,7 +140,78 @@ pub(crate) fn concise_remote_message(message: &str, fallback: &str) -> String {
 pub(crate) fn resolve_executable(variable: &str, name: &str) -> std::ffi::OsString {
     std::env::var_os(variable)
         .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| std::ffi::OsString::from(name))
+        .unwrap_or_else(|| {
+            #[cfg(windows)]
+            if let (Some(path), Some(local_app_data)) = (
+                std::env::var_os("PATH"),
+                std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from),
+            ) {
+                let windows_apps = local_app_data.join("Microsoft").join("WindowsApps");
+                if let Some(executable) =
+                    executable_shadowed_by_windows_app_alias(name, &path, &windows_apps)
+                {
+                    return executable;
+                }
+            }
+
+            std::ffi::OsString::from(name)
+        })
+}
+
+/// Finds the next executable on `PATH` when a Windows app execution alias would otherwise win.
+///
+/// The Microsoft Store's consumer Copilot app publishes `copilot.exe` under `WindowsApps`, the
+/// same command name as GitHub Copilot CLI. Launching that app alias as a child process fails with
+/// `APPMODEL_ERROR_NO_PACKAGE` on Windows, even when a working CLI appears later on `PATH`. Leave
+/// ordinary command lookup untouched unless that exact class of alias is the first match.
+#[cfg(windows)]
+fn executable_shadowed_by_windows_app_alias(
+    name: &str,
+    path: &std::ffi::OsStr,
+    windows_apps: &std::path::Path,
+) -> Option<std::ffi::OsString> {
+    let mut found_app_alias = false;
+
+    for directory in std::env::split_paths(path) {
+        for candidate in windows_executable_candidates(&directory, name) {
+            if !candidate.is_file() {
+                continue;
+            }
+            if !found_app_alias {
+                if candidate
+                    .parent()
+                    .is_some_and(|parent| windows_paths_equal(parent, &windows_apps))
+                {
+                    found_app_alias = true;
+                    continue;
+                }
+                // The normal lookup found a command before WindowsApps, so there is no alias to
+                // bypass and Command should retain its native lookup behavior.
+                return None;
+            }
+            return Some(candidate.into_os_string());
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_executable_candidates(
+    directory: &std::path::Path,
+    name: &str,
+) -> Vec<std::path::PathBuf> {
+    let candidate = directory.join(name);
+    if std::path::Path::new(name).extension().is_some() {
+        vec![candidate]
+    } else {
+        vec![candidate, directory.join(format!("{name}.exe"))]
+    }
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 /// The reading version of an identifier a Provider names in wire case, such as `long_context`.
@@ -1001,6 +1072,8 @@ pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
 mod tests {
     use std::{ffi::OsString, sync::Mutex};
 
+    #[cfg(windows)]
+    use super::executable_shadowed_by_windows_app_alias;
     use super::{
         MAX_REMOTE_ERROR_CHARS, built_in_providers, concise_remote_message, resolve_executable,
         runtimes,
@@ -1120,5 +1193,49 @@ mod tests {
                 None => std::env::remove_var(FIXTURE_PATH_ENV),
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_app_alias_does_not_shadow_a_later_cli_executable() {
+        let directory = tempfile::tempdir().expect("create executable lookup fixture");
+        let windows_apps = directory
+            .path()
+            .join("LocalAppData")
+            .join("Microsoft")
+            .join("WindowsApps");
+        let cli_directory = directory.path().join("WinGet").join("Links");
+        std::fs::create_dir_all(&windows_apps).expect("create WindowsApps fixture directory");
+        std::fs::create_dir_all(&cli_directory).expect("create CLI fixture directory");
+        std::fs::write(windows_apps.join("copilot.exe"), []).expect("write app alias fixture");
+        let cli = cli_directory.join("copilot.exe");
+        std::fs::write(&cli, []).expect("write CLI executable fixture");
+        let path = std::env::join_paths([&windows_apps, &cli_directory])
+            .expect("join executable lookup fixture PATH");
+
+        assert_eq!(
+            executable_shadowed_by_windows_app_alias("copilot", &path, &windows_apps),
+            Some(cli.into_os_string()),
+            "a Windows app execution alias must not hide an installed command-line program"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_windows_path_resolution_stays_native() {
+        let directory = tempfile::tempdir().expect("create executable lookup fixture");
+        let cli_directory = directory.path().join("bin");
+        let windows_apps = directory.path().join("WindowsApps");
+        std::fs::create_dir_all(&cli_directory).expect("create CLI fixture directory");
+        let cli = cli_directory.join("copilot.exe");
+        std::fs::write(&cli, []).expect("write CLI executable fixture");
+        let path = std::env::join_paths([&cli_directory, &windows_apps])
+            .expect("join executable lookup fixture PATH");
+
+        assert_eq!(
+            executable_shadowed_by_windows_app_alias("copilot", &path, &windows_apps),
+            None,
+            "a normal first match is left to Command's native lookup"
+        );
     }
 }
