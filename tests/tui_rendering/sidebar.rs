@@ -5854,6 +5854,7 @@ fn everywhere_workspace_names_use_each_rows_origin_path_style() {
                 },
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![remote_id],
+                checkout_states: Vec::new(),
             }),
         })
         .unwrap();
@@ -5925,6 +5926,7 @@ fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
                     workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(2),
                     session_ids: vec![remote_session],
+                    checkout_states: Vec::new(),
                 }),
             })
             .expect("take the fresh Remote snapshot"),
@@ -7500,6 +7502,7 @@ fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
                 workspace_paths: Default::default(),
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![listed_session],
+                checkout_states: Vec::new(),
             }),
         ),
         (
@@ -7600,6 +7603,7 @@ fn a_reconnection_brings_the_sidebar_the_work_it_missed() {
                     workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(4),
                     session_ids: vec![kept, made_while_away],
+                    checkout_states: Vec::new(),
                 }),
             ))
             .expect("take the catalog the reconnection reconciled"),

@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 mod source_control;
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
@@ -1902,6 +1902,9 @@ pub struct SessionCatalogSnapshot {
     pub workspace_paths: WorkspacePaths,
     pub revision: SessionCatalogRevision,
     pub session_ids: Vec<SessionId>,
+    /// One current reading per Worktree represented by the catalog. A client
+    /// takes this set whole when it joins or rejoins the stream.
+    pub checkout_states: Vec<CheckoutSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1910,6 +1913,13 @@ pub enum SessionCatalogChange {
     /// Stored content proved unreadable; clients refresh the containing root.
     Invalidated {
         session_id: SessionId,
+    },
+    /// The owning Server's current reading of one Worktree.
+    /// This is live presentation state rather than the recovery revision
+    /// retained with the Session, so clients take it whole and may clear it.
+    CheckoutStateChanged {
+        checkout_id: CheckoutId,
+        checkout_state: Option<CheckoutSummary>,
     },
     Created {
         session_id: SessionId,
@@ -2882,6 +2892,15 @@ pub struct SessionSettlementChanged {
 pub struct SessionWorkingChanged {
     pub session_id: SessionId,
     pub working_since: Option<SessionTimestamp>,
+}
+
+/// The owning Server's current reading of one Worktree, carried independently
+/// of whether any listing surface is open.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutStateChanged {
+    pub checkout_id: CheckoutId,
+    pub checkout_state: Option<CheckoutSummary>,
 }
 
 /// A Session's complete Standing input, carried to a client that may be

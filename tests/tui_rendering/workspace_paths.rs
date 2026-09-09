@@ -155,6 +155,7 @@ fn remote_workspace_labels_follow_the_remote_home_and_path_style() {
                     },
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![session_id],
+                    checkout_states: Vec::new(),
                 }),
             })
             .unwrap();
@@ -219,6 +220,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         },
                         revision: SessionCatalogRevision::INITIAL,
                         session_ids: vec![id],
+                        checkout_states: Vec::new(),
                     }),
                 })
                 .unwrap();

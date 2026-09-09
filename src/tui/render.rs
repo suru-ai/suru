@@ -3781,13 +3781,24 @@ fn render_session_header(
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
-    let workspace = workspace_context(
+    let mut orientation = workspace_context(
         state,
         &snapshot.session.execution_directory.path,
         detail.shows_secondary(),
     );
-    let orientation = if !workspace.is_empty() {
-        truncate_to_width(&workspace, left_width)
+    if detail.shows_secondary()
+        && let Some(checkout) = state
+            .session_reference
+            .as_ref()
+            .zip(snapshot.session.checkout.as_ref())
+            .and_then(|(reference, checkout)| state.checkout_state(&reference.origin, &checkout.id))
+        && let Some(branch) = checkout_branch_context(checkout)
+    {
+        orientation.push_str(" · ");
+        orientation.push_str(&branch);
+    }
+    let orientation = if !orientation.is_empty() {
+        truncate_to_width(&orientation, left_width)
     } else {
         String::new()
     };
@@ -3831,6 +3842,21 @@ fn render_session_header(
         );
         frame.render_widget(Paragraph::new(title).style(theme.text.primary), title_area);
     }
+}
+
+fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Option<String> {
+    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+
+    if checkout.availability != SourceControlAvailability::Available {
+        return None;
+    }
+    let CheckoutRevision::Branch { name, .. } = checkout.revision.as_ref()? else {
+        return None;
+    };
+    Some(match checkout.association.kind {
+        CheckoutKind::Main => name.clone(),
+        CheckoutKind::Linked => format!("{name} (worktree)"),
+    })
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {

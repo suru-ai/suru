@@ -381,6 +381,8 @@ pub struct TuiState {
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: Workspace,
     pub(super) execution_directory: Option<PathBuf>,
+    checkout_states:
+        HashMap<(Outlook, crate::protocol::CheckoutId), crate::protocol::CheckoutSummary>,
     pub(super) composers: ComposerMemory,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
@@ -575,6 +577,7 @@ impl TuiState {
             fatal_error: None,
             workspace: Workspace::directory(workspace.clone()),
             execution_directory: Some(workspace.clone()),
+            checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
@@ -1033,6 +1036,43 @@ impl TuiState {
         }
     }
 
+    fn adopt_checkout_state(&mut self, origin: &Outlook, event: &ManagedEvent) {
+        match event {
+            ManagedEvent::CheckoutStateChanged(changed) => {
+                let reference = (origin.clone(), changed.checkout_id.clone());
+                match &changed.checkout_state {
+                    Some(checkout) => {
+                        self.checkout_states.insert(reference, checkout.clone());
+                    }
+                    None => {
+                        self.checkout_states.remove(&reference);
+                    }
+                }
+            }
+            ManagedEvent::SessionCatalogReconciled(snapshot) => {
+                self.checkout_states
+                    .retain(|(checkout_origin, _), _| checkout_origin != origin);
+                self.checkout_states
+                    .extend(snapshot.checkout_states.iter().map(|checkout| {
+                        (
+                            (origin.clone(), checkout.association.id.clone()),
+                            checkout.clone(),
+                        )
+                    }));
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn checkout_state(
+        &self,
+        origin: &Outlook,
+        checkout_id: &crate::protocol::CheckoutId,
+    ) -> Option<&crate::protocol::CheckoutSummary> {
+        self.checkout_states
+            .get(&(origin.clone(), checkout_id.clone()))
+    }
+
     pub(super) fn workspace_name(&self, origin: &Outlook, path: &Path) -> String {
         self.workspace_paths.get(origin).map_or_else(
             || super::sidebar::workspace_name(path),
@@ -1052,6 +1092,7 @@ impl TuiState {
 
     pub fn apply(&mut self, event: ManagedEvent) {
         self.adopt_workspace_paths(&Outlook::Local, &event);
+        self.adopt_checkout_state(&Outlook::Local, &event);
         self.reconcile_questionnaire_catalog(&Outlook::Local, &event);
         // The managed catalog stream belongs to the local Server. A Remote
         // Outlook has its own main view and pickers, but Everywhere still
@@ -1079,6 +1120,7 @@ impl TuiState {
             return;
         }
         self.adopt_workspace_paths(outlook, &event);
+        self.adopt_checkout_state(outlook, &event);
         self.reconcile_questionnaire_catalog(outlook, &event);
         if self.sidebar.includes_origin(outlook) {
             match &event {
@@ -1245,7 +1287,9 @@ impl TuiState {
             // A creation says an id and nothing a row is drawn from, so there
             // is nothing to take in place: the catch-up above is the whole of
             // the Sidebar's answer to it.
-            ManagedEvent::SessionCatalogInvalidated { .. } | ManagedEvent::SessionCreated(_) => {}
+            ManagedEvent::SessionCatalogInvalidated { .. }
+            | ManagedEvent::CheckoutStateChanged(_)
+            | ManagedEvent::SessionCreated(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.session_picker.remove(deleted.session_id);
                 self.remove_deleted_session(deleted.session_id);
@@ -1299,6 +1343,7 @@ impl TuiState {
         self.sidebar.catch_up_origin(outlook.clone());
         match event {
             ManagedEvent::SessionCatalogInvalidated { .. }
+            | ManagedEvent::CheckoutStateChanged(_)
             | ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
@@ -1352,6 +1397,7 @@ impl TuiState {
         }
         match event {
             ManagedEvent::SessionCatalogInvalidated { .. }
+            | ManagedEvent::CheckoutStateChanged(_)
             | ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionWorkingChanged(_)
             | ManagedEvent::SessionUsageChanged(_) => {}

@@ -1246,6 +1246,7 @@ fn fixture_catalog_events_response(
         workspace_paths: Default::default(),
         revision: SessionCatalogRevision::INITIAL,
         session_ids: vec![session_id],
+        checkout_states: Vec::new(),
     };
     Sse::new(
         stream::once(async move {

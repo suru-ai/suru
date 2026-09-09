@@ -15,9 +15,9 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, AgentSelection, CreateSessionRequest, Health, InvitePreview,
-        IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
-        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
+        AdmitPromptRequest, AgentSelection, CheckoutStateChanged, CreateSessionRequest, Health,
+        InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook,
+        Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
         ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
         SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
         SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
@@ -190,6 +190,7 @@ pub enum ManagedEvent {
     SessionCatalogInvalidated {
         session_id: SessionId,
     },
+    CheckoutStateChanged(CheckoutStateChanged),
     SessionDeleted(SessionDeleted),
     /// A Session's derived Title and Emoji landed. It arrives for every Session
     /// the server holds, open or not, because the picker lists Sessions this
@@ -244,6 +245,7 @@ impl ManagedEvent {
         matches!(
             self,
             Self::SessionCatalogInvalidated { .. }
+                | Self::CheckoutStateChanged(_)
                 | Self::SessionCreated(_)
                 | Self::SessionDeleted(_)
                 | Self::SessionTitleChanged(_)

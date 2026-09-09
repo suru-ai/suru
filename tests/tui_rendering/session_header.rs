@@ -5,8 +5,10 @@ use crate::support::{
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        EffectiveSettings, EmojiVisibility, SessionChange, SessionRevision, SessionSnapshot,
-        SessionUpdate, SettingsSnapshot, SidebarVisibility,
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutStateChanged,
+        CheckoutSummary, EffectiveSettings, EmojiVisibility, RepositoryId, SessionChange,
+        SessionRevision, SessionSnapshot, SessionUpdate, SettingsSnapshot, SidebarVisibility,
+        SourceControlAvailability,
     },
     tui::{Application, ApplicationEvent},
 };
@@ -39,6 +41,116 @@ fn header(application: &Application, width: u16) -> String {
         .into_iter()
         .find(|row| row.contains("Connected"))
         .expect("Session header")
+}
+
+fn application_with_checkout_branch(
+    workspace: &std::path::Path,
+    kind: CheckoutKind,
+    branch: &str,
+    child: bool,
+) -> Application {
+    let mut application = connected_application(workspace);
+    settings(&mut application, EmojiVisibility::Hidden);
+    let (parent, mut snapshot) = enter_session(&mut application, workspace);
+    let repository = RepositoryId::from_metadata("git", workspace);
+    let association = CheckoutAssociation {
+        recovery_revision: None,
+        id: CheckoutId::from_root(&repository, workspace),
+        repository,
+        root: workspace.to_owned(),
+        kind,
+    };
+    snapshot.session.checkout = Some(association.clone());
+    if child {
+        snapshot.session.id = suru::protocol::SessionId::new();
+        snapshot.session.parent = Some(parent);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+            .unwrap();
+    } else {
+        show(&mut application, &snapshot);
+    }
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::CheckoutStateChanged(CheckoutStateChanged {
+                checkout_id: association.id.clone(),
+                checkout_state: Some(CheckoutSummary {
+                    association,
+                    revision: Some(CheckoutRevision::Branch {
+                        name: branch.to_owned(),
+                        commit: Some("0123456789abcdef".to_owned()),
+                    }),
+                    availability: SourceControlAvailability::Available,
+                }),
+            }),
+        ))
+        .unwrap();
+    application
+}
+
+#[test]
+fn branch_name_follows_the_workspace_path_in_the_session_header() {
+    let workspace = workspace_dir();
+    let application = application_with_checkout_branch(
+        workspace.path(),
+        CheckoutKind::Main,
+        "feature/header-context",
+        false,
+    );
+
+    let row = header(&application, 240);
+    assert!(
+        row.contains(&format!(
+            "{} · feature/header-context",
+            workspace.path().to_string_lossy()
+        )),
+        "{row}"
+    );
+    let narrow = header(&application, 40);
+    assert!(
+        !narrow.contains("feature/header-context") && !narrow.trim_start().starts_with('·'),
+        "a hidden workspace path leaves no branch or orphan separator: {narrow}"
+    );
+}
+
+#[test]
+fn linked_worktree_label_follows_the_branch_name_in_the_session_header() {
+    let workspace = workspace_dir();
+    let application = application_with_checkout_branch(
+        workspace.path(),
+        CheckoutKind::Linked,
+        "feature/worktree-context",
+        false,
+    );
+
+    let row = header(&application, 240);
+    assert!(
+        row.contains(&format!(
+            "{} · feature/worktree-context (worktree)",
+            workspace.path().to_string_lossy()
+        )),
+        "{row}"
+    );
+}
+
+#[test]
+fn viewed_child_uses_the_branch_state_shared_by_its_worktree() {
+    let workspace = workspace_dir();
+    let application = application_with_checkout_branch(
+        workspace.path(),
+        CheckoutKind::Linked,
+        "feature/child-context",
+        true,
+    );
+
+    let row = header(&application, 240);
+    assert!(
+        row.contains(&format!(
+            "{} · feature/child-context (worktree)",
+            workspace.path().to_string_lossy()
+        )),
+        "{row}"
+    );
 }
 
 #[test]

@@ -2957,6 +2957,7 @@ fn empty_catalog_snapshot() -> impl futures_util::Stream<Item = Result<Event, In
         workspace_paths: Default::default(),
         revision: SessionCatalogRevision::INITIAL,
         session_ids: Vec::new(),
+        checkout_states: Vec::new(),
     };
     stream::once(async move {
         Ok::<_, Infallible>(

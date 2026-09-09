@@ -201,28 +201,39 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let mut session_ids = state
+        let root_records = state
             .sessions
             .iter()
             // A Subagent's child Session rides no catalog: every client lists
             // what the catalog holds, and a child joins no listing.
             .filter(|(_, record)| !record.snapshot.session.is_subagent())
-            .map(|(session_id, _)| session_id)
+            .collect::<Vec<_>>();
+        let mut session_ids = root_records
+            .iter()
+            .map(|(session_id, _)| **session_id)
             .chain(
                 state
                     .unreadable_sessions
                     .keys()
-                    .filter(|id| !state.is_stored_child(**id)),
+                    .filter(|id| !state.is_stored_child(**id))
+                    .copied(),
             )
-            .copied()
             .collect::<Vec<_>>();
         session_ids.sort_unstable_by_key(ToString::to_string);
+        let mut checkout_states = root_records
+            .into_iter()
+            .filter_map(|(_, record)| record.summary.checkout_state.clone())
+            .collect::<Vec<_>>();
+        checkout_states
+            .sort_unstable_by(|left, right| left.association.id.cmp(&right.association.id));
+        checkout_states.dedup_by(|left, right| left.association.id == right.association.id);
         let (revision, updates) = state.catalog.subscribe();
         SessionCatalogFeed {
             snapshot: SessionCatalogSnapshot {
                 workspace_paths,
                 revision,
                 session_ids,
+                checkout_states,
             },
             updates,
         }

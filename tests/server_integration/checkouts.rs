@@ -141,6 +141,27 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     let b = create(&other, &nested).await;
     let before = observed(&local, &mut one, 2, |r| branch(r, "feature")).await;
     observed(&other, &mut two, 2, |r| branch(r, "feature")).await;
+    let mut late =
+        ManagedClient::connect(ManagedClientConfig::new(state.path(), "checkout-stream").unwrap())
+            .await
+            .unwrap();
+    assert!(matches!(late.next().await, Some(ManagedEvent::Connecting)));
+    assert!(matches!(
+        late.next().await,
+        Some(ManagedEvent::Connected(_))
+    ));
+    let Some(ManagedEvent::CheckoutStateChanged(initial_checkout)) = late.next().await else {
+        panic!("a late client receives the checkout reading from its catalog snapshot")
+    };
+    assert!(
+        initial_checkout
+            .checkout_state
+            .as_ref()
+            .is_some_and(|reading| branch(reading, "feature")),
+        "the hydrated reading carries the branch observed before this client joined"
+    );
+    local.settle_session(a, true).await.unwrap();
+    other.settle_session(b, true).await.unwrap();
     git(&linked, &["checkout", "-b", "external"]);
     let after = observed(&local, &mut one, 2, |r| branch(r, "external")).await;
     assert_eq!(after[0].checkout_state, after[1].checkout_state);
@@ -200,6 +221,7 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     drop(other);
     drop(first);
     drop(second);
+    drop(late);
     server.shutdown().await.unwrap();
     // If observation hydrates history this malformed content makes the rows
     // unreadable. Discovery, recovery metadata and live updates must not read it.

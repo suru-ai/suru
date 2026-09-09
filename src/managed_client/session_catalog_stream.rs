@@ -237,7 +237,7 @@ pub(super) async fn consume(
     response: reqwest::Response,
     events: &mpsc::Sender<ManagedEvent>,
     known_session_ids: &mut Option<HashSet<SessionId>>,
-    hydrated: oneshot::Sender<()>,
+    hydrated: oneshot::Sender<Vec<crate::protocol::CheckoutSummary>>,
     forward_models: bool,
 ) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
@@ -251,6 +251,7 @@ pub(super) async fn consume(
         };
         match decode_event(event, revision)? {
             CatalogEvent::Snapshot(snapshot) => {
+                let initial_checkout_states = snapshot.checkout_states.clone();
                 let reconnect_snapshot = known_session_ids.is_some().then(|| snapshot.clone());
                 let snapshot_revision = snapshot.revision;
                 let deleted = reconcile_snapshot(known_session_ids, snapshot);
@@ -273,7 +274,7 @@ pub(super) async fn consume(
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
                 if let Some(hydrated) = hydrated.take() {
-                    let _ = hydrated.send(());
+                    let _ = hydrated.send(initial_checkout_states);
                 }
             }
             CatalogEvent::Update(update) => {
@@ -341,6 +342,15 @@ fn apply_update(
             }
             Ok(ManagedEvent::SessionCatalogInvalidated { session_id })
         }
+        SessionCatalogChange::CheckoutStateChanged {
+            checkout_id,
+            checkout_state,
+        } => Ok(ManagedEvent::CheckoutStateChanged(
+            crate::protocol::CheckoutStateChanged {
+                checkout_id,
+                checkout_state,
+            },
+        )),
         SessionCatalogChange::Created { session_id } => {
             if !known.insert(session_id) {
                 bail!("Session catalog created an existing Session");
@@ -484,6 +494,7 @@ mod tests {
                     workspace_paths: Default::default(),
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![retained, deleted],
+                    checkout_states: Vec::new(),
                 },
             )
             .is_empty(),
@@ -510,6 +521,7 @@ mod tests {
                     workspace_paths: Default::default(),
                     revision: SessionCatalogRevision(4),
                     session_ids: vec![retained, created_after_connect],
+                    checkout_states: Vec::new(),
                 },
             ),
             vec![deleted],
@@ -527,6 +539,7 @@ mod tests {
                 workspace_paths: Default::default(),
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![listed],
+                checkout_states: Vec::new(),
             },
         );
 

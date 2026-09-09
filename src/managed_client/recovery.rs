@@ -158,6 +158,7 @@ async fn run_managed_client(
         return;
     }
     loop {
+        let first_catalog_snapshot = known_session_ids.is_none();
         descriptor.send_replace(connection.descriptor.clone());
         let active_descriptor = connection.descriptor.clone();
         let active_instance_id = connection.descriptor.instance_id;
@@ -171,12 +172,14 @@ async fn run_managed_client(
             false,
         );
         tokio::pin!(catalog);
+        let mut initial_checkout_states = Vec::new();
         let stream_result = tokio::select! {
             biased;
             outcome = &mut catalog => Some(ActiveStreamResult::Catalog(outcome)),
             hydrated = catalog_hydration => {
-                if hydrated.is_err() {
-                    return;
+                let Ok(checkout_states) = hydrated else { return };
+                if first_catalog_snapshot {
+                    initial_checkout_states = checkout_states;
                 }
                 None
             }
@@ -195,6 +198,19 @@ async fn run_managed_client(
                     .is_err()
                 {
                     return;
+                }
+                for checkout_state in initial_checkout_states {
+                    let changed = crate::protocol::CheckoutStateChanged {
+                        checkout_id: checkout_state.association.id.clone(),
+                        checkout_state: Some(checkout_state),
+                    };
+                    if events
+                        .send(ManagedEvent::CheckoutStateChanged(changed))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 let lifecycle = event_stream::consume(
                     connection.lifecycle_response,

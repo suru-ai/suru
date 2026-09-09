@@ -255,6 +255,7 @@ fn reconnect_catalog_removes_a_missed_current_session_deletion() {
                     workspace_paths: Default::default(),
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![remaining_id],
+                    checkout_states: Vec::new(),
                 }),
             ))
             .expect("reconcile deletion missed during a catalog disconnect"),

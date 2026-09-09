@@ -53,10 +53,7 @@ impl SessionStore {
                     state
                         .sessions
                         .values()
-                        .filter(|record| {
-                            record.summary.settled_at.is_none()
-                                && record.summary.session.parent.is_none()
-                        })
+                        .filter(|record| record.summary.session.parent.is_none())
                         .filter_map(|record| record.summary.session.checkout.as_ref())
                         .map(|checkout| (checkout.id.clone(), checkout.clone()))
                         .collect::<HashMap<_, _>>()
@@ -88,7 +85,8 @@ impl SessionStore {
         reading.association.recovery_revision = None;
         let mut state = self.state.lock().unwrap();
         let observed = state.catalog.has_subscribers();
-        let mut changed = Vec::new();
+        let mut checkout_changed = false;
+        let mut invalidated = Vec::new();
         for record in state.sessions.values_mut() {
             let Some(checkout) = record.summary.session.checkout.as_ref() else {
                 continue;
@@ -129,15 +127,22 @@ impl SessionStore {
                 let _ = record.updates.send(update);
             }
             let live = observed.then(|| reading.clone());
-            if record.summary.checkout_state != live || recovery_changed {
-                record.summary.checkout_state = live;
-                if record.summary.session.parent.is_none() {
-                    changed.push(record.summary.session.id);
-                }
+            if record.summary.checkout_state != live {
+                record.summary.checkout_state = live.clone();
+                checkout_changed = true;
+            }
+            if recovery_changed && record.summary.session.parent.is_none() {
+                invalidated.push(record.summary.session.id);
             }
         }
-        for session_id in changed {
+        for session_id in invalidated {
             state.publish_catalog_change(SessionCatalogChange::Invalidated { session_id });
+        }
+        if checkout_changed {
+            state.publish_catalog_change(SessionCatalogChange::CheckoutStateChanged {
+                checkout_id: reading.association.id.clone(),
+                checkout_state: observed.then_some(reading),
+            });
         }
         Ok(())
     }
