@@ -328,3 +328,142 @@ async fn checkout_observation_tracks_unborn_branch_detachment_missing_and_unread
         SourceControlAvailability::Unavailable { .. }
     ));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_observation_of_a_settled_checkout_reads_only_branch_and_commit() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let log = root.join("git-invocations.log");
+    let shim = root.join("git-shim");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let invocations = |log: &Path| -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let adapter = GitSourceControl::new(&shim);
+    let checkout = adapter.discover(&main).await.checkout.unwrap();
+    let _ = std::fs::remove_file(&log);
+    let first = adapter.observe(&checkout).await;
+    assert_eq!(first.availability, SourceControlAvailability::Available);
+    let cold = invocations(&log);
+    assert!(
+        cold.len() > 2,
+        "first observation validates identity: {cold:?}"
+    );
+    std::fs::remove_file(&log).unwrap();
+    git(&main, &["checkout", "-b", "topic"]);
+    let second = adapter.observe(&checkout).await;
+    assert!(
+        matches!(second.revision, Some(CheckoutRevision::Branch { ref name, .. }) if name == "topic")
+    );
+    let warm = invocations(&log);
+    assert_eq!(
+        warm.len(),
+        2,
+        "a settled checkout is re-read without re-validating its identity: {warm:?}"
+    );
+    assert!(
+        warm[0].contains("symbolic-ref") && warm[1].contains("rev-parse"),
+        "{warm:?}"
+    );
+}
+
+#[tokio::test]
+async fn validated_linked_worktree_replaced_by_another_repository_is_unavailable() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "topic");
+    let adapter = GitSourceControl::default();
+    let checkout = adapter.discover(&linked_root).await.checkout.unwrap();
+    assert_eq!(checkout.root, linked_root);
+    assert_eq!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Available
+    );
+    // A different Repository's checkout at the same path keeps the old
+    // Repository's metadata intact; the identity Git confirmed no longer holds.
+    std::fs::remove_dir_all(&linked_root).unwrap();
+    let other = root.join("other");
+    init(&other);
+    commit(&other);
+    linked(&other, &linked_root, "topic");
+    let replaced = adapter.observe(&checkout).await;
+    assert!(
+        matches!(
+            replaced.availability,
+            SourceControlAvailability::Unavailable { .. }
+        ),
+        "{replaced:?}"
+    );
+    assert_eq!(replaced.revision, None);
+    // A plain directory, then a clone, at the same path are equally unrelated.
+    std::fs::remove_dir_all(&linked_root).unwrap();
+    init(&linked_root);
+    assert!(matches!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Unavailable { .. }
+    ));
+    // Restoring the Repository's own Worktree at that path is observed again.
+    std::fs::remove_dir_all(&linked_root).unwrap();
+    git(&main, &["worktree", "prune"]);
+    linked(&main, &linked_root, "topic-again");
+    assert!(matches!(adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Branch { name, .. }) if name == "topic-again"));
+    // A validated Worktree whose HEAD becomes unreadable is reported as such,
+    // and reads again once it is restored.
+    let head = main
+        .join(".git")
+        .join("worktrees")
+        .join("linked")
+        .join("HEAD");
+    let contents = std::fs::read(&head).unwrap();
+    std::fs::remove_file(&head).unwrap();
+    assert!(matches!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Unavailable { .. }
+    ));
+    std::fs::write(&head, contents).unwrap();
+    assert!(matches!(adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Branch { name, .. }) if name == "topic-again"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn validated_worktree_moved_behind_a_symlink_at_its_root_is_unavailable() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "topic");
+    let adapter = GitSourceControl::default();
+    let checkout = adapter.discover(&linked_root).await.checkout.unwrap();
+    assert_eq!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Available
+    );
+    std::fs::rename(&linked_root, root.join("real")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), &linked_root).unwrap();
+    assert!(matches!(
+        adapter.observe(&checkout).await.availability,
+        SourceControlAvailability::Unavailable { .. }
+    ));
+}

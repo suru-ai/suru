@@ -2,8 +2,10 @@ use super::{SourceControl, repository_workspace};
 use crate::protocol::*;
 use async_trait::async_trait;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::Mutex,
     time::Duration,
 };
 use tokio::process::Command;
@@ -19,6 +21,35 @@ pub struct GitSourceControl {
     mutation_timeout: Duration,
     configuration_file: Option<PathBuf>,
     observer: Option<std::sync::Arc<dyn super::PreparationObserver>>,
+    /// Worktrees whose identity a prior observation validated with Git. Each
+    /// observation poll then repeats the three identity reads only once the
+    /// Worktree root no longer looks like the one Git confirmed.
+    validated_roots: Mutex<HashMap<CheckoutId, ValidatedRoot>>,
+}
+struct ValidatedRoot {
+    common: PathBuf,
+    marker: GitMarker,
+}
+/// A spawn-free fingerprint of a Worktree root's `.git` entry. A linked
+/// Worktree's file names its metadata directory, so an unrelated Worktree at
+/// the same path changes the marker even when the old Repository's metadata
+/// survives. A main Worktree's identity is its metadata path, so a Repository
+/// re-initialized there is the same Repository, exactly as Git reports it.
+#[derive(PartialEq)]
+enum GitMarker {
+    Directory,
+    File(Vec<u8>),
+}
+fn git_marker(root: &Path) -> Option<GitMarker> {
+    let entry = root.join(".git");
+    let metadata = std::fs::symlink_metadata(&entry).ok()?;
+    if metadata.is_dir() {
+        Some(GitMarker::Directory)
+    } else if metadata.is_file() {
+        std::fs::read(&entry).ok().map(GitMarker::File)
+    } else {
+        None
+    }
 }
 impl Default for GitSourceControl {
     fn default() -> Self {
@@ -45,72 +76,119 @@ impl GitSourceControl {
             };
             return reading;
         }
-        let Some(common) = self.common(&checkout.root).await else {
-            return reading;
+        let revision = if self.still_validated(checkout) {
+            self.read_revision(&checkout.root).await
+        } else {
+            None
         };
+        let revision = match revision {
+            Some(revision) => revision,
+            // A read that fails after validation is re-validated in full so a
+            // replaced or unreadable root is reported for what it now is.
+            None => match self.validate_root(checkout).await {
+                Some(revision) => revision,
+                None => return reading,
+            },
+        };
+        reading.revision = Some(revision);
+        reading.availability = SourceControlAvailability::Available;
+        reading
+    }
+    /// Confirm with Git that the root is this checkout's Worktree, remembering
+    /// it for later polls, and read its revision.
+    async fn validate_root(&self, checkout: &CheckoutAssociation) -> Option<CheckoutRevision> {
+        self.validated_roots.lock().unwrap().remove(&checkout.id);
+        // Fingerprint before Git confirms the identity: a root replaced in
+        // between then mismatches its own marker and is validated again.
+        let marker = git_marker(&checkout.root);
+        let common = self.common(&checkout.root).await?;
         if RepositoryId::from_metadata("git", &common) != checkout.repository
             || self.valid_root(&checkout.root, &common).await.as_ref() != Some(&checkout.root)
         {
-            return reading;
+            return None;
         }
+        let revision = self.read_revision(&checkout.root).await?;
+        if let Some(marker) = marker {
+            self.validated_roots
+                .lock()
+                .unwrap()
+                .insert(checkout.id.clone(), ValidatedRoot { common, marker });
+        }
+        Some(revision)
+    }
+    /// Whether a Worktree still looks like the one Git validated for this
+    /// checkout, judged without spawning Git: its metadata directory survives,
+    /// its root is not a symlink onto somewhere else, and its `.git` entry is
+    /// the one that was fingerprinted.
+    fn still_validated(&self, checkout: &CheckoutAssociation) -> bool {
+        let mut validated = self.validated_roots.lock().unwrap();
+        let Some(known) = validated.get(&checkout.id) else {
+            return false;
+        };
+        if known.common.is_dir()
+            && RepositoryId::from_metadata("git", &known.common) == checkout.repository
+            && std::fs::canonicalize(&checkout.root).ok().as_ref() == Some(&checkout.root)
+            && git_marker(&checkout.root).as_ref() == Some(&known.marker)
+        {
+            return true;
+        }
+        validated.remove(&checkout.id);
+        false
+    }
+    /// The branch and commit of a validated root. `None` means Git could not
+    /// read them; an unborn branch or a detached HEAD is still a revision.
+    async fn read_revision(&self, root: &Path) -> Option<CheckoutRevision> {
         let Ok(branch_output) = self
-            .command(&checkout.root, &["symbolic-ref", "--quiet", "HEAD"])
+            .command(root, &["symbolic-ref", "--quiet", "HEAD"])
             .await
         else {
-            return reading;
+            return None;
         };
         let branch = if branch_output.status.success() {
             let Ok(name) = String::from_utf8(branch_output.stdout) else {
-                return reading;
+                return None;
             };
             Some(name.trim_end_matches(['\r', '\n']).to_owned())
         } else if branch_output.status.code() == Some(1) {
             None // Detached HEAD is the documented quiet symbolic-ref miss.
         } else {
-            return reading;
+            return None;
         };
         let Ok(commit_output) = self
-            .command(
-                &checkout.root,
-                &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-            )
+            .command(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
             .await
         else {
-            return reading;
+            return None;
         };
         let commit = if commit_output.status.success() {
             let Ok(commit) = String::from_utf8(commit_output.stdout) else {
-                return reading;
+                return None;
             };
             Some(commit.trim_end_matches(['\r', '\n']).to_owned())
         } else if let Some(branch) = &branch {
             // Only a genuinely absent branch ref is unborn. A failed commit
             // read from an existing ref must not erase retained recovery facts.
             let Ok(reference) = self
-                .command(&checkout.root, &["show-ref", "--verify", "--quiet", branch])
+                .command(root, &["show-ref", "--verify", "--quiet", branch])
                 .await
             else {
-                return reading;
+                return None;
             };
             if reference.status.code() != Some(1) {
-                return reading;
+                return None;
             }
             None
         } else {
-            return reading;
+            return None;
         };
-        reading.revision = match (branch, commit) {
+        match (branch, commit) {
             (Some(name), commit) => Some(CheckoutRevision::Branch {
                 name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned(),
                 commit,
             }),
             (None, Some(commit)) => Some(CheckoutRevision::Detached { commit }),
             (None, None) => None,
-        };
-        if reading.revision.is_some() {
-            reading.availability = SourceControlAvailability::Available;
         }
-        reading
     }
 
     pub fn new(executable: impl Into<PathBuf>) -> Self {
@@ -120,6 +198,7 @@ impl GitSourceControl {
             mutation_timeout: Duration::from_secs(120),
             configuration_file: None,
             observer: None,
+            validated_roots: Mutex::new(HashMap::new()),
         }
     }
     pub fn with_preparation_observer(
@@ -180,6 +259,13 @@ impl GitSourceControl {
             .args(args)
             .stdin(stdin)
             .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            // The Server runs detached from any console, so a console-subsystem
+            // Git would otherwise open a window for every observation poll.
+            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         // Ambient Git overrides must not redirect discovery into another checkout.
         for name in [
             "GIT_DIR",
