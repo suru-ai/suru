@@ -321,6 +321,19 @@ pub async fn open_catalog_stream_with_snapshot(
     (snapshot.session_ids, Box::pin(updates))
 }
 
+/// Checks whether `haystack` (typically `git worktree list --porcelain`
+/// output) mentions `path`, comparing with path separators normalized on
+/// both sides. On Windows, Git always spells absolute paths with forward
+/// slashes in its own output, even when the path passed on the command line
+/// used backslashes — a plain substring check against a `Path`'s native
+/// rendering silently never matches there. Normalizing both sides keeps the
+/// comparison meaningful on every platform instead of hardcoding one slash
+/// flavour.
+pub fn git_output_mentions_path(haystack: &str, path: &std::path::Path) -> bool {
+    let needle = path.to_str().unwrap().replace('\\', "/");
+    haystack.replace('\\', "/").contains(&needle)
+}
+
 pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
         client.next().await,

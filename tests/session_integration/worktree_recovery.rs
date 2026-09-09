@@ -645,10 +645,10 @@ async fn interrupted_registration_retries_without_overwriting_staged_or_switched
                 assert!(body.contains("retained revision"), "{body}");
             }
         }
-        assert!(
-            read_git(&layout.main, &["worktree", "list", "--porcelain"])
-                .contains(unrelated.to_str().unwrap())
-        );
+        assert!(support::git_output_mentions_path(
+            &read_git(&layout.main, &["worktree", "list", "--porcelain"]),
+            &unrelated,
+        ));
         server.shutdown().await.unwrap();
     }
 }
