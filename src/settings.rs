@@ -59,6 +59,7 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
 const SESSION_TITLE_EMOJI: &str = "session.title.emoji";
 const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
+const SIDEBAR_INITIAL_WIDTH: &str = "sidebar.initialWidth";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
@@ -298,6 +299,24 @@ const SIDEBAR_AUTO_SETTLE_NUMERIC: NumericSettingChoice = NumericSettingChoice::
     },
 );
 
+fn validate_sidebar_initial_width(value: &str) -> Result<u64, &'static str> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|columns| *columns >= 24)
+        .ok_or("minimum: 24")
+}
+
+const SIDEBAR_INITIAL_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Columns at launch",
+    |settings| settings.sidebar.initial_width,
+    validate_sidebar_initial_width,
+    |columns| format!("{columns} columns"),
+    |columns| SettingMutation::SidebarInitialWidth {
+        value: Some(columns),
+    },
+);
+
 fn validate_serving_port(value: &str) -> Result<u64, &'static str> {
     value
         .parse::<u16>()
@@ -485,6 +504,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SidebarInitialVisibility { value } => {
             *value == Some(settings.sidebar.initial_visibility)
+        }
+        SettingMutation::SidebarInitialWidth { value } => {
+            *value == Some(settings.sidebar.initial_width)
         }
         SettingMutation::SidebarInitialScope { value } => {
             *value == Some(settings.sidebar.initial_scope)
@@ -802,6 +824,27 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             apply_value(value, |visibility| {
                 settings.sidebar.initial_visibility = visibility;
             })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEBAR_INITIAL_WIDTH,
+        label: "Sidebar width at launch",
+        description: "How many columns wide a TUI's Sidebar opens",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Open {
+            named: &[],
+            accepts: "an integer of at least 24",
+            spell: |settings| SIDEBAR_INITIAL_WIDTH_NUMERIC.spell(settings.sidebar.initial_width),
+            chosen_at: Some(SettingChoiceSurface::Numeric(SIDEBAR_INITIAL_WIDTH_NUMERIC)),
+        },
+        reset: SettingMutation::SidebarInitialWidth { value: None },
+        apply: |settings, value| {
+            let Some(width) = value.as_u64().filter(|width| *width >= 24) else {
+                return false;
+            };
+            settings.sidebar.initial_width = width;
+            true
         },
     },
     SettingDescriptor {
@@ -1287,6 +1330,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::SidebarInitialVisibility { value } => {
             (SIDEBAR_INITIAL_VISIBILITY, pinned(value))
         }
+        SettingMutation::SidebarInitialWidth { value } => (SIDEBAR_INITIAL_WIDTH, pinned(value)),
         SettingMutation::SidebarInitialScope { value } => (SIDEBAR_INITIAL_SCOPE, pinned(value)),
         SettingMutation::SidebarAutoSettle { value } => (SIDEBAR_AUTO_SETTLE, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
@@ -1810,6 +1854,7 @@ mod tests {
                 // can and describes the rest, in the same breath.
                 "one of \"session\", \"off\", or an Agent Selection".to_owned(),
                 "one of \"shown\" or \"hidden\"".to_owned(),
+                "an integer of at least 24".to_owned(),
                 "one of \"all_workspaces\", \"current_workspace\", or \"everywhere\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or

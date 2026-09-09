@@ -1033,12 +1033,24 @@ impl<'de> Deserialize<'de> for AutoSettle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarSettings {
     pub initial_visibility: SidebarVisibility,
+    pub initial_width: u64,
     pub initial_scope: SidebarScope,
     pub auto_settle: AutoSettle,
+}
+
+impl Default for SidebarSettings {
+    fn default() -> Self {
+        Self {
+            initial_visibility: SidebarVisibility::default(),
+            initial_width: 32,
+            initial_scope: SidebarScope::default(),
+            auto_settle: AutoSettle::default(),
+        }
+    }
 }
 
 /// Client presentation selected independently of whichever Server the reader
@@ -1354,6 +1366,9 @@ pub enum SettingMutation {
     },
     SidebarInitialVisibility {
         value: Option<SidebarVisibility>,
+    },
+    SidebarInitialWidth {
+        value: Option<u64>,
     },
     SidebarInitialScope {
         value: Option<SidebarScope>,

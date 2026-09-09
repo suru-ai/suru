@@ -2189,7 +2189,7 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     if !state.sidebar.is_revealed() {
         return frame_area;
     }
-    let Some(width) = sidebar::width_beside(frame_area.width) else {
+    let Some(width) = sidebar::width_beside(state.sidebar.chosen_width(), frame_area.width) else {
         return frame_area;
     };
     state.sidebar.record_drawn();

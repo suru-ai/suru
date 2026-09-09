@@ -26,12 +26,12 @@ use suru::{
         AutoSettle, EffectiveSettings, EmojiVisibility, LatestTurnStatus, Message, MessageId,
         MessageRole, MessageStatus, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus,
         ServerShutdown, Session, SessionCatalogRevision, SessionCatalogSnapshot, SessionChange,
-        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
-        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
-        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
-        SidebarSettings, SidebarVisibility, TitleSettings, TurnStatus, UnreadableSessionSummary,
-        Workspace,
+        SessionContentWidth, SessionCreated, SessionDeleted, SessionId, SessionListItem,
+        SessionReference, SessionRevision, SessionSettings, SessionSettlementChanged,
+        SessionStandingInputs, SessionStandingInputsChanged, SessionStatus, SessionSummary,
+        SessionTimestamp, SessionTitleChanged, SessionUpdate, SessionWorkingChanged,
+        ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility, TitleSettings,
+        TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -52,7 +52,7 @@ fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
         sidebar_is_drawn(&rows),
-        "the Sidebar takes a fixed 32-column left column, divided down the frame: {rows:?}"
+        "the Sidebar takes its default 32-column left column, divided down the frame: {rows:?}"
     );
     let landing = rendered_row(&rows, "Type a prompt");
     assert!(
@@ -771,7 +771,7 @@ fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
         vec![listed("Listed work", None, workspace.path(), 1, now())],
     );
 
-    let squeezed = rendered_application_rows_at(&application, 85, 20);
+    let squeezed = rendered_application_rows_at(&application, 77, 20);
     assert!(
         !squeezed.iter().any(|row| row.contains("Listed work")),
         "a terminal too narrow for the Sidebar plus a usable main view keeps the main view"
@@ -781,10 +781,103 @@ fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
         "the main view is drawn in full: {squeezed:?}"
     );
 
-    let widened = rendered_application_rows_at(&application, 86, 20);
+    let widened = rendered_application_rows_at(&application, 78, 20);
     assert!(
         widened.iter().any(|row| row.contains("Listed work")),
         "the Sidebar comes back the moment there is room, the reader's choice intact"
+    );
+}
+
+#[test]
+fn the_launch_setting_chooses_the_sidebar_width_and_the_main_view_takes_the_rest() {
+    let workspace = workspace_dir();
+    let application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+
+    let rows = rendered_application_rows_at(&application, 100, 20);
+    assert_eq!(sidebar_divider_column(&rows), Some(39));
+    let landing = rendered_row(&rows, "Type a prompt");
+    assert!(
+        rows[landing]
+            .find("Type a prompt")
+            .expect("draw the composer")
+            >= 40,
+        "the Landing is laid out in the sixty columns the Sidebar leaves: {rows:?}"
+    );
+}
+
+#[test]
+fn a_narrow_frame_clamps_the_drawn_width_at_both_floors_and_growth_restores_the_choice() {
+    let workspace = workspace_dir();
+    let application =
+        sidebar_showing_at_width(workspace.path(), 60, SessionContentWidth::default());
+
+    assert_eq!(
+        sidebar_divider_column(&rendered_application_rows_at(&application, 100, 20)),
+        Some(45),
+        "the main view keeps its 54-column floor"
+    );
+    assert_eq!(
+        sidebar_divider_column(&rendered_application_rows_at(&application, 78, 20)),
+        Some(23),
+        "the Sidebar keeps its 24-column floor"
+    );
+    assert_eq!(
+        sidebar_divider_column(&rendered_application_rows_at(&application, 114, 20)),
+        Some(59),
+        "drawing narrow never overwrites the chosen width"
+    );
+}
+
+#[test]
+fn a_changed_launch_setting_does_not_move_a_sidebar_already_seeded() {
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+    assert_eq!(
+        sidebar_divider_column(&rendered_application_rows_at(&application, 120, 20)),
+        Some(39)
+    );
+
+    deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            initial_visibility: SidebarVisibility::Shown,
+            initial_width: 60,
+            ..SidebarSettings::default()
+        },
+    );
+
+    assert_eq!(
+        sidebar_divider_column(&rendered_application_rows_at(&application, 120, 20)),
+        Some(39),
+        "a later settings delivery leaves live view state alone"
+    );
+}
+
+#[test]
+fn the_session_content_column_recenters_inside_the_width_the_sidebar_leaves() {
+    let workspace = workspace_dir();
+    let mut narrower_sidebar =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::Maximum(70));
+    let mut wider_sidebar =
+        sidebar_showing_at_width(workspace.path(), 60, SessionContentWidth::Maximum(70));
+    enter_session(&mut narrower_sidebar, workspace.path());
+    enter_session(&mut wider_sidebar, workspace.path());
+
+    let narrower_rows = rendered_application_rows_at(&narrower_sidebar, 120, 20);
+    let wider_rows = rendered_application_rows_at(&wider_sidebar, 120, 20);
+    assert_eq!(sidebar_divider_column(&narrower_rows), Some(39));
+    assert_eq!(sidebar_divider_column(&wider_rows), Some(59));
+    assert_eq!(
+        composer_columns(&narrower_rows),
+        (45, 114),
+        "the capped Content Column centers within the padded 76-column main view"
+    );
+    assert_eq!(
+        composer_columns(&wider_rows),
+        (62, 117),
+        "a wider Sidebar narrows and recenters the Content Column in the main view that remains"
     );
 }
 
@@ -921,6 +1014,29 @@ fn sidebar_showing_emojis(workspace: &Path, sessions: Vec<SessionListItem>) -> A
     )
 }
 
+fn sidebar_showing_at_width(
+    workspace: &Path,
+    initial_width: u64,
+    content_width: SessionContentWidth,
+) -> Application {
+    sidebar_hydrated(
+        workspace,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                initial_width,
+                ..SidebarSettings::default()
+            },
+            session: SessionSettings {
+                content_width,
+                ..SessionSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        Vec::new(),
+    )
+}
+
 /// The Sidebar's own Settings as a reader who wants it on screen leaves them.
 fn shown(auto_settle: AutoSettle) -> SidebarSettings {
     SidebarSettings {
@@ -1010,6 +1126,33 @@ fn expect_sidebar_listing(transition: ApplicationTransition) -> suru::tui::Sessi
 fn sidebar_is_drawn(rows: &[String]) -> bool {
     rows.iter()
         .all(|row| row.chars().nth(31) == Some('\u{2502}'))
+}
+
+fn sidebar_divider_column(rows: &[String]) -> Option<usize> {
+    let width = rows.first()?.chars().count();
+    (0..width).find(|column| {
+        rows.iter()
+            .all(|row| row.chars().nth(*column) == Some('\u{2502}'))
+    })
+}
+
+fn composer_columns(rows: &[String]) -> (usize, usize) {
+    let border = rows
+        .iter()
+        .find(|row| row.contains('┌'))
+        .expect("Session composer border is visible");
+    (
+        border
+            .chars()
+            .position(|character| character == '┌')
+            .unwrap(),
+        border
+            .chars()
+            .enumerate()
+            .filter_map(|(column, character)| (character == '┐').then_some(column))
+            .last()
+            .unwrap(),
+    )
 }
 
 fn listed_as(
@@ -1719,11 +1862,11 @@ fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer()
         vec![listed("Listed work", None, workspace.path(), 1, now())],
     );
 
-    rendered_application_rows_at(&application, 85, 20);
+    rendered_application_rows_at(&application, 77, 20);
     type_terminal_text(&mut application, "hello");
 
     assert!(
-        rendered_application_rows_at(&application, 85, 20)
+        rendered_application_rows_at(&application, 77, 20)
             .iter()
             .any(|row| row.contains("hello")),
         "a Sidebar the frame cannot spare the columns for cannot hold the keys either"
@@ -3766,7 +3909,7 @@ fn a_press_resolves_against_the_frame_in_force_rather_than_the_one_before_it() {
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
     let row = drawn_at(&application, "Wanted work");
 
-    let squeezed = rendered_application_rows_at(&application, 85, 20);
+    let squeezed = rendered_application_rows_at(&application, 77, 20);
     assert!(
         !squeezed.iter().any(|drawn| drawn.contains("Wanted work")),
         "the frame in force is one too narrow for the Sidebar: {squeezed:?}"
@@ -4047,7 +4190,7 @@ fn a_terminal_too_narrow_for_the_sidebar_draws_no_menu_and_holds_no_keys() {
     let mut application = sidebar_showing(workspace.path(), two_listed(workspace.path(), wanted));
     let _ = open_menu_on(&mut application, "Wanted work");
 
-    let squeezed = rendered_application_rows_at(&application, 85, PRESS_HEIGHT);
+    let squeezed = rendered_application_rows_at(&application, 77, PRESS_HEIGHT);
     assert!(
         !squeezed.iter().any(|row| row.contains("Delete")),
         "no menu stands over a main view the Sidebar was squeezed off: {squeezed:?}"
@@ -4055,7 +4198,7 @@ fn a_terminal_too_narrow_for_the_sidebar_draws_no_menu_and_holds_no_keys() {
 
     type_terminal_text(&mut application, "not-a-menu-key");
     assert!(
-        rendered_application_rows_at(&application, 85, PRESS_HEIGHT)
+        rendered_application_rows_at(&application, 77, PRESS_HEIGHT)
             .join("\n")
             .contains("not-a-menu-key"),
         "and the composer has the keys a menu nobody can see is not holding"

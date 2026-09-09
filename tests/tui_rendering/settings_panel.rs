@@ -103,6 +103,16 @@ fn with_content_width(content_width: SessionContentWidth) -> EffectiveSettings {
     }
 }
 
+fn with_sidebar_width(initial_width: u64) -> EffectiveSettings {
+    EffectiveSettings {
+        sidebar: SidebarSettings {
+            initial_width,
+            ..SidebarSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
 fn with_sidebar_scope(initial_scope: SidebarScope) -> EffectiveSettings {
     EffectiveSettings {
         sidebar: SidebarSettings {
@@ -1670,6 +1680,42 @@ fn session_content_width_opens_a_numeric_editor_prefilled_from_the_active_maximu
     assert!(
         rendered.contains("Maximum columns") && rendered.contains("132"),
         "the numeric editor opens over the panel with the active maximum prefilled: {rendered}"
+    );
+}
+
+#[test]
+fn sidebar_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_sidebar_width(48),
+        &["sidebar.initialWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidebar.initialWidth");
+
+    assert!(
+        row(&application, "Sidebar width at launch").contains("48 columns [pinned]"),
+        "the active width is shown in General"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Columns at launch") && rendered.contains("48"),
+        "Enter opens the numeric editor prefilled from the effective Setting: {rendered}"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('6'), KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('0'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialWidth {
+            value: Some(60),
+        })
     );
 }
 

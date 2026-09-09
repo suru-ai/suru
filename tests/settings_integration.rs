@@ -456,6 +456,87 @@ async fn a_hidden_sidebar_pins_from_a_document_and_resets_to_the_shown_default()
 }
 
 #[tokio::test]
+async fn sidebar_initial_width_loads_without_a_product_level_maximum_and_resets() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "sidebar": { "initialWidth": 1000000 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-sidebar-width")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-sidebar-width").await;
+    assert_eq!(opening.settings.sidebar.initial_width, 1_000_000);
+    assert_eq!(opening.pinned, ["sidebar.initialWidth"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let minimum = client
+        .mutate_setting(SettingMutation::SidebarInitialWidth { value: Some(24) })
+        .await
+        .expect("pin the minimum Sidebar width");
+    assert_eq!(minimum.settings.sidebar.initial_width, 24);
+    assert_eq!(minimum.pinned, ["sidebar.initialWidth"]);
+
+    let reset = client
+        .mutate_setting(SettingMutation::SidebarInitialWidth { value: None })
+        .await
+        .expect("reset Sidebar width at launch");
+    assert_eq!(reset.settings.sidebar.initial_width, 32);
+    assert_eq!(reset.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_sidebar_width_below_the_floor_is_ignored_individually_with_a_diagnostic() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "sidebar": { "initialWidth": 23 },
+            "transcript": { "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-sidebar-width-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (_, snapshot) = attach(state_dir.path(), "settings-sidebar-width-invalid").await;
+    assert_eq!(snapshot.settings.sidebar.initial_width, 32);
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "the unrelated valid pin still applies"
+    );
+    assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("the invalid width should produce one diagnostic");
+    };
+    assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+    assert_eq!(diagnostic.key.as_deref(), Some("sidebar.initialWidth"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not an integer of at least 24"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn an_everywhere_sidebar_at_launch_pins_from_a_document_and_resets_to_every_workspace() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");

@@ -22,9 +22,9 @@ use super::{
     session_listing::{ListedSession, SessionListing, everywhere_origins},
 };
 
-/// The columns the Sidebar occupies, cloning t3 code's own fixed column. There
-/// is no drag-resize and no Setting: the width is part of the clone.
-const SIDEBAR_WIDTH: u16 = 32;
+/// The narrowest Sidebar a reader can use. The chosen width may be greater,
+/// but draw-time clamping never lets a narrow frame overwrite that choice.
+const MINIMUM_SIDEBAR_WIDTH: u16 = 24;
 
 /// The narrowest main view the Sidebar will leave behind: the 50 columns a
 /// reader is allowed to cap the Session Content Column at (ADR 0012), inside
@@ -37,11 +37,23 @@ const MINIMUM_MAIN_WIDTH: u16 = 54;
 /// narrow for the Sidebar plus a usable main view keeps the main view, and the
 /// reader's own show-or-hide choice is untouched, so widening the terminal
 /// brings the Sidebar back exactly as they left it.
-pub(super) const fn width_beside(frame_width: u16) -> Option<u16> {
-    if frame_width < SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH {
+pub(super) const fn width_beside(chosen_width: u64, frame_width: u16) -> Option<u16> {
+    if frame_width < MINIMUM_SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH {
         None
     } else {
-        Some(SIDEBAR_WIDTH)
+        let maximum = frame_width - MINIMUM_MAIN_WIDTH;
+        let chosen = if chosen_width > u16::MAX as u64 {
+            u16::MAX
+        } else {
+            chosen_width as u16
+        };
+        Some(if chosen < MINIMUM_SIDEBAR_WIDTH {
+            MINIMUM_SIDEBAR_WIDTH
+        } else if chosen > maximum {
+            maximum
+        } else {
+            chosen
+        })
     }
 }
 
@@ -148,6 +160,10 @@ pub(super) struct Sidebar {
     /// who toggled the Sidebar since should not have it flipped back under
     /// them.
     seeded: bool,
+    /// The width the reader wants, independently of how many columns the
+    /// current frame can spare. Seeded once from the launch Setting; a draw
+    /// clamps a copy and leaves this choice whole.
+    chosen_width: u64,
     /// When a Session settles without anyone saying so. Adopted from every
     /// snapshot rather than seeded from the first, because unlike the two
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
@@ -779,6 +795,7 @@ impl Sidebar {
             revealed: false,
             focused: false,
             seeded: false,
+            chosen_width: 32,
             auto_settle: AutoSettle::default(),
             emoji: EmojiVisibility::default(),
             scope: SidebarListingScope::AllWorkspaces,
@@ -812,7 +829,7 @@ impl Sidebar {
 
     /// Takes the Settings the Sidebar draws under, each on its own schedule:
     /// auto-settle and how a Session is named govern every frame from here on,
-    /// while the two initial Settings have their say once and are then the
+    /// while the three initial Settings have their say once and are then the
     /// reader's to overrule. Returns nothing: a Sidebar that wants its Sessions
     /// leaves the requests in [`Self::take_listing_requests`].
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
@@ -822,6 +839,7 @@ impl Sidebar {
             return;
         }
         self.seeded = true;
+        self.chosen_width = settings.sidebar.initial_width;
         self.scope = match settings.sidebar.initial_scope {
             InitialSidebarScope::Everywhere => SidebarListingScope::Everywhere,
             InitialSidebarScope::AllWorkspaces => SidebarListingScope::AllWorkspaces,
@@ -830,6 +848,10 @@ impl Sidebar {
             }
         };
         self.reveal(settings.sidebar.initial_visibility == SidebarVisibility::Shown);
+    }
+
+    pub(super) fn chosen_width(&self) -> u64 {
+        self.chosen_width
     }
 
     /// Shows the Sidebar, or hides it. This is view state and nothing more: the
@@ -2719,9 +2741,9 @@ mod tests {
             SessionListRequest,
             commands::SemanticCommandId,
             sidebar::{
-                MINIMUM_MAIN_WIDTH, SIDEBAR_WIDTH, SessionStanding, Sidebar, SidebarActivation,
-                SidebarEntry, SidebarPress, SidebarSpan, SidebarTarget, StandingInputs,
-                session_standing, width_beside, workspace_name,
+                SessionStanding, Sidebar, SidebarActivation, SidebarEntry, SidebarPress,
+                SidebarSpan, SidebarTarget, StandingInputs, session_standing, width_beside,
+                workspace_name,
             },
         },
     };
@@ -3040,10 +3062,12 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_too_narrow_for_a_usable_main_view_spares_no_columns() {
-        assert_eq!(width_beside(SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH), Some(32));
-        assert_eq!(width_beside(SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH - 1), None);
-        assert_eq!(width_beside(0), None);
+    fn the_drawn_width_clamps_without_changing_the_chosen_width() {
+        assert_eq!(width_beside(40, 100), Some(40));
+        assert_eq!(width_beside(60, 100), Some(46));
+        assert_eq!(width_beside(60, 78), Some(24));
+        assert_eq!(width_beside(60, 77), None);
+        assert_eq!(width_beside(1_000_000, u16::MAX), Some(65_481));
     }
 
     #[test]
