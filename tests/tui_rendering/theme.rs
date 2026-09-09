@@ -47,6 +47,19 @@ fn open_theme_picker(application: &mut Application) -> ApplicationTransition {
         .expect("open Theme picker")
 }
 
+/// Keeps Theme preview assertions on the full main-view canvas after a
+/// snapshot seeds the independently configured Sidebar as shown.
+fn hide_sidebar_as_view_state(application: &mut Application) {
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SidebarToggle,
+            )))
+            .expect("hide the Sidebar without changing effective Settings"),
+        ApplicationTransition::Continue
+    );
+}
+
 fn truecolor_application() -> Application {
     let mut application = Application::default();
     application.set_terminal_facts(TerminalFacts::unprobed(true));
@@ -485,6 +498,7 @@ fn an_unrelated_snapshot_does_not_end_a_preview_still_being_browsed() {
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
 
     deliver_settings(&mut application, EffectiveSettings::default());
+    hide_sidebar_as_view_state(&mut application);
     assert_eq!(
         rendered_application_buffer(&application, 80, 15)
             .cell((0, 0))
@@ -507,6 +521,7 @@ fn escape_restores_the_opening_theme_after_another_client_changes_the_pin() {
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
 
     deliver_settings(&mut application, themed("catppuccin"));
+    hide_sidebar_as_view_state(&mut application);
     assert_eq!(
         press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
         ApplicationTransition::Continue

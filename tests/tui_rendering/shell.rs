@@ -33,6 +33,19 @@ fn rendered_state_rows(application: &Application) -> Vec<String> {
     rendered_rows(|frame| application.render(frame))
 }
 
+/// The first column the main view owns in a rendered frame. A Sidebar rule
+/// runs through every row; without one, the main view begins at the terminal's
+/// own left edge.
+fn main_view_left(rows: &[String]) -> usize {
+    let width = rows.first().map_or(0, |row| row.chars().count());
+    (0..width)
+        .find(|column| {
+            rows.iter()
+                .all(|row| row.chars().nth(*column) == Some('\u{2502}'))
+        })
+        .map_or(0, |divider| divider + 1)
+}
+
 /// A client reads its launching Workspace the way the server reads one, and a
 /// directory that cannot be read that way is not a reason to refuse to start:
 /// the client stands on the path as given, and the Landing says so.
@@ -424,9 +437,15 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
             );
             assert_eq!(logo_bottom - logo_top, 6);
             assert_eq!(composer_top - logo_bottom, 2, "one blank row before input");
+            let main_left = main_view_left(&rows);
             let logo_left = rows[logo_top..=logo_bottom]
                 .iter()
-                .filter_map(|row| row.chars().position(|ch| ch != ' '))
+                .filter_map(|row| {
+                    row.chars()
+                        .enumerate()
+                        .skip(main_left)
+                        .find_map(|(column, character)| (character != ' ').then_some(column))
+                })
                 .min()
                 .unwrap();
             let logo_right = rows[logo_top..=logo_bottom]
@@ -435,8 +454,8 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
                 .max()
                 .unwrap();
             assert!(
-                (logo_left + 1).abs_diff(width as usize - logo_right - 1) <= 1,
-                "the logo sits one column left of center for visual balance"
+                (logo_left - main_left + 1).abs_diff(width as usize - logo_right - 1) <= 1,
+                "the logo sits one column left of the main view's center for visual balance"
             );
         }
 
@@ -474,12 +493,16 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
         .expect("type a landing draft");
 
     let wide = rendered_application_rows_at(&application, 80, 16).join("\n");
-    for content in ["Keep the composer usable", "Agent unavailable", "Connected"] {
+    for content in ["Keep the composer usable", "Agent un…", "Connected"] {
         assert!(
             wide.contains(content),
-            "wide landing frame omitted {content:?}"
+            "the Sidebar-narrowed main view omitted {content:?}"
         );
     }
+    assert!(
+        !wide.contains("Agent unavailable"),
+        "the main view degrades the long footer label before sacrificing the composer: {wide}"
+    );
     assert!(!wide.contains("Workspace "), "{wide}");
 
     assert!(wide.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
