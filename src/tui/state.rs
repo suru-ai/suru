@@ -5671,7 +5671,18 @@ impl Application {
             }
             SemanticCommandId::PointerDrag => {
                 if self.state.sidebar.edge_is_held() {
-                    return Ok(ApplicationTransition::Continue);
+                    let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    // The Sidebar column includes its rule, so a choice one
+                    // wider than the pointer's zero-based screen column puts
+                    // that rule directly under the pointer. The Sidebar
+                    // resolves that choice under the last frame's floors,
+                    // then the semantic setter owns the view-state mutation.
+                    let Some(columns) = self.state.sidebar.width_at_held_edge(*position) else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    return self.invoke_semantic(SemanticCommandId::SidebarWidthSet { columns });
                 }
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
                     self.update_text_selection_drag(position, 1);

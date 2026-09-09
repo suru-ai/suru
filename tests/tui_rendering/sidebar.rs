@@ -1161,6 +1161,242 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
 }
 
 #[test]
+fn dragging_the_held_edge_reflows_the_sidebar_and_main_view_until_release() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing_at_width(workspace.path(), 32, SessionContentWidth::Fill);
+    enter_session(&mut application, workspace.path());
+    let before = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    let before_composer = composer_columns(&before);
+    assert_eq!(sidebar_divider_column(&before), Some(31));
+
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            (31, 0),
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Drag(MouseButton::Left),
+            (39, 0),
+        ),
+        ApplicationTransition::Continue,
+        "a pointer resize is view state and requests no configuration write"
+    );
+
+    let held = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+    let held_rows = crate::support::buffer_rows(&held);
+    assert_eq!(sidebar_divider_column(&held_rows), Some(39));
+    assert_eq!(
+        held[(39, 0)].fg,
+        Color::Cyan,
+        "the moved rule stays under the pointer in the focus color"
+    );
+    let after_composer = composer_columns(&held_rows);
+    assert_eq!(after_composer.0, before_composer.0 + 8);
+    assert_eq!(
+        after_composer.1, before_composer.1,
+        "the main view reflows eight columns narrower at its left edge"
+    );
+
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Up(MouseButton::Left),
+            (39, 0),
+        ),
+        ApplicationTransition::Continue
+    );
+    let released = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
+    assert_eq!(
+        sidebar_divider_column(&crate::support::buffer_rows(&released)),
+        Some(39)
+    );
+    assert_ne!(released[(39, 0)].fg, Color::Cyan);
+
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarToggle),
+        ApplicationTransition::Continue
+    );
+    answer_sidebar_reveal(&mut application);
+    assert_eq!(
+        drawn_sidebar_width(&application, WIDE),
+        Some(40),
+        "hide and show retain the width chosen by the drag"
+    );
+}
+
+#[test]
+fn edge_dragging_stops_at_the_sidebar_and_current_main_view_floors() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let mut minimum = sidebar_showing(workspace.path(), Vec::new());
+    rendered_application_buffer(&minimum, WIDE, PRESS_HEIGHT);
+    mouse(
+        &mut minimum,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    assert_eq!(
+        mouse(
+            &mut minimum,
+            MouseEventKind::Drag(MouseButton::Left),
+            (0, 0),
+        ),
+        ApplicationTransition::Continue
+    );
+    let at_minimum = rendered_application_buffer(&minimum, WIDE, PRESS_HEIGHT);
+    assert_eq!(
+        sidebar_divider_column(&crate::support::buffer_rows(&at_minimum)),
+        Some(23)
+    );
+    assert_eq!(at_minimum[(23, 0)].fg, Color::Cyan);
+    mouse(&mut minimum, MouseEventKind::Up(MouseButton::Left), (0, 0));
+
+    let mut maximum = sidebar_showing(workspace.path(), Vec::new());
+    rendered_application_buffer(&maximum, WIDE, PRESS_HEIGHT);
+    mouse(
+        &mut maximum,
+        MouseEventKind::Down(MouseButton::Left),
+        (31, 0),
+    );
+    assert_eq!(
+        mouse(
+            &mut maximum,
+            MouseEventKind::Drag(MouseButton::Left),
+            (WIDE - 1, 0),
+        ),
+        ApplicationTransition::Continue
+    );
+    let at_maximum = rendered_application_buffer(&maximum, WIDE, PRESS_HEIGHT);
+    assert_eq!(
+        sidebar_divider_column(&crate::support::buffer_rows(&at_maximum)),
+        Some(45),
+        "a 46-column Sidebar leaves the current 100-column frame's 54-column main floor"
+    );
+    assert_eq!(at_maximum[(45, 0)].fg, Color::Cyan);
+    assert_eq!(
+        drawn_sidebar_width(&maximum, 120),
+        Some(46),
+        "an over-limit drag records the current floor and leaves no latent width for frame growth"
+    );
+    mouse(
+        &mut maximum,
+        MouseEventKind::Up(MouseButton::Left),
+        (WIDE - 1, 0),
+    );
+}
+
+#[test]
+fn terminal_shrink_during_an_edge_drag_clamps_only_the_drawn_width() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+    rendered_application_buffer(&application, 120, PRESS_HEIGHT);
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (39, 0),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Drag(MouseButton::Left),
+        (59, 0),
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(60));
+    assert_eq!(
+        drawn_sidebar_width(&application, 100),
+        Some(46),
+        "the smaller frame preserves its 54-column main view"
+    );
+    assert_eq!(
+        drawn_sidebar_width(&application, 120),
+        Some(60),
+        "frame growth reveals the drag's retained chosen width"
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (59, 0),
+    );
+}
+
+#[test]
+fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let mut transcript = sidebar_hydrated(
+        workspace.path(),
+        EffectiveSettings {
+            sidebar: shown(AutoSettle::default()),
+            text_selection: suru::protocol::TextSelectionSettings {
+                copy: TextSelectionCopy::Release,
+            },
+            ..EffectiveSettings::default()
+        },
+        Vec::new(),
+    );
+    enter_session(&mut transcript, workspace.path());
+    let transcript_buffer = rendered_application_buffer(&transcript, WIDE, PRESS_HEIGHT);
+    let prompt = text_position(&transcript_buffer, "Initial Prompt");
+    assert!(prompt.0 > 32, "the Selection begins past the grab zone");
+    mouse(
+        &mut transcript,
+        MouseEventKind::Down(MouseButton::Left),
+        prompt,
+    );
+    mouse(
+        &mut transcript,
+        MouseEventKind::Drag(MouseButton::Left),
+        (20, prompt.1),
+    );
+    assert_eq!(drawn_sidebar_width(&transcript, WIDE), Some(32));
+    assert!(matches!(
+        mouse(
+            &mut transcript,
+            MouseEventKind::Up(MouseButton::Left),
+            (20, prompt.1),
+        ),
+        ApplicationTransition::CopyToClipboard(_)
+    ));
+
+    let mut composer = sidebar_showing(workspace.path(), Vec::new());
+    enter_session(&mut composer, workspace.path());
+    type_terminal_text(&mut composer, "composer drag stays text");
+    let composer_buffer = rendered_application_buffer(&composer, WIDE, PRESS_HEIGHT);
+    let draft = text_position(&composer_buffer, "composer drag stays text");
+    assert!(
+        draft.0 > 32,
+        "the composer gesture begins past the grab zone"
+    );
+    mouse(
+        &mut composer,
+        MouseEventKind::Down(MouseButton::Left),
+        draft,
+    );
+    mouse(
+        &mut composer,
+        MouseEventKind::Drag(MouseButton::Left),
+        (20, draft.1),
+    );
+    assert_eq!(drawn_sidebar_width(&composer, WIDE), Some(32));
+    mouse(
+        &mut composer,
+        MouseEventKind::Up(MouseButton::Left),
+        (20, draft.1),
+    );
+}
+
+#[test]
 fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus() {
     use super::selection::mouse;
 

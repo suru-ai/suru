@@ -1093,6 +1093,22 @@ impl Sidebar {
         self.edge_held
     }
 
+    /// Resolves a held edge's pointer column to a chosen Sidebar width under
+    /// the last frame's two floors. Unlike an explicit set-width command, a
+    /// drag stops at the room that frame actually offered rather than keeping
+    /// an over-limit choice for a later, wider frame.
+    pub(super) fn width_at_held_edge(&self, position: Position) -> Option<u64> {
+        if !self.edge_held {
+            return None;
+        }
+        let limit = u64::from(self.drawn_width_limit.get()?);
+        Some(
+            (u64::from(position.x) + 1)
+                .max(u64::from(MINIMUM_SIDEBAR_WIDTH))
+                .min(limit),
+        )
+    }
+
     /// Whether this cell is the first one beyond the grab zone in the main
     /// view. The Session Content Column begins after layout padding, but this
     /// boundary cell retains the ordinary Text Selection behavior promised
