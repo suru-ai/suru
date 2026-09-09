@@ -2506,20 +2506,27 @@ pub(super) struct QueuedPrompt<'a> {
 
 /// The last left press, kept beside the press history so that nothing that
 /// clears or copies a Text Selection can reset the click count: only time,
-/// distance, and surface do.
+/// distance, and target do.
 #[derive(Clone, Copy, Debug)]
 struct LastClick {
     count: u8,
-    surface: Option<SelectionSurface>,
+    target: ClickTarget,
     position: Position,
     at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClickTarget {
+    Blank,
+    Selection(SelectionSurface),
+    SidebarEdge,
+}
+
 impl LastClick {
-    /// Whether `next` continues this click's count: same surface, within the
+    /// Whether `next` continues this click's count: same target, within the
     /// interval, and within the slop on either axis.
     fn continues(&self, next: &LastClick, interval: Duration) -> bool {
-        self.surface == next.surface
+        self.target == next.target
             && next.at.saturating_duration_since(self.at) <= interval
             && self.position.x.abs_diff(next.position.x) <= CLICK_SLOP
             && self.position.y.abs_diff(next.position.y) <= CLICK_SLOP
@@ -3650,6 +3657,25 @@ impl Application {
         }
     }
 
+    /// Records one left press against its resolved target, sharing the same
+    /// interval, slop, and count limit across selectable text and the Sidebar
+    /// edge without sending the edge through either surface's click routing.
+    fn record_click(&mut self, target: ClickTarget, position: Position) -> LastClick {
+        let mut click = LastClick {
+            count: 1,
+            target,
+            position,
+            at: self.state.presentation_clock.now(),
+        };
+        if let Some(last) = self.state.last_click
+            && last.continues(&click, self.state.click_interval)
+        {
+            click.count = last.count.saturating_add(1).min(CLICK_COUNT_LIMIT);
+        }
+        self.state.last_click = Some(click);
+        click
+    }
+
     /// Routes a command to the handler for the surface it acts on. This match
     /// is exhaustive, so a newly added [`CommandId`] has to be routed to a
     /// surface before it compiles; the handler it lands in then ignores
@@ -3731,6 +3757,10 @@ impl Application {
                 {
                     self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
                     self.state.left_press = None;
+                    let click = self.record_click(ClickTarget::SidebarEdge, position);
+                    if click.count == 2 {
+                        self.invoke_semantic(SemanticCommandId::SidebarWidthReset)?;
+                    }
                     return Ok(ApplicationTransition::Continue);
                 }
                 self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
@@ -3775,19 +3805,15 @@ impl Application {
                     selection_anchor,
                     composer_anchor,
                 });
-                let mut click = LastClick {
-                    count: 1,
-                    surface: selection_anchor.map(|(_, _, surface)| surface),
+                let click = self.record_click(
+                    selection_anchor.map_or(ClickTarget::Blank, |(_, _, surface)| {
+                        ClickTarget::Selection(surface)
+                    }),
                     position,
-                    at: self.state.presentation_clock.now(),
-                };
-                if let Some(last) = self.state.last_click
-                    && last.continues(&click, self.state.click_interval)
+                );
+                if click.count >= 2
+                    && click.target == ClickTarget::Selection(SelectionSurface::Transcript)
                 {
-                    click.count = last.count.saturating_add(1).min(CLICK_COUNT_LIMIT);
-                }
-                self.state.last_click = Some(click);
-                if click.count >= 2 && click.surface == Some(SelectionSurface::Transcript) {
                     self.invoke_semantic(SemanticInvocation {
                         id: if click.count == 2 {
                             SemanticCommandId::TextSelectionWord
@@ -3805,9 +3831,9 @@ impl Application {
             }),
             CommandId::ReleaseAt { position } => {
                 if self.state.sidebar.release_edge() {
-                    // An edge press is never a click. Width movement and the
-                    // double-click reset are added by their own subissues;
-                    // this release merely ends the held paint.
+                    // Reset is decided by the press count. Release merely
+                    // ends the held paint and cannot become a row click or a
+                    // Text Selection copy.
                     self.state.left_press = None;
                     return Ok(ApplicationTransition::Continue);
                 }

@@ -1397,6 +1397,220 @@ fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
 }
 
 #[test]
+fn a_second_edge_press_within_the_click_interval_resets_and_keeps_the_edge_held() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let (application, now) = opening_clock(sidebar_showing_at_width(
+        workspace.path(),
+        32,
+        SessionContentWidth::default(),
+    ));
+    let mut application = application.with_click_interval(Duration::from_millis(300));
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden);
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(33));
+
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Down(MouseButton::Left),
+            (32, 0),
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(33));
+    assert_eq!(
+        rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)[(32, 0)].fg,
+        Color::Cyan,
+        "the first press starts the ordinary held-edge gesture"
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (32, 0),
+    );
+
+    advance_opening_clock(&now, Duration::from_millis(299));
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (32, 0),
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    assert_eq!(
+        rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        Color::Cyan,
+        "resetting on the second press leaves its new edge drag held"
+    );
+    assert_eq!(
+        mouse(
+            &mut application,
+            MouseEventKind::Drag(MouseButton::Left),
+            (39, 0),
+        ),
+        ApplicationTransition::Continue,
+        "the reset press continues through the ordinary edge-drag route"
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(40));
+    assert_eq!(
+        rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
+        Color::Cyan,
+        "the held edge follows the pointer from its reset width"
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (39, 0),
+    );
+    assert_eq!(
+        rendered_application_buffer(&application, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
+        Color::DarkGray
+    );
+}
+
+#[test]
+fn edge_presses_farther_apart_than_the_click_interval_do_not_reset() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let (application, now) = opening_clock(sidebar_showing_at_width(
+        workspace.path(),
+        32,
+        SessionContentWidth::default(),
+    ));
+    let mut application = application.with_click_interval(Duration::from_millis(300));
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden);
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(33));
+
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (32, 0),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (32, 0),
+    );
+    advance_opening_clock(&now, Duration::from_millis(301));
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (32, 0),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (32, 0),
+    );
+
+    assert_eq!(
+        drawn_sidebar_width(&application, WIDE),
+        Some(33),
+        "an expired press begins a new edge-click count"
+    );
+}
+
+#[test]
+fn edge_double_click_uses_the_sidebar_width_setting_delivered_mid_session() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let (mut application, now) = opening_clock(sidebar_showing_at_width(
+        workspace.path(),
+        32,
+        SessionContentWidth::default(),
+    ));
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    invoke_sidebar_width(
+        &mut application,
+        SemanticCommandId::SidebarWidthSet { columns: 40 },
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(40));
+
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (39, 0),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (39, 0),
+    );
+    advance_opening_clock(&now, Duration::from_millis(1));
+    deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            initial_visibility: SidebarVisibility::Shown,
+            initial_width: 45,
+            ..SidebarSettings::default()
+        },
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(40));
+
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (39, 0),
+    );
+
+    assert_eq!(
+        drawn_sidebar_width(&application, WIDE),
+        Some(45),
+        "the gesture invokes reset against the Setting as it currently stands"
+    );
+}
+
+#[test]
+fn edge_double_click_while_the_sidebar_owns_keys_preserves_row_focus() {
+    use super::selection::mouse;
+
+    let workspace = workspace_dir();
+    let sessions = vec![
+        listed("Nearest work", None, workspace.path(), 2, now()),
+        listed("Older work", None, workspace.path(), 1, now()),
+    ];
+    let (application, now) = opening_clock(sidebar_focused(workspace.path(), sessions));
+    let mut application = application.with_click_interval(Duration::from_millis(300));
+    step_onto_the_list(&mut application);
+    let focused_before = selected_sidebar_text(&application);
+    invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden);
+    let older_row = drawn_at(&application, "Older work");
+
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (32, older_row),
+    );
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (32, older_row),
+    );
+    advance_opening_clock(&now, Duration::from_millis(299));
+    mouse(
+        &mut application,
+        MouseEventKind::Down(MouseButton::Left),
+        (32, older_row),
+    );
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    assert_eq!(selected_sidebar_text(&application), focused_before);
+    mouse(
+        &mut application,
+        MouseEventKind::Up(MouseButton::Left),
+        (32, older_row),
+    );
+    assert_eq!(
+        selected_sidebar_text(&application),
+        focused_before,
+        "neither edge press is routed to the row beneath it"
+    );
+}
+
+#[test]
 fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus() {
     use super::selection::mouse;
 
