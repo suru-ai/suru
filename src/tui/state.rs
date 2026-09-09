@@ -4719,6 +4719,26 @@ impl Application {
         ApplicationTransition::Continue
     }
 
+    fn handle_sidebar_width_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> ApplicationTransition {
+        match command {
+            SemanticCommandId::SidebarWiden => self.state.sidebar.widen(),
+            SemanticCommandId::SidebarNarrow => self.state.sidebar.narrow(),
+            SemanticCommandId::SidebarWidthSet { columns } => {
+                self.state.sidebar.set_width(columns);
+            }
+            SemanticCommandId::SidebarWidthReset => {
+                self.state
+                    .sidebar
+                    .set_width(self.state.settings.sidebar.initial_width);
+            }
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
     /// Handles the Sidebar context menu's commands routed here; any other
     /// command leaves the menu alone. A menu that is not open answers none of
     /// them, so an invocation arriving from elsewhere cannot act on a row the
@@ -6029,6 +6049,12 @@ impl Application {
             | SemanticCommandId::SidebarNext
             | SemanticCommandId::SidebarAttach
             | SemanticCommandId::SidebarLeave) => Ok(self.handle_sidebar_command(command)),
+            command @ (SemanticCommandId::SidebarWiden
+            | SemanticCommandId::SidebarNarrow
+            | SemanticCommandId::SidebarWidthSet { .. }
+            | SemanticCommandId::SidebarWidthReset) => {
+                Ok(self.handle_sidebar_width_command(command))
+            }
             command @ (SemanticCommandId::SidebarMenuPrevious
             | SemanticCommandId::SidebarMenuNext
             | SemanticCommandId::SidebarMenuSelect

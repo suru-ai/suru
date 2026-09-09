@@ -68,6 +68,10 @@ pub enum SemanticCommandId {
     ServeRemovePeer,
     ServeClose,
     SidebarToggle,
+    SidebarWiden,
+    SidebarNarrow,
+    SidebarWidthSet { columns: u64 },
+    SidebarWidthReset,
     SidebarPrevious,
     SidebarNext,
     SidebarAttach,
@@ -301,6 +305,10 @@ impl SemanticCommandId {
             Self::ServeRemovePeer => "serve.peer.remove",
             Self::ServeClose => "serve.close",
             Self::SidebarToggle => "sidebar.toggle",
+            Self::SidebarWiden => "sidebar.width.widen",
+            Self::SidebarNarrow => "sidebar.width.narrow",
+            Self::SidebarWidthSet { .. } => "sidebar.width.set",
+            Self::SidebarWidthReset => "sidebar.width.reset",
             Self::SidebarPrevious => "sidebar.previous",
             Self::SidebarNext => "sidebar.next",
             Self::SidebarAttach => "sidebar.attach",
@@ -939,6 +947,37 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         }),
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarWiden,
+        title: "Widen Sidebar",
+        description: "Move the Sidebar's chosen edge one column to the right",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarNarrow,
+        title: "Narrow Sidebar",
+        description: "Move the Sidebar's chosen edge one column to the left",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The column count is invocation data. This representative lets the
+        // one descriptor cover every explicit width without enumerating an
+        // open integer command in the registry.
+        id: SemanticCommandId::SidebarWidthSet { columns: 0 },
+        title: "Set Sidebar Width",
+        description: "Set the Sidebar's chosen width to an explicit column count",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarWidthReset,
+        title: "Reset Sidebar Width",
+        description: "Restore the Sidebar width from its current launch Setting",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarPrevious,
         title: "Previous Sidebar Session",
         description: "Move the Sidebar's selection to the row above, wrapping past the top",
@@ -1199,7 +1238,16 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
     SEMANTIC_COMMANDS
         .iter()
         .chain(NUMERIC_INSERT_COMMANDS.iter())
-        .find(|command| command.id == id)
+        .find(|command| {
+            command.id == id
+                || matches!(
+                    (command.id, id),
+                    (
+                        SemanticCommandId::SidebarWidthSet { .. },
+                        SemanticCommandId::SidebarWidthSet { .. }
+                    )
+                )
+        })
         .expect("every semantic command ID has one descriptor")
 }
 

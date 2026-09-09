@@ -2192,7 +2192,10 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     let Some(width) = sidebar::width_beside(state.sidebar.chosen_width(), frame_area.width) else {
         return frame_area;
     };
-    state.sidebar.record_drawn();
+    state.sidebar.record_drawn(
+        width,
+        sidebar::width_limit(frame_area.width).unwrap_or(width),
+    );
     let [column, main] =
         Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
     // The Sidebar's edge stands out while the reader is driving it, which is

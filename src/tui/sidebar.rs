@@ -38,22 +38,31 @@ const MINIMUM_MAIN_WIDTH: u16 = 54;
 /// reader's own show-or-hide choice is untouched, so widening the terminal
 /// brings the Sidebar back exactly as they left it.
 pub(super) const fn width_beside(chosen_width: u64, frame_width: u16) -> Option<u16> {
+    match width_limit(frame_width) {
+        None => None,
+        Some(maximum) => {
+            let chosen = if chosen_width > u16::MAX as u64 {
+                u16::MAX
+            } else {
+                chosen_width as u16
+            };
+            Some(if chosen < MINIMUM_SIDEBAR_WIDTH {
+                MINIMUM_SIDEBAR_WIDTH
+            } else if chosen > maximum {
+                maximum
+            } else {
+                chosen
+            })
+        }
+    }
+}
+
+/// The widest Sidebar this frame can carry beside a main view at its floor.
+pub(super) const fn width_limit(frame_width: u16) -> Option<u16> {
     if frame_width < MINIMUM_SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH {
         None
     } else {
-        let maximum = frame_width - MINIMUM_MAIN_WIDTH;
-        let chosen = if chosen_width > u16::MAX as u64 {
-            u16::MAX
-        } else {
-            chosen_width as u16
-        };
-        Some(if chosen < MINIMUM_SIDEBAR_WIDTH {
-            MINIMUM_SIDEBAR_WIDTH
-        } else if chosen > maximum {
-            maximum
-        } else {
-            chosen
-        })
+        Some(frame_width - MINIMUM_MAIN_WIDTH)
     }
 }
 
@@ -164,6 +173,14 @@ pub(super) struct Sidebar {
     /// current frame can spare. Seeded once from the launch Setting; a draw
     /// clamps a copy and leaves this choice whole.
     chosen_width: u64,
+    /// The width the last frame actually drew. Incremental commands move the
+    /// visible edge from here, so they stop at both draw-time floors and a
+    /// command after a terminal clamp still moves one visible column.
+    drawn_width: Cell<Option<u16>>,
+    /// The widest the last frame could draw while keeping the main view at
+    /// its floor. Kept with the drawn width so widening at that boundary does
+    /// not create a latent choice that appears only after a later resize.
+    drawn_width_limit: Cell<Option<u16>>,
     /// When a Session settles without anyone saying so. Adopted from every
     /// snapshot rather than seeded from the first, because unlike the two
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
@@ -796,6 +813,8 @@ impl Sidebar {
             focused: false,
             seeded: false,
             chosen_width: 32,
+            drawn_width: Cell::new(None),
+            drawn_width_limit: Cell::new(None),
             auto_settle: AutoSettle::default(),
             emoji: EmojiVisibility::default(),
             scope: SidebarListingScope::AllWorkspaces,
@@ -852,6 +871,40 @@ impl Sidebar {
 
     pub(super) fn chosen_width(&self) -> u64 {
         self.chosen_width
+    }
+
+    /// Sets a freely chosen width. The Sidebar floor is part of every valid
+    /// choice; the frame-dependent upper clamp remains a draw-time concern so
+    /// a wider terminal can reveal the choice whole later.
+    pub(super) fn set_width(&mut self, columns: u64) {
+        self.chosen_width = columns.max(u64::from(MINIMUM_SIDEBAR_WIDTH));
+    }
+
+    /// Moves the drawn edge one column where the current frame has room.
+    pub(super) fn widen(&mut self) {
+        if !self.revealed {
+            return;
+        }
+        let Some(drawn) = self.drawn_width.get() else {
+            return;
+        };
+        let Some(limit) = self.drawn_width_limit.get() else {
+            return;
+        };
+        if drawn < limit {
+            self.chosen_width = u64::from(drawn + 1);
+        }
+    }
+
+    /// Moves the drawn edge one column left, stopping at the Sidebar floor.
+    pub(super) fn narrow(&mut self) {
+        if !self.revealed {
+            return;
+        }
+        let Some(drawn) = self.drawn_width.get() else {
+            return;
+        };
+        self.chosen_width = u64::from(drawn.saturating_sub(1).max(MINIMUM_SIDEBAR_WIDTH));
     }
 
     /// Shows the Sidebar, or hides it. This is view state and nothing more: the
@@ -987,12 +1040,16 @@ impl Sidebar {
     /// reads is always the one on screen.
     pub(super) fn forget_frame(&self) {
         self.on_screen.set(false);
+        self.drawn_width.set(None);
+        self.drawn_width_limit.set(None);
         self.geometry.replace(SidebarGeometry::default());
     }
 
     /// Records that this frame found the columns for the Sidebar and drew it.
-    pub(super) fn record_drawn(&self) {
+    pub(super) fn record_drawn(&self, width: u16, width_limit: u16) {
         self.on_screen.set(true);
+        self.drawn_width.set(Some(width));
+        self.drawn_width_limit.set(Some(width_limit));
     }
 
     /// Takes the geometry the frame just drew its body in, which is the only
@@ -2956,7 +3013,7 @@ mod tests {
             "a Sidebar squeezed off a narrow terminal cannot act on the focus it keeps"
         );
 
-        sidebar.record_drawn();
+        sidebar.record_drawn(32, 46);
 
         assert!(
             sidebar.has_focus(),
@@ -3383,7 +3440,7 @@ mod tests {
             "a Sidebar the frame found no columns for animates nothing"
         );
 
-        sidebar.record_drawn();
+        sidebar.record_drawn(32, 46);
         sidebar.toggle(None);
 
         assert!(

@@ -882,6 +882,140 @@ fn the_session_content_column_recenters_inside_the_width_the_sidebar_leaves() {
 }
 
 #[test]
+fn semantic_commands_widen_and_narrow_the_drawn_sidebar_one_column() {
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(40));
+
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(41));
+
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarNarrow),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(40));
+}
+
+#[test]
+fn incremental_width_commands_stop_at_the_sidebar_and_main_view_floors() {
+    let workspace = workspace_dir();
+    let mut minimum =
+        sidebar_showing_at_width(workspace.path(), 24, SessionContentWidth::default());
+    assert_eq!(drawn_sidebar_width(&minimum, 120), Some(24));
+    assert_eq!(
+        invoke_sidebar_width(&mut minimum, SemanticCommandId::SidebarNarrow),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&minimum, 120), Some(24));
+
+    let mut maximum =
+        sidebar_showing_at_width(workspace.path(), 46, SessionContentWidth::default());
+    assert_eq!(drawn_sidebar_width(&maximum, 100), Some(46));
+    assert_eq!(
+        invoke_sidebar_width(&mut maximum, SemanticCommandId::SidebarWiden),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&maximum, 100), Some(46));
+    assert_eq!(
+        drawn_sidebar_width(&maximum, 120),
+        Some(46),
+        "a stopped widen creates no latent width that appears after frame growth"
+    );
+}
+
+#[test]
+fn the_set_command_keeps_an_explicit_choice_while_the_drawn_width_clamps() {
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 32, SessionContentWidth::default());
+
+    assert_eq!(
+        invoke_sidebar_width(
+            &mut application,
+            SemanticCommandId::SidebarWidthSet { columns: 60 },
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, 100), Some(46));
+    assert_eq!(
+        drawn_sidebar_width(&application, 114),
+        Some(60),
+        "the explicit choice survives its draw-time clamp"
+    );
+
+    assert_eq!(
+        invoke_sidebar_width(
+            &mut application,
+            SemanticCommandId::SidebarWidthSet { columns: 12 },
+        ),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(24));
+}
+
+#[test]
+fn reset_uses_the_launch_width_setting_currently_delivered() {
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+    deliver_sidebar_settings(
+        &mut application,
+        SidebarSettings {
+            initial_visibility: SidebarVisibility::Shown,
+            initial_width: 60,
+            ..SidebarSettings::default()
+        },
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(40));
+
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWidthReset),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(60));
+}
+
+#[test]
+fn hidden_incremental_commands_do_nothing_and_hide_show_keeps_a_set_width() {
+    let workspace = workspace_dir();
+    let mut application =
+        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::default());
+    invoke_sidebar_width(
+        &mut application,
+        SemanticCommandId::SidebarWidthSet { columns: 50 },
+    );
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(50));
+
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarToggle),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden),
+        ApplicationTransition::Continue
+    );
+    answer_sidebar_reveal(&mut application);
+    assert_eq!(drawn_sidebar_width(&application, 120), Some(50));
+
+    invoke_sidebar_width(&mut application, SemanticCommandId::SidebarToggle);
+    assert_eq!(
+        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarNarrow),
+        ApplicationTransition::Continue
+    );
+    answer_sidebar_reveal(&mut application);
+    assert_eq!(
+        drawn_sidebar_width(&application, 120),
+        Some(50),
+        "hiding is neither an incremental edit nor a reset"
+    );
+}
+
+#[test]
 fn the_landing_footer_is_spread_across_the_columns_the_sidebar_left() {
     let workspace = workspace_dir();
     let application = sidebar_showing(workspace.path(), Vec::new());
@@ -1134,6 +1268,35 @@ fn sidebar_divider_column(rows: &[String]) -> Option<usize> {
         rows.iter()
             .all(|row| row.chars().nth(*column) == Some('\u{2502}'))
     })
+}
+
+fn drawn_sidebar_width(application: &Application, frame_width: u16) -> Option<usize> {
+    sidebar_divider_column(&rendered_application_rows_at(application, frame_width, 20))
+        .map(|divider| divider + 1)
+}
+
+fn invoke_sidebar_width(
+    application: &mut Application,
+    command: SemanticCommandId,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            command,
+        )))
+        .expect("invoke a semantic Sidebar width command")
+}
+
+fn answer_sidebar_reveal(application: &mut Application) {
+    let request = expect_sidebar_listing(invoke_sidebar_width(
+        application,
+        SemanticCommandId::SidebarToggle,
+    ));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: Vec::new(),
+        })
+        .expect("answer the Sidebar listing after showing it again");
 }
 
 fn composer_columns(rows: &[String]) -> (usize, usize) {
