@@ -31,6 +31,9 @@ mod checkout_observation;
 mod preparation_recovery;
 
 #[allow(dead_code)]
+#[path = "support/failing_provider.rs"]
+mod failing_provider_support;
+#[allow(dead_code)]
 #[path = "support/provider.rs"]
 mod provider_support;
 
@@ -1118,8 +1121,17 @@ async fn paired_servers_with_source_control(
     let connecting_config = ServerConfig::new(connecting_state.path(), &connecting_channel)
         .expect("configure connecting Server");
     let connecting_identity_path = connecting_config.data_dir().join("server-identity.pk8");
-    let connecting = server::spawn_with_timings(
+    // A Provider double stands in for the built-in runtimes on this side too.
+    // Those launch the developer's real harness CLIs, and a Codex Errand starts
+    // `codex exec` in the Session's own Execution Directory. On Windows a
+    // running process holds the directory it started in, so a Session created
+    // on this Server against a Worktree checkout pins that checkout, and the
+    // `git worktree remove` a test performs afterwards fails with a permission
+    // error. No paired test drives a Provider on the connecting Server, so none
+    // needs a real one.
+    let connecting = server::spawn_with_provider_and_timings(
         connecting_config,
+        std::sync::Arc::new(failing_provider_support::FailingProviderRuntime),
         ServerTimings {
             shutdown_grace: Duration::from_millis(5),
             ..ServerTimings::default()
