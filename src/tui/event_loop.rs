@@ -31,10 +31,15 @@ use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent},
     execute,
     style::available_color_count,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use futures_util::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::{Backend, CrosstermBackend},
+};
 use termina::Terminal as _;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -493,7 +498,7 @@ async fn run_loop(
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
-            terminal.draw(|frame| run.application.render(frame))?;
+            draw_frame(terminal, |frame| run.application.render(frame))?;
             run.needs_redraw = false;
         }
         // Rendering records which animation is actually visible, including a
@@ -583,9 +588,37 @@ fn leave_run_loop(
     exit: Exit,
 ) -> Result<()> {
     if exit == Exit::AfterFinalFrame {
-        terminal.draw(|frame| application.render(frame))?;
+        draw_frame(terminal, |frame| application.render(frame))?;
     }
     Ok(())
+}
+
+/// Draws one frame inside a DEC private mode 2026 (synchronized output) update,
+/// so the terminal presents the whole frame in a single repaint.
+///
+/// ratatui writes the frame diff before it repositions the cursor, and the
+/// composer always reports a caret, so without this the cursor visibly trips to
+/// whatever animation cell was repainted and back again once per frame. Holding
+/// the frame means no intermediate cursor position is ever displayed, and frame
+/// tearing goes with it. Terminals that do not implement mode 2026 ignore both
+/// sequences, which costs them nothing.
+///
+/// A frame that fails is still ended, for the same reason the display restores
+/// past a failure: a terminal left inside a synchronized update shows nothing
+/// further -- not even the sequences that give the screen back -- until its own
+/// timeout expires. The failure that ended the frame is the one reported.
+fn draw_frame<B: Backend + TerminalSink>(
+    terminal: &mut Terminal<B>,
+    render: impl FnOnce(&mut Frame),
+) -> std::io::Result<()> {
+    // Begin has to reach the terminal ahead of the diff, so it is written
+    // before ratatui draws anything.
+    terminal.backend_mut().apply(BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(render).map(|_| ());
+    // `apply` flushes, so End reaches the terminal now rather than sitting in
+    // the backend's buffer until the next frame.
+    let ended = terminal.backend_mut().apply(EndSynchronizedUpdate);
+    drawn.and(ended)
 }
 
 impl RunLoop {
@@ -2986,6 +3019,14 @@ impl<W: std::io::Write> TerminalSink for TerminalOutput<W> {
     }
 }
 
+/// Lets [`draw_frame`] write terminal-mode changes straight through the backend
+/// the frame is drawn on, so the sequences land in the same stream as the diff.
+impl<W: std::io::Write> TerminalSink for CrosstermBackend<W> {
+    fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()> {
+        execute!(self, command)
+    }
+}
+
 fn enable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<()> {
     ignore_unsupported(output.apply(EnableBracketedPaste))?;
     // Mouse reporting is the one feature with no graceful degradation: a TUI
@@ -3066,13 +3107,25 @@ impl Drop for TerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::Command;
+    use crossterm::{
+        Command,
+        cursor::{Hide, MoveTo, Show},
+        style::Print,
+        terminal::{Clear, ClearType},
+    };
+    use ratatui::{
+        Terminal,
+        backend::{Backend, WindowSize},
+        buffer::Cell,
+        layout::{Position, Size},
+    };
 
     use super::{
         Application, ApplicationEvent, ClipboardContent, DisableMouseButtonReporting,
         EnableMouseButtonReporting, NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, enter_terminal_display,
-        ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
+        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, draw_frame,
+        enter_terminal_display, ignore_unsupported, leave_terminal_display,
+        remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
@@ -3157,6 +3210,184 @@ mod tests {
                     })
                 })
                 .collect()
+        }
+    }
+
+    /// A ratatui backend that draws a frame into an [`AnsiTranscript`], for the
+    /// same cross-platform reason that recorder exists.
+    struct AnsiTranscriptBackend {
+        transcript: AnsiTranscript,
+        refuses_to_draw: bool,
+    }
+
+    impl AnsiTranscriptBackend {
+        const SIZE: Size = Size {
+            width: 20,
+            height: 5,
+        };
+
+        fn new() -> Self {
+            Self {
+                transcript: AnsiTranscript(String::new()),
+                refuses_to_draw: false,
+            }
+        }
+
+        /// Stands in for a terminal that goes away mid-frame.
+        fn refusing_to_draw() -> Self {
+            Self {
+                refuses_to_draw: true,
+                ..Self::new()
+            }
+        }
+
+        fn transcript(&self) -> &str {
+            &self.transcript.0
+        }
+    }
+
+    impl TerminalSink for AnsiTranscriptBackend {
+        fn apply(&mut self, command: impl Command) -> std::io::Result<()> {
+            self.transcript.apply(command)
+        }
+    }
+
+    impl Backend for AnsiTranscriptBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            if self.refuses_to_draw {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            for (column, row, cell) in content {
+                self.apply(MoveTo(column, row))?;
+                self.apply(Print(cell.symbol().to_owned()))?;
+            }
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.apply(Hide)
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.apply(Show)
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            Ok(Position::new(0, 0))
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+            let position = position.into();
+            self.apply(MoveTo(position.x, position.y))
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.apply(Clear(ClearType::All))
+        }
+
+        fn size(&self) -> std::io::Result<Size> {
+            Ok(Self::SIZE)
+        }
+
+        fn window_size(&mut self) -> std::io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: Self::SIZE,
+                pixels: Size {
+                    width: 0,
+                    height: 0,
+                },
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The frame -- cell writes and the cursor trip they end with -- has to
+    /// reach the terminal inside one synchronized update, or the cursor is
+    /// visibly parked on the animation cell until the frame moves it back.
+    #[test]
+    fn a_frame_is_drawn_inside_one_synchronized_update() {
+        let mut terminal = Terminal::new(AnsiTranscriptBackend::new())
+            .expect("a recording Terminal always starts");
+
+        draw_frame(&mut terminal, |frame| {
+            frame.render_widget("suru", frame.area());
+            frame.set_cursor_position(Position::new(3, 2));
+        })
+        .expect("an ANSI transcript never fails to record");
+
+        let transcript = terminal.backend().transcript();
+        assert!(
+            transcript.starts_with("\x1b[?2026h"),
+            "the frame did not open a synchronized update: {transcript:?}"
+        );
+        assert!(
+            transcript.ends_with("\x1b[?2026l"),
+            "the frame did not close its synchronized update: {transcript:?}"
+        );
+        let positions = AnsiTranscript::positions(
+            transcript,
+            &[
+                "\x1b[?2026h", // synchronized update opened
+                "\x1b[1;1H",   // the frame's first painted cell
+                "\x1b[?25h",   // cursor shown
+                "\x1b[3;4H",   // cursor parked at the composer caret
+                "\x1b[?2026l", // synchronized update closed
+            ],
+        );
+        assert!(
+            positions.is_sorted(),
+            "the frame was drawn out of order: {transcript:?}"
+        );
+    }
+
+    /// A frame that fails part way through still has to close its synchronized
+    /// update: a terminal left inside mode 2026 shows nothing further until its
+    /// own timeout expires, including the sequences that restore the display.
+    #[test]
+    fn a_frame_that_fails_to_draw_still_closes_its_synchronized_update() {
+        let mut terminal = Terminal::new(AnsiTranscriptBackend::refusing_to_draw())
+            .expect("a recording Terminal always starts");
+
+        let failure = draw_frame(&mut terminal, |frame| {
+            frame.render_widget("suru", frame.area());
+            frame.set_cursor_position(Position::new(3, 2));
+        })
+        .expect_err("a terminal that refuses to draw fails the frame");
+
+        assert_eq!(
+            failure.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "the failure the draw reported is the one that survives: {failure}"
+        );
+        let transcript = terminal.backend().transcript();
+        assert!(
+            transcript.starts_with("\x1b[?2026h"),
+            "the frame did not open a synchronized update: {transcript:?}"
+        );
+        assert!(
+            transcript.ends_with("\x1b[?2026l"),
+            "the failed frame left the terminal inside a synchronized update: {transcript:?}"
+        );
+    }
+
+    /// Synchronized output is per frame. Entering or leaving the display with
+    /// mode 2026 still on would hold every later repaint hostage.
+    #[test]
+    fn synchronized_output_is_never_part_of_entering_or_leaving_the_display() {
+        for transcript in [
+            AnsiTranscript::record(enter_terminal_display),
+            AnsiTranscript::record(leave_terminal_display),
+        ] {
+            assert!(
+                !transcript.contains("?2026"),
+                "synchronized output leaked into the display lifecycle: {transcript:?}"
+            );
         }
     }
 
