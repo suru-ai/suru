@@ -49,7 +49,7 @@ A single emoji standing for a Session beside its Title, derived with that Title 
 _Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
 
 **Landing**:
-The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. The user may choose an existing Worktree or ask Suru to create a new one, whose branch, starting commit, and location Suru manages.
+The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names that location by its path and the Checkout State of the Worktree it lies in, drawn as a Sidebar row draws it, and says instead that a new Worktree will be made on submit while that intent is pending. The user may choose an existing Worktree or ask Suru to create a new one, whose branch, starting commit, and location Suru manages.
 _Avoid_: Home, launch view, start screen, welcome screen
 
 **Workspace**:
@@ -205,7 +205,7 @@ The centered, searchable list a Client opens to switch among the Workspaces its 
 _Avoid_: Project picker, project list, workspace switcher
 
 **Worktree Selector**:
-The Landing control that chooses an existing Worktree for the next Session or asks Suru to create a new one on first Prompt submission. Choosing another existing Worktree or creating a new one starts at its root, with subdirectory selection remaining explicit.
+The Landing control that chooses an existing Worktree for the next Session or asks Suru to create a new one on first Prompt submission. It names the current location above its list without offering it as a choice, then offers creating a new Worktree first and selected, then every Worktree of the Repository with its Checkout State and its location: the leaf name alone for a Worktree Suru manages, the path beneath the Workspace's main root for one within it, and the whole path otherwise. The Worktree the reader is already in is marked among them, and choosing it keeps the location as it stands. Choosing another existing Worktree or creating a new one starts at its root; a subdirectory is reached through the Sidebar's path entry instead.
 _Avoid_: Workspace Picker, branch picker
 
 **Truncation**:
@@ -277,7 +277,7 @@ The scope under which a listing of Sessions ranges over every Server the Client 
 _Avoid_: All servers, all machines, fleet, merged view, global
 
 **Channel**:
-The build variant (release or a development channel) whose Sessions, runtime state, and managed Worktree destinations are kept separate. Channels that select the same existing Worktree still share its working-copy files.
+The build variant (release or a development channel) whose Sessions and runtime state are kept separate. Which Worktrees a Repository has is no concern of the Channel: Suru manages its Worktrees in one place, and Channels that select the same Worktree share its working-copy files.
 _Avoid_: Environment, profile
 
 **Log**:
