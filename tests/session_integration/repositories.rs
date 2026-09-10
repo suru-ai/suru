@@ -675,3 +675,126 @@ async fn known_repository_worktrees_are_observed_without_any_session_referencing
     drop(catalog);
     server.shutdown().await.unwrap();
 }
+
+/// A Repository whose listing fails for a moment keeps the Worktrees it was
+/// already observed to have: none of them is retired, so no Client is told a
+/// Checkout State has gone only to be told it is back on the next tick.
+#[tokio::test]
+async fn a_failed_worktree_listing_retires_nothing_it_could_not_speak_for() {
+    /// Git in every respect but the one listing this fails, which answers as a
+    /// briefly unrunnable Git does.
+    struct FailingListing {
+        git: GitSourceControl,
+        listings: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl suru::source_control::SourceControl for FailingListing {
+        async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+            self.git.discover(directory).await
+        }
+        async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+            self.git.observe(checkout).await
+        }
+        async fn list_checkouts(
+            &self,
+            repository: &Repository,
+        ) -> Result<Vec<CheckoutAssociation>, String> {
+            // The first listing establishes the observed set; the second fails,
+            // and every listing after it answers again.
+            if self
+                .listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
+            {
+                return Err("Git could not be run".to_owned());
+            }
+            self.git.list_checkouts(repository).await
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main");
+    init(&main);
+    let spare = root.join("spare");
+    git(
+        &main,
+        &["worktree", "add", "-b", "spare", spare.to_str().unwrap()],
+    );
+    let source_control = Arc::new(FailingListing {
+        git: GitSourceControl::default(),
+        listings: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let timings = ServerTimings {
+        shutdown_grace: std::time::Duration::from_millis(5),
+        ..Default::default()
+    }
+    .with_checkout_observation_interval(std::time::Duration::from_millis(15));
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(root.join("state"), "failing-listing").unwrap(),
+        vec![Arc::new(FailingProviderRuntime)],
+        timings,
+        source_control.clone(),
+    )
+    .await
+    .unwrap();
+    let descriptor = server.descriptor();
+    let resolved = resolve(descriptor, &main, None).await;
+    let spare_id = resolved
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.association.root == spare)
+        .expect("the spare Worktree is one of this Repository's")
+        .association
+        .id
+        .clone();
+    let mut catalog = request(descriptor, reqwest::Method::GET, "/v1/session-events")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream()
+        .eventsource();
+    let opening = tokio::time::timeout(PROGRESS_DEADLINE, catalog.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(opening.event, SESSION_CATALOG_SNAPSHOT_EVENT);
+    // Wait out the failing listing, then give the observation something to
+    // announce that can only be announced after it: every change up to that
+    // point is then in hand, and none of them may be a retirement.
+    tokio::time::timeout(PROGRESS_DEADLINE, async {
+        while source_control
+            .listings
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 3
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observation keeps listing after a failure");
+    git(&spare, &["checkout", "-b", "moved"]);
+    let mut retired = Vec::new();
+    await_catalog_change!(catalog, |change: &SessionCatalogChange| {
+        if let SessionCatalogChange::CheckoutStateChanged {
+            checkout_id,
+            checkout_state: None,
+        } = change
+        {
+            retired.push(checkout_id.clone());
+        }
+        matches!(
+            change,
+            SessionCatalogChange::CheckoutStateChanged { checkout_id, checkout_state: Some(state) }
+                if checkout_id == &spare_id
+                    && matches!(&state.revision, Some(CheckoutRevision::Branch { name, .. }) if name == "moved")
+        )
+    });
+    assert!(
+        retired.is_empty(),
+        "a failed listing retires nothing: {retired:?}"
+    );
+    drop(catalog);
+    server.shutdown().await.unwrap();
+}

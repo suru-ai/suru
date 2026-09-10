@@ -126,17 +126,22 @@ pub trait SourceControl: Send + Sync {
     /// own cadence, so a Worktree added or removed outside Suru is picked up;
     /// it is one call per Repository, and each named Worktree is then read by
     /// [`SourceControl::observe`].
+    ///
+    /// A listing that could not be taken is an error rather than an empty
+    /// Repository, so that a source control system briefly unable to answer is
+    /// never mistaken for every Worktree having gone.
     async fn list_checkouts(
         &self,
         repository: &Repository,
-    ) -> Vec<crate::protocol::CheckoutAssociation> {
-        self.discover(repository.presentation_path())
+    ) -> Result<Vec<crate::protocol::CheckoutAssociation>, String> {
+        Ok(self
+            .discover(repository.presentation_path())
             .await
             .checkouts
             .into_iter()
             .filter(|reading| reading.association.repository == repository.id)
             .map(|reading| reading.association)
-            .collect()
+            .collect())
     }
     /// Reuse a reading within one discovery batch only when the adapter can
     /// establish that this directory has the same nearest checkout.
@@ -355,7 +360,7 @@ impl SourceControlService {
     pub(crate) async fn list_checkouts(
         &self,
         repository: &Repository,
-    ) -> Vec<crate::protocol::CheckoutAssociation> {
+    ) -> Result<Vec<crate::protocol::CheckoutAssociation>, String> {
         self.adapter.list_checkouts(repository).await
     }
     pub(crate) fn workspaces(&self) -> Vec<Workspace> {

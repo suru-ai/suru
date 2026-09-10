@@ -75,24 +75,37 @@ impl SessionStore {
                 let listings =
                     stream::iter(source_control.repositories().into_iter().map(|repository| {
                         let source_control = &source_control;
-                        async move { source_control.list_checkouts(&repository).await }
+                        async move {
+                            let listed = source_control.list_checkouts(&repository).await;
+                            (repository.id, listed)
+                        }
                     }))
                     .buffer_unordered(4);
-                tokio::pin!(listings);
                 let mut checkouts = session_checkouts;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.changed() => return,
-                        listed = listings.next() => {
-                            let Some(listed) = listed else { break };
-                            for association in listed {
-                                // A Session's own association carries the
-                                // recovery facts a listing cannot name.
-                                checkouts.entry(association.id.clone()).or_insert(association);
-                            }
+                if drain_until_shutdown(listings, &mut shutdown, |(repository, listed)| {
+                    // A listing that could not be taken says nothing about which
+                    // Worktrees this Repository has, so the ones last observed
+                    // stand for this tick rather than being retired now and
+                    // announced again the moment the listing answers.
+                    let associations = match listed {
+                        Ok(listed) => listed,
+                        Err(error) => {
+                            tracing::debug!(%error, "Repository Worktree listing failed");
+                            sessions.observed_checkouts_of(&repository)
                         }
+                    };
+                    for association in associations {
+                        // A Session's own association carries the recovery facts
+                        // a listing cannot name.
+                        checkouts
+                            .entry(association.id.clone())
+                            .or_insert(association);
                     }
+                })
+                .await
+                .is_break()
+                {
+                    return;
                 }
                 sessions.retire_unobserved_checkouts(&checkouts);
                 let readings = stream::iter(checkouts.into_values().map(|checkout| {
@@ -100,21 +113,33 @@ impl SessionStore {
                     async move { source_control.observe(&checkout).await }
                 }))
                 .buffer_unordered(8);
-                tokio::pin!(readings);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.changed() => return,
-                        reading = readings.next() => {
-                            let Some(reading) = reading else { break };
-                            if let Err(error) = sessions.record_checkout(reading) {
-                                tracing::warn!(%error, "Checkout recovery facts could not be persisted");
-                            }
-                        }
+                if drain_until_shutdown(readings, &mut shutdown, |reading| {
+                    if let Err(error) = sessions.record_checkout(reading) {
+                        tracing::warn!(%error, "Checkout recovery facts could not be persisted");
                     }
+                })
+                .await
+                .is_break()
+                {
+                    return;
                 }
             }
         });
+    }
+
+    /// The Worktrees this Server last observed for one Repository, as the
+    /// associations a fresh listing would have named them by. A tick whose
+    /// listing failed stands on these, so a Repository that could not answer
+    /// keeps the Worktrees it had rather than losing and regaining them.
+    fn observed_checkouts_of(&self, repository: &RepositoryId) -> Vec<CheckoutAssociation> {
+        self.state
+            .lock()
+            .unwrap()
+            .observed_checkouts
+            .values()
+            .filter(|reading| &reading.association.repository == repository)
+            .map(|reading| reading.association.clone())
+            .collect()
     }
 
     /// Let go of the Worktrees this tick no longer observes, saying so once on
@@ -220,5 +245,29 @@ impl SessionStore {
             });
         }
         Ok(())
+    }
+}
+
+/// Hand every finished piece of work in `stream` to `handle`, and give the
+/// whole observation up the moment shutdown is asked for: a tick already in
+/// flight is never worth waiting out. Breaking says the loop must return
+/// rather than go on to its next stage.
+async fn drain_until_shutdown<S: futures_util::Stream>(
+    stream: S,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    mut handle: impl FnMut(S::Item),
+) -> std::ops::ControlFlow<()> {
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return std::ops::ControlFlow::Break(()),
+            item = stream.next() => {
+                let Some(item) = item else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                handle(item);
+            }
+        }
     }
 }

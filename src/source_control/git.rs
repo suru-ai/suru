@@ -414,7 +414,7 @@ impl SourceControl for GitSourceControl {
                 &uuid::Uuid::new_v4().simple().to_string()[..12]
             );
             let branch = format!("suru/{name}");
-            let destination = root.join(".suru-worktrees").join(&name);
+            let destination = root.join(MANAGED_WORKTREE_DIRECTORY).join(&name);
             if destination.exists()
                 || self
                     .text(
@@ -497,7 +497,7 @@ impl SourceControl for GitSourceControl {
             || relative
                 .components()
                 .next()
-                .is_none_or(|c| c.as_os_str() != ".suru-worktrees")
+                .is_none_or(|c| c.as_os_str() != MANAGED_WORKTREE_DIRECTORY)
         {
             return Err("Invalid managed destination".to_owned());
         }
@@ -522,6 +522,9 @@ impl SourceControl for GitSourceControl {
             .metadata_directory
             .join("info")
             .join("exclude");
+        // The managed directory is Suru's own, kept out of the reader's own
+        // status listings by the Repository-local exclude.
+        let excluded = format!("/{MANAGED_WORKTREE_DIRECTORY}/");
         let mut contents = match std::fs::read(&exclude) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -529,12 +532,12 @@ impl SourceControl for GitSourceControl {
         };
         if !contents
             .split(|b| *b == b'\n')
-            .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == b"/.suru-worktrees/")
+            .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == excluded.as_bytes())
         {
             if !contents.is_empty() && !contents.ends_with(b"\n") {
                 contents.push(b'\n');
             }
-            contents.extend_from_slice(b"/.suru-worktrees/\n");
+            contents.extend_from_slice(format!("{excluded}\n").as_bytes());
             std::fs::create_dir_all(exclude.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(&exclude, contents)
                 .map_err(|e| format!("Cannot update repository-local exclude: {e}"))?;
@@ -571,52 +574,39 @@ impl SourceControl for GitSourceControl {
     /// One `worktree list` per Repository names its Worktrees; nothing here
     /// reads or validates them, because the caller observes each in turn and
     /// that reading is what says whether a root is still this Worktree.
-    async fn list_checkouts(&self, repository: &Repository) -> Vec<CheckoutAssociation> {
-        let Ok(output) = self
+    ///
+    /// A listing that could not be taken is an error rather than an empty
+    /// Repository: Git being briefly unrunnable, or its metadata briefly
+    /// unreadable, is no evidence that a Worktree has gone.
+    async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Result<Vec<CheckoutAssociation>, String> {
+        let output = self
             .command(
                 &repository.metadata_directory,
                 &["worktree", "list", "--porcelain", "-z"],
             )
-            .await
-        else {
-            return Vec::new();
-        };
+            .await?;
         if !output.status.success() {
-            return Vec::new();
+            return Err(format!(
+                "Git Worktree listing failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        parse_worktrees(&output.stdout)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                if entry.bare {
-                    return None;
-                }
-                // Separate metadata layouts report the metadata directory as the
-                // main Worktree. Only a main root the Repository already names is
-                // a root; anything else here is a label, never a working copy.
-                let root = if index == 0 {
-                    match &repository.location {
-                        RepositoryLocation::Main { root } => root.clone(),
-                        RepositoryLocation::Bare { .. } | RepositoryLocation::UnknownMain => {
-                            return None;
-                        }
-                    }
-                } else {
-                    canonical_checkout_path(&entry.root)
-                };
-                Some(CheckoutAssociation {
-                    recovery_revision: None,
-                    id: CheckoutId::from_root(&repository.id, &root),
-                    repository: repository.id.clone(),
-                    root,
-                    kind: if index == 0 {
-                        CheckoutKind::Main
-                    } else {
-                        CheckoutKind::Linked
-                    },
-                })
-            })
-            .collect()
+        // Separate metadata layouts report the metadata directory as the main
+        // Worktree. Only a main root the Repository already names is a root;
+        // anything else in that position is a label, never a working copy.
+        let main_root = match &repository.location {
+            RepositoryLocation::Main { root } => Some(root.as_path()),
+            RepositoryLocation::Bare { .. } | RepositoryLocation::UnknownMain => None,
+        };
+        Ok(
+            listed_checkouts(parse_worktrees(&output.stdout), &repository.id, main_root)
+                .into_iter()
+                .map(|(_, association)| association)
+                .collect(),
+        )
     }
 
     fn reuse_discovery(
@@ -734,46 +724,29 @@ impl SourceControl for GitSourceControl {
         let mut availability = SourceControlAvailability::Available;
         match listing {
             Ok(output) if output.status.success() => {
-                for (index, entry) in parse_worktrees(&output.stdout).into_iter().enumerate() {
-                    if entry.bare {
-                        continue;
-                    }
-                    // Separate metadata layouts can report the metadata directory
-                    // as the main worktree. It is a label hint, never executable proof.
-                    let is_main = index == 0;
-                    let root = if is_main {
-                        if bare {
-                            continue;
-                        }
-                        match &location {
-                            RepositoryLocation::Main { root } => root.clone(),
-                            _ => match self.valid_root(&entry.root, &common).await {
-                                Some(root) => {
-                                    location = RepositoryLocation::Main { root: root.clone() };
-                                    root
-                                }
-                                None => continue,
-                            },
-                        }
-                    } else {
-                        canonical_checkout_path(&entry.root)
-                    };
-                    let valid = self.valid_root(&root, &common).await.is_some()
-                        && !recovery_in_progress(&root);
-                    let association = CheckoutAssociation {
-                        // Discovery is already a successful reading. Preserve it
-                        // before any Client starts live observation, but never
-                        // promote stale Git listing data for an unavailable root.
-                        recovery_revision: if valid { entry.revision.clone() } else { None },
-                        id: CheckoutId::from_root(&id, &root),
-                        repository: id.clone(),
-                        root,
-                        kind: if is_main {
-                            CheckoutKind::Main
-                        } else {
-                            CheckoutKind::Linked
-                        },
-                    };
+                let entries = parse_worktrees(&output.stdout);
+                // Separate metadata layouts can report the metadata directory as
+                // the main worktree. It is a label hint, never executable proof,
+                // so an unknown main root is established here before the listing
+                // is named — and learning it is what relabels the Repository.
+                let main_root = match (bare, entries.first()) {
+                    (false, Some(first)) if !first.bare => match &location {
+                        RepositoryLocation::Main { root } => Some(root.clone()),
+                        _ => self.valid_root(&first.root, &common).await.inspect(|root| {
+                            location = RepositoryLocation::Main { root: root.clone() };
+                        }),
+                    },
+                    _ => None,
+                };
+                for (entry, mut association) in listed_checkouts(entries, &id, main_root.as_deref())
+                {
+                    let valid = self.valid_root(&association.root, &common).await.is_some()
+                        && !recovery_in_progress(&association.root);
+                    // Discovery is already a successful reading. Preserve it
+                    // before any Client starts live observation, but never
+                    // promote stale Git listing data for an unavailable root.
+                    association.recovery_revision =
+                        if valid { entry.revision.clone() } else { None };
                     checkouts.push(CheckoutSummary {
                         association,
                         revision: entry.revision,
@@ -857,6 +830,46 @@ impl SourceControl for GitSourceControl {
         resolved.checkouts = checkouts;
         resolved
     }
+}
+
+/// The Worktrees a `worktree list --porcelain -z` listing names, each paired
+/// with the association the rest of Suru knows it by. Discovery and plain
+/// listing differ in what they do with a named Worktree — one reads it, the
+/// other only names it — but never in which Worktrees a listing names.
+///
+/// The first entry is the Repository's main Worktree, so the caller passes the
+/// main root it has established: `None` where it has none to give, and that
+/// entry is passed over rather than guessed at.
+fn listed_checkouts(
+    entries: Vec<Entry>,
+    repository: &RepositoryId,
+    main_root: Option<&Path>,
+) -> Vec<(Entry, CheckoutAssociation)> {
+    entries
+        .into_iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.bare)
+        .filter_map(|(index, entry)| {
+            let main = index == 0;
+            let root = if main {
+                main_root?.to_owned()
+            } else {
+                canonical_checkout_path(&entry.root)
+            };
+            let association = CheckoutAssociation {
+                recovery_revision: None,
+                id: CheckoutId::from_root(repository, &root),
+                repository: repository.clone(),
+                root,
+                kind: if main {
+                    CheckoutKind::Main
+                } else {
+                    CheckoutKind::Linked
+                },
+            };
+            Some((entry, association))
+        })
+        .collect()
 }
 
 // Canonicalize the surviving ancestor of a missing checkout too. In

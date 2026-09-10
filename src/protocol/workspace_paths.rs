@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 /// The directory a Server puts the Worktrees it manages under. What it lays
 /// out beneath that directory is Suru's own business rather than the reader's,
 /// so a Worktree standing anywhere under it presents as its leaf name alone.
-const MANAGED_WORKTREE_DIRECTORY: &str = ".suru-worktrees";
+/// The Server that makes those Worktrees and the surfaces that present them
+/// both answer for the same directory, so both name it from here.
+pub const MANAGED_WORKTREE_DIRECTORY: &str = ".suru-worktrees";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,13 +89,14 @@ impl WorkspacePaths {
     /// Where a Worktree stands, said as shortly as it can be said without
     /// leaving the reader guessing which working copy they are looking at.
     ///
-    /// A Worktree Suru made itself lives under a managed directory whose
-    /// layout means nothing to the reader, so only its leaf name is shown. One
-    /// standing inside the root the Workspace is presented by is said relative
-    /// to that root, which the surface is already answering for. Anything else
-    /// keeps its whole label, spelled in the owning Server's own syntax rather
-    /// than the Client's.
-    pub fn worktree_location(&self, root: &Path, within: Option<&Path>) -> String {
+    /// A Worktree Suru made itself lives at any depth under a managed
+    /// directory whose layout means nothing to the reader, so only its leaf
+    /// name is shown. One standing inside `presented_root` — the path the
+    /// Repository's Workspace is presented by — is said relative to that root,
+    /// which the surface is already answering for. Anything else keeps its
+    /// whole label, spelled in the owning Server's own syntax rather than the
+    /// Client's.
+    pub fn worktree_location(&self, root: &Path, presented_root: Option<&Path>) -> String {
         let separator = self.separator();
         let spelled = self.spelling(&root.to_string_lossy());
         let trimmed = spelled.trim_end_matches(separator);
@@ -102,11 +105,11 @@ impl WorkspacePaths {
         if ancestry.contains(&MANAGED_WORKTREE_DIRECTORY) {
             return self.name(root);
         }
-        if let Some(within) = within {
-            let within = self.spelling(&within.to_string_lossy());
-            let within = within.trim_end_matches(separator);
-            if !within.is_empty()
-                && let Some(rest) = trimmed.strip_prefix(within)
+        if let Some(presented_root) = presented_root {
+            let presented_root = self.spelling(&presented_root.to_string_lossy());
+            let presented_root = presented_root.trim_end_matches(separator);
+            if !presented_root.is_empty()
+                && let Some(rest) = trimmed.strip_prefix(presented_root)
                 && let Some(rest) = rest.strip_prefix(separator)
                 && !rest.is_empty()
             {
@@ -165,18 +168,35 @@ mod tests {
         }
     }
 
+    /// A managed Worktree presents as its leaf name at any depth under the
+    /// managed directory, so both a Worktree standing directly beneath it and
+    /// one standing further down are read the same way.
     #[test]
     fn managed_worktrees_present_as_their_leaf_name_in_either_syntax() {
         assert_eq!(
             paths(PathStyle::Unix, "/home/reader").worktree_location(
-                Path::new("/home/reader/suru/.suru-worktrees/dev/review-landing"),
+                Path::new("/home/reader/suru/.suru-worktrees/review-landing"),
+                Some(Path::new("/home/reader/suru")),
+            ),
+            "review-landing"
+        );
+        assert_eq!(
+            paths(PathStyle::Unix, "/home/reader").worktree_location(
+                Path::new("/home/reader/suru/.suru-worktrees/nested/deeper/review-landing"),
                 Some(Path::new("/home/reader/suru")),
             ),
             "review-landing"
         );
         assert_eq!(
             paths(PathStyle::Windows, r"C:\Users\reader").worktree_location(
-                Path::new(r"C:\Users\reader\suru\.suru-worktrees\dev\review-landing"),
+                Path::new(r"C:\Users\reader\suru\.suru-worktrees\review-landing"),
+                Some(Path::new(r"C:\Users\reader\suru")),
+            ),
+            "review-landing"
+        );
+        assert_eq!(
+            paths(PathStyle::Windows, r"C:\Users\reader").worktree_location(
+                Path::new(r"C:\Users\reader\suru\.suru-worktrees\nested\review-landing"),
                 Some(Path::new(r"C:\Users\reader\suru")),
             ),
             "review-landing"

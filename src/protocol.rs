@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use uuid::Uuid;
 
 mod workspace_paths;
-pub use workspace_paths::{PathStyle, WorkspacePaths};
+pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
 pub const PROTOCOL_VERSION: u32 = 45;
 mod source_control;
