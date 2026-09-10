@@ -897,7 +897,7 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             };
             let location =
                 state.worktree_location(&state.outlook, &checkout.association.root, presentation);
-            match CheckoutStateLabel::read(checkout) {
+            match CheckoutStateLabel::read_in(checkout, CheckoutStateForm::Choosing) {
                 Some(label) => format!("{marker}{} · {location}", label.text()),
                 None => format!("{marker}{location}"),
             }
@@ -2799,10 +2799,31 @@ struct CheckoutStateLabel {
     suffix: &'static str,
 }
 
+/// How fully a surface spells a Checkout State out.
+///
+/// The Sidebar, the Landing, and a Session header present the Worktree their
+/// reader is already standing in, where the branch is orientation and the rest
+/// is noise. The Worktree Selector presents Worktrees the reader is choosing
+/// between, where a branch with nothing committed to it yet and a head that is
+/// on no branch at all are exactly what tells two rows apart, so it says both
+/// in words and gives a detached commit a column more to be distinct by.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CheckoutStateForm {
+    Standing,
+    Choosing,
+}
+
 impl CheckoutStateLabel {
     /// Nothing at all where the Worktree's source control was never detected:
     /// a directory outside source control has no Checkout State to present.
     fn read(reading: &crate::protocol::CheckoutSummary) -> Option<Self> {
+        Self::read_in(reading, CheckoutStateForm::Standing)
+    }
+
+    fn read_in(
+        reading: &crate::protocol::CheckoutSummary,
+        form: CheckoutStateForm,
+    ) -> Option<Self> {
         use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
         let unavailable = || Self {
             state: "[unavailable]".to_owned(),
@@ -2813,15 +2834,25 @@ impl CheckoutStateLabel {
             SourceControlAvailability::Unavailable { .. } => unavailable(),
             SourceControlAvailability::Available => match &reading.revision {
                 // The main working copy needs no label of its own.
-                Some(CheckoutRevision::Branch { name, .. }) => Self {
-                    state: name.clone(),
+                Some(CheckoutRevision::Branch { name, commit }) => Self {
+                    state: match form {
+                        CheckoutStateForm::Choosing if commit.is_none() => {
+                            format!("{name} (unborn)")
+                        }
+                        _ => name.clone(),
+                    },
                     suffix: match reading.association.kind {
                         CheckoutKind::Main => "",
                         CheckoutKind::Linked => " (worktree)",
                     },
                 },
                 Some(CheckoutRevision::Detached { commit }) => Self {
-                    state: commit.chars().take(7).collect(),
+                    state: match form {
+                        CheckoutStateForm::Standing => commit.chars().take(7).collect(),
+                        CheckoutStateForm::Choosing => {
+                            format!("detached {}", commit.chars().take(8).collect::<String>())
+                        }
+                    },
                     suffix: "",
                 },
                 None => unavailable(),
@@ -3194,11 +3225,14 @@ fn render_landing(
                         .and_then(CheckoutStateLabel::read)
                         .map(|checkout| format!(" · {}", checkout.text()))
                         .unwrap_or_default();
-                    let intent = if state.new_worktree.is_some() {
-                        " · New Worktree on submit"
-                    } else {
-                        ""
-                    };
+                    // A pending intent is only ever said where there is a
+                    // Repository to make the Worktree in.
+                    let intent =
+                        if state.new_worktree.is_some() && state.workspace.repository.is_some() {
+                            " · New Worktree on submit"
+                        } else {
+                            ""
+                        };
                     format!("{label}{status}{checkout}{intent}")
                 }
                 None => format!(

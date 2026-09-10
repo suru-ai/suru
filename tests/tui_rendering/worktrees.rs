@@ -270,7 +270,7 @@ fn the_selector_leads_with_a_new_worktree_and_marks_the_current_one() {
     assert!(rows[0].starts_with("› New Worktree"), "{rendered}");
     assert!(rows[1].starts_with("main ·"), "{rendered}");
     assert!(
-        rows[2].starts_with("* abcdef0 ·"),
+        rows[2].starts_with("* detached abcdef01 ·"),
         "the Worktree in use is marked: {rendered}"
     );
     assert!(!rows[1].contains('*'), "{rendered}");
@@ -283,6 +283,39 @@ fn the_selector_leads_with_a_new_worktree_and_marks_the_current_one() {
         ApplicationTransition::Continue
     );
     assert!(!text(&app).contains(" Worktrees "));
+}
+
+/// A Selector row is a Worktree the reader is choosing between rather than one
+/// they are standing in, so it says what a branch with no commits behind it is.
+#[test]
+fn the_selector_says_an_unborn_branch_is_unborn() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let mut context = layout.context.clone();
+    context.checkouts[0].revision = Some(CheckoutRevision::Branch {
+        name: "main".to_owned(),
+        commit: None,
+    });
+    open(&mut app, context);
+    let rendered = text(&app);
+    assert!(rendered.contains("main (unborn) ·"), "{rendered}");
+}
+
+/// A detached head says so in full on a Selector row, with commit enough to
+/// tell two of them apart.
+#[test]
+fn the_selector_says_a_detached_head_is_detached() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    open(&mut app, layout.context.clone());
+    let rendered = text(&app);
+    assert!(rendered.contains("detached abcdef01 ·"), "{rendered}");
+    // The Landing beneath keeps the Sidebar's shorter reading of the same
+    // Worktree: one shared label, two forms.
+    key(&mut app, KeyCode::Esc);
+    let landing = text(&app);
+    assert!(!landing.contains("detached"), "{landing}");
+    assert!(landing.contains("abcdef0"), "{landing}");
 }
 
 /// The Landing says which Checkout State the next Session begins on, and says
@@ -321,33 +354,69 @@ fn the_landing_names_the_current_checkout_state_and_prefers_the_live_reading() {
     assert!(!rendered.contains("feature/landing"), "{rendered}");
 }
 
-/// A Worktree Suru made is known by the name it was given, wherever the
-/// Channel's managed directory happens to put it.
+/// Turning the Outlook is turning toward another Server's world. The Landing
+/// answers for the Server it is turned to alone, so a Checkout State the
+/// Server it left resolved is left behind with it: until the Remote resolves a
+/// context of its own the footer has nothing to say beyond the path.
+#[test]
+fn turning_to_a_remote_leaves_the_local_checkout_state_behind() {
+    let layout = Layout::new();
+    let mut local = layout.context.clone();
+    local.checkouts[1].revision = Some(CheckoutRevision::Branch {
+        name: "local-only".to_owned(),
+        commit: Some("1234567890abcdef".to_owned()),
+    });
+    let mut app = layout.app();
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, local);
+    key(&mut app, KeyCode::Esc);
+    assert!(text(&app).contains("local-only"), "{}", text(&app));
+    crate::connecting::turn_to_studio(&mut app);
+    let remote = text(&app);
+    assert!(
+        !remote.contains("local-only"),
+        "the Remote's Landing says nothing of the Local Server's branch: {remote}"
+    );
+}
+
+/// A Worktree Suru made is known by the name it was given, at whatever depth
+/// under `.suru-worktrees` the Server that made it chose to put it: what the
+/// managed directory holds beneath itself is Suru's own business rather than
+/// the reader's. Both a Worktree standing directly beneath it and one standing
+/// a level further down are offered by their leaf name alone.
 #[test]
 fn managed_worktrees_are_offered_by_their_leaf_name() {
     let layout = Layout::new();
     let mut app = layout.app();
     let mut context = layout.context.clone();
-    let managed = layout.main.join(".suru-worktrees/dev/review-landing");
     let repository = context.workspace.repository.clone().unwrap();
-    context.checkouts.push(CheckoutSummary {
-        association: CheckoutAssociation {
-            recovery_revision: None,
-            id: CheckoutId::from_root(&repository.id, &managed),
-            repository: repository.id.clone(),
-            root: managed,
-            kind: CheckoutKind::Linked,
-        },
-        revision: Some(CheckoutRevision::Branch {
-            name: "suru/review".to_owned(),
-            commit: Some("1234567890abcdef".to_owned()),
-        }),
-        availability: SourceControlAvailability::Available,
-    });
+    for managed in [
+        layout.main.join(".suru-worktrees/review-landing"),
+        layout.main.join(".suru-worktrees/nested/review-selector"),
+    ] {
+        context.checkouts.push(CheckoutSummary {
+            association: CheckoutAssociation {
+                recovery_revision: None,
+                id: CheckoutId::from_root(&repository.id, &managed),
+                repository: repository.id.clone(),
+                root: managed,
+                kind: CheckoutKind::Linked,
+            },
+            revision: Some(CheckoutRevision::Branch {
+                name: "suru/review".to_owned(),
+                commit: Some("1234567890abcdef".to_owned()),
+            }),
+            availability: SourceControlAvailability::Available,
+        });
+    }
     open(&mut app, context);
     let rendered = text(&app);
     assert!(
         rendered.contains("suru/review (worktree) · review-landing"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("suru/review (worktree) · review-selector"),
         "{rendered}"
     );
     assert!(!rendered.contains(".suru-worktrees"), "{rendered}");

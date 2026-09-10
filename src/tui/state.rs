@@ -355,6 +355,15 @@ struct RememberedExecutionContext {
     status: crate::protocol::ExecutionDirectoryStatus,
 }
 
+/// What one Outlook's own Server last said about the Worktree the next Session
+/// would work in there: the association it named, and the reading its
+/// resolution carried for it.
+#[derive(Clone, Debug)]
+struct ResolvedCheckout {
+    association: Option<crate::protocol::CheckoutAssociation>,
+    reading: Option<crate::protocol::CheckoutSummary>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TuiState {
     left_press: Option<LeftPress>,
@@ -381,13 +390,16 @@ pub struct TuiState {
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: Workspace,
     pub(super) execution_directory: Option<PathBuf>,
-    /// The Worktree the next Session would work in, as the owning Server named
-    /// it when it resolved this context, with the reading that resolution
-    /// carried for it. The catalog's live reading stands in front of that one;
-    /// keeping it is what leaves the Landing's Checkout State never blank
-    /// while the catalog is still on its way.
-    execution_checkout: Option<crate::protocol::CheckoutAssociation>,
-    resolved_checkout_state: Option<crate::protocol::CheckoutSummary>,
+    /// The Worktree the next Session would work in on each Outlook, as that
+    /// Server named it when it resolved a context there, with the reading that
+    /// resolution carried for it. The catalog's live reading stands in front of
+    /// the resolution's; keeping the resolution's is what leaves the Landing's
+    /// Checkout State never blank while the catalog is still on its way.
+    ///
+    /// It is held per Outlook because it answers for one Server: an Outlook
+    /// with nothing remembered here has no Checkout State to present, and must
+    /// never be given another Server's.
+    outlook_execution_checkouts: HashMap<Outlook, ResolvedCheckout>,
     checkout_states:
         HashMap<(Outlook, crate::protocol::CheckoutId), crate::protocol::CheckoutSummary>,
     pub(super) composers: ComposerMemory,
@@ -584,8 +596,7 @@ impl TuiState {
             fatal_error: None,
             workspace: Workspace::directory(workspace.clone()),
             execution_directory: Some(workspace.clone()),
-            execution_checkout: None,
-            resolved_checkout_state: None,
+            outlook_execution_checkouts: HashMap::new(),
             checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
@@ -670,14 +681,19 @@ impl TuiState {
         }
 
         self.execution_status = context.execution_status.clone();
-        self.resolved_checkout_state = context.checkout.as_ref().and_then(|checkout| {
-            context
-                .checkouts
-                .iter()
-                .find(|reading| reading.association.id == checkout.id)
-                .cloned()
-        });
-        self.execution_checkout = context.checkout.clone();
+        self.outlook_execution_checkouts.insert(
+            self.outlook.clone(),
+            ResolvedCheckout {
+                reading: context.checkout.as_ref().and_then(|checkout| {
+                    context
+                        .checkouts
+                        .iter()
+                        .find(|reading| reading.association.id == checkout.id)
+                        .cloned()
+                }),
+                association: context.checkout.clone(),
+            },
+        );
         self.remembered_execution_directories.insert(
             (self.outlook.clone(), context.workspace.id.clone()),
             RememberedExecutionContext {
@@ -1094,9 +1110,22 @@ impl TuiState {
     /// catalog's live reading answers wherever it has one, and the reading the
     /// owning Server's resolution carried answers until then.
     pub(super) fn execution_checkout_state(&self) -> Option<&crate::protocol::CheckoutSummary> {
-        let checkout = self.execution_checkout.as_ref()?;
-        self.checkout_state(&self.outlook, &checkout.id)
-            .or(self.resolved_checkout_state.as_ref())
+        let resolved = self.outlook_execution_checkouts.get(&self.outlook)?;
+        let association = resolved.association.as_ref()?;
+        self.checkout_state(&self.outlook, &association.id)
+            .or(resolved.reading.as_ref())
+    }
+
+    /// The path facts a path of this Origin's is spelled by: the ones its own
+    /// Server answered with, or — for the Client's own Server alone, which
+    /// runs on this very machine — the ones this machine has. A Remote that
+    /// has not yet answered has none, and its paths are left exactly as it
+    /// spelled them rather than read with the Client's own syntax.
+    fn paths_for(&self, origin: &Outlook) -> Option<crate::protocol::WorkspacePaths> {
+        self.workspace_paths
+            .get(origin)
+            .cloned()
+            .or_else(|| (origin == &Outlook::Local).then(crate::protocol::WorkspacePaths::default))
     }
 
     /// Where a Worktree stands, in the owning Server's own path syntax and as
@@ -1105,32 +1134,26 @@ impl TuiState {
         &self,
         origin: &Outlook,
         root: &Path,
-        within: Option<&Path>,
+        presented_root: Option<&Path>,
     ) -> String {
-        match self.workspace_paths.get(origin) {
-            Some(paths) => paths.worktree_location(root, within),
-            None if origin == &Outlook::Local => {
-                crate::protocol::WorkspacePaths::default().worktree_location(root, within)
-            }
-            None => root.to_string_lossy().into_owned(),
-        }
+        self.paths_for(origin).map_or_else(
+            || root.to_string_lossy().into_owned(),
+            |paths| paths.worktree_location(root, presented_root),
+        )
     }
 
     pub(super) fn workspace_name(&self, origin: &Outlook, path: &Path) -> String {
-        self.workspace_paths.get(origin).map_or_else(
+        self.paths_for(origin).map_or_else(
             || super::sidebar::workspace_name(path),
             |paths| paths.name(path),
         )
     }
 
     pub(super) fn workspace_label(&self, origin: &Outlook, path: &Path) -> String {
-        match self.workspace_paths.get(origin) {
-            Some(paths) => paths.label(path),
-            None if origin == &Outlook::Local => {
-                crate::protocol::WorkspacePaths::default().label(path)
-            }
-            None => path.to_string_lossy().into_owned(),
-        }
+        self.paths_for(origin).map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |paths| paths.label(path),
+        )
     }
 
     pub fn apply(&mut self, event: ManagedEvent) {
