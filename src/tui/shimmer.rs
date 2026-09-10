@@ -1,19 +1,46 @@
-//! The Working Indicator's Codex-style shimmer: a 1.5-second brightness sweep
-//! followed by one second at rest, expressed entirely as draw-time styles.
+//! Draw-time brightness sweeps at the speed of the original “Working” label,
+//! followed by one second at rest. Distances are measured in terminal columns.
 
-use std::{f64::consts::PI, time::Duration};
+use std::{cell::Cell, f64::consts::PI, time::Duration};
 
 use ratatui::style::{Color, Modifier, Style};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub(super) const TICK_PERIOD: Duration = Duration::from_millis(32);
 
-const CYCLE_MILLIS: u64 = 2_500;
-const SWEEP_MILLIS: u64 = 1_500;
+const REST_MICROS: u128 = 1_000_000;
+// Working spans seven columns. Including the five-column band beyond each
+// end, its center travels 16 columns in the original 1.5-second sweep.
+const MICROS_PER_COLUMN: u128 = 1_500_000 / 16;
 const BAND_HALF_WIDTH: f64 = 5.0;
 
-/// One style per character. All Shimmers share the run loop's frame clock, so
-/// appearing text joins the process-wide sweep instead of starting a private
-/// timer that would have to enter transcript state or its cache key.
+/// A label-local origin on the existing animation clock; no additional timer
+/// or transcript cache dependency is needed when the label changes.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Clock {
+    origin: Cell<Option<(&'static str, usize)>>,
+}
+
+impl Clock {
+    pub(super) fn frame(&self, label: &'static str, frame: usize) -> usize {
+        let origin = match self.origin.get() {
+            Some((previous, origin)) if previous == label => origin,
+            _ => {
+                self.origin.set(Some((label, frame)));
+                frame
+            }
+        };
+        frame.wrapping_sub(origin)
+    }
+}
+
+fn sweep_micros(width: usize) -> u128 {
+    (width.saturating_sub(1) as u128 + 10) * MICROS_PER_COLUMN
+}
+
+/// One style per extended grapheme cluster, sampled at its first terminal
+/// column. Combining sequences and wide glyphs remain intact during rendering.
 pub(super) fn styles(
     text: &str,
     frame: usize,
@@ -21,26 +48,19 @@ pub(super) fn styles(
     subdued: Style,
     truecolor: bool,
 ) -> Vec<Style> {
-    let character_count = text.chars().count();
-    if character_count == 0 {
-        return Vec::new();
-    }
-    let elapsed = (frame as u64).saturating_mul(TICK_PERIOD.as_millis() as u64) % CYCLE_MILLIS;
-    if elapsed >= SWEEP_MILLIS {
-        return vec![shimmer_style(primary, subdued, 0.0, truecolor); character_count];
-    }
-    let progress = elapsed as f64 / SWEEP_MILLIS as f64;
-    let first_center = -BAND_HALF_WIDTH;
-    let last_center = character_count.saturating_sub(1) as f64 + BAND_HALF_WIDTH;
-    let center = first_center + progress * (last_center - first_center);
-    (0..character_count)
-        .map(|index| {
-            shimmer_style(
-                primary,
-                subdued,
-                intensity(index as f64 - center),
-                truecolor,
-            )
+    let sweep = sweep_micros(UnicodeWidthStr::width(text));
+    let elapsed = (frame as u128 * TICK_PERIOD.as_micros()) % (sweep + REST_MICROS);
+    let center = -BAND_HALF_WIDTH + elapsed as f64 / MICROS_PER_COLUMN as f64;
+    let mut column = 0;
+    text.graphemes(true)
+        .map(|grapheme| {
+            let brightness = if elapsed >= sweep {
+                0.0
+            } else {
+                intensity(column as f64 - center)
+            };
+            column += UnicodeWidthStr::width(grapheme);
+            shimmer_style(primary, subdued, brightness, truecolor)
         })
         .collect()
 }
@@ -117,6 +137,61 @@ mod tests {
     use crate::theme::Theme;
 
     #[test]
+    fn labels_share_speed_but_have_length_dependent_cycles() {
+        assert_eq!(sweep_micros(7), 1_500_000);
+        assert_eq!(sweep_micros(21), 2_812_500);
+        let primary = Style::default().fg(Color::White);
+        let subdued = Style::default().fg(Color::Black);
+        for frame in 0..47 {
+            let short = styles("Working", frame, primary, subdued, true);
+            let long = styles("Waiting for subagents", frame, primary, subdued, true);
+            assert_eq!(short, long[..7]);
+        }
+        let resting = shimmer_style(primary, subdued, 0.0, true);
+        // Every sampled frame in the longer label's one-second rest is dark.
+        for frame in 88..120 {
+            assert!(
+                styles("Waiting for subagents", frame, primary, subdued, true)
+                    .iter()
+                    .all(|style| *style == resting)
+            );
+        }
+        assert!(
+            styles("Waiting for subagents", 125, primary, subdued, true)
+                .iter()
+                .any(|style| *style != resting)
+        );
+    }
+
+    #[test]
+    fn unicode_is_positioned_by_columns_without_splitting_graphemes() {
+        let primary = Style::default().fg(Color::White);
+        let subdued = Style::default().fg(Color::Black);
+        for frame in 0..100 {
+            let ascii = styles("abcdefg", frame, primary, subdued, true);
+            let wide = styles("界abcde", frame, primary, subdued, true);
+            assert_eq!(wide[0], ascii[0]);
+            assert_eq!(wide[1..], ascii[2..]);
+            assert_eq!(
+                styles("a\u{301}bcdefg", frame, primary, subdued, true),
+                ascii
+            );
+            assert!(styles("", frame, primary, subdued, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn changing_labels_restarts_the_sweep_on_the_shared_clock() {
+        let clock = Clock::default();
+        assert_eq!(clock.frame("Loading", 100), 0);
+        assert_eq!(clock.frame("Loading", 110), 10);
+        assert_eq!(clock.frame("Working", 110), 0);
+        assert_eq!(clock.frame("Working", 120), 10);
+        assert_eq!(clock.frame("Waiting for subagents", 120), 0);
+        assert_eq!(clock.frame("Working", 130), 0);
+    }
+
+    #[test]
     fn fallback_maps_the_sweep_to_dim_plain_and_bold() {
         let base = Style::default();
         assert!(
@@ -191,7 +266,7 @@ mod tests {
         let base = Style::default();
         let midpoint = styles(
             "Working",
-            (SWEEP_MILLIS / 2 / TICK_PERIOD.as_millis() as u64) as usize,
+            (1_500 / 2 / TICK_PERIOD.as_millis()) as usize,
             base,
             base,
             false,
@@ -200,12 +275,12 @@ mod tests {
             midpoint[midpoint.len() / 2]
                 .add_modifier
                 .contains(Modifier::BOLD),
-            "the sweep reaches the middle of the label within half a second"
+            "the sweep reaches the middle of the label halfway through the sweep"
         );
         // The sweep does not end on a frame boundary, so the first resting
         // frame is the first tick at or after the sweep's final millisecond.
-        let first_resting_frame = SWEEP_MILLIS.div_ceil(TICK_PERIOD.as_millis() as u64);
-        let last_resting_frame = CYCLE_MILLIS / TICK_PERIOD.as_millis() as u64;
+        let first_resting_frame = 1_500_u64.div_ceil(TICK_PERIOD.as_millis() as u64);
+        let last_resting_frame = 2_500 / TICK_PERIOD.as_millis() as u64;
         for truecolor in [false, true] {
             let resting = shimmer_style(base, base, 0.0, truecolor);
             let opening = styles("Working", 0, base, base, truecolor);
@@ -231,7 +306,7 @@ mod tests {
                         .iter()
                         .all(|style| *style == resting)
                 }),
-                "the label remains unhighlighted for the second half of the cycle"
+                "the label remains unhighlighted during the one-second rest"
             );
         }
     }

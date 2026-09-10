@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -3375,7 +3376,7 @@ fn render_opening_session(
         frame.render_widget(
             Paragraph::new(Line::from(shimmered_label_spans(
                 "Loading",
-                state.spinner_frame,
+                state.shimmer_clock.frame("Loading", state.spinner_frame),
                 theme.text.primary,
                 theme.text.subdued,
                 truecolor,
@@ -3474,7 +3475,9 @@ fn render_session(
                 &context,
                 SessionTimestamp::now().0,
                 binding_label(&CommandId::RequestInterrupt),
-                state.spinner_frame,
+                state
+                    .shimmer_clock
+                    .frame(working_indicator_label(context.state), state.spinner_frame),
                 theme,
                 truecolor,
             );
@@ -3801,6 +3804,13 @@ fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option
         .find(|text| UnicodeWidthStr::width(text.as_str()) <= usize::from(width))
 }
 
+fn working_indicator_label(state: WorkingIndicatorState) -> &'static str {
+    match state {
+        WorkingIndicatorState::Working => "Working",
+        WorkingIndicatorState::WaitingForSubagents => "Waiting for subagents",
+    }
+}
+
 fn working_indicator_line(
     context: &WorkingIndicatorSlotContext,
     now: u64,
@@ -3809,10 +3819,7 @@ fn working_indicator_line(
     theme: &Theme,
     truecolor: bool,
 ) -> Line<'static> {
-    let label = match context.state {
-        WorkingIndicatorState::Working => "Working",
-        WorkingIndicatorState::WaitingForSubagents => "Waiting for subagents",
-    };
+    let label = working_indicator_label(context.state);
     let elapsed = working_indicator_elapsed(context.working_since, now);
     let metadata = match context.interrupt {
         None => format!(" ({elapsed})"),
@@ -3853,7 +3860,7 @@ fn shimmered_label_spans(
     truecolor: bool,
 ) -> Vec<Span<'static>> {
     label
-        .chars()
+        .graphemes(true)
         .zip(shimmer::styles(
             label,
             animation_frame,
