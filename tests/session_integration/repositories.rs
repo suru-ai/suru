@@ -247,19 +247,28 @@ async fn learning_separate_main_updates_streamed_presentation_without_splitting_
     let known = resolve(descriptor, &main, None).await;
     assert_eq!(known.workspace.id, original.session.workspace.id);
     assert_eq!(known.workspace.path, main);
-    let event = tokio::time::timeout(PROGRESS_DEADLINE, async {
+    // Checkout observation runs on its own cadence and publishes its reading of
+    // the Worktree to this same stream, so the invalidation learning the main
+    // working copy causes is not necessarily the first update to arrive — which
+    // of the two lands first is a race this test has no stake in. Wait for the
+    // change being asserted rather than for whichever poller happened to tick
+    // first; the session it names is still what proves the relabelling.
+    let change = tokio::time::timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = catalog.next().await.unwrap().unwrap();
-            if event.event == SESSION_CATALOG_UPDATED_EVENT {
-                break event;
+            if event.event != SESSION_CATALOG_UPDATED_EVENT {
+                continue;
+            }
+            let update: SessionCatalogUpdate = serde_json::from_str(&event.data).unwrap();
+            if matches!(update.change, SessionCatalogChange::Invalidated { .. }) {
+                break update.change;
             }
         }
     })
     .await
     .unwrap();
-    let update: SessionCatalogUpdate = serde_json::from_str(&event.data).unwrap();
     assert_eq!(
-        update.change,
+        change,
         SessionCatalogChange::Invalidated {
             session_id: original.session.id
         }
