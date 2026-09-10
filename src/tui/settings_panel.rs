@@ -256,6 +256,11 @@ impl PanelLayout {
 #[derive(Clone, Debug)]
 pub(super) struct SettingRow {
     pub(super) label: &'static str,
+    /// The Provider this row presents, where the row is a Provider rather
+    /// than one of its Settings. Rendering uses the identity for Provider
+    /// presentation such as an optional icon without inferring it from the
+    /// display name.
+    pub(super) provider: Option<&'static ProviderId>,
     pub(super) value: RowValue,
     pub(super) pinned: bool,
     pub(super) selected: bool,
@@ -680,6 +685,7 @@ impl SettingsPanel {
                 };
                 SettingRow {
                     label: entry.label,
+                    provider: entry.provider,
                     value,
                     pinned: pinned.iter().any(|key| key == entry.descriptor.key),
                     selected: index == selected,

@@ -19,6 +19,7 @@ use crate::{
         LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
         SessionSnapshot, SessionStatus, SessionTimestamp,
     },
+    provider::built_in_providers,
     theme::Theme,
 };
 
@@ -1271,6 +1272,7 @@ const SETTINGS_TAB_GAP: &str = "  ";
 /// decided here. A pointer is resolved against that record, so the reader can
 /// only ever click something this frame actually drew.
 fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let show_icons = state.settings().appearance.show_icons;
     let rows = state
         .settings_panel
         .rows(state.settings(), state.pinned_settings());
@@ -1411,12 +1413,13 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             RowAvailability::Unavailable(reason) => format!(" · {}", reason.label()),
             RowAvailability::Failed => " · error".to_owned(),
         };
+        let label = row.provider.map_or_else(
+            || row.label.to_owned(),
+            |provider| provider_label(show_icons, provider, row.label),
+        );
         lines.push(Line::styled(
             truncate_to_width(
-                &format!(
-                    "{marker}{expansion}{}{value}{availability} [{origin}]",
-                    row.label
-                ),
+                &format!("{marker}{expansion}{label}{value}{availability} [{origin}]"),
                 content_width,
             ),
             match (row.selected, &row.value) {
@@ -3998,9 +4001,37 @@ fn checkout_branch_context(
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
     match state.agent_selection() {
         None => "Agent unavailable".to_owned(),
-        Some(selection) => state
-            .model_picker
-            .selection_summary(selection, detail.shows_secondary()),
+        Some(selection) => {
+            let detailed = detail.shows_secondary();
+            let summary = state.model_picker.selection_summary(selection, detailed);
+            if detailed {
+                provider_label(
+                    state.settings().appearance.show_icons,
+                    &selection.provider,
+                    &summary,
+                )
+            } else {
+                summary
+            }
+        }
+    }
+}
+
+/// A Provider's Nerd Font glyph where Suru knows one. Unknown Provider IDs
+/// keep their text-only presentation, which lets future Providers participate
+/// in the shared surfaces before choosing an icon of their own.
+fn provider_icon(provider: &crate::protocol::ProviderId) -> Option<char> {
+    built_in_providers()
+        .iter()
+        .find(|candidate| &candidate.id == provider)
+        .and_then(|provider| provider.nerd_font_icon)
+}
+
+fn provider_label(show_icons: bool, provider: &crate::protocol::ProviderId, label: &str) -> String {
+    if show_icons && let Some(icon) = provider_icon(provider) {
+        format!("{icon} {label}")
+    } else {
+        label.to_owned()
     }
 }
 

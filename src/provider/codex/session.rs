@@ -155,6 +155,11 @@ impl ProviderRuntime for CodexRuntime {
         "Codex"
     }
 
+    fn nerd_font_icon(&self) -> Option<char> {
+        // Nerd Fonts `nf-cod-openai` (Codicons OpenAI).
+        Some('\u{ec81}')
+    }
+
     // A collab child is a thread of its own, and `turn/interrupt` addresses
     // any thread — which is exactly a per-Subagent stop.
     fn supports_subagent_stop(&self) -> bool {

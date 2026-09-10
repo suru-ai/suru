@@ -1,25 +1,114 @@
 //! The model picker: listing, search, focus, and selection.
 
 use crate::support::{
-    model_descriptor, navigable_session_snapshot, rendered_application_rows,
+    deliver_settings, model_descriptor, navigable_session_snapshot, rendered_application_rows,
     rendered_application_rows_at, rendered_row, selected_session_snapshot, type_terminal_text,
     workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
-    managed_client::SessionEvent,
+    managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice,
-        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ProviderUnavailability, SessionChange, SessionId, SessionRevision, SessionUpdate,
+        AgentSelection, AppearanceSettings, EffectiveSettings, ModelAvailability, ModelCatalog,
+        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, ProviderUnavailability, SessionChange, SessionId, SessionRevision,
+        SessionUpdate,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
 
 #[test]
+fn provider_icons_decorate_agent_summaries_on_the_landing_and_in_sessions() {
+    let workspace = workspace_dir();
+    let settings = EffectiveSettings {
+        appearance: AppearanceSettings {
+            show_icons: true,
+            ..AppearanceSettings::default()
+        },
+        ..EffectiveSettings::default()
+    };
+
+    for (provider, display_name, icon) in [
+        ("codex", "Codex", '\u{ec81}'),
+        ("copilot", "Copilot", '\u{ec1e}'),
+        ("claude", "Claude", '\u{ec82}'),
+    ] {
+        let model = model_descriptor(
+            provider,
+            "fixture-model",
+            "Fixture Model",
+            true,
+            ModelAvailability::Available,
+        );
+        let catalog = || ModelCatalog {
+            providers: vec![ProviderModelCatalog {
+                provider: ProviderId::new(provider),
+                display_name: display_name.to_owned(),
+                models: vec![model.clone()],
+                status: ProviderCatalogStatus::Fresh,
+            }],
+        };
+
+        let mut landing = Application::new(workspace.path(), Default::default());
+        deliver_settings(&mut landing, settings.clone());
+        let ApplicationTransition::ListModels(request) = landing
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                suru::tui::SemanticCommandId::ModelList,
+            )))
+            .expect("open the landing Model picker")
+        else {
+            panic!("the Model picker should request a catalog")
+        };
+        landing
+            .handle_event(ApplicationEvent::ModelsListed {
+                request,
+                catalog: catalog(),
+            })
+            .expect("list the Provider's Model");
+        assert!(matches!(
+            landing
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .expect("select the Provider's Model"),
+            ApplicationTransition::ConfirmLandingAgentSelection(_)
+        ));
+        let landing_frame = rendered_application_rows_at(&landing, 100, 16).join("\n");
+        assert!(
+            landing_frame.contains(&format!("{icon} {display_name} · Fixture Model")),
+            "the Landing summary identifies {display_name}: {landing_frame}"
+        );
+
+        let selection = AgentSelection {
+            provider: ProviderId::new(provider),
+            model: ModelId::new("fixture-model"),
+            options: Vec::new(),
+        };
+        let mut session = Application::new(workspace.path(), Default::default());
+        deliver_settings(&mut session, settings.clone());
+        session
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+                catalog(),
+            )))
+            .expect("cache the Provider's Model catalog");
+        session
+            .handle_event(ApplicationEvent::SessionAttached(
+                selected_session_snapshot(SessionId::new(), workspace.path(), selection),
+            ))
+            .expect("attach the selected Session");
+        let session_frame = rendered_application_rows_at(&session, 100, 16).join("\n");
+        assert!(
+            session_frame.contains(&format!("{icon} {display_name} · Fixture Model")),
+            "the Session composer summary identifies {display_name}: {session_frame}"
+        );
+    }
+}
+
+#[test]
 fn remote_session_names_follow_its_pushed_catalog_without_opening_models() {
-    use suru::{managed_client::ManagedEvent, protocol::Outlook};
+    use suru::protocol::Outlook;
 
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());

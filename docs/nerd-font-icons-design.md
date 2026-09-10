@@ -7,7 +7,8 @@ Implemented from the confirmed design.
 - Add a Client Setting named **Show icons** in **Appearance**, disabled by default and pinned as `appearance.showIcons` in Config Documents.
 - Help text: “Show Nerd Font icons. Requires a Nerd Font in your terminal.”
 - The Setting governs Nerd Font icons throughout Suru, including future additions.
-- Initially decorate the location elements beneath the Landing composer and at the top-left of the open Session header.
+- Decorate the location elements beneath the Landing composer and at the top-left of the open Session header.
+- Prefix Provider names beneath the Landing and Session composers and in the Providers settings tab: `nf-cod-openai` for Codex, `nf-cod-claude` for Claude, and `nf-cod-copilot` for Copilot.
 - Preserve existing text except the `(worktree)` suffix described below. Place prefix icons to the left of their text, in the same color, separated by one space.
 - Use `nf-cod-folder` for the workspace/path and `nf-md-monitor` for the Remote when present.
 - Use `nf-cod-git_branch` before a named main-Worktree branch. For a named linked-Worktree branch, use `nf-cod-worktree` instead of the branch icon and omit the `(worktree)` suffix.

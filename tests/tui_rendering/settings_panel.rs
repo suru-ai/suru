@@ -874,6 +874,45 @@ fn the_providers_tab_lists_every_built_in_provider_by_display_name_whatever_its_
 }
 
 #[test]
+fn the_providers_tab_prefixes_each_provider_with_its_icon_when_enabled() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            appearance: AppearanceSettings {
+                show_icons: true,
+                ..AppearanceSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["appearance.showIcons"],
+    );
+    open_providers_tab(&mut application);
+
+    for (provider, icon) in [
+        ("Codex", '\u{ec81}'),
+        ("Copilot", '\u{ec1e}'),
+        ("Claude", '\u{ec82}'),
+    ] {
+        assert!(
+            row(&application, provider).contains(&format!("{icon} {provider}")),
+            "the {provider} row carries its Provider icon: {:?}",
+            row(&application, provider)
+        );
+    }
+
+    deliver_snapshot(&mut application, EffectiveSettings::default(), &[]);
+    for icon in ['\u{ec81}', '\u{ec1e}', '\u{ec82}'] {
+        assert!(
+            !rendered_application_rows(&application)
+                .join("\n")
+                .contains(icon),
+            "turning Show icons off removes Provider icons"
+        );
+    }
+}
+
+#[test]
 fn space_on_a_provider_row_toggles_that_providers_enablement() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);

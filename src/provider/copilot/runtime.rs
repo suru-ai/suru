@@ -93,6 +93,11 @@ impl ProviderRuntime for CopilotRuntime {
         "Copilot"
     }
 
+    fn nerd_font_icon(&self) -> Option<char> {
+        // Nerd Fonts `nf-cod-copilot` (Codicons Copilot).
+        Some('\u{ec1e}')
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         Box::pin(async move {
             // Launches the shared process if this is the first demand, or the first since a crash.

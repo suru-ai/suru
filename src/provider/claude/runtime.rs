@@ -118,6 +118,11 @@ impl ProviderRuntime for ClaudeRuntime {
         "Claude"
     }
 
+    fn nerd_font_icon(&self) -> Option<char> {
+        // Nerd Fonts `nf-cod-claude` (Codicons Claude).
+        Some('\u{ec82}')
+    }
+
     // The CLI stops one task by id, which is exactly a per-Subagent stop.
     fn supports_subagent_stop(&self) -> bool {
         true
