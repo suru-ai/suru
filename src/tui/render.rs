@@ -791,12 +791,11 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     record_overlay_selection(frame, state, area, SelectionSurface::Sessions, true);
 }
 
-/// The Workspace Picker, drawn in the session picker's mold: a centered box
-/// over the main view, the query the reader is narrowing by, a loading line
-/// while the listing it derives from is on its way, then one row per Workspace
-/// on offer — or a line saying the query left none.
+/// The Worktree Selector: a centered box over the Landing that says where the
+/// next Session stands today on a line of its own, then offers a new Worktree
+/// ahead of every Worktree the Repository already has, each named by its
+/// Checkout State and where it stands.
 fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
     let picker = &state.worktree_picker;
     let area = centered_rect(
         main,
@@ -854,61 +853,55 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         } else {
             "Enter Remove · Esc cancel"
         }));
-    } else if let Some(directory) = &picker.directory {
-        lines.push(Line::styled(
-            truncate_to_width(&format!("Directory: {directory}"), width),
-            theme.text.primary,
-        ));
-        lines.push(Line::styled(
-            "Enter choose directory · Esc back",
-            theme.text.subdued,
-        ));
     } else if picker.loading {
         lines.push(Line::styled("Loading Worktrees…", theme.text.subdued));
     } else if let Some(context) = &picker.context {
+        // Where the next Session stands today, which the reader reads rather
+        // than chooses: the Worktree it is in has a row of its own below.
+        let presentation = context
+            .workspace
+            .repository
+            .as_ref()
+            .map(|repository| repository.presentation_path());
         let current = context
             .execution_directory
             .as_ref()
-            .map(|directory| state.workspace_label(&state.outlook, &directory.path))
+            .map(|directory| state.worktree_location(&state.outlook, &directory.path, presentation))
             .unwrap_or_else(|| "No working copy selected".to_owned());
-        let mut rows = vec![format!("Current: {current}{}", picker.current_status())];
-        rows.extend(context.checkouts.iter().map(|checkout| {
-            let kind = match checkout.association.kind {
-                CheckoutKind::Main => "main",
-                CheckoutKind::Linked => "linked",
-            };
-            let revision = match &checkout.revision {
-                Some(CheckoutRevision::Branch { name, commit: None }) => format!("{name} (unborn)"),
-                Some(CheckoutRevision::Branch { name, .. }) => name.clone(),
-                Some(CheckoutRevision::Detached { commit }) => {
-                    format!("detached {}", commit.chars().take(8).collect::<String>())
-                }
-                None => "unknown revision".to_owned(),
-            };
-            let unavailable =
-                if matches!(checkout.availability, SourceControlAvailability::Available) {
-                    ""
-                } else {
-                    " · unavailable"
-                };
-            format!(
-                "{kind} · {revision} · {}{unavailable}",
-                state.workspace_label(&state.outlook, &checkout.association.root)
-            )
-        }));
-        rows.push("Choose directory…".to_owned());
+        lines.push(Line::styled(
+            truncate_to_width(
+                &format!("Current: {current}{}", picker.current_status()),
+                width,
+            ),
+            theme.text.subdued,
+        ));
         let reason = context
             .workspace
             .repository
             .as_ref()
             .map(|r| &r.capabilities.create_checkout);
-        rows.push(match reason {
+        let mut rows = vec![match reason {
             Some(crate::protocol::SourceControlCapability::Available) => "New Worktree".to_owned(),
             Some(crate::protocol::SourceControlCapability::Unsupported { reason }) => {
                 format!("New Worktree unavailable · {reason}")
             }
             None => "New Worktree unavailable · no Repository".to_owned(),
-        });
+        }];
+        rows.extend(context.checkouts.iter().map(|checkout| {
+            // The Worktree the reader is already in is marked rather than
+            // moved, so the rows keep the order the Repository gives them.
+            let marker = if picker.current_checkout() == Some(&checkout.association.id) {
+                "* "
+            } else {
+                ""
+            };
+            let location =
+                state.worktree_location(&state.outlook, &checkout.association.root, presentation);
+            match CheckoutStateLabel::read(checkout) {
+                Some(label) => format!("{marker}{} · {location}", label.text()),
+                None => format!("{marker}{location}"),
+            }
+        }));
         let available_rows = capacity.saturating_sub(2).max(1);
         let start = picker
             .selected
@@ -2782,7 +2775,6 @@ fn sidebar_active_row_lines(
 }
 
 fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
-    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
     let SidebarShelf::Active {
         checkout_state: Some(reading),
         ..
@@ -2790,34 +2782,64 @@ fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
     else {
         return String::new();
     };
-    let label = match &reading.availability {
-        SourceControlAvailability::NotDetected => return String::new(),
-        SourceControlAvailability::Unavailable { .. } => "[unavailable]".to_owned(),
-        SourceControlAvailability::Available => match &reading.revision {
-            Some(CheckoutRevision::Branch { name, .. }) => name.clone(),
-            Some(CheckoutRevision::Detached { commit }) => commit.chars().take(7).collect(),
-            None => "[unavailable]".to_owned(),
-        },
-    };
-    // Keep a linked Worktree visible even when a branch name is long. The main
-    // working copy needs no label of its own.
-    let suffix = match (
-        &reading.availability,
-        &reading.revision,
-        reading.association.kind,
-    ) {
-        (
-            SourceControlAvailability::Available,
-            Some(CheckoutRevision::Branch { .. }),
-            CheckoutKind::Linked,
-        ) => " (worktree)",
-        _ => "",
-    };
-    format!(
-        "{}{}",
-        truncate_to_width(&label, width.saturating_sub(suffix.width())),
-        suffix
-    )
+    CheckoutStateLabel::read(reading)
+        .map(|label| label.truncated(width))
+        .unwrap_or_default()
+}
+
+/// A Worktree's Checkout State as every surface presenting one spells it: the
+/// branch it stands on, the commit a detached head stands at, or the plain
+/// fact that the reading could not be taken. The Sidebar, the Landing, the
+/// Worktree Selector, and a Session's header all read one Checkout State, so
+/// they say it in one voice.
+struct CheckoutStateLabel {
+    state: String,
+    /// Kept apart from the state so a long branch name is what truncation
+    /// takes, leaving a linked Worktree's own label standing.
+    suffix: &'static str,
+}
+
+impl CheckoutStateLabel {
+    /// Nothing at all where the Worktree's source control was never detected:
+    /// a directory outside source control has no Checkout State to present.
+    fn read(reading: &crate::protocol::CheckoutSummary) -> Option<Self> {
+        use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+        let unavailable = || Self {
+            state: "[unavailable]".to_owned(),
+            suffix: "",
+        };
+        Some(match &reading.availability {
+            SourceControlAvailability::NotDetected => return None,
+            SourceControlAvailability::Unavailable { .. } => unavailable(),
+            SourceControlAvailability::Available => match &reading.revision {
+                // The main working copy needs no label of its own.
+                Some(CheckoutRevision::Branch { name, .. }) => Self {
+                    state: name.clone(),
+                    suffix: match reading.association.kind {
+                        CheckoutKind::Main => "",
+                        CheckoutKind::Linked => " (worktree)",
+                    },
+                },
+                Some(CheckoutRevision::Detached { commit }) => Self {
+                    state: commit.chars().take(7).collect(),
+                    suffix: "",
+                },
+                None => unavailable(),
+            },
+        })
+    }
+
+    fn text(&self) -> String {
+        format!("{}{}", self.state, self.suffix)
+    }
+
+    fn truncated(&self, width: usize) -> String {
+        format!(
+            "{}{}",
+            truncate_to_width(&self.state, width.saturating_sub(self.suffix.width())),
+            self.suffix
+        )
+    }
 }
 
 /// One Session set aside, as the single slim line the settled shelf gives it:
@@ -3164,16 +3186,20 @@ fn render_landing(
                     } else {
                         ""
                     };
-                    let chooser = if state.workspace.repository.is_some() {
-                        if state.new_worktree.is_some() {
-                            " · New Worktree on submit"
-                        } else {
-                            " · /worktree choose"
-                        }
+                    // What the next Session would begin on, said exactly as a
+                    // Sidebar row says it, and live: the catalog's reading
+                    // stands in front of the one the resolution carried.
+                    let checkout = state
+                        .execution_checkout_state()
+                        .and_then(CheckoutStateLabel::read)
+                        .map(|checkout| format!(" · {}", checkout.text()))
+                        .unwrap_or_default();
+                    let intent = if state.new_worktree.is_some() {
+                        " · New Worktree on submit"
                     } else {
                         ""
                     };
-                    format!("{label}{status}{chooser}")
+                    format!("{label}{status}{checkout}{intent}")
                 }
                 None => format!(
                     "{} · {}",
@@ -3860,19 +3886,18 @@ fn render_session_header(
     }
 }
 
+/// A Session header names the branch its Worktree stands on beside the
+/// Workspace, and stays quiet where there is no branch to name: a detached
+/// commit or an unreadable Worktree is not orientation.
 fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Option<String> {
-    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+    use crate::protocol::{CheckoutRevision, SourceControlAvailability};
 
-    if checkout.availability != SourceControlAvailability::Available {
+    if checkout.availability != SourceControlAvailability::Available
+        || !matches!(checkout.revision, Some(CheckoutRevision::Branch { .. }))
+    {
         return None;
     }
-    let CheckoutRevision::Branch { name, .. } = checkout.revision.as_ref()? else {
-        return None;
-    };
-    Some(match checkout.association.kind {
-        CheckoutKind::Main => name.clone(),
-        CheckoutKind::Linked => format!("{name} (worktree)"),
-    })
+    CheckoutStateLabel::read(checkout).map(|label| label.text())
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {

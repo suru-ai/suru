@@ -381,6 +381,13 @@ pub struct TuiState {
     pub(super) fatal_error: Option<String>,
     pub(super) workspace: Workspace,
     pub(super) execution_directory: Option<PathBuf>,
+    /// The Worktree the next Session would work in, as the owning Server named
+    /// it when it resolved this context, with the reading that resolution
+    /// carried for it. The catalog's live reading stands in front of that one;
+    /// keeping it is what leaves the Landing's Checkout State never blank
+    /// while the catalog is still on its way.
+    execution_checkout: Option<crate::protocol::CheckoutAssociation>,
+    resolved_checkout_state: Option<crate::protocol::CheckoutSummary>,
     checkout_states:
         HashMap<(Outlook, crate::protocol::CheckoutId), crate::protocol::CheckoutSummary>,
     pub(super) composers: ComposerMemory,
@@ -577,6 +584,8 @@ impl TuiState {
             fatal_error: None,
             workspace: Workspace::directory(workspace.clone()),
             execution_directory: Some(workspace.clone()),
+            execution_checkout: None,
+            resolved_checkout_state: None,
             checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
@@ -661,6 +670,14 @@ impl TuiState {
         }
 
         self.execution_status = context.execution_status.clone();
+        self.resolved_checkout_state = context.checkout.as_ref().and_then(|checkout| {
+            context
+                .checkouts
+                .iter()
+                .find(|reading| reading.association.id == checkout.id)
+                .cloned()
+        });
+        self.execution_checkout = context.checkout.clone();
         self.remembered_execution_directories.insert(
             (self.outlook.clone(), context.workspace.id.clone()),
             RememberedExecutionContext {
@@ -1071,6 +1088,32 @@ impl TuiState {
     ) -> Option<&crate::protocol::CheckoutSummary> {
         self.checkout_states
             .get(&(origin.clone(), checkout_id.clone()))
+    }
+
+    /// The Checkout State of the Worktree the next Session would work in. The
+    /// catalog's live reading answers wherever it has one, and the reading the
+    /// owning Server's resolution carried answers until then.
+    pub(super) fn execution_checkout_state(&self) -> Option<&crate::protocol::CheckoutSummary> {
+        let checkout = self.execution_checkout.as_ref()?;
+        self.checkout_state(&self.outlook, &checkout.id)
+            .or(self.resolved_checkout_state.as_ref())
+    }
+
+    /// Where a Worktree stands, in the owning Server's own path syntax and as
+    /// short as that Server's facts allow.
+    pub(super) fn worktree_location(
+        &self,
+        origin: &Outlook,
+        root: &Path,
+        within: Option<&Path>,
+    ) -> String {
+        match self.workspace_paths.get(origin) {
+            Some(paths) => paths.worktree_location(root, within),
+            None if origin == &Outlook::Local => {
+                crate::protocol::WorkspacePaths::default().worktree_location(root, within)
+            }
+            None => root.to_string_lossy().into_owned(),
+        }
     }
 
     pub(super) fn workspace_name(&self, origin: &Outlook, path: &Path) -> String {
@@ -2861,8 +2904,6 @@ pub enum CommandId {
     PageNextWorkspaces,
     SelectWorkspace,
     CloseWorkspacePicker,
-    InsertWorktreeDirectory(String),
-    DeleteWorktreeDirectoryBackward,
     SelectPreviousSubagent,
     SelectNextSubagent,
     OpenSelectedSubagent,
@@ -3982,18 +4023,6 @@ impl Application {
             | CommandId::PageNextWorkspaces
             | CommandId::SelectWorkspace
             | CommandId::CloseWorkspacePicker) => Ok(self.handle_workspace_picker_command(command)),
-            CommandId::InsertWorktreeDirectory(text) => {
-                if let Some(directory) = &mut self.state.worktree_picker.directory {
-                    directory.push_str(&text);
-                }
-                Ok(ApplicationTransition::Continue)
-            }
-            CommandId::DeleteWorktreeDirectoryBackward => {
-                if let Some(directory) = &mut self.state.worktree_picker.directory {
-                    directory.pop();
-                }
-                Ok(ApplicationTransition::Continue)
-            }
             command @ (CommandId::SelectPreviousSubagent
             | CommandId::SelectNextSubagent
             | CommandId::OpenSelectedSubagent
@@ -4260,9 +4289,6 @@ impl Application {
                 }
                 let checkout = match picker.choice() {
                     Some(WorktreeChoice::Checkout(c)) => Some(c.association),
-                    Some(WorktreeChoice::Current) => {
-                        picker.context.as_ref().and_then(|c| c.checkout.clone())
-                    }
                     _ => None,
                 };
                 if let Some(checkout) = checkout
@@ -4315,20 +4341,6 @@ impl Application {
                     self.state.worktree_picker.error = None;
                     return ApplicationTransition::Continue;
                 }
-                if self.state.worktree_picker.directory.take().is_some() {
-                    self.state.worktree_picker.loading = false;
-                    self.state.worktree_picker.error = None;
-                    return if self
-                        .state
-                        .cancel_workspace_resolution(WorkspaceResolutionSurface::WorktreeSelection)
-                    {
-                        ApplicationTransition::CancelWorkspaceResolution(
-                            WorkspaceResolutionSurface::WorktreeSelection,
-                        )
-                    } else {
-                        ApplicationTransition::Continue
-                    };
-                }
                 self.state.worktree_picker.close();
                 for surface in [
                     WorkspaceResolutionSurface::WorktreeList,
@@ -4343,29 +4355,7 @@ impl Application {
                 if self.state.worktree_picker.removal.is_some() {
                     return self.handle_worktree_command(SemanticCommandId::WorktreeRemove);
                 }
-                if let Some(path) = &self.state.worktree_picker.directory {
-                    if path.trim().is_empty() {
-                        self.state
-                            .worktree_picker
-                            .fail("Name a directory".to_owned());
-                        return ApplicationTransition::Continue;
-                    }
-                    let request = ResolveWorkspaceRequest {
-                        checkout_id: None,
-                        remembered_execution_directory: None,
-                        workspace_id: None,
-                        base: self.state.execution_directory.clone(),
-                        path: PathBuf::from(path),
-                    };
-                    self.state.worktree_picker.loading = true;
-                    return self
-                        .resolve_worktree(WorkspaceResolutionSurface::WorktreeSelection, request);
-                }
                 match self.state.worktree_picker.choice() {
-                    Some(WorktreeChoice::Current) => {
-                        self.state.cancel_worktree_intent();
-                        self.state.worktree_picker.close();
-                    }
                     Some(WorktreeChoice::New) => {
                         let capability = self
                             .state
@@ -4410,11 +4400,18 @@ impl Application {
                         }
                         self.state.worktree_picker.close();
                     }
-                    Some(WorktreeChoice::Directory) => {
-                        self.state.worktree_picker.directory = Some(String::new());
-                        self.state.worktree_picker.error = None;
-                    }
                     Some(WorktreeChoice::Checkout(checkout)) => {
+                        // Choosing the Worktree the next Session already
+                        // stands in is saying to stay put: there is nothing to
+                        // resolve, and a pending intention to make another one
+                        // is what the reader has just taken back.
+                        if self.state.worktree_picker.current_checkout()
+                            == Some(&checkout.association.id)
+                        {
+                            self.state.cancel_worktree_intent();
+                            self.state.worktree_picker.close();
+                            return ApplicationTransition::Continue;
+                        }
                         if let crate::protocol::SourceControlAvailability::Unavailable { reason } =
                             &checkout.availability
                         {
@@ -6737,10 +6734,7 @@ impl Application {
             }
             Some(SelectionSurface::Settings) => return command_for_settings_panel_event(event),
             Some(SelectionSurface::Worktrees) => {
-                return super::keymap::command_for_worktree_picker_event(
-                    event,
-                    self.state.worktree_picker.directory.is_some(),
-                );
+                return super::keymap::command_for_worktree_picker_event(event);
             }
             Some(SelectionSurface::Workspaces) => return command_for_workspace_picker_event(event),
             Some(SelectionSurface::Sessions) => return command_for_session_picker_event(event),

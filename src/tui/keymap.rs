@@ -876,42 +876,27 @@ fn command_from_scoped_bindings(
         .map(|binding| binding.command.clone())
 }
 
-/// Worktree navigation uses semantic actions; directory entry is explicit.
-pub(super) fn command_for_worktree_picker_event(
-    event: InputEvent,
-    directory: bool,
-) -> Option<CommandId> {
-    let key = match event {
-        InputEvent::Key(key) => key,
-        InputEvent::Paste(text) if directory => {
-            return Some(CommandId::InsertWorktreeDirectory(text));
-        }
-        _ => return None,
+/// Worktree navigation uses semantic actions. A directory below a Worktree is
+/// reached through the Sidebar's path entry rather than from here.
+pub(super) fn command_for_worktree_picker_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
     };
     if key.kind != KeyEventKind::Press {
         return None;
     }
     let semantic = match key.code {
-        KeyCode::Char('d') if !directory => SemanticCommandId::WorktreeRemove,
-        KeyCode::Char('F') if !directory => SemanticCommandId::WorktreeForceRemove,
+        KeyCode::Char('d') => SemanticCommandId::WorktreeRemove,
+        KeyCode::Char('F') => SemanticCommandId::WorktreeForceRemove,
         KeyCode::Esc => SemanticCommandId::WorktreeClose,
         KeyCode::Enter => SemanticCommandId::WorktreeSelect,
-        KeyCode::Up if !directory => SemanticCommandId::WorktreePrevious,
-        KeyCode::Char('p') if !directory && key.modifiers == KeyModifiers::CONTROL => {
+        KeyCode::Up => SemanticCommandId::WorktreePrevious,
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
             SemanticCommandId::WorktreePrevious
         }
-        KeyCode::Down if !directory => SemanticCommandId::WorktreeNext,
-        KeyCode::Char('n') if !directory && key.modifiers == KeyModifiers::CONTROL => {
+        KeyCode::Down => SemanticCommandId::WorktreeNext,
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
             SemanticCommandId::WorktreeNext
-        }
-        KeyCode::Backspace if directory => return Some(CommandId::DeleteWorktreeDirectoryBackward),
-        KeyCode::Char(character)
-            if directory
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            return Some(CommandId::InsertWorktreeDirectory(character.to_string()));
         }
         _ => return None,
     };

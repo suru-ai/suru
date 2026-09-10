@@ -686,7 +686,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeList,
         title: "Choose Worktree",
-        description: "Choose an existing Worktree or directory for a new Session",
+        description: "Choose an existing Worktree, or a new one, for a new Session",
         slash: Some(SlashCommand {
             name: "worktree",
             aliases: &["checkout"],

@@ -229,8 +229,7 @@ fn landing_worktree_selection_uses_root_and_cancel_ignores_late_server_response(
     open(&mut app, layout.context.clone());
     let rows = text(&app);
     assert!(rows.contains("Current:"));
-    assert!(rows.contains("detached abcdef01"));
-    key(&mut app, KeyCode::Down);
+    assert!(rows.contains("abcdef0"), "{rows}");
     key(&mut app, KeyCode::Down);
     let transition = key(&mut app, KeyCode::Enter);
     let ApplicationTransition::ResolveWorkspace { request, .. } = &transition else {
@@ -238,29 +237,146 @@ fn landing_worktree_selection_uses_root_and_cancel_ignores_late_server_response(
     };
     assert_eq!(
         request.checkout_id,
-        Some(layout.context.checkouts[1].association.id.clone())
+        Some(layout.context.checkouts[0].association.id.clone())
     );
     assert_eq!(
         request.workspace_id,
         Some(layout.context.workspace.id.clone())
     );
-    answer(&mut app, transition, layout.at(&layout.linked));
+    answer(&mut app, transition, layout.at(&layout.main));
     type_terminal_text(&mut app, "Use this checkout");
     let ApplicationTransition::CreateSession(request) = key(&mut app, KeyCode::Enter) else {
         panic!("start new Session")
     };
-    assert_eq!(request.execution_directory.path, layout.linked);
+    assert_eq!(request.execution_directory.path, layout.main);
+}
+
+/// The rows the Worktree Selector offers, in the order it offers them: a new
+/// Worktree first and selected, then every Worktree the Repository has, with
+/// the one the next Session already stands in marked rather than moved.
+#[test]
+fn the_selector_leads_with_a_new_worktree_and_marks_the_current_one() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    open(&mut app, layout.context.clone());
+    let rendered = text(&app);
+    let rows = rendered
+        .lines()
+        .skip_while(|row| !row.contains("Current:"))
+        .skip(1)
+        .take(3)
+        .map(|row| row.trim().trim_start_matches('│').trim().to_owned())
+        .collect::<Vec<_>>();
+    assert!(rows[0].starts_with("› New Worktree"), "{rendered}");
+    assert!(rows[1].starts_with("main ·"), "{rendered}");
+    assert!(
+        rows[2].starts_with("* abcdef0 ·"),
+        "the Worktree in use is marked: {rendered}"
+    );
+    assert!(!rows[1].contains('*'), "{rendered}");
+    // Enter on the marked row is the reader saying they are staying put, so
+    // nothing is asked of the owning Server and the selector closes.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(
+        key(&mut app, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(!text(&app).contains(" Worktrees "));
+}
+
+/// The Landing says which Checkout State the next Session begins on, and says
+/// it as a Sidebar row does.
+#[test]
+fn the_landing_names_the_current_checkout_state_and_prefers_the_live_reading() {
+    let layout = Layout::new();
+    let mut linked = layout.context.clone();
+    linked.checkouts[1].revision = Some(CheckoutRevision::Branch {
+        name: "feature/landing".to_owned(),
+        commit: Some("1234567890abcdef".to_owned()),
+    });
+    let mut app = layout.app();
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, linked.clone());
+    key(&mut app, KeyCode::Esc);
+    assert!(
+        text(&app).contains("feature/landing (worktree)"),
+        "{}",
+        text(&app)
+    );
+    let mut moved = linked.checkouts[1].clone();
+    moved.revision = Some(CheckoutRevision::Branch {
+        name: "feature/moved".to_owned(),
+        commit: Some("1234567890abcdef".to_owned()),
+    });
+    app.handle_event(ApplicationEvent::Managed(
+        ManagedEvent::CheckoutStateChanged(CheckoutStateChanged {
+            checkout_id: moved.association.id.clone(),
+            checkout_state: Some(moved),
+        }),
+    ))
+    .unwrap();
+    let rendered = text(&app);
+    assert!(rendered.contains("feature/moved (worktree)"), "{rendered}");
+    assert!(!rendered.contains("feature/landing"), "{rendered}");
+}
+
+/// A Worktree Suru made is known by the name it was given, wherever the
+/// Channel's managed directory happens to put it.
+#[test]
+fn managed_worktrees_are_offered_by_their_leaf_name() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let mut context = layout.context.clone();
+    let managed = layout.main.join(".suru-worktrees/dev/review-landing");
+    let repository = context.workspace.repository.clone().unwrap();
+    context.checkouts.push(CheckoutSummary {
+        association: CheckoutAssociation {
+            recovery_revision: None,
+            id: CheckoutId::from_root(&repository.id, &managed),
+            repository: repository.id.clone(),
+            root: managed,
+            kind: CheckoutKind::Linked,
+        },
+        revision: Some(CheckoutRevision::Branch {
+            name: "suru/review".to_owned(),
+            commit: Some("1234567890abcdef".to_owned()),
+        }),
+        availability: SourceControlAvailability::Available,
+    });
+    open(&mut app, context);
+    let rendered = text(&app);
+    assert!(
+        rendered.contains("suru/review (worktree) · review-landing"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(".suru-worktrees"), "{rendered}");
 }
 
 #[test]
 fn explicit_subdirectory_keeps_draft_and_updates_destination_skills_and_relative_path_base() {
     let layout = Layout::new();
     let mut app = layout.app();
-    open(&mut app, layout.context.clone());
-    for _ in 0..3 {
-        key(&mut app, KeyCode::Down);
+    let transition = deliver_settings(
+        &mut app,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    if let ApplicationTransition::ListSessions(request) = transition {
+        app.handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![],
+        })
+        .unwrap();
     }
-    key(&mut app, KeyCode::Enter);
+    // A directory below a Worktree is named in the Sidebar's path entry; the
+    // Worktree Selector offers Worktrees and nothing else.
+    crate::support::press_add_workspace(&mut app);
     app.handle_terminal_event(InputEvent::Paste("../another directory".to_owned()))
         .unwrap();
     let transition = key(&mut app, KeyCode::Enter);
@@ -304,23 +420,6 @@ fn explicit_subdirectory_keeps_draft_and_updates_destination_skills_and_relative
     };
     assert_eq!(request.execution_directory.path, destination);
     key(&mut app, KeyCode::Esc);
-    let transition = deliver_settings(
-        &mut app,
-        EffectiveSettings {
-            sidebar: SidebarSettings {
-                initial_visibility: SidebarVisibility::Shown,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-    if let ApplicationTransition::ListSessions(request) = transition {
-        app.handle_event(ApplicationEvent::SessionsListed {
-            request,
-            sessions: vec![],
-        })
-        .unwrap();
-    }
     crate::support::press_add_workspace(&mut app);
     type_terminal_text(&mut app, "child");
     let ApplicationTransition::ResolveWorkspace { request, .. } = key(&mut app, KeyCode::Enter)
@@ -591,22 +690,17 @@ fn choosing_worktree_from_open_session_cannot_relocate_that_session() {
 }
 
 #[test]
-fn cancelling_directory_resolution_does_not_adopt_a_late_destination() {
+fn cancelling_worktree_resolution_does_not_adopt_a_late_destination() {
     let layout = Layout::new();
     let mut app = layout.app();
     open(&mut app, layout.context.clone());
-    for _ in 0..3 {
-        key(&mut app, KeyCode::Down);
-    }
-    key(&mut app, KeyCode::Enter);
-    type_terminal_text(&mut app, "somewhere else");
+    key(&mut app, KeyCode::Down);
     let transition = key(&mut app, KeyCode::Enter);
     assert!(matches!(
         key(&mut app, KeyCode::Esc),
         ApplicationTransition::CancelWorkspaceResolution(_)
     ));
     answer(&mut app, transition, layout.at(&layout.main));
-    key(&mut app, KeyCode::Esc);
     type_terminal_text(&mut app, "Keep current directory");
     let ApplicationTransition::CreateSession(request) = key(&mut app, KeyCode::Enter) else {
         panic!("current directory stays executable")
@@ -661,7 +755,8 @@ fn choose_new(app: &mut Application, layout: &Layout) {
         .capabilities
         .create_checkout = SourceControlCapability::Available;
     open(app, context);
-    key(app, KeyCode::Up); // Last row is the semantic new-Worktree intent.
+    // The first row is the semantic new-Worktree intent, and where an opened
+    // selector already stands.
     assert_eq!(key(app, KeyCode::Enter), ApplicationTransition::Continue);
 }
 fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckoutResult {
@@ -705,7 +800,10 @@ fn new_worktree_intent_is_deferred_cancelable_and_first_prompt_automatically_adm
     assert!(text(&app).contains("New Worktree on submit"));
     assert!(!layout.main.join(".suru-worktrees").exists());
     open(&mut app, layout.context.clone());
-    key(&mut app, KeyCode::Enter); // Current cancels the intention.
+    // Choosing the Worktree already in use cancels the intention.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
     assert!(!text(&app).contains("New Worktree on submit"));
     choose_new(&mut app, &layout);
     type_terminal_text(&mut app, "Prepare and work");
@@ -757,6 +855,7 @@ fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_de
     assert_eq!(retry.id, request.id);
     assert_ne!(retry_id, prompt_id);
     open(&mut app, layout.at(&layout.main));
+    key(&mut app, KeyCode::Down); // The Worktree in use, which cancels the intention.
     key(&mut app, KeyCode::Enter);
     assert_eq!(
         app.handle_event(ApplicationEvent::CheckoutPrepared {
@@ -914,6 +1013,9 @@ fn linked_removal_confirmation_warns_counts_cancel_is_read_only_and_force_is_dis
     let mut app = layout.app();
     let transition = command(&mut app, SemanticCommandId::WorktreeList);
     answer(&mut app, transition, layout.context.clone());
+    // Walk past the New Worktree row and the main Worktree onto the linked one.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
     let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
         key(&mut app, KeyCode::Char('d'))
     else {
@@ -1025,6 +1127,8 @@ fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_se
     let mut app = layout.app();
     let transition = command(&mut app, SemanticCommandId::WorktreeList);
     answer(&mut app, transition, layout.context.clone());
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
     let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
         key(&mut app, KeyCode::Char('d'))
     else {
