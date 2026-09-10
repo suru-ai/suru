@@ -445,13 +445,13 @@ impl SidebarShelf<'_> {
     }
 }
 
-/// The Sidebar's body, top to bottom: the active Sessions with space between
-/// them, recovering Remotes, then — where there is a settled shelf to open —
-/// the divider and settled Sessions.
+/// The Sidebar's body, top to bottom: the active Sessions with space around
+/// and between them, recovering Remotes, then — where there is a settled shelf
+/// to open — the divider and settled Sessions.
 #[derive(Clone, Debug)]
 pub(super) enum SidebarEntry<'a> {
     Row(SidebarRow<'a>),
-    /// The blank line separating adjacent active Session rows.
+    /// A blank line surrounding or separating active Session rows.
     Spacer,
     Unreachable(SidebarUnreachable<'a>),
     /// One Workspace the open selector offers, which stands in place of the
@@ -2725,18 +2725,20 @@ enum BodyEntry<'a> {
     ShowMore(usize),
 }
 
-/// Active Session rows with exactly one blank line between neighbours. The
-/// spacer belongs to the body projection so line windowing, rendering, and
-/// pointer geometry all read the same layout.
+/// Active Session rows with exactly one blank line above, below, and between
+/// them. The spacers belong to the body projection so line windowing,
+/// rendering, and pointer geometry all read the same layout.
 fn active_session_entries<'a>(
     sessions: impl IntoIterator<Item = &'a ListedSession>,
 ) -> Vec<BodyEntry<'a>> {
-    let mut entries = Vec::new();
+    let mut sessions = sessions.into_iter().peekable();
+    if sessions.peek().is_none() {
+        return Vec::new();
+    }
+    let mut entries = vec![BodyEntry::Spacer];
     for session in sessions {
-        if !entries.is_empty() {
-            entries.push(BodyEntry::Spacer);
-        }
         entries.push(BodyEntry::Session(session, Standing::Active));
+        entries.push(BodyEntry::Spacer);
     }
     entries
 }
@@ -2993,15 +2995,26 @@ mod tests {
         );
 
         let local_entry = sidebar.entries(Some(&local_twin), &workspace_name);
+        let local_row = local_entry
+            .iter()
+            .find_map(|entry| match entry {
+                SidebarEntry::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("the listing holds its Session row");
         assert!(
-            matches!(&local_entry[0], SidebarEntry::Row(row) if !row.open),
+            !local_row.open,
             "an equal Session ID from another Origin is not the open row"
         );
         let remote_entry = sidebar.entries(Some(&reference), &workspace_name);
-        assert!(matches!(
-            &remote_entry[0],
-            SidebarEntry::Row(row) if row.open && row.remote.is_none()
-        ));
+        let remote_row = remote_entry
+            .iter()
+            .find_map(|entry| match entry {
+                SidebarEntry::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("the listing holds its Session row");
+        assert!(remote_row.open && remote_row.remote.is_none());
 
         sidebar.record_geometry(
             0..32,
@@ -3096,12 +3109,12 @@ mod tests {
 
         assert_eq!(
             drawn(&sidebar),
-            vec!["Newest", BLANK, "Middle", BLANK, "Oldest"]
+            vec![BLANK, "Newest", BLANK, "Middle", BLANK, "Oldest", BLANK]
         );
     }
 
     #[test]
-    fn active_sessions_have_one_blank_line_between_them() {
+    fn active_sessions_have_one_blank_line_above_below_and_between_them() {
         let sidebar = showing(vec![
             summary("Older, still going", 1, 20),
             set_aside("Ended last", 2, 10, 70),
@@ -3110,21 +3123,29 @@ mod tests {
         ]);
 
         assert_eq!(
-            drawn_within(&sidebar, 7),
-            vec!["Newer, still going", BLANK, "Older, still going"],
-            "the blank line separates adjacent active Sessions without separating settled history"
+            drawn_within(&sidebar, 9),
+            vec![
+                BLANK,
+                "Newer, still going",
+                BLANK,
+                "Older, still going",
+                BLANK,
+            ],
+            "active Sessions have one blank line above, below, and between them"
         );
         assert_eq!(
             drawn(&sidebar),
             vec![
+                BLANK,
                 "Newer, still going",
                 BLANK,
                 "Older, still going",
+                BLANK,
                 DIVIDER,
                 "Ended last",
                 "Ended first",
             ],
-            "the settled shelf stays compact and no blank trails the active list"
+            "the lower blank separates the active Sessions from the settled divider"
         );
     }
 
@@ -3313,9 +3334,11 @@ mod tests {
         assert_eq!(
             drawn(&sidebar),
             vec![
+                BLANK,
                 "Newer, still going",
                 BLANK,
                 "Older, still going",
+                BLANK,
                 DIVIDER,
                 "Ended last",
                 "Ended first"
@@ -3351,7 +3374,7 @@ mod tests {
 
         assert_eq!(
             drawn(&sidebar),
-            vec!["A minute short of it", DIVIDER, "Reached it"]
+            vec![BLANK, "A minute short of it", BLANK, DIVIDER, "Reached it"]
         );
     }
 
@@ -3371,18 +3394,26 @@ mod tests {
         );
 
         assert_eq!(
-            drawn_within(&sidebar, 5),
-            vec!["Still going", DIVIDER, "Ended last"],
-            "three lines for the active Session, one for the divider, one for the shelf"
+            drawn_within(&sidebar, 7),
+            vec![BLANK, "Still going", BLANK, DIVIDER, "Ended last"],
+            "the active Session and its surrounding blanks take five lines before the divider and shelf"
         );
         assert_eq!(
-            drawn_within(&sidebar, 6),
-            vec!["Still going", DIVIDER, "Ended last", "Ended first"],
-            "a column measuring in rows would have wound past what the sixth line holds"
+            drawn_within(&sidebar, 8),
+            vec![
+                BLANK,
+                "Still going",
+                BLANK,
+                DIVIDER,
+                "Ended last",
+                "Ended first"
+            ],
+            "a column measuring in rows would have wound past what the eighth line holds"
         );
-        assert!(
-            drawn_within(&sidebar, 2).is_empty(),
-            "an entry the column cannot hold whole is left off rather than cut in half"
+        assert_eq!(
+            drawn_within(&sidebar, 3),
+            vec![BLANK],
+            "the leading blank fits but the three-line Session is left off rather than cut"
         );
     }
 
@@ -3679,7 +3710,7 @@ mod tests {
             .take_listing_request()
             .expect("turning the visible Sidebar asks its new Origin");
         sidebar.load(&request, vec![summary("Remote work", 2, 2)], None);
-        assert_eq!(drawn(&sidebar), vec!["Remote work"]);
+        assert_eq!(drawn(&sidebar), vec![BLANK, "Remote work", BLANK]);
 
         sidebar.adopt_outlook(Outlook::Local);
         let request = sidebar
@@ -3687,7 +3718,7 @@ mod tests {
             .expect("turning back asks the Origin again");
         assert_eq!(
             drawn(&sidebar),
-            vec!["Local work"],
+            vec![BLANK, "Local work", BLANK],
             "the rows held for the Origin stand while it is asked again"
         );
         assert!(!sidebar.is_loading());
@@ -3696,7 +3727,10 @@ mod tests {
             vec![summary("Local work", 1, 1), summary("Newer", 3, 3)],
             None,
         );
-        assert_eq!(drawn(&sidebar), vec!["Newer", BLANK, "Local work"]);
+        assert_eq!(
+            drawn(&sidebar),
+            vec![BLANK, "Newer", BLANK, "Local work", BLANK]
+        );
 
         sidebar.adopt_outlook(studio);
         sidebar.refresh_after_outlook_workspace();
@@ -3705,11 +3739,11 @@ mod tests {
             .expect("the resolved Workspace asks again");
         assert_eq!(
             drawn(&sidebar),
-            vec!["Remote work"],
+            vec![BLANK, "Remote work", BLANK],
             "the Workspace resolving does not blank the column either"
         );
         sidebar.load(&request, vec![summary("Remote work", 2, 2)], None);
-        assert_eq!(drawn(&sidebar), vec!["Remote work"]);
+        assert_eq!(drawn(&sidebar), vec![BLANK, "Remote work", BLANK]);
     }
 
     fn driven() -> (Sidebar, SessionListRequest) {
