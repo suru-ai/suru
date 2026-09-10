@@ -4,7 +4,8 @@ use crate::{
     server_support::next_skill_catalog,
     support::{
         CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, ScriptedClaude, agent_messages, hosting,
-        list_models_arm, session_where, settled_session, user_turn_arm, version_arm,
+        hosting_runtime, list_models_arm, session_where, settled_session, user_turn_arm,
+        version_arm,
     },
 };
 use serde_json::Value;
@@ -524,6 +525,53 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
     );
 
     drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn claude_skill_discovery_survives_a_cli_that_lingers_after_its_stdin_closes() {
+    // A CLI started in a directory it has never seen can keep working past the closed pipe.
+    // Forcing it down is cleanup; the catalog it already answered with is what the user asked for.
+    let claude = ScriptedClaude::new(&format!(
+        r#"{}{}    *'"subtype":"initialize"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"commands":[],"agents":[],"output_style":"default","account":{{"email":"fixture@example.com","apiProvider":"firstParty"}}}}}}}}'
+      ;;
+    *'"subtype":"reload_skills"'*)
+      printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"skills":[{{"name":"review","description":"Review the current change (project)","argumentHint":""}}]}}}}}}'
+      sleep 30
+      ;;
+"#,
+        version_arm(CLAUDE_SUGGESTED_VERSION),
+        list_models_arm(CLAUDE_MODELS),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let runtime = suru::provider::ClaudeRuntime::new(claude.executable())
+        .with_process_exit_grace(std::time::Duration::from_millis(50));
+    let (server, mut client) = hosting_runtime(
+        runtime,
+        "claude-lingering-skill-discovery",
+        state_dir.path(),
+    )
+    .await;
+
+    let catalog = fresh_catalog(&mut client, workspace.path()).await;
+
+    assert!(
+        matches!(catalog.status, SkillCatalogStatus::Fresh { warning: None }),
+        "a CLI forced down after answering still yields a fresh Catalog, got {:?}",
+        catalog.status
+    );
+    assert_eq!(
+        catalog
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        ["review"]
+    );
+
     drop(client);
     server.shutdown().await.expect("shut down server");
 }

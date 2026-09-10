@@ -1342,12 +1342,18 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
     if request.description.trim().is_empty() {
         return preparation_error("Prompt must contain non-whitespace text");
     }
+    // A dropped handler leaves no response and no final record; the guard logs that so a
+    // preparation that stalls silently can be traced to the request ending early.
+    let mut progress = PreparationProgress::begin(request.id);
     // Stable ID allocation and persistence precede Git mutation. The repository
     // guard is also used by admission, and can cover recovery/removal operations.
     let _serial = state.preparations.serial.lock().await;
     let mut planned_guard = None;
     let mut preparation = match state.preparations.load(request.id) {
-        Ok(Some(plan)) => plan,
+        Ok(Some(plan)) => {
+            progress.stage("resuming retained preparation");
+            plan
+        }
         Ok(None) => match state
             .source_control
             .plan_checkout(&request, &state.preparations.channel)
@@ -1356,21 +1362,33 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
             Ok((plan, guard)) => {
                 planned_guard = Some(guard);
                 if let Err(e) = state.preparations.save(&plan) {
-                    return preparation_error(e);
+                    return progress.reject(preparation_error(e));
                 }
+                progress.stage("planned");
                 plan
             }
-            Err(e) => return preparation_error(e),
+            Err(e) => return progress.reject(preparation_error(e)),
         },
-        Err(e) => return preparation_error(e),
+        Err(e) => return progress.reject(preparation_error(e)),
     };
+    tracing::info!(
+        preparation = %preparation.id.0,
+        provider = %request.provider,
+        source = %preparation.source.path.display(),
+        destination = %preparation.destination.path.display(),
+        checkout_created = preparation.checkout_created,
+        "Worktree preparation started"
+    );
     let source =
         std::fs::canonicalize(&request.source.path).unwrap_or_else(|_| request.source.path.clone());
     if source != preparation.source.path && source != preparation.destination.path {
-        return preparation_error("Preparation identity belongs to another execution location");
+        return progress.reject(preparation_error(
+            "Preparation identity belongs to another execution location",
+        ));
     }
     match rejoin_preparation(&state, &mut preparation).await {
         Ok(Some(_)) => {
+            progress.finish(&preparation, None);
             return Json(PrepareCheckoutResult {
                 preparation,
                 location: None,
@@ -1380,6 +1398,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         }
         Ok(None) => {}
         Err(error) => {
+            progress.finish(&preparation, Some(&error));
             return Json(PrepareCheckoutResult {
                 preparation,
                 location: None,
@@ -1397,6 +1416,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
                 .await
         }
     };
+    progress.stage("repository mutation guard acquired");
     let mut location = None;
     let operation = async {
         state
@@ -1410,6 +1430,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         location = Some(resolved);
         preparation.checkout_created = true;
         state.preparations.save(&preparation)?;
+        progress.stage("checkout created");
         state
             .source_control
             .initialize_checkout(&preparation)
@@ -1421,6 +1442,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
                 &preparation,
             )
             .await?;
+        progress.stage("submodules ready; refreshing destination Skills");
         let catalog = tokio::time::timeout(
             state.timings.checkout_skill_timeout,
             state.skill_catalog.refresh_current(SkillCatalogRequest {
@@ -1456,12 +1478,93 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
     if let Err(e) = state.preparations.save(&preparation) {
         error = Some(e);
     }
+    progress.finish(&preparation, error.as_deref());
     Json(PrepareCheckoutResult {
         preparation,
         location,
         error,
     })
     .into_response()
+}
+
+/// Traces one Worktree preparation request from arrival to its response.
+///
+/// Every stage logs with the preparation's identity and elapsed time. A handler that is dropped
+/// before it answers, which happens when the Client's connection ends, logs the stage it was
+/// in, because that outcome otherwise leaves neither a response nor a final record behind.
+struct PreparationProgress {
+    id: crate::protocol::PreparationId,
+    started: std::time::Instant,
+    stage: &'static str,
+    finished: bool,
+}
+
+impl PreparationProgress {
+    fn begin(id: crate::protocol::PreparationId) -> Self {
+        Self {
+            id,
+            started: std::time::Instant::now(),
+            stage: "received",
+            finished: false,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+        tracing::info!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            "Worktree preparation: {stage}"
+        );
+    }
+
+    /// Ends tracing for a request refused before it reached a preparation record.
+    fn reject(mut self, response: Response) -> Response {
+        self.finished = true;
+        tracing::info!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            "Worktree preparation rejected"
+        );
+        response
+    }
+
+    fn finish(&mut self, preparation: &crate::protocol::PreparedCheckout, error: Option<&str>) {
+        self.finished = true;
+        match error {
+            None => tracing::info!(
+                preparation = %self.id.0,
+                elapsed_ms = self.elapsed_ms(),
+                ready = preparation.ready,
+                admitted = preparation.admitted_session.is_some(),
+                "Worktree preparation responded"
+            ),
+            Some(error) => tracing::warn!(
+                preparation = %self.id.0,
+                elapsed_ms = self.elapsed_ms(),
+                checkout_created = preparation.checkout_created,
+                "Worktree preparation responded with an error: {error}"
+            ),
+        }
+    }
+}
+
+impl Drop for PreparationProgress {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        tracing::warn!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            stage = self.stage,
+            "Worktree preparation handler ended before responding; the request was likely dropped"
+        );
+    }
 }
 
 /// An admitted initial Prompt is immutable even if a Client edits its retry.

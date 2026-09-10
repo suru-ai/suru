@@ -51,10 +51,16 @@ impl CodexSkills {
             )
             .await;
         connection.transport.close().await;
-        let stopped = connection.process.wait_until_stopped().await;
+        // Stopping the child is cleanup, not the operation the user asked for; the supervisor
+        // forces a lingering app-server down regardless, so a missed stop deadline only logs.
+        if let Err(error) = connection.process.wait_until_stopped().await {
+            tracing::warn!(
+                execution_directory = %execution_directory.display(),
+                "Codex Skill discovery process cleanup: {error}"
+            );
+        }
         let result =
             result.map_err(|error| codex_error_context("Codex Skill discovery failed", error))?;
-        stopped?;
         let listed: NativeSkillsList = serde_json::from_value(result)
             .map_err(|_| codex_error("Codex returned an invalid skills/list response"))?;
         let mut entries = listed.data.into_iter();

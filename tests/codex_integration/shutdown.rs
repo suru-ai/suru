@@ -268,7 +268,10 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), "codex-forced-shutdown").expect("configure server"),
-        Arc::new(CodexRuntime::new(fixture.executable())),
+        Arc::new(
+            CodexRuntime::new(fixture.executable())
+                .with_process_exit_grace(Duration::from_millis(50)),
+        ),
     )
     .await
     .expect("spawn server");

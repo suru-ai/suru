@@ -90,15 +90,17 @@ impl ClaudeSkills {
         }
         .await;
         transport.close().await;
-        let stopped = process
-            .wait_until_stopped()
-            .await
-            .map_err(|error| claude_error_context(DISCOVERY_CONTEXT, error));
-
-        // Prefer the discovery error when there is one: stopping the child is cleanup, not the
-        // operation the user asked for. Either way, the short-lived process is gone first.
+        // Stopping the child is cleanup, not the operation the user asked for. A CLI that
+        // lingers past its exit grace is forced down by the supervisor either way, so a missed
+        // stop deadline is worth a Log line, never a failed discovery. The short-lived process
+        // is gone before the catalog is published.
+        if let Err(error) = process.wait_until_stopped().await {
+            tracing::warn!(
+                execution_directory = %execution_directory.display(),
+                "Claude Skill discovery process cleanup: {error}"
+            );
+        }
         let (initialized, listed) = listed?;
-        stopped?;
         let mut by_name = HashMap::<String, (NativeSkill, SafeMetadata)>::new();
         let mut invalid_entries = 0usize;
         for skill in listed.skills {

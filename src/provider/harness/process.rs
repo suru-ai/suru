@@ -29,7 +29,11 @@ use crate::{
     provider::{ProviderError, wait_for_shutdown},
 };
 
-const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
+/// How long a harness may take to exit on its own after its stdin closes before it is forced
+/// down. A CLI starting in a directory it has never seen (a fresh Worktree) can spend seconds
+/// on first-run setup before it notices the closed pipe; killing it that early turns routine
+/// cleanup into spurious failures.
+const PROCESS_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The harness server process a Provider runtime launches: its executable, the arguments that put
