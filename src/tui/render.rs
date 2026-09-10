@@ -66,6 +66,16 @@ const LANDING_LOGO: [&str; 7] = [
     "       ▄▀           ▄▀▀▄   █",
     "     ▀▀             ▀▄▄▀▄▄▀",
 ];
+/// Nerd Fonts `nf-cod-folder` (Codicons folder).
+const NF_COD_FOLDER: char = '\u{ea83}';
+/// Nerd Fonts `nf-md-monitor` (Material Design monitor).
+const NF_MD_MONITOR: char = '\u{f0379}';
+/// Nerd Fonts `nf-cod-git_branch` (Codicons git-branch).
+const NF_COD_GIT_BRANCH: char = '\u{ec6f}';
+/// Nerd Fonts `nf-cod-worktree` (Codicons worktree).
+const NF_COD_WORKTREE: char = '\u{ec7e}';
+/// Nerd Fonts `nf-cod-git_commit` (Codicons git-commit).
+const NF_COD_GIT_COMMIT: char = '\u{eafc}';
 const SESSION_HEADER_MINIMUM_HEIGHT: u16 = 8;
 /// Rows of air the layout keeps below the Transcript, so its last entry never
 /// abuts whatever is docked underneath.
@@ -2873,6 +2883,35 @@ impl CheckoutStateLabel {
     }
 }
 
+fn icon_label(show_icons: bool, icon: char, label: &str) -> String {
+    if show_icons {
+        format!("{icon} {label}")
+    } else {
+        label.to_owned()
+    }
+}
+
+fn checkout_state_context(
+    reading: &crate::protocol::CheckoutSummary,
+    show_icons: bool,
+) -> Option<String> {
+    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
+
+    let label = CheckoutStateLabel::read(reading)?;
+    if !show_icons || reading.availability != SourceControlAvailability::Available {
+        return Some(label.text());
+    }
+    let icon = match &reading.revision {
+        Some(CheckoutRevision::Branch { .. }) => match reading.association.kind {
+            CheckoutKind::Main => NF_COD_GIT_BRANCH,
+            CheckoutKind::Linked => NF_COD_WORKTREE,
+        },
+        Some(CheckoutRevision::Detached { .. }) => NF_COD_GIT_COMMIT,
+        None => return Some(label.text()),
+    };
+    Some(icon_label(true, icon, &label.state))
+}
+
 /// One Session set aside, as the single slim line the settled shelf gives it:
 /// what the work was, and how long ago it ended.
 fn sidebar_settled_row_line(
@@ -3105,6 +3144,7 @@ fn render_landing(
     slots: &RenderSlots,
     theme: &Theme,
 ) -> RenderedComposer {
+    let show_icons = state.settings().appearance.show_icons;
     let detail = ResponsiveDetail::for_width(area.width);
     let footer_detail = detail.secondary_only_when(area.height >= LANDING_DETAILS_MINIMUM_HEIGHT);
     let footer_width = area
@@ -3222,28 +3262,33 @@ fn render_landing(
                     // stands in front of the one the resolution carried.
                     let checkout = state
                         .execution_checkout_state()
-                        .and_then(CheckoutStateLabel::read)
-                        .map(|checkout| format!(" · {}", checkout.text()))
+                        .and_then(|checkout| checkout_state_context(checkout, show_icons))
+                        .map(|checkout| format!(" · {checkout}"))
                         .unwrap_or_default();
                     // A pending intent is only ever said where there is a
                     // Repository to make the Worktree in.
                     let intent =
                         if state.new_worktree.is_some() && state.workspace.repository.is_some() {
-                            " · New Worktree on submit"
+                            format!(
+                                " · {}",
+                                icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
+                            )
                         } else {
-                            ""
+                            String::new()
                         };
                     format!("{label}{status}{checkout}{intent}")
                 }
-                None => format!(
-                    "{} · {}",
-                    workspace_context(state, &state.workspace.path, true),
-                    if state.new_worktree.is_some() {
-                        "New Worktree on submit"
+                None => {
+                    let intent = if state.new_worktree.is_some() {
+                        icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
                     } else {
-                        "Choose a working copy to start a Session"
-                    }
-                ),
+                        "Choose a working copy to start a Session".to_owned()
+                    };
+                    format!(
+                        "{} · {intent}",
+                        workspace_context(state, &state.workspace.path, true)
+                    )
+                }
             },
             usize::from(panel.width),
         ))
@@ -3847,16 +3892,22 @@ fn render_session_header(
     detail: ResponsiveDetail,
     theme: &Theme,
 ) {
+    let show_icons = state.settings().appearance.show_icons;
     let connection = connection_status_text(state, ResponsiveDetail::CoreOnly);
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
     let mut orientation = if detail.shows_secondary() {
-        state.workspace_name(&state.outlook, &snapshot.session.workspace.path)
+        icon_label(
+            show_icons,
+            NF_COD_FOLDER,
+            &state.workspace_name(&state.outlook, &snapshot.session.workspace.path),
+        )
     } else {
         String::new()
     };
     if let Some(remote) = state.outlook.remote_name() {
-        orientation = [remote, orientation.as_str()]
+        let remote = icon_label(show_icons, NF_MD_MONITOR, remote);
+        orientation = [remote.as_str(), orientation.as_str()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
@@ -3868,7 +3919,7 @@ fn render_session_header(
             .as_ref()
             .zip(snapshot.session.checkout.as_ref())
             .and_then(|(reference, checkout)| state.checkout_state(&reference.origin, &checkout.id))
-        && let Some(branch) = checkout_branch_context(checkout)
+        && let Some(branch) = checkout_branch_context(checkout, show_icons)
     {
         orientation.push_str(" · ");
         orientation.push_str(&branch);
@@ -3923,7 +3974,10 @@ fn render_session_header(
 /// A Session header names the branch its Worktree stands on beside the
 /// Workspace, and stays quiet where there is no branch to name: a detached
 /// commit or an unreadable Worktree is not orientation.
-fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Option<String> {
+fn checkout_branch_context(
+    checkout: &crate::protocol::CheckoutSummary,
+    show_icons: bool,
+) -> Option<String> {
     use crate::protocol::{CheckoutRevision, SourceControlAvailability};
 
     if checkout.availability != SourceControlAvailability::Available
@@ -3931,7 +3985,7 @@ fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Optio
     {
         return None;
     }
-    CheckoutStateLabel::read(checkout).map(|label| label.text())
+    checkout_state_context(checkout, show_icons)
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
@@ -4311,9 +4365,20 @@ fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String 
 }
 
 fn workspace_context(state: &TuiState, path: &std::path::Path, show_path: bool) -> String {
-    let remote = state.outlook.remote_name();
-    let path = show_path.then(|| state.workspace_label(&state.outlook, path));
+    let show_icons = state.settings().appearance.show_icons;
+    let remote = state
+        .outlook
+        .remote_name()
+        .map(|remote| icon_label(show_icons, NF_MD_MONITOR, remote));
+    let path = show_path.then(|| {
+        icon_label(
+            show_icons,
+            NF_COD_FOLDER,
+            &state.workspace_label(&state.outlook, path),
+        )
+    });
     remote
+        .as_deref()
         .into_iter()
         .chain(path.as_deref())
         .collect::<Vec<_>>()

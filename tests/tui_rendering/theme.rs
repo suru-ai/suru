@@ -34,6 +34,7 @@ fn themed_in_mode(name: &str, mode: AppearanceMode) -> EffectiveSettings {
             theme: name.to_owned(),
             mode,
             landing_page: suru::protocol::LandingPage::Fancy,
+            show_icons: false,
         },
         ..EffectiveSettings::default()
     }

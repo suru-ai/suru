@@ -155,6 +155,61 @@ async fn appearance_mode_round_trips_byte_preservingly_and_reaches_every_client(
 }
 
 #[tokio::test]
+async fn nerd_font_icons_round_trip_byte_preservingly_and_reach_every_client() {
+    assert!(
+        !suru::protocol::EffectiveSettings::default()
+            .appearance
+            .show_icons,
+        "Nerd Font icons stay off until the reader asks for them"
+    );
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // My terminal uses a Nerd Font.\n",
+        "  \"appearance\": { \"showIcons\":    true },\n",
+        "  \"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-icons")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-icons").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-icons").await;
+
+    assert!(opening.settings.appearance.show_icons);
+    assert_eq!(
+        opening.pinned,
+        ["appearance.showIcons", "transcript.reasoningVisibility"]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = editor
+        .mutate_setting(SettingMutation::AppearanceShowIcons { value: Some(false) })
+        .await
+        .expect("hide Nerd Font icons");
+    assert!(!answered.settings.appearance.show_icons);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, answered);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        original.replace("true", "false"),
+        "only the Show icons pin's bytes change"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn an_invalid_appearance_mode_is_ignored_alone_and_names_all_three_accepted_values() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");

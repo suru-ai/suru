@@ -164,6 +164,11 @@ fn key(app: &mut Application, key: KeyCode) -> ApplicationTransition {
 fn text(app: &Application) -> String {
     rendered_application_rows_at(app, 160, 30).join("\n")
 }
+fn show_icons(app: &mut Application) {
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(app, settings);
+}
 fn open(app: &mut Application, context: ResolvedWorkspace) {
     let transition = command(app, SemanticCommandId::WorktreeList);
     answer(app, transition, context);
@@ -352,6 +357,100 @@ fn the_landing_names_the_current_checkout_state_and_prefers_the_live_reading() {
     let rendered = text(&app);
     assert!(rendered.contains("feature/moved (worktree)"), "{rendered}");
     assert!(!rendered.contains("feature/landing"), "{rendered}");
+}
+
+#[test]
+fn landing_icons_decorate_the_location_checkout_and_pending_worktree() {
+    let layout = Layout::new();
+    let mut linked = layout.context.clone();
+    linked.checkouts[1].revision = Some(CheckoutRevision::Branch {
+        name: "feature/landing-icons".to_owned(),
+        commit: Some("1234567890abcdef".to_owned()),
+    });
+    let mut app = layout.app();
+    show_icons(&mut app);
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, linked);
+    key(&mut app, KeyCode::Esc);
+
+    let rendered = text(&app);
+    let location = Path::new("~").join("linked").join("nested");
+    assert!(
+        rendered.contains(&format!(" {}", location.display())),
+        "{rendered}"
+    );
+    assert!(rendered.contains(" feature/landing-icons"), "{rendered}");
+    assert!(!rendered.contains("(worktree)"), "{rendered}");
+
+    choose_new(&mut app, &layout);
+    let pending = text(&app);
+    assert!(pending.contains(" New Worktree on submit"), "{pending}");
+}
+
+#[test]
+fn landing_icons_distinguish_main_detached_and_unavailable_checkout_states() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    show_icons(&mut app);
+
+    let mut main = layout.at(&layout.main);
+    main.checkouts[0].revision = Some(CheckoutRevision::Branch {
+        name: "main".to_owned(),
+        commit: Some("1234567890abcdef".to_owned()),
+    });
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, main);
+    key(&mut app, KeyCode::Esc);
+    assert!(text(&app).contains(" main"), "{}", text(&app));
+
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, layout.context.clone());
+    key(&mut app, KeyCode::Esc);
+    let detached = text(&app);
+    assert!(detached.contains(" abcdef0"), "{detached}");
+    assert!(!detached.contains("(worktree)"), "{detached}");
+
+    let mut unavailable = layout.context.clone();
+    unavailable.checkouts[1].availability = SourceControlAvailability::Unavailable {
+        reason: "gone".to_owned(),
+    };
+    let transition = command(&mut app, SemanticCommandId::WorktreeList);
+    answer(&mut app, transition, unavailable);
+    key(&mut app, KeyCode::Esc);
+    let unavailable = text(&app);
+    assert!(unavailable.contains("[unavailable]"), "{unavailable}");
+    assert!(!unavailable.contains(''));
+    assert!(!unavailable.contains(''));
+    assert!(!unavailable.contains(''));
+}
+
+#[test]
+fn landing_remote_and_path_icons_are_measured_by_existing_truncation() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    show_icons(&mut app);
+    crate::connecting::turn_to_studio(&mut app);
+    app.handle_event(ApplicationEvent::WorkspaceResolved {
+        outlook: Outlook::Remote("studio".to_owned()),
+        surface: suru::tui::WorkspaceResolutionSurface::Outlook,
+        request_id: 2,
+        result: Ok(layout.context.clone()),
+    })
+    .unwrap();
+
+    let wide = text(&app);
+    assert!(wide.contains("󰍹 studio ·  "), "{wide}");
+
+    let narrow = rendered_application_rows_at(&app, 28, 20)
+        .into_iter()
+        .find(|row| row.contains("󰍹 studio"))
+        .expect("narrow Landing location row");
+    assert!(narrow.contains('…'), "{narrow}");
+    assert_eq!(
+        unicode_width::UnicodeWidthStr::width(narrow.trim()),
+        26,
+        "the two horizontal padding cells leave 26 measured columns: {narrow}"
+    );
 }
 
 /// Turning the Outlook is turning toward another Server's world. The Landing

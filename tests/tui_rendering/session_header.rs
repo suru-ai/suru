@@ -1,6 +1,7 @@
 //! The viewed Session's Title stays centered between the header indicators.
 use crate::support::{
-    connected_application, enter_session, rendered_application_rows_at, workspace_dir,
+    connected_application, enter_session, navigable_session_snapshot, rendered_application_rows_at,
+    workspace_dir,
 };
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
@@ -22,6 +23,21 @@ fn settings(application: &mut Application, emoji: EmojiVisibility) {
             SettingsSnapshot {
                 settings,
                 pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .unwrap();
+}
+
+fn enable_icons(application: &mut Application) {
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.appearance.show_icons = true;
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings,
+                pinned: vec!["appearance.showIcons".to_owned()],
                 diagnostics: Vec::new(),
             },
         )))
@@ -115,6 +131,74 @@ fn branch_name_follows_the_workspace_name_in_the_session_header() {
         !narrow.contains("feature/header-context") && !narrow.trim_start().starts_with('·'),
         "a hidden workspace path leaves no branch or orphan separator: {narrow}"
     );
+}
+
+#[test]
+fn icons_identify_the_workspace_and_worktree_in_the_session_header() {
+    let workspace = workspace_dir();
+    for (kind, icon, legacy_suffix) in [
+        (CheckoutKind::Main, '\u{ec6f}', ""),
+        (CheckoutKind::Linked, '\u{ec7e}', " (worktree)"),
+    ] {
+        let mut application =
+            application_with_checkout_branch(workspace.path(), kind, "feature/icons", false);
+        enable_icons(&mut application);
+
+        let row = header(&application, 240);
+        assert!(
+            row.contains(&format!(
+                "\u{ea83} {} · {icon} feature/icons",
+                workspace.path().file_name().unwrap().to_string_lossy()
+            )),
+            "{row}"
+        );
+        assert!(!row.contains("(worktree)"), "{row}");
+        let narrow = header(&application, 40);
+        assert!(
+            !narrow.contains('\u{ea83}') && !narrow.contains(icon),
+            "icons disappear with their labels at narrow widths: {narrow}"
+        );
+
+        settings(&mut application, EmojiVisibility::Hidden);
+        let plain = header(&application, 240);
+        assert!(
+            plain.contains(&format!(" · feature/icons{legacy_suffix}")),
+            "{plain}"
+        );
+        assert!(
+            !plain.contains('\u{ea83}') && !plain.contains(icon),
+            "{plain}"
+        );
+    }
+}
+
+#[test]
+fn remote_header_icons_preserve_the_centered_title_and_compact_remote_label() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    enable_icons(&mut application);
+    crate::connecting::turn_to_studio(&mut application);
+    let mut snapshot =
+        navigable_session_snapshot(suru::protocol::SessionId::new(), workspace.path(), 1);
+    snapshot.title = "Alpha".into();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+
+    let row = header(&application, 240);
+    assert!(row.contains("\u{f0379} studio · \u{ea83} "), "{row}");
+    assert_eq!(
+        row.find("Alpha")
+            .map(|offset| row[..offset].chars().count()),
+        Some((240 - 5) / 2),
+        "{row}"
+    );
+    for width in [28, 40] {
+        let row = header(&application, width);
+        assert!(row.contains("\u{f0379} studio"), "width {width}: {row}");
+        assert!(!row.contains('\u{ea83}'), "width {width}: {row}");
+        assert!(row.contains("Connected"), "width {width}: {row}");
+    }
 }
 
 #[test]

@@ -1062,6 +1062,7 @@ pub struct AppearanceSettings {
     pub theme: String,
     pub mode: AppearanceMode,
     pub landing_page: LandingPage,
+    pub show_icons: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -1070,6 +1071,7 @@ impl Default for AppearanceSettings {
             theme: "system".to_owned(),
             mode: AppearanceMode::System,
             landing_page: LandingPage::Minimal,
+            show_icons: false,
         }
     }
 }
@@ -1345,6 +1347,9 @@ pub enum SettingMutation {
     },
     AppearanceLandingPage {
         value: Option<LandingPage>,
+    },
+    AppearanceShowIcons {
+        value: Option<bool>,
     },
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,

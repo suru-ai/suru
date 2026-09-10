@@ -48,6 +48,7 @@ pub const FALLBACK_CONFIG_FILE: &str = "suru.json";
 const APPEARANCE_THEME: &str = "appearance.theme";
 const APPEARANCE_MODE: &str = "appearance.mode";
 const APPEARANCE_LANDING_PAGE: &str = "appearance.landingPage";
+const APPEARANCE_SHOW_ICONS: &str = "appearance.showIcons";
 const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
@@ -481,6 +482,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::AppearanceLandingPage { value } => {
             *value == Some(settings.appearance.landing_page)
         }
+        SettingMutation::AppearanceShowIcons { value } => {
+            *value == Some(settings.appearance.show_icons)
+        }
         SettingMutation::TextSelectionCopy { value } => {
             *value == Some(settings.text_selection.copy)
         }
@@ -624,6 +628,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |landing_page| {
                 settings.appearance.landing_page = landing_page;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: APPEARANCE_SHOW_ICONS,
+        label: "Show icons",
+        description: "Show Nerd Font icons. Requires a Nerd Font in your terminal.",
+        group: SettingGroup::Appearance,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "false",
+                build_mutation: || SettingMutation::AppearanceShowIcons { value: Some(false) },
+            },
+            SettingChoice {
+                value: "true",
+                build_mutation: || SettingMutation::AppearanceShowIcons { value: Some(true) },
+            },
+        ]),
+        reset: SettingMutation::AppearanceShowIcons { value: None },
+        apply: |settings, value| {
+            apply_value(value, |show_icons| {
+                settings.appearance.show_icons = show_icons;
             })
         },
     },
@@ -1315,6 +1342,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::AppearanceLandingPage { value } => {
             (APPEARANCE_LANDING_PAGE, pinned(value))
         }
+        SettingMutation::AppearanceShowIcons { value } => (APPEARANCE_SHOW_ICONS, pinned(value)),
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
         }
@@ -1846,6 +1874,7 @@ mod tests {
                 "one of \"system\" or a Theme name".to_owned(),
                 "one of \"system\", \"dark\", or \"light\"".to_owned(),
                 "one of \"Minimal\" or \"Fancy\"".to_owned(),
+                "one of false or true".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),

@@ -441,6 +441,22 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
 }
 
 #[test]
+fn appearance_offers_icons_disabled_by_default_and_explains_the_font_requirement() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Appearance");
+
+    assert!(row(&application, "Show icons").contains("false [default]"));
+    focus_setting(&mut application, "appearance.showIcons");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Requires a Nerd Font")
+    );
+}
+
+#[test]
 fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     let workspace = workspace_dir();
     let settings = EffectiveSettings {
