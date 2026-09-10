@@ -427,6 +427,8 @@ pub struct TuiState {
     /// read only at draw time — never by the transcript projection (ADR 0009).
     pub(super) spinner_frame: usize,
     pub(super) shimmer_clock: super::shimmer::Clock,
+    pub(super) rail_origins:
+        RefCell<HashMap<SessionReference, (crate::protocol::SessionTimestamp, usize)>>,
     /// Whether the last frame actually drew current-Session animation. A
     /// Working Indicator that scrolled away cannot justify 32ms redraws.
     pub(super) session_animation_on_screen: Cell<bool>,
@@ -610,6 +612,7 @@ impl TuiState {
             transcript_generation: 0,
             spinner_frame: 0,
             shimmer_clock: super::shimmer::Clock::default(),
+            rail_origins: RefCell::new(HashMap::new()),
             session_animation_on_screen: Cell::new(false),
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),

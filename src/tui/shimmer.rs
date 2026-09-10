@@ -104,6 +104,33 @@ fn shimmer_style(primary: Style, subdued: Style, intensity: f64, truecolor: bool
     }
 }
 
+/// A two-second fade to half opacity and two seconds back, beginning at full
+/// strength. Unknown terminal backgrounds and limited colors use dim instead.
+pub(super) fn fade_style(style: Style, frame: usize, truecolor: bool) -> Style {
+    let elapsed = (frame as u128 * TICK_PERIOD.as_micros()) % 4_000_000;
+    let opacity = 0.75 + 0.25 * (elapsed as f64 * PI / 2_000_000.0).cos();
+    if elapsed == 0 {
+        return style;
+    }
+    if truecolor
+        && let (Some(foreground), Some(background)) = (style.fg, style.bg)
+        && foreground != Color::Reset
+        && background != Color::Reset
+        && let (Some(fg), Some(bg)) = (color_channels(foreground), color_channels(background))
+    {
+        return style.fg(Color::Rgb(
+            blend(bg.0, fg.0, opacity),
+            blend(bg.1, fg.1, opacity),
+            blend(bg.2, fg.2, opacity),
+        ));
+    }
+    if opacity < 0.75 {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
 fn blend(from: u8, to: u8, intensity: f64) -> u8 {
     (f64::from(from) + (f64::from(to) - f64::from(from)) * intensity).round() as u8
 }

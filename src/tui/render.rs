@@ -149,7 +149,7 @@ pub(super) fn render_with_slots(
         render_terminal_too_small(frame, theme);
         return;
     }
-    let main = render_sidebar(frame, state, theme);
+    let main = render_sidebar(frame, state, theme, truecolor);
     let main = render_application_notice(frame, state, main, slots, theme);
     let composer = if state.session.is_some() {
         render_session(frame, state, main, slots, theme, truecolor)
@@ -2191,7 +2191,7 @@ fn render_subagent_picker(
 /// Draws the Sidebar down the left of the frame and reports what is left for
 /// the main view — the whole frame when the reader has the Sidebar hidden, or
 /// when the terminal cannot spare its columns.
-fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rect {
+fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme, truecolor: bool) -> Rect {
     let frame_area = frame.area();
     if !state.sidebar.is_revealed() {
         return frame_area;
@@ -2222,7 +2222,7 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
     frame.render_widget(block, column);
     let (lines, rows, rails) = sidebar_lines(state, content, theme);
     frame.render_widget(Paragraph::new(lines).style(theme.surface.elevated), content);
-    paint_standing_rails(frame, &rails, inside.x, theme);
+    paint_standing_rails(frame, &rails, inside.x, theme, state, truecolor);
     state
         .selection_frames
         .borrow_mut()
@@ -2252,7 +2252,22 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) -> Rec
 /// Needs Intervention has no producer yet; issue #168
 /// (<https://github.com/jake-tucker/suru/issues/168>) tracks the Approval and Input labels that
 /// will eventually feed it.
-fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u16, theme: &Theme) {
+fn paint_standing_rails(
+    frame: &mut Frame<'_>,
+    rails: &[StandingRail],
+    column: u16,
+    theme: &Theme,
+    state: &TuiState,
+    truecolor: bool,
+) {
+    let mut origins = state.rail_origins.borrow_mut();
+    origins.retain(|reference, _| {
+        rails.iter().any(|rail| {
+            rail.working
+                .as_ref()
+                .is_some_and(|(working, _)| working == reference)
+        })
+    });
     let buffer = frame.buffer_mut();
     for rail in rails {
         let feedback = rail.standing.presentation().feedback.style(theme);
@@ -2261,6 +2276,16 @@ fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u
         } else {
             feedback
         };
+        let animation_frame = rail.working.as_ref().map(|(reference, since)| {
+            let (previous_since, origin) = origins
+                .entry(reference.clone())
+                .or_insert((*since, state.spinner_frame));
+            if previous_since != since {
+                *previous_since = *since;
+                *origin = state.spinner_frame;
+            }
+            state.spinner_frame.wrapping_sub(*origin)
+        });
         for row in rail.rows.clone() {
             if let Some(cell) = buffer.cell_mut(Position::new(column, row)) {
                 if rail.focused {
@@ -2268,12 +2293,20 @@ fn paint_standing_rails(frame: &mut Frame<'_>, rails: &[StandingRail], column: u
                 }
                 cell.set_symbol("▎");
                 cell.set_style(style);
+                if let Some(animation_frame) = animation_frame {
+                    cell.set_style(shimmer::fade_style(
+                        cell.style(),
+                        animation_frame,
+                        truecolor,
+                    ));
+                }
             }
         }
     }
 }
 
 struct StandingRail {
+    working: Option<(crate::protocol::SessionReference, SessionTimestamp)>,
     rows: std::ops::Range<u16>,
     standing: SessionStanding,
     focused: bool,
@@ -2487,6 +2520,18 @@ fn sidebar_lines(
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
     let mut rails = Vec::new();
     for entry in entries {
+        let working = match &entry {
+            SidebarEntry::Row(row) if row.standing == Some(SessionStanding::Working) => {
+                match row.shelf {
+                    SidebarShelf::Active {
+                        working_since: Some(since),
+                        ..
+                    } => Some((row.reference.clone(), since)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let standing = entry.standing();
         let focused = driving && entry.is_focused();
         let target = entry.target();
@@ -2494,6 +2539,7 @@ fn sidebar_lines(
         let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
         if let Some(standing) = standing {
             rails.push(StandingRail {
+                working,
                 rows: top..bottom,
                 standing,
                 focused,
