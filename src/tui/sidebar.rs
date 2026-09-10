@@ -445,12 +445,14 @@ impl SidebarShelf<'_> {
     }
 }
 
-/// The Sidebar's body, top to bottom: the active Sessions, recovering Remotes,
-/// then — where there is a settled shelf to open — the divider and settled
-/// Sessions.
+/// The Sidebar's body, top to bottom: the active Sessions with space between
+/// them, recovering Remotes, then — where there is a settled shelf to open —
+/// the divider and settled Sessions.
 #[derive(Clone, Debug)]
 pub(super) enum SidebarEntry<'a> {
     Row(SidebarRow<'a>),
+    /// The blank line separating adjacent active Session rows.
+    Spacer,
     Unreachable(SidebarUnreachable<'a>),
     /// One Workspace the open selector offers, which stands in place of the
     /// shelves while the reader is choosing between them.
@@ -510,7 +512,11 @@ impl SidebarEntry<'_> {
     const fn lines(&self) -> usize {
         match self {
             Self::Row(row) => row.shelf.lines(),
-            Self::Unreachable(_) | Self::Divider | Self::ShowMore(_) | Self::Scope(_) => 1,
+            Self::Spacer
+            | Self::Unreachable(_)
+            | Self::Divider
+            | Self::ShowMore(_)
+            | Self::Scope(_) => 1,
         }
     }
 
@@ -519,7 +525,11 @@ impl SidebarEntry<'_> {
     const fn is_open(&self) -> bool {
         match self {
             Self::Row(row) => row.open,
-            Self::Unreachable(_) | Self::Scope(_) | Self::Divider | Self::ShowMore(_) => false,
+            Self::Spacer
+            | Self::Unreachable(_)
+            | Self::Scope(_)
+            | Self::Divider
+            | Self::ShowMore(_) => false,
         }
     }
 
@@ -531,7 +541,7 @@ impl SidebarEntry<'_> {
             Self::ShowMore(more) => more.focused,
             Self::Scope(scope) => scope.focused,
             Self::Unreachable(remote) => remote.focused,
-            Self::Divider => false,
+            Self::Spacer | Self::Divider => false,
         }
     }
 
@@ -540,7 +550,11 @@ impl SidebarEntry<'_> {
     pub(super) const fn standing(&self) -> Option<SessionStanding> {
         match self {
             Self::Row(row) => row.standing,
-            Self::Unreachable(_) | Self::Scope(_) | Self::Divider | Self::ShowMore(_) => None,
+            Self::Spacer
+            | Self::Unreachable(_)
+            | Self::Scope(_)
+            | Self::Divider
+            | Self::ShowMore(_) => None,
         }
     }
 
@@ -552,7 +566,7 @@ impl SidebarEntry<'_> {
             Self::ShowMore(_) => Some(SidebarTarget::ShowMore),
             Self::Scope(scope) => Some(SidebarTarget::Scope(scope.scope.clone())),
             Self::Unreachable(remote) => Some(SidebarTarget::Unreachable(remote.outlook.clone())),
-            Self::Divider => None,
+            Self::Spacer | Self::Divider => None,
         }
     }
 }
@@ -1544,7 +1558,8 @@ impl Sidebar {
             && self.on_screen.get()
             && self.body().into_iter().any(|entry| match entry {
                 BodyEntry::Session(session, _) => session.working_since().is_some(),
-                BodyEntry::Unreachable(_)
+                BodyEntry::Spacer
+                | BodyEntry::Unreachable(_)
                 | BodyEntry::Scope(_)
                 | BodyEntry::Divider
                 | BodyEntry::ShowMore(_) => false,
@@ -2229,6 +2244,7 @@ impl Sidebar {
         self.body()
             .into_iter()
             .map(|entry| match entry {
+                BodyEntry::Spacer => SidebarEntry::Spacer,
                 BodyEntry::Divider => SidebarEntry::Divider,
                 BodyEntry::Unreachable(outlook) => SidebarEntry::Unreachable(SidebarUnreachable {
                     outlook,
@@ -2317,11 +2333,7 @@ impl Sidebar {
         if !self.query.is_empty() {
             return self.results(settlement);
         }
-        let mut body = self
-            .active(settlement)
-            .into_iter()
-            .map(|session| BodyEntry::Session(session, Standing::Active))
-            .collect::<Vec<_>>();
+        let mut body = active_session_entries(self.active(settlement));
         if self.scope == SidebarListingScope::Everywhere {
             body.extend(self.everywhere_origins.iter().filter_map(|outlook| {
                 self.recovering_origins
@@ -2381,17 +2393,18 @@ impl Sidebar {
     /// where the reader would have gone looking for it, and each keeps the
     /// shape its shelf gives it, so they can still tell live work from history.
     fn results(&self, settlement: Settlement) -> Vec<BodyEntry<'_>> {
-        self.active(settlement)
-            .into_iter()
-            .map(|session| (session, Standing::Active))
-            .chain(
-                self.settled(settlement)
-                    .into_iter()
-                    .map(|session| (session, Standing::Settled)),
-            )
-            .filter(|(session, _)| title_carries(&self.query, session.title()))
-            .map(|(session, standing)| BodyEntry::Session(session, standing))
-            .collect()
+        let mut results = active_session_entries(
+            self.active(settlement)
+                .into_iter()
+                .filter(|session| title_carries(&self.query, session.title())),
+        );
+        results.extend(
+            self.settled(settlement)
+                .into_iter()
+                .filter(|session| title_carries(&self.query, session.title()))
+                .map(|session| BodyEntry::Session(session, Standing::Settled)),
+        );
+        results
     }
 
     /// The settled shelf as one pass over the listing draws it: the rows on
@@ -2545,7 +2558,7 @@ impl Sidebar {
             BodyEntry::ShowMore(_) => Some(SidebarFocus::ShowMore),
             BodyEntry::Scope(scope) => Some(SidebarFocus::Scope(scope)),
             BodyEntry::Unreachable(outlook) => Some(SidebarFocus::Unreachable(outlook.clone())),
-            BodyEntry::Divider => None,
+            BodyEntry::Spacer | BodyEntry::Divider => None,
         });
         if self.selector_open {
             return rows.collect();
@@ -2675,6 +2688,7 @@ impl Sidebar {
 #[derive(Clone, Debug)]
 enum BodyEntry<'a> {
     Session(&'a ListedSession, Standing),
+    Spacer,
     Unreachable(&'a Outlook),
     /// One Workspace the open selector offers.
     Scope(SidebarListingScope),
@@ -2682,6 +2696,22 @@ enum BodyEntry<'a> {
     /// The affordance closing a capped settled shelf, and how many rows acting
     /// on it brings up.
     ShowMore(usize),
+}
+
+/// Active Session rows with exactly one blank line between neighbours. The
+/// spacer belongs to the body projection so line windowing, rendering, and
+/// pointer geometry all read the same layout.
+fn active_session_entries<'a>(
+    sessions: impl IntoIterator<Item = &'a ListedSession>,
+) -> Vec<BodyEntry<'a>> {
+    let mut entries = Vec::new();
+    for session in sessions {
+        if !entries.is_empty() {
+            entries.push(BodyEntry::Spacer);
+        }
+        entries.push(BodyEntry::Session(session, Standing::Active));
+    }
+    entries
 }
 
 /// Which of the Sidebar's two shelves a Session stands on, which is what
@@ -3037,7 +3067,38 @@ mod tests {
             None,
         );
 
-        assert_eq!(drawn(&sidebar), vec!["Newest", "Middle", "Oldest"]);
+        assert_eq!(
+            drawn(&sidebar),
+            vec!["Newest", BLANK, "Middle", BLANK, "Oldest"]
+        );
+    }
+
+    #[test]
+    fn active_sessions_have_one_blank_line_between_them() {
+        let sidebar = showing(vec![
+            summary("Older, still going", 1, 20),
+            set_aside("Ended last", 2, 10, 70),
+            set_aside("Ended first", 4, 90, 30),
+            summary("Newer, still going", 3, 80),
+        ]);
+
+        assert_eq!(
+            drawn_within(&sidebar, 7),
+            vec!["Newer, still going", BLANK, "Older, still going"],
+            "the blank line separates adjacent active Sessions without separating settled history"
+        );
+        assert_eq!(
+            drawn(&sidebar),
+            vec![
+                "Newer, still going",
+                BLANK,
+                "Older, still going",
+                DIVIDER,
+                "Ended last",
+                "Ended first",
+            ],
+            "the settled shelf stays compact and no blank trails the active list"
+        );
     }
 
     #[test]
@@ -3226,6 +3287,7 @@ mod tests {
             drawn(&sidebar),
             vec![
                 "Newer, still going",
+                BLANK,
                 "Older, still going",
                 DIVIDER,
                 "Ended last",
@@ -3461,6 +3523,7 @@ mod tests {
 
     /// What stands in for the divider where the Titles the Sidebar draws are
     /// read out in order.
+    const BLANK: &str = "<blank>";
     const DIVIDER: &str = "<divider>";
 
     /// A shelf of Sessions the reader set aside, the first of them the most
@@ -3603,6 +3666,7 @@ mod tests {
             .into_iter()
             .map(|entry| match entry {
                 SidebarEntry::Row(row) => row.title.to_owned(),
+                SidebarEntry::Spacer => BLANK.to_owned(),
                 SidebarEntry::Unreachable(remote) => {
                     format!("{} [unreachable]", remote.name)
                 }

@@ -2574,6 +2574,7 @@ fn sidebar_entry_lines(
     state: &TuiState,
 ) -> Vec<Line<'static>> {
     match entry {
+        SidebarEntry::Spacer => vec![Line::default()],
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
         SidebarEntry::Unreachable(remote) => {
             vec![sidebar_unreachable_line(remote, width, driving, theme)]
