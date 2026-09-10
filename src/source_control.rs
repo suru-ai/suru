@@ -122,6 +122,23 @@ pub trait SourceControl: Send + Sync {
                 },
             })
     }
+    /// Every Worktree this Repository presently has, named rather than read.
+    /// Checkout observation enumerates a known Repository through this on its
+    /// own cadence, so a Worktree added or removed outside Suru is picked up;
+    /// it is one call per Repository, and each named Worktree is then read by
+    /// [`SourceControl::observe`].
+    async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Vec<crate::protocol::CheckoutAssociation> {
+        self.discover(repository.presentation_path())
+            .await
+            .checkouts
+            .into_iter()
+            .filter(|reading| reading.association.repository == repository.id)
+            .map(|reading| reading.association)
+            .collect()
+    }
     /// Reuse a reading within one discovery batch only when the adapter can
     /// establish that this directory has the same nearest checkout.
     fn reuse_discovery(
@@ -324,6 +341,24 @@ impl SourceControlService {
                 })
                 .or_insert_with(|| repository.clone());
         }
+    }
+    /// Every Repository this Server has grouped a Workspace for, however it came
+    /// to know it — through a Session at startup, or through a Workspace
+    /// resolution since. Checkout observation watches all of their Worktrees,
+    /// including the ones no Session works in.
+    pub(crate) fn repositories(&self) -> Vec<Repository> {
+        self.repositories
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+    pub(crate) async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Vec<crate::protocol::CheckoutAssociation> {
+        self.adapter.list_checkouts(repository).await
     }
     pub(crate) fn workspaces(&self) -> Vec<Workspace> {
         self.repositories

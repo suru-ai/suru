@@ -1,5 +1,6 @@
 //! One bounded observation loop per Server. Catalog subscriptions express
-//! interest; Sessions sharing a checkout consume one reading per poll.
+//! interest; every Worktree of every Repository this Server knows is then read
+//! once per poll, and Sessions sharing a checkout share that one reading.
 use super::SessionStore;
 use crate::{protocol::*, source_control::SourceControlService};
 use futures_util::{StreamExt, stream};
@@ -24,6 +25,18 @@ impl SessionStore {
         (affected, working)
     }
 
+    /// Watch every Worktree of every Repository this Server knows, for as long
+    /// as some catalog subscriber is interested.
+    ///
+    /// The observed set is not the Sessions' checkouts: it is every Worktree of
+    /// every Repository a Workspace has been grouped for, whether that grouping
+    /// came from a Session at startup or from a Workspace resolution since,
+    /// together with the checkouts Sessions themselves name. A Worktree no
+    /// Session works in is watched exactly like one that several share.
+    ///
+    /// Each tick re-enumerates, so a Worktree added or removed outside Suru is
+    /// picked up, and the work stays bounded: one listing per Repository, then
+    /// one reading per distinct Worktree.
     pub(crate) fn observe_checkouts(
         &self,
         source_control: SourceControlService,
@@ -40,7 +53,7 @@ impl SessionStore {
                     _ = shutdown.changed() => break,
                     _ = ticker.tick() => {}
                 }
-                let checkouts = {
+                let session_checkouts = {
                     let mut state = sessions.state.lock().unwrap();
                     if !state.catalog.has_subscribers() {
                         // A later subscriber must not mistake an idle cached
@@ -48,6 +61,7 @@ impl SessionStore {
                         for record in state.sessions.values_mut() {
                             record.summary.checkout_state = None;
                         }
+                        state.observed_checkouts.clear();
                         continue;
                     }
                     state
@@ -58,6 +72,29 @@ impl SessionStore {
                         .map(|checkout| (checkout.id.clone(), checkout.clone()))
                         .collect::<HashMap<_, _>>()
                 };
+                let listings =
+                    stream::iter(source_control.repositories().into_iter().map(|repository| {
+                        let source_control = &source_control;
+                        async move { source_control.list_checkouts(&repository).await }
+                    }))
+                    .buffer_unordered(4);
+                tokio::pin!(listings);
+                let mut checkouts = session_checkouts;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => return,
+                        listed = listings.next() => {
+                            let Some(listed) = listed else { break };
+                            for association in listed {
+                                // A Session's own association carries the
+                                // recovery facts a listing cannot name.
+                                checkouts.entry(association.id.clone()).or_insert(association);
+                            }
+                        }
+                    }
+                }
+                sessions.retire_unobserved_checkouts(&checkouts);
                 let readings = stream::iter(checkouts.into_values().map(|checkout| {
                     let source_control = &source_control;
                     async move { source_control.observe(&checkout).await }
@@ -80,12 +117,41 @@ impl SessionStore {
         });
     }
 
+    /// Let go of the Worktrees this tick no longer observes, saying so once on
+    /// the catalog exactly as an ended interest does.
+    fn retire_unobserved_checkouts(&self, observed: &HashMap<CheckoutId, CheckoutAssociation>) {
+        let mut state = self.state.lock().unwrap();
+        let retired = state
+            .observed_checkouts
+            .keys()
+            .filter(|id| !observed.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for checkout_id in retired {
+            state.observed_checkouts.remove(&checkout_id);
+            for record in state.sessions.values_mut() {
+                if record
+                    .summary
+                    .session
+                    .checkout
+                    .as_ref()
+                    .is_some_and(|checkout| checkout.id == checkout_id)
+                {
+                    record.summary.checkout_state = None;
+                }
+            }
+            state.publish_catalog_change(SessionCatalogChange::CheckoutStateChanged {
+                checkout_id,
+                checkout_state: None,
+            });
+        }
+    }
+
     pub(crate) fn record_checkout(&self, mut reading: CheckoutSummary) -> anyhow::Result<()> {
         // Recovery fields are never part of the live reading.
         reading.association.recovery_revision = None;
         let mut state = self.state.lock().unwrap();
         let observed = state.catalog.has_subscribers();
-        let mut checkout_changed = false;
         let mut invalidated = Vec::new();
         for record in state.sessions.values_mut() {
             let Some(checkout) = record.summary.session.checkout.as_ref() else {
@@ -126,11 +192,7 @@ impl SessionStore {
                 record.summary.session = record.snapshot.session.clone();
                 let _ = record.updates.send(update);
             }
-            let live = observed.then(|| reading.clone());
-            if record.summary.checkout_state != live {
-                record.summary.checkout_state = live.clone();
-                checkout_changed = true;
-            }
+            record.summary.checkout_state = observed.then(|| reading.clone());
             if recovery_changed && record.summary.session.parent.is_none() {
                 invalidated.push(record.summary.session.id);
             }
@@ -138,9 +200,22 @@ impl SessionStore {
         for session_id in invalidated {
             state.publish_catalog_change(SessionCatalogChange::Invalidated { session_id });
         }
-        if checkout_changed {
+        // The Worktree's reading is the catalog's, not any one Session's: what
+        // decides whether to announce it is whether this Worktree's own last
+        // reading changed, so a Worktree no Session works in announces too.
+        let checkout_id = reading.association.id.clone();
+        let changed = if observed {
+            state
+                .observed_checkouts
+                .insert(checkout_id.clone(), reading.clone())
+                .as_ref()
+                != Some(&reading)
+        } else {
+            state.observed_checkouts.remove(&checkout_id).is_some()
+        };
+        if changed {
             state.publish_catalog_change(SessionCatalogChange::CheckoutStateChanged {
-                checkout_id: reading.association.id.clone(),
+                checkout_id,
                 checkout_state: observed.then_some(reading),
             });
         }

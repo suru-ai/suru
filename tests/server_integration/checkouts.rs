@@ -181,9 +181,24 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
         late.next().await,
         Some(ManagedEvent::Connected(_))
     ));
-    let Some(ManagedEvent::CheckoutStateChanged(initial_checkout)) = late.next().await else {
-        panic!("a late client receives the checkout reading from its catalog snapshot")
-    };
+    // The snapshot carries a reading for every observed Worktree, this
+    // Repository's Session-less main among them, in no order this test relies on.
+    let shared = before[0].session.checkout.clone().unwrap().id;
+    let initial_checkout = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match late.next().await {
+                Some(ManagedEvent::CheckoutStateChanged(changed))
+                    if changed.checkout_id == shared =>
+                {
+                    break changed;
+                }
+                Some(_) => {}
+                None => panic!("the late client's stream stays open"),
+            }
+        }
+    })
+    .await
+    .expect("a late client receives the checkout readings from its catalog snapshot");
     assert!(
         initial_checkout
             .checkout_state

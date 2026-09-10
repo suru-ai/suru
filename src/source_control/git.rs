@@ -580,6 +580,57 @@ impl SourceControl for GitSourceControl {
         self.observe_checkout(checkout, false).await
     }
 
+    /// One `worktree list` per Repository names its Worktrees; nothing here
+    /// reads or validates them, because the caller observes each in turn and
+    /// that reading is what says whether a root is still this Worktree.
+    async fn list_checkouts(&self, repository: &Repository) -> Vec<CheckoutAssociation> {
+        let Ok(output) = self
+            .command(
+                &repository.metadata_directory,
+                &["worktree", "list", "--porcelain", "-z"],
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        parse_worktrees(&output.stdout)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if entry.bare {
+                    return None;
+                }
+                // Separate metadata layouts report the metadata directory as the
+                // main Worktree. Only a main root the Repository already names is
+                // a root; anything else here is a label, never a working copy.
+                let root = if index == 0 {
+                    match &repository.location {
+                        RepositoryLocation::Main { root } => root.clone(),
+                        RepositoryLocation::Bare { .. } | RepositoryLocation::UnknownMain => {
+                            return None;
+                        }
+                    }
+                } else {
+                    canonical_checkout_path(&entry.root)
+                };
+                Some(CheckoutAssociation {
+                    recovery_revision: None,
+                    id: CheckoutId::from_root(&repository.id, &root),
+                    repository: repository.id.clone(),
+                    root,
+                    kind: if index == 0 {
+                        CheckoutKind::Main
+                    } else {
+                        CheckoutKind::Linked
+                    },
+                })
+            })
+            .collect()
+    }
+
     fn reuse_discovery(
         &self,
         directory: &Path,

@@ -77,6 +77,12 @@ struct SessionStoreState {
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
     catalog: SessionCatalogPublisher,
+    /// The current reading of every Worktree observation presently watches,
+    /// deduplicated by checkout id. It holds Worktrees no Session works in
+    /// alongside the ones Sessions reference, and is empty whenever no catalog
+    /// subscriber is expressing interest, so a reading is only ever one taken
+    /// during that interest.
+    observed_checkouts: HashMap<crate::protocol::CheckoutId, crate::protocol::CheckoutSummary>,
     deferred: Option<DeferredSessions>,
 }
 
@@ -159,6 +165,7 @@ impl SessionStore {
             prompts,
             last_timestamp,
             catalog,
+            observed_checkouts: HashMap::new(),
             deferred,
         };
         // Durable Turns reconstruct Working and Usage before any Session can
@@ -201,16 +208,13 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let root_records = state
+        let mut session_ids = state
             .sessions
             .iter()
             // A Subagent's child Session rides no catalog: every client lists
             // what the catalog holds, and a child joins no listing.
             .filter(|(_, record)| !record.snapshot.session.is_subagent())
-            .collect::<Vec<_>>();
-        let mut session_ids = root_records
-            .iter()
-            .map(|(session_id, _)| **session_id)
+            .map(|(session_id, _)| *session_id)
             .chain(
                 state
                     .unreadable_sessions
@@ -220,13 +224,15 @@ impl SessionStore {
             )
             .collect::<Vec<_>>();
         session_ids.sort_unstable_by_key(ToString::to_string);
-        let mut checkout_states = root_records
-            .into_iter()
-            .filter_map(|(_, record)| record.summary.checkout_state.clone())
+        // Every observed Worktree, not only the ones a Session references, so a
+        // client joining or rejoining takes the whole set at once.
+        let mut checkout_states = state
+            .observed_checkouts
+            .values()
+            .cloned()
             .collect::<Vec<_>>();
         checkout_states
             .sort_unstable_by(|left, right| left.association.id.cmp(&right.association.id));
-        checkout_states.dedup_by(|left, right| left.association.id == right.association.id);
         let (revision, updates) = state.catalog.subscribe();
         SessionCatalogFeed {
             snapshot: SessionCatalogSnapshot {

@@ -545,3 +545,133 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
     assert!(list(server.descriptor(), None).await.is_empty());
     server.shutdown().await.unwrap();
 }
+
+/// The next catalog change satisfying `wanted`, skipping the ones that do not.
+/// Several publishers share this one stream, and the Worktree readings this
+/// module waits on are announced on observation's own cadence.
+macro_rules! await_catalog_change {
+    ($catalog:expr, $wanted:expr) => {
+        tokio::time::timeout(PROGRESS_DEADLINE, async {
+            loop {
+                let event = $catalog.next().await.unwrap().unwrap();
+                if event.event != SESSION_CATALOG_UPDATED_EVENT {
+                    continue;
+                }
+                let update: SessionCatalogUpdate = serde_json::from_str(&event.data).unwrap();
+                if $wanted(&update.change) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the awaited catalog change is announced")
+    };
+}
+
+/// A Worktree no Session works in is still the owning Server's to watch: once a
+/// Workspace resolution makes the Repository known, every Worktree it has joins
+/// the observed set, lands whole in the catalog snapshot a client joins on, and
+/// announces its own external branch changes.
+#[tokio::test]
+async fn known_repository_worktrees_are_observed_without_any_session_referencing_them() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = canonical(temporary.path());
+    let main = root.join("main");
+    init(&main);
+    let spare = root.join("spare");
+    git(
+        &main,
+        &["worktree", "add", "-b", "spare", spare.to_str().unwrap()],
+    );
+    let timings = ServerTimings {
+        shutdown_grace: std::time::Duration::from_millis(5),
+        ..Default::default()
+    }
+    .with_checkout_observation_interval(std::time::Duration::from_millis(15));
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(root.join("state"), "session-less-worktrees").unwrap(),
+        Arc::new(FailingProviderRuntime),
+        timings,
+    )
+    .await
+    .unwrap();
+    let descriptor = server.descriptor();
+    // The Server knows this Repository through the resolution alone: no Session
+    // exists here, or anywhere.
+    let resolved = resolve(descriptor, &main, None).await;
+    let checkout_id = |wanted: &Path| {
+        resolved
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.association.root == wanted)
+            .unwrap_or_else(|| panic!("{} is a Worktree of this Repository", wanted.display()))
+            .association
+            .id
+            .clone()
+    };
+    let main_id = checkout_id(&main);
+    let spare_id = checkout_id(&spare);
+    let mut catalog = request(descriptor, reqwest::Method::GET, "/v1/session-events")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream()
+        .eventsource();
+    let opening = tokio::time::timeout(PROGRESS_DEADLINE, catalog.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(opening.event, SESSION_CATALOG_SNAPSHOT_EVENT);
+    fn reading(change: &SessionCatalogChange, wanted_id: &CheckoutId, wanted: &str) -> bool {
+        matches!(
+            change,
+            SessionCatalogChange::CheckoutStateChanged { checkout_id, checkout_state: Some(state) }
+                if checkout_id == wanted_id
+                    && state.availability == SourceControlAvailability::Available
+                    && matches!(&state.revision, Some(CheckoutRevision::Branch { name, .. }) if name == wanted)
+        )
+    }
+    // Which Worktree's reading lands first is a race this test has no stake in.
+    let mut seen = std::collections::HashSet::new();
+    await_catalog_change!(catalog, |change: &SessionCatalogChange| {
+        if reading(change, &spare_id, "spare") {
+            seen.insert(&spare_id);
+        }
+        if reading(change, &main_id, "main") {
+            seen.insert(&main_id);
+        }
+        seen.len() == 2
+    });
+    // A client joining now takes both readings whole, though no Session names
+    // either Worktree.
+    let mut rejoined = request(descriptor, reqwest::Method::GET, "/v1/session-events")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream()
+        .eventsource();
+    let snapshot = tokio::time::timeout(PROGRESS_DEADLINE, rejoined.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.event, SESSION_CATALOG_SNAPSHOT_EVENT);
+    let snapshot: SessionCatalogSnapshot = serde_json::from_str(&snapshot.data).unwrap();
+    assert!(snapshot.session_ids.is_empty());
+    let mut observed = snapshot
+        .checkout_states
+        .iter()
+        .map(|state| state.association.root.clone())
+        .collect::<Vec<_>>();
+    observed.sort();
+    let mut expected = vec![main.clone(), spare.clone()];
+    expected.sort();
+    assert_eq!(observed, expected);
+    drop(rejoined);
+    // Switching the Session-less Worktree's branch outside Suru is announced.
+    git(&spare, &["checkout", "-b", "moved"]);
+    await_catalog_change!(catalog, |change| reading(change, &spare_id, "moved"));
+    drop(catalog);
+    server.shutdown().await.unwrap();
+}
