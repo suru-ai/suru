@@ -56,6 +56,12 @@ use crate::terminal::{TerminalEvents, TerminalFacts, TerminalInput, request_term
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 mod clipboard_thread;
+mod cursor_backend;
+
+/// The production terminal: crossterm over the platform terminal, with cursor
+/// traffic deduplicated so a redraw whose caret has not changed stays silent.
+type TuiTerminal =
+    Terminal<cursor_backend::QuietCursorBackend<CrosstermBackend<termina::PlatformTerminal>>>;
 
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
@@ -454,7 +460,7 @@ struct RunLoop {
 }
 
 async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<termina::PlatformTerminal>>,
+    terminal: &mut TuiTerminal,
     client: ManagedClient,
     workspace: PathBuf,
     terminal_facts: TerminalFacts,
@@ -582,11 +588,7 @@ async fn run_loop(
     }
 }
 
-fn leave_run_loop(
-    terminal: &mut Terminal<CrosstermBackend<termina::PlatformTerminal>>,
-    application: &Application,
-    exit: Exit,
-) -> Result<()> {
+fn leave_run_loop(terminal: &mut TuiTerminal, application: &Application, exit: Exit) -> Result<()> {
     if exit == Exit::AfterFinalFrame {
         draw_frame(terminal, |frame| application.render(frame))?;
     }
@@ -2667,7 +2669,7 @@ async fn wait_for_spinner_tick(tick: &mut Option<Pin<Box<tokio::time::Sleep>>>) 
 }
 
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<termina::PlatformTerminal>>,
+    terminal: TuiTerminal,
 }
 
 /// Enables button and wheel reporting (1000), SGR encoding (1006), and
@@ -3087,10 +3089,15 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         let mut platform = termina::PlatformTerminal::new()?;
         platform.enter_raw_mode()?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(platform))?;
+        let mut terminal = Terminal::new(cursor_backend::QuietCursorBackend::new(
+            CrosstermBackend::new(platform),
+        ))?;
         if let Err(error) = enter_terminal_display(&mut TerminalOutput(terminal.backend_mut())) {
             return Err(error.into());
         }
+        // Entry always re-asserts the cursor: it wrote Hide past the memory, and
+        // the terminal may have been handed back with any cursor at all.
+        terminal.backend_mut().forget_cursor();
         Ok(Self { terminal })
     }
 }
@@ -3123,9 +3130,9 @@ mod tests {
     use super::{
         Application, ApplicationEvent, ClipboardContent, DisableMouseButtonReporting,
         EnableMouseButtonReporting, NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard, draw_frame,
-        enter_terminal_display, ignore_unsupported, leave_terminal_display,
-        remote_failure_from_session_error,
+        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
+        cursor_backend::QuietCursorBackend, draw_frame, enter_terminal_display, ignore_unsupported,
+        leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
@@ -3312,8 +3319,7 @@ mod tests {
     /// visibly parked on the animation cell until the frame moves it back.
     #[test]
     fn a_frame_is_drawn_inside_one_synchronized_update() {
-        let mut terminal = Terminal::new(AnsiTranscriptBackend::new())
-            .expect("a recording Terminal always starts");
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
 
         draw_frame(&mut terminal, |frame| {
             frame.render_widget("suru", frame.area());
@@ -3321,7 +3327,7 @@ mod tests {
         })
         .expect("an ANSI transcript never fails to record");
 
-        let transcript = terminal.backend().transcript();
+        let transcript = terminal.backend().inner().transcript();
         assert!(
             transcript.starts_with("\x1b[?2026h"),
             "the frame did not open a synchronized update: {transcript:?}"
@@ -3351,8 +3357,7 @@ mod tests {
     /// own timeout expires, including the sequences that restore the display.
     #[test]
     fn a_frame_that_fails_to_draw_still_closes_its_synchronized_update() {
-        let mut terminal = Terminal::new(AnsiTranscriptBackend::refusing_to_draw())
-            .expect("a recording Terminal always starts");
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::refusing_to_draw());
 
         let failure = draw_frame(&mut terminal, |frame| {
             frame.render_widget("suru", frame.area());
@@ -3365,7 +3370,7 @@ mod tests {
             std::io::ErrorKind::BrokenPipe,
             "the failure the draw reported is the one that survives: {failure}"
         );
-        let transcript = terminal.backend().transcript();
+        let transcript = terminal.backend().inner().transcript();
         assert!(
             transcript.starts_with("\x1b[?2026h"),
             "the frame did not open a synchronized update: {transcript:?}"
@@ -3373,6 +3378,138 @@ mod tests {
         assert!(
             transcript.ends_with("\x1b[?2026l"),
             "the failed frame left the terminal inside a synchronized update: {transcript:?}"
+        );
+    }
+
+    type RecordingTerminal = Terminal<QuietCursorBackend<AnsiTranscriptBackend>>;
+
+    fn recording_terminal(backend: AnsiTranscriptBackend) -> RecordingTerminal {
+        Terminal::new(QuietCursorBackend::new(backend)).expect("a recording Terminal always starts")
+    }
+
+    /// Draws one frame and returns only what that frame wrote, so a test can
+    /// look at a later frame without the first frame's full paint in the way.
+    fn draw_recorded_frame(
+        terminal: &mut RecordingTerminal,
+        caret: Option<Position>,
+        text: &'static str,
+    ) -> String {
+        let before = terminal.backend().inner().transcript().len();
+        draw_frame(terminal, |frame| {
+            frame.render_widget(text, frame.area());
+            if let Some(caret) = caret {
+                frame.set_cursor_position(caret);
+            }
+        })
+        .expect("an ANSI transcript never fails to record");
+        terminal.backend().inner().transcript()[before..].to_owned()
+    }
+
+    /// Terminals restart the blink phase whenever the cursor is shown or moved,
+    /// and the run loop redraws every 32 ms while anything animates. A frame
+    /// that changes nothing has to say nothing about the cursor, or the
+    /// composer caret never gets to its dark phase.
+    #[test]
+    fn a_redraw_with_the_same_content_and_caret_writes_nothing_but_the_synchronized_update() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let caret = Some(Position::new(3, 2));
+
+        draw_recorded_frame(&mut terminal, caret, "suru");
+        let second = draw_recorded_frame(&mut terminal, caret, "suru");
+
+        assert_eq!(
+            second, "\x1b[?2026h\x1b[?2026l",
+            "an unchanged frame re-emitted cursor traffic"
+        );
+    }
+
+    /// Hide and Show are transitions, not per-frame decorations: three frames
+    /// that toggle the caret off and on again cost one Hide and two Shows.
+    #[test]
+    fn cursor_visibility_is_only_written_when_it_changes() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let caret = Some(Position::new(3, 2));
+
+        let mut frames = String::new();
+        frames += &draw_recorded_frame(&mut terminal, caret, "suru");
+        frames += &draw_recorded_frame(&mut terminal, None, "suru");
+        frames += &draw_recorded_frame(&mut terminal, caret, "suru");
+
+        assert_eq!(
+            frames.matches("\x1b[?25l").count(),
+            1,
+            "Hide was written other than on the one transition: {frames:?}"
+        );
+        assert_eq!(
+            frames.matches("\x1b[?25h").count(),
+            2,
+            "Show was written other than on the two transitions: {frames:?}"
+        );
+    }
+
+    /// Display entry writes its own Hide past the memory, and a resumed
+    /// terminal may have been handed back with any cursor, so the first frame
+    /// after forgetting re-asserts both visibility and position.
+    #[test]
+    fn forgetting_the_cursor_makes_the_next_frame_re_assert_it() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let caret = Some(Position::new(3, 2));
+
+        draw_recorded_frame(&mut terminal, caret, "suru");
+        terminal.backend_mut().forget_cursor();
+        let resumed = draw_recorded_frame(&mut terminal, caret, "suru");
+
+        assert!(
+            resumed.contains("\x1b[?25h"),
+            "the first frame after forgetting did not show the cursor: {resumed:?}"
+        );
+        assert!(
+            resumed.contains("\x1b[3;4H"),
+            "the first frame after forgetting did not park the caret: {resumed:?}"
+        );
+    }
+
+    /// Typing moves the caret without changing the visible cells: only the
+    /// move is written, since the cursor is already shown.
+    #[test]
+    fn a_moved_caret_over_unchanged_content_writes_only_the_move() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+
+        draw_recorded_frame(&mut terminal, Some(Position::new(3, 2)), "suru");
+        let moved = draw_recorded_frame(&mut terminal, Some(Position::new(4, 2)), "suru");
+
+        assert!(
+            moved.contains("\x1b[3;5H"),
+            "the caret was not moved to its new cell: {moved:?}"
+        );
+        assert!(
+            !moved.contains("\x1b[?25h"),
+            "an already shown cursor was shown again: {moved:?}"
+        );
+    }
+
+    /// The diff's own cell writes leave the terminal cursor on the last
+    /// repainted cell, so an unchanged caret still has to be parked again --
+    /// but it does not have to be shown again.
+    #[test]
+    fn a_changed_diff_re_parks_an_unchanged_caret_without_showing_it_again() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let caret = Some(Position::new(3, 2));
+
+        draw_recorded_frame(&mut terminal, caret, "suru");
+        let repainted = draw_recorded_frame(&mut terminal, caret, "sura");
+
+        assert!(
+            repainted.contains("\x1b[1;4H"),
+            "the changed cell was not repainted: {repainted:?}"
+        );
+        assert!(
+            repainted.ends_with("\x1b[3;4H\x1b[?2026l"),
+            "the caret was not parked again after the diff: {repainted:?}"
+        );
+        assert!(
+            !repainted.contains("\x1b[?25h"),
+            "an already shown cursor was shown again: {repainted:?}"
         );
     }
 
