@@ -3115,8 +3115,9 @@ mod tests {
         Application, ApplicationEvent, ClipboardContent, DisableMouseButtonReporting,
         EnableMouseButtonReporting, FRAME_BUFFER_CAPACITY, NativeClipboard, NativeClipboardSink,
         PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
-        draw_frame, enter_terminal_display, frame_backend::FrameBackend, ignore_unsupported,
-        leave_terminal_display, remote_failure_from_session_error,
+        draw_frame, enter_terminal_display,
+        frame_backend::{FrameBackend, ansi},
+        ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
         managed_client::{ManagedEvent, SessionStreamError},
@@ -3177,9 +3178,8 @@ mod tests {
 
     impl TerminalSink for AnsiTranscript {
         fn apply(&mut self, command: impl Command) -> std::io::Result<()> {
-            command
-                .write_ansi(&mut self.0)
-                .map_err(std::io::Error::other)
+            self.0.push_str(&ansi(&command)?);
+            Ok(())
         }
     }
 
@@ -3246,11 +3246,7 @@ mod tests {
         }
 
         fn queue(&mut self, command: impl Command) -> std::io::Result<()> {
-            let mut ansi = String::new();
-            command
-                .write_ansi(&mut ansi)
-                .map_err(std::io::Error::other)?;
-            self.sink.write_all(ansi.as_bytes())
+            self.sink.write_all(ansi(&command)?.as_bytes())
         }
 
         fn execute(&mut self, command: impl Command) -> std::io::Result<()> {
@@ -3431,6 +3427,8 @@ mod tests {
     /// A frame that fails part way through still has to close its synchronized
     /// update: a terminal left inside mode 2026 shows nothing further until its
     /// own timeout expires, including the sequences that restore the display.
+    /// What reached the terminal before the failure -- the Hide ahead of the
+    /// diff -- is exactly what the memory keeps, so the next frame recovers.
     #[test]
     fn a_frame_that_fails_to_draw_still_closes_its_synchronized_update() {
         let mut terminal = recording_terminal(AnsiTranscriptBackend::refusing_to_draw());
@@ -3451,8 +3449,8 @@ mod tests {
             transcript.starts_with("\x1b[?2026h"),
             "the frame did not open a synchronized update: {transcript:?}"
         );
-        assert!(
-            transcript.ends_with("\x1b[?2026l"),
+        assert_eq!(
+            transcript, "\x1b[?2026h\x1b[?25l\x1b[?2026l",
             "the failed frame left the terminal inside a synchronized update: {transcript:?}"
         );
     }

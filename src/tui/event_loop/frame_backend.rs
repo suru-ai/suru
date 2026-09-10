@@ -13,7 +13,7 @@ use ratatui::{
 
 /// Whether the terminal was last told to show or hide its cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Visibility {
+enum CursorVisibility {
     Unknown,
     Hidden,
     Shown,
@@ -53,7 +53,7 @@ enum Visibility {
 pub(super) struct FrameBackend<B> {
     inner: B,
     frame_open: bool,
-    visibility: Visibility,
+    visibility: CursorVisibility,
     /// The last MoveTo written, or `None` when the terminal's cursor is
     /// somewhere else: unknown at start, or displaced by the diff's own moves.
     position: Option<Position>,
@@ -64,17 +64,16 @@ impl<B> FrameBackend<B> {
         Self {
             inner,
             frame_open: false,
-            visibility: Visibility::Unknown,
+            visibility: CursorVisibility::Unknown,
             position: None,
         }
     }
 
     /// Forgets what the terminal was last told, so the next frame re-asserts
-    /// both visibility and position. Called whenever the display is
-    /// (re)entered: entering writes its own Hide through the sink, past this
-    /// memory, and a resumed terminal may have been left with any cursor.
+    /// both visibility and position. Called whenever the display is entered,
+    /// because entering writes its own Hide through the sink, past this memory.
     pub(super) fn forget_cursor(&mut self) {
-        self.visibility = Visibility::Unknown;
+        self.visibility = CursorVisibility::Unknown;
         self.position = None;
     }
 
@@ -100,18 +99,23 @@ impl<B: Write> FrameBackend<B> {
         Ok(())
     }
 
-    /// Writes a command's ANSI rendering into the buffer without flushing.
-    /// `crossterm::queue!` is not used: on Windows it silently takes the
-    /// console API path when it cannot detect ANSI support, which writes no
-    /// bytes and makes the frame's contents depend on the console the process
-    /// happens to be attached to.
+    /// Writes a command's ANSI rendering into the buffer without flushing,
+    /// which `execute!` would do. The rendering is always ANSI: termina's raw
+    /// mode enables virtual terminal processing on Windows, so the console
+    /// API fallback `queue!` would pick without it is never needed.
     fn queue(&mut self, command: impl Command) -> std::io::Result<()> {
-        let mut ansi = String::new();
-        command
-            .write_ansi(&mut ansi)
-            .map_err(std::io::Error::other)?;
-        self.inner.write_all(ansi.as_bytes())
+        self.inner.write_all(ansi(&command)?.as_bytes())
     }
+}
+
+/// A command as the bytes an ANSI terminal receives, independent of the
+/// console the process is attached to.
+pub(super) fn ansi(command: &impl Command) -> std::io::Result<String> {
+    let mut rendered = String::new();
+    command
+        .write_ansi(&mut rendered)
+        .map_err(std::io::Error::other)?;
+    Ok(rendered)
 }
 
 impl<B: Backend + Write> Backend for FrameBackend<B> {
@@ -142,17 +146,17 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
     }
 
     fn hide_cursor(&mut self) -> std::io::Result<()> {
-        if self.visibility != Visibility::Hidden {
+        if self.visibility != CursorVisibility::Hidden {
             self.queue(Hide)?;
-            self.visibility = Visibility::Hidden;
+            self.visibility = CursorVisibility::Hidden;
         }
         Ok(())
     }
 
     fn show_cursor(&mut self) -> std::io::Result<()> {
-        if self.visibility != Visibility::Shown {
+        if self.visibility != CursorVisibility::Shown {
             self.queue(Show)?;
-            self.visibility = Visibility::Shown;
+            self.visibility = CursorVisibility::Shown;
         }
         Ok(())
     }
@@ -175,6 +179,8 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
         self.inner.clear()
     }
 
+    /// Clearing a region leaves the cursor where it was, unlike `clear` and
+    /// `append_lines`, so the remembered position stays good.
     fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
         self.inner.clear_region(clear_type)
     }
