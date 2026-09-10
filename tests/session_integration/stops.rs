@@ -5,7 +5,7 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
-    server_support::next_catalog_change,
+    server_support::next_catalog_change_matching,
     support::{
         WorkingTurn, open_catalog_stream_with_snapshot, read_session_until, the_subagent_row,
         working_turn,
@@ -165,21 +165,16 @@ async fn interrupting_with_no_turn_active_stops_every_subagent_and_clears_workin
     // Each settle may re-anchor the reading on the Subagents still left, so
     // the stream is read to the change that matters: Working clearing once
     // the last one stopped.
-    timeout(PROGRESS_DEADLINE, async {
-        loop {
-            match next_catalog_change(&mut catalog).await {
-                SessionCatalogChange::WorkingChanged {
-                    session_id,
-                    working_since: None,
-                } if session_id == fixture.session_id => return,
-                SessionCatalogChange::WorkingChanged { .. }
-                | SessionCatalogChange::StandingInputsChanged { .. } => {}
-                other => panic!("only work and its Standing move here, got {other:?}"),
-            }
-        }
+    next_catalog_change_matching(&mut catalog, |change| match change {
+        SessionCatalogChange::WorkingChanged {
+            session_id,
+            working_since: None,
+        } if *session_id == fixture.session_id => true,
+        SessionCatalogChange::WorkingChanged { .. }
+        | SessionCatalogChange::StandingInputsChanged { .. } => false,
+        other => panic!("only work and its Standing move here, got {other:?}"),
     })
-    .await
-    .expect("stopping the last Subagent clears Working");
+    .await;
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");

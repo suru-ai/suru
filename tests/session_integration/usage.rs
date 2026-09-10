@@ -97,15 +97,18 @@ async fn read_session_until_total(
 async fn next_usage_change(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
 ) -> (SessionId, Option<UsageTotal>) {
-    loop {
-        if let SessionCatalogChange::UsageChanged {
-            session_id,
-            total_usage,
-        } = crate::server_support::next_catalog_change(catalog).await
-        {
-            return (session_id, total_usage);
-        }
-    }
+    let change = crate::server_support::next_catalog_change_matching(catalog, |change| {
+        matches!(change, SessionCatalogChange::UsageChanged { .. })
+    })
+    .await;
+    let SessionCatalogChange::UsageChanged {
+        session_id,
+        total_usage,
+    } = change
+    else {
+        unreachable!("the awaited change is a roll-up")
+    };
+    (session_id, total_usage)
 }
 
 #[tokio::test]

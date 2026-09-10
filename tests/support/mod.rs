@@ -169,6 +169,14 @@ pub async fn open_catalog_stream(
 
 /// The next change the Session catalog stream announces, however long the
 /// commits between it stream for.
+///
+/// This is the strict reading: it asserts adjacency, that the change a test
+/// names is the one that arrives next and nothing was announced in between.
+/// Reach for it only when that is the point. Several independent publishers
+/// share this one stream — Session lifecycle, Title derivation, and the
+/// Worktree readings checkout observation takes on its own cadence — so a test
+/// that merely wants a particular change is asserting a race it has no stake
+/// in, and [`next_catalog_change_matching`] is what it means.
 pub async fn next_catalog_change(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
 ) -> SessionCatalogChange {
@@ -177,6 +185,30 @@ pub async fn next_catalog_change(
         .expect("a catalog change arrives")
         .expect("the catalog stream stays open")
         .change
+}
+
+/// The first change satisfying `wanted`, skipping the ones that do not.
+///
+/// A test waiting for one publisher's change should not be woken by another's.
+/// The whole wait shares a single [`PROGRESS_DEADLINE`], so a stream that stays
+/// busy without ever announcing the awaited change fails the test rather than
+/// spinning — which is what open-coding this as a loop around
+/// [`next_catalog_change`] gets wrong, since that bounds each read and never
+/// the wait.
+pub async fn next_catalog_change_matching(
+    catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
+    wanted: impl Fn(&SessionCatalogChange) -> bool,
+) -> SessionCatalogChange {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let update = catalog.next().await.expect("the catalog stream stays open");
+            if wanted(&update.change) {
+                return update.change;
+            }
+        }
+    })
+    .await
+    .expect("the awaited catalog change arrives")
 }
 
 /// Every catalog change up to and including the derived Title.

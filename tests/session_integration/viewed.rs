@@ -3,7 +3,7 @@
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
-    server_support::{next_catalog_change, open_catalog_stream},
+    server_support::{next_catalog_change, next_catalog_change_matching, open_catalog_stream},
     support::{create_session, receive_managed_client_initial_state},
 };
 use futures_util::StreamExt;
@@ -114,11 +114,11 @@ async fn replaying_a_viewed_operation_does_not_move_viewed_or_announce_it_again(
         .standing_inputs
         .viewed_at
         .expect("first Viewed moment");
-    while !matches!(
-        next_catalog_change(&mut catalog).await,
-        SessionCatalogChange::StandingInputsChanged { inputs, .. }
-            if inputs.viewed_at == Some(first_viewed)
-    ) {}
+    next_catalog_change_matching(&mut catalog, |change| {
+        matches!(change, SessionCatalogChange::StandingInputsChanged { inputs, .. }
+            if inputs.viewed_at == Some(first_viewed))
+    })
+    .await;
 
     let second = view(&descriptor, session_id)
         .await
@@ -132,11 +132,11 @@ async fn replaying_a_viewed_operation_does_not_move_viewed_or_announce_it_again(
         .viewed_at
         .expect("second Viewed moment");
     assert!(second_viewed > first_viewed);
-    while !matches!(
-        next_catalog_change(&mut catalog).await,
-        SessionCatalogChange::StandingInputsChanged { inputs, .. }
-            if inputs.viewed_at == Some(second_viewed)
-    ) {}
+    next_catalog_change_matching(&mut catalog, |change| {
+        matches!(change, SessionCatalogChange::StandingInputsChanged { inputs, .. }
+            if inputs.viewed_at == Some(second_viewed))
+    })
+    .await;
 
     let replayed = view_with_operation(&descriptor, session_id, first_operation)
         .await
@@ -243,16 +243,11 @@ async fn viewing_a_session_stamps_its_summary_and_announces_the_reading() {
         Some(viewed_at),
         "the readable listing carries the same Viewed moment"
     );
-    let announced = loop {
-        let change = next_catalog_change(&mut catalog).await;
-        if matches!(
-            &change,
-            SessionCatalogChange::StandingInputsChanged { inputs, .. }
-                if inputs.viewed_at == Some(viewed_at)
-        ) {
-            break change;
-        }
-    };
+    let announced = next_catalog_change_matching(&mut catalog, |change| {
+        matches!(change, SessionCatalogChange::StandingInputsChanged { inputs, .. }
+            if inputs.viewed_at == Some(viewed_at))
+    })
+    .await;
     assert_eq!(
         announced,
         SessionCatalogChange::StandingInputsChanged {

@@ -4,7 +4,7 @@
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
-    server_support::{next_catalog_change, open_catalog_stream},
+    server_support::{next_catalog_change, next_catalog_change_matching, open_catalog_stream},
     support::{create_session, receive_managed_client_initial_state},
 };
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
@@ -313,20 +313,14 @@ async fn settlement_changes_are_announced_on_the_session_catalog_stream() {
         .await
         .settled_at
         .expect("settling stamps the moment it happened");
-    timeout(PROGRESS_DEADLINE, async {
-        loop {
-            if next_catalog_change(&mut catalog).await
-                == (SessionCatalogChange::SettlementChanged {
-                    session_id: created,
-                    settled_at: Some(marked_at),
-                })
-            {
-                return;
+    next_catalog_change_matching(&mut catalog, |change| {
+        *change
+            == SessionCatalogChange::SettlementChanged {
+                session_id: created,
+                settled_at: Some(marked_at),
             }
-        }
     })
-    .await
-    .expect("the Session settlement change follows any Turn settlement changes");
+    .await;
 
     // Saying it twice changes nothing, so it announces nothing: the very next
     // change on the stream is the one that follows it.
