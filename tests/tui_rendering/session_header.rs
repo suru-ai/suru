@@ -118,24 +118,24 @@ fn branch_name_follows_the_workspace_name_in_the_session_header() {
 }
 
 #[test]
-fn main_branch_is_implicit_in_the_session_header() {
+fn main_branch_is_shown_in_the_session_header() {
     let workspace = workspace_dir();
     let application =
         application_with_checkout_branch(workspace.path(), CheckoutKind::Main, "main", false);
 
     let row = header(&application, 240);
     assert!(
-        row.contains(
-            workspace
-                .path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
-        ),
+        row.contains(&format!(
+            "{} · main",
+            workspace.path().file_name().unwrap().to_string_lossy()
+        )),
         "{row}"
     );
-    assert!(!row.contains(" · main"), "{row}");
+
+    let linked =
+        application_with_checkout_branch(workspace.path(), CheckoutKind::Linked, "main", false);
+    let row = header(&linked, 240);
+    assert!(row.contains(" · main (worktree)"), "{row}");
 }
 
 #[test]

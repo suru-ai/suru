@@ -3868,12 +3868,10 @@ fn checkout_branch_context(checkout: &crate::protocol::CheckoutSummary) -> Optio
     let CheckoutRevision::Branch { name, .. } = checkout.revision.as_ref()? else {
         return None;
     };
-    match checkout.association.kind {
-        CheckoutKind::Main if name == "main" => None,
-        CheckoutKind::Main => Some(name.clone()),
-        CheckoutKind::Linked if name == "main" => Some("(worktree)".to_owned()),
-        CheckoutKind::Linked => Some(format!("{name} (worktree)")),
-    }
+    Some(match checkout.association.kind {
+        CheckoutKind::Main => name.clone(),
+        CheckoutKind::Linked => format!("{name} (worktree)"),
+    })
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
