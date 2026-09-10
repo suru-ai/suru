@@ -3423,12 +3423,16 @@ mod tests {
         );
     }
 
-    /// Hide and Show are transitions, not per-frame decorations: three frames
-    /// that toggle the caret off and on again cost one Hide and two Shows.
+    /// Hide and Show are transitions, not per-frame decorations: once the first
+    /// paint has settled, three frames that toggle the caret off and on again
+    /// cost one Hide and one Show.
     #[test]
     fn cursor_visibility_is_only_written_when_it_changes() {
         let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
         let caret = Some(Position::new(3, 2));
+        // The first paint hides an unknown cursor across its repaint; the
+        // transitions are counted from a settled screen.
+        draw_recorded_frame(&mut terminal, caret, "suru");
 
         let mut frames = String::new();
         frames += &draw_recorded_frame(&mut terminal, caret, "suru");
@@ -3442,8 +3446,8 @@ mod tests {
         );
         assert_eq!(
             frames.matches("\x1b[?25h").count(),
-            2,
-            "Show was written other than on the two transitions: {frames:?}"
+            1,
+            "Show was written other than on the one transition: {frames:?}"
         );
     }
 
@@ -3488,28 +3492,85 @@ mod tests {
         );
     }
 
-    /// The diff's own cell writes leave the terminal cursor on the last
-    /// repainted cell, so an unchanged caret still has to be parked again --
-    /// but it does not have to be shown again.
+    /// On a terminal that ignores mode 2026 the diff is presented as it is
+    /// written, so a shown cursor is dragged across every repainted cell. The
+    /// cursor is hidden ahead of the diff and shown again once, after it, at
+    /// the caret -- and no more than once each.
     #[test]
-    fn a_changed_diff_re_parks_an_unchanged_caret_without_showing_it_again() {
+    fn a_changed_diff_hides_the_cursor_across_the_repaint_and_shows_it_once_at_the_caret() {
         let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
         let caret = Some(Position::new(3, 2));
 
         draw_recorded_frame(&mut terminal, caret, "suru");
         let repainted = draw_recorded_frame(&mut terminal, caret, "sura");
 
-        assert!(
-            repainted.contains("\x1b[1;4H"),
-            "the changed cell was not repainted: {repainted:?}"
+        let positions = AnsiTranscript::positions(
+            &repainted,
+            &[
+                "\x1b[?2026h", // synchronized update opened
+                "\x1b[?25l",   // cursor hidden ahead of the diff
+                "\x1b[1;4H",   // the changed cell repainted
+                "\x1b[?25h",   // cursor shown again after the diff
+                "\x1b[3;4H",   // cursor parked at the composer caret
+                "\x1b[?2026l", // synchronized update closed
+            ],
         );
         assert!(
-            repainted.ends_with("\x1b[3;4H\x1b[?2026l"),
-            "the caret was not parked again after the diff: {repainted:?}"
+            positions.is_sorted(),
+            "the repaint was not bracketed by Hide and Show: {repainted:?}"
+        );
+        assert_eq!(
+            repainted.matches("\x1b[?25l").count(),
+            1,
+            "the cursor was hidden more than once in one frame: {repainted:?}"
+        );
+        assert_eq!(
+            repainted.matches("\x1b[?25h").count(),
+            1,
+            "the cursor was shown more than once in one frame: {repainted:?}"
+        );
+    }
+
+    /// A surface without a caret hides the cursor once; later repaints find
+    /// it already hidden and have nothing to say about it.
+    #[test]
+    fn repaints_without_a_caret_hide_the_cursor_once_and_never_show_it() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+
+        let mut frames = draw_recorded_frame(&mut terminal, None, "suru");
+        frames += &draw_recorded_frame(&mut terminal, None, "sura");
+
+        assert_eq!(
+            frames.matches("\x1b[?25l").count(),
+            1,
+            "a hidden cursor was hidden again: {frames:?}"
         );
         assert!(
-            !repainted.contains("\x1b[?25h"),
-            "an already shown cursor was shown again: {repainted:?}"
+            !frames.contains("\x1b[?25h"),
+            "a caret-less surface showed the cursor: {frames:?}"
+        );
+    }
+
+    /// Before the first frame nothing is known about the cursor, and a cursor
+    /// that might be shown is treated as shown: the first repaint is hidden
+    /// too.
+    #[test]
+    fn the_first_frame_hides_an_unknown_cursor_ahead_of_its_repaint() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+
+        let first = draw_recorded_frame(&mut terminal, Some(Position::new(3, 2)), "suru");
+
+        let positions = AnsiTranscript::positions(
+            &first,
+            &[
+                "\x1b[?25l", // cursor hidden ahead of the diff
+                "\x1b[1;1H", // the frame's first painted cell
+                "\x1b[?25h", // cursor shown again after the diff
+            ],
+        );
+        assert!(
+            positions.is_sorted(),
+            "the first repaint was not hidden: {first:?}"
         );
     }
 

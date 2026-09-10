@@ -21,6 +21,15 @@ enum Visibility {
 /// phase on both sequences, so the composer caret is put back in its lit phase
 /// far more often than any blink interval and never goes dark. Remembering what
 /// was last written lets an unchanged caret cost nothing at all.
+///
+/// A frame that repaints anything hides the cursor ahead of its diff. That is
+/// what makes the synchronized-output fix safe on terminals that ignore mode
+/// 2026 -- legacy conhost among them -- where the diff is otherwise presented
+/// cell by cell with the caret riding along. The known cost: on such a
+/// terminal, one that also restarts the blink phase on Show, the caret looks
+/// solid while a spinner animates, since every repainting frame hides and
+/// re-shows it. Idle redraws (empty diff, unchanged caret) still write nothing
+/// and keep blinking.
 pub(super) struct QuietCursorBackend<B> {
     inner: B,
     visibility: Visibility,
@@ -59,9 +68,15 @@ impl<B: Backend> Backend for QuietCursorBackend<B> {
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         let mut content = content.peekable();
-        // The diff's own moves leave the terminal cursor on the last repainted
-        // cell, so an unchanged caret still has to be parked again afterwards.
         if content.peek().is_some() {
+            // A cursor that might be shown is dragged across every repainted
+            // cell on a terminal that presents the diff as it arrives, so it
+            // is hidden ahead of the diff. ratatui shows and parks it again
+            // afterwards, and the memory makes that a single Show.
+            self.hide_cursor()?;
+            // The diff's own moves leave the terminal cursor on the last
+            // repainted cell, so an unchanged caret still has to be parked
+            // again afterwards.
             self.position = None;
         }
         self.inner.draw(content)
