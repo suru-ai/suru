@@ -383,7 +383,6 @@ impl SourceControl for GitSourceControl {
         id: PreparationId,
         source: &ResolvedWorkspace,
         description: &str,
-        channel: &str,
     ) -> Result<PreparedCheckout, String> {
         let repository = source
             .workspace
@@ -409,24 +408,13 @@ impl SourceControl for GitSourceControl {
             .await
             .ok_or("A usable local source commit is required; this Repository may be unborn")?;
         let description = portable_description(description);
-        // A Channel is part of a portable destination, never a caller supplied path.
-        if channel.is_empty()
-            || channel == "."
-            || channel == ".."
-            || channel.ends_with('.')
-            || !channel
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-        {
-            return Err("Channel cannot be used as a managed directory name".to_owned());
-        }
         for _ in 0..32 {
             let name = format!(
                 "{description}-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]
             );
             let branch = format!("suru/{name}");
-            let destination = root.join(".suru-worktrees").join(channel).join(&name);
+            let destination = root.join(".suru-worktrees").join(&name);
             if destination.exists()
                 || self
                     .text(
@@ -505,7 +493,7 @@ impl SourceControl for GitSourceControl {
         let relative = destination
             .strip_prefix(root)
             .map_err(|_| "Managed destination escaped its Repository")?;
-        if relative.components().count() != 3
+        if relative.components().count() != 2
             || relative
                 .components()
                 .next()
@@ -514,7 +502,7 @@ impl SourceControl for GitSourceControl {
             return Err("Invalid managed destination".to_owned());
         }
         let mut parent = root.clone();
-        for component in relative.components().take(2) {
+        for component in relative.components().take(1) {
             parent.push(component);
             match std::fs::symlink_metadata(&parent) {
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {

@@ -665,7 +665,7 @@ fn choose_new(app: &mut Application, layout: &Layout) {
     assert_eq!(key(app, KeyCode::Enter), ApplicationTransition::Continue);
 }
 fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckoutResult {
-    let destination = layout.main.join(".suru-worktrees/test/prepared");
+    let destination = layout.main.join(".suru-worktrees/prepared");
     std::fs::create_dir_all(&destination).unwrap();
     let mut location = layout.at(&destination);
     let repository = location.workspace.repository.clone().unwrap();

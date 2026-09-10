@@ -110,7 +110,7 @@ async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_
     let result = prepare(server.descriptor(), &request).await;
     assert_eq!(result.error, None);
     let destination = result.preparation.destination.path.clone();
-    assert!(destination.starts_with(main.join(".suru-worktrees/preview.1")));
+    assert!(destination.starts_with(main.join(".suru-worktrees")));
     assert_eq!(read_git(&destination, &["rev-parse", "HEAD"]), source);
     assert_eq!(
         std::fs::read_to_string(destination.join("tracked")).unwrap(),
@@ -225,7 +225,7 @@ async fn naming_bare_storage_and_destination_validation_preserve_existing_resour
                 .preparation
                 .destination
                 .path
-                .starts_with(bare.join(".suru-worktrees/naming"))
+                .starts_with(bare.join(".suru-worktrees"))
         );
         assert!(destinations.insert(result.preparation.destination.path.clone()));
     }
@@ -420,12 +420,8 @@ impl suru::source_control::SourceControl for CollisionAdapter {
         id: PreparationId,
         source: &ResolvedWorkspace,
         description: &str,
-        channel: &str,
     ) -> Result<PreparedCheckout, String> {
-        let plan = self
-            .git
-            .plan_checkout(id, source, description, channel)
-            .await?;
+        let plan = self.git.plan_checkout(id, source, description).await?;
         let CheckoutPreparationPlan::Git { branch, .. } = &plan.plan;
         // Another Git actor wins this name after planning, before Suru mutation.
         git(&plan.source.path, &["branch", branch]);

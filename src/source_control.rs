@@ -65,7 +65,6 @@ pub trait SourceControl: Send + Sync {
         _id: crate::protocol::PreparationId,
         _source: &ResolvedWorkspace,
         _description: &str,
-        _channel: &str,
     ) -> Result<crate::protocol::PreparedCheckout, String> {
         Err("Working-copy creation is unsupported".to_owned())
     }
@@ -281,7 +280,6 @@ impl SourceControlService {
     pub(crate) async fn plan_checkout(
         &self,
         request: &crate::protocol::PrepareCheckoutRequest,
-        channel: &str,
     ) -> Result<
         (
             crate::protocol::PreparedCheckout,
@@ -304,7 +302,7 @@ impl SourceControlService {
         }
         let plan = self
             .adapter
-            .plan_checkout(request.id, &current, &request.description, channel)
+            .plan_checkout(request.id, &current, &request.description)
             .await?;
         Ok((plan, guard))
     }

@@ -582,10 +582,7 @@ pub async fn spawn_with_source_control(
         settings.subscribe(),
     );
     let state = AppState {
-        preparations: crate::source_control::PreparationStore::new(
-            config.data_dir(),
-            config.channel(),
-        ),
+        preparations: crate::source_control::PreparationStore::new(config.data_dir()),
         source_control,
         workspace_paths: crate::protocol::WorkspacePaths::discover(),
         descriptor: Arc::new(descriptor.clone()),
@@ -1354,11 +1351,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
             progress.stage("resuming retained preparation");
             plan
         }
-        Ok(None) => match state
-            .source_control
-            .plan_checkout(&request, &state.preparations.channel)
-            .await
-        {
+        Ok(None) => match state.source_control.plan_checkout(&request).await {
             Ok((plan, guard)) => {
                 planned_guard = Some(guard);
                 if let Err(e) = state.preparations.save(&plan) {

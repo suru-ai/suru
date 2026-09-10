@@ -46,33 +46,32 @@ Sidebar rows show the current branch or detached commit together with a main/lin
 28. As a user creating from a linked Worktree, I want the destination anchored to the main Repository root, so that managed checkouts do not become nested inside arbitrary linked checkouts.
 29. As a user, I want Suru's generated checkout container ignored locally without changing tracked files, so that using Suru does not create unrelated repository changes.
 30. As a user with existing local ignore rules, I want those rules preserved, so that Suru does not disrupt my other tooling.
-31. As a user of multiple Channels, I want their generated destinations kept separate, so that development and release runs do not allocate the same managed checkout.
-32. As a user of submodules, I want them initialized recursively before Agent startup, so that committed source and Skills inside them are available.
-33. As a user encountering creation or submodule failure, I want a useful error, a preserved draft, and a reusable checkout when one was already created, so that retrying does not lose work or create duplicates.
-34. As a user editing a draft after preparation, I want Suru to reuse the prepared Worktree, so that a changed Prompt identity does not allocate another checkout.
-35. As a user selecting explicit Skills before a Worktree exists, I want Suru to refresh the destination Skill Catalog and require reselection before delivery, so that a Skill is not silently retargeted into a different context.
-36. As a user sending a Prompt without explicit Skills, I want successful preparation to proceed directly to the Agent, so that ordinary new-Worktree creation remains automatic.
-37. As a user, I want a Session's Execution Directory fixed from its first Turn onward, so that later activity and Provider Resume State remain associated with the same location.
-38. As a user wanting to work in another checkout, I want to start another Session there, so that existing conversation assumptions are not silently moved.
-39. As a user reading the Sidebar, I want each active Session row to show the current checkout branch or detached commit and a main/linked indicator, so that I know where its Agent works.
-40. As a user switching branches outside Suru, I want every Session sharing that Worktree to reflect the change automatically, so that the Sidebar describes current checkout state rather than an old association.
-41. As a user with a missing or unreadable Worktree, I want that state marked explicitly, so that an unavailable checkout is not confused with a directory outside source control.
-42. As a user prompting a Session whose Worktree disappeared, I want Suru to recreate it at its original path, so that I can resume without manually rebuilding the checkout.
-43. As a user recovering a branch Worktree, I want its retained branch's current tip used, so that commits made since its creation are preserved.
-44. As a user recovering a detached Worktree, I want its last-known commit restored, so that recovery does not invent a branch or revision.
-45. As a user encountering an occupied branch, deleted branch, conflicting destination, or inaccessible repository data, I want recovery to stop before Agent startup with a clear explanation, so that work does not begin in an incorrect location.
-46. As a user of an externally created Worktree, I want the same known-path recovery behavior, so that recovery does not depend on Suru having created the checkout.
-47. As a user settling or deleting a Session, I want its Worktree left alone, so that conversation lifecycle does not unexpectedly remove files.
-48. As a user removing an idle Worktree, I want to keep its branch and Session histories, so that cleanup does not require deleting useful conversations or committed work.
-49. As a user removing a shared Worktree, I want the acting Server to show its affected Session count and block while any associated Session or surviving Subagent is Working, so that removal does not interrupt work it knows about.
-50. As a user removing a Worktree, I want dirty, untracked, ignored, locked, and submodule-related conditions explained and a force option where supported, so that I can make the removal decision explicitly.
-51. As a user later prompting a Session after explicit Worktree removal, I want ordinary recovery rules to apply, so that removing files does not make retained history permanently unusable.
-52. As a Remote user, I want repository discovery and filesystem actions performed by the owning Server, so that local paths and tools are never applied to the wrong machine.
-53. As a user with matching directory spellings on different Servers, I want those Workspaces kept distinct, so that remote and local work are not conflated.
-54. As a user restarting Suru, I want Repository associations, execution locations, recovery state, and resumable conversations retained, so that the workflow survives process replacement.
-55. As a user with substantial history, I want grouping and live checkout labels without loading every Transcript, so that Session discovery remains responsive.
-56. As a user on Windows, macOS, or Linux, I want the same behavior with native paths and short, bounded waits, so that Worktree support is reliable on every supported platform.
-57. As a future source control integration author, I want capability-based interfaces independent of the Agent Provider interface, so that another system is not required to imitate every Git concept.
+31. As a user of submodules, I want them initialized recursively before Agent startup, so that committed source and Skills inside them are available.
+32. As a user encountering creation or submodule failure, I want a useful error, a preserved draft, and a reusable checkout when one was already created, so that retrying does not lose work or create duplicates.
+33. As a user editing a draft after preparation, I want Suru to reuse the prepared Worktree, so that a changed Prompt identity does not allocate another checkout.
+34. As a user selecting explicit Skills before a Worktree exists, I want Suru to refresh the destination Skill Catalog and require reselection before delivery, so that a Skill is not silently retargeted into a different context.
+35. As a user sending a Prompt without explicit Skills, I want successful preparation to proceed directly to the Agent, so that ordinary new-Worktree creation remains automatic.
+36. As a user, I want a Session's Execution Directory fixed from its first Turn onward, so that later activity and Provider Resume State remain associated with the same location.
+37. As a user wanting to work in another checkout, I want to start another Session there, so that existing conversation assumptions are not silently moved.
+38. As a user reading the Sidebar, I want each active Session row to show the current checkout branch or detached commit and a main/linked indicator, so that I know where its Agent works.
+39. As a user switching branches outside Suru, I want every Session sharing that Worktree to reflect the change automatically, so that the Sidebar describes current checkout state rather than an old association.
+40. As a user with a missing or unreadable Worktree, I want that state marked explicitly, so that an unavailable checkout is not confused with a directory outside source control.
+41. As a user prompting a Session whose Worktree disappeared, I want Suru to recreate it at its original path, so that I can resume without manually rebuilding the checkout.
+42. As a user recovering a branch Worktree, I want its retained branch's current tip used, so that commits made since its creation are preserved.
+43. As a user recovering a detached Worktree, I want its last-known commit restored, so that recovery does not invent a branch or revision.
+44. As a user encountering an occupied branch, deleted branch, conflicting destination, or inaccessible repository data, I want recovery to stop before Agent startup with a clear explanation, so that work does not begin in an incorrect location.
+45. As a user of an externally created Worktree, I want the same known-path recovery behavior, so that recovery does not depend on Suru having created the checkout.
+46. As a user settling or deleting a Session, I want its Worktree left alone, so that conversation lifecycle does not unexpectedly remove files.
+47. As a user removing an idle Worktree, I want to keep its branch and Session histories, so that cleanup does not require deleting useful conversations or committed work.
+48. As a user removing a shared Worktree, I want the acting Server to show its affected Session count and block while any associated Session or surviving Subagent is Working, so that removal does not interrupt work it knows about.
+49. As a user removing a Worktree, I want dirty, untracked, ignored, locked, and submodule-related conditions explained and a force option where supported, so that I can make the removal decision explicitly.
+50. As a user later prompting a Session after explicit Worktree removal, I want ordinary recovery rules to apply, so that removing files does not make retained history permanently unusable.
+51. As a Remote user, I want repository discovery and filesystem actions performed by the owning Server, so that local paths and tools are never applied to the wrong machine.
+52. As a user with matching directory spellings on different Servers, I want those Workspaces kept distinct, so that remote and local work are not conflated.
+53. As a user restarting Suru, I want Repository associations, execution locations, recovery state, and resumable conversations retained, so that the workflow survives process replacement.
+54. As a user with substantial history, I want grouping and live checkout labels without loading every Transcript, so that Session discovery remains responsive.
+55. As a user on Windows, macOS, or Linux, I want the same behavior with native paths and short, bounded waits, so that Worktree support is reliable on every supported platform.
+56. As a future source control integration author, I want capability-based interfaces independent of the Agent Provider interface, so that another system is not required to imitate every Git concept.
 
 ## Implementation Decisions
 
@@ -96,9 +95,9 @@ Sidebar rows show the current branch or detached commit together with a main/lin
 
 10. **Generate branch names locally.** Use the suru prefix followed by a slash, a short description derived from the first Prompt, and a unique suffix separated by a hyphen. Produce valid Git refs and portable directory names, including for empty-after-normalization, non-ASCII, long, and collision-prone input. No additional AI request or subsequent automatic rename is part of naming. Never reset an existing branch to resolve a name collision.
 
-11. **Use repository-local managed storage.** Create a hidden directory named .suru-worktrees at the resolved main root, then a Channel directory and a generated Worktree-name directory beneath it. Creation initiated in a linked checkout still uses the main root. For a bare Repository, place that same container under the bare root. Keep storage on the repository's disk and do not silently fall back to Suru's general data directory. If a non-bare main root cannot be found, disable managed creation until it is located while retaining existing Session and Worktree selection support.
+11. **Use repository-local managed storage.** Create a hidden directory named .suru-worktrees at the resolved main root, then a generated Worktree-name directory beneath it. Creation initiated in a linked checkout still uses the main root. For a bare Repository, place that same container under the bare root. Keep storage on the repository's disk and do not silently fall back to Suru's general data directory. If a non-bare main root cannot be found, disable managed creation until it is located while retaining existing Session and Worktree selection support.
 
-12. **Ignore the managed container locally.** Add a root-anchored directory rule for .suru-worktrees to Git's repository-local exclude file in the common metadata directory, preserving all existing entries and correctly handling an existing last line without a newline. Do not change tracked ignore files or depend on a container-local ignore file that ordinary cleanup can delete. Channel directories separate generated destinations; they do not isolate the files of an existing Worktree selected across Channels.
+12. **Ignore the managed container locally.** Add a root-anchored directory rule for .suru-worktrees to Git's repository-local exclude file in the common metadata directory, preserving all existing entries and correctly handling an existing last line without a newline. Do not change tracked ignore files or depend on a container-local ignore file that ordinary cleanup can delete.
 
 13. **Make preparation resumable and distinct from Prompt identity.** Retain a stable preparation identity and recoverable progress across retries, edited drafts, Skill reselection, interrupted requests, and a restart after filesystem creation. A changed Prompt ID must not allocate another checkout. Validate any previously created destination before reuse; do not overwrite unrelated contents. Already-created Worktrees remain available for reuse or explicit removal after later failure.
 
@@ -144,7 +143,7 @@ Sidebar rows show the current branch or detached commit together with a main/lin
 
 9. **Cover automatic creation and naming.** Toggling the Landing option must not mutate Git. First submission must use the current local commit and a unique valid generated branch, with no remote-base selection or copying of uncommitted source files. Test source-commit changes before submission and after preparation starts, invalid/long/non-ASCII description input, collisions, and creation from a linked checkout anchoring at the main root.
 
-10. **Cover exact storage and ignore outcomes.** Verify the repository-local, Channel-separated layout, including bare-root placement and refusal to create when the required non-bare main root is unknown. Preserve existing local exclude entries, including missing final newlines. Assert the main checkout remains clean, the linked Worktree sees its own tracked/untracked changes, and ordinary force-cleaning from the main checkout preserves the nested Worktree and local exclude rule. Use disposable repositories for all destructive fixtures.
+10. **Cover exact storage and ignore outcomes.** Verify the repository-local layout, including bare-root placement and refusal to create when the required non-bare main root is unknown. Preserve existing local exclude entries, including missing final newlines. Assert the main checkout remains clean, the linked Worktree sees its own tracked/untracked changes, and ordinary force-cleaning from the main checkout preserves the nested Worktree and local exclude rule. Use disposable repositories for all destructive fixtures.
 
 11. **Cover interrupted preparation and corrected drafts.** Inject failures after checkout creation and during submodule initialization, destination Skill discovery, and metadata persistence. Retry unchanged and edited Prompts and reselected Skills; assert reuse of the same prepared Worktree and preservation of the draft before admission. Verify that successful admission followed by Provider failure follows existing failed-Turn behavior rather than deleting resources.
 
@@ -173,7 +172,7 @@ Sidebar rows show the current branch or detached commit together with a main/lin
 - Automatic Worktree deletion when a Session settles or is deleted, automatic branch deletion, or forced removal of the main checkout.
 - Dependency installation, project setup commands, and copying uncommitted or ignored/local files into a newly created checkout. Recursive Git submodule initialization is included.
 - Recovering deleted uncommitted files, inventing a replacement for a deleted recovery branch, or rebuilding lost repository metadata.
-- Treating channel-specific managed directories as filesystem isolation for shared existing Worktrees, or discovering another Channel's Sessions and arbitrary external processes for the removal guard.
+- Discovering another Channel's Sessions and arbitrary external processes for the removal guard.
 - New user-facing Settings for the initial observation and creation behavior.
 
 ## Further Notes

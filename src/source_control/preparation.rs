@@ -10,14 +10,12 @@ use std::{
 pub(crate) struct PreparationStore {
     root: PathBuf,
     pub(crate) serial: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) channel: String,
 }
 impl PreparationStore {
-    pub(crate) fn new(data: &Path, channel: &str) -> Self {
+    pub(crate) fn new(data: &Path) -> Self {
         Self {
             root: data.join("checkout-preparations"),
             serial: Default::default(),
-            channel: channel.to_owned(),
         }
     }
     pub(crate) fn load(&self, id: PreparationId) -> Result<Option<PreparedCheckout>, String> {

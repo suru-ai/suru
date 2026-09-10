@@ -29,10 +29,9 @@ Confirmed design expanding [#169](https://github.com/jake-tucker/suru/issues/169
 - Where execution is possible, ordinary Sessions remain available when Git is unavailable or a repository has no commits. Disable new-Worktree creation with the specific reason when no usable source checkout/commit is available, including a bare Workspace without a selected working copy.
 - Keep a missing remembered Execution Directory visibly selected until it is recovered or explicitly changed. Never silently substitute another execution location.
 - Group by shared Repository identity even when its main checkout cannot be located. Present the main root when known; otherwise present the repository metadata location with “main checkout unknown.” Discovering the main checkout updates presentation without splitting or relocating Sessions.
-- Create managed Worktrees at `<main-root>/.suru-worktrees/<channel>/<name>/`, keeping them on the repository's disk. Anchor this to the main root even when the source checkout is linked; never create another container inside an arbitrary linked Worktree or fall back to Suru's general data directory.
+- Create managed Worktrees at `<main-root>/.suru-worktrees/<name>/`, keeping them on the repository's disk. Anchor this to the main root even when the source checkout is linked; never create another container inside an arbitrary linked Worktree or fall back to Suru's general data directory.
 - Add `/.suru-worktrees/` to `$GIT_COMMON_DIR/info/exclude`, preserving existing entries, rather than relying on a container `.gitignore` or changing tracked files. Ordinary cleanup cannot delete this ignore rule; double-force cleanup can still delete nested Worktrees.
-- For bare Repositories, use `<bare-root>/.suru-worktrees/<channel>/<name>/`. If a non-bare Repository's main checkout is unknown, existing Sessions and Worktree selection remain available, but managed creation requires locating the main checkout first.
-- Channel directories separate generated destinations. Existing Worktrees can still be shared across Channels; this layout does not isolate their working-copy files.
+- For bare Repositories, use `<bare-root>/.suru-worktrees/<name>/`. If a non-bare Repository's main checkout is unknown, existing Sessions and Worktree selection remain available, but managed creation requires locating the main checkout first.
 - Refresh visible Checkout State automatically within roughly two seconds, sharing an observation across Sessions in the same Worktree. Keep this as built-in behavior initially, without new Settings.
 
 The identity decision is recorded in [ADR-0023](adr/0023-separate-workspace-grouping-from-session-execution.md).
@@ -123,7 +122,7 @@ Checked with Git 2.55.0, local Git documentation, and disposable repositories; e
 
 ## Repository-local storage validation
 
-The accepted layout is `<main-root>/.suru-worktrees/<channel>/<name>/` (or the bare-root equivalent), with `/.suru-worktrees/` in Git's local `info/exclude`. The exploration also tested a container `.gitignore` containing `*`, which established that nested Worktrees work but exposed the ignore-file cleanup problem.
+The accepted layout is `<main-root>/.suru-worktrees/<name>/` (or the bare-root equivalent), with `/.suru-worktrees/` in Git's local `info/exclude`. The exploration also tested a container `.gitignore` containing `*`, which established that nested Worktrees work but exposed the ignore-file cleanup problem.
 
 The final accepted variant was separately validated on Linux with Git 2.55.0: normal and bare-root nested Worktree creation succeeded; appending the local exclude preserved existing content, including a last line without a newline; the main checkout stayed clean; and the linked checkout reported its own tracked and untracked changes. Main-checkout `git clean -fdx` retained both the linked Worktree's uncommitted file and the local exclude file unchanged.
 
