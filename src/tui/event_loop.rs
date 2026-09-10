@@ -31,9 +31,7 @@ use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste, Event as InputEvent},
     execute,
     style::available_color_count,
-    terminal::{
-        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
 use ratatui::{
@@ -56,12 +54,21 @@ use crate::terminal::{TerminalEvents, TerminalFacts, TerminalInput, request_term
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 mod clipboard_thread;
-mod cursor_backend;
+mod frame_backend;
 
-/// The production terminal: crossterm over the platform terminal, with cursor
-/// traffic deduplicated so a redraw whose caret has not changed stays silent.
-type TuiTerminal =
-    Terminal<cursor_backend::QuietCursorBackend<CrosstermBackend<termina::PlatformTerminal>>>;
+/// termina's own writer is 128 bytes on Windows and 4 KiB on Unix, so a frame
+/// of a few KiB reached the console as dozens of writes and the terminal could
+/// repaint between any two of them. A frame-sized buffer, flushed once per
+/// frame, complements DEC 2026 rather than replacing it: it is what keeps the
+/// bracket and its contents in one write on terminals that honour the mode,
+/// and what keeps the diff contiguous on those that do not.
+const FRAME_BUFFER_CAPACITY: usize = 64 * 1024;
+
+/// The production terminal: crossterm over a frame-sized buffer over the
+/// platform terminal, each draw reaching it as one whole frame.
+type TuiTerminal = Terminal<
+    frame_backend::FrameBackend<CrosstermBackend<std::io::BufWriter<termina::PlatformTerminal>>>,
+>;
 
 pub async fn run(client: ManagedClient) -> Result<()> {
     let workspace =
@@ -595,31 +602,16 @@ fn leave_run_loop(terminal: &mut TuiTerminal, application: &Application, exit: E
     Ok(())
 }
 
-/// Draws one frame inside a DEC private mode 2026 (synchronized output) update,
-/// so the terminal presents the whole frame in a single repaint.
-///
-/// ratatui writes the frame diff before it repositions the cursor, and the
-/// composer always reports a caret, so without this the cursor visibly trips to
-/// whatever animation cell was repainted and back again once per frame. Holding
-/// the frame means no intermediate cursor position is ever displayed, and frame
-/// tearing goes with it. Terminals that do not implement mode 2026 ignore both
-/// sequences, which costs them nothing.
-///
-/// A frame that fails is still ended, for the same reason the display restores
-/// past a failure: a terminal left inside a synchronized update shows nothing
-/// further -- not even the sequences that give the screen back -- until its own
-/// timeout expires. The failure that ended the frame is the one reported.
-fn draw_frame<B: Backend + TerminalSink>(
-    terminal: &mut Terminal<B>,
+/// Draws one frame and ends it, so the frame reaches the terminal whole even
+/// when the draw fails part way. Why the frame is bracketed, and why a failed
+/// one is still ended, is on [`frame_backend::FrameBackend`]. The failure that
+/// ended the frame is the one reported.
+fn draw_frame<B: Backend + std::io::Write>(
+    terminal: &mut Terminal<frame_backend::FrameBackend<B>>,
     render: impl FnOnce(&mut Frame),
 ) -> std::io::Result<()> {
-    // Begin has to reach the terminal ahead of the diff, so it is written
-    // before ratatui draws anything.
-    terminal.backend_mut().apply(BeginSynchronizedUpdate)?;
     let drawn = terminal.draw(render).map(|_| ());
-    // `apply` flushes, so End reaches the terminal now rather than sitting in
-    // the backend's buffer until the next frame.
-    let ended = terminal.backend_mut().apply(EndSynchronizedUpdate);
+    let ended = terminal.backend_mut().end_frame();
     drawn.and(ended)
 }
 
@@ -3021,14 +3013,6 @@ impl<W: std::io::Write> TerminalSink for TerminalOutput<W> {
     }
 }
 
-/// Lets [`draw_frame`] write terminal-mode changes straight through the backend
-/// the frame is drawn on, so the sequences land in the same stream as the diff.
-impl<W: std::io::Write> TerminalSink for CrosstermBackend<W> {
-    fn apply(&mut self, command: impl crossterm::Command) -> std::io::Result<()> {
-        execute!(self, command)
-    }
-}
-
 fn enable_terminal_features(output: &mut impl TerminalSink) -> std::io::Result<()> {
     ignore_unsupported(output.apply(EnableBracketedPaste))?;
     // Mouse reporting is the one feature with no graceful degradation: a TUI
@@ -3089,9 +3073,9 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         let mut platform = termina::PlatformTerminal::new()?;
         platform.enter_raw_mode()?;
-        let mut terminal = Terminal::new(cursor_backend::QuietCursorBackend::new(
-            CrosstermBackend::new(platform),
-        ))?;
+        let mut terminal = Terminal::new(frame_backend::FrameBackend::new(CrosstermBackend::new(
+            std::io::BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, platform),
+        )))?;
         if let Err(error) = enter_terminal_display(&mut TerminalOutput(terminal.backend_mut())) {
             return Err(error.into());
         }
@@ -3129,9 +3113,9 @@ mod tests {
 
     use super::{
         Application, ApplicationEvent, ClipboardContent, DisableMouseButtonReporting,
-        EnableMouseButtonReporting, NativeClipboard, NativeClipboardSink, PopModifiedKeyReporting,
-        PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
-        cursor_backend::QuietCursorBackend, draw_frame, enter_terminal_display, ignore_unsupported,
+        EnableMouseButtonReporting, FRAME_BUFFER_CAPACITY, NativeClipboard, NativeClipboardSink,
+        PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
+        draw_frame, enter_terminal_display, frame_backend::FrameBackend, ignore_unsupported,
         leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
@@ -3220,24 +3204,19 @@ mod tests {
         }
     }
 
-    /// A ratatui backend that draws a frame into an [`AnsiTranscript`], for the
-    /// same cross-platform reason that recorder exists.
-    struct AnsiTranscriptBackend {
-        transcript: AnsiTranscript,
+    /// A ratatui backend that draws a frame as ANSI bytes through a sink, for
+    /// the same cross-platform reason [`AnsiTranscript`] exists. The cursor
+    /// methods flush the sink the way `CrosstermBackend` does (it writes them
+    /// with `execute!`), so a write count taken through this backend is
+    /// faithful to the production one.
+    struct AnsiTranscriptBackend<W = Vec<u8>> {
+        sink: W,
         refuses_to_draw: bool,
     }
 
     impl AnsiTranscriptBackend {
-        const SIZE: Size = Size {
-            width: 20,
-            height: 5,
-        };
-
         fn new() -> Self {
-            Self {
-                transcript: AnsiTranscript(String::new()),
-                refuses_to_draw: false,
-            }
+            Self::over(Vec::new())
         }
 
         /// Stands in for a terminal that goes away mid-frame.
@@ -3249,17 +3228,38 @@ mod tests {
         }
 
         fn transcript(&self) -> &str {
-            &self.transcript.0
+            std::str::from_utf8(&self.sink).expect("ANSI transcripts are UTF-8")
         }
     }
 
-    impl TerminalSink for AnsiTranscriptBackend {
-        fn apply(&mut self, command: impl Command) -> std::io::Result<()> {
-            self.transcript.apply(command)
+    impl<W: std::io::Write> AnsiTranscriptBackend<W> {
+        const SIZE: Size = Size {
+            width: 20,
+            height: 5,
+        };
+
+        fn over(sink: W) -> Self {
+            Self {
+                sink,
+                refuses_to_draw: false,
+            }
+        }
+
+        fn queue(&mut self, command: impl Command) -> std::io::Result<()> {
+            let mut ansi = String::new();
+            command
+                .write_ansi(&mut ansi)
+                .map_err(std::io::Error::other)?;
+            self.sink.write_all(ansi.as_bytes())
+        }
+
+        fn execute(&mut self, command: impl Command) -> std::io::Result<()> {
+            self.queue(command)?;
+            self.sink.flush()
         }
     }
 
-    impl Backend for AnsiTranscriptBackend {
+    impl<W: std::io::Write> Backend for AnsiTranscriptBackend<W> {
         fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -3268,18 +3268,18 @@ mod tests {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             for (column, row, cell) in content {
-                self.apply(MoveTo(column, row))?;
-                self.apply(Print(cell.symbol().to_owned()))?;
+                self.queue(MoveTo(column, row))?;
+                self.queue(Print(cell.symbol().to_owned()))?;
             }
             Ok(())
         }
 
         fn hide_cursor(&mut self) -> std::io::Result<()> {
-            self.apply(Hide)
+            self.execute(Hide)
         }
 
         fn show_cursor(&mut self) -> std::io::Result<()> {
-            self.apply(Show)
+            self.execute(Show)
         }
 
         fn get_cursor_position(&mut self) -> std::io::Result<Position> {
@@ -3288,11 +3288,11 @@ mod tests {
 
         fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
             let position = position.into();
-            self.apply(MoveTo(position.x, position.y))
+            self.execute(MoveTo(position.x, position.y))
         }
 
         fn clear(&mut self) -> std::io::Result<()> {
-            self.apply(Clear(ClearType::All))
+            self.execute(Clear(ClearType::All))
         }
 
         fn size(&self) -> std::io::Result<Size> {
@@ -3310,8 +3310,84 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            self.sink.flush()
+        }
+    }
+
+    impl<W: std::io::Write> std::io::Write for AnsiTranscriptBackend<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sink.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.sink.flush()
+        }
+    }
+
+    /// Counts the writes a console would receive and keeps nothing else.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl CountingWriter {
+        fn counter(&self) -> std::rc::Rc<std::cell::Cell<usize>> {
+            std::rc::Rc::clone(&self.writes)
+        }
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A frame with several changed runs and a caret, the shape a spinner
+    /// frame has.
+    fn a_busy_frame(frame: &mut ratatui::Frame, text: &'static str) {
+        frame.render_widget(text, frame.area());
+        frame.set_cursor_position(Position::new(3, 2));
+    }
+
+    /// termina's own writer is 128 bytes on Windows, so a several-KiB frame
+    /// became dozens of WriteFile calls and the terminal could repaint between
+    /// any two of them. With a frame-sized buffer and one flush per frame the
+    /// whole frame -- bracket, diff, cursor -- is one write; without the
+    /// buffer the same frame is several, so it is the buffering that
+    /// collapses it.
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_write() {
+        let console = CountingWriter::default();
+        let writes = console.counter();
+        let buffered = std::io::BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, console);
+        let mut terminal = Terminal::new(FrameBackend::new(AnsiTranscriptBackend::over(buffered)))
+            .expect("a counting Terminal always starts");
+
+        draw_frame(&mut terminal, |frame| a_busy_frame(frame, "suru\nis\nhere"))
+            .expect("a counting console never fails");
+        assert_eq!(writes.get(), 1, "a busy frame took more than one write");
+
+        draw_frame(&mut terminal, |frame| a_busy_frame(frame, "suru\nis\nhere"))
+            .expect("a counting console never fails");
+        assert_eq!(writes.get(), 2, "an idle frame took more than one write");
+
+        let console = CountingWriter::default();
+        let writes = console.counter();
+        let mut unbuffered = Terminal::new(FrameBackend::new(AnsiTranscriptBackend::over(console)))
+            .expect("a counting Terminal always starts");
+        draw_frame(&mut unbuffered, |frame| {
+            a_busy_frame(frame, "suru\nis\nhere")
+        })
+        .expect("a counting console never fails");
+        assert!(
+            writes.get() > 1,
+            "an unbuffered frame collapsed to one write on its own, so the buffer proves nothing"
+        );
     }
 
     /// The frame -- cell writes and the cursor trip they end with -- has to
@@ -3381,10 +3457,10 @@ mod tests {
         );
     }
 
-    type RecordingTerminal = Terminal<QuietCursorBackend<AnsiTranscriptBackend>>;
+    type RecordingTerminal = Terminal<FrameBackend<AnsiTranscriptBackend>>;
 
     fn recording_terminal(backend: AnsiTranscriptBackend) -> RecordingTerminal {
-        Terminal::new(QuietCursorBackend::new(backend)).expect("a recording Terminal always starts")
+        Terminal::new(FrameBackend::new(backend)).expect("a recording Terminal always starts")
     }
 
     /// Draws one frame and returns only what that frame wrote, so a test can
