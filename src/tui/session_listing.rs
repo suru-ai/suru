@@ -160,6 +160,18 @@ impl SessionListing {
         request
     }
 
+    /// Asks one named Origin again as the reader turns back toward it. The
+    /// rows held from their last visit are still that Origin's own answer, so
+    /// they stand until the reply replaces them whole rather than blanking a
+    /// column that was already true. An Origin holding nothing says it is
+    /// loading, as a first visit should.
+    pub(super) fn revisit_origin(&mut self, outlook: Outlook) -> SessionListRequest {
+        let request = self.catch_up_origin(outlook);
+        let origin = self.origin_mut(request.outlook().clone());
+        origin.loading = origin.sessions.is_empty();
+        request
+    }
+
     /// Starts one fresh listing conversation per Origin. The caller dispatches
     /// the returned requests independently, so a slow Server cannot hold up or
     /// invalidate any other Server's answer.

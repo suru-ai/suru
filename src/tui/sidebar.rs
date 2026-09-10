@@ -2005,8 +2005,13 @@ impl Sidebar {
         self.listing.adopt_current_workspace(workspace);
     }
 
+    /// Turns the column toward another Outlook. The rows it already holds for
+    /// that Origin stand while it asks again, so a reader returning to a
+    /// Remote sees the listing they left rather than a blank column that
+    /// refills; only an Origin the Everywhere view has never included needs
+    /// the paired Remotes listed afresh before it can be shown at all.
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
-        self.listing.adopt_outlook(outlook);
+        self.listing.adopt_outlook(outlook.clone());
         self.query.clear();
         self.focus = None;
         self.attaching = None;
@@ -2016,9 +2021,27 @@ impl Sidebar {
         self.awaiting_dispatch.clear();
         self.everywhere_remote_dispatch_pending = false;
         self.pending_everywhere_remotes = None;
-        if self.revealed {
-            self.ask_for_sessions();
+        if !self.revealed {
+            return;
         }
+        if self.scope == SidebarListingScope::Everywhere
+            && !self.everywhere_origins.contains(&outlook)
+        {
+            self.ask_for_sessions();
+            return;
+        }
+        self.revisit_origin_on_show();
+    }
+
+    /// Asks the Origin on show again with its rows standing. It is the reader
+    /// looking again, so the answer lands as a fresh ask does — the settled
+    /// shelf opens on its first rows and row focus is seeded — while the rows
+    /// beneath them are not taken away in the meantime.
+    fn revisit_origin_on_show(&mut self) {
+        self.settled_on_show = SETTLED_SHELF_OPENING;
+        self.asked_afresh = true;
+        let outlook = self.listing.outlook().clone();
+        self.awaiting_dispatch = vec![self.listing.revisit_origin(outlook)];
     }
 
     /// Turns the listing after a cross-Origin Session row was chosen. An
@@ -2036,11 +2059,15 @@ impl Sidebar {
 
     /// Re-asks after a newly chosen Outlook has named its canonical Workspace.
     /// The first ask may have used the temporary `.` reading while the Remote
-    /// resolved it, so a visible Sidebar must replace that answer.
+    /// resolved it, so a visible Sidebar must replace that answer — with its
+    /// rows standing, since the first answer may already be on screen. An
+    /// Everywhere Sidebar lists every Workspace and needs nothing from the
+    /// resolution.
     pub(super) fn refresh_after_outlook_workspace(&mut self) {
-        if self.revealed {
-            self.ask_for_sessions();
+        if !self.revealed || self.scope == SidebarListingScope::Everywhere {
+            return;
         }
+        self.revisit_origin_on_show();
     }
 
     /// Narrows the Sidebar to the Workspace the reader named at its own path
@@ -3637,6 +3664,54 @@ mod tests {
     /// on opening still to be answered. It is the reader's own opening that
     /// gives the Sidebar the keys, and so the row focus every question about
     /// the arrows is asked of.
+    #[test]
+    fn turning_toward_an_origin_keeps_the_rows_it_holds_until_the_answer_lands() {
+        let studio = Outlook::Remote("studio".to_owned());
+        let (mut sidebar, request) = driven();
+        sidebar.load(&request, vec![summary("Local work", 1, 1)], None);
+
+        sidebar.adopt_outlook(studio.clone());
+        assert!(
+            sidebar.is_loading(),
+            "an Origin the reader has never visited says it is loading"
+        );
+        let request = sidebar
+            .take_listing_request()
+            .expect("turning the visible Sidebar asks its new Origin");
+        sidebar.load(&request, vec![summary("Remote work", 2, 2)], None);
+        assert_eq!(drawn(&sidebar), vec!["Remote work"]);
+
+        sidebar.adopt_outlook(Outlook::Local);
+        let request = sidebar
+            .take_listing_request()
+            .expect("turning back asks the Origin again");
+        assert_eq!(
+            drawn(&sidebar),
+            vec!["Local work"],
+            "the rows held for the Origin stand while it is asked again"
+        );
+        assert!(!sidebar.is_loading());
+        sidebar.load(
+            &request,
+            vec![summary("Local work", 1, 1), summary("Newer", 3, 3)],
+            None,
+        );
+        assert_eq!(drawn(&sidebar), vec!["Newer", BLANK, "Local work"]);
+
+        sidebar.adopt_outlook(studio);
+        sidebar.refresh_after_outlook_workspace();
+        let request = sidebar
+            .take_listing_request()
+            .expect("the resolved Workspace asks again");
+        assert_eq!(
+            drawn(&sidebar),
+            vec!["Remote work"],
+            "the Workspace resolving does not blank the column either"
+        );
+        sidebar.load(&request, vec![summary("Remote work", 2, 2)], None);
+        assert_eq!(drawn(&sidebar), vec!["Remote work"]);
+    }
+
     fn driven() -> (Sidebar, SessionListRequest) {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&settling_nothing());
