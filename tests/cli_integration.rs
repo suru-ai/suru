@@ -1622,17 +1622,31 @@ async fn run_server_cli(
     channel: &str,
     command: &str,
 ) -> std::process::Output {
-    const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
-    let timing_args = match command {
-        "start" => &["--startup-timeout-ms", "2000"][..],
-        "stop" => &[
+    // The CLI's own start and stop deadlines are failure deadlines in exactly
+    // the sense `PROGRESS_DEADLINE` describes: the command returns the moment
+    // the server settles, so a generous value costs a passing run nothing. A
+    // literal second was enough on Linux but not on Windows, where a server
+    // with a Client attached needs a little longer to release its registration
+    // than the stop deadline allowed — and the CLI then reported a settled
+    // shutdown as a failure.
+    let settle_ms = PROGRESS_DEADLINE.as_millis().to_string();
+    // The health probe is the opposite case. It is spent in full on every
+    // iteration that finds the endpoint still reachable, so it keeps a short
+    // literal: deciding "unreachable" quickly is what makes the wait above end
+    // early rather than late.
+    let timing_args: Vec<&str> = match command {
+        "start" => vec!["--startup-timeout-ms", &settle_ms],
+        "stop" => vec![
             "--stop-timeout-ms",
-            "1000",
+            &settle_ms,
             "--health-check-timeout-ms",
             "100",
-        ][..],
-        _ => &[],
+        ],
+        _ => vec![],
     };
+    // Only a wedged subprocess reaches this; it sits beyond the deadlines above
+    // so the CLI's own diagnosis wins whenever the CLI is still answering.
+    const PROCESS_TIMEOUT: Duration = PROGRESS_DEADLINE.saturating_add(Duration::from_secs(10));
     let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
     process
         .arg("server")
