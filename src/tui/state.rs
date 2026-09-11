@@ -2827,11 +2827,12 @@ impl TuiState {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
-        for prompt in snapshot
-            .prompts
-            .iter()
-            .filter(|prompt| prompt.status == PromptStatus::Pending)
-        {
+        // Only a Prompt owed a Turn is withdrawn by an interrupt; a queued one
+        // is left where it is, and a Session that cancels it does so for reasons
+        // of its own.
+        for prompt in snapshot.prompts.iter().filter(|prompt| {
+            prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
+        }) {
             self.withdrawing.push(WithdrawingPrompt {
                 session: session.clone(),
                 prompt: InitialPrompt {
