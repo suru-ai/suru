@@ -1586,6 +1586,11 @@ pub enum Activity {
         name: String,
         /// What the Subagent was asked to do, as its spawn described it.
         description: String,
+        /// The latest Model the Provider confirmed for this Subagent. It is
+        /// independent of the parent's mutable Agent Selection and remains
+        /// absent until the Provider supplies evidence.
+        #[serde(default)]
+        model: Option<ModelId>,
         /// The Subagent's own Session: a child of the Session this row is in,
         /// and the way into everything the Subagent did.
         session_id: SessionId,
@@ -2182,6 +2187,46 @@ pub enum CostBasis {
     Estimated,
 }
 
+/// The work one frozen Cost accounts for. A Turn measurement covers only the
+/// Turn carrying it. A Session-subtree measurement is cumulative within one
+/// Provider reporting lifetime and includes that Session and every descendant.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CostCoverage {
+    Turn,
+    SessionSubtree { reporting_lifetime: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostRecord {
+    pub cost: Cost,
+    pub basis: CostBasis,
+    pub coverage: CostCoverage,
+    pub recorded_at: SessionTimestamp,
+    pub is_partial: bool,
+}
+
+/// Attribution accompanying a Turn's current Cost. Earlier independent
+/// reporting lifetimes remain as records so reconnecting cannot erase frozen
+/// historical amounts.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostDetails {
+    pub coverage: CostCoverage,
+    pub recorded_at: SessionTimestamp,
+    pub is_partial: bool,
+    #[serde(default)]
+    pub prior: Vec<CostRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostTotal {
+    pub cost: Cost,
+    pub is_partial: bool,
+}
+
 /// What a set of Turns consumed together: the token parts that add up, and
 /// the Cost each Turn froze when it recorded its Usage. It is what a surface
 /// states for a whole Session — its own Turns, and its Subagent subtree with
@@ -2203,6 +2248,8 @@ pub struct UsageTotal {
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cost: Option<Cost>,
+    #[serde(default)]
+    pub cost_is_partial: bool,
 }
 
 impl UsageTotal {
@@ -2221,6 +2268,11 @@ impl UsageTotal {
             output_tokens: usage.and_then(|usage| usage.output_tokens),
             reasoning_tokens: usage.and_then(|usage| usage.reasoning_tokens),
             cost: turn.cost,
+            cost_is_partial: turn
+                .cost_details
+                .as_ref()
+                .is_some_and(|details| details.is_partial)
+                || usage.is_some() && turn.cost.is_none(),
         })
     }
 
@@ -2255,6 +2307,7 @@ impl UsageTotal {
                         .saturating_add(added.unwrap_or(Cost::from_nano_usd(0))),
                 ),
             },
+            cost_is_partial: self.cost_is_partial || other.cost_is_partial,
         }
     }
 
@@ -2294,6 +2347,9 @@ pub struct Turn {
     /// worked only when it knows.
     pub started_at: Option<SessionTimestamp>,
     pub settled_at: Option<SessionTimestamp>,
+    /// Latest durable evidence that this Turn produced substantive output.
+    #[serde(default)]
+    pub last_output_at: Option<SessionTimestamp>,
     /// Absent on Turns stored before usage recording and on Turns whose
     /// Provider never reported a measurement.
     pub usage: Option<Usage>,
@@ -2301,6 +2357,8 @@ pub struct Turn {
     /// was available. A reported zero is known and distinct from absence.
     pub cost: Option<Cost>,
     pub cost_basis: Option<CostBasis>,
+    #[serde(default)]
+    pub cost_details: Option<CostDetails>,
 }
 
 #[derive(Deserialize)]
@@ -2312,9 +2370,13 @@ struct TurnWire {
     status: TurnStatus,
     started_at: Option<SessionTimestamp>,
     settled_at: Option<SessionTimestamp>,
+    #[serde(default)]
+    last_output_at: Option<SessionTimestamp>,
     usage: Option<Usage>,
     cost: Option<Cost>,
     cost_basis: Option<CostBasis>,
+    #[serde(default)]
+    cost_details: Option<CostDetails>,
 }
 
 impl TryFrom<TurnWire> for Turn {
@@ -2331,9 +2393,11 @@ impl TryFrom<TurnWire> for Turn {
             status: turn.status,
             started_at: turn.started_at,
             settled_at: turn.settled_at,
+            last_output_at: turn.last_output_at,
             usage: turn.usage,
             cost: turn.cost,
             cost_basis: turn.cost_basis,
+            cost_details: turn.cost_details,
         })
     }
 }
@@ -2409,6 +2473,10 @@ pub struct SessionSnapshot {
     /// states the whole of what its work cost.
     #[serde(default)]
     pub subagent_usage: Option<UsageTotal>,
+    /// Authoritative Cost for this Session tree after applying Cost Coverage.
+    /// Derived from durable Turn measurements by the owning server.
+    #[serde(default)]
+    pub total_cost: Option<CostTotal>,
     #[serde(default)]
     pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
 }
@@ -2440,10 +2508,16 @@ impl SessionSnapshot {
     /// taken here so a listing and an open Session can never tell a reader
     /// different things about the same spend.
     pub fn total_usage(&self) -> Option<UsageTotal> {
-        match (UsageTotal::of_turns(&self.turns), self.subagent_usage) {
+        let mut total = match (UsageTotal::of_turns(&self.turns), self.subagent_usage) {
             (Some(own), Some(delegated)) => Some(own.saturating_add(delegated)),
             (own, delegated) => own.or(delegated),
+        };
+        if let Some(cost) = self.total_cost {
+            let total = total.get_or_insert_with(UsageTotal::default);
+            total.cost = Some(cost.cost);
+            total.cost_is_partial = cost.is_partial;
         }
+        total
     }
 }
 
@@ -2493,11 +2567,27 @@ pub enum SessionChange {
         turn_id: TurnId,
         agent: AgentIdentity,
     },
+    /// Provider-confirmed identity for a Subagent's prompt-less Turn. Unlike
+    /// an Agent Selection change, this is observation and is valid only for a
+    /// child Session.
+    SubagentAgentChanged {
+        turn_id: TurnId,
+        agent: AgentIdentity,
+    },
     TurnUsageChanged {
         turn_id: TurnId,
         usage: Usage,
         cost: Option<Cost>,
         cost_basis: Option<CostBasis>,
+        cost_coverage: Option<CostCoverage>,
+        cost_is_partial: bool,
+        /// Filled by the authoritative store when the change commits.
+        cost_recorded_at: Option<SessionTimestamp>,
+    },
+    /// Filled by the authoritative store when Provider output commits.
+    TurnOutputObserved {
+        turn_id: TurnId,
+        observed_at: SessionTimestamp,
     },
     /// What this Session's Subagent subtree has consumed, rolled up whole by
     /// the server. It carries the new reading entire rather than a delta,
@@ -2508,6 +2598,9 @@ pub enum SessionChange {
     },
     SubagentUsageChanged {
         subagent_usage: Option<UsageTotal>,
+    },
+    TotalCostChanged {
+        total_cost: Option<CostTotal>,
     },
     /// The whole Working reading derived by the server across this Session's
     /// Subagent subtree. It is carried as one value so a client joining an
@@ -2578,6 +2671,10 @@ pub enum SessionChange {
     SubagentDescriptionChanged {
         activity_id: ActivityId,
         description: String,
+    },
+    SubagentModelChanged {
+        activity_id: ActivityId,
+        model: ModelId,
     },
     SubagentStatusChanged {
         activity_id: ActivityId,

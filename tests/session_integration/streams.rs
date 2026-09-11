@@ -193,9 +193,11 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         status: TurnStatus::Active,
                         started_at: None,
                         settled_at: None,
+                        last_output_at: None,
                         usage: None,
                         cost: None,
                         cost_basis: None,
+                        cost_details: None,
                     },
                 },
                 SessionChange::MessageAdded {

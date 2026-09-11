@@ -662,9 +662,11 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         status: TurnStatus::Active,
                         started_at: None,
                         settled_at: None,
+                        last_output_at: None,
                         usage: None,
                         cost: None,
                         cost_basis: None,
+                        cost_details: None,
                     },
                 },
                 SessionChange::MessageAdded {
@@ -1589,9 +1591,11 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             status: TurnStatus::Active,
                             started_at: None,
                             settled_at: None,
+                            last_output_at: None,
                             usage: None,
                             cost: None,
                             cost_basis: None,
+                            cost_details: None,
                         },
                     },
                     SessionChange::MessageAdded {
@@ -3213,6 +3217,7 @@ fn subagent_activity_session(
         status,
         name: "Explore".to_owned(),
         description: description.to_owned(),
+        model: None,
         session_id: SessionId::new(),
         duration_ms,
     };
@@ -6030,9 +6035,11 @@ fn append_settled_turn(
         status: TurnStatus::Completed,
         started_at: None,
         settled_at: None,
+        last_output_at: None,
         usage: None,
         cost: None,
         cost_basis: None,
+        cost_details: None,
     });
     for (role, content) in [(MessageRole::User, prompt), (MessageRole::Agent, answer)] {
         let message = Message {
@@ -6363,9 +6370,11 @@ fn newer_turn_begins(
                     status: TurnStatus::Active,
                     started_at: None,
                     settled_at: None,
+                    last_output_at: None,
                     usage: None,
                     cost: None,
                     cost_basis: None,
+                    cost_details: None,
                 },
             },
             SessionChange::MessageAdded {

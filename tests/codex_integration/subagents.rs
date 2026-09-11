@@ -166,7 +166,6 @@ const COLLAB_SPAWN_CODEX: &str = r#"
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"completed","senderThreadId":"root-thread","receiverThreadIds":["child-thread"],"prompt":"Map the crate layout","agentsStates":{"child-thread":{"status":"running"}}}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"agentMessage","id":"child-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"child-thread","turnId":"child-turn","itemId":"child-message","delta":"Two crates, one workspace."}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"agentMessage","id":"child-message","text":"Two crates, one workspace."}}}'
@@ -175,6 +174,8 @@ const COLLAB_SPAWN_CODEX: &str = r#"
       printf '%s\n' '{"method":"item/started","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","id":"root-message","text":""}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","id":"root-message","text":"The layout is mapped."}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      sleep 0.05
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-child"}}'
       ;;
 "#;
 
@@ -185,7 +186,22 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
     let session_id = opened.session_id;
     let client = &opened.client;
 
-    let settled = settled_session(client, session_id, 0).await;
+    let settled = session_where(
+        client,
+        session_id,
+        "the late attach reply records the child model after both Turns settle",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+                && matches!(
+                    the_subagent_row(snapshot),
+                    Activity::Subagent { model: Some(_), .. }
+                )
+        },
+    )
+    .await;
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
     assert_eq!(
         agent_message_contents(&settled),
@@ -198,6 +214,7 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
         description,
         session_id: child_id,
         duration_ms,
+        model,
         ..
     } = the_subagent_row(&settled)
     else {
@@ -205,6 +222,10 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
     };
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(name, "Agent");
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("gpt-child")
+    );
     assert_eq!(
         description, "Map the crate layout",
         "the row reads the prompt the spawn call carried"
@@ -227,6 +248,18 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
         "the child names the Session whose Turn spawned it"
     );
     assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        child.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("gpt-child"),
+        "the attach reply establishes the child's own Model"
+    );
+    assert_eq!(
+        child.session.agent_selection, None,
+        "observed child identity does not become mutable Agent Selection"
+    );
     assert_eq!(
         agent_message_contents(&child),
         ["Two crates, one workspace."],

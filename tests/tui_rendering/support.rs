@@ -449,9 +449,11 @@ pub fn enter_active_session(
         status: TurnStatus::Active,
         started_at: Some(started_at),
         settled_at: None,
+        last_output_at: None,
         usage: None,
         cost: None,
         cost_basis: None,
+        cost_details: None,
     });
     snapshot.messages.push(Message {
         id: message_id,
@@ -504,6 +506,7 @@ pub fn failed_session_snapshot(
         transcript,
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     }
 }
 
@@ -555,6 +558,7 @@ pub fn selected_session_snapshot(
         transcript: Vec::new(),
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     }
 }
 
@@ -588,6 +592,7 @@ pub fn navigable_session_snapshot(
         transcript: Vec::new(),
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     };
     for section in 1..=section_count {
         let prompt_id = PromptId::new();
@@ -609,9 +614,11 @@ pub fn navigable_session_snapshot(
             status: TurnStatus::Completed,
             started_at: None,
             settled_at: None,
+            last_output_at: None,
             usage: None,
             cost: None,
             cost_basis: None,
+            cost_details: None,
         });
         snapshot.messages.extend([
             Message {
@@ -673,9 +680,11 @@ impl FailedTurnFixture {
                 status: TurnStatus::Failed,
                 started_at: None,
                 settled_at: None,
+                last_output_at: None,
                 usage: None,
                 cost: None,
                 cost_basis: None,
+                cost_details: None,
             },
             message: Message {
                 id: MessageId::new(),

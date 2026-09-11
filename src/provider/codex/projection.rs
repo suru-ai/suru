@@ -32,7 +32,7 @@ use super::{
         NativeCommandStatus, NativeCumulativeUsage, NativeField, NativeFileChange,
         NativeFileChangeStatus, NativeNotification, NativeSubagentActivityKind,
         NativeTurnFailureKind, NativeTurnOutcome, THREAD_APPROVAL_POLICY, THREAD_SANDBOX,
-        ThreadResumeParams,
+        ThreadConnectionResult, ThreadResumeParams,
     },
 };
 use crate::{
@@ -142,6 +142,10 @@ struct AttachedChild {
     /// thread is opened for the delegation and everything it ever meters is
     /// the Subagent's Turn — including whatever it ran before Suru attached.
     metering: ThreadMetering,
+    model: Option<ModelId>,
+    pricing_baseline: NativeCumulativeUsage,
+    unpriced_prefix: bool,
+    estimate_blocked: bool,
 }
 
 /// Codex's latest running total for one followed thread, and the point the
@@ -262,9 +266,27 @@ impl NativeCorrelation {
         }
     }
 
-    /// The Model this connection's Costs are estimated at.
-    pub(super) fn metered_model(&self) -> ModelId {
-        self.metered_model.clone()
+    fn observe_child_model(&mut self, thread_id: &str, model: ModelId) -> Option<Usage> {
+        let child = self.children.get_mut(thread_id)?;
+        match child.model.as_ref() {
+            None => {
+                child.pricing_baseline = child.metering.latest;
+                child.unpriced_prefix = has_billable_usage(
+                    &child
+                        .metering
+                        .latest
+                        .since(NativeCumulativeUsage::default()),
+                );
+                child.model = Some(model);
+                None
+            }
+            Some(current) if current == &model => None,
+            Some(_) => {
+                child.model = Some(model);
+                child.estimate_blocked = true;
+                Some(child.metering.latest.since(child.metering.baseline))
+            }
+        }
     }
 
     /// The native Turn whose notifications are currently being projected.
@@ -520,6 +542,7 @@ pub(super) fn provider_events(
     attachment: ChildThreadAttachment,
     pricing: Option<Arc<PricingSource>>,
 ) -> ProviderEventStream {
+    let (attached_models, attached_model_results) = mpsc::unbounded_channel();
     Box::pin(stream::unfold(
         GuardedEventReceiver {
             receiver: notifications,
@@ -527,6 +550,8 @@ pub(super) fn provider_events(
             correlation,
             skill_catalog_invalidations,
             attachment,
+            attached_models,
+            attached_model_results,
             pricing,
             pending: VecDeque::new(),
         },
@@ -549,11 +574,11 @@ impl ChildThreadAttachment {
     /// Fire-and-forget: a child Codex will not hand over leaves its Subagent's
     /// Session sparse — settled by the lifecycle items the spawner's thread
     /// still carries — rather than failing the parent's.
-    fn attach(&self, thread_id: String) {
+    fn attach(&self, thread_id: String, results: mpsc::UnboundedSender<(String, ModelId)>) {
         let transport = self.transport.clone();
         let cwd = self.cwd.clone();
         tokio::spawn(async move {
-            let _ = transport
+            let Ok(result) = transport
                 .request(
                     "thread/resume",
                     &ThreadResumeParams {
@@ -563,7 +588,17 @@ impl ChildThreadAttachment {
                         sandbox: THREAD_SANDBOX,
                     },
                 )
-                .await;
+                .await
+            else {
+                return;
+            };
+            let Ok(attached) = serde_json::from_value::<ThreadConnectionResult>(result) else {
+                return;
+            };
+            if attached.thread.id != thread_id || attached.model.is_empty() {
+                return;
+            }
+            let _ = results.send((thread_id, ModelId::new(attached.model)));
         });
     }
 }
@@ -574,6 +609,8 @@ struct GuardedEventReceiver {
     correlation: Arc<StdMutex<NativeCorrelation>>,
     skill_catalog_invalidations: tokio::sync::watch::Sender<u64>,
     attachment: ChildThreadAttachment,
+    attached_models: mpsc::UnboundedSender<(String, ModelId)>,
+    attached_model_results: mpsc::UnboundedReceiver<(String, ModelId)>,
     /// The rate table a Codex Cost is estimated from. Absent where the Session
     /// was started without one, which leaves Costs absent and tokens intact —
     /// the same reading as a rate table that has never been fetched.
@@ -591,7 +628,32 @@ async fn next_provider_event(
         if let Some(event) = events.pending.pop_front() {
             return Some((event, events));
         }
-        let native = events.receiver.recv().await?;
+        let native = tokio::select! {
+            native = events.receiver.recv() => native?,
+            attached = events.attached_model_results.recv() => {
+                let (thread_id, model) = attached?;
+                let restated_usage = events
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned")
+                    .observe_child_model(&thread_id, model.clone());
+                if let Some(usage) = restated_usage {
+                    events.pending.push_back(Ok(AttributedProviderEvent {
+                        attribution: ProviderEventAttribution::Subagent(
+                            ProviderSubagentId::new(thread_id.clone()),
+                        ),
+                        event: ProviderEvent::Usage { usage, cost: None },
+                    }));
+                }
+                return Some((Ok(AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(thread_id),
+                        model,
+                    },
+                }), events));
+            }
+        };
         match native {
             Err(error) => return Some((Err(error), events)),
             Ok(native) => {
@@ -603,32 +665,30 @@ async fn next_provider_event(
                         });
                     continue;
                 }
-                let (projected, attaches, model) = {
+                let (projected, attaches) = {
                     let mut correlation = events
                         .correlation
                         .lock()
                         .expect("Codex native correlation lock is not poisoned");
                     let projected = project_native_notification(&mut correlation, native);
-                    (
-                        projected,
-                        correlation.take_pending_attaches(),
-                        correlation.metered_model(),
-                    )
+                    let projected = projected.map(|projected| {
+                        projected
+                            .into_iter()
+                            .map(|event| {
+                                estimate_cost(&mut correlation, events.pricing.as_deref(), event)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    (projected, correlation.take_pending_attaches())
                 };
                 for thread_id in attaches {
-                    events.attachment.attach(thread_id);
+                    events
+                        .attachment
+                        .attach(thread_id, events.attached_models.clone());
                 }
                 match projected {
                     Ok(projected) => {
-                        let mut priced = Vec::with_capacity(projected.len());
-                        for event in projected {
-                            priced.push(Ok(estimate_cost(
-                                events.pricing.as_deref(),
-                                &model,
-                                event,
-                            )));
-                        }
-                        events.pending.extend(priced);
+                        events.pending.extend(projected.into_iter().map(Ok));
                     }
                     Err(error) => events.pending.push_back(Err(error)),
                 }
@@ -643,25 +703,60 @@ async fn next_provider_event(
 /// ever filled, and an event that is not a Usage all pass through unchanged,
 /// leaving the Cost absent rather than zero.
 ///
-/// A Subagent's tokens are priced at the Session's Model too. Codex states a
-/// spawned thread's own Model only in the attach reply this projection never
-/// sees, and a child ordinarily runs the Model its spawner does — so the
-/// Session's Model is the closest honest rate, and the Estimated Basis is
-/// already what says not to read the figure as exact.
+/// A Subagent is priced only after its own attach/settings evidence establishes
+/// a Model. Usage already observed before that evidence becomes the pricing
+/// baseline, and an ambiguous later Model change stops further estimates.
 fn estimate_cost(
+    correlation: &mut NativeCorrelation,
     pricing: Option<&PricingSource>,
-    model: &ModelId,
     mut event: AttributedProviderEvent,
 ) -> AttributedProviderEvent {
     let (Some(pricing), ProviderEvent::Usage { usage, cost }) = (pricing, &mut event.event) else {
         return event;
     };
+    let (model, priceable_usage, partial) = match &event.attribution {
+        ProviderEventAttribution::OwningSession => {
+            (correlation.metered_model.clone(), usage.clone(), false)
+        }
+        ProviderEventAttribution::Subagent(subagent) => {
+            let Some(child) = correlation.children.get(subagent.as_str()) else {
+                return event;
+            };
+            let Some(model) = child.model.clone() else {
+                return event;
+            };
+            if child.estimate_blocked {
+                return event;
+            }
+            (
+                model,
+                child.metering.latest.since(child.pricing_baseline),
+                child.unpriced_prefix,
+            )
+        }
+    };
     let estimated = pricing.estimate_cached(
-        &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model.clone()),
-        usage,
+        &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model),
+        &priceable_usage,
     );
-    *cost = estimated.map(MeteredCost::from);
+    *cost = estimated.map(|estimated| {
+        let metered = MeteredCost::from(estimated);
+        if partial { metered.partial() } else { metered }
+    });
     event
+}
+
+fn has_billable_usage(usage: &Usage) -> bool {
+    [
+        usage.fresh_input_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        usage.output_tokens,
+        usage.reasoning_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|count| count > 0)
 }
 
 fn project_native_notification(
@@ -728,8 +823,39 @@ fn project_native_notification(
             model,
             effort,
             service_tier,
-        } => project_agent_selection_changed(correlation, &thread_id, model, effort, service_tier)
-            .map(owning),
+        } => {
+            if correlation.thread_id == thread_id {
+                project_agent_selection_changed(
+                    correlation,
+                    &thread_id,
+                    model,
+                    effort,
+                    service_tier,
+                )
+                .map(owning)
+            } else if model.is_empty() || !correlation.children.contains_key(&thread_id) {
+                Ok(Vec::new())
+            } else {
+                let model = ModelId::new(model);
+                let restated = correlation.observe_child_model(&thread_id, model.clone());
+                let mut projected = vec![AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(thread_id.clone()),
+                        model,
+                    },
+                }];
+                if let Some(usage) = restated {
+                    projected.push(AttributedProviderEvent {
+                        attribution: ProviderEventAttribution::Subagent(ProviderSubagentId::new(
+                            thread_id,
+                        )),
+                        event: ProviderEvent::Usage { usage, cost: None },
+                    });
+                }
+                Ok(projected)
+            }
+        }
         NativeNotification::AgentMessageStarted {
             thread_id,
             turn_id,

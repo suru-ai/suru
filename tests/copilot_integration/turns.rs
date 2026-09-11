@@ -29,7 +29,7 @@ const METERED_TURNS: &str = r#"      sends=$(( ${sends:-0} + 1 ))
       if [ "$sends" -eq 1 ]; then
         event u1 assistant.usage '{"model":"claude-fixture","inputTokens":1000,"cacheReadTokens":100,"cacheWriteTokens":50,"cacheTtlSeconds":3600,"outputTokens":200,"reasoningTokens":50,"cost":1.5,"maxPromptTokens":128000,"maxOutputTokens":32000}'
         event u2 assistant.usage '{"model":"claude-fixture","inputTokens":500,"cacheReadTokens":50,"cacheWriteTokens":0,"outputTokens":100,"reasoningTokens":0,"cost":0.5}'
-        event u_sparse assistant.usage '{"model":"claude-fixture","inputTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0,"outputTokens":0,"reasoningTokens":0}'
+        event u_sparse assistant.usage '{"model":"unpriced-fixture","inputTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0,"outputTokens":0,"reasoningTokens":0}'
         event m1 assistant.message '{"messageId":"m1","content":"First answer"}'
         event i1 session.idle '{}'
       else
@@ -126,6 +126,13 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
     );
     assert_eq!(first.turns[0].cost, Cost::from_usd(0.05325));
     assert_eq!(first.turns[0].cost_basis, Some(CostBasis::Reported));
+    assert!(
+        first.turns[0]
+            .cost_details
+            .as_ref()
+            .is_some_and(|details| details.is_partial),
+        "the known subtotal remains visible when another call has no published price"
+    );
     assert_eq!(
         serde_json::to_value(first.turns[0].usage.as_ref().expect("first Turn Usage"))
             .expect("serialize Usage")["native_meter"],

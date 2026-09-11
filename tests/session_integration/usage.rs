@@ -5,7 +5,7 @@ use crate::{
     provider_support::ControlledProvider,
     support::{
         WorkingTurn, open_catalog_stream_with_snapshot, read_session, read_session_until,
-        the_subagent_row, working_turn,
+        working_turn,
     },
 };
 use suru::{
@@ -13,7 +13,10 @@ use suru::{
         Activity, Cost, SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionSnapshot,
         Usage, UsageTotal,
     },
-    provider::{MeteredCost, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
+    provider::{
+        MeteredCost, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
+        ProviderSubagentStatus,
+    },
     server::{self, ServerConfig},
 };
 
@@ -27,11 +30,12 @@ fn measured(fresh_input: u64, output: u64) -> Usage {
     }
 }
 
-fn totalling(fresh_input: u64, output: u64, usd: f64) -> UsageTotal {
+fn active_total(fresh_input: u64, output: u64, usd: f64) -> UsageTotal {
     UsageTotal {
         fresh_input_tokens: Some(fresh_input),
         output_tokens: Some(output),
         cost: Cost::from_usd(usd),
+        cost_is_partial: true,
         ..UsageTotal::default()
     }
 }
@@ -69,7 +73,12 @@ async fn spawn_subagent(
         },
     )
     .await;
-    let Activity::Subagent { session_id, .. } = the_subagent_row(&owner) else {
+    let Activity::Subagent { session_id, .. } = owner
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { name: row_name, .. } if row_name == name))
+        .expect("the named Subagent row opens")
+    else {
         unreachable!()
     };
     *session_id
@@ -143,8 +152,12 @@ async fn a_parents_total_carries_its_subagents_usage_while_the_child_keeps_its_o
         )
         .await;
 
-    let parent =
-        read_session_until_total(&fixture, fixture.session_id, totalling(6_000, 1_500, 0.25)).await;
+    let parent = read_session_until_total(
+        &fixture,
+        fixture.session_id,
+        active_total(6_000, 1_500, 0.25),
+    )
+    .await;
     assert_eq!(
         parent.turns[0]
             .usage
@@ -155,14 +168,14 @@ async fn a_parents_total_carries_its_subagents_usage_while_the_child_keeps_its_o
     );
     assert_eq!(
         parent.subagent_usage,
-        Some(totalling(2_000, 500, 0.05)),
+        Some(active_total(2_000, 500, 0.05)),
         "the roll-up stands apart from the parent's own Turns"
     );
 
     let child = read_session(fixture.server.descriptor(), child_id).await;
     assert_eq!(
         child.total_usage(),
-        Some(totalling(2_000, 500, 0.05)),
+        Some(active_total(2_000, 500, 0.05)),
         "the child's own total is its own Turn's Usage alone"
     );
     assert_eq!(
@@ -172,6 +185,407 @@ async fn a_parents_total_carries_its_subagents_usage_while_the_child_keeps_its_o
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_whole_tree_cost_counts_once_and_retains_proven_later_cost_as_partial() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-cost-coverage-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let covered = ProviderSubagentId::new("covered-child");
+    spawn_subagent(
+        &fixture,
+        ProviderEventAttribution::OwningSession,
+        fixture.session_id,
+        &covered,
+        "Covered",
+    )
+    .await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(4_000, 1_000),
+            cost: Cost::from_usd(0.20)
+                .map(|cost| MeteredCost::reported_subtree(cost, "provider-call-1")),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(covered),
+            ProviderEvent::Usage {
+                usage: measured(2_000, 500),
+                cost: Cost::from_usd(0.05).map(MeteredCost::reported),
+            },
+        )
+        .await;
+
+    let delayed = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the aggregate retains precedence over delayed child metering",
+        |snapshot| {
+            snapshot
+                .total_usage()
+                .is_some_and(|total| total.cost == Cost::from_usd(0.20) && total.cost_is_partial)
+        },
+    )
+    .await;
+    assert_eq!(delayed.total_usage().unwrap().cost, Cost::from_usd(0.20));
+
+    let later = ProviderSubagentId::new("later-child");
+    spawn_subagent(
+        &fixture,
+        ProviderEventAttribution::OwningSession,
+        fixture.session_id,
+        &later,
+        "Later",
+    )
+    .await;
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(later),
+            ProviderEvent::Usage {
+                usage: measured(900, 100),
+                cost: Cost::from_usd(0.03).map(MeteredCost::reported),
+            },
+        )
+        .await;
+    let later = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "proven later work is added outside the aggregate",
+        |snapshot| {
+            snapshot
+                .total_usage()
+                .is_some_and(|total| total.cost == Cost::from_usd(0.23))
+        },
+    )
+    .await;
+    assert!(later.total_usage().unwrap().cost_is_partial);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure restarted server"),
+        runtime,
+    )
+    .await
+    .expect("restart server");
+    let restored = read_session(restarted.descriptor(), fixture.session_id).await;
+    let restored_total = restored.total_usage().expect("restore the covered total");
+    assert_eq!(restored_total.cost, Cost::from_usd(0.23));
+    assert!(
+        restored_total.cost_is_partial,
+        "replay preserves the aggregate's temporal coverage"
+    );
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
+}
+
+#[tokio::test]
+async fn an_ancestor_report_suppresses_an_overlapping_nested_report() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "nested-cost-coverage-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let subagent = ProviderSubagentId::new("nested-report-child");
+    let child_id = spawn_subagent(
+        &fixture,
+        ProviderEventAttribution::OwningSession,
+        fixture.session_id,
+        &subagent,
+        "Measure",
+    )
+    .await;
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(subagent),
+            ProviderEvent::Usage {
+                usage: measured(100, 10),
+                cost: Cost::from_usd(0.05)
+                    .map(|cost| MeteredCost::reported_subtree(cost, "child-lifetime")),
+            },
+        )
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(200, 20),
+            cost: Cost::from_usd(0.10)
+                .map(|cost| MeteredCost::reported_subtree(cost, "parent-lifetime")),
+        })
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the ancestor aggregate wins without double counting",
+        |snapshot| {
+            snapshot
+                .total_usage()
+                .is_some_and(|total| total.cost == Cost::from_usd(0.10))
+        },
+    )
+    .await;
+    assert!(parent.total_usage().unwrap().cost_is_partial);
+    assert_eq!(
+        read_session(fixture.server.descriptor(), child_id)
+            .await
+            .total_usage()
+            .and_then(|total| total.cost),
+        Cost::from_usd(0.05),
+        "the child's own Session retains its independently reported amount"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure restarted server"),
+        runtime,
+    )
+    .await
+    .expect("restart server");
+    let restored_parent = read_session(restarted.descriptor(), fixture.session_id).await;
+    let restored_parent = restored_parent
+        .total_usage()
+        .expect("restore ancestor aggregate");
+    assert_eq!(restored_parent.cost, Cost::from_usd(0.10));
+    assert!(restored_parent.cost_is_partial);
+    assert_eq!(
+        read_session(restarted.descriptor(), child_id)
+            .await
+            .total_usage()
+            .and_then(|total| total.cost),
+        Cost::from_usd(0.05),
+        "restoration preserves the child's independently reported amount"
+    );
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
+}
+
+#[tokio::test]
+async fn output_without_a_price_keeps_a_known_total_partial_after_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "unpriced-output-coverage-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let subagent = ProviderSubagentId::new("unpriced-child");
+    spawn_subagent(
+        &fixture,
+        ProviderEventAttribution::OwningSession,
+        fixture.session_id,
+        &subagent,
+        "Write",
+    )
+    .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(200, 20),
+            cost: Cost::from_usd(0.10)
+                .map(|cost| MeteredCost::reported_subtree(cost, "output-lifetime")),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "Unmetered child output".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_attributed_and_wait_until_observed(
+                ProviderEventAttribution::Subagent(subagent.clone()),
+                event,
+            )
+            .await;
+    }
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let partial = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "unpriced output marks the known subtotal partial",
+        |snapshot| {
+            snapshot
+                .total_usage()
+                .is_some_and(|total| total.cost == Cost::from_usd(0.10) && total.cost_is_partial)
+        },
+    )
+    .await;
+    assert!(partial.total_usage().unwrap().cost_is_partial);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure restarted server"),
+        runtime,
+    )
+    .await
+    .expect("restart server");
+    let restored = read_session(restarted.descriptor(), fixture.session_id).await;
+    let restored = restored.total_usage().expect("restore known subtotal");
+    assert_eq!(restored.cost, Cost::from_usd(0.10));
+    assert!(restored.cost_is_partial);
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
+}
+
+#[tokio::test]
+async fn a_settled_turn_with_output_and_its_own_price_stays_complete_after_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "priced-output-restoration-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "Priced output".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::Usage {
+            usage: measured(300, 30),
+            cost: Cost::from_usd(0.04).map(MeteredCost::reported),
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let live = read_session(fixture.server.descriptor(), fixture.session_id)
+        .await
+        .total_usage()
+        .expect("live priced Turn total");
+    assert_eq!(live.cost, Cost::from_usd(0.04));
+    assert!(!live.cost_is_partial);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure restarted server"),
+        runtime,
+    )
+    .await
+    .expect("restart server");
+    let restored = read_session(restarted.descriptor(), fixture.session_id)
+        .await
+        .total_usage()
+        .expect("restored priced Turn total");
+    assert_eq!(restored.cost, Cost::from_usd(0.04));
+    assert!(!restored.cost_is_partial);
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
+}
+
+#[tokio::test]
+async fn independent_reporting_lifetimes_on_one_turn_survive_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "independent-reporting-lifetimes-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(100, 10),
+            cost: Cost::from_usd(0.10).map(|cost| MeteredCost::reported_subtree(cost, "process-1")),
+        })
+        .await;
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "Work between reporting processes".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(100, 10),
+            cost: Cost::from_usd(0.02).map(|cost| MeteredCost::reported_subtree(cost, "process-2")),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let live_snapshot = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let live_details = live_snapshot.turns[0]
+        .cost_details
+        .as_ref()
+        .expect("lifetime history");
+    assert_eq!(live_details.prior.len(), 1);
+    assert!(matches!(
+        &live_details.prior[0].coverage,
+        suru::protocol::CostCoverage::SessionSubtree { reporting_lifetime }
+            if reporting_lifetime == "process-1"
+    ));
+    let live = live_snapshot.total_usage().expect("live lifetime total");
+    assert_eq!(live.cost, Cost::from_usd(0.12));
+    assert!(!live.cost_is_partial);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure restarted server"),
+        runtime,
+    )
+    .await
+    .expect("restart server");
+    let restored_snapshot = read_session(restarted.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        restored_snapshot.turns[0]
+            .cost_details
+            .as_ref()
+            .expect("restored lifetime history")
+            .prior
+            .len(),
+        1
+    );
+    let restored = restored_snapshot
+        .total_usage()
+        .expect("restored lifetime total");
+    assert_eq!(restored.cost, Cost::from_usd(0.12));
+    assert!(!restored.cost_is_partial);
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
 }
 
 #[tokio::test]
@@ -208,17 +622,17 @@ async fn roll_up_recurses_through_a_subagents_own_subagents() {
         )
         .await;
 
-    read_session_until_total(&fixture, fixture.session_id, totalling(900, 100, 0.01)).await;
+    read_session_until_total(&fixture, fixture.session_id, active_total(900, 100, 0.01)).await;
     let child = read_session(fixture.server.descriptor(), child_id).await;
     assert_eq!(
         child.total_usage(),
-        Some(totalling(900, 100, 0.01)),
+        Some(active_total(900, 100, 0.01)),
         "the Subagent in the middle rolls its own Subagent up too"
     );
     let grandchild = read_session(fixture.server.descriptor(), grandchild_id).await;
     assert_eq!(
         grandchild.total_usage(),
-        Some(totalling(900, 100, 0.01)),
+        Some(active_total(900, 100, 0.01)),
         "the deepest Session states what it consumed itself"
     );
 
@@ -260,7 +674,7 @@ async fn the_catalog_announces_a_roll_up_without_the_session_open() {
 
     assert_eq!(
         next_usage_change(&mut catalog).await,
-        (fixture.session_id, Some(totalling(2_000, 500, 0.05))),
+        (fixture.session_id, Some(active_total(2_000, 500, 0.05))),
         "the listed root announces what its subtree consumed"
     );
     assert_ne!(
@@ -302,7 +716,7 @@ async fn usage_owed_to_a_subagent_after_its_spawning_turn_settled_still_rolls_up
             },
         )
         .await;
-    read_session_until_total(&fixture, fixture.session_id, totalling(2_000, 500, 0.05)).await;
+    read_session_until_total(&fixture, fixture.session_id, active_total(2_000, 500, 0.05)).await;
 
     // Late output owed to that Subagent begins a Continuation, whose own
     // Usage counts like any Turn's.
@@ -327,7 +741,8 @@ async fn usage_owed_to_a_subagent_after_its_spawning_turn_settled_still_rolls_up
         .await;
 
     let parent =
-        read_session_until_total(&fixture, fixture.session_id, totalling(3_000, 700, 0.07)).await;
+        read_session_until_total(&fixture, fixture.session_id, active_total(3_000, 700, 0.07))
+            .await;
     assert_eq!(
         parent.turns.len(),
         2,
@@ -371,7 +786,7 @@ async fn a_restarted_server_derives_the_roll_up_again_from_the_turns_it_stored()
             },
         )
         .await;
-    read_session_until_total(&fixture, session_id, totalling(6_000, 1_500, 0.25)).await;
+    read_session_until_total(&fixture, session_id, active_total(6_000, 1_500, 0.25)).await;
     drop(fixture.provider_session);
     fixture
         .server
@@ -389,13 +804,13 @@ async fn a_restarted_server_derives_the_roll_up_again_from_the_turns_it_stored()
     let parent = read_session(restarted.descriptor(), session_id).await;
     assert_eq!(
         parent.total_usage(),
-        Some(totalling(6_000, 1_500, 0.25)),
+        Some(active_total(6_000, 1_500, 0.25)),
         "the roll-up comes back from the child's own stored Turns"
     );
     let child = read_session(restarted.descriptor(), child_id).await;
     assert_eq!(
         child.total_usage(),
-        Some(totalling(2_000, 500, 0.05)),
+        Some(active_total(2_000, 500, 0.05)),
         "a restored child still keeps its own"
     );
 

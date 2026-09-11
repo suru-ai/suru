@@ -2,9 +2,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::protocol::{SessionId, SessionTimestamp, UsageTotal};
+use crate::protocol::{
+    Cost, CostCoverage, CostRecord, CostTotal, SessionId, SessionTimestamp, Turn, TurnId,
+    TurnStatus, UsageTotal,
+};
 
-use super::{SessionStoreState, projection::derived_session_status};
+use super::{
+    SessionStoreState,
+    projection::{derived_session_status, interval_contains, work_exceeds_coverage},
+};
 
 impl SessionStoreState {
     /// Derive each Session once, after its children. The temporary index and
@@ -31,11 +37,36 @@ impl SessionStoreState {
             visit += 1;
         }
 
+        // Reporting lifetimes can cross Session boundaries. Establish their
+        // beginning once before the bottom-up fold so a descendant report and
+        // an ancestor report use the same temporal extent without rescanning
+        // either subtree.
+        let mut lifetime_starts = HashMap::<String, SessionTimestamp>::new();
+        for &id in &walk {
+            for turn in &self.sessions[&id].snapshot.turns {
+                record_work(1);
+                let Some(started_at) = turn.started_at else {
+                    continue;
+                };
+                for record in turn_cost_records(turn) {
+                    record_work(1);
+                    if let CostCoverage::SessionSubtree { reporting_lifetime } = &record.coverage {
+                        lifetime_starts
+                            .entry(reporting_lifetime.clone())
+                            .and_modify(|current| *current = (*current).min(started_at))
+                            .or_insert(started_at);
+                    }
+                }
+            }
+        }
+
         let mut intervals: HashMap<SessionId, WorkingIntervals> = HashMap::new();
+        let mut cost_states = HashMap::<SessionId, RestoredCostState>::new();
         for id in walk.into_iter().rev() {
             record_work(1);
             let mut working = WorkingIntervals::default();
             let mut delegated: Option<UsageTotal> = None;
+            let mut cost_state = RestoredCostState::default();
             for child in children.get(&id).into_iter().flatten() {
                 record_work(1);
                 if let Some(usage) = self.sessions[child].summary.total_usage {
@@ -44,7 +75,12 @@ impl SessionStoreState {
                 if let Some(child_intervals) = intervals.remove(child) {
                     working.merge(child_intervals);
                 }
+                if let Some(child_costs) = cost_states.remove(child) {
+                    cost_state.merge(child_costs);
+                }
             }
+            cost_state.add_session(id, &self.sessions[&id].snapshot.turns, &lifetime_starts);
+            let total_cost = cost_state.total();
             let record = self.sessions.get_mut(&id).expect("indexed Session exists");
             for turn in &record.snapshot.turns {
                 record_work(1);
@@ -73,6 +109,7 @@ impl SessionStoreState {
             record.snapshot.session.status = status;
             record.summary.session.status = status;
             record.snapshot.subagent_usage = delegated;
+            record.snapshot.total_cost = total_cost;
             // Reads only this Session's Turns; child totals already include
             // their descendants and preserve absent measurements versus zero.
             record_work(record.snapshot.turns.len());
@@ -80,8 +117,329 @@ impl SessionStoreState {
             if record.snapshot.session.parent.is_some() {
                 intervals.insert(id, working);
             }
+            cost_states.insert(id, cost_state);
         }
     }
+}
+
+struct RestoredCostState {
+    components: Vec<RestoredCostComponent>,
+    uncovered_work: Vec<RestoredWork>,
+    total_cost: Option<Cost>,
+    incomplete: usize,
+}
+
+impl Default for RestoredCostState {
+    fn default() -> Self {
+        Self {
+            components: Vec::new(),
+            uncovered_work: Vec::new(),
+            total_cost: None,
+            incomplete: 0,
+        }
+    }
+}
+
+impl RestoredCostState {
+    fn merge(&mut self, mut child: Self) {
+        if self.components.len() < child.components.len() {
+            std::mem::swap(&mut self.components, &mut child.components);
+        }
+        record_work(child.components.len());
+        self.components.extend(child.components);
+        if self.uncovered_work.len() < child.uncovered_work.len() {
+            std::mem::swap(&mut self.uncovered_work, &mut child.uncovered_work);
+        }
+        record_work(child.uncovered_work.len());
+        self.uncovered_work.extend(child.uncovered_work);
+        self.total_cost = match (self.total_cost, child.total_cost) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (left, right) => left.or(right),
+        };
+        self.incomplete = self.incomplete.saturating_add(child.incomplete);
+    }
+
+    fn add_session(
+        &mut self,
+        owner: SessionId,
+        turns: &[Turn],
+        lifetime_starts: &HashMap<String, SessionTimestamp>,
+    ) {
+        let mut reports = HashMap::<String, (TurnId, CostRecord)>::new();
+        for turn in turns {
+            record_work(1);
+            for record in turn_cost_records(turn) {
+                record_work(1);
+                match &record.coverage {
+                    CostCoverage::Turn => self.push_component(RestoredCostComponent {
+                        owner,
+                        reporting_lifetime: None,
+                        cost: record.cost,
+                        interval: turn
+                            .started_at
+                            .map(|started_at| (started_at, record.recorded_at)),
+                        is_partial: record.is_partial || turn.started_at.is_none(),
+                    }),
+                    CostCoverage::SessionSubtree { reporting_lifetime } => {
+                        let replace = reports
+                            .get(reporting_lifetime)
+                            .is_none_or(|(_, current)| current.recorded_at < record.recorded_at);
+                        if replace {
+                            reports.insert(reporting_lifetime.clone(), (turn.id, record));
+                        }
+                    }
+                }
+            }
+            if turn.cost.is_none()
+                || turn.last_output_at.is_some()
+                || turn.status == TurnStatus::Active
+            {
+                self.push_work(RestoredWork {
+                    owner,
+                    turn_id: turn.id,
+                    started_at: turn.started_at,
+                    last_output_at: turn.last_output_at,
+                    active: turn.status == TurnStatus::Active,
+                    // A settled Turn with its own known price is complete on
+                    // its own. Retain its work evidence only so an ancestor
+                    // report can decide whether suppressing that price leaves
+                    // a temporal gap.
+                    covered: turn.cost.is_some() && turn.status != TurnStatus::Active,
+                });
+            }
+        }
+        let mut reports = reports
+            .into_iter()
+            .map(|(lifetime, (turn_id, record))| RestoredReport {
+                interval: lifetime_starts
+                    .get(&lifetime)
+                    .copied()
+                    .map(|start| (start, record.recorded_at)),
+                lifetime,
+                turn_id,
+                partial: record.is_partial,
+                cost: record.cost,
+            })
+            .collect::<Vec<_>>();
+        if reports.is_empty() {
+            return;
+        }
+        reports.sort_unstable_by_key(|report| {
+            report
+                .interval
+                .map(|interval| interval.0)
+                .unwrap_or(SessionTimestamp(u64::MAX))
+        });
+        let report_index = ReportIndex::new(&reports);
+        let untimed_report = reports.iter().position(|report| report.interval.is_none());
+        let furthest_report = reports
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, report)| report.interval.map(|(_, end)| end))
+            .map(|(index, _)| index)
+            .expect("a non-empty report set has a furthest report");
+        self.components.retain(|component| {
+            record_work(1);
+            if component.owner == owner && component.reporting_lifetime.is_some() {
+                return true;
+            }
+            if component.reporting_lifetime.is_some()
+                && component.owner != owner
+                && component.interval.is_none()
+            {
+                reports[furthest_report].partial = true;
+                return false;
+            }
+            if component.reporting_lifetime.is_some()
+                && component.owner != owner
+                && let Some(report_index) = untimed_report
+            {
+                reports[report_index].partial = true;
+                return false;
+            }
+            let Some(interval) = component.interval else {
+                return true;
+            };
+            let Some(report_index) = report_index.overlapping(interval) else {
+                return true;
+            };
+            reports[report_index].partial |=
+                !interval_contains(reports[report_index].interval.unwrap(), interval);
+            false
+        });
+        self.uncovered_work.retain_mut(|work| {
+            record_work(1);
+            let Some(started_at) = work.started_at else {
+                return true;
+            };
+            let Some(report_index) = report_index.overlapping((started_at, started_at)) else {
+                return true;
+            };
+            let report = &reports[report_index];
+            let coverage = report
+                .interval
+                .expect("the report index contains timed reports");
+            let incomplete = work_exceeds_coverage(
+                work.last_output_at,
+                work.active,
+                work.owner == owner && work.turn_id == report.turn_id,
+                coverage.1,
+            );
+            work.covered = !incomplete;
+            incomplete || work.active
+        });
+        self.recalculate();
+        for report in reports {
+            self.push_component(RestoredCostComponent {
+                owner,
+                reporting_lifetime: Some(report.lifetime),
+                cost: report.cost,
+                interval: report.interval,
+                is_partial: report.partial || report.interval.is_none(),
+            });
+        }
+    }
+
+    fn total(&self) -> Option<CostTotal> {
+        let cost = self.total_cost?;
+        Some(CostTotal {
+            cost,
+            is_partial: self.incomplete > 0,
+        })
+    }
+
+    fn push_component(&mut self, component: RestoredCostComponent) {
+        self.total_cost = Some(
+            self.total_cost
+                .map_or(component.cost, |total| total.saturating_add(component.cost)),
+        );
+        self.incomplete = self
+            .incomplete
+            .saturating_add(usize::from(component.is_partial));
+        self.components.push(component);
+    }
+
+    fn push_work(&mut self, work: RestoredWork) {
+        self.incomplete = self.incomplete.saturating_add(usize::from(!work.covered));
+        self.uncovered_work.push(work);
+    }
+
+    fn recalculate(&mut self) {
+        self.total_cost = None;
+        self.incomplete = 0;
+        for component in &self.components {
+            record_work(1);
+            self.total_cost = Some(
+                self.total_cost
+                    .map_or(component.cost, |total| total.saturating_add(component.cost)),
+            );
+            self.incomplete = self
+                .incomplete
+                .saturating_add(usize::from(component.is_partial));
+        }
+        for work in &self.uncovered_work {
+            record_work(1);
+            self.incomplete = self.incomplete.saturating_add(usize::from(!work.covered));
+        }
+    }
+}
+
+struct RestoredCostComponent {
+    owner: SessionId,
+    reporting_lifetime: Option<String>,
+    cost: Cost,
+    interval: Option<(SessionTimestamp, SessionTimestamp)>,
+    is_partial: bool,
+}
+
+struct RestoredReport {
+    lifetime: String,
+    turn_id: TurnId,
+    cost: Cost,
+    interval: Option<(SessionTimestamp, SessionTimestamp)>,
+    partial: bool,
+}
+
+struct ReportIndex {
+    starts: Vec<SessionTimestamp>,
+    max_end_tree: Vec<Option<(SessionTimestamp, usize)>>,
+    leaf_count: usize,
+}
+
+impl ReportIndex {
+    fn new(reports: &[RestoredReport]) -> Self {
+        let timed_reports = reports
+            .iter()
+            .enumerate()
+            .filter_map(|(index, report)| report.interval.map(|_| index))
+            .collect::<Vec<_>>();
+        let starts = timed_reports
+            .iter()
+            .map(|&index| reports[index].interval.unwrap().0)
+            .collect::<Vec<_>>();
+        let leaf_count = timed_reports.len().max(1).next_power_of_two();
+        let mut max_end_tree = vec![None; leaf_count * 2];
+        for (offset, &index) in timed_reports.iter().enumerate() {
+            max_end_tree[leaf_count + offset] = Some((reports[index].interval.unwrap().1, index));
+        }
+        for node in (1..leaf_count).rev() {
+            max_end_tree[node] = max_end_tree[node * 2].max(max_end_tree[node * 2 + 1]);
+        }
+        Self {
+            starts,
+            max_end_tree,
+            leaf_count,
+        }
+    }
+
+    fn overlapping(&self, interval: (SessionTimestamp, SessionTimestamp)) -> Option<usize> {
+        let upper = self.starts.partition_point(|start| *start <= interval.1);
+        let mut left = self.leaf_count;
+        let mut right = self.leaf_count + upper;
+        let mut furthest = None;
+        while left < right {
+            if left % 2 == 1 {
+                furthest = furthest.max(self.max_end_tree[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                furthest = furthest.max(self.max_end_tree[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        furthest
+            .filter(|(end, _)| *end >= interval.0)
+            .map(|(_, report_index)| report_index)
+    }
+}
+
+struct RestoredWork {
+    owner: SessionId,
+    turn_id: TurnId,
+    started_at: Option<SessionTimestamp>,
+    last_output_at: Option<SessionTimestamp>,
+    active: bool,
+    covered: bool,
+}
+
+fn turn_cost_records(turn: &Turn) -> Vec<CostRecord> {
+    let Some(cost) = turn.cost else {
+        return Vec::new();
+    };
+    let (Some(basis), Some(details)) = (turn.cost_basis, turn.cost_details.as_ref()) else {
+        return Vec::new();
+    };
+    let mut records = details.prior.clone();
+    records.push(CostRecord {
+        cost,
+        basis,
+        coverage: details.coverage.clone(),
+        recorded_at: details.recorded_at,
+        is_partial: details.is_partial,
+    });
+    records
 }
 
 /// Disjoint, ordered components of the union of durable Turn intervals.

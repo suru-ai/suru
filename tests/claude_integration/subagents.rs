@@ -21,12 +21,12 @@ use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
 /// `parent_tool_use_id` — and the CLI notifies the task settling before the conversation answers.
 /// The loop's own answer streams with its snapshot restating it beside the chunks.
 const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Task","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Scout the workspace\",\"prompt\":\"scout the workspace\",\"subagent_type\":\"Explore\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-task-1","tool_use_id":"task_1","description":"Scout the workspace","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
-      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Scouting the workspace now."}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"id":"msg-child-1","role":"assistant","model":"claude-sonnet-child","content":[{"type":"text","text":"Scouting the workspace now."}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"**Scouting plan**\n\nLook for TODO markers.","signature":"sig"},{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{"command":"rg -l TODO"}}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub","content":"src/main.rs\n","is_error":false}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-1","status":"completed","summary":"Found one file.","session_id":"prov-session"}'
@@ -82,6 +82,7 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
         description,
         session_id: child_id,
         duration_ms,
+        model,
         ..
     } = the_subagent_row(&settled)
     else {
@@ -90,6 +91,10 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(name, "Explore", "the row names the subagent's own type");
     assert_eq!(description, "Scout the workspace");
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("claude-sonnet-child")
+    );
     assert!(
         duration_ms.is_some(),
         "the settled row states how long the delegation ran"
@@ -108,6 +113,13 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
         "the child names the Session whose Turn spawned it"
     );
     assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        child.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("claude-sonnet-child")
+    );
     let [narration] = agent_messages(&child)[..] else {
         panic!(
             "the subagent's narration is the child's Message, got {:?}",

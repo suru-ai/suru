@@ -190,6 +190,8 @@ pub(super) struct AssistantMessageSnapshot {
 #[derive(Deserialize)]
 pub(super) struct AssistantMessageBody {
     #[serde(default)]
+    pub(super) model: Option<String>,
+    #[serde(default)]
     pub(super) content: Vec<ContentBlock>,
 }
 
@@ -241,6 +243,8 @@ pub(super) struct EchoedUserBlock {
 /// other subtype is a failure whose `errors` say what went wrong.
 #[derive(Deserialize)]
 pub(super) struct ResultMessage {
+    #[serde(default)]
+    pub(super) uuid: Option<String>,
     pub(super) subtype: String,
     #[serde(default)]
     pub(super) is_error: bool,

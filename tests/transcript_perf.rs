@@ -62,6 +62,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         transcript: Vec::new(),
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     };
     for section in 1..=sections {
         let prompt_id = PromptId::new();
@@ -84,9 +85,11 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
             status: TurnStatus::Completed,
             started_at: None,
             settled_at: None,
+            last_output_at: None,
             usage: None,
             cost: None,
             cost_basis: None,
+            cost_details: None,
         });
         snapshot.messages.extend([
             Message {

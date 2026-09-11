@@ -105,6 +105,7 @@ impl SessionStore {
                     persisted.snapshot.session.working_since =
                         record.snapshot.session.working_since;
                     persisted.snapshot.subagent_usage = record.snapshot.subagent_usage;
+                    persisted.snapshot.total_cost = record.snapshot.total_cost;
 
                     let record = restored_record(persisted, &mut state.prompts);
                     state.sessions.insert(id, record);

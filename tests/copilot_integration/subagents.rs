@@ -89,6 +89,7 @@ fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
 const FAN_OUT_TURN: &str = r#"      event e1 assistant.message_start '{"messageId":"m1"}'
       event e2 assistant.message_delta '{"messageId":"m1","deltaContent":"Delegating to the researcher."}'
       agent_event e3 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout the workspace"}'
+      agent_event e-usage agent-1 assistant.usage '{"model":"gpt-child","inputTokens":20,"outputTokens":5}'
       agent_event e4 agent-1 assistant.message_start '{"messageId":"sub-m1"}'
       agent_event e5 agent-1 assistant.message_delta '{"messageId":"sub-m1","deltaContent":"Scouting the workspace now."}'
       agent_event e6 agent-1 assistant.message '{"messageId":"sub-m1","content":"Scouting the workspace now."}'
@@ -129,6 +130,7 @@ async fn attributed_events_land_in_the_child_session_while_the_parents_transcrip
         description,
         session_id: child_id,
         duration_ms,
+        model,
         ..
     } = the_subagent_row(&settled)
     else {
@@ -137,6 +139,10 @@ async fn attributed_events_land_in_the_child_session_while_the_parents_transcrip
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(name, "Researcher");
     assert_eq!(description, "Scout the workspace");
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("gpt-child")
+    );
     assert!(
         duration_ms.is_some(),
         "the settled row states how long the delegation ran"
@@ -149,6 +155,13 @@ async fn attributed_events_land_in_the_child_session_while_the_parents_transcrip
     );
 
     let child = settled_session(client, *child_id, 0).await;
+    assert_eq!(
+        child.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("gpt-child")
+    );
     assert_eq!(
         child.session.parent,
         Some(session_id),

@@ -25,7 +25,7 @@ Whether the user wants Suru to offer a Provider at all, carried as a Setting and
 _Avoid_: Provider toggle, active, installed
 
 **Model**:
-The language model selected for an Agent through its Provider.
+The language model selected for an Agent through its Provider. A Subagent's actual Model is known only from Provider evidence; its parent's Model does not establish its own.
 _Avoid_: Engine
 
 **Model Catalog**:
@@ -101,8 +101,12 @@ The latest known number of tokens occupying a Session's context, expressed again
 _Avoid_: Session Usage, total tokens used, context remaining
 
 **Cost**:
-The dollar figure attached to a Turn's Usage, fixed when that Usage is recorded and never restated against later prices, so a historical Cost stays a fact about the past. A Cost the Provider states itself outranks one Suru estimates from a rate table, and where neither exists the Cost is absent — shown as nothing rather than as zero, so free and unknown never blur. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed; its Cost Basis says where the number came from.
+The dollar figure for recorded work, fixed when recorded and never restated against later prices; a Provider-reported figure outranks a Suru estimate, and unknown Cost remains absent rather than zero. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed, with its origin stated by Cost Basis and the work it accounts for stated by Cost Coverage.
 _Avoid_: Price (that is a rate), spend, billing
+
+**Cost Coverage**:
+The work a Cost accounts for, including whether it covers a Session's own work or also its descendants, so overlapping amounts contribute only once to a total. A total with known amounts and uncovered work retains those amounts and is marked partial; a whole-tree amount can cover descendants whose individual Costs remain unknown.
+_Avoid_: Cost Basis (which describes origin), billing coverage
 
 **Cost Basis**:
 Where a Cost came from: **Reported** when the Provider itself stated the figure, **Estimated** when Suru computed it from a rate table. Basis records who computed the number rather than whether money changed hands — a Reported Cost under a subscription may still have billed nothing.

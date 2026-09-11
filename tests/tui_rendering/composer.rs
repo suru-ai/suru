@@ -53,6 +53,7 @@ fn session_composer_footer_uses_persisted_context_and_cost_across_all_turn_outco
         status: TurnStatus::Interrupted,
         started_at: None,
         settled_at: None,
+        last_output_at: None,
         usage: Some(Usage {
             fresh_input_tokens: Some(10_000),
             cache_write_tokens: Some(50_000),
@@ -62,6 +63,7 @@ fn session_composer_footer_uses_persisted_context_and_cost_across_all_turn_outco
         }),
         cost: Cost::from_usd(0.52),
         cost_basis: Some(CostBasis::Reported),
+        cost_details: None,
     });
 
     snapshot.session.context_fill = Some(ContextFill {
@@ -131,6 +133,9 @@ fn session_composer_footer_updates_with_active_turn_usage_and_hides_unknown_cost
                         },
                         cost: None,
                         cost_basis: None,
+                        cost_coverage: None,
+                        cost_is_partial: true,
+                        cost_recorded_at: None,
                     },
                 ],
             },

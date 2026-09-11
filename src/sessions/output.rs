@@ -94,6 +94,7 @@ impl SessionStore {
                     // its own lifecycle is gated on the row still being open
                     // rather than on the Turn it was spawned under.
                     SessionChange::SubagentDescriptionChanged { activity_id, .. }
+                    | SessionChange::SubagentModelChanged { activity_id, .. }
                     | SessionChange::SubagentStatusChanged { activity_id, .. } => {
                         let activity = record
                             .snapshot
@@ -204,7 +205,8 @@ fn agent_output_turn_id(
     change: &SessionChange,
 ) -> anyhow::Result<TurnId> {
     match change {
-        SessionChange::TurnUsageChanged { turn_id, .. } => Ok(*turn_id),
+        SessionChange::TurnUsageChanged { turn_id, .. }
+        | SessionChange::SubagentAgentChanged { turn_id, .. } => Ok(*turn_id),
         SessionChange::MessageAdded { message } if message.role == MessageRole::Agent => {
             Ok(message.turn_id)
         }

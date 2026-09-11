@@ -7,8 +7,8 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    AgentIdentity, PromptOrder, Session, SessionId, SessionRevision, SessionSnapshot,
-    SessionStandingInputs, SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
+    PromptOrder, Session, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
+    SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
 };
 
 use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore};
@@ -30,7 +30,6 @@ impl SessionStore {
     pub(crate) fn create_subagent(
         &self,
         parent_id: SessionId,
-        agent: Option<AgentIdentity>,
         name: &str,
         description: &str,
     ) -> anyhow::Result<SpawnedSubagentSession> {
@@ -62,7 +61,7 @@ impl SessionStore {
                 id: session_id,
                 execution_directory: parent_session.execution_directory.clone(),
                 workspace: parent_session.workspace.clone(),
-                agent_selection: parent_session.agent_selection.clone(),
+                agent_selection: None,
                 agent_selection_availability: parent_session.agent_selection_availability,
                 status: SessionStatus::Active,
                 working_since: Some(timestamp),
@@ -73,21 +72,24 @@ impl SessionStore {
             turns: vec![Turn {
                 id: turn_id,
                 prompt_id: None,
-                agent,
+                agent: None,
                 status: TurnStatus::Active,
                 // Stamped here rather than by a commit, because the spawn is
                 // the child's creation and no commit delivers its Turn.
                 started_at: Some(timestamp),
                 settled_at: None,
+                last_output_at: None,
                 usage: None,
                 cost: None,
                 cost_basis: None,
+                cost_details: None,
             }],
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
         };
         let summary = SessionSummary {
             checkout_state: None,

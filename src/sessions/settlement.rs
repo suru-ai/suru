@@ -169,9 +169,11 @@ impl SessionStore {
                     // The commit that lands this Turn stamps when it began.
                     started_at: None,
                     settled_at: None,
+                    last_output_at: None,
                     usage: None,
                     cost: None,
                     cost_basis: None,
+                    cost_details: None,
                 },
             }],
         )?;
@@ -531,12 +533,15 @@ mod tests {
                 status: TurnStatus::Active,
                 started_at: None,
                 settled_at: None,
+                last_output_at: None,
                 usage: None,
                 cost: None,
                 cost_basis: None,
+                cost_details: None,
             }],
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
             transcript: messages
                 .iter()
                 .map(|message| TranscriptItem::Message {

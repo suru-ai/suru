@@ -3,8 +3,9 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, MessageRole, MessageStatus, PromptDelivery, PromptStatus,
-    SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
+    Activity, ActivityId, ActivityStatus, CostDetails, CostRecord, MessageRole, MessageStatus,
+    PromptDelivery, PromptStatus, SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem,
+    TurnStatus,
 };
 
 /// Applies `update` to `snapshot` in place. On error the snapshot may hold a
@@ -132,11 +133,36 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 turn.agent = Some(agent.clone());
             }
+            SessionChange::SubagentAgentChanged { turn_id, agent } => {
+                if !next.session.is_subagent() {
+                    bail!("Session update observed a Subagent Agent on a root Session");
+                }
+                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                    bail!("Session update referenced an unknown Turn");
+                };
+                if let Some(current) = turn.agent.as_ref()
+                    && (current.agent != agent.agent
+                        || current.selection.provider != agent.selection.provider)
+                {
+                    bail!("Session update changed the Provider identity of a Subagent Turn");
+                }
+                if turn
+                    .agent
+                    .as_ref()
+                    .is_some_and(|current| current.selection.model != agent.selection.model)
+                {
+                    next.session.context_fill = None;
+                }
+                turn.agent = Some(agent.clone());
+            }
             SessionChange::TurnUsageChanged {
                 turn_id,
                 usage,
                 cost,
                 cost_basis,
+                cost_coverage,
+                cost_is_partial,
+                cost_recorded_at,
             } => {
                 let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
@@ -144,12 +170,55 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if turn.status != TurnStatus::Active {
                     bail!("Session update recorded Usage on a terminal Turn");
                 }
-                if cost.is_some() != cost_basis.is_some() {
-                    bail!("Session update recorded a Cost without exactly one Cost Basis");
+                if cost.is_some() != cost_basis.is_some()
+                    || cost.is_some() != cost_coverage.is_some()
+                    || cost.is_some() != cost_recorded_at.is_some()
+                {
+                    bail!("Session update recorded an incomplete Cost attribution");
                 }
                 turn.usage = Some(usage.clone());
-                turn.cost = *cost;
-                turn.cost_basis = *cost_basis;
+                if let (Some(cost), Some(basis), Some(coverage), Some(recorded_at)) =
+                    (cost, cost_basis, cost_coverage, cost_recorded_at)
+                {
+                    let mut prior = turn
+                        .cost_details
+                        .as_ref()
+                        .map_or_else(Vec::new, |details| details.prior.clone());
+                    if let (Some(old_cost), Some(old_basis), Some(old_details)) =
+                        (turn.cost, turn.cost_basis, turn.cost_details.as_ref())
+                        && old_details.coverage != *coverage
+                    {
+                        prior.push(CostRecord {
+                            cost: old_cost,
+                            basis: old_basis,
+                            coverage: old_details.coverage.clone(),
+                            recorded_at: old_details.recorded_at,
+                            is_partial: old_details.is_partial,
+                        });
+                    }
+                    turn.cost = Some(*cost);
+                    turn.cost_basis = Some(*basis);
+                    turn.cost_details = Some(CostDetails {
+                        coverage: coverage.clone(),
+                        recorded_at: *recorded_at,
+                        is_partial: *cost_is_partial,
+                        prior,
+                    });
+                } else if let Some(details) = turn.cost_details.as_mut() {
+                    details.is_partial = true;
+                }
+            }
+            SessionChange::TurnOutputObserved {
+                turn_id,
+                observed_at,
+            } => {
+                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                    bail!("Session update referenced an unknown Turn");
+                };
+                turn.last_output_at = Some(
+                    turn.last_output_at
+                        .map_or(*observed_at, |current| current.max(*observed_at)),
+                );
             }
             SessionChange::SubagentQuestionnairesChanged {
                 subagent_questionnaires,
@@ -162,6 +231,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 // can see across Sessions, so applying it is taking it as
                 // given rather than adding anything up.
                 next.subagent_usage = *subagent_usage;
+            }
+            SessionChange::TotalCostChanged { total_cost } => {
+                next.total_cost = *total_cost;
             }
             SessionChange::SessionWorkingChanged { working_since } => {
                 next.session.working_since = *working_since;
@@ -562,6 +634,16 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 *current_description = description.clone();
             }
+            SessionChange::SubagentModelChanged { activity_id, model } => {
+                let Some(Activity::Subagent {
+                    model: current_model,
+                    ..
+                }) = subagent_activity(next, activity_id)?
+                else {
+                    bail!("Session update identified a different Activity kind");
+                };
+                *current_model = Some(model.clone());
+            }
             SessionChange::SubagentStatusChanged {
                 activity_id,
                 status,
@@ -699,6 +781,7 @@ mod tests {
             transcript: Vec::new(),
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
         };
 
         apply_update(
@@ -714,9 +797,11 @@ mod tests {
                         status: TurnStatus::Active,
                         started_at: Some(SessionTimestamp(1_755_000_000_000)),
                         settled_at: None,
+                        last_output_at: None,
                         usage: None,
                         cost: None,
                         cost_basis: None,
+                        cost_details: None,
                     },
                 }],
             },
@@ -742,6 +827,9 @@ mod tests {
                     },
                     cost: Cost::from_usd(0.03),
                     cost_basis: Some(CostBasis::Reported),
+                    cost_coverage: Some(crate::protocol::CostCoverage::Turn),
+                    cost_is_partial: false,
+                    cost_recorded_at: Some(SessionTimestamp(2)),
                 }],
             },
         )

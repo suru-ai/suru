@@ -494,6 +494,7 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 transcript: Vec::new(),
                 subagent_questionnaires: Vec::new(),
                 subagent_usage: None,
+                total_cost: None,
             };
             summary.total_usage = snapshot.total_usage();
             Ok::<_, StorageError>(PersistedSession {
@@ -617,6 +618,7 @@ fn load_session(
         // loaded rather than stored twice.
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     };
     // Working is reconstructed across the complete Session tree after every
     // stored Session has been loaded; one row cannot see that subtree here.

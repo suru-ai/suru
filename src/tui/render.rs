@@ -2138,9 +2138,39 @@ fn render_subagent_picker(
         } else {
             "├"
         };
+        let model = entry
+            .model
+            .map(|model| {
+                snapshot
+                    .session
+                    .agent_selection
+                    .as_ref()
+                    .or_else(|| {
+                        snapshot
+                            .turns
+                            .last()
+                            .and_then(|turn| turn.agent.as_ref())
+                            .map(|agent| &agent.selection)
+                    })
+                    .map_or_else(
+                        || model.as_str().to_owned(),
+                        |selection| {
+                            state.model_picker.selection_summary(
+                                &crate::protocol::AgentSelection {
+                                    provider: selection.provider.clone(),
+                                    model: model.clone(),
+                                    options: Vec::new(),
+                                },
+                                false,
+                            )
+                        },
+                    )
+            })
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default();
         let content = truncate_to_width(
             &format!(
-                "{guide} {} {}{}: {}",
+                "{guide} {} {}{model}{}: {}",
                 spinner::frame(state.spinner_frame / 3),
                 entry.name,
                 if entry.pending_questionnaires > 0 {
@@ -4068,11 +4098,22 @@ fn render_session_surface(
 
 /// Context occupancy has priority over accumulated Cost under width pressure.
 fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
-    let cost = snapshot
-        .total_usage()
-        .and_then(|total| total.cost)
-        .filter(|cost| !cost.is_zero())
-        .map(compact_cost);
+    let cost = snapshot.total_usage().and_then(|total| {
+        total
+            .cost
+            .filter(|cost| !cost.is_zero() || total.cost_is_partial)
+            .map(|cost| {
+                let mut rendered = if cost.is_zero() {
+                    "$0.00".to_owned()
+                } else {
+                    compact_cost(cost)
+                };
+                if total.cost_is_partial {
+                    rendered.push_str(" · partial");
+                }
+                rendered
+            })
+    });
     let (full, minimal) = match snapshot.session.context_fill {
         Some(fill) => {
             let count = compact_count(fill.occupied_tokens);
@@ -4801,7 +4842,7 @@ mod tests {
         },
         state::{Application, ApplicationEvent},
     };
-    use super::working_indicator_elapsed;
+    use super::{session_footer_metrics_text, working_indicator_elapsed};
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
@@ -4817,7 +4858,7 @@ mod tests {
     /// smaller content areas supplied by a layout.
     #[test]
     fn context_fill_footer_drops_cost_then_count_and_hides_unfit_minimum() {
-        use crate::protocol::{ContextFill, Cost, UsageTotal};
+        use crate::protocol::{ContextFill, Cost, CostTotal, UsageTotal};
         for capacity in [Some(200_000), None] {
             let workspace = tempfile::tempdir().unwrap();
             let snapshot = SessionSnapshot {
@@ -4851,7 +4892,19 @@ mod tests {
                     cost: Cost::from_usd(0.42),
                     ..UsageTotal::default()
                 }),
+                total_cost: None,
             };
+            let mut partial_zero = snapshot.clone();
+            partial_zero.session.context_fill = None;
+            partial_zero.total_cost = Some(CostTotal {
+                cost: Cost::from_nano_usd(0),
+                is_partial: true,
+            });
+            assert_eq!(
+                session_footer_metrics_text(&partial_zero, 30).as_deref(),
+                Some("$0.00 · partial"),
+                "a known-zero partial total remains visible"
+            );
             let mut application = Application::default();
             application
                 .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
@@ -5091,6 +5144,7 @@ mod tests {
                     transcript: Vec::new(),
                     subagent_questionnaires: Vec::new(),
                     subagent_usage: None,
+                    total_cost: None,
                 },
             )))
             .expect("hydrate test Application");
@@ -5163,6 +5217,7 @@ mod tests {
                     transcript: Vec::new(),
                     subagent_questionnaires: Vec::new(),
                     subagent_usage: None,
+                    total_cost: None,
                 },
             )))
             .expect("hydrate test Application");

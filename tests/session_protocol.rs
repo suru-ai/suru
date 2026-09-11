@@ -240,6 +240,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             output_tokens: Some(900),
             reasoning_tokens: None,
             cost: Cost::from_usd(0.03),
+            cost_is_partial: false,
         }),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
@@ -264,7 +265,8 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "cache_write_tokens": 400,
             "output_tokens": 900,
             "reasoning_tokens": null,
-            "cost": 0.03
+            "cost": 0.03,
+            "cost_is_partial": false
         },
         "workspace": Workspace::directory(std::path::PathBuf::from("/work/suru")),
         "checkout": null,
@@ -375,6 +377,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             status: TurnStatus::Failed,
             started_at: Some(SessionTimestamp(1_755_000_000_000)),
             settled_at: Some(SessionTimestamp(1_755_000_004_200)),
+            last_output_at: None,
             usage: Some(Usage {
                 fresh_input_tokens: Some(1_200),
                 cache_read_tokens: Some(300),
@@ -386,6 +389,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             }),
             cost: Cost::from_usd(0.03),
             cost_basis: Some(CostBasis::Reported),
+            cost_details: None,
         }],
         messages: vec![Message {
             id: MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81")),
@@ -420,6 +424,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             cost: Cost::from_usd(0.05),
             ..UsageTotal::default()
         }),
+        total_cost: None,
     };
     let expected = json!({
         "title": "",
@@ -469,6 +474,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "status": "failed",
             "started_at": 1_755_000_000_000_u64,
             "settled_at": 1_755_000_004_200_u64,
+            "last_output_at": null,
             "usage": {
                 "fresh_input_tokens": 1_200,
                 "cache_read_tokens": 300,
@@ -479,7 +485,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 "model_context_window": 200_000
             },
             "cost": 0.03,
-            "cost_basis": "reported"
+            "cost_basis": "reported",
+            "cost_details": null
         }],
         "messages": [{
             "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
@@ -513,8 +520,10 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "cache_write_tokens": null,
             "output_tokens": 500,
             "reasoning_tokens": null,
-            "cost": 0.05
-        }
+            "cost": 0.05,
+            "cost_is_partial": false
+        },
+        "total_cost": null
     });
 
     assert_eq!(
@@ -880,6 +889,7 @@ fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
                     status: ActivityStatus::Active,
                     name: "Explore".to_owned(),
                     description: "Map the provider seams".to_owned(),
+                    model: None,
                     session_id: child_session_id,
                     duration_ms: None,
                 },
@@ -916,6 +926,7 @@ fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
                     "status": "active",
                     "name": "Explore",
                     "description": "Map the provider seams",
+                    "model": null,
                     "session_id": "0198b27e-4f11-7d80-a4de-3f2a6f6b3a01",
                     "duration_ms": null
                 }
@@ -1295,6 +1306,9 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                 },
                 cost: Cost::from_usd(0.03),
                 cost_basis: Some(CostBasis::Reported),
+                cost_coverage: Some(suru::protocol::CostCoverage::Turn),
+                cost_is_partial: false,
+                cost_recorded_at: Some(SessionTimestamp(1_755_000_004_100)),
             },
             SessionChange::TurnStatusChanged {
                 turn_id,
@@ -1335,7 +1349,10 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                         "model_context_window": null
                     },
                     "cost": 0.03,
-                    "cost_basis": "reported"
+                    "cost_basis": "reported",
+                    "cost_coverage": { "scope": "turn" },
+                    "cost_is_partial": false,
+                    "cost_recorded_at": 1_755_000_004_100_u64
                 },
                 {
                     "type": "turn_status_changed",

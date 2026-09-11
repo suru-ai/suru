@@ -5250,6 +5250,7 @@ mod tests {
             transcript,
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
         }
     }
 
@@ -5492,9 +5493,11 @@ mod tests {
                 status,
                 started_at: None,
                 settled_at: None,
+                last_output_at: None,
                 usage: None,
                 cost: None,
                 cost_basis: None,
+                cost_details: None,
             });
             snapshot.messages.append(&mut turn.messages);
             snapshot.activities.append(&mut turn.activities);

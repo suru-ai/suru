@@ -15,10 +15,10 @@ use crossterm::event::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
-        ModelAvailability, PromptId, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
-        TurnId, TurnStatus, Workspace,
+        Activity, ActivityId, ActivityStatus, AgentSelection, Message, MessageId, MessageRole,
+        MessageStatus, ModelAvailability, ModelId, PromptId, ProviderId, Session, SessionChange,
+        SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp,
+        SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition},
 };
@@ -28,6 +28,33 @@ use suru::{
 struct SpawnedSubagent {
     child_id: SessionId,
     activity_id: ActivityId,
+}
+
+#[test]
+fn picker_shows_a_subagents_confirmed_model() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) =
+        parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
+    let Activity::Subagent { model, .. } = &mut snapshot.activities[0] else {
+        unreachable!()
+    };
+    *model = Some(ModelId::new("child-model"));
+    snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new("controlled"),
+        model: ModelId::new("parent-model"),
+        options: Vec::new(),
+    });
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a known Subagent Model");
+    press_key(&mut application, KeyCode::Down);
+
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Explore · child-model: Map the provider seams"),
+        "the picker presents Provider-confirmed child identity: {text}"
+    );
 }
 
 /// A parent Session whose active Turn spawned one working Subagent per given
@@ -60,6 +87,7 @@ fn parent_with_working_subagents(
             status: ActivityStatus::Active,
             name: (*name).to_owned(),
             description: (*description).to_owned(),
+            model: None,
             session_id: child_id,
             duration_ms: None,
         };
@@ -116,9 +144,11 @@ fn child_with_working_subagent(
             status: TurnStatus::Active,
             started_at: None,
             settled_at: None,
+            last_output_at: None,
             usage: None,
             cost: None,
             cost_basis: None,
+            cost_details: None,
         }],
         messages: vec![Message {
             id: message_id,
@@ -135,11 +165,13 @@ fn child_with_working_subagent(
             status: ActivityStatus::Active,
             name: "Verify".to_owned(),
             description: "Check the mapped seams".to_owned(),
+            model: None,
             session_id: grandchild_id,
             duration_ms: None,
         }],
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
         transcript: vec![
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },
@@ -353,6 +385,7 @@ fn down_keeps_walking_history_even_while_subagents_work() {
                         status: ActivityStatus::Active,
                         name: "Explore".to_owned(),
                         description: "Map the provider seams".to_owned(),
+                        model: None,
                         session_id: SessionId::new(),
                         duration_ms: None,
                     },
@@ -417,6 +450,7 @@ fn the_picker_takes_in_a_subagent_spawning_while_it_is_open() {
                         status: ActivityStatus::Active,
                         name: "Plan".to_owned(),
                         description: "Design the picker".to_owned(),
+                        model: None,
                         session_id: SessionId::new(),
                         duration_ms: None,
                     },
@@ -631,8 +665,12 @@ fn clicks_and_drags_outside_the_picker_dismiss_it_only_on_release() {
 #[test]
 fn a_subagent_session_browses_its_own_working_subagents() {
     let workspace = workspace_dir();
-    let (child, grandchild_id) =
+    let (mut child, grandchild_id) =
         child_with_working_subagent(SessionId::new(), SessionId::new(), workspace.path());
+    let Activity::Subagent { model, .. } = &mut child.activities[0] else {
+        unreachable!()
+    };
+    *model = Some(ModelId::new("grandchild-model"));
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(child))
@@ -641,7 +679,7 @@ fn a_subagent_session_browses_its_own_working_subagents() {
     press_key(&mut application, KeyCode::Down);
     let text = rendered_application_rows_at(&application, 80, 22).join("\n");
     assert!(
-        text.contains("└ ⠋ Verify: Check the mapped seams"),
+        text.contains("└ ⠋ Verify · grandchild-model: Check the mapped seams"),
         "the picker browses the open Session's own working Subagents, one level down: {text}"
     );
     assert_eq!(

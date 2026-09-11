@@ -43,7 +43,7 @@ const REPORTED_USAGE: &str = r#"      emit '{"type":"result","subtype":"success"
 const USAGE_WITHOUT_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":5}}'
 "#;
 
-const USAGE_WITH_ZERO_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":5},"total_cost_usd":0}'
+const USAGE_WITH_ZERO_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","total_cost_usd":0}'
 "#;
 
 fn selection(model: &str, effort: &str) -> AgentSelection {
@@ -468,7 +468,11 @@ async fn an_errored_success_result_settles_the_turn_as_failed_with_its_text() {
 const TWO_TURNS: &str = r#"      turns=$(( ${turns:-0} + 1 ))
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Answer '"$turns"'"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":7,"num_turns":1,"result":"","session_id":"prov-session"}'
+      if [ "$turns" -eq 1 ]; then
+        emit '{"type":"result","uuid":"turn-result-1","subtype":"success","is_error":false,"duration_ms":7,"num_turns":1,"result":"","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":1},"total_cost_usd":0.10}'
+      else
+        emit '{"type":"result","uuid":"turn-result-2","subtype":"success","is_error":false,"duration_ms":7,"num_turns":1,"result":"","session_id":"prov-session","usage":{"input_tokens":1,"output_tokens":1},"total_cost_usd":0}'
+      fi
 "#;
 
 #[tokio::test]
@@ -518,6 +522,15 @@ async fn a_second_prompt_runs_its_turn_on_the_same_long_lived_child() {
     let settled = settled_session(&client, created.session.id, 1).await;
 
     assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    let total = settled
+        .total_usage()
+        .expect("the cumulative report remains known");
+    assert_eq!(total.cost, Cost::from_usd(0.10));
+    assert!(
+        total.cost_is_partial,
+        "a regressive crash-style result cannot erase or refresh the prior report"
+    );
+    assert_eq!(settled.turns[1].cost, None);
     assert_eq!(
         agent_messages(&settled)
             .iter()

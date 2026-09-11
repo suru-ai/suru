@@ -7,9 +7,10 @@ use anyhow::anyhow;
 use std::collections::HashMap;
 
 use crate::protocol::{
-    Prompt, PromptId, PromptOrder, PromptStatus, SessionCatalogChange, SessionChange, SessionId,
-    SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus, SessionTimestamp,
-    SessionUpdate, TurnId, TurnStatus, UsageTotal,
+    Cost, CostCoverage, CostRecord, CostTotal, Prompt, PromptId, PromptOrder, PromptStatus,
+    SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStandingInputs, SessionStatus, SessionTimestamp, SessionUpdate, Turn, TurnId,
+    TurnStatus, UsageTotal,
 };
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
@@ -94,6 +95,14 @@ impl SessionStoreState {
         // transition that changes it, but cannot inject a competing clock.
         changes.retain(|change| !matches!(change, SessionChange::SessionWorkingChanged { .. }));
         stamp_turn_timing(&mut changes, updated_at);
+        stamp_cost_measurements(&mut changes, updated_at);
+        if let Some(snapshot) = self
+            .sessions
+            .get(&session_id)
+            .map(|record| &record.snapshot)
+        {
+            stamp_output_evidence(&mut changes, snapshot, updated_at);
+        }
         let turn_settled = changes.iter().any(|change| match change {
             SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
             SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
@@ -289,9 +298,11 @@ impl SessionStoreState {
         let ancestry = self.ancestry(session_id);
         for current in &ancestry.sessions {
             let delegated = self.subagent_usage(*current);
+            let total_cost = self.cost_total(*current);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
             };
+            let mut changes = Vec::new();
             if record.snapshot.subagent_usage != delegated {
                 // The roll-up is the server's own derivation rather than
                 // Agent output, so it goes straight to the record's commit:
@@ -299,15 +310,17 @@ impl SessionStoreState {
                 // against. A commit that cannot land leaves the Session on
                 // the reading it already had, said out loud because a total
                 // quietly frozen is worse than a total that moved late.
-                if let Err(error) = record.commit_derived(
-                    storage,
-                    *current,
-                    vec![SessionChange::SubagentUsageChanged {
-                        subagent_usage: delegated,
-                    }],
-                ) {
-                    tracing::warn!(session_id = %current, "Subagent Usage did not roll up: {error}");
-                }
+                changes.push(SessionChange::SubagentUsageChanged {
+                    subagent_usage: delegated,
+                });
+            }
+            if record.snapshot.total_cost != total_cost {
+                changes.push(SessionChange::TotalCostChanged { total_cost });
+            }
+            if !changes.is_empty()
+                && let Err(error) = record.commit_derived(storage, *current, changes)
+            {
+                tracing::warn!(session_id = %current, "Session Usage did not roll up: {error}");
             }
             let reading = record.snapshot.total_usage();
             if record.summary.total_usage == reading {
@@ -328,11 +341,169 @@ impl SessionStoreState {
     /// left out — the walk skips the Session it starts from — because they
     /// are already in the snapshot every reader holds.
     fn subagent_usage(&self, session_id: SessionId) -> Option<UsageTotal> {
-        self.subtree(session_id)
-            .into_iter()
-            .skip(1)
-            .filter_map(|child| UsageTotal::of_turns(&self.sessions.get(&child)?.snapshot.turns))
+        self.sessions
+            .values()
+            .filter(|record| record.snapshot.session.parent == Some(session_id))
+            .filter_map(|record| record.summary.total_usage)
             .reduce(UsageTotal::saturating_add)
+    }
+
+    /// Applies each Provider-declared coverage window to the frozen Cost
+    /// records in one Session tree. A subtree report is cumulative only inside
+    /// its reporting lifetime, and receipt order alone never proves that late
+    /// descendant evidence falls outside a report.
+    pub(super) fn cost_total(&self, session_id: SessionId) -> Option<CostTotal> {
+        let sessions = self.subtree(session_id);
+        let mut records = Vec::new();
+        for &owner in &sessions {
+            let Some(session) = self.sessions.get(&owner) else {
+                continue;
+            };
+            for turn in &session.snapshot.turns {
+                records.extend(cost_records(owner, turn));
+            }
+        }
+
+        let mut lifetime_starts = HashMap::<String, SessionTimestamp>::new();
+        let mut latest_subtree = HashMap::<(SessionId, String), ScopedCost>::new();
+        for record in records
+            .iter()
+            .filter(|record| matches!(record.record.coverage, CostCoverage::SessionSubtree { .. }))
+        {
+            let CostCoverage::SessionSubtree { reporting_lifetime } = &record.record.coverage
+            else {
+                unreachable!();
+            };
+            if let Some(started_at) = record.turn_started_at {
+                lifetime_starts
+                    .entry(reporting_lifetime.clone())
+                    .and_modify(|current| *current = (*current).min(started_at))
+                    .or_insert(started_at);
+            }
+            let key = (record.owner, reporting_lifetime.clone());
+            if latest_subtree
+                .get(&key)
+                .is_none_or(|current| current.record.recorded_at < record.record.recorded_at)
+            {
+                latest_subtree.insert(key, record.clone());
+            }
+        }
+        let aggregates = latest_subtree.into_values().collect::<Vec<_>>();
+        let mut overlap_is_partial = false;
+        let included = aggregates
+            .iter()
+            .filter(|candidate| {
+                let candidate_interval = cost_interval(candidate, &lifetime_starts);
+                !aggregates.iter().any(|cover| {
+                    if cover.owner == candidate.owner
+                        || !self.is_ancestor_of(cover.owner, candidate.owner)
+                    {
+                        return false;
+                    }
+                    let (Some(candidate_interval), Some(cover_interval)) =
+                        (candidate_interval, cost_interval(cover, &lifetime_starts))
+                    else {
+                        overlap_is_partial = true;
+                        return true;
+                    };
+                    if !intervals_overlap(candidate_interval, cover_interval) {
+                        return false;
+                    }
+                    if !interval_contains(cover_interval, candidate_interval) {
+                        overlap_is_partial = true;
+                    }
+                    true
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut total = None;
+        let mut partial = overlap_is_partial;
+        for aggregate in &included {
+            total = Some(add_cost(total, aggregate.record.cost));
+            partial |= aggregate.record.is_partial;
+        }
+
+        for record in records
+            .iter()
+            .filter(|record| record.record.coverage == CostCoverage::Turn)
+        {
+            let Some(started_at) = record.turn_started_at else {
+                total = Some(add_cost(total, record.record.cost));
+                partial = true;
+                continue;
+            };
+            let interval = (started_at, record.record.recorded_at);
+            let overlapping = included
+                .iter()
+                .copied()
+                .filter(|aggregate| {
+                    self.is_ancestor_of(aggregate.owner, record.owner)
+                        && cost_interval(aggregate, &lifetime_starts)
+                            .is_some_and(|coverage| intervals_overlap(interval, coverage))
+                })
+                .max_by_key(|aggregate| aggregate.record.recorded_at);
+            if let Some(aggregate) = overlapping {
+                let coverage = cost_interval(aggregate, &lifetime_starts)
+                    .expect("an overlapping aggregate has an interval");
+                partial |= !interval_contains(coverage, interval);
+            } else {
+                total = Some(add_cost(total, record.record.cost));
+                partial |= record.record.is_partial;
+            }
+        }
+
+        if total.is_some() {
+            for &owner in &sessions {
+                for turn in &self.sessions[&owner].snapshot.turns {
+                    let covering = turn.started_at.and_then(|started_at| {
+                        included
+                            .iter()
+                            .copied()
+                            .filter(|aggregate| {
+                                self.is_ancestor_of(aggregate.owner, owner)
+                                    && cost_interval(aggregate, &lifetime_starts).is_some_and(
+                                        |coverage| {
+                                            coverage.0 <= started_at && started_at <= coverage.1
+                                        },
+                                    )
+                            })
+                            .max_by_key(|aggregate| aggregate.record.recorded_at)
+                    });
+                    if let Some(aggregate) = covering {
+                        partial |= work_exceeds_coverage(
+                            turn.last_output_at,
+                            turn.status == TurnStatus::Active,
+                            aggregate.owner == owner && aggregate.turn_id == turn.id,
+                            aggregate.record.recorded_at,
+                        );
+                    } else if turn.cost.is_none() || turn.status == TurnStatus::Active {
+                        partial = true;
+                    }
+                }
+            }
+        }
+
+        total.map(|cost| CostTotal {
+            cost,
+            is_partial: partial,
+        })
+    }
+
+    fn is_ancestor_of(&self, ancestor: SessionId, mut descendant: SessionId) -> bool {
+        loop {
+            if ancestor == descendant {
+                return true;
+            }
+            let Some(parent) = self
+                .sessions
+                .get(&descendant)
+                .and_then(|record| record.snapshot.session.parent)
+            else {
+                return false;
+            };
+            descendant = parent;
+        }
     }
 
     /// This Session and every Subagent Session below it, to any depth, each
@@ -456,6 +627,205 @@ impl SessionStoreState {
 
         component.and_then(|(started_at, settled_at)| settled_at.is_none().then_some(started_at))
     }
+}
+
+#[derive(Clone)]
+struct ScopedCost {
+    owner: SessionId,
+    turn_id: TurnId,
+    turn_started_at: Option<SessionTimestamp>,
+    record: CostRecord,
+}
+
+fn cost_records(owner: SessionId, turn: &Turn) -> Vec<ScopedCost> {
+    let Some(cost) = turn.cost else {
+        return Vec::new();
+    };
+    let (Some(basis), Some(details)) = (turn.cost_basis, turn.cost_details.as_ref()) else {
+        return Vec::new();
+    };
+    let mut records = details
+        .prior
+        .iter()
+        .cloned()
+        .map(|record| ScopedCost {
+            owner,
+            turn_id: turn.id,
+            turn_started_at: turn.started_at,
+            record,
+        })
+        .collect::<Vec<_>>();
+    records.push(ScopedCost {
+        owner,
+        turn_id: turn.id,
+        turn_started_at: turn.started_at,
+        record: CostRecord {
+            cost,
+            basis,
+            coverage: details.coverage.clone(),
+            recorded_at: details.recorded_at,
+            is_partial: details.is_partial,
+        },
+    });
+    records
+}
+
+fn reporting_lifetime(record: &CostRecord) -> Option<&str> {
+    match &record.coverage {
+        CostCoverage::Turn => None,
+        CostCoverage::SessionSubtree { reporting_lifetime } => Some(reporting_lifetime),
+    }
+}
+
+fn cost_interval(
+    cost: &ScopedCost,
+    lifetime_starts: &HashMap<String, SessionTimestamp>,
+) -> Option<(SessionTimestamp, SessionTimestamp)> {
+    let lifetime = reporting_lifetime(&cost.record)?;
+    Some((*lifetime_starts.get(lifetime)?, cost.record.recorded_at))
+}
+
+pub(super) fn intervals_overlap(
+    left: (SessionTimestamp, SessionTimestamp),
+    right: (SessionTimestamp, SessionTimestamp),
+) -> bool {
+    left.0 <= right.1 && right.0 <= left.1
+}
+
+pub(super) fn interval_contains(
+    coverage: (SessionTimestamp, SessionTimestamp),
+    interval: (SessionTimestamp, SessionTimestamp),
+) -> bool {
+    coverage.0 <= interval.0 && coverage.1 >= interval.1
+}
+
+pub(super) fn work_exceeds_coverage(
+    last_output_at: Option<SessionTimestamp>,
+    active: bool,
+    is_report_carrier: bool,
+    coverage_end: SessionTimestamp,
+) -> bool {
+    last_output_at.is_some_and(|output| output > coverage_end) || active && !is_report_carrier
+}
+
+fn add_cost(total: Option<Cost>, cost: Cost) -> Cost {
+    total.map_or(cost, |total| total.saturating_add(cost))
+}
+
+fn stamp_cost_measurements(changes: &mut [SessionChange], updated_at: SessionTimestamp) {
+    for change in changes {
+        if let SessionChange::TurnUsageChanged {
+            cost,
+            cost_recorded_at,
+            ..
+        } = change
+            && cost.is_some()
+        {
+            *cost_recorded_at = Some(updated_at);
+        }
+    }
+}
+
+fn stamp_output_evidence(
+    changes: &mut Vec<SessionChange>,
+    snapshot: &SessionSnapshot,
+    updated_at: SessionTimestamp,
+) {
+    let mut observed = Vec::new();
+    for (index, change) in changes.iter().enumerate() {
+        let turn_id = match change {
+            SessionChange::MessageAdded { message }
+                if message.role == crate::protocol::MessageRole::Agent
+                    && !message.content.is_empty() =>
+            {
+                Some(message.turn_id)
+            }
+            SessionChange::MessageContentAppended {
+                message_id,
+                content,
+            } if !content.is_empty() => changes[..index]
+                .iter()
+                .rev()
+                .find_map(|change| match change {
+                    SessionChange::MessageAdded { message } if message.id == *message_id => {
+                        Some(message.turn_id)
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    snapshot
+                        .messages
+                        .iter()
+                        .find(|message| message.id == *message_id)
+                        .map(|message| message.turn_id)
+                }),
+            SessionChange::ActivityAdded { activity } => Some(activity.turn_id()),
+            SessionChange::CommandOutputAppended {
+                activity_id,
+                content,
+            }
+            | SessionChange::ReasoningContentAppended {
+                activity_id,
+                content,
+            } if !content.is_empty() => activity_turn_id(&changes[..index], snapshot, *activity_id),
+            SessionChange::FileChangeUpdated { activity_id, .. }
+            | SessionChange::SubagentDescriptionChanged { activity_id, .. } => {
+                activity_turn_id(&changes[..index], snapshot, *activity_id)
+            }
+            SessionChange::TurnUsageChanged {
+                turn_id,
+                usage,
+                cost_coverage,
+                ..
+            } if !matches!(cost_coverage, Some(CostCoverage::SessionSubtree { .. }))
+                && snapshot
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == *turn_id)
+                    .and_then(|turn| turn.usage.as_ref())
+                    != Some(usage) =>
+            {
+                Some(*turn_id)
+            }
+            _ => None,
+        };
+        if let Some(turn_id) = turn_id
+            && !observed.contains(&turn_id)
+        {
+            observed.push(turn_id);
+        }
+    }
+    changes.extend(
+        observed
+            .into_iter()
+            .map(|turn_id| SessionChange::TurnOutputObserved {
+                turn_id,
+                observed_at: updated_at,
+            }),
+    );
+}
+
+fn activity_turn_id(
+    preceding: &[SessionChange],
+    snapshot: &SessionSnapshot,
+    activity_id: crate::protocol::ActivityId,
+) -> Option<TurnId> {
+    preceding
+        .iter()
+        .rev()
+        .find_map(|change| match change {
+            SessionChange::ActivityAdded { activity } if activity.id() == activity_id => {
+                Some(activity.turn_id())
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            snapshot
+                .activities
+                .iter()
+                .find(|activity| activity.id() == activity_id)
+                .map(crate::protocol::Activity::turn_id)
+        })
 }
 
 /// The Sessions one derivation climbs, from where a commit landed up to the

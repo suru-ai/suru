@@ -15,10 +15,10 @@ use tokio::sync::watch;
 
 use crate::pricing::{EstimatedCost, PricingSource};
 use crate::protocol::{
-    AgentIdentity, AgentSelection, Cost, CostBasis, EffectiveSettings, FileChange, ModelDescriptor,
-    ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability, SkillCatalog,
-    SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation, SkillMarkerSpan,
-    SkillPromptDelivery, Usage,
+    AgentIdentity, AgentSelection, Cost, CostBasis, CostCoverage, EffectiveSettings, FileChange,
+    ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability,
+    SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation,
+    SkillMarkerSpan, SkillPromptDelivery, Usage,
 };
 
 mod claude;
@@ -636,6 +636,11 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         description: String,
     },
+    /// Provider evidence of the Model presently running one Subagent.
+    SubagentModelChanged {
+        subagent_id: ProviderSubagentId,
+        model: crate::protocol::ModelId,
+    },
     /// The Provider reported a Subagent settling. This settles the Subagent's
     /// row and its child Session's Turn together. Later output is discarded;
     /// ordered Context Fill measurements may still refresh the child Session.
@@ -676,10 +681,12 @@ pub struct ContextFillReport {
 /// far to trust it. Pairing the two makes a Cost impossible to record without
 /// stating who computed it, so a rate-table estimate can never be stored as a
 /// Provider's own figure.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MeteredCost {
     cost: Cost,
     basis: CostBasis,
+    coverage: CostCoverage,
+    is_partial: bool,
 }
 
 impl MeteredCost {
@@ -688,15 +695,41 @@ impl MeteredCost {
         Self {
             cost,
             basis: CostBasis::Reported,
+            coverage: CostCoverage::Turn,
+            is_partial: false,
         }
     }
 
-    pub const fn cost(self) -> Cost {
+    pub fn reported_subtree(cost: Cost, reporting_lifetime: impl Into<String>) -> Self {
+        Self {
+            cost,
+            basis: CostBasis::Reported,
+            coverage: CostCoverage::SessionSubtree {
+                reporting_lifetime: reporting_lifetime.into(),
+            },
+            is_partial: false,
+        }
+    }
+
+    pub fn partial(mut self) -> Self {
+        self.is_partial = true;
+        self
+    }
+
+    pub const fn cost(&self) -> Cost {
         self.cost
     }
 
-    pub const fn basis(self) -> CostBasis {
+    pub const fn basis(&self) -> CostBasis {
         self.basis
+    }
+
+    pub fn coverage(&self) -> &CostCoverage {
+        &self.coverage
+    }
+
+    pub const fn is_partial(&self) -> bool {
+        self.is_partial
     }
 }
 
@@ -705,6 +738,8 @@ impl From<EstimatedCost> for MeteredCost {
         Self {
             cost: estimated.cost(),
             basis: estimated.basis(),
+            coverage: CostCoverage::Turn,
+            is_partial: false,
         }
     }
 }
@@ -716,6 +751,7 @@ impl From<EstimatedCost> for MeteredCost {
 pub(super) struct ReportedTurnMetering {
     usage: Usage,
     reported_cost: Option<Cost>,
+    cost_complete: bool,
     native_meter_overflowed: bool,
 }
 
@@ -724,11 +760,26 @@ impl ReportedTurnMetering {
         Self {
             usage,
             reported_cost,
+            cost_complete: reported_cost.is_some(),
             native_meter_overflowed: false,
         }
     }
 
     pub(super) fn add(&mut self, usage: Usage, reported_cost: Option<Cost>) {
+        self.add_usage(usage);
+        match reported_cost {
+            Some(next) => {
+                self.reported_cost = match self.reported_cost {
+                    Some(current) => current.checked_add(next),
+                    None => Some(next),
+                };
+                self.cost_complete &= self.reported_cost.is_some();
+            }
+            None => self.cost_complete = false,
+        }
+    }
+
+    fn add_usage(&mut self, usage: Usage) {
         self.usage.fresh_input_tokens =
             add_reported_counts(self.usage.fresh_input_tokens, usage.fresh_input_tokens);
         self.usage.cache_read_tokens =
@@ -760,16 +811,49 @@ impl ReportedTurnMetering {
                 (None, Some(next)) => Some(next),
                 (None, None) => None,
             };
-        self.reported_cost = self
-            .reported_cost
-            .zip(reported_cost)
-            .and_then(|(current, next)| current.checked_add(next));
+    }
+
+    pub(super) fn add_usage_with_cumulative_cost(
+        &mut self,
+        usage: Usage,
+        reported_cost: Option<Cost>,
+    ) {
+        self.add_usage(usage);
+        match reported_cost {
+            Some(cost)
+                if self
+                    .reported_cost
+                    .is_none_or(|current| cost.nano_usd() >= current.nano_usd()) =>
+            {
+                self.reported_cost = Some(cost);
+                self.cost_complete = true;
+            }
+            Some(_) | None => self.cost_complete = false,
+        }
     }
 
     pub(super) fn event(&self) -> ProviderEvent {
         ProviderEvent::Usage {
             usage: self.usage.clone(),
-            cost: self.reported_cost.map(MeteredCost::reported),
+            cost: self.reported_cost.map(|cost| {
+                let metered = MeteredCost::reported(cost);
+                if self.cost_complete {
+                    metered
+                } else {
+                    metered.partial()
+                }
+            }),
+        }
+    }
+
+    pub(super) fn subtree_event(&self, reporting_lifetime: &str) -> ProviderEvent {
+        ProviderEvent::Usage {
+            usage: self.usage.clone(),
+            cost: self
+                .cost_complete
+                .then_some(self.reported_cost)
+                .flatten()
+                .map(|cost| MeteredCost::reported_subtree(cost, reporting_lifetime)),
         }
     }
 }

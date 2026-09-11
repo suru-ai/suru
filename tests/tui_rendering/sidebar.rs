@@ -1792,6 +1792,7 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         status: ActivityStatus::Active,
         name: "Explore".to_owned(),
         description: "Map the edge".to_owned(),
+        model: None,
         session_id: SessionId::new(),
         duration_ms: None,
     };

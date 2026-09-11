@@ -503,9 +503,11 @@ impl TurnRow {
                     status: turn.status,
                     started_at: turn.started_at,
                     settled_at: turn.settled_at,
+                    last_output_at: turn.last_output_at,
                     usage: turn.usage,
                     cost: turn.cost,
                     cost_basis: turn.cost_basis,
+                    cost_details: turn.cost_details,
                 },
             )?,
         })
@@ -525,9 +527,11 @@ impl TurnRow {
             status: payload.status,
             started_at: payload.started_at,
             settled_at: payload.settled_at,
+            last_output_at: payload.last_output_at,
             usage: payload.usage,
             cost: payload.cost,
             cost_basis: payload.cost_basis,
+            cost_details: payload.cost_details,
         };
         if !turn.has_valid_cost_attribution() {
             return Err(StorageError::InvalidSession {
@@ -792,6 +796,8 @@ struct StoredTurnPayload {
     started_at: Option<SessionTimestamp>,
     #[serde(default)]
     settled_at: Option<SessionTimestamp>,
+    #[serde(default)]
+    last_output_at: Option<SessionTimestamp>,
     /// Absent in every Turn stored before usage tracking; defaulted fields
     /// keep those payloads readable without a schema migration.
     #[serde(default)]
@@ -800,6 +806,8 @@ struct StoredTurnPayload {
     cost: Option<Cost>,
     #[serde(default)]
     cost_basis: Option<CostBasis>,
+    #[serde(default)]
+    cost_details: Option<crate::protocol::CostDetails>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -849,6 +857,8 @@ enum StoredActivityPayload {
         status: ActivityStatus,
         name: String,
         description: String,
+        #[serde(default)]
+        model: Option<ModelId>,
         session_id: SessionId,
         duration_ms: Option<u64>,
     },
@@ -912,6 +922,7 @@ impl StoredActivityPayload {
                 status,
                 name,
                 description,
+                model,
                 session_id,
                 duration_ms,
             } => Activity::Subagent {
@@ -920,6 +931,7 @@ impl StoredActivityPayload {
                 status,
                 name,
                 description,
+                model,
                 session_id,
                 duration_ms,
             },
@@ -982,6 +994,7 @@ impl From<Activity> for StoredActivityPayload {
                 status,
                 name,
                 description,
+                model,
                 session_id,
                 duration_ms,
                 ..
@@ -989,6 +1002,7 @@ impl From<Activity> for StoredActivityPayload {
                 status,
                 name,
                 description,
+                model,
                 session_id,
                 duration_ms,
             },

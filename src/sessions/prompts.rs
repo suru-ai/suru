@@ -352,6 +352,7 @@ impl SessionStore {
             // below it to roll up.
             subagent_questionnaires: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let summary = SessionSummary {
@@ -996,9 +997,11 @@ pub(super) fn prepare_prompt_delivery(
                 // the Turn in the same breath when it arrives already settled.
                 started_at: None,
                 settled_at: None,
+                last_output_at: None,
                 usage: None,
                 cost: None,
                 cost_basis: None,
+                cost_details: None,
             },
         },
         SessionChange::MessageAdded {

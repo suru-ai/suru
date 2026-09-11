@@ -29,11 +29,12 @@ const STEERED_CONVERSATION: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
         (
           while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
           emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-          emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}'
+          emit '{"type":"result","uuid":"result-1","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}'
+          emit '{"type":"result","uuid":"result-1","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}'
           emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
           emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Bonjour"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
           emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-          emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":4,"num_turns":1,"result":"Bonjour","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":7},"total_cost_usd":0.02}'
+          emit '{"type":"result","uuid":"result-2","subtype":"success","is_error":false,"duration_ms":4,"num_turns":1,"result":"Bonjour","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":7},"total_cost_usd":0.02}'
         ) &
       fi
 "#;
@@ -121,7 +122,7 @@ async fn a_steer_prompt_joins_the_running_turn_rather_than_beginning_another() {
         }),
         "both result stretches contribute to the one Turn's Usage"
     );
-    assert_eq!(settled.turns[0].cost, Cost::from_usd(0.03));
+    assert_eq!(settled.turns[0].cost, Cost::from_usd(0.02));
     assert_eq!(settled.turns[0].cost_basis, Some(CostBasis::Reported));
     assert_eq!(
         agent_messages(&settled)

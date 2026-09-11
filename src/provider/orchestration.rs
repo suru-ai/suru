@@ -322,6 +322,9 @@ struct SubagentRoutes {
     /// Context measurements can arrive after the child's output route settles.
     context_routes: HashMap<ProviderSubagentId, (SessionId, TurnId)>,
     rows: HashMap<ProviderSubagentId, SubagentRow>,
+    /// Durable routing facts retained for the connection lifetime so delayed
+    /// attach/metadata replies can still identify a child after it settles.
+    identities: HashMap<ProviderSubagentId, SubagentIdentityRoute>,
     /// The Subagents Suru itself settled by stopping them. Their rows and
     /// routes are gone, but the Provider was not the one to close them, so
     /// its own account of their end — the settle it still owes, the progress
@@ -352,6 +355,14 @@ struct SubagentRow {
     owner_session_id: SessionId,
     activity_id: ActivityId,
     started: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct SubagentIdentityRoute {
+    session_id: SessionId,
+    turn_id: TurnId,
+    owner_session_id: SessionId,
+    activity_id: ActivityId,
 }
 
 impl SubagentRoutes {
@@ -537,6 +548,39 @@ impl SubagentRoutes {
                 )
                 .map(|_| ()),
         )
+    }
+
+    /// Applies Provider-confirmed identity to both places a reader needs it:
+    /// the child's own Turn and the parent's Subagent row. Requested parent
+    /// options are deliberately dropped because they are not child evidence.
+    fn update_model(
+        &self,
+        sessions: &SessionStore,
+        subagent: &ProviderSubagentId,
+        next_agent: &AgentIdentity,
+        model: crate::protocol::ModelId,
+    ) -> Option<anyhow::Result<()>> {
+        let route = self.identities.get(subagent)?;
+        let mut agent = next_agent.clone();
+        agent.selection.model = model.clone();
+        agent.selection.options.clear();
+        Some((|| {
+            sessions.publish(
+                route.session_id,
+                vec![SessionChange::SubagentAgentChanged {
+                    turn_id: route.turn_id,
+                    agent,
+                }],
+            )?;
+            sessions.publish(
+                route.owner_session_id,
+                vec![SessionChange::SubagentModelChanged {
+                    activity_id: route.activity_id,
+                    model,
+                }],
+            )?;
+            Ok(())
+        })())
     }
 
     /// Settles one Subagent on the Provider's own settle signal: the child's
@@ -1215,6 +1259,16 @@ async fn run_provider_session(
                             } => {
                                 let _ = updates.apply(|| {
                                     subagents.update_row(&sessions, &subagent_id, &description)
+                                });
+                            }
+                            ProviderEvent::SubagentModelChanged { subagent_id, model } => {
+                                let _ = updates.apply(|| {
+                                    subagents.update_model(
+                                        &sessions,
+                                        &subagent_id,
+                                        &identity,
+                                        model,
+                                    )
                                 });
                             }
                             ProviderEvent::SubagentCompleted {
@@ -2719,7 +2773,7 @@ fn project_provider_event(
                     let name = normalize_provider_text(&name);
                     let description = normalize_provider_text(&description);
                     sessions
-                        .create_subagent(session_id, Some(next_agent.clone()), &name, &description)
+                        .create_subagent(session_id, &name, &description)
                         .and_then(|spawned| {
                             let subagent_activity_id = ActivityId::new();
                             sessions.publish_agent_output(
@@ -2731,6 +2785,7 @@ fn project_provider_event(
                                         status: ActivityStatus::Active,
                                         name,
                                         description,
+                                        model: None,
                                         session_id: spawned.session_id,
                                         duration_ms: None,
                                     },
@@ -2745,6 +2800,15 @@ fn project_provider_event(
                                 },
                             );
                             subagents.context_routes.insert(subagent_id.clone(), (spawned.session_id, spawned.turn_id));
+                            subagents.identities.insert(
+                                subagent_id.clone(),
+                                SubagentIdentityRoute {
+                                    session_id: spawned.session_id,
+                                    turn_id: spawned.turn_id,
+                                    owner_session_id: session_id,
+                                    activity_id: subagent_activity_id,
+                                },
+                            );
                             subagents.routes.insert(
                                 subagent_id,
                                 SubagentRoute {
@@ -2776,6 +2840,20 @@ fn project_provider_event(
                 }
                 Some(updated) => updated.map(|()| ProviderEventProjection::Continue),
             },
+            ProviderEvent::SubagentModelChanged { subagent_id, model } => {
+                match subagents.update_model(sessions, &subagent_id, next_agent, model) {
+                    None if subagents.was_stopped(&subagent_id) => {
+                        Ok(ProviderEventProjection::Continue)
+                    }
+                    None => return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider identified a Subagent Model before spawning it",
+                    ),
+                    Some(updated) => updated.map(|()| ProviderEventProjection::Continue),
+                }
+            }
             ProviderEvent::SubagentCompleted {
                 subagent_id,
                 status,
@@ -2805,8 +2883,11 @@ fn project_provider_event(
                     SessionChange::TurnUsageChanged {
                         turn_id: active.turn_id,
                         usage,
-                        cost: cost.map(MeteredCost::cost),
-                        cost_basis: cost.map(MeteredCost::basis),
+                        cost: cost.as_ref().map(MeteredCost::cost),
+                        cost_basis: cost.as_ref().map(MeteredCost::basis),
+                        cost_coverage: cost.as_ref().map(|cost| cost.coverage().clone()),
+                        cost_is_partial: cost.as_ref().is_some_and(MeteredCost::is_partial),
+                        cost_recorded_at: None,
                     },
                 )
                 .map(|_| ProviderEventProjection::Continue),

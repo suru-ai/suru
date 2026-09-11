@@ -55,6 +55,7 @@ pub fn created_session_snapshot(
         transcript: Vec::new(),
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     }
 }
 
@@ -546,6 +547,8 @@ fn turn_for(prompt_id: PromptId) -> Turn {
         usage: None,
         cost: None,
         cost_basis: None,
+        cost_details: None,
+        last_output_at: None,
     }
 }
 

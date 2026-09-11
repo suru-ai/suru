@@ -557,10 +557,23 @@ fn project_session_event(
             return Ok(Vec::new());
         };
         if event.parsed_type() == SessionEventType::AssistantUsage {
-            return Ok(vec![attributed(
+            let model = reported::<AssistantUsageData>(&event)
+                .and_then(|usage| (!usage.model.is_empty()).then(|| usage.model));
+            let mut projected = Vec::new();
+            if let Some(model) = model {
+                projected.push(attributed(
+                    None,
+                    ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(subagent.clone()),
+                        model: crate::protocol::ModelId::new(model),
+                    },
+                ));
+            }
+            projected.push(attributed(
                 Some(&subagent),
                 project_usage_event(streams, &event, &correlation.pricing)?,
-            )]);
+            ));
+            return Ok(projected);
         }
         return Ok(
             project_conversation_event(streams, &mut correlation.delegations, &event)?
@@ -786,14 +799,25 @@ impl CopilotCorrelation {
         } else {
             started.agent_display_name
         };
-        vec![attributed(
+        let model = started.model.filter(|model| !model.is_empty());
+        let mut projected = vec![attributed(
             spawner.as_deref(),
             ProviderEvent::SubagentStarted {
-                subagent_id: ProviderSubagentId::new(subagent),
+                subagent_id: ProviderSubagentId::new(subagent.clone()),
                 name,
                 description: started.agent_description,
             },
-        )]
+        )];
+        if let Some(model) = model {
+            projected.push(attributed(
+                spawner.as_deref(),
+                ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(subagent),
+                    model: crate::protocol::ModelId::new(model),
+                },
+            ));
+        }
+        projected
     }
 
     /// The Subagent whose conversation ran `tool_call_id`, or `None` for the main agent's own —

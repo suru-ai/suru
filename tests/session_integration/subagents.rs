@@ -5,17 +5,17 @@
 use crate::{
     provider_support::ControlledProvider,
     support::{
-        open_catalog_stream_with_snapshot, read_session_at_least_revision, read_session_until,
-        the_subagent_row, working_turn,
+        open_catalog_stream_with_snapshot, read_session, read_session_at_least_revision,
+        read_session_until, the_subagent_row, working_turn,
     },
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, PromptDelivery,
-        PromptId, SessionCatalogChange, SessionChange, SessionError, SessionErrorCode,
-        SessionListItem, SessionRevision, SessionSnapshot, TurnStatus, ViewSessionOperationId,
-        ViewSessionRequest,
+        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, ModelId,
+        PromptDelivery, PromptId, SessionCatalogChange, SessionChange, SessionError,
+        SessionErrorCode, SessionListItem, SessionRevision, SessionSnapshot, TurnStatus,
+        ViewSessionOperationId, ViewSessionRequest,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -23,6 +23,82 @@ use suru::{
     },
     server::{self, ServerConfig},
 };
+
+#[tokio::test]
+async fn a_subagents_confirmed_model_updates_its_session_and_parent_projection() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-model-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    let parent_selection = parent.session.agent_selection.clone();
+    let unknown = read_session(fixture.server.descriptor(), child_id).await;
+    assert_eq!(unknown.session.agent_selection, None);
+    assert_eq!(unknown.turns[0].agent, None);
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentModelChanged {
+            subagent_id: subagent,
+            model: ModelId::new("child-model"),
+        })
+        .await;
+
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the child Model is confirmed",
+        |snapshot| {
+            snapshot.turns[0]
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.selection.model.as_str() == "child-model")
+        },
+    )
+    .await;
+    assert_eq!(
+        child.session.agent_selection, None,
+        "observation is not selection"
+    );
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the parent projection carries the child Model",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent { model: Some(model), .. } if model.as_str() == "child-model"
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        parent.session.agent_selection, parent_selection,
+        "child evidence never changes the parent's Agent Selection"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
 
 #[tokio::test]
 async fn a_spawn_opens_a_subagent_row_in_the_parent_and_a_child_session_with_a_parent_link() {

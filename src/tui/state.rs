@@ -2045,6 +2045,14 @@ impl TuiState {
         let Some(projection) = self.session.as_ref() else {
             return self.landing_agent_selection.as_ref();
         };
+        if projection.snapshot().session.is_subagent() {
+            return projection
+                .snapshot()
+                .turns
+                .last()
+                .and_then(|turn| turn.agent.as_ref())
+                .map(|agent| &agent.selection);
+        }
         let session = self
             .session_reference
             .as_ref()
@@ -2920,6 +2928,7 @@ impl TuiState {
             activities: Vec::new(),
             transcript: Vec::new(),
             subagent_usage: None,
+            total_cost: None,
             subagent_questionnaires: Vec::new(),
         })
     }

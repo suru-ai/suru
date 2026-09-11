@@ -4091,9 +4091,11 @@ mod tests {
                         status: TurnStatus::Completed,
                         started_at: None,
                         settled_at: None,
+                        last_output_at: None,
                         usage: None,
                         cost: None,
                         cost_basis: None,
+                        cost_details: None,
                     }],
                     messages: vec![Message {
                         id: message_id,
@@ -4108,6 +4110,7 @@ mod tests {
                     transcript: vec![TranscriptItem::Message { message_id }],
                     subagent_questionnaires: vec![],
                     subagent_usage: None,
+                    total_cost: None,
                 }))
                 .unwrap();
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

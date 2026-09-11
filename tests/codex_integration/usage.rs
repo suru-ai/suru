@@ -125,11 +125,64 @@ const DELEGATED_METERING_CODEX: &str = r#"
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      sleep 0.05
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"last":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"modelContextWindow":272000}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"root-thread","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+/// A child's first cumulative reading arrives before `thread/resume` supplies
+/// Provider evidence of its Model. Only the distance travelled after that
+/// reply can be estimated at the newly known rate.
+const LATE_CHILD_MODEL_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      sleep 0.05
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":240,"inputTokens":200,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":40,"reasoningOutputTokens":10},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+/// Once cumulative child Usage has crossed a Model boundary, switching back
+/// to the original Model cannot make the later tokens attributable again.
+const CHANGING_CHILD_MODEL_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      sleep 0.05
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn-a","tokenUsage":{"total":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"child-thread","threadSettings":{"model":"priced-fixture"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn-b","tokenUsage":{"total":{"totalTokens":240,"inputTokens":200,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":40,"reasoningOutputTokens":10},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"child-thread","threadSettings":{"model":"child-priced-fixture"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn-a2","tokenUsage":{"total":{"totalTokens":360,"inputTokens":300,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":60,"reasoningOutputTokens":15},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn-a2","status":"completed","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -227,6 +280,15 @@ async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
                                 "output": 4.0,
                                 "cache_read": 0.5,
                                 "cache_write": 0.25
+                            }
+                        },
+                        "child-priced-fixture": {
+                            "id": "child-priced-fixture",
+                            "cost": {
+                                "input": 10.0,
+                                "output": 20.0,
+                                "cache_read": 1.0,
+                                "cache_write": 1.0
                             }
                         }
                     }
@@ -526,7 +588,7 @@ async fn a_child_threads_readings_land_in_the_subagents_own_session() {
     );
     assert_eq!(parent.session.context_fill.unwrap().occupied_tokens, 1350);
     assert_eq!(child.session.context_fill.unwrap().occupied_tokens, 600);
-    assert_eq!(child.turns[0].cost, Cost::from_usd(0.0014));
+    assert_eq!(child.turns[0].cost, Cost::from_usd(0.007));
     assert_eq!(child.turns[0].cost_basis, Some(CostBasis::Estimated));
 
     opened
@@ -534,6 +596,135 @@ async fn a_child_threads_readings_land_in_the_subagents_own_session() {
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn child_usage_before_model_evidence_is_never_priced_retroactively() {
+    let fixture = ScriptedCodex::new_multiprocess(LATE_CHILD_MODEL_CODEX);
+    let opened = metered_session(
+        &fixture,
+        "codex-late-child-model-metering",
+        "Delegate before identity arrives",
+    )
+    .await;
+    let parent = settled_turn(&opened.client, opened.session_id, 0).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        model,
+        ..
+    } = parent
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+        .expect("the Transcript carries a Subagent row")
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("child-priced-fixture")
+    );
+
+    let child = settled_turn(&opened.client, *child_id, 0).await;
+    assert_eq!(
+        child.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(200),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(30),
+            reasoning_tokens: Some(10),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "all cumulative tokens remain visible after identity arrives"
+    );
+    assert_eq!(
+        child.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("child-priced-fixture")
+    );
+    assert_eq!(
+        child.turns[0].cost,
+        Cost::from_usd(0.0014),
+        "only the 100 input and 20 output tokens after Model evidence are priced"
+    );
+    assert!(
+        child.turns[0]
+            .cost_details
+            .as_ref()
+            .is_some_and(|details| details.is_partial),
+        "the known subtotal records the unpriced prefix"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn switching_a_child_model_back_does_not_resume_ambiguous_estimates() {
+    let fixture = ScriptedCodex::new_multiprocess(CHANGING_CHILD_MODEL_CODEX);
+    let opened = metered_session(
+        &fixture,
+        "codex-changing-child-model-metering",
+        "Delegate across Model changes",
+    )
+    .await;
+    let parent = settled_turn(&opened.client, opened.session_id, 0).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        model,
+        ..
+    } = parent
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+        .expect("the Transcript carries a Subagent row")
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("child-priced-fixture"),
+        "the row presents the latest confirmed Model after A to B to A"
+    );
+
+    let child = settled_turn(&opened.client, *child_id, 0).await;
+    assert_eq!(
+        child.turns[0].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(300),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(45),
+            reasoning_tokens: Some(15),
+            native_meter: None,
+            model_context_window: Some(272_000),
+        }),
+        "tokens continue updating through both Model changes"
+    );
+    assert_eq!(
+        child.turns[0]
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("child-priced-fixture")
+    );
+    assert_eq!(
+        child.turns[0].cost,
+        Cost::from_usd(0.0014),
+        "only the amount established before the first Model change is retained"
+    );
+    assert!(
+        child.turns[0]
+            .cost_details
+            .as_ref()
+            .is_some_and(|details| details.is_partial),
+        "the cumulative Usage remains ambiguous after switching back"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

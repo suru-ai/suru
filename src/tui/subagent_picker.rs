@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use ratatui::layout::Position;
 
-use crate::protocol::{Activity, ActivityStatus, SessionId, SessionSnapshot};
+use crate::protocol::{Activity, ActivityStatus, ModelId, SessionId, SessionSnapshot};
 
 /// One working Subagent on offer: the child Session its entry opens, and the
 /// name and description its row is drawn from.
@@ -22,6 +22,7 @@ pub(super) struct WorkingSubagent<'a> {
     pub(super) name: &'a str,
     pub(super) pending_questionnaires: usize,
     pub(super) description: &'a str,
+    pub(super) model: Option<&'a ModelId>,
 }
 
 /// The open Session's working Subagents, in the order they spawned — the tree
@@ -36,6 +37,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 status: ActivityStatus::Active,
                 name,
                 description,
+                model,
                 session_id,
                 ..
             } => Some(WorkingSubagent {
@@ -43,6 +45,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 session_id: *session_id,
                 name,
                 description,
+                model: model.as_ref(),
             }),
             _ => None,
         })

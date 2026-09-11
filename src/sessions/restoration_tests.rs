@@ -5,9 +5,9 @@ use std::{cell::Cell, collections::HashMap, path::Path};
 use super::SessionStore;
 use crate::{
     protocol::{
-        ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot,
-        SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, Turn, TurnId,
-        TurnStatus, Usage, UsageTotal, Workspace,
+        Cost, CostBasis, CostCoverage, CostDetails, ModelAvailability, Session, SessionId,
+        SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus, SessionSummary,
+        SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
 };
@@ -28,13 +28,149 @@ fn turn(start: u64, end: Option<u64>, output: Option<u64>) -> Turn {
         },
         started_at: Some(SessionTimestamp(start)),
         settled_at: end.map(SessionTimestamp),
+        last_output_at: None,
         usage: output.map(|output| Usage {
             output_tokens: Some(output),
             ..Default::default()
         }),
         cost: None,
         cost_basis: None,
+        cost_details: None,
     }
+}
+
+fn priced_turn(
+    started_at: Option<u64>,
+    cost: f64,
+    coverage: CostCoverage,
+    recorded_at: u64,
+) -> Turn {
+    Turn {
+        id: TurnId::new(),
+        prompt_id: None,
+        agent: None,
+        status: TurnStatus::Completed,
+        started_at: started_at.map(SessionTimestamp),
+        settled_at: Some(SessionTimestamp(recorded_at)),
+        last_output_at: None,
+        usage: Some(Usage {
+            output_tokens: Some(1),
+            ..Default::default()
+        }),
+        cost: Cost::from_usd(cost),
+        cost_basis: Some(CostBasis::Reported),
+        cost_details: Some(CostDetails {
+            coverage,
+            recorded_at: SessionTimestamp(recorded_at),
+            is_partial: false,
+            prior: Vec::new(),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_is_retained() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+
+    let mut aggregate_root = persisted(directory.path(), None);
+    aggregate_root.snapshot.turns = vec![priced_turn(
+        Some(10),
+        0.10,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: "ancestor-process".to_owned(),
+        },
+        20,
+    )];
+    let aggregate_root_id = aggregate_root.snapshot.session.id;
+    let mut untimed_aggregate = persisted(directory.path(), Some(aggregate_root_id));
+    untimed_aggregate.snapshot.turns = vec![priced_turn(
+        None,
+        0.03,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: "child-process".to_owned(),
+        },
+        15,
+    )];
+
+    let mut turn_root = persisted(directory.path(), None);
+    turn_root.snapshot.turns = vec![priced_turn(
+        Some(10),
+        0.10,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: "other-ancestor-process".to_owned(),
+        },
+        20,
+    )];
+    let turn_root_id = turn_root.snapshot.session.id;
+    let mut untimed_turn = persisted(directory.path(), Some(turn_root_id));
+    untimed_turn.snapshot.turns = vec![priced_turn(None, 0.03, CostCoverage::Turn, 15)];
+
+    let mut untimed_root = persisted(directory.path(), None);
+    untimed_root.snapshot.turns = vec![priced_turn(
+        None,
+        0.10,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: "untimed-ancestor-process".to_owned(),
+        },
+        20,
+    )];
+    let untimed_root_id = untimed_root.snapshot.session.id;
+    let mut timed_aggregate = persisted(directory.path(), Some(untimed_root_id));
+    timed_aggregate.snapshot.turns = vec![priced_turn(
+        Some(10),
+        0.03,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: "timed-child-process".to_owned(),
+        },
+        15,
+    )];
+
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: vec![
+                aggregate_root,
+                untimed_aggregate,
+                turn_root,
+                untimed_turn,
+                untimed_root,
+                timed_aggregate,
+            ],
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+    );
+
+    let aggregate_total = store
+        .subscribe(aggregate_root_id)
+        .unwrap()
+        .snapshot
+        .total_usage()
+        .expect("ancestor aggregate total");
+    assert_eq!(aggregate_total.cost, Cost::from_usd(0.10));
+    assert!(aggregate_total.cost_is_partial);
+
+    let turn_total = store
+        .subscribe(turn_root_id)
+        .unwrap()
+        .snapshot
+        .total_usage()
+        .expect("ancestor plus Turn cost total");
+    assert_eq!(turn_total.cost, Cost::from_usd(0.13));
+    assert!(turn_total.cost_is_partial);
+
+    let untimed_total = store
+        .subscribe(untimed_root_id)
+        .unwrap()
+        .snapshot
+        .total_usage()
+        .expect("untimed ancestor aggregate total");
+    assert_eq!(untimed_total.cost, Cost::from_usd(0.10));
+    assert!(untimed_total.cost_is_partial);
+
+    writer.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -86,6 +222,7 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
             snapshot.total_usage(),
             output.map(|output| UsageTotal {
                 output_tokens: Some(output),
+                cost_is_partial: true,
                 ..Default::default()
             })
         );
@@ -175,6 +312,66 @@ async fn restoring_a_deep_tree_reuses_descendant_history() {
 #[tokio::test]
 async fn restoring_a_wide_tree_reuses_child_totals() {
     restore_tree(true).await;
+}
+
+#[tokio::test]
+async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let mut record = persisted(directory.path(), None);
+    record.snapshot.turns = (0..256)
+        .map(|index| {
+            let started_at = SessionTimestamp(index * 4 + 1);
+            Turn {
+                id: TurnId::new(),
+                prompt_id: None,
+                agent: None,
+                status: TurnStatus::Completed,
+                started_at: Some(started_at),
+                settled_at: Some(SessionTimestamp(started_at.0 + 2)),
+                last_output_at: Some(SessionTimestamp(started_at.0 + 1)),
+                usage: Some(Usage {
+                    output_tokens: Some(1),
+                    ..Default::default()
+                }),
+                cost: Cost::from_usd(0.01),
+                cost_basis: Some(CostBasis::Reported),
+                cost_details: Some(CostDetails {
+                    coverage: CostCoverage::SessionSubtree {
+                        reporting_lifetime: format!("process-{index}"),
+                    },
+                    recorded_at: SessionTimestamp(started_at.0 + 1),
+                    is_partial: false,
+                    prior: Vec::new(),
+                }),
+            }
+        })
+        .collect();
+    let root = record.snapshot.session.id;
+    WORK.set(0);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: vec![record],
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+    );
+    let work = WORK.get();
+    assert!(
+        work <= 256 * 16,
+        "256 reporting lifetimes required {work} restoration operations"
+    );
+    let total = store
+        .subscribe(root)
+        .unwrap()
+        .snapshot
+        .total_usage()
+        .expect("reported totals");
+    assert_eq!(total.cost, Cost::from_usd(2.56));
+    assert!(!total.cost_is_partial);
+    writer.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -340,6 +537,7 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
             activities: vec![],
             transcript: vec![],
             subagent_usage: None,
+            total_cost: None,
             subagent_questionnaires: vec![],
         },
         resume_states: HashMap::new(),

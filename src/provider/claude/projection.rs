@@ -27,7 +27,7 @@
 //! does not present is passed over rather than failed, because the wire grows freely (ADR 0010).
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -59,6 +59,7 @@ const COMMAND_TOOL: &str = "Bash";
 /// The tool that spawns a subagent. Its tool-use id is what the CLI names as a task's
 /// `tool_use_id` and what the subagent's every chunk rides under as `parent_tool_use_id`.
 const TASK_TOOL: &str = "Task";
+const AGENT_TOOL: &str = "Agent";
 
 /// The task type the CLI reports for a task running an agent — a Subagent. Every other type
 /// (`local_bash` above all) is background work with no conversation of its own, already in the
@@ -263,6 +264,13 @@ struct ClaudeProjection {
     spawn_tools: BTreeMap<String, ConversationKey>,
     /// The agent tasks running as Subagents, by the task id the rest of the lifecycle names.
     subagent_tasks: BTreeMap<String, SubagentTask>,
+    /// Latest assistant-snapshot Model evidence by spawning tool-use id. A
+    /// snapshot can race the task lifecycle, so evidence waits here until the
+    /// Subagent row exists.
+    subagent_models: BTreeMap<String, crate::protocol::ModelId>,
+    reporting_lifetime: String,
+    latest_reported_cost: Option<Cost>,
+    seen_results: HashSet<String>,
     reasoning_blocks: u64,
     turn_metering: Option<ReportedTurnMetering>,
     /// What the Session reads back out of the conversation: whether the Turn it started is still
@@ -296,6 +304,10 @@ impl ClaudeProjection {
             running_commands: BTreeMap::new(),
             spawn_tools: BTreeMap::new(),
             subagent_tasks: BTreeMap::new(),
+            subagent_models: BTreeMap::new(),
+            reporting_lifetime: uuid::Uuid::new_v4().to_string(),
+            latest_reported_cost: None,
+            seen_results: HashSet::new(),
             reasoning_blocks: 0,
             turn_metering: None,
             turn,
@@ -374,14 +386,24 @@ impl ClaudeProjection {
         // which Session the child hangs under. The rest of the lifecycle addresses the row by
         // the Subagent's own identity and rides the owning conversation, so a nested Subagent's
         // settle still lands after its spawner's own — order the wire does not promise.
-        vec![attributed(
+        let mut projected = vec![attributed(
             &spawner,
             ProviderEvent::SubagentStarted {
-                subagent_id: ProviderSubagentId::new(subagent),
+                subagent_id: ProviderSubagentId::new(subagent.clone()),
                 name,
                 description,
             },
-        )]
+        )];
+        if let Some(model) = self.subagent_models.get(&subagent).cloned() {
+            projected.push(attributed(
+                &OWNING_CONVERSATION,
+                ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(subagent),
+                    model,
+                },
+            ));
+        }
+        projected
     }
 
     /// A revised description for a running Subagent. Tasks that are not Subagents, tasks never
@@ -565,6 +587,16 @@ impl ClaudeProjection {
             return Vec::new();
         };
         let owner: ConversationKey = message.parent_tool_use_id;
+        let observed_model = owner.as_ref().and_then(|subagent| {
+            message
+                .message
+                .model
+                .filter(|model| !model.is_empty())
+                .map(|model| (subagent.clone(), crate::protocol::ModelId::new(model)))
+        });
+        if let Some((subagent, model)) = observed_model.as_ref() {
+            self.subagent_models.insert(subagent.clone(), model.clone());
+        }
         let held = self.conversations.remove(&owner);
         let known = held.is_some();
         let mut conversation = held.unwrap_or_default();
@@ -609,10 +641,25 @@ impl ClaudeProjection {
         if known {
             self.conversations.insert(owner.clone(), conversation);
         }
-        projected
+        let mut attributed_events = observed_model
+            .filter(|(subagent, _)| {
+                self.subagent_tasks
+                    .values()
+                    .any(|task| &task.subagent == subagent)
+            })
+            .map(|(subagent, model)| {
+                attributed(
+                    &OWNING_CONVERSATION,
+                    ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(subagent),
+                        model,
+                    },
+                )
+            })
             .into_iter()
-            .map(|event| attributed(&owner, event))
-            .collect()
+            .collect::<Vec<_>>();
+        attributed_events.extend(projected.into_iter().map(|event| attributed(&owner, event)));
+        attributed_events
     }
 
     /// Starts tracking a `tool_use` block whose input is about to stream. A Task tool use is
@@ -631,7 +678,7 @@ impl ClaudeProjection {
         if name == "AskUserQuestion" {
             self.question_tools.insert(id.clone(), owner.clone());
         }
-        if name == TASK_TOOL {
+        if name == TASK_TOOL || name == AGENT_TOOL {
             self.spawn_tools.insert(id.clone(), owner.clone());
         }
         conversation.open_tools.insert(
@@ -819,6 +866,13 @@ impl ClaudeProjection {
                 "Claude Code CLI sent a malformed result message: {error}"
             ))
         })?;
+        if result
+            .uuid
+            .as_ref()
+            .is_some_and(|uuid| !self.seen_results.insert(uuid.clone()))
+        {
+            return Ok(Vec::new());
+        }
         let mut projected = Vec::new();
         // A result is a boundary of the loop's own conversation alone: its subagents stream on
         // past it (ADR 0015). A result while the loop's blocks are still streaming is the CLI
@@ -861,19 +915,31 @@ impl ClaudeProjection {
                 ..ConversationInFlight::default()
             },
         );
-        if let Some(usage) = result.usage.as_ref() {
-            let usage = Usage {
-                fresh_input_tokens: reported_token_count(usage.input_tokens),
-                cache_read_tokens: reported_token_count(usage.cache_read_input_tokens),
-                cache_write_tokens: reported_token_count(usage.cache_creation_input_tokens),
-                output_tokens: reported_token_count(usage.output_tokens),
-                reasoning_tokens: None,
-                native_meter: None,
-                model_context_window: None,
-            };
-            let reported_cost = result.total_cost_usd.and_then(Cost::from_usd);
+        let reported_cost = result
+            .total_cost_usd
+            .and_then(Cost::from_usd)
+            .filter(|cost| {
+                self.latest_reported_cost
+                    .is_none_or(|latest| cost.nano_usd() >= latest.nano_usd())
+            });
+        if let Some(cost) = reported_cost {
+            self.latest_reported_cost = Some(cost);
+        }
+        if result.usage.is_some() || reported_cost.is_some() || self.turn_metering.is_some() {
+            let usage = result
+                .usage
+                .as_ref()
+                .map_or_else(Usage::default, |usage| Usage {
+                    fresh_input_tokens: reported_token_count(usage.input_tokens),
+                    cache_read_tokens: reported_token_count(usage.cache_read_input_tokens),
+                    cache_write_tokens: reported_token_count(usage.cache_creation_input_tokens),
+                    output_tokens: reported_token_count(usage.output_tokens),
+                    reasoning_tokens: None,
+                    native_meter: None,
+                    model_context_window: None,
+                });
             if let Some(metering) = self.turn_metering.as_mut() {
-                metering.add(usage, reported_cost);
+                metering.add_usage_with_cumulative_cost(usage, reported_cost);
             } else {
                 self.turn_metering = Some(ReportedTurnMetering::new(usage, reported_cost));
             }
@@ -881,7 +947,7 @@ impl ClaudeProjection {
                 .turn_metering
                 .as_ref()
                 .expect("Claude Turn metering was just initialized");
-            projected.push(metering.event());
+            projected.push(metering.subtree_event(&self.reporting_lifetime));
         }
         let turn_settled;
         if was_interrupted(&result) {

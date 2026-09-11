@@ -410,12 +410,6 @@ impl ComposerMemory {
         }
     }
 
-    /// Gives up the draft standing in a composer, keeping it in that composer's
-    /// history so the reader can call it back, and leaves the composer empty.
-    pub(super) fn discard_draft(&mut self, key: ComposerKey) {
-        self.composer_mut(key).discard_draft();
-    }
-
     pub(super) fn begin_submission(&mut self, key: ComposerKey) -> InitialPrompt {
         self.composer_mut(key).begin_submission()
     }

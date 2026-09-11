@@ -952,6 +952,14 @@ fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckou
         root: destination.clone(),
         kind: CheckoutKind::Linked,
     });
+    location.checkouts.push(CheckoutSummary {
+        association: location.checkout.clone().unwrap(),
+        revision: Some(CheckoutRevision::Branch {
+            name: "suru/prepared".to_owned(),
+            commit: Some("abc".to_owned()),
+        }),
+        availability: SourceControlAvailability::Available,
+    });
     PrepareCheckoutResult {
         preparation: PreparedCheckout {
             id: request.id,
@@ -1026,8 +1034,11 @@ fn a_prepared_worktree_stands_in_place_of_the_pending_intent_beneath_the_claim()
     let mut app = layout.app();
     choose_new(&mut app, &layout);
     type_terminal_text(&mut app, "Prepare and work");
-    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
-        key(&mut app, KeyCode::Enter)
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
     else {
         panic!("first submit prepares")
     };
@@ -1035,7 +1046,11 @@ fn a_prepared_worktree_stands_in_place_of_the_pending_intent_beneath_the_claim()
     let result = prepared(&layout, &request);
     let destination = result.preparation.destination.path.clone();
     let ApplicationTransition::CreateSession(_) = app
-        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
         .unwrap()
     else {
         panic!("a prepared Worktree continues to creation")
@@ -1057,21 +1072,29 @@ fn a_retry_asks_again_for_the_worktree_it_prepared_wherever_the_reader_has_moved
     let mut app = layout.app();
     choose_new(&mut app, &layout);
     type_terminal_text(&mut app, "Prepare and work");
-    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
-        key(&mut app, KeyCode::Enter)
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
     else {
         panic!("first submit prepares")
     };
     let result = prepared(&layout, &request);
     let destination = result.preparation.destination.clone();
     let ApplicationTransition::CreateSession(create) = app
-        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
         .unwrap()
     else {
         panic!("a prepared Worktree continues to creation")
     };
     app.handle_event(ApplicationEvent::SessionCreationFailed {
         prompt_id: create.prompt.id,
+        code: None,
         error: "Provider unavailable".to_owned(),
     })
     .unwrap();

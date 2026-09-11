@@ -14,10 +14,11 @@ use crossterm::event::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Activity, ActivityStatus, Cost, CostBasis, Message, MessageId, MessageRole, MessageStatus,
-        ModelAvailability, PromptId, Session, SessionChange, SessionId, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
-        TurnId, TurnStatus, Usage, UsageTotal, Workspace,
+        Activity, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost, CostBasis, Message,
+        MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId, PromptId, ProviderId,
+        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Usage,
+        UsageTotal, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -51,6 +52,7 @@ fn parent_with_subagent_row(
         status,
         name: "Explore".to_owned(),
         description: "Map the provider seams".to_owned(),
+        model: None,
         session_id: child_id,
         duration_ms,
     };
@@ -58,6 +60,30 @@ fn parent_with_subagent_row(
         snapshot.session.working_since = Some(SessionTimestamp::now());
     }
     (snapshot, child_id)
+}
+
+#[test]
+fn a_subagent_session_header_shows_its_observed_model() {
+    let workspace = workspace_dir();
+    let mut child = child_session_snapshot(SessionId::new(), SessionId::new(), workspace.path());
+    child.turns[0].agent = Some(AgentIdentity {
+        agent: AgentId::new("provider-agent"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("child-model"),
+            options: Vec::new(),
+        },
+    });
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach a Subagent Session with observed identity");
+
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("child-model"),
+        "the child Session presents its own Model: {text}"
+    );
 }
 
 /// A Subagent's own Session: parented, running its prompt-less Turn, with the
@@ -95,9 +121,11 @@ fn child_session_snapshot(
             status: TurnStatus::Active,
             started_at: None,
             settled_at: None,
+            last_output_at: None,
             usage: None,
             cost: None,
             cost_basis: None,
+            cost_details: None,
         }],
         messages: vec![Message {
             id: message_id,
@@ -112,6 +140,7 @@ fn child_session_snapshot(
         transcript: vec![TranscriptItem::Message { message_id }],
         subagent_questionnaires: Vec::new(),
         subagent_usage: None,
+        total_cost: None,
     }
 }
 
