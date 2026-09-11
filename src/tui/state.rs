@@ -464,8 +464,9 @@ pub struct TuiState {
     pub(super) provisional: Option<ProvisionalSession>,
     /// A refusal owed to the Landing rather than to whatever the reader has
     /// since opened. A creation the reader walked away from still answers, and
-    /// its answer belongs where the draft it restores is.
-    landing_error: Option<String>,
+    /// its answer belongs where the draft it hands back is: both wait here
+    /// until the Landing is next drawn.
+    deferred_refusal: Option<DeferredRefusal>,
     /// Why the open route could not hydrate, if its newest attachment failed.
     ///
     /// This is client presentation, not Session history: it never enters a
@@ -542,10 +543,10 @@ pub(super) struct ProvisionalSession {
     /// client and is never the created Session's own.
     pub(super) session_id: SessionId,
     pub(super) prompt: InitialPrompt,
-    /// What was asked of the Server, kept whole so a refusal is retried under
-    /// the context the reader submitted in rather than the one they have since
-    /// moved to.
-    dispatch: ProvisionalDispatch,
+    /// The Worktree prepared for this Session, once one has been. A retry uses
+    /// it rather than preparing again, for as long as the reader is still
+    /// working there.
+    prepared: Option<PreparedFor>,
     /// Why the Server refused, which stands where the Working Indicator was
     /// until the reader retries.
     pub(super) error: Option<String>,
@@ -554,37 +555,11 @@ pub(super) struct ProvisionalSession {
     interrupt_intent: bool,
 }
 
-/// The request a Provisional Session stands for: creating the Session outright,
-/// or preparing the Worktree it will be created in first.
+/// A Worktree already made for a Session that has not been created yet.
 #[derive(Clone, Debug)]
-enum ProvisionalDispatch {
-    Create {
-        preparation_id: Option<crate::protocol::PreparationId>,
-        agent_selection: Option<AgentSelection>,
-        execution_directory: crate::protocol::ExecutionDirectory,
-    },
-    Prepare(crate::protocol::PrepareCheckoutRequest),
-}
-
-impl ProvisionalDispatch {
-    fn transition(&self, prompt: InitialPrompt) -> ApplicationTransition {
-        match self {
-            Self::Prepare(request) => ApplicationTransition::PrepareCheckout {
-                prompt_id: prompt.id,
-                request: request.clone(),
-            },
-            Self::Create {
-                preparation_id,
-                agent_selection,
-                execution_directory,
-            } => ApplicationTransition::CreateSession(CreateSessionRequest {
-                preparation_id: preparation_id.clone(),
-                agent_selection: agent_selection.clone(),
-                execution_directory: execution_directory.clone(),
-                prompt,
-            }),
-        }
-    }
+struct PreparedFor {
+    id: crate::protocol::PreparationId,
+    destination: crate::protocol::ExecutionDirectory,
 }
 
 #[derive(Clone, Debug)]
@@ -598,6 +573,14 @@ struct PendingAgentSelection {
 struct FailedSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
+    prompt: InitialPrompt,
+}
+
+/// A refused creation the reader had already walked away from, kept until the
+/// Landing they wrote it in is drawn again.
+#[derive(Clone, Debug)]
+struct DeferredRefusal {
+    error: String,
     prompt: InitialPrompt,
 }
 
@@ -700,7 +683,7 @@ impl TuiState {
             opening_loading: OpeningLoadingState::Inactive,
             session: None,
             provisional: None,
-            landing_error: None,
+            deferred_refusal: None,
             opening_error: None,
             session_reference: None,
             workspace_paths: HashMap::new(),
@@ -867,9 +850,12 @@ impl TuiState {
     fn leave_session_route(&mut self) -> bool {
         self.abandon_provisional_session();
         // A refusal owed to the Landing is said the first time the Landing is
-        // drawn after it, rather than in whatever the reader was looking at.
-        if let Some(error) = self.landing_error.take() {
-            self.submission_error = Some(error);
+        // drawn after it, rather than in whatever the reader was looking at,
+        // and the draft it hands back is put there with it.
+        if let Some(refusal) = self.deferred_refusal.take() {
+            self.composers
+                .admission_failed(ComposerKey::Landing, &refusal.prompt);
+            self.submission_error = Some(refusal.error);
         }
         self.text_selection.set(None);
         self.composers.clear_selections();
@@ -1778,8 +1764,7 @@ impl TuiState {
     /// answered: the Session is theirs and reaches the Sidebar through the
     /// catalog, but the submission that made it settles where its draft stands
     /// rather than under a Session they are not in.
-    fn detach_creation(&mut self, snapshot: &SessionSnapshot) {
-        self.new_worktree = None;
+    fn detach_creation(&mut self, snapshot: &SessionSnapshot) -> bool {
         let settles = self.pending_submission.as_ref().is_some_and(|pending| {
             pending.target == SubmissionTarget::CreateSession
                 && snapshot
@@ -1788,14 +1773,16 @@ impl TuiState {
                     .any(|prompt| prompt.id == pending.prompt.id)
         });
         if !settles {
-            return;
+            return false;
         }
+        self.new_worktree = None;
         let pending = self
             .pending_submission
             .take()
             .expect("the settling submission was just observed");
         self.composers
             .admission_reconciled(pending.source.clone(), pending.source, &pending.prompt);
+        true
     }
 
     fn apply_attached_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
@@ -2523,19 +2510,17 @@ impl TuiState {
             .take()
             .expect("matching pending submission exists");
         let created_session = pending.target == SubmissionTarget::CreateSession;
-        // A refused creation the client is still drawing its claim for stays in
-        // that claim: the view stands with the user Message in place, the
-        // Working Indicator gives way to the refusal, and the composer stands
-        // empty, because Enter there retries the very Prompt that was refused.
-        if let Some(claim) = self
+        // A Provisional Session stands for a Server's answer about a Session.
+        // Anything else that stops a submission on its way — a Worktree that
+        // could not be prepared, Skills to reselect in a destination — is about
+        // the draft, so the reader goes back to the Landing holding it rather
+        // than standing in a view whose composer means retry.
+        if self
             .provisional
-            .as_mut()
-            .filter(|claim| claim.prompt.id == prompt_id)
+            .as_ref()
+            .is_some_and(|claim| claim.prompt.id == prompt_id)
         {
-            claim.error = Some(error);
-            self.composers.discard_draft(ComposerKey::Landing);
-            self.transcript_generation = self.transcript_generation.wrapping_add(1);
-            return;
+            self.abandon_provisional_session();
         }
         self.composers
             .admission_failed(pending.source.clone(), &pending.prompt);
@@ -2544,17 +2529,49 @@ impl TuiState {
             FailedSubmission {
                 source: pending.source,
                 target: pending.target,
-                prompt: pending.prompt,
+                prompt: pending.prompt.clone(),
             },
         );
         // A creation the reader walked away from answers to the Landing, where
         // the draft it just restored stands, rather than to whatever they
         // opened in the meantime.
         if created_session && self.route.is_some() {
-            self.landing_error = Some(error);
+            self.deferred_refusal = Some(DeferredRefusal {
+                error,
+                prompt: pending.prompt,
+            });
             return;
         }
         self.submission_error = Some(error);
+    }
+
+    /// Takes the Server's refusal of a Session this client asked for.
+    ///
+    /// A claim still standing for it keeps the view: the user Message stays, the
+    /// Working Indicator gives way to the refusal, and the composer stands empty
+    /// because Enter there retries the very Prompt that was refused. A reader
+    /// who has left it is answered at the Landing instead, with the draft the
+    /// refusal hands back.
+    fn refuse_creation(&mut self, prompt_id: PromptId, error: String) {
+        let refuses_claim = self
+            .provisional
+            .as_ref()
+            .is_some_and(|claim| claim.prompt.id == prompt_id)
+            && self
+                .pending_submission
+                .as_ref()
+                .is_some_and(|pending| pending.prompt.id == prompt_id);
+        if !refuses_claim {
+            self.fail_pending_submission(prompt_id, error);
+            return;
+        }
+        self.pending_submission = None;
+        self.composers.discard_draft(ComposerKey::Landing);
+        self.provisional
+            .as_mut()
+            .expect("the refused claim was just observed")
+            .error = Some(error);
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
     }
 
     fn reconcile_failed_submissions(&mut self) {
@@ -2630,6 +2647,15 @@ impl TuiState {
                 prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
             })
             .filter(|prompt| !prompts.iter().any(|drawn| drawn.id == prompt.id))
+            .filter(|prompt| {
+                self.session.as_ref().is_none_or(|projection| {
+                    !projection
+                        .snapshot()
+                        .turns
+                        .iter()
+                        .any(|turn| turn.prompt_id == Some(prompt.id))
+                })
+            })
             .map(|prompt| InitialPrompt {
                 id: prompt.id,
                 text: prompt.text.clone(),
@@ -2649,24 +2675,63 @@ impl TuiState {
     /// Session for a Session that exists. The draft stays under the Landing's
     /// own composer, which is where the migration onto the created Session's
     /// key reads it from.
-    fn begin_provisional_session(
-        &mut self,
-        prompt: InitialPrompt,
-        dispatch: ProvisionalDispatch,
-    ) -> ApplicationTransition {
-        let transition = dispatch.transition(prompt.clone());
+    fn begin_provisional_session(&mut self, prompt: InitialPrompt) -> ApplicationTransition {
         self.text_selection.set(None);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.provisional = Some(ProvisionalSession {
             session_id: SessionId::new(),
-            prompt,
-            dispatch,
+            prompt: prompt.clone(),
+            prepared: None,
             error: None,
             interrupt_intent: false,
         });
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
-        transition
+        self.creation_transition(prompt)
+    }
+
+    /// Asks for the Session this Prompt is written for: the Worktree already
+    /// prepared for it, a new one where that intent stands, or the Execution
+    /// Directory the reader is working in.
+    ///
+    /// Both the first submission and every retry come through here, so a retry
+    /// is asked under the context the reader is in rather than one they have
+    /// left, and a Worktree already made for this Prompt is never made twice.
+    fn creation_transition(&mut self, prompt: InitialPrompt) -> ApplicationTransition {
+        let prepared = self
+            .provisional
+            .as_ref()
+            .and_then(|claim| claim.prepared.clone())
+            .filter(|prepared| self.execution_directory.as_ref() == Some(&prepared.destination.path));
+        if let Some(prepared) = prepared {
+            return ApplicationTransition::CreateSession(CreateSessionRequest {
+                preparation_id: Some(prepared.id),
+                agent_selection: self.landing_agent_selection.clone(),
+                execution_directory: prepared.destination,
+                prompt,
+            });
+        }
+        if let Some(request) = &mut self.new_worktree {
+            request.description = prompt.text.clone();
+            if let Some(selection) = &self.landing_agent_selection {
+                request.provider = selection.provider.clone();
+            }
+            return ApplicationTransition::PrepareCheckout {
+                prompt_id: prompt.id,
+                request: request.clone(),
+            };
+        }
+        let Some(path) = self.execution_directory.clone() else {
+            self.submission_error =
+                Some("Choose a working copy before starting a Session".to_owned());
+            return ApplicationTransition::Continue;
+        };
+        ApplicationTransition::CreateSession(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: self.landing_agent_selection.clone(),
+            execution_directory: crate::protocol::ExecutionDirectory { path },
+            prompt,
+        })
     }
 
     /// Gives up a Provisional Session, which a newer route does without pulling
@@ -4053,6 +4118,12 @@ impl Application {
                         ApplicationTransition::RefreshSkills,
                     ));
                 }
+                if let Some(claim) = self.state.provisional.as_mut() {
+                    claim.prepared = Some(PreparedFor {
+                        id: result.preparation.id,
+                        destination: result.preparation.destination.clone(),
+                    });
+                }
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
                     preparation_id: Some(result.preparation.id),
                     agent_selection: self.state.landing_agent_selection.clone(),
@@ -4070,7 +4141,7 @@ impl Application {
                             && pending.target == SubmissionTarget::CreateSession
                     })
                 {
-                    self.state.fail_pending_submission(prompt_id, error);
+                    self.state.refuse_creation(prompt_id, error);
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -5512,10 +5583,6 @@ impl Application {
             .expect("a retry answers the claim that was refused");
         claim.prompt = prompt.clone();
         claim.error = None;
-        if let ProvisionalDispatch::Prepare(request) = &mut claim.dispatch {
-            request.description = prompt.text.clone();
-        }
-        let dispatch = claim.dispatch.clone();
         self.state.transcript_generation = self.state.transcript_generation.wrapping_add(1);
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
@@ -5524,7 +5591,7 @@ impl Application {
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
         });
-        dispatch.transition(prompt)
+        self.state.creation_transition(prompt)
     }
 
     /// Takes the Session the Server made in place of the claim the client drew
@@ -5537,14 +5604,18 @@ impl Application {
         &mut self,
         snapshot: SessionSnapshot,
     ) -> Result<ApplicationTransition> {
-        let Some(claim) = self.state.provisional.take() else {
-            self.state.detach_creation(&snapshot);
+        let claim = self.state.provisional.take();
+        // Without a claim, the only creation this client could have walked away
+        // from is the submission still waiting on an answer. A Session arriving
+        // for anything else — a client that never drew a claim for it — is
+        // opened as it always was.
+        if claim.is_none() && self.state.detach_creation(&snapshot) {
             return Ok(ApplicationTransition::Continue);
-        };
+        }
         self.state.new_worktree = None;
         self.state.session_events_blocked = false;
         self.state.apply_session(SessionEvent::snapshot(snapshot))?;
-        if claim.interrupt_intent
+        if claim.is_some_and(|claim| claim.interrupt_intent)
             && let Some(session) = self.state.session_reference.clone()
         {
             self.state.await_withdrawals(&session);
@@ -5628,26 +5699,7 @@ impl Application {
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
         });
-        let dispatch = if let Some(request) = &mut self.state.new_worktree {
-            request.description = prompt.text.clone();
-            if let Some(selection) = &self.state.landing_agent_selection {
-                request.provider = selection.provider.clone();
-            }
-            ProvisionalDispatch::Prepare(request.clone())
-        } else {
-            ProvisionalDispatch::Create {
-                preparation_id: None,
-                agent_selection: self.state.landing_agent_selection.clone(),
-                execution_directory: crate::protocol::ExecutionDirectory {
-                    path: self
-                        .state
-                        .execution_directory
-                        .clone()
-                        .expect("Landing execution checked before submission"),
-                },
-            }
-        };
-        self.state.begin_provisional_session(prompt.clone(), dispatch)
+        self.state.begin_provisional_session(prompt)
     }
 
     fn elapse_reconnect_grace(&mut self) -> ApplicationTransition {

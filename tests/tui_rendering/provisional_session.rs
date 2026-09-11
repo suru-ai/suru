@@ -2,13 +2,13 @@
 //! Landing's first Prompt is submitted until the Server answers with the Session
 //! it made, and the refusal it stands through.
 
-use crate::support::{rendered_application_rows, workspace_dir};
+use crate::support::{failed_session_snapshot, rendered_application_rows, workspace_dir};
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::SessionEvent,
     protocol::{
         InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptOrder, PromptStatus,
-        Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp,
+        PromptId, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp,
         Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
@@ -363,14 +363,73 @@ fn a_session_working_only_for_an_undelivered_prompt_can_be_interrupted() {
 }
 
 #[test]
-#[ignore]
-fn dump_provisional() {
+fn a_draft_typed_while_the_server_answers_is_kept_and_migrates_onto_the_session() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
-    let _ = submit_landing_prompt(&mut application, "Rename the widget");
-    for row in rendered_application_rows(&application) {
-        println!("|{row}|");
-    }
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "A later thought".to_owned(),
+        )))
+        .expect("type while the Server answers");
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(drawn.contains("A later thought"), "{drawn}");
+    // Nothing is delivered until the Session arrives.
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit while the Server answers"),
+        ApplicationTransition::Continue
+    );
+
+    application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            SessionId::new(),
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the created Session");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(drawn.contains("A later thought"), "{drawn}");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the migrated draft")
+    else {
+        panic!("the draft should have migrated onto the created Session's composer");
+    };
+    assert_eq!(request.prompt.text, "A later thought");
+}
+
+#[test]
+fn a_refusal_waits_for_the_landing_while_another_session_is_open() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    application
+        .handle_event(ApplicationEvent::SessionAttached(failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Another Session",
+            workspace.path(),
+        )))
+        .expect("open another Session");
+
+    refuse_creation(&mut application, &prompt, "Provider unavailable");
+    let opened = rendered_application_rows(&application).join("\n");
+    assert!(!opened.contains("Provider unavailable"), "{opened}");
+    assert!(!opened.contains("Rename the widget"), "{opened}");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("return to the Landing");
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(landing.contains("Provider unavailable"), "{landing}");
+    assert!(landing.contains("Rename the widget"), "{landing}");
 }
 
 #[test]
