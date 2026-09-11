@@ -40,6 +40,12 @@ pub(super) struct CursorTarget {
     pub(super) prefer_previous_row: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RowDirection {
+    Previous,
+    Next,
+}
+
 /// Text laid out over content columns `width` wide, as the byte range of each
 /// visual row.
 pub(super) struct TextLayout<'a> {
@@ -173,6 +179,87 @@ impl<'a> TextLayout<'a> {
             );
         }
         self.cursor_position(cursor)
+    }
+
+    /// Where a caret with an explicit wrap-side affinity is painted.
+    pub(super) fn cursor_position_with_affinity(
+        &self,
+        cursor: usize,
+        prefer_previous_row: bool,
+    ) -> (u16, u16) {
+        if prefer_previous_row {
+            self.cursor_position_before_wrap(cursor)
+        } else {
+            self.cursor_position(cursor)
+        }
+    }
+
+    /// The nearest insertion point at `column` on the Row adjacent to the
+    /// caret. The returned affinity keeps a soft-wrap boundary on the Row it
+    /// was reached from, while an exact-width trailing caret remains its own
+    /// Row below the text.
+    pub(super) fn adjacent_cursor_target(
+        &self,
+        cursor: usize,
+        prefer_previous_row: bool,
+        column: u16,
+        direction: RowDirection,
+    ) -> Option<CursorTarget> {
+        let current_row = self
+            .cursor_position_with_affinity(cursor, prefer_previous_row)
+            .0;
+        let target_row = match direction {
+            RowDirection::Previous => current_row.checked_sub(1)?,
+            RowDirection::Next => current_row.checked_add(1)?,
+        };
+        let last_row = self
+            .row_count()
+            .saturating_sub(1)
+            .max(self.cursor_position(self.text.len()).0);
+        if target_row > last_row {
+            return None;
+        }
+
+        let Some(range) = self.rows.get(usize::from(target_row)) else {
+            return Some(CursorTarget {
+                offset: self.text.len(),
+                prefer_previous_row: false,
+            });
+        };
+        let drawn = self.drawn(range);
+        let mut best = (column, range.start, false);
+        let mut display_column = 0_u16;
+        for (relative_offset, character) in drawn.text.char_indices() {
+            display_column = display_column
+                .saturating_add(u16::try_from(display_width(character)).unwrap_or(u16::MAX));
+            let offset = range.start + relative_offset + character.len_utf8();
+            let at_row_end = offset == range.end;
+            let next_row_shares_offset = self
+                .rows
+                .get(usize::from(target_row).saturating_add(1))
+                .is_some_and(|next| next.start == offset);
+            let newline_ended = self.text[offset..].starts_with('\n');
+            let (is_on_row, affinity) = if !at_row_end {
+                (usize::from(display_column) < self.width, false)
+            } else if next_row_shares_offset {
+                (usize::from(display_column) < self.width, true)
+            } else if newline_ended {
+                (true, false)
+            } else {
+                (usize::from(display_column) < self.width, false)
+            };
+            if !is_on_row {
+                continue;
+            }
+            let distance = display_column.abs_diff(column);
+            if distance < best.0 {
+                best = (distance, offset, affinity);
+            }
+        }
+        Some(CursorTarget {
+            offset: best.1,
+            prefer_previous_row: best.2,
+        })
     }
 
     /// How many rows the text occupies.

@@ -4404,11 +4404,8 @@ fn render_composer(
     let content_width = composer_content_width(area.width);
     let content_height = area.height.saturating_sub(2).max(1);
     let layout = TextLayout::new(text, content_width);
-    let (cursor_row, cursor_column) = if memory.prefers_previous_row(key.clone()) {
-        layout.cursor_position_before_wrap(cursor)
-    } else {
-        layout.cursor_position(cursor)
-    };
+    let (cursor_row, cursor_column) =
+        layout.cursor_position_with_affinity(cursor, memory.prefers_previous_row(key.clone()));
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
     memory.record_frame(key, content_area, scroll);
     let paragraph = if text.is_empty() {

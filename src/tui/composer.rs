@@ -8,7 +8,7 @@ use std::{
 
 use ratatui::layout::{Position, Rect};
 
-use super::text_layout::{CursorTarget, TextLayout};
+use super::text_layout::{CursorTarget, RowDirection, TextLayout};
 
 use crate::protocol::{
     InitialPrompt, PromptId, SessionReference, SkillDescriptor, SkillInvocation, SkillMarkerSpan,
@@ -53,6 +53,9 @@ struct ComposerState {
     // Pointer placement may choose the end of the row before a wrap;
     // ordinary editing and navigation return to the default wrap side.
     prefer_previous_row: bool,
+    // Vertical movement preserves the painted terminal column even when an
+    // intervening Row is too short to reach it.
+    preferred_display_column: Option<u16>,
     history: Vec<String>,
     history_position: Option<usize>,
     history_scratch: Option<String>,
@@ -332,44 +335,56 @@ impl ComposerMemory {
         composer.cursor = composer.line_end();
     }
 
-    /// Extending uses written Lines and never enters the history walk.
+    /// Extending vertically uses painted Rows and never enters history or a
+    /// picker. Home and End continue to use written Lines.
     pub(super) fn extend_selection(&mut self, key: ComposerKey, motion: SelectionMotion) {
-        let composer = self.composer_mut(key);
+        let width = self.layout_width(key.clone());
+        let composer = match motion {
+            SelectionMotion::Up | SelectionMotion::Down => self.composers.entry(key).or_default(),
+            _ => self.composer_mut(key),
+        };
         composer.selection_anchor.get_or_insert(composer.cursor);
         match motion {
             SelectionMotion::Left => composer.move_left(),
             SelectionMotion::Right => composer.move_right(),
-            SelectionMotion::Up if composer.line_start() == 0 => composer.cursor = 0,
-            SelectionMotion::Up => composer.move_up(),
-            SelectionMotion::Down if composer.line_end() == composer.text.len() => {
-                composer.cursor = composer.text.len();
+            SelectionMotion::Up if !composer.move_vertical(width, RowDirection::Previous) => {
+                composer.cursor = 0;
+                composer.prefer_previous_row = false;
             }
-            SelectionMotion::Down => composer.move_down(),
+            SelectionMotion::Up => {}
+            SelectionMotion::Down if !composer.move_vertical(width, RowDirection::Next) => {
+                composer.cursor = composer.text.len();
+                composer.prefer_previous_row = false;
+            }
+            SelectionMotion::Down => {}
             SelectionMotion::LineStart => composer.cursor = composer.line_start(),
             SelectionMotion::LineEnd => composer.cursor = composer.line_end(),
         }
     }
 
     pub(super) fn history_previous(&mut self, key: ComposerKey) {
-        let composer = self.composer_mut(key);
+        let width = self.layout_width(key.clone());
+        let composer = self.composers.entry(key).or_default();
         composer.selection_anchor = None;
-        composer.history_previous();
+        composer.history_previous(width);
     }
 
     pub(super) fn history_next(&mut self, key: ComposerKey) {
-        let composer = self.composer_mut(key);
+        let width = self.layout_width(key.clone());
+        let composer = self.composers.entry(key).or_default();
         composer.selection_anchor = None;
-        composer.history_next();
+        composer.history_next(width);
     }
 
     /// Whether Down would do nothing in this composer: the caret already rests
-    /// on the last line and no history walk is in progress. That one free
+    /// on the last painted Row and no history walk is in progress. That one free
     /// meaning is the only one another surface may take, so caret movement and
     /// history navigation always keep theirs.
     pub(super) fn down_is_inert(&self, key: ComposerKey) -> bool {
+        let width = self.layout_width(key.clone());
         self.composers
             .get(&key)
-            .is_none_or(ComposerState::down_is_inert)
+            .is_none_or(|composer| composer.down_is_inert(width))
     }
 
     pub(super) fn clear(&mut self, key: ComposerKey) {
@@ -458,7 +473,16 @@ impl ComposerMemory {
     fn composer_mut(&mut self, key: ComposerKey) -> &mut ComposerState {
         let composer = self.composers.entry(key).or_default();
         composer.prefer_previous_row = false;
+        composer.preferred_display_column = None;
         composer
+    }
+
+    fn layout_width(&self, key: ComposerKey) -> u16 {
+        self.frame
+            .borrow()
+            .as_ref()
+            .filter(|frame| frame.key == key)
+            .map_or(u16::MAX, |frame| frame.area.width.max(1))
     }
 
     fn with_migrated_composer<T>(
@@ -690,9 +714,30 @@ impl ComposerState {
             .map_or(self.text.len(), |(offset, _)| self.cursor + offset);
     }
 
-    fn history_previous(&mut self) {
-        if self.line_start() != 0 {
-            self.move_up();
+    fn vertical_target(&self, width: u16, direction: RowDirection) -> Option<(CursorTarget, u16)> {
+        let layout = TextLayout::new(&self.text, width);
+        let column = self.preferred_display_column.unwrap_or_else(|| {
+            layout
+                .cursor_position_with_affinity(self.cursor, self.prefer_previous_row)
+                .1
+        });
+        layout
+            .adjacent_cursor_target(self.cursor, self.prefer_previous_row, column, direction)
+            .map(|target| (target, column))
+    }
+
+    fn move_vertical(&mut self, width: u16, direction: RowDirection) -> bool {
+        let Some((target, column)) = self.vertical_target(width, direction) else {
+            return false;
+        };
+        self.cursor = target.offset;
+        self.prefer_previous_row = target.prefer_previous_row;
+        self.preferred_display_column = Some(column);
+        true
+    }
+
+    fn history_previous(&mut self, width: u16) {
+        if self.move_vertical(width, RowDirection::Previous) {
             return;
         }
         if self.history.is_empty() {
@@ -709,15 +754,16 @@ impl ComposerState {
         self.text.clone_from(&self.history[position]);
         self.skill_bindings.clear();
         self.cursor = self.text.len();
+        self.prefer_previous_row = false;
+        self.preferred_display_column = None;
     }
 
-    fn down_is_inert(&self) -> bool {
-        self.line_end() == self.text.len() && self.history_position.is_none()
+    fn down_is_inert(&self, width: u16) -> bool {
+        self.vertical_target(width, RowDirection::Next).is_none() && self.history_position.is_none()
     }
 
-    fn history_next(&mut self) {
-        if self.line_end() != self.text.len() {
-            self.move_down();
+    fn history_next(&mut self, width: u16) {
+        if self.move_vertical(width, RowDirection::Next) {
             return;
         }
         let Some(position) = self.history_position else {
@@ -734,6 +780,8 @@ impl ComposerState {
             self.skill_bindings.clear();
         }
         self.cursor = self.text.len();
+        self.prefer_previous_row = false;
+        self.preferred_display_column = None;
     }
 
     fn clear(&mut self) {
@@ -856,33 +904,6 @@ impl ComposerState {
         self.text[self.cursor..]
             .find('\n')
             .map_or(self.text.len(), |offset| self.cursor + offset)
-    }
-
-    fn move_up(&mut self) {
-        let current_start = self.line_start();
-        if current_start == 0 {
-            return;
-        }
-        let column = self.text[current_start..self.cursor].chars().count();
-        let previous_end = current_start - 1;
-        let previous_start = self.text[..previous_end]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        self.cursor = byte_at_character_column(&self.text, previous_start, previous_end, column);
-    }
-
-    fn move_down(&mut self) {
-        let current_start = self.line_start();
-        let current_end = self.line_end();
-        if current_end == self.text.len() {
-            return;
-        }
-        let column = self.text[current_start..self.cursor].chars().count();
-        let next_start = current_end + 1;
-        let next_end = self.text[next_start..]
-            .find('\n')
-            .map_or(self.text.len(), |offset| next_start + offset);
-        self.cursor = byte_at_character_column(&self.text, next_start, next_end, column);
     }
 
     fn leave_history_navigation(&mut self) {
@@ -1030,11 +1051,4 @@ fn shift(value: usize, delta: isize) -> usize {
     } else {
         value.saturating_sub(delta.unsigned_abs())
     }
-}
-
-fn byte_at_character_column(text: &str, start: usize, end: usize, column: usize) -> usize {
-    text[start..end]
-        .char_indices()
-        .nth(column)
-        .map_or(end, |(offset, _)| start + offset)
 }

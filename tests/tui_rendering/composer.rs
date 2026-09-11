@@ -1519,6 +1519,155 @@ fn multiline_history_is_boundary_aware_and_session_drafts_keep_their_cursor() {
     assert_ne!(first_session, second_session);
 }
 
+#[test]
+fn vertical_navigation_follows_painted_rows_and_preserves_display_column() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_terminal_event(InputEvent::Paste(
+            "abcdefghijklmnopqrstuvwxyz\nABCDEFGHIJKLMNOPQRSTU".into(),
+        ))
+        .unwrap();
+
+    // At 28 terminal columns the Landing composer has 22 text columns, so the
+    // first written Line occupies a full Row followed by a four-column Row.
+    let buffer = rendered_application_buffer(&application, 28, 30);
+    let first = text_position(&buffer, "abcdefghijklmnopqrstuv");
+    let short = text_position(&buffer, "wxyz");
+    let last = text_position(&buffer, "ABCDEFGHIJKLMNOPQRSTU");
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(last.0 + 21, last.1)
+    );
+
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(short.0 + 4, short.1),
+        "a short Row clamps the caret to its end"
+    );
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(first.0 + 21, first.1),
+        "the original display column survives the short Row"
+    );
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(last.0 + 21, last.1)
+    );
+
+    composer_selection_key(&mut application, KeyCode::Left, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(first.0 + 20, first.1),
+        "horizontal movement establishes a new preferred display column"
+    );
+}
+
+#[test]
+fn shift_vertical_navigation_selects_painted_rows_without_history() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_terminal_event(InputEvent::Paste(
+            "abcdefghijklmnopqrstuvwxyz\nABCDEFGHIJKLMNOPQRSTU".into(),
+        ))
+        .unwrap();
+    rendered_application_buffer(&application, 28, 30);
+
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(
+        composer_selection_key(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ApplicationTransition::CopyToClipboard("vwxyz\nABCDEFGHIJKLMNOPQRSTU".into())
+    );
+}
+
+#[test]
+fn vertical_navigation_uses_valid_wide_character_boundaries() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_terminal_event(InputEvent::Paste("a\n界x\nb".into()))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 28, 30);
+    // Ratatui reserves a continuation cell after the two-column character,
+    // so locate the character itself rather than requiring `x` to be adjacent
+    // in the buffer's cell-symbol String.
+    let wide = text_position(&buffer, "界");
+    let last = text_position(&buffer, "b");
+
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(wide.0, wide.1),
+        "column one is equally close to either side of the wide character and chooses its start"
+    );
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(last.0 + 1, last.1)
+    );
+}
+
+#[test]
+fn vertical_navigation_accounts_for_an_exact_width_trailing_caret_row() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "abcdefghijklmnopqrstuv");
+    let buffer = rendered_application_buffer(&application, 28, 30);
+    let text = text_position(&buffer, "abcdefghijklmnopqrstuv");
+    let trailing = rendered_application_cursor_at(&application, 28, 30);
+    assert_eq!(trailing, Position::new(text.0, text.1 + 1));
+
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(text.0, text.1)
+    );
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        trailing
+    );
+}
+
+#[test]
+fn history_waits_until_the_caret_reaches_the_first_painted_row() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_session(&mut application, workspace.path());
+    type_terminal_text(&mut application, "abcdefghijklmnopqrstuvwxyz");
+    let buffer = rendered_application_buffer(&application, 28, 30);
+    let first = text_position(&buffer, "abcdefghijklmnopqrstuv");
+
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        rendered_application_cursor_at(&application, 28, 30),
+        Position::new(first.0 + 4, first.1),
+        "Up traverses the wrapped draft before browsing history"
+    );
+    composer_selection_key(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Initial Prompt"),
+        "Up on the first painted Row browses history immediately"
+    );
+    composer_selection_key(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("abcdefghijklmnopqrstuvwxyz"),
+        "Down on history's last painted Row restores the wrapped scratch draft"
+    );
+}
+
 /// Where the composer's Prompt block sits on screen.
 struct PromptBlock {
     left: u16,
@@ -2614,7 +2763,7 @@ fn keyboard_selection_keeps_anchor_when_focus_crosses_unicode_characters() {
 }
 
 #[test]
-fn keyboard_selection_extends_by_written_lines_and_to_draft_edges_without_history() {
+fn keyboard_selection_extends_by_painted_rows_and_to_draft_edges_without_history() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     type_terminal_text(&mut application, "old history");

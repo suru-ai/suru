@@ -234,6 +234,37 @@ fn down_opens_the_picker_while_subagents_work() {
 }
 
 #[test]
+fn down_traverses_a_wrapped_draft_before_opening_the_picker() {
+    let workspace = workspace_dir();
+    let (snapshot, _) =
+        parent_with_working_subagents(workspace.path(), &[("Explore", "Map the provider seams")]);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a working Subagent");
+    type_terminal_text(&mut application, "abcdefghijklmnopqrstuvwxyz");
+
+    // The narrow frame gives the composer 22 text columns and paints the
+    // draft over two Rows. Move to the first, then let Down traverse both.
+    rendered_application_rows_at(&application, 28, 22);
+    press_key(&mut application, KeyCode::Up);
+    press_key(&mut application, KeyCode::Down);
+    let draft_rows = rendered_application_rows_at(&application, 28, 22);
+    assert!(
+        !draft_rows.join("\n").contains("Subagents"),
+        "Down within the painted draft remains composer movement"
+    );
+
+    press_key(&mut application, KeyCode::Down);
+    assert!(
+        rendered_application_rows_at(&application, 28, 22)
+            .join("\n")
+            .contains("Subagents"),
+        "Down on the final painted Row opens the picker immediately"
+    );
+}
+
+#[test]
 fn down_stays_inert_without_working_subagents() {
     let workspace = workspace_dir();
     let (mut snapshot, spawned) =
