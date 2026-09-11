@@ -8,8 +8,8 @@ use suru::{
     managed_client::SessionEvent,
     protocol::{
         InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionTimestamp, Turn, TurnId, TurnStatus, Workspace,
+        PromptStatus, Session, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionTimestamp, Turn, TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -137,6 +137,7 @@ fn a_refusal_after_leaving_restores_the_landing_draft_and_says_why() {
     application
         .handle_event(ApplicationEvent::SessionCreationFailed {
             prompt_id: prompt.id,
+            code: None,
             error: "Provider unavailable".to_owned(),
         })
         .expect("take the late refusal");
@@ -152,6 +153,7 @@ fn refuse_creation(application: &mut Application, prompt: &InitialPrompt, error:
     application
         .handle_event(ApplicationEvent::SessionCreationFailed {
             prompt_id: prompt.id,
+            code: None,
             error: error.to_owned(),
         })
         .expect("take the refusal");
@@ -227,6 +229,59 @@ fn a_typed_submit_replaces_the_refused_prompt() {
     assert!(!drawn.contains("Rename the widget"), "{drawn}");
     assert_eq!(drawn.matches("Rename the gadget").count(), 2, "{drawn}");
     assert!(drawn.contains("Working"), "{drawn}");
+}
+
+#[test]
+fn a_replacement_typed_before_the_refusal_survives_and_can_be_submitted() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Rename the gadget".to_owned(),
+        )))
+        .expect("type a replacement while creation is in flight");
+
+    refuse_creation(
+        &mut application,
+        &prompt,
+        "Destination Skill `review` is ambiguous",
+    );
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(drawn.contains("Rename the gadget"), "{drawn}");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the preserved replacement")
+    else {
+        panic!("the preserved replacement should retry Session creation")
+    };
+    assert_ne!(request.prompt.id, prompt.id);
+    assert_eq!(request.prompt.text, "Rename the gadget");
+}
+
+#[test]
+fn a_destination_skill_refusal_restores_the_original_prompt_for_editing() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Use $review here");
+    application
+        .handle_event(ApplicationEvent::SessionCreationFailed {
+            prompt_id: prompt.id,
+            code: Some(SessionErrorCode::InvalidSkillInvocation),
+            error: "Destination Skill `review` is ambiguous".to_owned(),
+        })
+        .expect("take the destination Skill refusal");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert_eq!(drawn.matches("Use $review here").count(), 3, "{drawn}");
+    let ApplicationTransition::CreateSession(retry) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the editable original Prompt")
+    else {
+        panic!("the restored Skill Prompt should retry creation")
+    };
+    assert_eq!(retry.prompt.id, prompt.id);
+    assert_eq!(retry.prompt.text, prompt.text);
 }
 
 #[test]

@@ -988,16 +988,26 @@ fn new_worktree_intent_is_deferred_cancelable_and_first_prompt_automatically_adm
     assert!(!text(&app).contains("New Worktree on submit"));
     choose_new(&mut app, &layout);
     type_terminal_text(&mut app, "Prepare and work");
-    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
-        key(&mut app, KeyCode::Enter)
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
     else {
         panic!("first submit prepares")
     };
+    let creating = text(&app);
+    assert!(creating.contains("Creating worktree"), "{creating}");
+    assert!(!creating.contains("Creating worktree (0s"), "{creating}");
     assert_eq!(request.source.path, layout.nested);
     let result = prepared(&layout, &request);
     let destination = result.preparation.destination.clone();
     let ApplicationTransition::CreateSession(create) = app
-        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
         .unwrap()
     else {
         panic!("unbound Prompt automatically continues")
@@ -1005,6 +1015,9 @@ fn new_worktree_intent_is_deferred_cancelable_and_first_prompt_automatically_adm
     assert_eq!(create.preparation_id, Some(request.id));
     assert_eq!(create.execution_directory, destination);
     assert_eq!(create.prompt.id, prompt_id);
+    let admitting = text(&app);
+    assert!(admitting.contains("Working"), "{admitting}");
+    assert!(!admitting.contains("Creating worktree"), "{admitting}");
 }
 
 #[test]
@@ -1082,20 +1095,34 @@ fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_de
     let mut app = layout.app();
     choose_new(&mut app, &layout);
     type_terminal_text(&mut app, "Retry this draft");
-    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
-        key(&mut app, KeyCode::Enter)
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
     else {
         panic!("prepare")
     };
     let mut result = prepared(&layout, &request);
-    result.error = Some("Submodule initialization failed; retry".to_owned());
+    result.error = Some("Destination Skill discovery failed; retry".to_owned());
     result.preparation.ready = false;
-    app.handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
-        .unwrap();
-    assert!(text(&app).contains("Retry this draft"));
-    assert!(text(&app).contains("Submodule initialization failed"));
+    app.handle_event(ApplicationEvent::CheckoutPrepared {
+        attempt_id,
+        prompt_id,
+        result,
+    })
+    .unwrap();
+    let failed = text(&app);
+    assert_eq!(failed.matches("Retry this draft").count(), 2, "{failed}");
+    assert!(failed.contains("Could not create Session"), "{failed}");
+    assert!(
+        failed.contains("Destination Skill discovery failed"),
+        "{failed}"
+    );
+    assert!(!failed.contains("Creating worktree"), "{failed}");
     type_terminal_text(&mut app, " corrected");
     let ApplicationTransition::PrepareCheckout {
+        attempt_id: retry_attempt,
         prompt_id: retry_id,
         request: retry,
     } = key(&mut app, KeyCode::Enter)
@@ -1109,6 +1136,7 @@ fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_de
     key(&mut app, KeyCode::Enter);
     assert_eq!(
         app.handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id: retry_attempt,
             prompt_id: retry_id,
             result: prepared(&layout, &retry)
         })
@@ -1120,6 +1148,272 @@ fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_de
     };
     assert_eq!(create.preparation_id, None);
     assert_eq!(create.execution_directory.path, layout.main);
+}
+
+#[test]
+fn interrupting_preparation_restores_the_prompt_and_a_retry_ignores_the_late_result() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Original preparation prompt");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id: interrupted_attempt,
+        prompt_id: interrupted_prompt,
+        request: interrupted,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+
+    assert_eq!(key(&mut app, KeyCode::Esc), ApplicationTransition::Continue);
+    assert_eq!(key(&mut app, KeyCode::Esc), ApplicationTransition::Continue);
+    let restored = text(&app);
+    assert!(
+        restored.contains("Original preparation prompt"),
+        "{restored}"
+    );
+    assert!(!restored.contains("Creating worktree"), "{restored}");
+
+    app.handle_event(ApplicationEvent::Command(CommandId::SelectAll))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InsertText(
+        "Edited retry prompt".to_owned(),
+    )))
+    .unwrap();
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id: retry_attempt,
+        prompt_id: retry_prompt,
+        request: retry,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("the interrupted Worktree remains reusable")
+    };
+    assert_eq!(retry.id, interrupted.id);
+    assert_ne!(retry_prompt, interrupted_prompt);
+
+    assert_eq!(
+        app.handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id: interrupted_attempt,
+            prompt_id: interrupted_prompt,
+            result: prepared(&layout, &interrupted),
+        })
+        .unwrap(),
+        ApplicationTransition::Continue,
+        "the old attempt cannot admit its first Prompt"
+    );
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id: retry_attempt,
+            prompt_id: retry_prompt,
+            result: prepared(&layout, &retry),
+        })
+        .unwrap()
+    else {
+        panic!("the current retry may continue to admission")
+    };
+    assert_eq!(create.prompt.text, "Edited retry prompt");
+    assert_eq!(create.preparation_id, Some(interrupted.id));
+}
+
+#[test]
+fn unchanged_retry_does_not_let_the_interrupted_attempt_admit_its_prompt() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Retry unchanged");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Esc);
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id: _retry_attempt,
+        prompt_id: retry_prompt_id,
+        request: retry,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("retry unchanged")
+    };
+    assert_eq!(
+        retry_prompt_id, prompt_id,
+        "unchanged retry keeps Prompt identity"
+    );
+    assert_eq!(retry.id, request.id);
+
+    assert_eq!(
+        app.handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result: prepared(&layout, &request),
+        })
+        .unwrap(),
+        ApplicationTransition::Continue,
+        "the interrupted transport attempt cannot admit the unchanged retry"
+    );
+    assert!(text(&app).contains("Creating worktree"));
+}
+
+#[test]
+fn interrupted_preparation_failure_cannot_refuse_an_unchanged_retry() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Retry after stale failure");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id: interrupted_attempt,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Esc);
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id: retry_attempt,
+        prompt_id: retry_prompt_id,
+        request: retry,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("retry unchanged")
+    };
+    assert_eq!(retry_prompt_id, prompt_id);
+    assert_eq!(retry.id, request.id);
+
+    assert_eq!(
+        app.handle_event(ApplicationEvent::CheckoutPreparationFailed {
+            attempt_id: interrupted_attempt,
+            prompt_id,
+            error: "old transport failure".to_owned(),
+        })
+        .unwrap(),
+        ApplicationTransition::Continue
+    );
+    let still_preparing = text(&app);
+    assert!(
+        still_preparing.contains("Creating worktree"),
+        "{still_preparing}"
+    );
+    assert!(
+        !still_preparing.contains("old transport failure"),
+        "{still_preparing}"
+    );
+
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id: retry_attempt,
+            prompt_id: retry_prompt_id,
+            result: prepared(&layout, &retry),
+        })
+        .unwrap()
+    else {
+        panic!("the current retry may continue to admission")
+    };
+    assert_eq!(create.prompt.text, "Retry after stale failure");
+}
+
+#[test]
+fn current_preparation_transport_failure_stays_in_the_provisional_retry_view() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Show current failure");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        ..
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    app.handle_event(ApplicationEvent::CheckoutPreparationFailed {
+        attempt_id,
+        prompt_id,
+        error: "current transport failure".to_owned(),
+    })
+    .unwrap();
+
+    let failed = text(&app);
+    assert_eq!(
+        failed.matches("Show current failure").count(),
+        2,
+        "{failed}"
+    );
+    assert!(failed.contains("Could not create Session"), "{failed}");
+    assert!(failed.contains("current transport failure"), "{failed}");
+    assert!(!failed.contains("Creating worktree"), "{failed}");
+}
+
+#[test]
+fn navigating_away_does_not_cancel_background_preparation_or_restore_its_route() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Finish in the background");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    assert_eq!(
+        command(&mut app, SemanticCommandId::SessionNew),
+        ApplicationTransition::DetachSession
+    );
+    assert!(!text(&app).contains("Finish in the background"));
+
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result: prepared(&layout, &request),
+        })
+        .unwrap()
+    else {
+        panic!("ordinary navigation leaves background creation running")
+    };
+    assert_eq!(create.prompt.text, "Finish in the background");
+    assert!(!text(&app).contains("Finish in the background"));
+}
+
+#[test]
+fn leaving_failed_preparation_restores_its_prompt_and_reuses_the_worktree_intent() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Restore this failed preparation");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    let mut result = prepared(&layout, &request);
+    result.preparation.ready = false;
+    result.error = Some("Destination Skills unavailable".to_owned());
+    app.handle_event(ApplicationEvent::CheckoutPrepared {
+        attempt_id,
+        prompt_id,
+        result,
+    })
+    .unwrap();
+    command(&mut app, SemanticCommandId::SessionNew);
+    assert!(text(&app).contains("Restore this failed preparation"));
+    let ApplicationTransition::PrepareCheckout { request: retry, .. } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("the restored failure remains retryable")
+    };
+    assert_eq!(retry.id, request.id);
 }
 
 fn offer_review(app: &mut Application, path: &Path, id: &str) {
@@ -1150,8 +1444,7 @@ fn offer_review(app: &mut Application, path: &Path, id: &str) {
     .unwrap();
 }
 #[test]
-fn managed_preparation_requires_destination_skill_reselection_and_keeps_identity_after_correcting_draft()
- {
+fn managed_preparation_carries_explicit_skill_names_directly_to_destination_admission() {
     let layout = Layout::new();
     let mut app = layout.app();
     offer_review(&mut app, &layout.nested, "source-review");
@@ -1164,57 +1457,30 @@ fn managed_preparation_requires_destination_skill_reselection_and_keeps_identity
     ))
     .unwrap();
     choose_new(&mut app, &layout);
-    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
-        key(&mut app, KeyCode::Enter)
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
     else {
         panic!("source bindings may prepare")
     };
     let result = prepared(&layout, &request);
-    let destination = result.preparation.destination.clone();
-    let ApplicationTransition::RefreshSkills(refresh) = app
-        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
-        .unwrap()
-    else {
-        panic!("explicit bindings require reselection")
-    };
-    assert_eq!(refresh.execution_directory, destination);
-    assert!(text(&app).contains("$review"));
-    assert_eq!(
-        key(&mut app, KeyCode::Enter),
-        ApplicationTransition::Continue
-    );
-    offer_review(&mut app, &destination.path, "destination-review");
-    app.handle_event(ApplicationEvent::Command(CommandId::SelectAll))
-        .unwrap();
-    app.handle_event(ApplicationEvent::Command(CommandId::InsertText(
-        "Please $rev".to_owned(),
-    )))
-    .unwrap();
-    app.handle_event(ApplicationEvent::Command(
-        CommandId::ConfirmSelectedCompletion,
-    ))
-    .unwrap();
-    let ApplicationTransition::PrepareCheckout {
-        prompt_id: next_id,
-        request: next,
-    } = key(&mut app, KeyCode::Enter)
-    else {
-        panic!("reselection retries existing preparation")
-    };
-    assert_eq!(next.id, request.id);
     let ApplicationTransition::CreateSession(create) = app
         .handle_event(ApplicationEvent::CheckoutPrepared {
-            prompt_id: next_id,
-            result: prepared(&layout, &next),
+            attempt_id,
+            prompt_id,
+            result,
         })
         .unwrap()
     else {
-        panic!("destination binding may be delivered")
+        panic!("destination matching is automatic at the Server boundary")
     };
     assert_eq!(create.preparation_id, Some(request.id));
     assert_eq!(
         create.prompt.skill_invocations[0].skill_id,
-        SkillId::new("destination-review")
+        SkillId::new("source-review"),
+        "the client preserves the request; the Server owns destination rebinding"
     );
 }
 
@@ -1236,6 +1502,7 @@ fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_
     type_terminal_text(&mut app, " edited");
     let ApplicationTransition::PrepareCheckout {
         request: retry,
+        attempt_id,
         prompt_id,
     } = key(&mut app, KeyCode::Enter)
     else {
@@ -1249,7 +1516,11 @@ fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_
     result.preparation.admitted_session = Some(intended);
     result.location = None;
     let ApplicationTransition::CreateSession(create) = app
-        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
         .unwrap()
     else {
         panic!("admitted retry rejoins through existing creation")

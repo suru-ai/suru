@@ -21,7 +21,6 @@ pub enum PreparationCheckpoint {
     BranchCreated,
     RegistrationCreated,
     CheckoutCreated,
-    SubmodulesReady,
     SessionPersisted,
     Admitted,
 }
@@ -75,12 +74,6 @@ pub trait SourceControl: Send + Sync {
         Err("Working-copy creation is unsupported".to_owned())
     }
 
-    async fn initialize_checkout(
-        &self,
-        _plan: &crate::protocol::PreparedCheckout,
-    ) -> Result<(), String> {
-        Ok(())
-    }
     /// Validate a retained working copy, restoring an absent one when supported.
     /// Report recreation after all adapter-owned initialization succeeds, including
     /// when resuming a partial attempt, so every native connection can reconnect.
@@ -316,12 +309,6 @@ impl SourceControlService {
         plan: &crate::protocol::PreparedCheckout,
     ) -> Result<ResolvedWorkspace, String> {
         self.adapter.prepare_checkout(plan).await
-    }
-    pub(crate) async fn initialize_checkout(
-        &self,
-        plan: &crate::protocol::PreparedCheckout,
-    ) -> Result<(), String> {
-        self.adapter.initialize_checkout(plan).await
     }
     pub(crate) async fn observe(
         &self,

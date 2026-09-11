@@ -8,7 +8,9 @@ Suru represents an explicit Skill Invocation as the user's visible `$skill-name`
 - **Expand every Skill into instructions inside Suru**: rejected because it would bypass Provider-native loading, precedence, dynamic context, command behavior, and future Provider changes. It would also require Suru to read configuration that belongs behind the Provider boundary.
 - **Expose native paths or command names to clients**: rejected because those identifiers leak server-local configuration, couple clients to Provider protocols, and let a client attempt to invoke capabilities outside its current Provider and Workspace.
 - **Build one host-side Skill loader shared by Providers**: rejected because each Provider decides which Skills are enabled and user-invocable, how scopes override one another, and how invocation works. A shared loader would be a shallow abstraction over incompatible authority.
-- **Let a changed catalog silently retarget a binding by name**: rejected because a same-named Skill may come from a different source or carry different instructions. A stale binding requires explicit user confirmation.
+- **Let a changed catalog silently retarget a binding by name**: rejected because a same-named Skill may come from a different source or carry different instructions. A stale binding requires explicit user confirmation, except when preparing a newly requested Worktree: the user’s requested canonical Skill name is resolved automatically against the destination Catalog. This exception makes explicit Skill selection survive managed checkout creation even though its Execution Directory and opaque identity change. Matching uses the existing case-insensitive name rules and requires exactly one destination match for each requested Skill; a missing or ambiguous match blocks the whole Prompt for correction, without discarding its Worktree. General catalog refreshes retain the original rule.
+
+A Skill explicitly selected from the destination Catalog already carries destination authority and proceeds through ordinary validation. This lets a user resolve an ambiguous automatic name match by choosing the intended destination Skill.
 
 ## Consequences
 

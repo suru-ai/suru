@@ -22,9 +22,9 @@ use crate::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, CreateSessionRequest, EffectiveSettings, FoldPosture,
         InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId, PromptStatus,
-        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionId, SessionListItem,
-        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
-        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
+        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
+        SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
         UpdateAgentSelectionRequest, Workspace,
     },
     provider::built_in_providers,
@@ -526,6 +526,9 @@ struct PendingSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
     prompt: InitialPrompt,
+    /// One spawned preparation request, distinct from stable Prompt and
+    /// Preparation identities so an interrupted task cannot answer a retry.
+    preparation_attempt: Option<uuid::Uuid>,
 }
 
 /// The Session view a client draws from the moment the Landing's first Prompt
@@ -547,6 +550,7 @@ pub(super) struct ProvisionalSession {
     /// it rather than preparing again: a claim never makes two.
     prepared: Option<PreparedFor>,
     pub(super) standing: ClaimStanding,
+    pub(super) phase: ProvisionalSessionPhase,
 }
 
 /// Where a Provisional Session stands, which is one reading rather than two:
@@ -590,11 +594,18 @@ impl ProvisionalSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProvisionalSessionPhase {
+    PreparingWorktree,
+    CreatingSession,
+}
+
 /// A Worktree already made for a Session that has not been created yet.
 #[derive(Clone, Debug)]
 struct PreparedFor {
     id: crate::protocol::PreparationId,
     destination: crate::protocol::ExecutionDirectory,
+    ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2607,11 +2618,12 @@ impl TuiState {
     /// Takes the Server's refusal of a Session this client asked for.
     ///
     /// A claim still standing for it keeps the view: the user Message stays, the
-    /// Working Indicator gives way to the refusal, and the composer stands empty
-    /// because Enter there retries the very Prompt that was refused. A reader
-    /// who has left it is answered at the Landing instead, with the draft the
-    /// refusal hands back.
-    fn refuse_creation(&mut self, prompt_id: PromptId, error: String) {
+    /// Working Indicator gives way to the refusal. Ordinary failures leave an
+    /// empty composer whose Enter retries the Prompt; a destination Skill
+    /// mismatch restores that Prompt for editing unless the reader has already
+    /// typed a newer replacement. A reader who has left is answered at the
+    /// Landing instead, with the draft the refusal hands back.
+    fn refuse_creation(&mut self, prompt_id: PromptId, error: String, restore_for_editing: bool) {
         let refuses_claim = self
             .provisional
             .as_ref()
@@ -2624,8 +2636,17 @@ impl TuiState {
             self.fail_pending_submission(prompt_id, error);
             return;
         }
+        let prompt = self
+            .pending_submission
+            .as_ref()
+            .expect("the refused claim has its pending submission")
+            .prompt
+            .clone();
         self.pending_submission = None;
-        self.composers.discard_draft(ComposerKey::Landing);
+        if restore_for_editing && self.composers.is_empty(ComposerKey::Landing) {
+            self.composers
+                .admission_failed(ComposerKey::Landing, &prompt);
+        }
         self.provisional
             .as_mut()
             .expect("the refused claim was just observed")
@@ -2739,10 +2760,16 @@ impl TuiState {
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         let session_id = SessionId::new();
+        let phase = if self.new_worktree.is_some() {
+            ProvisionalSessionPhase::PreparingWorktree
+        } else {
+            ProvisionalSessionPhase::CreatingSession
+        };
         self.provisional = Some(ProvisionalSession {
             session_id,
             prompt: prompt.clone(),
             prepared: None,
+            phase,
             standing: ClaimStanding::Claimed {
                 interrupt_intent: false,
             },
@@ -2796,7 +2823,8 @@ impl TuiState {
         let prepared = self
             .provisional
             .as_ref()
-            .and_then(|claim| claim.prepared.clone());
+            .and_then(|claim| claim.prepared.clone())
+            .filter(|prepared| prepared.ready);
         if let Some(prepared) = prepared {
             return ApplicationTransition::CreateSession(CreateSessionRequest {
                 preparation_id: Some(prepared.id),
@@ -2810,7 +2838,12 @@ impl TuiState {
             if let Some(selection) = &self.landing_agent_selection {
                 request.provider = selection.provider.clone();
             }
+            let attempt_id = uuid::Uuid::new_v4();
+            if let Some(pending) = self.pending_submission.as_mut() {
+                pending.preparation_attempt = Some(attempt_id);
+            }
             return ApplicationTransition::PrepareCheckout {
+                attempt_id,
                 prompt_id: prompt.id,
                 request: request.clone(),
             };
@@ -3296,11 +3329,18 @@ pub enum ApplicationEvent {
         result: Result<crate::protocol::RemoveCheckoutResult, String>,
     },
     CheckoutPrepared {
+        attempt_id: uuid::Uuid,
         prompt_id: PromptId,
         result: crate::protocol::PrepareCheckoutResult,
     },
+    CheckoutPreparationFailed {
+        attempt_id: uuid::Uuid,
+        prompt_id: PromptId,
+        error: String,
+    },
     SessionCreationFailed {
         prompt_id: PromptId,
+        code: Option<SessionErrorCode>,
         error: String,
     },
     SessionAttached(SessionSnapshot),
@@ -3560,6 +3600,7 @@ pub enum ApplicationTransition {
         request: crate::protocol::RemoveCheckoutRequest,
     },
     PrepareCheckout {
+        attempt_id: uuid::Uuid,
         prompt_id: PromptId,
         request: crate::protocol::PrepareCheckoutRequest,
     },
@@ -4213,12 +4254,21 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::CheckoutPrepared { prompt_id, result } => {
+            ApplicationEvent::CheckoutPrepared {
+                attempt_id,
+                prompt_id,
+                result,
+            } => {
                 if self
                     .state
                     .pending_submission
                     .as_ref()
                     .is_none_or(|p| p.prompt.id != prompt_id)
+                    || self
+                        .state
+                        .pending_submission
+                        .as_ref()
+                        .is_none_or(|pending| pending.preparation_attempt != Some(attempt_id))
                     || self
                         .state
                         .new_worktree
@@ -4232,8 +4282,23 @@ impl Application {
                     self.state.adopt_context(location);
                 }
                 self.state.new_worktree = intent.clone();
+                if result.preparation.checkout_created
+                    && let Some(intent) = &mut self.state.new_worktree
+                {
+                    intent.source = result.preparation.destination.clone();
+                }
+                if let Some(claim) = self.state.provisional.as_mut() {
+                    claim.prepared = Some(PreparedFor {
+                        id: result.preparation.id,
+                        destination: result.preparation.destination.clone(),
+                        ready: result.preparation.ready,
+                    });
+                }
                 if let Some(error) = result.error {
-                    self.state.fail_pending_submission(prompt_id, error);
+                    // Preparation refusals have the same retry affordance as
+                    // creation refusals, but keep the retained Worktree proof
+                    // above so the next attempt resumes this exact checkout.
+                    self.state.refuse_creation(prompt_id, error, false);
                     self.state.sync_composer_completion();
                     return Ok(ApplicationTransition::Continue);
                 }
@@ -4244,29 +4309,11 @@ impl Application {
                     .unwrap()
                     .prompt
                     .clone();
-                // The destination is a new Skill authority even when names match.
-                let explicit_source = result.preparation.admitted_session.is_none()
-                    && !prompt.skill_invocations.is_empty()
-                    && intent
-                        .as_ref()
-                        .is_some_and(|intent| intent.source != result.preparation.destination);
-                // Once moved, future bindings come from this actual destination.
-                if let Some(intent) = &mut self.state.new_worktree {
-                    intent.source = result.preparation.destination.clone();
-                }
-                if explicit_source {
-                    self.state.fail_pending_submission(prompt_id, "Worktree prepared. Reselect explicit Skills in the destination before submitting".to_owned());
-                    self.state.sync_composer_completion();
-                    return Ok(self.state.skill_catalog_request().map_or(
-                        ApplicationTransition::Continue,
-                        ApplicationTransition::RefreshSkills,
-                    ));
-                }
                 if let Some(claim) = self.state.provisional.as_mut() {
-                    claim.prepared = Some(PreparedFor {
-                        id: result.preparation.id,
-                        destination: result.preparation.destination.clone(),
-                    });
+                    claim.phase = ProvisionalSessionPhase::CreatingSession;
+                    if let Some(prepared) = &mut claim.prepared {
+                        prepared.ready = true;
+                    }
                 }
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
                     preparation_id: Some(result.preparation.id),
@@ -4275,7 +4322,31 @@ impl Application {
                     prompt,
                 }))
             }
-            ApplicationEvent::SessionCreationFailed { prompt_id, error } => {
+            ApplicationEvent::CheckoutPreparationFailed {
+                attempt_id,
+                prompt_id,
+                error,
+            } => {
+                let current_attempt =
+                    self.state
+                        .pending_submission
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.prompt.id == prompt_id
+                                && pending.target == SubmissionTarget::CreateSession
+                                && pending.preparation_attempt == Some(attempt_id)
+                        });
+                if current_attempt {
+                    self.state.refuse_creation(prompt_id, error, false);
+                    self.state.sync_composer_completion();
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionCreationFailed {
+                prompt_id,
+                code,
+                error,
+            } => {
                 if self
                     .state
                     .pending_submission
@@ -4285,7 +4356,11 @@ impl Application {
                             && pending.target == SubmissionTarget::CreateSession
                     })
                 {
-                    self.state.refuse_creation(prompt_id, error);
+                    self.state.refuse_creation(
+                        prompt_id,
+                        error,
+                        code == Some(SessionErrorCode::InvalidSkillInvocation),
+                    );
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -5634,6 +5709,41 @@ impl Application {
         // delayed second Esc must not interrupt merely because the run loop
         // had no opportunity to draw between the two presses.
         self.state.reconcile_command_mode();
+        // Worktree preparation precedes Prompt admission. Confirming Escape in
+        // this phase cancels only this client attempt: Git may safely finish in
+        // its spawned task, but its late result no longer has a matching
+        // submission and therefore cannot dispatch Session creation.
+        if self.state.provisional.as_ref().is_some_and(|claim| {
+            claim.phase == ProvisionalSessionPhase::PreparingWorktree
+                && matches!(
+                    self.state.command_mode,
+                    CommandMode::InterruptConfirmation { .. }
+                )
+        }) {
+            self.state.command_mode = CommandMode::Composer;
+            let claim = self
+                .state
+                .release_claim()
+                .expect("the preparing provisional Session was just observed");
+            if self
+                .state
+                .pending_submission
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.prompt.id == claim.prompt.id
+                        && pending.target == SubmissionTarget::CreateSession
+                })
+            {
+                self.state.pending_submission = None;
+            }
+            self.state
+                .composers
+                .return_prompt(ComposerKey::Landing, &claim.prompt);
+            self.state.submission_error = None;
+            self.state.transcript_generation = self.state.transcript_generation.wrapping_add(1);
+            self.state.sync_composer_completion();
+            return ApplicationTransition::Continue;
+        }
         // A claim has no Session to interrupt yet. The intent is recorded and
         // travels with the Session's arrival, so the reader's second Escape
         // means what it said even though nothing could be sent when they made
@@ -5747,6 +5857,7 @@ impl Application {
             source: key,
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
+            preparation_attempt: None,
         });
         self.state.creation_transition(prompt)
     }
@@ -5855,6 +5966,7 @@ impl Application {
                 source: key.clone(),
                 target: SubmissionTarget::AdmitPrompt(session.clone(), delivery),
                 prompt: prompt.clone(),
+                preparation_attempt: None,
             });
             return ApplicationTransition::AdmitPrompt {
                 session: session.clone(),
@@ -5865,6 +5977,7 @@ impl Application {
             source: key,
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
+            preparation_attempt: None,
         });
         self.state.begin_provisional_session(prompt)
     }

@@ -733,7 +733,11 @@ impl RunLoop {
                     });
                 });
             }
-            ApplicationTransition::PrepareCheckout { prompt_id, request } => {
+            ApplicationTransition::PrepareCheckout {
+                attempt_id,
+                prompt_id,
+                request,
+            } => {
                 let outlook = self.application.outlook().clone();
                 let commands = self.client.session_commands_for(outlook.clone());
                 let results = self.channels.submissions.clone();
@@ -741,12 +745,13 @@ impl RunLoop {
                     let result = match commands.prepare_checkout(request).await {
                         Ok(result) => SubmissionResult::CheckoutPrepared {
                             outlook,
+                            attempt_id,
                             prompt_id,
                             result,
                         },
-                        Err(error) => SubmissionResult::PromptDeliveryFailed {
+                        Err(error) => SubmissionResult::CheckoutPreparationFailed {
                             outlook,
-                            session: None,
+                            attempt_id,
                             prompt_id,
                             error: error.to_string(),
                         },
@@ -1317,16 +1322,37 @@ impl RunLoop {
             }
             SubmissionResult::CheckoutPrepared {
                 outlook,
+                attempt_id,
                 prompt_id,
                 result,
             } => {
                 if self.application.outlook() != &outlook {
                     return Ok(ControlFlow::Continue(()));
                 }
-                let transition = self
-                    .application
-                    .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })?;
+                let transition =
+                    self.application
+                        .handle_event(ApplicationEvent::CheckoutPrepared {
+                            attempt_id,
+                            prompt_id,
+                            result,
+                        })?;
                 return Ok(self.dispatch_transition(transition));
+            }
+            SubmissionResult::CheckoutPreparationFailed {
+                outlook,
+                attempt_id,
+                prompt_id,
+                error,
+            } => {
+                if self.application.outlook() != &outlook {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                self.application
+                    .handle_event(ApplicationEvent::CheckoutPreparationFailed {
+                        attempt_id,
+                        prompt_id,
+                        error,
+                    })?;
             }
             SubmissionResult::SessionCreated { outlook, snapshot } => {
                 if self.application.outlook() != &outlook {
@@ -1365,6 +1391,7 @@ impl RunLoop {
                 outlook,
                 session,
                 prompt_id,
+                code,
                 error,
             } => {
                 if self.application.outlook() != &outlook {
@@ -1376,7 +1403,11 @@ impl RunLoop {
                         prompt_id,
                         error,
                     },
-                    None => ApplicationEvent::SessionCreationFailed { prompt_id, error },
+                    None => ApplicationEvent::SessionCreationFailed {
+                        prompt_id,
+                        code,
+                        error,
+                    },
                 };
                 self.application.handle_event(event)?;
             }
@@ -2090,14 +2121,18 @@ fn spawn_prompt_delivery(
     deliver: impl Future<Output = Result<SubmissionResult>> + Send + 'static,
 ) {
     tokio::spawn(async move {
-        let result = deliver
-            .await
-            .unwrap_or_else(|error| SubmissionResult::PromptDeliveryFailed {
+        let result = deliver.await.unwrap_or_else(|error| {
+            let code = error
+                .downcast_ref::<crate::protocol::SessionError>()
+                .map(|error| error.code);
+            SubmissionResult::PromptDeliveryFailed {
                 outlook,
                 session,
                 prompt_id,
+                code,
                 error: error.to_string(),
-            });
+            }
+        });
         let _ = results.send(result);
     });
 }
@@ -2110,8 +2145,15 @@ enum SubmissionResult {
     },
     CheckoutPrepared {
         outlook: Outlook,
+        attempt_id: uuid::Uuid,
         prompt_id: PromptId,
         result: crate::protocol::PrepareCheckoutResult,
+    },
+    CheckoutPreparationFailed {
+        outlook: Outlook,
+        attempt_id: uuid::Uuid,
+        prompt_id: PromptId,
+        error: String,
     },
     SessionCreated {
         outlook: Outlook,
@@ -2125,6 +2167,7 @@ enum SubmissionResult {
         outlook: Outlook,
         session: Option<SessionReference>,
         prompt_id: PromptId,
+        code: Option<crate::protocol::SessionErrorCode>,
         error: String,
     },
     QuestionnaireReconciled {

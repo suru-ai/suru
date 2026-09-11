@@ -24,8 +24,8 @@ Confirmed design expanding [#169](https://github.com/jake-tucker/suru/issues/169
 - Recreate any known missing linked Worktree when an associated Session is prompted, including externally created Worktrees, at its original path. Use its last-known branch at that branch's current tip, or its last-known commit when detached. Remember the latest observed branch/commit for recovery; this is not a history of Session branches.
 - If the recovery branch was deleted, is checked out elsewhere, or the destination belongs to something else, report a clear error and prevent Agent startup. Failed recreation never redirects the Session to another Execution Directory or starts the Provider anyway.
 - Support linked Worktrees backed by bare Repositories. Group them under the bare root and require a working-copy selection for execution; never run the Agent at the bare root.
-- After creating a Worktree, refresh its Skill Catalog and require reselection of any explicitly selected Skills before delivery. Preserve the draft and reuse the prepared Worktree; Prompts without explicit Skill Invocations proceed normally.
-- Initialize submodules recursively during creation and recreation, before Agent startup. Failure retains the Worktree and offers retry. Dependency installation and project setup commands remain out of scope.
+- After creating a Worktree, refresh its Skill Catalog and automatically resolve explicitly selected Skills by their canonical names in the destination, using destination identities before delivery. Matching Skills require no user intervention. Match names case-insensitively using the existing Skill-name rules and require exactly one destination match for every requested Skill. If any name is missing or ambiguous, block the whole Prompt before admission, keep the Provisional Session and retained Worktree, and restore the Prompt for correction with an error naming the affected Skills. Never omit a requested Skill or choose an ambiguous match arbitrarily. An explicit binding selected from the destination Catalog resolves an ambiguous name through ordinary validation. Prompts without explicit Skill Invocations proceed normally.
+- Do not initialize or update submodules during creation or recreation. Dependency installation, project setup commands, and configurable actions on Worktree creation remain out of scope.
 - Where execution is possible, ordinary Sessions remain available when Git is unavailable or a repository has no commits. Disable new-Worktree creation with the specific reason when no usable source checkout/commit is available, including a bare Workspace without a selected working copy.
 - Keep a missing remembered Execution Directory visibly selected until it is recovered or explicitly changed. Never silently substitute another execution location.
 - Group by shared Repository identity even when its main checkout cannot be located. Present the main root when known; otherwise present the repository metadata location with “main checkout unknown.” Discovering the main checkout updates presentation without splitting or relocating Sessions.
@@ -54,13 +54,17 @@ For Git, resolve the nearest repository first, then use its canonical common met
 
 ## Preparation and retry invariants
 
+- Interrupting during Worktree preparation prevents first-Prompt admission and restores its text to the composer. Let an ongoing Git operation finish safely and retain its checkout for reuse; do not start the Agent for that submission.
+
+- First Prompt submission immediately opens a Provisional Session with the Prompt visible. Show **Creating worktree** without elapsed time throughout checkout creation and destination Skill discovery, then use the ordinary Session-start indicator. Preparation failure stays in that view with a readable error; empty Enter retries the same Prompt and submitted new text replaces it. Retry reuses any retained Worktree. Leaving the failed view preserves its text as the Landing draft.
+
 - Resolve the source commit once for a new preparation. Retrying that preparation keeps its branch, destination, and commit even if the source checkout subsequently moves.
-- Reuse a Worktree already created for a submission after draft edits, Skill reselection, submodule failure, or interrupted delivery. Worktree preparation therefore needs an identity independent of Prompt identity and recoverable progress; the implementation must not allocate another checkout merely because a Prompt ID changed.
+- Reuse a Worktree already created for a submission after draft edits, Skill reselection, preparation failure, or interrupted delivery. Worktree preparation therefore needs an identity independent of Prompt identity and recoverable progress; the implementation must not allocate another checkout merely because a Prompt ID changed.
 - Retain an already-created Worktree after a later preparation failure and expose it for reuse or explicit removal. Preparation failure before Prompt admission preserves the draft; after admission, existing failed-Turn semantics apply.
 - Recheck filesystem and Git state before mutations or Provider startup. Serialize conflicting Suru operations on the same Repository, while handling external changes through Git's errors and explicit state checks. Force removal cannot bypass the Server's Working-Session check.
 - Recovery must restore the actual Execution Directory, including a preserved subdirectory. Restoring a Worktree root is insufficient if that subdirectory remains unavailable; do not redirect the Session to the root.
 - Never overwrite a destination that belongs to another checkout, recursively delete an unrelated directory, or reset an existing branch during creation/recovery. Automatic recovery does not override Git locks. Manage only the required stale registration rather than using recovery as a reason to clean up unrelated Worktrees.
-- Newly created Worktrees contain the chosen commit and initialized submodules. Source-checkout uncommitted changes and ignored/local files are not copied.
+- Newly created Worktrees contain the chosen commit without initialized submodules. Source-checkout uncommitted changes and ignored/local files are not copied.
 
 ## Proposed delivery slices
 
@@ -70,7 +74,7 @@ These are local planning slices, not published GitHub subissues.
 | --- | --- | --- |
 | 1. Repository and execution identity | Typed source control seam, Git discovery, durable Workspace/Worktree associations, existing-Session regrouping with execution paths preserved | — |
 | 2. Existing Worktree navigation and live state | Grouped Workspace lists, Landing selection, current branch/detached/unavailable Sidebar labels, shared observation on the owning Server | 1 |
-| 3. Managed first-Prompt preparation | Repository-local storage, generated branch, captured commit, retryable creation, recursive submodules, destination Skill reselection, all three Agent Providers | 1, 2 |
+| 3. Managed first-Prompt preparation | Repository-local storage, generated branch, captured commit, retryable creation without submodule initialization, automatic destination Skill matching, all three Agent Providers | 1, 2 |
 | 4. Missing Worktree recovery | Durable latest-known checkout state, original-path recovery, branch/detached handling, destination validation, pre-start failure behavior | 1, 3 |
 | 5. Explicit Worktree removal | Associated-Session count and Working guard, content warnings, force option, retained branch/history, recovery after later prompting | 2, 3, 4 |
 
@@ -81,7 +85,7 @@ These are local planning slices, not published GitHub subissues.
 - Workspace selection restores the per-Client/Server/Workspace execution location; Worktree selection and new creation start at the selected checkout root. Missing remembered locations remain explicit, and bare roots never become execution directories.
 - A new-Worktree choice performs no mutation until submission. Creation uses the source commit at submission, a valid unique `suru/<description>-<id>` branch, and the accepted repository-local/channel path; initiating from a linked checkout still anchors storage at the main root.
 - Preserve existing local exclude rules. The main checkout stays clean and the linked checkout sees its own tracked/untracked files. Cover spaces, non-ASCII names, long names, and platform-correct paths without assuming POSIX roots.
-- Duplicate/retried preparation, changed drafts, stale Skills, submodule failures, and a restart after filesystem creation must reuse or recover the same preparation without overwriting unrelated state or creating duplicate Worktrees.
+- Duplicate/retried preparation, changed drafts, stale Skills, preparation failures, and a restart after filesystem creation must reuse or recover the same preparation without overwriting unrelated state or creating duplicate Worktrees.
 - No Provider starts before the destination is ready and its explicit Skills are valid. Verify Codex, Copilot, and Claude startup/resume receive the exact Execution Directory.
 - All Sessions sharing a Worktree show current checkout state within the observation interval, including external branch changes, detached state, missing paths, and Remote failures. Share observations and keep listings independent of history hydration.
 - Recreate a missing linked Worktree from the retained branch's current tip, or a remembered detached commit, including external paths and after explicit removal. Deleted/occupied branches, locks, missing repository data, replacement directories, and missing execution subdirectories must fail clearly before Agent startup.
@@ -102,12 +106,12 @@ Inspected vendored T3 revision `8b2838e0e` under `references/t3code`.
 - T3 recovery uses the saved branch's current tip at the saved Worktree path, including external paths. It skips detached Worktrees, does not validate a replacement directory that already exists, and logs recovery errors before allowing Provider execution to continue (`apps/server/src/orchestration/Layers/ProviderCommandReactor.ts`, `ensureThreadWorktree`). Suru deliberately also supports detached recovery, validates destination identity, and blocks Agent startup on recovery failure.
 - T3 recovery runs repository-wide `git worktree prune` before adding the saved path. Locks can prevent that recovery; pruning and unrelated registrations need deliberate handling.
 - T3 creation can leave Worktree/branch artifacts when a later bootstrap step fails: it removes the new thread but does not remove those filesystem artifacts. Creation/recovery helpers do not provide a shared repository mutation lock or durable preparation identity.
-- Creation can launch a project setup command without waiting for it, while recovery does not rerun that command. Both paths attempt submodule initialization, and neither copies ignored/local configuration files. Suru has excluded dependency installation and setup automation and requires recursive submodule initialization to succeed before Agent startup.
+- Creation can launch a project setup command without waiting for it, while recovery does not rerun that command. Both paths attempt submodule initialization, and neither copies ignored/local configuration files. Suru excludes dependency installation, setup automation, and automatic submodule initialization.
 
 ## Suru first-Prompt integration findings
 
 - Every supported Provider's Skill IDs include the Execution Directory, even for globally installed Skills (`src/provider/{codex,copilot,claude}/skills.rs`). Discovery requires the directory to exist (`src/skill_catalog.rs`), so a source-checkout Skill binding cannot simply be sent in a newly created Worktree.
-- Current stale-Skill handling retains the draft and requires editing or choosing the Skill again; it does not silently retarget an explicit binding by name (`src/tui/composer.rs`, `src/tui/state.rs`, ADR-0014).
+- General stale-Skill handling retains the draft and requires editing or choosing the Skill again. New-Worktree preparation is an explicit exception: resolve requested canonical names automatically in the destination Catalog (ADR-0014).
 - Editing text or Skill bindings changes Prompt identity. If Worktree preparation has already succeeded, corrected submissions must be able to reuse that same prepared Worktree independently of Prompt identity.
 - Existing Session creation validates Skills before admission and again before native delivery. Once a Session/first Prompt is admitted, Provider startup failures produce a failed Turn rather than undoing the Session (`src/server.rs`, `src/provider/orchestration.rs`). The preparation boundary must fit those semantics.
 

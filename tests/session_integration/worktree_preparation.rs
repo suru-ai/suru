@@ -46,6 +46,18 @@ async fn prepare(
     assert!(status.is_success(), "{status}: {body}");
     serde_json::from_str(&body).unwrap()
 }
+async fn create_response(
+    descriptor: &RuntimeDescriptor,
+    request: &CreateSessionRequest,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(request)
+        .send()
+        .await
+        .unwrap()
+}
 fn request(root: &Path, description: &str) -> PrepareCheckoutRequest {
     PrepareCheckoutRequest {
         id: Default::default(),
@@ -249,8 +261,155 @@ async fn naming_bare_storage_and_destination_validation_preserve_existing_resour
 }
 
 #[tokio::test]
-async fn recursive_local_submodules_and_destination_skills_finish_before_startup_and_retry_reuses_progress()
- {
+async fn every_provider_automatically_rebinds_selected_skill_names_to_destination_identities() {
+    for provider_name in ["codex", "copilot", "claude"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = suru::paths::canonical(temp.path()).unwrap();
+        let main = root.join("main");
+        committed(&main);
+        let model = format!("{provider_name}-model");
+        let provider_id = ProviderId::new(provider_name);
+        let (runtime, mut provider) = ControlledProvider::with_provider(
+            provider_id.clone(),
+            vec![support::hosted_model(provider_name, &model)],
+        );
+        let server = server::spawn_with_provider(
+            ServerConfig::new(
+                root.join("state"),
+                format!("{provider_name}-destination-skill"),
+            )
+            .unwrap(),
+            runtime,
+        )
+        .await
+        .unwrap();
+        let mut intent = request(&main, "Carry selected Skill");
+        intent.provider = provider_id.clone();
+        let ready = prepare(server.descriptor(), &intent).await;
+        assert_eq!(ready.error, None);
+        let mut create = creation(&ready.preparation, "Please $ExPlAiN this checkout");
+        create.agent_selection = Some(support::hosted_selection(provider_name, &model));
+        create.prompt.skill_invocations = vec![SkillInvocation {
+            skill_id: SkillId::new(format!("{provider_name}-source-explain")),
+            name: "explain".to_owned(),
+            scope: Some("Source checkout".to_owned()),
+            marker: SkillMarkerSpan { start: 7, end: 15 },
+        }];
+
+        let snapshot = support::create_session(server.descriptor(), &create).await;
+        let rebound = &snapshot.prompts[0].skill_invocations[0];
+        assert_eq!(rebound.skill_id, SkillId::new("safe-explain-id"));
+        assert_eq!(rebound.name, "explain");
+        assert_eq!(rebound.scope.as_deref(), Some("Workspace"));
+        let start = provider.next_start().await;
+        let mut connection = start.succeed(AgentIdentity {
+            agent: AgentId::new(provider_name),
+            selection: support::hosted_selection(provider_name, &model),
+        });
+        let turn = connection.next_turn().await;
+        assert_eq!(turn.skill_invocations().len(), 1);
+        assert_eq!(
+            turn.skill_invocations()[0].skill_id,
+            SkillId::new("safe-explain-id")
+        );
+        turn.fail("fixture settled");
+        drop(connection);
+        server.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn missing_or_ambiguous_destination_names_block_atomically_and_explicit_choice_can_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "destination-skill-errors").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let ready = prepare(server.descriptor(), &request(&main, "Match Skills")).await;
+
+    let mut mixed = creation(&ready.preparation, "$explain $review");
+    mixed.prompt.skill_invocations = vec![
+        SkillInvocation {
+            skill_id: SkillId::new("source-explain"),
+            name: "explain".to_owned(),
+            scope: Some("Source".to_owned()),
+            marker: SkillMarkerSpan { start: 0, end: 8 },
+        },
+        SkillInvocation {
+            skill_id: SkillId::new("source-review"),
+            name: "review".to_owned(),
+            scope: Some("Source".to_owned()),
+            marker: SkillMarkerSpan { start: 9, end: 16 },
+        },
+    ];
+    let rejected = create_response(server.descriptor(), &mixed).await;
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body = rejected.text().await.unwrap();
+    assert!(body.contains("ambiguous"), "{body}");
+    assert!(body.contains("review"), "{body}");
+    assert!(provider.try_next_start().is_none());
+
+    let mut missing = creation(&ready.preparation, "$gone");
+    missing.prompt.skill_invocations = vec![SkillInvocation {
+        skill_id: SkillId::new("source-gone"),
+        name: "gone".to_owned(),
+        scope: Some("Source".to_owned()),
+        marker: SkillMarkerSpan { start: 0, end: 5 },
+    }];
+    let rejected = create_response(server.descriptor(), &missing).await;
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body = rejected.text().await.unwrap();
+    assert!(body.contains("missing"), "{body}");
+    assert!(body.contains("gone"), "{body}");
+    assert!(provider.try_next_start().is_none());
+
+    // `review` has two destination matches. Selecting one from destination
+    // autocomplete supplies its exact identity and metadata, resolving that
+    // ambiguity without retargeting the already-current binding.
+    let mut corrected = creation(&ready.preparation, "$explain $review");
+    corrected.prompt.skill_invocations = vec![
+        SkillInvocation {
+            skill_id: SkillId::new("source-explain"),
+            name: "explain".to_owned(),
+            scope: Some("Source".to_owned()),
+            marker: SkillMarkerSpan { start: 0, end: 8 },
+        },
+        SkillInvocation {
+            skill_id: SkillId::new("safe-review-id"),
+            name: "review".to_owned(),
+            scope: Some("Workspace".to_owned()),
+            marker: SkillMarkerSpan { start: 9, end: 16 },
+        },
+    ];
+    let snapshot = create_response(server.descriptor(), &corrected)
+        .await
+        .error_for_status()
+        .unwrap()
+        .json::<SessionSnapshot>()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.prompts.len(), 1);
+    assert_eq!(
+        snapshot.prompts[0].skill_invocations[0].skill_id,
+        SkillId::new("safe-explain-id")
+    );
+    assert_eq!(
+        snapshot.prompts[0].skill_invocations[1].skill_id,
+        SkillId::new("safe-review-id")
+    );
+    drop(provider.next_start().await);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn creation_leaves_recursive_submodules_uninitialized_and_still_discovers_destination_skills()
+{
     let temp = tempfile::tempdir().unwrap();
     let root = suru::paths::canonical(temp.path()).unwrap();
     let leaf = root.join("leaf");
@@ -309,50 +468,38 @@ async fn recursive_local_submodules_and_destination_skills_finish_before_startup
     )
     .await
     .unwrap();
-    // A missing local source makes initialization fail after Worktree creation.
+    // Make both submodule sources unavailable. Preparation must not consult
+    // either source or run recursive initialization.
     let hidden = root.join("middle-hidden");
     std::fs::rename(&middle, &hidden).unwrap();
-    let mut intent = request(&main, "Initialize recursive modules");
-    let failed = prepare(server.descriptor(), &intent).await;
-    assert!(
-        failed
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Submodule initialization failed")
-    );
-    assert!(failed.preparation.checkout_created);
-    assert!(!failed.preparation.ready);
-    assert!(failed.location.is_some());
-    assert!(provider.try_next_start().is_none());
-    std::fs::rename(hidden, &middle).unwrap();
+    let intent = request(&main, "Leave recursive modules alone");
     runtime.fail_skill_discovery("fixture destination Skills unavailable");
-    intent.description = "Edited draft after creation".to_owned();
     let skills_failed = prepare(server.descriptor(), &intent).await;
-    assert_eq!(
-        skills_failed.preparation.destination,
-        failed.preparation.destination
-    );
+    assert!(skills_failed.preparation.checkout_created);
     assert!(skills_failed.error.as_ref().unwrap().contains("Skills"));
     let destination = &skills_failed.preparation.destination.path;
-    assert!(destination.join("module/nested/tracked").is_file());
+    assert!(!destination.join("module/.git").exists());
+    assert!(!destination.join("module/nested/tracked").exists());
     assert!(provider.try_next_start().is_none());
     runtime.clear_skill_discovery_failure();
     let ready = prepare(server.descriptor(), &intent).await;
     assert_eq!(ready.error, None);
     assert_eq!(
         ready.preparation.destination,
-        failed.preparation.destination
+        skills_failed.preparation.destination
     );
     let snapshot = support::create_session(
         server.descriptor(),
-        &creation(&ready.preparation, "Use initialized modules"),
+        &creation(&ready.preparation, "Work without initialized modules"),
     )
     .await;
     let start = provider.next_start().await;
     assert_eq!(start.execution_directory(), destination);
     drop(start);
     assert_eq!(snapshot.session.execution_directory.path, *destination);
+    assert!(!destination.join("module/.git").exists());
+    assert!(!destination.join("module/nested/tracked").exists());
+    std::fs::rename(hidden, &middle).unwrap();
     server.shutdown().await.unwrap();
 }
 
@@ -429,9 +576,6 @@ impl suru::source_control::SourceControl for CollisionAdapter {
     }
     async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
         self.git.prepare_checkout(plan).await
-    }
-    async fn initialize_checkout(&self, plan: &PreparedCheckout) -> Result<(), String> {
-        self.git.initialize_checkout(plan).await
     }
 }
 #[tokio::test]

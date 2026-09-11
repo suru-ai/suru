@@ -795,13 +795,6 @@ impl ComposerState {
         self.skill_issues.clear();
     }
 
-    fn discard_draft(&mut self) {
-        if !self.text.is_empty() {
-            self.push_history(self.text.clone());
-        }
-        self.clear();
-    }
-
     fn begin_submission(&mut self) -> InitialPrompt {
         let text = self.text.clone();
         let id = self

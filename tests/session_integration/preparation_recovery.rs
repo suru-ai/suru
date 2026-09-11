@@ -67,7 +67,6 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
         Point::BranchCreated,
         Point::RegistrationCreated,
         Point::CheckoutCreated,
-        Point::SubmodulesReady,
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = suru::paths::canonical(temp.path()).unwrap();
@@ -96,10 +95,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
         );
         let captured = failed.preparation.clone();
         assert!(provider.try_next_start().is_none());
-        if matches!(
-            point,
-            Point::CheckoutCreated | Point::RegistrationCreated | Point::SubmodulesReady
-        ) {
+        if matches!(point, Point::CheckoutCreated | Point::RegistrationCreated) {
             let listed = reqwest::Client::new()
                 .post(format!(
                     "{}/v1/workspaces/resolve",
@@ -730,7 +726,7 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
 }
 
 #[tokio::test]
-async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provider_until_ready() {
+async fn restart_reuses_checkout_without_initializing_an_unavailable_submodule() {
     let temp = tempfile::tempdir().unwrap();
     let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("main");
@@ -766,20 +762,21 @@ async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provide
     )
     .await
     .unwrap();
-    let request = request(&main, "Initialize modules");
-    let failed = prepare(server.descriptor(), &request).await;
+    let request = request(&main, "Leave modules uninitialized");
+    let first = prepare(server.descriptor(), &request).await;
+    assert_eq!(first.error, None);
+    assert!(first.preparation.checkout_created);
+    assert!(first.preparation.destination.path.join("tracked").exists());
     assert!(
-        failed
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Submodule initialization failed")
+        !first
+            .preparation
+            .destination
+            .path
+            .join("module/.git")
+            .exists()
     );
-    assert!(failed.preparation.checkout_created);
-    assert!(failed.preparation.destination.path.join("tracked").exists());
     assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
-    std::fs::rename(saved_module, &module).unwrap();
     let server = server::spawn_with_source_control(
         config,
         vec![runtime],
@@ -790,18 +787,15 @@ async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provide
     .unwrap();
     let retry = prepare(server.descriptor(), &request).await;
     assert_eq!(retry.error, None);
-    assert_eq!(
-        retry.preparation.destination,
-        failed.preparation.destination
-    );
-    assert_eq!(retry.preparation.plan, failed.preparation.plan);
+    assert_eq!(retry.preparation.destination, first.preparation.destination);
+    assert_eq!(retry.preparation.plan, first.preparation.plan);
     assert!(
-        retry
+        !retry
             .preparation
             .destination
             .path
-            .join("module/tracked")
-            .is_file()
+            .join("module/.git")
+            .exists()
     );
     support::create_session(
         server.descriptor(),
@@ -814,5 +808,6 @@ async fn restart_after_real_submodule_failure_reuses_checkout_and_blocks_provide
             .unwrap(),
     );
     assert!(provider.try_next_start().is_none());
+    std::fs::rename(saved_module, &module).unwrap();
     server.shutdown().await.unwrap();
 }

@@ -204,16 +204,6 @@ impl GitSourceControl {
             self.mutate(&common, &["worktree", "unlock", destination])
                 .await?;
         }
-        self.mutate(
-            &checkout.root,
-            &["submodule", "update", "--init", "--recursive"],
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Worktree recreated, but submodule initialization failed; retry to continue: {e}"
-            )
-        })?;
         let reading = self.observe_checkout(checkout, true).await;
         if !matches!(reading.availability, SourceControlAvailability::Available) {
             return Err("Recovered Worktree remains unavailable".to_owned());

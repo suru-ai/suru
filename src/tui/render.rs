@@ -3581,7 +3581,14 @@ fn render_provisional_session(
             "Could not create Session: {error} · Enter to retry, or type a new prompt"
         )),
         ClaimStanding::Claimed { interrupt_intent } => SessionTail::Working {
-            state: WorkingIndicatorState::Working,
+            state: match claim.phase {
+                super::state::ProvisionalSessionPhase::PreparingWorktree => {
+                    WorkingIndicatorState::CreatingWorktree
+                }
+                super::state::ProvisionalSessionPhase::CreatingSession => {
+                    WorkingIndicatorState::Working
+                }
+            },
             working_since: None,
             // An interrupt the reader has already confirmed says so until the
             // Session it is waiting for arrives to take it.
@@ -4097,6 +4104,7 @@ fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option
 
 fn working_indicator_label(state: WorkingIndicatorState) -> &'static str {
     match state {
+        WorkingIndicatorState::CreatingWorktree => "Creating worktree",
         WorkingIndicatorState::Working => "Working",
         WorkingIndicatorState::WaitingForSubagents => "Waiting for subagents",
     }

@@ -546,20 +546,6 @@ impl SourceControl for GitSourceControl {
         self.materialize_owned(plan).await?;
         Ok(self.discover(destination).await)
     }
-    async fn initialize_checkout(&self, plan: &PreparedCheckout) -> Result<(), String> {
-        self.validate_prepared(plan).await?;
-        self.mutate(
-            &plan.destination.path,
-            &["submodule", "update", "--init", "--recursive"],
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Worktree retained at {}. Submodule initialization failed; retry: {e}",
-                plan.destination.path.display()
-            )
-        })
-    }
     async fn recover_checkout(
         &self,
         repository: &Repository,

@@ -11,8 +11,8 @@ use tokio::sync::{broadcast, watch};
 use crate::{
     protocol::{
         InitialPrompt, ProviderId, SettingsSnapshot, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogRequest, SkillCatalogStatus, SkillId, SkillPromptDelivery,
-        skill_marker_matches,
+        SkillCatalogRequest, SkillCatalogStatus, SkillId, SkillInvocation, SkillPromptDelivery,
+        skill_marker_matches, skill_names_equal,
     },
     provider::ProviderRuntime,
 };
@@ -231,22 +231,107 @@ impl SkillCatalogService {
                     invocation.skill_id
                 )));
             }
-            let start = invocation.marker.start as usize;
-            let end = invocation.marker.end as usize;
-            let Some(marker) = prompt.text.get(start..end) else {
-                return Err(SkillCatalogError::InvalidInvocation(format!(
-                    "Skill `{}` has an invalid marker range",
-                    invocation.name
-                )));
-            };
-            if !skill_marker_matches(marker, &descriptor.name) {
-                return Err(SkillCatalogError::InvalidInvocation(format!(
-                    "Skill `{}` is not bound to its visible marker",
-                    invocation.name
-                )));
-            }
+            validate_skill_marker(prompt, invocation)?;
         }
         Ok(())
+    }
+
+    /// Rebinds Skills explicitly selected before a managed destination existed
+    /// to the fresh catalog for that destination. The whole Prompt is returned
+    /// only when every requested canonical name has exactly one match; callers
+    /// never observe a partially retargeted set.
+    pub(crate) async fn rebind_prepared_prompt(
+        &self,
+        provider: ProviderId,
+        execution_directory: &Path,
+        prompt: &InitialPrompt,
+    ) -> Result<InitialPrompt, SkillCatalogError> {
+        if prompt.skill_invocations.is_empty() {
+            return Ok(prompt.clone());
+        }
+        let key = self.resolve_key(SkillCatalogRequest {
+            provider,
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: execution_directory.to_owned(),
+            },
+        })?;
+        let catalog = self.await_current(key).await?;
+        if !matches!(catalog.status, SkillCatalogStatus::Fresh { .. }) {
+            return Err(SkillCatalogError::InvalidInvocation(
+                "the destination Skill Catalog is not current".to_owned(),
+            ));
+        }
+
+        let mut destinations = Vec::with_capacity(prompt.skill_invocations.len());
+        let mut missing: Vec<String> = Vec::new();
+        let mut ambiguous: Vec<String> = Vec::new();
+        for invocation in &prompt.skill_invocations {
+            validate_skill_marker(prompt, invocation)?;
+            // A correction made from the destination autocomplete already
+            // carries destination authority. Preserve it so an ambiguous name
+            // can be resolved explicitly and the general stale-binding rule
+            // remains unchanged outside this managed-preparation exception.
+            if let Some(destination) = catalog.skills.iter().find(|skill| {
+                skill.id == invocation.skill_id
+                    && skill.name == invocation.name
+                    && skill.scope == invocation.scope
+            }) {
+                destinations.push(Some(destination));
+                continue;
+            }
+            let matches = catalog
+                .skills
+                .iter()
+                .filter(|skill| skill_names_equal(&skill.name, &invocation.name))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [destination] => destinations.push(Some(*destination)),
+                [] => {
+                    destinations.push(None);
+                    if !missing
+                        .iter()
+                        .any(|name| skill_names_equal(name, &invocation.name))
+                    {
+                        missing.push(invocation.name.clone());
+                    }
+                }
+                _ => {
+                    destinations.push(None);
+                    if !ambiguous
+                        .iter()
+                        .any(|name| skill_names_equal(name, &invocation.name))
+                    {
+                        ambiguous.push(invocation.name.clone());
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() || !ambiguous.is_empty() {
+            let mut reasons = Vec::new();
+            if !missing.is_empty() {
+                reasons.push(format!("missing: {}", missing.join(", ")));
+            }
+            if !ambiguous.is_empty() {
+                reasons.push(format!("ambiguous: {}", ambiguous.join(", ")));
+            }
+            return Err(SkillCatalogError::InvalidInvocation(format!(
+                "destination Skills could not be matched by name ({})",
+                reasons.join("; ")
+            )));
+        }
+
+        let mut rebound = prompt.clone();
+        for (invocation, destination) in rebound
+            .skill_invocations
+            .iter_mut()
+            .zip(destinations.into_iter())
+        {
+            let destination = destination.expect("every destination match was validated");
+            invocation.skill_id = destination.id.clone();
+            invocation.name.clone_from(&destination.name);
+            invocation.scope.clone_from(&destination.scope);
+        }
+        Ok(rebound)
     }
 
     /// Waits only when authority for this context is already being established
@@ -480,6 +565,27 @@ impl SkillCatalogService {
         }
         let _ = self.inner.updates.send(catalog);
     }
+}
+
+fn validate_skill_marker(
+    prompt: &InitialPrompt,
+    invocation: &SkillInvocation,
+) -> Result<(), SkillCatalogError> {
+    let start = invocation.marker.start as usize;
+    let end = invocation.marker.end as usize;
+    let Some(marker) = prompt.text.get(start..end) else {
+        return Err(SkillCatalogError::InvalidInvocation(format!(
+            "Skill `{}` has an invalid marker range",
+            invocation.name
+        )));
+    };
+    if !skill_marker_matches(marker, &invocation.name) {
+        return Err(SkillCatalogError::InvalidInvocation(format!(
+            "Skill `{}` is not bound to its visible marker",
+            invocation.name
+        )));
+    }
+    Ok(())
 }
 
 fn loading_catalog(key: &CatalogKey) -> SkillCatalog {

@@ -417,7 +417,7 @@ async fn recovery_conflicts_preserve_retained_identity_and_never_start_native_wo
 }
 
 #[tokio::test]
-async fn recursive_submodule_and_skill_failures_retain_recovery_progress_across_restart() {
+async fn recovery_leaves_recursive_submodules_uninitialized_when_their_sources_are_unavailable() {
     let layout = Layout::new();
     let leaf = layout.root.join("leaf");
     let middle = layout.root.join("middle");
@@ -473,39 +473,18 @@ async fn recursive_submodule_and_skill_failures_retain_recovery_progress_across_
     let hidden = layout.root.join("middle-hidden");
     std::fs::rename(&middle, &hidden).unwrap();
     let retry = prompt("Continue with recursive modules");
-    let failed = admit(server.descriptor(), original.session.id, retry.clone()).await;
-    assert_eq!(failed.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-    let body = failed.text().await.unwrap();
-    assert!(body.contains("submodule initialization failed"), "{body}");
-    assert!(layout.linked.join("nested/tracked").is_file());
-    assert!(provider.try_next_start().is_none());
-    server.shutdown().await.unwrap();
-    std::fs::rename(hidden, &middle).unwrap();
-    let (runtime, mut provider) = ControlledProvider::new();
-    runtime.fail_skill_discovery("destination catalog offline");
-    let server = server::spawn_with_source_control(
-        config,
-        vec![runtime.clone()],
-        server::ServerTimings::default().with_checkout_skill_timeout(Duration::from_millis(300)),
-        adapter,
-    )
-    .await
-    .unwrap();
-    let failed = admit(server.descriptor(), original.session.id, retry.clone()).await;
-    assert_eq!(failed.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-    let body = failed.text().await.unwrap();
-    assert!(body.contains("Skills"), "{body}");
-    assert!(layout.linked.join("module/nested/tracked").is_file());
-    assert!(provider.try_next_start().is_none());
-    runtime.clear_skill_discovery_failure();
     assert_success(admit(server.descriptor(), original.session.id, retry).await).await;
     let _new = restarted(&mut provider, &layout.linked).await;
+    assert!(layout.linked.join("nested/tracked").is_file());
+    assert!(!layout.linked.join("module/.git").exists());
+    assert!(!layout.linked.join("module/nested/tracked").exists());
     assert_eq!(
         read_git(&layout.main, &["worktree", "list", "--porcelain"])
             .matches("worktree ")
             .count(),
         2
     );
+    std::fs::rename(hidden, &middle).unwrap();
     server.shutdown().await.unwrap();
 }
 

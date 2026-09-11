@@ -60,6 +60,7 @@ pub(super) struct PromptFooterSlotContext {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkingIndicatorState {
+    CreatingWorktree,
     Working,
     WaitingForSubagents,
 }

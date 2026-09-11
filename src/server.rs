@@ -1429,18 +1429,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         preparation.checkout_created = true;
         state.preparations.save(&preparation)?;
         progress.stage("checkout created");
-        state
-            .source_control
-            .initialize_checkout(&preparation)
-            .await?;
-        state
-            .source_control
-            .checkpoint(
-                crate::source_control::PreparationCheckpoint::SubmodulesReady,
-                &preparation,
-            )
-            .await?;
-        progress.stage("submodules ready; refreshing destination Skills");
+        progress.stage("checkout ready; refreshing destination Skills");
         let catalog = tokio::time::timeout(
             state.timings.checkout_skill_timeout,
             state.skill_catalog.refresh_current(SkillCatalogRequest {
@@ -1604,7 +1593,6 @@ async fn rejoin_preparation(
             .mutation_guard(&plan.repository.id)
             .await;
         state.source_control.prepare_checkout(plan).await?;
-        state.source_control.initialize_checkout(plan).await?;
         let provider = snapshot
             .session
             .agent_selection
@@ -1788,9 +1776,6 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         if let Err(e) = state.source_control.prepare_checkout(plan).await {
             return preparation_error(e);
         }
-        if let Err(e) = state.source_control.initialize_checkout(plan).await {
-            return preparation_error(e);
-        }
     }
 
     if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
@@ -1862,6 +1847,25 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         .as_ref()
         .map(|selection| selection.provider.clone())
         .or_else(|| state.hosted_providers.first().cloned());
+    if preparation.is_some()
+        && !request.prompt.skill_invocations.is_empty()
+        && let Some(provider) = provider.clone()
+    {
+        request.prompt = match state
+            .skill_catalog
+            .rebind_prepared_prompt(provider, &request.execution_directory.path, &request.prompt)
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return session_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    SessionErrorCode::InvalidSkillInvocation,
+                    format!("Destination Skills must match before Prompt admission: {error:?}"),
+                );
+            }
+        };
+    }
     if let Err(response) = validate_new_prompt_skills(
         &state,
         provider,
