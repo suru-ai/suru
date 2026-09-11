@@ -457,6 +457,15 @@ pub struct TuiState {
     /// state, usage, footer, and Prompt delivery — stands down until the
     /// snapshot arrives rather than answering for the Session left behind.
     pub(super) session: Option<SessionProjection>,
+    /// This client's own claim on a Session it has asked for and not been
+    /// answered about, present exactly while the Provisional Session is the
+    /// main view. It stands in place of a route rather than beside one: the
+    /// route is what a Server has confirmed, and nothing here has been.
+    pub(super) provisional: Option<ProvisionalSession>,
+    /// A refusal owed to the Landing rather than to whatever the reader has
+    /// since opened. A creation the reader walked away from still answers, and
+    /// its answer belongs where the draft it restores is.
+    landing_error: Option<String>,
     /// Why the open route could not hydrate, if its newest attachment failed.
     ///
     /// This is client presentation, not Session history: it never enters a
@@ -512,6 +521,66 @@ struct PendingSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
     prompt: InitialPrompt,
+}
+
+/// The Session view a client draws from the moment the Landing's first Prompt
+/// is submitted until the Server answers with the Session it made.
+///
+/// Everything in it is this client's own knowledge: the Prompt as the user
+/// Message it will become, the Title that Prompt gives, and a Working Indicator
+/// with no elapsed time, because only the Server knows when Working began. It
+/// is never listed in the Sidebar and leaves no highlight there, and the real
+/// Session replaces it in place when it arrives.
+#[derive(Clone, Debug)]
+pub(super) struct ProvisionalSession {
+    /// A local identity, held only so the Transcript projection and the render
+    /// slots have the Session id they are shaped around. It never leaves this
+    /// client and is never the created Session's own.
+    pub(super) session_id: SessionId,
+    pub(super) prompt: InitialPrompt,
+    /// What was asked of the Server, kept whole so a refusal is retried under
+    /// the context the reader submitted in rather than the one they have since
+    /// moved to.
+    dispatch: ProvisionalDispatch,
+    /// Why the Server refused, which stands where the Working Indicator was
+    /// until the reader retries.
+    pub(super) error: Option<String>,
+    /// Whether the reader confirmed an interrupt with no Session to send it to
+    /// yet. The intent waits here and travels with the Session's arrival.
+    interrupt_intent: bool,
+}
+
+/// The request a Provisional Session stands for: creating the Session outright,
+/// or preparing the Worktree it will be created in first.
+#[derive(Clone, Debug)]
+enum ProvisionalDispatch {
+    Create {
+        preparation_id: Option<crate::protocol::PreparationId>,
+        agent_selection: Option<AgentSelection>,
+        execution_directory: crate::protocol::ExecutionDirectory,
+    },
+    Prepare(crate::protocol::PrepareCheckoutRequest),
+}
+
+impl ProvisionalDispatch {
+    fn transition(&self, prompt: InitialPrompt) -> ApplicationTransition {
+        match self {
+            Self::Prepare(request) => ApplicationTransition::PrepareCheckout {
+                prompt_id: prompt.id,
+                request: request.clone(),
+            },
+            Self::Create {
+                preparation_id,
+                agent_selection,
+                execution_directory,
+            } => ApplicationTransition::CreateSession(CreateSessionRequest {
+                preparation_id: preparation_id.clone(),
+                agent_selection: agent_selection.clone(),
+                execution_directory: execution_directory.clone(),
+                prompt,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +689,8 @@ impl TuiState {
             route: None,
             opening_loading: OpeningLoadingState::Inactive,
             session: None,
+            provisional: None,
+            landing_error: None,
             opening_error: None,
             session_reference: None,
             workspace_paths: HashMap::new(),
@@ -2478,6 +2549,112 @@ impl TuiState {
             prompts.push(&pending.prompt);
         }
         prompts
+    }
+
+    /// Carries the reader into their own claim on the Session they have just
+    /// asked for, before the Server has answered anything about it.
+    ///
+    /// The claim stands in the route's place rather than beside it, so nothing
+    /// that reads the route — the Sidebar's highlight, the composer the keys
+    /// write into, what a Prompt would be delivered to — takes the Provisional
+    /// Session for a Session that exists. The draft stays under the Landing's
+    /// own composer, which is where the migration onto the created Session's
+    /// key reads it from.
+    fn begin_provisional_session(
+        &mut self,
+        prompt: InitialPrompt,
+        dispatch: ProvisionalDispatch,
+    ) -> ApplicationTransition {
+        let transition = dispatch.transition(prompt.clone());
+        self.text_selection.set(None);
+        self.command_mode = CommandMode::Composer;
+        self.submission_error = None;
+        self.provisional = Some(ProvisionalSession {
+            session_id: SessionId::new(),
+            prompt,
+            dispatch,
+            error: None,
+            interrupt_intent: false,
+        });
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        transition
+    }
+
+    /// Gives up a Provisional Session, which a newer route does without pulling
+    /// the client back: the creation goes on, and its answer no longer decides
+    /// where the reader is.
+    fn abandon_provisional_session(&mut self) -> Option<ProvisionalSession> {
+        let abandoned = self.provisional.take();
+        if abandoned.is_some() {
+            self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        }
+        abandoned
+    }
+
+    /// The Session the Provisional Session draws as, built from what this
+    /// client knows and held nowhere: a claim it renders from rather than a
+    /// Session anything may act on.
+    pub(super) fn provisional_snapshot(&self) -> Option<SessionSnapshot> {
+        let provisional = self.provisional.as_ref()?;
+        Some(SessionSnapshot {
+            title: provisional.prompt.text.trim().to_owned(),
+            emoji: None,
+            session: crate::protocol::Session {
+                context_fill: None,
+                id: provisional.session_id,
+                workspace: self.workspace.clone(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: self
+                        .execution_directory
+                        .clone()
+                        .unwrap_or_else(|| self.workspace.path.clone()),
+                },
+                checkout: None,
+                agent_selection: self.landing_agent_selection.clone(),
+                agent_selection_availability: crate::protocol::ModelAvailability::Available,
+                status: crate::protocol::SessionStatus::Active,
+                working_since: None,
+                parent: None,
+            },
+            revision: crate::protocol::SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
+            subagent_usage: None,
+            subagent_questionnaires: Vec::new(),
+        })
+    }
+
+    /// The Provisional Session's one row, projected exactly as the Transcript
+    /// projects a Prompt admitted and not yet delivered, so the row the reader
+    /// is looking at survives the Session's arrival unchanged.
+    pub(super) fn provisional_transcript_view(
+        &self,
+        snapshot: &SessionSnapshot,
+        theme: &Theme,
+        width: u16,
+    ) -> Option<std::cell::Ref<'_, TranscriptView>> {
+        let provisional = self.provisional.as_ref()?;
+        // A claim has no disclosure of its own: nothing in it folds, groups,
+        // or hides, so the axes open at their default and die with the frame.
+        let folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
+        let turns = TranscriptTurnFolds::default();
+        Some(self.transcript_cache.view(
+            self.transcript_generation,
+            snapshot,
+            &[&provisional.prompt],
+            TranscriptDisclosure {
+                folds: &folds,
+                groups: &groups,
+                turns: &turns,
+                reasoning_visibility: self.settings().transcript.reasoning_visibility,
+            },
+            theme,
+            width,
+        ))
     }
 
     fn track_pending_steer(&mut self, session: SessionReference, prompt: InitialPrompt) {
@@ -5151,28 +5328,26 @@ impl Application {
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
         });
-        if let Some(request) = &mut self.state.new_worktree {
+        let dispatch = if let Some(request) = &mut self.state.new_worktree {
             request.description = prompt.text.clone();
             if let Some(selection) = &self.state.landing_agent_selection {
                 request.provider = selection.provider.clone();
             }
-            return ApplicationTransition::PrepareCheckout {
-                prompt_id: prompt.id,
-                request: request.clone(),
-            };
-        }
-        ApplicationTransition::CreateSession(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: self.state.landing_agent_selection.clone(),
-            execution_directory: crate::protocol::ExecutionDirectory {
-                path: self
-                    .state
-                    .execution_directory
-                    .clone()
-                    .expect("Landing execution checked before submission"),
-            },
-            prompt,
-        })
+            ProvisionalDispatch::Prepare(request.clone())
+        } else {
+            ProvisionalDispatch::Create {
+                preparation_id: None,
+                agent_selection: self.state.landing_agent_selection.clone(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: self
+                        .state
+                        .execution_directory
+                        .clone()
+                        .expect("Landing execution checked before submission"),
+                },
+            }
+        };
+        self.state.begin_provisional_session(prompt.clone(), dispatch)
     }
 
     fn elapse_reconnect_grace(&mut self) -> ApplicationTransition {

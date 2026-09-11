@@ -75,7 +75,7 @@ pub(super) struct WorkingIndicatorSlotContext {
     pub(super) session_id: SessionId,
     pub(super) width: u16,
     pub(super) state: WorkingIndicatorState,
-    pub(super) working_since: SessionTimestamp,
+    pub(super) working_since: Option<SessionTimestamp>,
     pub(super) interrupt: Option<WorkingIndicatorInterrupt>,
 }
 

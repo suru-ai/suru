@@ -17,6 +17,7 @@ mod landing_notice;
 mod model_options;
 mod model_picker;
 mod prompts;
+mod provisional_session;
 mod reasoning_cycle;
 mod serving;
 mod session_header;

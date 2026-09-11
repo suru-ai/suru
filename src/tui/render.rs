@@ -155,6 +155,8 @@ pub(super) fn render_with_slots(
         render_session(frame, state, main, slots, theme, truecolor)
     } else if state.route.is_some() {
         render_opening_session(frame, state, main, theme, truecolor)
+    } else if state.provisional.is_some() {
+        render_provisional_session(frame, state, main, slots, theme, truecolor)
     } else {
         render_landing(frame, state, main, slots, theme)
     };
@@ -3187,6 +3189,59 @@ fn pad_to_width(text: &str, width: usize) -> String {
     padded
 }
 
+/// Where the Session written here would execute, said exactly as the Landing
+/// says it: the path, its Checkout State as a Sidebar row reads it, and — while
+/// the intent is pending — that a new checkout will be made on submit instead.
+///
+/// The Landing and the Provisional Session share it word for word, because the
+/// Provisional Session is drawn from the very reading the Landing was showing
+/// when the Prompt was submitted.
+fn execution_context(state: &TuiState, show_icons: bool) -> String {
+    match state.execution_directory.as_deref() {
+        Some(path) => {
+            let label = workspace_context(state, path, true);
+            let status = if matches!(
+                state.execution_status,
+                crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
+            ) {
+                " · unavailable"
+            } else {
+                ""
+            };
+            // What the next Session would begin on, said exactly as a
+            // Sidebar row says it, and live: the catalog's reading
+            // stands in front of the one the resolution carried.
+            let checkout = state
+                .execution_checkout_state()
+                .and_then(|checkout| checkout_state_context(checkout, show_icons))
+                .map(|checkout| format!(" · {checkout}"))
+                .unwrap_or_default();
+            // A pending intent is only ever said where there is a
+            // Repository to make it in.
+            let intent = if state.new_worktree.is_some() && state.workspace.repository.is_some() {
+                format!(
+                    " · {}",
+                    icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
+                )
+            } else {
+                String::new()
+            };
+            format!("{label}{status}{checkout}{intent}")
+        }
+        None => {
+            let intent = if state.new_worktree.is_some() {
+                icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
+            } else {
+                "Choose a working copy to start a Session".to_owned()
+            };
+            format!(
+                "{} · {intent}",
+                workspace_context(state, &state.workspace.path, true)
+            )
+        }
+    }
+}
+
 fn render_landing(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -3296,50 +3351,7 @@ fn render_landing(
 
     frame.render_widget(
         Paragraph::new(truncate_to_width(
-            &match state.execution_directory.as_deref() {
-                Some(path) => {
-                    let label = workspace_context(state, path, true);
-                    let status = if matches!(
-                        state.execution_status,
-                        crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
-                    ) {
-                        " · unavailable"
-                    } else {
-                        ""
-                    };
-                    // What the next Session would begin on, said exactly as a
-                    // Sidebar row says it, and live: the catalog's reading
-                    // stands in front of the one the resolution carried.
-                    let checkout = state
-                        .execution_checkout_state()
-                        .and_then(|checkout| checkout_state_context(checkout, show_icons))
-                        .map(|checkout| format!(" · {checkout}"))
-                        .unwrap_or_default();
-                    // A pending intent is only ever said where there is a
-                    // Repository to make the Worktree in.
-                    let intent =
-                        if state.new_worktree.is_some() && state.workspace.repository.is_some() {
-                            format!(
-                                " · {}",
-                                icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
-                            )
-                        } else {
-                            String::new()
-                        };
-                    format!("{label}{status}{checkout}{intent}")
-                }
-                None => {
-                    let intent = if state.new_worktree.is_some() {
-                        icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
-                    } else {
-                        "Choose a working copy to start a Session".to_owned()
-                    };
-                    format!(
-                        "{} · {intent}",
-                        workspace_context(state, &state.workspace.path, true)
-                    )
-                }
-            },
+            &execution_context(state, show_icons),
             usize::from(panel.width),
         ))
         .style(theme.text.subdued),
@@ -3453,6 +3465,208 @@ fn render_opening_session(
     }
 }
 
+/// The Session view a client draws for its own claim on a Session it has asked
+/// for and not been answered about.
+///
+/// Everything in it is drawn from what the client already knows: the Prompt as
+/// the user Message it will become, the Title that Prompt gives, where it would
+/// execute, the Agent it would begin under, and a Working Indicator with no
+/// elapsed time, because only the Server knows when Working began. It uses the
+/// Session view's own layout so the Session replaces it in place rather than
+/// shifting under the reader when it arrives.
+///
+/// Its composer is the Landing's, which is what the draft migration onto the
+/// created Session's key reads from, so a draft typed while the Server is
+/// answering survives the handoff.
+///
+/// A refusal leaves every one of those readings standing and puts a
+/// client-local, transcript-shaped Error row where the Working Indicator was.
+fn render_provisional_session(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    slots: &RenderSlots,
+    theme: &Theme,
+    truecolor: bool,
+) -> RenderedComposer {
+    let provisional = state
+        .provisional
+        .as_ref()
+        .expect("the Provisional Session renderer requires the claim it draws");
+    let snapshot = state
+        .provisional_snapshot()
+        .expect("a Provisional Session draws the Session it claims");
+    let padding = horizontal_padding(area.width);
+    let normally_padded = horizontally_inset(area, padding);
+    let content_column = session_content_area(area, state);
+    let content_width = content_column.width;
+    let content_detail = ResponsiveDetail::for_width(content_width);
+    let header_detail = ResponsiveDetail::for_width(normally_padded.width);
+    let show_header = area.height >= SESSION_HEADER_MINIMUM_HEIGHT;
+    let session_id = snapshot.session.id;
+    let key = ComposerKey::Landing;
+    let composer_text = state.composers.text(key.clone());
+    let composer_cursor = state.composers.cursor(key.clone());
+    let skill_markers = state.composers.skill_markers(key.clone());
+    let desired_composer_height =
+        composer_block_height(area.height, content_width, composer_text, composer_cursor);
+    let mut tail = match provisional.error.as_deref() {
+        Some(error) => client_error_lines(
+            &format!(
+                "Could not create Session: {error} · Enter to retry, or type a new prompt"
+            ),
+            theme,
+        ),
+        None => {
+            let context = WorkingIndicatorSlotContext {
+                session_id,
+                width: content_width,
+                state: WorkingIndicatorState::Working,
+                working_since: None,
+                interrupt: Some(
+                    if matches!(
+                        state.command_mode,
+                        CommandMode::InterruptConfirmation { .. }
+                    ) {
+                        WorkingIndicatorInterrupt::Armed
+                    } else {
+                        WorkingIndicatorInterrupt::Ready
+                    },
+                ),
+            };
+            let default = working_indicator_line(
+                &context,
+                SessionTimestamp::now().0,
+                binding_label(&CommandId::RequestInterrupt),
+                state
+                    .shimmer_clock
+                    .frame(working_indicator_label(context.state), state.spinner_frame),
+                theme,
+                truecolor,
+            );
+            rendered_slot_lines(slots.working_indicator(&context, default), content_width, theme)
+        }
+    };
+    if !tail.is_empty() {
+        tail.insert(0, Line::default());
+    }
+    let footer = slots.prompt_footer(
+        &PromptFooterSlotContext {
+            session_id,
+            width: content_width,
+        },
+        &PromptContextSlotContext {
+            session_id,
+            agent: SlotText::new(
+                agent_selection_context(state, content_detail),
+                theme.text.subdued,
+            ),
+            usage: None,
+        },
+    );
+    // The execution line the Landing drew stays drawn, one row above the footer
+    // the Session view puts its Agent Selection in.
+    let execution_height = 1;
+    let footer_height = footer.height().saturating_add(execution_height);
+    let reserved_height = u16::from(show_header)
+        .saturating_add(footer_height)
+        .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
+        .saturating_add(1);
+    let composer_height =
+        desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
+    let [header_area, transcript_area, _, _, _, _, composer_area, status_area] = session_areas(
+        area,
+        u16::from(show_header),
+        0,
+        0,
+        0,
+        composer_height,
+        footer_height.min(area.height.saturating_sub(composer_height)),
+    );
+    if show_header {
+        render_session_header(
+            frame,
+            state,
+            &snapshot,
+            horizontally_inset(header_area, padding),
+            header_detail,
+            theme,
+        );
+    }
+    let transcript_area = in_column(transcript_area, content_column);
+    let composer_area = in_column(composer_area, content_column);
+    let status_area = in_column(status_area, content_column);
+    let view = state
+        .provisional_transcript_view(&snapshot, theme, content_width)
+        .expect("a Provisional Session projects the Prompt it stands for");
+    let has_top_border = transcript_area.height > 1;
+    let border_rows = u16::from(has_top_border);
+    let visible_rows = usize::from(transcript_area.height.saturating_sub(border_rows));
+    let rows = view.row_count_with_tail(&tail);
+    let scroll_position = rows.saturating_sub(transcript_viewport_height(transcript_area));
+    let window = view.window_with_tail(&tail, scroll_position, visible_rows);
+    state
+        .session_animation_on_screen
+        .set(provisional.error.is_none());
+    if has_top_border {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.border.subdued),
+            transcript_area,
+        );
+    }
+    let content_top = transcript_area.y.saturating_add(border_rows);
+    let buffer = frame.buffer_mut();
+    for (index, row) in window.rows.iter().take(visible_rows).enumerate() {
+        draw_row(
+            buffer,
+            transcript_area.x,
+            content_top.saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+            transcript_area.width,
+            row,
+        );
+    }
+    let cursor = Some(render_composer(
+        frame,
+        composer_area,
+        ComposerContent {
+            memory: &state.composers,
+            key,
+            text: composer_text,
+            cursor: composer_cursor,
+            skill_markers: &skill_markers,
+        },
+        state.composer_border_style(theme),
+        theme,
+    ));
+    if status_area.height >= execution_height {
+        frame.render_widget(
+            Paragraph::new(truncate_to_width(
+                &execution_context(state, state.settings().appearance.show_icons),
+                usize::from(status_area.width),
+            ))
+            .style(theme.text.subdued),
+            Rect::new(status_area.x, status_area.y, status_area.width, 1),
+        );
+        render_slot(
+            frame,
+            Rect::new(
+                status_area.x,
+                status_area.y.saturating_add(execution_height),
+                status_area.width,
+                status_area.height.saturating_sub(execution_height),
+            ),
+            footer,
+            theme,
+        );
+    }
+    RenderedComposer {
+        area: composer_area,
+        cursor,
+    }
+}
+
 fn render_session(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -3506,7 +3720,7 @@ fn render_session(
                 } else {
                     WorkingIndicatorState::WaitingForSubagents
                 },
-                working_since: since,
+                working_since: Some(since),
                 // Escape leaves a Subagent's Session instead of interrupting it,
                 // so its indicator carries elapsed work but no false gesture.
                 interrupt: (!subagent_view).then_some(
@@ -3869,14 +4083,25 @@ fn working_indicator_line(
     truecolor: bool,
 ) -> Line<'static> {
     let label = working_indicator_label(context.state);
-    let elapsed = working_indicator_elapsed(context.working_since, now);
-    let metadata = match context.interrupt {
-        None => format!(" ({elapsed})"),
-        Some(WorkingIndicatorInterrupt::Ready) => {
+    // A Provisional Session carries no elapsed time: only the Server knows when
+    // Working began, and it has not said so yet. The guidance stands either way.
+    let elapsed = context
+        .working_since
+        .map(|since| working_indicator_elapsed(since, now));
+    let metadata = match (elapsed, context.interrupt) {
+        (Some(elapsed), None) => format!(" ({elapsed})"),
+        (Some(elapsed), Some(WorkingIndicatorInterrupt::Ready)) => {
             format!(" ({elapsed} • {interrupt_binding} to interrupt)")
         }
-        Some(WorkingIndicatorInterrupt::Armed) => {
+        (Some(elapsed), Some(WorkingIndicatorInterrupt::Armed)) => {
             format!(" ({elapsed} • {interrupt_binding} again to interrupt)")
+        }
+        (None, None) => String::new(),
+        (None, Some(WorkingIndicatorInterrupt::Ready)) => {
+            format!(" ({interrupt_binding} to interrupt)")
+        }
+        (None, Some(WorkingIndicatorInterrupt::Armed)) => {
+            format!(" ({interrupt_binding} again to interrupt)")
         }
     };
     let label = shimmered_label_spans(
