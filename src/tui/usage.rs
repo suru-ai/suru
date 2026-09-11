@@ -30,17 +30,7 @@ pub(super) fn compact_count(value: u64) -> String {
 }
 
 pub(super) fn compact_cost(cost: Cost) -> String {
-    let usd = cost.as_usd();
-    let precision = if usd >= 0.01 {
-        2
-    } else if usd >= 0.001 {
-        3
-    } else if usd >= 0.0001 {
-        4
-    } else {
-        return "<$0.0001".to_owned();
-    };
-    format!("${}", trim_fractional_zeros(format!("{usd:.precision$}")))
+    format!("${:.2}", cost.as_usd())
 }
 
 fn trim_fractional_zeros(mut value: String) -> String {
@@ -53,4 +43,17 @@ fn trim_fractional_zeros(mut value: String) -> String {
         }
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_cost;
+    use crate::protocol::Cost;
+
+    #[test]
+    fn cost_always_has_two_decimal_places() {
+        for (usd, expected) in [(0.001, "$0.00"), (1.2, "$1.20"), (10.0, "$10.00")] {
+            assert_eq!(compact_cost(Cost::from_usd(usd).unwrap()), expected);
+        }
+    }
 }

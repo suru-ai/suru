@@ -3235,6 +3235,8 @@ fn context_fill_footer_formats_partial_zero_and_over_capacity_measurements() {
             Some("1 (13%)"),
         ),
         (None, Some(0.42), Some("$0.42")),
+        (None, Some(1.2), Some("$1.20")),
+        (None, Some(10.0), Some("$10.00")),
         (None, Some(0.0), None),
         (None, None, None),
     ] {
