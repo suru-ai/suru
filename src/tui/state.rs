@@ -824,6 +824,7 @@ impl TuiState {
     /// swaps — and what it sends is taken and dropped rather than drawn,
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
+        self.abandon_provisional_session();
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -853,6 +854,12 @@ impl TuiState {
     /// reader is on their way to, and leaving is them saying they are not
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
+        self.abandon_provisional_session();
+        // A refusal owed to the Landing is said the first time the Landing is
+        // drawn after it, rather than in whatever the reader was looking at.
+        if let Some(error) = self.landing_error.take() {
+            self.submission_error = Some(error);
+        }
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -1755,10 +1762,28 @@ impl TuiState {
         viewed.then(|| self.session_reference.clone()).flatten()
     }
 
-    fn apply_created_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
+    /// Lets go of a creation the reader walked away from before it was
+    /// answered: the Session is theirs and reaches the Sidebar through the
+    /// catalog, but the submission that made it settles where its draft stands
+    /// rather than under a Session they are not in.
+    fn detach_creation(&mut self, snapshot: &SessionSnapshot) {
         self.new_worktree = None;
-        self.session_events_blocked = false;
-        self.apply_session(SessionEvent::snapshot(snapshot))
+        let settles = self.pending_submission.as_ref().is_some_and(|pending| {
+            pending.target == SubmissionTarget::CreateSession
+                && snapshot
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.id == pending.prompt.id)
+        });
+        if !settles {
+            return;
+        }
+        let pending = self
+            .pending_submission
+            .take()
+            .expect("the settling submission was just observed");
+        self.composers
+            .admission_reconciled(pending.source.clone(), pending.source, &pending.prompt);
     }
 
     fn apply_attached_session(&mut self, snapshot: SessionSnapshot) -> Result<()> {
@@ -1772,6 +1797,9 @@ impl TuiState {
     }
 
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
+        // Any claim this client was drawing is answered by a Session arriving,
+        // whether or not it is the one the claim was for.
+        self.provisional = None;
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -2059,10 +2087,11 @@ impl TuiState {
     ) -> Option<std::cell::Ref<'_, TranscriptView>> {
         let snapshot = self.session.as_ref()?.snapshot();
         let interaction = self.session_interaction(self.session_reference.as_ref()?)?;
+        let provisional = self.provisional_prompts(snapshot.session.id);
         Some(self.transcript_cache.view(
             self.transcript_generation,
             snapshot,
-            &self.provisional_prompts(snapshot.session.id),
+            &provisional.iter().collect::<Vec<_>>(),
             TranscriptDisclosure {
                 folds: &interaction.folds.borrow(),
                 groups: &interaction.groups.borrow(),
@@ -2481,6 +2510,21 @@ impl TuiState {
             .pending_submission
             .take()
             .expect("matching pending submission exists");
+        let created_session = pending.target == SubmissionTarget::CreateSession;
+        // A refused creation the client is still drawing its claim for stays in
+        // that claim: the view stands with the user Message in place, the
+        // Working Indicator gives way to the refusal, and the composer stands
+        // empty, because Enter there retries the very Prompt that was refused.
+        if let Some(claim) = self
+            .provisional
+            .as_mut()
+            .filter(|claim| claim.prompt.id == prompt_id)
+        {
+            claim.error = Some(error);
+            self.composers.discard_draft(ComposerKey::Landing);
+            self.transcript_generation = self.transcript_generation.wrapping_add(1);
+            return;
+        }
         self.composers
             .admission_failed(pending.source.clone(), &pending.prompt);
         self.failed_submissions.insert(
@@ -2491,6 +2535,13 @@ impl TuiState {
                 prompt: pending.prompt,
             },
         );
+        // A creation the reader walked away from answers to the Landing, where
+        // the draft it just restored stands, rather than to whatever they
+        // opened in the meantime.
+        if created_session && self.route.is_some() {
+            self.landing_error = Some(error);
+            return;
+        }
         self.submission_error = Some(error);
     }
 
@@ -2535,19 +2586,45 @@ impl TuiState {
         }
     }
 
-    pub(super) fn provisional_prompts(&self, session_id: SessionId) -> Vec<&InitialPrompt> {
+    /// The Prompts this Session draws in the Transcript's position as the user
+    /// Messages they will become.
+    ///
+    /// A Prompt admitted to begin a Turn and not yet delivered is one of them
+    /// for every client, read off the Session itself, so no reader waits on the
+    /// Agent to see what was asked. The client that submitted one draws it from
+    /// its own hand first, before the Server has confirmed anything; the two
+    /// readings are the same Prompt, so the identity decides and never the
+    /// source.
+    pub(super) fn provisional_prompts(&self, session_id: SessionId) -> Vec<InitialPrompt> {
         let session = SessionReference::new(self.outlook.clone(), session_id);
         let mut prompts = self
             .pending_steers
             .iter()
             .filter(|steer| steer.session == session)
-            .map(|steer| &steer.prompt)
+            .map(|steer| steer.prompt.clone())
             .collect::<Vec<_>>();
         if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
             pending.target == SubmissionTarget::AdmitPrompt(session.clone(), PromptDelivery::Steer)
         }) {
-            prompts.push(&pending.prompt);
+            prompts.push(pending.prompt.clone());
         }
+        let admitted = self
+            .session
+            .as_ref()
+            .filter(|projection| projection.session_id() == session_id)
+            .into_iter()
+            .flat_map(|projection| &projection.snapshot().prompts)
+            .filter(|prompt| {
+                prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
+            })
+            .filter(|prompt| !prompts.iter().any(|drawn| drawn.id == prompt.id))
+            .map(|prompt| InitialPrompt {
+                id: prompt.id,
+                text: prompt.text.clone(),
+                skill_invocations: prompt.skill_invocations.clone(),
+            })
+            .collect::<Vec<_>>();
+        prompts.extend(admitted);
         prompts
     }
 
@@ -2584,11 +2661,15 @@ impl TuiState {
     /// the client back: the creation goes on, and its answer no longer decides
     /// where the reader is.
     fn abandon_provisional_session(&mut self) -> Option<ProvisionalSession> {
-        let abandoned = self.provisional.take();
-        if abandoned.is_some() {
-            self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        let abandoned = self.provisional.take()?;
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        // A refused Prompt is the reader's again: its text goes back to the
+        // Landing as a draft, to be resubmitted as the very Prompt it was.
+        if abandoned.error.is_some() {
+            self.composers
+                .admission_failed(ComposerKey::Landing, &abandoned.prompt);
         }
-        abandoned
+        Some(abandoned)
     }
 
     /// The Session the Provisional Session draws as, built from what this
@@ -3446,10 +3527,7 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |session_id| {
                     ApplicationTransition::SubscribeSession(session_id)
                 })),
-            ApplicationEvent::SessionCreated(snapshot) => {
-                self.state.apply_created_session(snapshot)?;
-                Ok(ApplicationTransition::Continue)
-            }
+            ApplicationEvent::SessionCreated(snapshot) => self.take_created_session(snapshot),
             ApplicationEvent::SessionAttached(snapshot) => {
                 let reference =
                     SessionReference::new(self.state.outlook.clone(), snapshot.session.id);
@@ -5259,6 +5337,31 @@ impl Application {
                 armed_at: self.state.presentation_clock.now(),
             };
         }
+    }
+
+    /// Takes the Session the Server made in place of the claim the client drew
+    /// for it, and answers with the interrupt the reader confirmed while there
+    /// was nothing yet to send it to.
+    ///
+    /// A claim the reader has since left is not replaced: a newer route stands,
+    /// and no late answer pulls them back to a Session they stopped waiting on.
+    fn take_created_session(
+        &mut self,
+        snapshot: SessionSnapshot,
+    ) -> Result<ApplicationTransition> {
+        let Some(claim) = self.state.provisional.take() else {
+            self.state.detach_creation(&snapshot);
+            return Ok(ApplicationTransition::Continue);
+        };
+        self.state.new_worktree = None;
+        self.state.session_events_blocked = false;
+        self.state.apply_session(SessionEvent::snapshot(snapshot))?;
+        if claim.interrupt_intent
+            && let Some(session) = self.state.session_reference.clone()
+        {
+            return Ok(ApplicationTransition::InterruptSession { session });
+        }
+        Ok(ApplicationTransition::Continue)
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {

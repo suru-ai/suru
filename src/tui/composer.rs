@@ -380,6 +380,12 @@ impl ComposerMemory {
         self.composers.remove(&ComposerKey::Session(session));
     }
 
+    /// Gives up the draft standing in a composer, keeping it in that composer's
+    /// history so the reader can call it back, and leaves the composer empty.
+    pub(super) fn discard_draft(&mut self, key: ComposerKey) {
+        self.composer_mut(key).discard_draft();
+    }
+
     pub(super) fn begin_submission(&mut self, key: ComposerKey) -> InitialPrompt {
         self.composer_mut(key).begin_submission()
     }
@@ -724,6 +730,13 @@ impl ComposerState {
         self.retry = None;
         self.skill_bindings.clear();
         self.skill_issues.clear();
+    }
+
+    fn discard_draft(&mut self) {
+        if !self.text.is_empty() {
+            self.push_history(self.text.clone());
+        }
+        self.clear();
     }
 
     fn begin_submission(&mut self) -> InitialPrompt {
