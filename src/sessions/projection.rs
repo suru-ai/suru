@@ -341,9 +341,11 @@ impl SessionStoreState {
     }
 
     /// When the uninterrupted live-work interval below this Session began.
-    /// Turn intervals are merged across the whole subtree, so a parent Turn
-    /// that overlaps a surviving Subagent keeps anchoring Working after the
-    /// parent Settles. Only the merged interval that is still open matters.
+    /// Turn intervals are merged with the intervals this Session's own
+    /// admissions open across the whole subtree, so a Prompt admitted to begin
+    /// a Turn anchors Working before that Turn exists, and a parent Turn that
+    /// overlaps a surviving Subagent keeps anchoring it after the parent
+    /// Settles. Only the merged interval that is still open matters.
     pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
         self.subtree_working_since_with(session_id, None)
     }

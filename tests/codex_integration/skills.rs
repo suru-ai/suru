@@ -13,7 +13,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, SessionSnapshot, SessionStatus, SkillCatalogStatus,
-        SkillDescriptor, SkillInvocation, SkillMarkerSpan,
+        SkillDescriptor, SkillInvocation, SkillMarkerSpan, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -448,7 +448,14 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
         &client,
         created.session.id,
         "initial Codex Turn becomes active",
-        |snapshot| snapshot.session.status == SessionStatus::Active,
+        // A Session reads as Active from the moment its Prompt is admitted, so
+        // what this waits for is the Turn itself (ADR 0024).
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Active)
+        },
     )
     .await;
 

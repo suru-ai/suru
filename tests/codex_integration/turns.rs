@@ -317,7 +317,10 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .await
         .expect("create Session without waiting for Codex startup");
     assert_eq!(created.session.agent_selection, None);
-    assert_eq!(created.session.status, SessionStatus::Idle);
+    // The Session owes a Turn to the Prompt it was made with, before the
+    // harness has been reached at all (ADR 0024).
+    assert_eq!(created.session.status, SessionStatus::Active);
+    assert!(created.session.working_since.is_some());
     assert_eq!(created.prompts[0].status, PromptStatus::Pending);
     assert!(created.turns.is_empty());
 
@@ -807,6 +810,16 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         .await
         .expect("decode idle-flushed Session after abrupt restart");
     assert_eq!(final_boundary, boundary_snapshot);
+    // A restart rebuilds Working from the durable Turns alone, so a Session
+    // whose Working began at its Prompt's admission comes back Working from
+    // the Turn that Prompt began instead (ADR 0024); everything else about
+    // the Session survives the restart unchanged.
+    assert_eq!(
+        final_idle.session.working_since,
+        final_idle.turns[0].started_at
+    );
+    let mut idle_snapshot = idle_snapshot;
+    idle_snapshot.session.working_since = final_idle.session.working_since;
     assert_eq!(final_idle, idle_snapshot);
     assert_eq!(final_idle.turns[0].status, TurnStatus::Active);
     assert_eq!(

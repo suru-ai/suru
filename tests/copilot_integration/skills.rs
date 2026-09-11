@@ -16,7 +16,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, ProviderId, SessionStatus, SkillCatalogRequest, SkillCatalogStatus,
-        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
+        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -490,7 +490,14 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
         &mut feed,
         created.session.id,
         "the first Copilot Turn becomes active",
-        |snapshot| snapshot.session.status == SessionStatus::Active,
+        // A Session reads as Active from the moment its Prompt is admitted, so
+        // what this waits for is the Turn itself (ADR 0024).
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Active)
+        },
     )
     .await;
 
