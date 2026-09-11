@@ -508,6 +508,13 @@ impl ControlledProviderSession {
             .expect("Provider Session remains connected")
     }
 
+    /// The Turn already started on this Provider Session, without waiting for
+    /// one. A test that must show a Provider was *never* asked to run a Turn
+    /// reads the absence here rather than waiting out a timeout.
+    pub fn try_next_turn(&mut self) -> Option<TurnStart> {
+        self.turns.try_recv().ok()
+    }
+
     pub async fn next_steer(&mut self) -> TurnSteer {
         self.steers
             .recv()

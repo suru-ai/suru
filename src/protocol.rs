@@ -1995,6 +1995,22 @@ pub struct Prompt {
     pub status: PromptStatus,
 }
 
+/// What one interrupt actually did. A Session that is Working only because it
+/// owes a Turn to a Prompt it has not delivered has no Turn to stop, so
+/// interrupting it withdraws that Prompt instead; the client that asked is
+/// told which Prompt so it can return the text to its own composer, where
+/// every other viewer only sees the Prompt go (ADR 0024).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "outcome")]
+pub enum InterruptOutcome {
+    /// The interrupt stopped work already under way: an active Turn, or the
+    /// Subagents that outlived one.
+    StoppedWork,
+    /// The interrupt withdrew a Prompt that had been admitted to begin a Turn
+    /// and never delivered. The Prompt is carried as it now stands, Cancelled.
+    WithdrewPrompt { prompt: Prompt },
+}
+
 /// The disjoint measurements a Provider reported for one Turn. An absent
 /// field means the Provider did not state it; a reported zero remains
 /// `Some(0)`, so absence is never fabricated into a number.

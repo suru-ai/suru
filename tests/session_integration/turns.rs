@@ -266,9 +266,10 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                 && message.content == "Explain the provider seam")
     }));
     assert!(
-        !first_delivery.changes.iter().any(|change| {
-            matches!(change, SessionChange::SessionStatusChanged { .. })
-        }),
+        !first_delivery
+            .changes
+            .iter()
+            .any(|change| { matches!(change, SessionChange::SessionStatusChanged { .. }) }),
         "the Session has read as Active since its Prompt was admitted, so \
          delivering that Prompt moves no status"
     );
@@ -1960,13 +1961,15 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
         "a Session with a running Turn lists as active"
     );
     assert_eq!(
-        running.session.working_since,
-        created.session.working_since,
+        running.session.working_since, created.session.working_since,
         "a listing says live work has been running since the Prompt that owed \
          this Turn was admitted, which the Turn starting does not restart"
     );
     assert!(
-        running.session.working_since.is_some_and(|since| since < started_at),
+        running
+            .session
+            .working_since
+            .is_some_and(|since| since < started_at),
         "the admission moment precedes the Turn it began"
     );
     assert_eq!(
@@ -2088,7 +2091,10 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
         })
         .expect("Prompt delivery creates a Turn that knows when it started");
     assert!(
-        created.session.working_since.is_some_and(|since| since < started_at),
+        created
+            .session
+            .working_since
+            .is_some_and(|since| since < started_at),
         "the Session was already Working when its Prompt was admitted, so the \
          Turn starting moves no listing's reading and announces nothing"
     );

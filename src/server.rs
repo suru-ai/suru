@@ -31,9 +31,9 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-    IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole,
-    MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote,
-    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId,
+    MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
+    RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
     SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity,
     ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
@@ -2349,7 +2349,13 @@ async fn interrupt_session(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.providers.interrupt_session(session_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Stopping work says everything it has to say by succeeding; a
+        // withdrawal has to name the Prompt it withdrew, so the client that
+        // asked can put the text back in its own composer (ADR 0024).
+        Ok(InterruptOutcome::StoppedWork) => StatusCode::NO_CONTENT.into_response(),
+        Ok(withdrawn @ InterruptOutcome::WithdrewPrompt { .. }) => {
+            (StatusCode::OK, Json(withdrawn)).into_response()
+        }
         Err(InterruptSessionError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,

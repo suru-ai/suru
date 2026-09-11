@@ -25,9 +25,9 @@ use super::{
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, Message, MessageId, MessageRole,
-    MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-    SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, InterruptOutcome, Message, MessageId,
+    MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+    ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
     DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
@@ -925,7 +925,7 @@ impl ProviderOrchestrator {
     pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
-    ) -> Result<(), InterruptSessionError> {
+    ) -> Result<InterruptOutcome, InterruptSessionError> {
         let actor_commands = |actor_id: SessionId| {
             self.actors
                 .lock()
@@ -934,7 +934,21 @@ impl ProviderOrchestrator {
                 .get(&actor_id)
                 .map(|actor| actor.commands.clone())
         };
-        match self.sessions.interrupt_target(session_id)? {
+        let stopped: Result<(), InterruptSessionError> = match self
+            .sessions
+            .interrupt_or_withdraw(session_id)?
+        {
+            // The startup this Prompt set going is left to abandon itself:
+            // the actor re-reads the Prompt before it delivers one, and a
+            // Cancelled Prompt is one it declines to deliver. A Provider
+            // connection that finished starting stays where it is, idle,
+            // exactly as a Session between Turns keeps its connection.
+            InterruptTarget::WithdrewPrompt(prompt) => {
+                return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
+            }
+            InterruptTarget::UndeliveredPrompt(_) => {
+                unreachable!("the withdrawing resolution answers with the Prompt it withdrew")
+            }
             InterruptTarget::Turn(turn) => {
                 let actor = actor_commands(session_id).ok_or_else(|| {
                     self.fail_unavailable_interruption(
@@ -978,7 +992,8 @@ impl ProviderOrchestrator {
                 })
                 .await
             }
-        }
+        };
+        stopped.map(|()| InterruptOutcome::StoppedWork)
     }
 
     /// Fails a Turn whose Provider actor could not be reached, settling whatever

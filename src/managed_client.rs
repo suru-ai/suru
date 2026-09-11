@@ -16,14 +16,14 @@ use crate::{
     RuntimeConfig,
     protocol::{
         AdmitPromptRequest, AgentSelection, CheckoutStateChanged, CreateSessionRequest, Health,
-        InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook,
-        Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
-        ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown, SessionCatalogSnapshot,
-        SessionCreated, SessionDeleted, SessionError, SessionId, SessionListItem,
-        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
-        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SettingMutation,
-        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        UpdateAgentSelectionRequest, ViewSessionRequest,
+        InterruptOutcome, InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState,
+        ModelCatalog, Outlook, Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest,
+        Remote, RemoteHealth, ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown,
+        SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError, SessionId,
+        SessionListItem, SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged,
+        SessionSummary, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
+        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+        SkillCatalogRequest, UpdateAgentSelectionRequest, ViewSessionRequest,
     },
 };
 
@@ -483,6 +483,17 @@ impl ManagedClient {
         self.session_commands().interrupt_session(session_id).await
     }
 
+    /// Interrupts the Session and reports what the interrupt did: stopped work,
+    /// or the undelivered Prompt it withdrew (ADR 0024).
+    pub async fn interrupt_session_reporting_outcome(
+        &self,
+        session_id: SessionId,
+    ) -> Result<InterruptOutcome> {
+        self.session_commands()
+            .interrupt_session_reporting_outcome(session_id)
+            .await
+    }
+
     pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         self.session_commands().read_session(session_id).await
     }
@@ -641,6 +652,17 @@ impl OutlookClient {
 
     pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
         self.commands.interrupt_session(session_id).await
+    }
+
+    /// Interrupts the Session and reports what the interrupt did: stopped work,
+    /// or the undelivered Prompt it withdrew (ADR 0024).
+    pub async fn interrupt_session_reporting_outcome(
+        &self,
+        session_id: SessionId,
+    ) -> Result<InterruptOutcome> {
+        self.commands
+            .interrupt_session_reporting_outcome(session_id)
+            .await
     }
 
     pub async fn read_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -927,28 +949,42 @@ impl SessionCommandClient {
     }
 
     pub(crate) async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
-        self.post_session_command_without_response(
-            &format!("/v1/sessions/{session_id}/interrupt"),
-            "Session interruption",
-        )
-        .await
+        self.interrupt_session_reporting_outcome(session_id)
+            .await
+            .map(|_| ())
     }
 
-    /// Posts a body-less command whose success answers with no body either.
-    async fn post_session_command_without_response(
+    /// Interrupts the Session and reports what the interrupt did, so a client
+    /// that withdrew an undelivered Prompt can return its text to the composer
+    /// it was submitted from (ADR 0024). Stopping work answers with no body at
+    /// all, which is [`InterruptOutcome::StoppedWork`].
+    pub(crate) async fn interrupt_session_reporting_outcome(
         &self,
-        path: &str,
-        operation: &str,
-    ) -> Result<()> {
+        session_id: SessionId,
+    ) -> Result<InterruptOutcome> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
-            .post(server_url(&descriptor.base_url, &self.outlook, path)?)
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/interrupt"),
+            )?)
             .bearer_auth(&descriptor.token)
             .send()
             .await
-            .with_context(|| format!("send {operation} command"))?;
-        decode_empty_api_response(response, operation).await
+            .context("send Session interruption command")?;
+        if !response.status().is_success() {
+            return Err(decode_api_error(response, "Session interruption").await);
+        }
+        let body = response
+            .bytes()
+            .await
+            .context("read Session interruption outcome")?;
+        if body.is_empty() {
+            return Ok(InterruptOutcome::StoppedWork);
+        }
+        serde_json::from_slice(&body).context("decode Session interruption outcome")
     }
 
     async fn post_session_command<RequestBody, ResponseBody>(

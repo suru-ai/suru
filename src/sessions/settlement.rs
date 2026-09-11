@@ -6,13 +6,15 @@ use anyhow::anyhow;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, MessageRole, MessageStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, MessageRole, MessageStatus, Prompt,
     PromptDelivery, PromptStatus, SessionChange, SessionId, SessionSnapshot, SessionUpdate, Turn,
     TurnId, TurnStatus,
 };
 
 use super::{
-    SessionStore, output::command_output_changes, projection::active_turn_id,
+    SessionStore, SessionStoreState,
+    output::command_output_changes,
+    projection::{active_turn_id, undelivered_turn_starts},
     prompts::append_steer_delivery_changes,
 };
 
@@ -41,6 +43,17 @@ pub(crate) enum InterruptTarget {
     /// The Session is a Subagent's own, so the interrupt stops that one
     /// Subagent — through the Provider connection its root ancestor owns.
     Subagent { root: SessionId },
+    /// No work is under way: the Session is Working only because it owes a
+    /// Turn to this Prompt, which it has admitted and not delivered. Only
+    /// [`SessionStore::interrupt_or_withdraw`] answers with it, and it answers
+    /// with [`InterruptTarget::WithdrewPrompt`] instead once it has acted.
+    UndeliveredPrompt(Box<Prompt>),
+    /// The Session was Working only because it owed a Turn to a Prompt it had
+    /// not delivered, so the interrupt withdrew that Prompt where it stood.
+    /// The Prompt is already Cancelled by the time this is returned: the
+    /// decision and the mutation are one act under the store lock, so a
+    /// delivery that wins the race is seen as a Turn to stop instead.
+    WithdrewPrompt(Box<Prompt>),
 }
 
 pub(crate) enum ProviderTurnOutcome {
@@ -208,7 +221,7 @@ impl SessionStore {
                     !settling_continuation
                         && prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
-                        && !record.pending_turn_starts.contains(&prompt.id)
+                        && !record.turn_start_admissions.contains_key(&prompt.id)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -250,6 +263,45 @@ impl SessionStore {
         Ok(())
     }
 
+    /// What one interrupt of a Session should reach, deciding and — where the
+    /// answer is a Prompt — acting under the one lock.
+    ///
+    /// Stopping work comes first: a Session running a Turn, or with Subagents
+    /// outliving one, is interrupted the way it always was. Only a Session
+    /// Working solely because it owes a Turn to an undelivered Prompt has that
+    /// Prompt withdrawn, and because the delivery that would end that state
+    /// takes this same lock, the race resolves one way or the other rather
+    /// than into a failure: delivery first leaves a Turn here to stop, and the
+    /// withdrawal first leaves the actor a Cancelled Prompt it declines to
+    /// deliver.
+    pub(crate) fn interrupt_or_withdraw(
+        &self,
+        session_id: SessionId,
+    ) -> Result<InterruptTarget, InterruptSessionError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let target = state.interrupt_target(session_id)?;
+        let InterruptTarget::UndeliveredPrompt(prompt) = target else {
+            return Ok(target);
+        };
+        let prompt_id = prompt.id;
+        state
+            .commit(
+                &self.storage,
+                session_id,
+                vec![SessionChange::PromptStatusChanged {
+                    prompt_id,
+                    status: PromptStatus::Cancelled,
+                }],
+            )
+            .map_err(|error| InterruptSessionError::ProviderFailure(error.to_string()))?;
+        let mut withdrawn = *prompt;
+        withdrawn.status = PromptStatus::Cancelled;
+        Ok(InterruptTarget::WithdrewPrompt(Box::new(withdrawn)))
+    }
+
     pub(crate) fn interrupt_target(
         &self,
         session_id: SessionId,
@@ -258,6 +310,16 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        state.interrupt_target(session_id)
+    }
+}
+
+impl SessionStoreState {
+    fn interrupt_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<InterruptTarget, InterruptSessionError> {
+        let state = self;
         let record = state
             .sessions
             .get(&session_id)
@@ -286,6 +348,27 @@ impl SessionStore {
             return Ok(InterruptTarget::Turn(Box::new(turn.clone())));
         }
         if state.subtree_working_since(session_id).is_some() {
+            // Work below the Session outranks a Prompt waiting above it: an
+            // interrupt reaches what is running, and only a Session Working
+            // solely because it owes a Turn has that Prompt withdrawn instead
+            // (ADR 0024).
+            let subagents_working =
+                state
+                    .subtree(session_id)
+                    .into_iter()
+                    .skip(1)
+                    .any(|descendant| {
+                        state
+                            .sessions
+                            .get(&descendant)
+                            .is_some_and(|record| record.snapshot.session.working_since.is_some())
+                    });
+            if !subagents_working
+                && let Some(prompt) =
+                    undelivered_turn_starts(&record.snapshot, &record.turn_start_admissions).next()
+            {
+                return Ok(InterruptTarget::UndeliveredPrompt(Box::new(prompt.clone())));
+            }
             return Ok(InterruptTarget::Subagents);
         }
         Err(InterruptSessionError::NothingToInterrupt)
