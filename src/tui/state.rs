@@ -492,6 +492,10 @@ pub struct TuiState {
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
     pending_steers: Vec<PendingSteer>,
+    /// The undelivered Prompts this client asked a Session to withdraw. Their
+    /// text is this reader's to get back, which is why it is remembered here
+    /// rather than derived from a Session every viewer reads the same.
+    withdrawing: Vec<WithdrawingPrompt>,
     pub(super) command_mode: CommandMode,
     pub(super) composer_completion: ComposerCompletion,
     skill_catalog: Option<(SkillCatalogRequest, SkillCatalog)>,
@@ -594,6 +598,12 @@ struct PendingAgentSelection {
 struct FailedSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
+    prompt: InitialPrompt,
+}
+
+#[derive(Clone, Debug)]
+struct WithdrawingPrompt {
+    session: SessionReference,
     prompt: InitialPrompt,
 }
 
@@ -707,6 +717,7 @@ impl TuiState {
             pending_submission: None,
             failed_submissions: HashMap::new(),
             pending_steers: Vec::new(),
+            withdrawing: Vec::new(),
             command_mode: CommandMode::Composer,
             composer_completion: ComposerCompletion::default(),
             skill_catalog: None,
@@ -1733,6 +1744,7 @@ impl TuiState {
         self.reconcile_pending_submission();
         self.reconcile_failed_submissions();
         self.reconcile_pending_steers();
+        self.reconcile_withdrawn_prompts();
         self.reconcile_command_mode();
         self.reconcile_subagent_picker();
         Ok(())
@@ -2738,6 +2750,66 @@ impl TuiState {
         ))
     }
 
+    /// Remembers the undelivered Prompts an interrupt just asked to withdraw,
+    /// so this client — the one that interrupted — is the one their text comes
+    /// back to when the Session says they were cancelled.
+    fn await_withdrawals(&mut self, session: &SessionReference) {
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        for prompt in snapshot
+            .prompts
+            .iter()
+            .filter(|prompt| prompt.status == PromptStatus::Pending)
+        {
+            self.withdrawing.push(WithdrawingPrompt {
+                session: session.clone(),
+                prompt: InitialPrompt {
+                    id: prompt.id,
+                    text: prompt.text.clone(),
+                    skill_invocations: prompt.skill_invocations.clone(),
+                },
+            });
+        }
+    }
+
+    /// Returns a withdrawn Prompt's text to the composer of the Session it was
+    /// written in, cursor at its end, as a refused admission does.
+    fn reconcile_withdrawn_prompts(&mut self) {
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        let session = self
+            .session_reference
+            .as_ref()
+            .expect("a Session snapshot carries its reference")
+            .clone();
+        let mut returned = Vec::new();
+        self.withdrawing.retain(|awaited| {
+            if awaited.session != session {
+                return true;
+            }
+            match snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == awaited.prompt.id)
+            {
+                Some(prompt) if prompt.status == PromptStatus::Pending => true,
+                Some(prompt) if prompt.status == PromptStatus::Cancelled => {
+                    returned.push(awaited.prompt.clone());
+                    false
+                }
+                // Delivered after all, or gone from the Session: nothing to
+                // hand back.
+                _ => false,
+            }
+        });
+        for prompt in returned {
+            self.composers
+                .admission_failed(ComposerKey::Session(session.clone()), &prompt);
+        }
+    }
+
     fn track_pending_steer(&mut self, session: SessionReference, prompt: InitialPrompt) {
         if !self
             .pending_steers
@@ -2803,6 +2875,34 @@ impl TuiState {
         queued
     }
 
+    /// What an interrupt would reach here, and `None` where the gesture has
+    /// nothing to stop and the key stays inert.
+    ///
+    /// A Session Working for a Prompt it has not delivered is one of them: the
+    /// interrupt withdraws that Prompt rather than stopping a Turn that does not
+    /// exist. So is a Provisional Session, whose claim the reader may give up
+    /// before the Server has answered at all.
+    fn interrupt_target(&self) -> Option<InterruptTarget> {
+        if let Some(turn_id) = self.active_turn_id() {
+            return Some(InterruptTarget::Turn(turn_id));
+        }
+        if !self.working_subagent_ids().is_empty() {
+            return Some(InterruptTarget::Subagents);
+        }
+        if self
+            .provisional
+            .as_ref()
+            .is_some_and(|claim| claim.error.is_none())
+        {
+            return Some(InterruptTarget::Prompt);
+        }
+        let working = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.snapshot().working_since().is_some());
+        working.then_some(InterruptTarget::Prompt)
+    }
+
     fn active_turn_id(&self) -> Option<TurnId> {
         self.session
             .as_ref()?
@@ -2836,7 +2936,10 @@ impl TuiState {
                 // owed to Subagents alone — any Subagent still working.
                 let still_running = match turn_id {
                     Some(turn_id) => self.active_turn_id() == Some(turn_id),
-                    None => !self.working_subagent_ids().is_empty(),
+                    None => matches!(
+                        self.interrupt_target(),
+                        Some(InterruptTarget::Subagents | InterruptTarget::Prompt)
+                    ),
                 };
                 let expired = self
                     .presentation_clock
@@ -2850,6 +2953,17 @@ impl TuiState {
             _ => {}
         }
     }
+}
+
+/// What the interrupt gesture would reach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptTarget {
+    Turn(TurnId),
+    Subagents,
+    /// A Prompt admitted and not yet delivered — including one this client has
+    /// only claimed, with no Session to send anything to yet. Interrupting
+    /// withdraws it instead of stopping a Turn.
+    Prompt,
 }
 
 /// Which neighbour a queued Prompt selection command moves to.
@@ -5305,6 +5419,24 @@ impl Application {
         // delayed second Esc must not interrupt merely because the run loop
         // had no opportunity to draw between the two presses.
         self.state.reconcile_command_mode();
+        // A claim has no Session to interrupt yet. The intent is recorded and
+        // travels with the Session's arrival, so the reader's second Escape
+        // means what it said even though nothing could be sent when they made
+        // it.
+        if self.state.provisional.is_some() {
+            if matches!(
+                self.state.command_mode,
+                CommandMode::InterruptConfirmation { .. }
+            ) {
+                self.state.command_mode = CommandMode::Composer;
+                if let Some(claim) = self.state.provisional.as_mut() {
+                    claim.interrupt_intent = true;
+                }
+            } else {
+                self.request_interrupt();
+            }
+            return ApplicationTransition::Continue;
+        }
         let (
             Some(session),
             CommandMode::InterruptConfirmation {
@@ -5322,21 +5454,27 @@ impl Application {
         self.state.command_mode = CommandMode::Composer;
         if let Some(turn_id) = turn_id {
             self.state.keep_interrupted_turn_open(turn_id);
+        } else {
+            self.state.await_withdrawals(&session);
         }
         ApplicationTransition::InterruptSession { session }
     }
 
     fn request_interrupt(&mut self) {
-        // The gesture reaches whatever is running: the active Turn, or — with
-        // none — the Subagents that outlived it. With neither there is nothing
-        // to stop and the key stays inert.
-        let turn_id = self.state.active_turn_id();
-        if turn_id.is_some() || !self.state.working_subagent_ids().is_empty() {
-            self.state.command_mode = CommandMode::InterruptConfirmation {
-                turn_id,
-                armed_at: self.state.presentation_clock.now(),
-            };
-        }
+        // The gesture reaches whatever is running: the active Turn, the
+        // Subagents that outlived it, or the Prompt the Session is Working for
+        // and has not delivered. With none of them there is nothing to stop and
+        // the key stays inert.
+        let Some(target) = self.state.interrupt_target() else {
+            return;
+        };
+        self.state.command_mode = CommandMode::InterruptConfirmation {
+            turn_id: match target {
+                InterruptTarget::Turn(turn_id) => Some(turn_id),
+                InterruptTarget::Subagents | InterruptTarget::Prompt => None,
+            },
+            armed_at: self.state.presentation_clock.now(),
+        };
     }
 
     /// Asks for the refused Session again.
@@ -5409,6 +5547,7 @@ impl Application {
         if claim.interrupt_intent
             && let Some(session) = self.state.session_reference.clone()
         {
+            self.state.await_withdrawals(&session);
             return Ok(ApplicationTransition::InterruptSession { session });
         }
         Ok(ApplicationTransition::Continue)
@@ -7189,6 +7328,12 @@ impl Application {
 
     pub(super) fn outlook(&self) -> &Outlook {
         &self.state.outlook
+    }
+
+    /// The Session the main view has open, and `None` on the Landing or in a
+    /// Provisional Session, neither of which is a Session the client watches.
+    pub(super) fn open_session(&self) -> Option<SessionId> {
+        self.state.open_session()
     }
 
     pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {

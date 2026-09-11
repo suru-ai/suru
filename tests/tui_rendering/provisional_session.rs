@@ -3,7 +3,9 @@
 //! it made, and the refusal it stands through.
 
 use crate::support::{rendered_application_rows, workspace_dir};
+use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
+    managed_client::SessionEvent,
     protocol::{
         InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptOrder, PromptStatus,
         Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp,
@@ -248,6 +250,115 @@ fn leaving_a_refused_provisional_session_keeps_its_text_as_the_landing_draft() {
     else {
         panic!("the restored draft should ask for the Session again");
     };
+    assert_eq!(request.prompt.id, prompt.id);
+}
+
+fn press_escape(application: &mut Application) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .expect("press Escape")
+}
+
+#[test]
+fn escape_in_a_provisional_session_arms_an_interrupt_that_waits_for_the_session() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+    let armed = rendered_application_rows(&application).join("\n");
+    assert!(armed.contains("Esc again to interrupt"), "{armed}");
+
+    // Confirming with no Session to send it to records the intent instead.
+    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+
+    let session_id = SessionId::new();
+    let transition = application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            session_id,
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the created Session");
+    let ApplicationTransition::InterruptSession { session } = transition else {
+        panic!("a confirmed interrupt should travel with the Session's arrival: {transition:?}");
+    };
+    assert_eq!(session.session_id, session_id);
+}
+
+#[test]
+fn un_arming_an_interrupt_drops_the_intent() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+    press_escape(&mut application);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseCommandMode))
+        .expect("un-arm the interrupt");
+
+    let transition = application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            SessionId::new(),
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the created Session");
+    assert_eq!(transition, ApplicationTransition::Continue);
+}
+
+#[test]
+fn a_session_working_only_for_an_undelivered_prompt_can_be_interrupted() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    let session_id = SessionId::new();
+    application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            session_id,
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the created Session");
+
+    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+    let armed = rendered_application_rows(&application).join("\n");
+    assert!(armed.contains("again to interrupt"), "{armed}");
+    let transition = press_escape(&mut application);
+    let ApplicationTransition::InterruptSession { session } = transition else {
+        panic!("interrupting a Session owed to a Prompt should reach it: {transition:?}");
+    };
+    assert_eq!(session.session_id, session_id);
+
+    // The Server withdraws the Prompt rather than stopping a Turn it never
+    // began, and the text comes back to this client's composer.
+    let mut withdrawn =
+        created_session_snapshot(session_id, &prompt, workspace.path(), SessionTimestamp::now());
+    withdrawn.session.working_since = None;
+    withdrawn.session.status = SessionStatus::Idle;
+    withdrawn.prompts[0].status = PromptStatus::Cancelled;
+    withdrawn.revision = SessionRevision(withdrawn.revision.0 + 1);
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(withdrawn)))
+        .expect("take the withdrawal");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    // The Title and the composer say it; the Transcript no longer does.
+    assert_eq!(drawn.matches("Rename the widget").count(), 2, "{drawn}");
+    assert!(!drawn.contains("Working"), "{drawn}");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the returned text")
+    else {
+        panic!("the withdrawn Prompt should stand in this Session's composer");
+    };
+    assert_eq!(request.prompt.text, prompt.text);
     assert_eq!(request.prompt.id, prompt.id);
 }
 

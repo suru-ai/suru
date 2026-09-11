@@ -1333,13 +1333,21 @@ impl RunLoop {
                     return Ok(ControlFlow::Continue(()));
                 }
                 let session_id = snapshot.session.id;
-                self.application
+                let transition = self
+                    .application
                     .handle_event(ApplicationEvent::SessionCreated(*snapshot))?;
-                self.tasks.resubscribe(
-                    self.client.session_commands_for(outlook.clone()),
-                    SessionReference::new(outlook, session_id),
-                    &self.channels.subscriptions,
-                );
+                // A reader who left this creation for another Session is
+                // watching that one. Taking its stream away for a Session they
+                // are not in would be the late answer pulling them back by
+                // another route.
+                if self.application.open_session() == Some(session_id) {
+                    self.tasks.resubscribe(
+                        self.client.session_commands_for(outlook.clone()),
+                        SessionReference::new(outlook, session_id),
+                        &self.channels.subscriptions,
+                    );
+                }
+                return Ok(self.dispatch_transition(transition));
             }
             SubmissionResult::PromptAdmitted { session, prompt_id } => {
                 self.application
