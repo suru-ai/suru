@@ -1780,8 +1780,11 @@ impl TuiState {
             .pending_submission
             .take()
             .expect("the settling submission was just observed");
-        self.composers
-            .admission_reconciled(pending.source.clone(), pending.source, &pending.prompt);
+        self.composers.admission_reconciled(
+            pending.source.clone(),
+            pending.source,
+            &pending.prompt,
+        );
         true
     }
 
@@ -2702,7 +2705,9 @@ impl TuiState {
             .provisional
             .as_ref()
             .and_then(|claim| claim.prepared.clone())
-            .filter(|prepared| self.execution_directory.as_ref() == Some(&prepared.destination.path));
+            .filter(|prepared| {
+                self.execution_directory.as_ref() == Some(&prepared.destination.path)
+            });
         if let Some(prepared) = prepared {
             return ApplicationTransition::CreateSession(CreateSessionRequest {
                 preparation_id: Some(prepared.id),
@@ -5600,10 +5605,7 @@ impl Application {
     ///
     /// A claim the reader has since left is not replaced: a newer route stands,
     /// and no late answer pulls them back to a Session they stopped waiting on.
-    fn take_created_session(
-        &mut self,
-        snapshot: SessionSnapshot,
-    ) -> Result<ApplicationTransition> {
+    fn take_created_session(&mut self, snapshot: SessionSnapshot) -> Result<ApplicationTransition> {
         let claim = self.state.provisional.take();
         // Without a claim, the only creation this client could have walked away
         // from is the submission still waiting on an answer. A Session arriving

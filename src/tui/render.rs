@@ -3541,7 +3541,11 @@ fn render_provisional_session(
                 theme,
                 truecolor,
             );
-            rendered_slot_lines(slots.working_indicator(&context, default), content_width, theme)
+            rendered_slot_lines(
+                slots.working_indicator(&context, default),
+                content_width,
+                theme,
+            )
         }
     };
     if !tail.is_empty() {
@@ -3571,7 +3575,16 @@ fn render_provisional_session(
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
-    let [header_area, transcript_area, _, _, _, _, composer_area, status_area] = session_areas(
+    let [
+        header_area,
+        transcript_area,
+        _,
+        _,
+        _,
+        _,
+        composer_area,
+        status_area,
+    ] = session_areas(
         area,
         u16::from(show_header),
         0,

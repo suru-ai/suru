@@ -7,9 +7,9 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptOrder, PromptStatus,
-        PromptId, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp,
-        Workspace,
+        InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionTimestamp, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -268,12 +268,18 @@ fn escape_in_a_provisional_session_arms_an_interrupt_that_waits_for_the_session(
     let mut application = Application::new(workspace.path(), Default::default());
     let prompt = submit_landing_prompt(&mut application, "Rename the widget");
 
-    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        press_escape(&mut application),
+        ApplicationTransition::Continue
+    );
     let armed = rendered_application_rows(&application).join("\n");
     assert!(armed.contains("Esc again to interrupt"), "{armed}");
 
     // Confirming with no Session to send it to records the intent instead.
-    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        press_escape(&mut application),
+        ApplicationTransition::Continue
+    );
 
     let session_id = SessionId::new();
     let transition = application
@@ -327,7 +333,10 @@ fn a_session_working_only_for_an_undelivered_prompt_can_be_interrupted() {
         )))
         .expect("take the created Session");
 
-    assert_eq!(press_escape(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        press_escape(&mut application),
+        ApplicationTransition::Continue
+    );
     let armed = rendered_application_rows(&application).join("\n");
     assert!(armed.contains("again to interrupt"), "{armed}");
     let transition = press_escape(&mut application);
@@ -338,8 +347,12 @@ fn a_session_working_only_for_an_undelivered_prompt_can_be_interrupted() {
 
     // The Server withdraws the Prompt rather than stopping a Turn it never
     // began, and the text comes back to this client's composer.
-    let mut withdrawn =
-        created_session_snapshot(session_id, &prompt, workspace.path(), SessionTimestamp::now());
+    let mut withdrawn = created_session_snapshot(
+        session_id,
+        &prompt,
+        workspace.path(),
+        SessionTimestamp::now(),
+    );
     withdrawn.session.working_since = None;
     withdrawn.session.status = SessionStatus::Idle;
     withdrawn.prompts[0].status = PromptStatus::Cancelled;
