@@ -315,12 +315,13 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
+    /// The reading itself, taken off a locked store so both the read-only
+    /// question and the one that acts ask it of the same state.
     fn interrupt_target(
         &self,
         session_id: SessionId,
     ) -> Result<InterruptTarget, InterruptSessionError> {
-        let state = self;
-        let record = state
+        let record = self
             .sessions
             .get(&session_id)
             .ok_or(InterruptSessionError::SessionNotFound)?;
@@ -330,7 +331,7 @@ impl SessionStoreState {
             // caller finds nothing to stop under whatever Session the walk
             // ends on.
             let mut root = session_id;
-            while let Some(parent) = state
+            while let Some(parent) = self
                 .sessions
                 .get(&root)
                 .and_then(|record| record.snapshot.session.parent)
@@ -347,19 +348,17 @@ impl SessionStoreState {
         {
             return Ok(InterruptTarget::Turn(Box::new(turn.clone())));
         }
-        if state.subtree_working_since(session_id).is_some() {
+        if self.subtree_working_since(session_id).is_some() {
             // Work below the Session outranks a Prompt waiting above it: an
             // interrupt reaches what is running, and only a Session Working
             // solely because it owes a Turn has that Prompt withdrawn instead
             // (ADR 0024).
             let subagents_working =
-                state
-                    .subtree(session_id)
+                self.subtree(session_id)
                     .into_iter()
                     .skip(1)
                     .any(|descendant| {
-                        state
-                            .sessions
+                        self.sessions
                             .get(&descendant)
                             .is_some_and(|record| record.snapshot.session.working_since.is_some())
                     });
