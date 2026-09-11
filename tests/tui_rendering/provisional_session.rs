@@ -144,6 +144,113 @@ fn a_refusal_after_leaving_restores_the_landing_draft_and_says_why() {
     assert!(drawn.contains("Provider unavailable"), "{drawn}");
 }
 
+/// Refuses the creation the Landing's Prompt asked for, leaving the client
+/// standing in the Provisional Session it drew for it.
+fn refuse_creation(application: &mut Application, prompt: &InitialPrompt, error: &str) {
+    application
+        .handle_event(ApplicationEvent::SessionCreationFailed {
+            prompt_id: prompt.id,
+            error: error.to_owned(),
+        })
+        .expect("take the refusal");
+}
+
+#[test]
+fn a_refusal_leaves_the_provisional_session_standing_with_its_prompt() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+    refuse_creation(&mut application, &prompt, "Provider unavailable");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    // The user Message stays; the refusal stands where the Working Indicator was.
+    assert_eq!(drawn.matches("Rename the widget").count(), 2, "{drawn}");
+    // Read across the wrap the Transcript's own width gives it.
+    let flattened = drawn.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flattened.contains(
+            "Error: Could not create Session: Provider unavailable · Enter to retry, or type a new prompt"
+        ),
+        "{drawn}"
+    );
+    assert!(!drawn.contains("Working"), "{drawn}");
+    // The composer stands empty: Enter there retries the Prompt that was refused.
+    assert!(drawn.contains("Type a prompt"), "{drawn}");
+}
+
+#[test]
+fn an_empty_submit_retries_the_refused_prompt_itself() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    refuse_creation(&mut application, &prompt, "Provider unavailable");
+
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("retry the refused Prompt")
+    else {
+        panic!("an empty submit over a refusal should ask for the Session again");
+    };
+    assert_eq!(request.prompt.id, prompt.id);
+    assert_eq!(request.prompt.text, prompt.text);
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(!drawn.contains("Could not create Session"), "{drawn}");
+    assert!(drawn.contains("Working"), "{drawn}");
+}
+
+#[test]
+fn a_typed_submit_replaces_the_refused_prompt() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    refuse_creation(&mut application, &prompt, "Provider unavailable");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Rename the gadget".to_owned(),
+        )))
+        .expect("type a new Prompt over the refusal");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the replacement")
+    else {
+        panic!("a typed submit over a refusal should ask for the Session again");
+    };
+    assert_ne!(request.prompt.id, prompt.id);
+    assert_eq!(request.prompt.text, "Rename the gadget");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(!drawn.contains("Rename the widget"), "{drawn}");
+    assert_eq!(drawn.matches("Rename the gadget").count(), 2, "{drawn}");
+    assert!(drawn.contains("Working"), "{drawn}");
+}
+
+#[test]
+fn leaving_a_refused_provisional_session_keeps_its_text_as_the_landing_draft() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    refuse_creation(&mut application, &prompt, "Provider unavailable");
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("return to the Landing");
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(drawn.contains("Rename the widget"), "{drawn}");
+
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the restored draft")
+    else {
+        panic!("the restored draft should ask for the Session again");
+    };
+    assert_eq!(request.prompt.id, prompt.id);
+}
+
 #[test]
 #[ignore]
 fn dump_provisional() {

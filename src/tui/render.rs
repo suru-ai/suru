@@ -3510,13 +3510,10 @@ fn render_provisional_session(
     let skill_markers = state.composers.skill_markers(key.clone());
     let desired_composer_height =
         composer_block_height(area.height, content_width, composer_text, composer_cursor);
-    let mut tail = match provisional.error.as_deref() {
-        Some(error) => client_error_lines(
-            &format!(
-                "Could not create Session: {error} · Enter to retry, or type a new prompt"
-            ),
-            theme,
-        ),
+    let mut tail = match provisional.error {
+        // The refusal is drawn after the rows rather than projected among them:
+        // it resembles Transcript content without ever becoming part of it.
+        Some(_) => Vec::new(),
         None => {
             let context = WorkingIndicatorSlotContext {
                 session_id,
@@ -3626,6 +3623,28 @@ fn render_provisional_session(
             transcript_area.width,
             row,
         );
+    }
+    if let Some(error) = provisional.error.as_deref() {
+        let top = content_top
+            .saturating_add(u16::try_from(view.row_count()).unwrap_or(u16::MAX))
+            .saturating_add(1);
+        if top < transcript_area.bottom() {
+            frame.render_widget(
+                Paragraph::new(client_error_lines(
+                    &format!(
+                        "Could not create Session: {error} · Enter to retry, or type a new prompt"
+                    ),
+                    theme,
+                ))
+                .wrap(Wrap { trim: false }),
+                Rect::new(
+                    transcript_area.x,
+                    top,
+                    transcript_area.width,
+                    transcript_area.bottom().saturating_sub(top),
+                ),
+            );
+        }
     }
     let cursor = Some(render_composer(
         frame,

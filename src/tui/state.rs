@@ -5339,6 +5339,56 @@ impl Application {
         }
     }
 
+    /// Asks for the refused Session again.
+    ///
+    /// An empty composer means the very Prompt that was refused — the one place
+    /// an empty submit is not an error — and anything typed replaces it: a new
+    /// Prompt, drawn in the old one's place. Either way the request context the
+    /// reader submitted under is reused, so a retry cannot quietly land
+    /// somewhere else, and the refusal gives way to the Working Indicator.
+    fn retry_provisional_session(&mut self) -> ApplicationTransition {
+        let key = ComposerKey::Landing;
+        self.state.sync_composer_completion();
+        let typed = !self.state.composers.text(key.clone()).trim().is_empty();
+        if typed && let Some(error) = self.state.composers.skill_issue(key.clone()) {
+            self.state.submission_error = Some(error.to_owned());
+            self.state.composer_completion.dismiss_active();
+            return ApplicationTransition::Continue;
+        }
+        let prompt = if typed {
+            let prompt = self.state.composers.begin_submission(key.clone());
+            self.state.sync_composer_completion();
+            prompt
+        } else {
+            self.state
+                .provisional
+                .as_ref()
+                .expect("a retry answers the claim that was refused")
+                .prompt
+                .clone()
+        };
+        let claim = self
+            .state
+            .provisional
+            .as_mut()
+            .expect("a retry answers the claim that was refused");
+        claim.prompt = prompt.clone();
+        claim.error = None;
+        if let ProvisionalDispatch::Prepare(request) = &mut claim.dispatch {
+            request.description = prompt.text.clone();
+        }
+        let dispatch = claim.dispatch.clone();
+        self.state.transcript_generation = self.state.transcript_generation.wrapping_add(1);
+        self.state.failed_submissions.remove(&prompt.id);
+        self.state.submission_error = None;
+        self.state.pending_submission = Some(PendingSubmission {
+            source: key,
+            target: SubmissionTarget::CreateSession,
+            prompt: prompt.clone(),
+        });
+        dispatch.transition(prompt)
+    }
+
     /// Takes the Session the Server made in place of the claim the client drew
     /// for it, and answers with the interrupt the reader confirmed while there
     /// was nothing yet to send it to.
@@ -5372,6 +5422,14 @@ impl Application {
         }
         if self.state.pending_submission.is_some() {
             return ApplicationTransition::Continue;
+        }
+        if self
+            .state
+            .provisional
+            .as_ref()
+            .is_some_and(|claim| claim.error.is_some())
+        {
+            return self.retry_provisional_session();
         }
         // A Prompt is delivered to a Session, and a Session still loading is
         // not one yet. The draft stands where the reader wrote it and the
