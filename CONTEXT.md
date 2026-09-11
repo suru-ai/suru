@@ -49,7 +49,7 @@ A single emoji standing for a Session beside its Title, derived with that Title 
 _Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
 
 **Landing**:
-The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names that location by its path and the Checkout State of the Worktree it lies in, drawn as a Sidebar row draws it, and says instead that a new Worktree will be made on submit while that intent is pending. The user may choose an existing Worktree or ask Suru to create a new one, whose branch, starting commit, and location Suru manages.
+The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names the Workspace by its presented root, followed by the selected Worktree's Checkout State as a Sidebar row draws it and, when working in a subdirectory, the path relative to that Worktree's root; the user may choose an existing Worktree or ask Suru to create one on submit, with that pending intent shown here and its branch, starting commit, and location managed by Suru.
 _Avoid_: Home, launch view, start screen, welcome screen
 
 **Provisional Session**:

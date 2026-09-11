@@ -356,6 +356,15 @@ fn the_landing_names_the_current_checkout_state_and_prefers_the_live_reading() {
     .unwrap();
     let rendered = text(&app);
     assert!(rendered.contains("feature/moved (worktree)"), "{rendered}");
+    let location = Path::new("~").join("main");
+    assert!(
+        rendered.contains(&format!(
+            "{} · feature/moved (worktree) · nested",
+            location.display()
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains('\u{ef81}'), "{rendered}");
     assert!(!rendered.contains("feature/landing"), "{rendered}");
 }
 
@@ -374,12 +383,15 @@ fn landing_icons_decorate_the_location_checkout_and_pending_worktree() {
     key(&mut app, KeyCode::Esc);
 
     let rendered = text(&app);
-    let location = Path::new("~").join("linked").join("nested");
+    let location = Path::new("~").join("main");
     assert!(
         rendered.contains(&format!(" {}", location.display())),
         "{rendered}"
     );
-    assert!(rendered.contains(" feature/landing-icons"), "{rendered}");
+    assert!(
+        rendered.contains(" feature/landing-icons ·  nested"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("(worktree)"), "{rendered}");
 
     choose_new(&mut app, &layout);
@@ -402,6 +414,7 @@ fn landing_icons_distinguish_main_detached_and_unavailable_checkout_states() {
     answer(&mut app, transition, main);
     key(&mut app, KeyCode::Esc);
     assert!(text(&app).contains(" main"), "{}", text(&app));
+    assert!(!text(&app).contains('\u{ef81}'), "{}", text(&app));
 
     let transition = command(&mut app, SemanticCommandId::WorktreeList);
     answer(&mut app, transition, layout.context.clone());

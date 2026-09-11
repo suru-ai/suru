@@ -119,6 +119,26 @@ impl WorkspacePaths {
         self.label(root)
     }
 
+    /// A strict descendant's path relative to its root, in the owning
+    /// Server's syntax. Equal or unrelated paths have no subdirectory label.
+    pub fn subdirectory(&self, path: &Path, root: &Path) -> Option<String> {
+        let separator = self.separator();
+        let path = self.spelling(&path.to_string_lossy());
+        let root = self.spelling(&root.to_string_lossy());
+        if root.is_empty()
+            || [&path, &root]
+                .into_iter()
+                .any(|path| path.split(separator).any(|part| matches!(part, "." | "..")))
+        {
+            return None;
+        }
+        let relative = path
+            .trim_end_matches(separator)
+            .strip_prefix(root.trim_end_matches(separator))?
+            .strip_prefix(separator)?;
+        (!relative.is_empty()).then(|| relative.to_owned())
+    }
+
     fn separator(&self) -> char {
         match self.style {
             PathStyle::Unix => '/',
@@ -165,6 +185,47 @@ mod tests {
         WorkspacePaths {
             home: Some(home.to_owned()),
             style,
+        }
+    }
+
+    #[test]
+    fn subdirectories_use_the_owning_servers_syntax_and_require_containment() {
+        for (style, root, path, expected) in [
+            (PathStyle::Unix, "/repo/", "/repo/src/ui", Some("src/ui")),
+            (PathStyle::Unix, "/", "/src", Some("src")),
+            (PathStyle::Unix, "/repo", "/repo/", None),
+            (PathStyle::Unix, "/repo", "/repo-other/src", None),
+            (PathStyle::Unix, "/repo", "/repo/../src", None),
+            (
+                PathStyle::Windows,
+                r"C:\repo",
+                r"\\?\C:\repo\src\ui",
+                Some(r"src\ui"),
+            ),
+            (PathStyle::Windows, r"C:\", r"C:\src", Some("src")),
+            (
+                PathStyle::Windows,
+                r"C:\repo",
+                "C:/repo/src/ui",
+                Some(r"src\ui"),
+            ),
+            (
+                PathStyle::Windows,
+                r"\\host\share",
+                r"\\?\UNC\host\share\src",
+                Some("src"),
+            ),
+            (PathStyle::Windows, r"C:\repo", r"C:\repo", None),
+            (PathStyle::Windows, r"C:\repo", r"D:\repo\src", None),
+            (PathStyle::Windows, r"C:\repo", r"C:\repo-other\src", None),
+        ] {
+            assert_eq!(
+                paths(style, "")
+                    .subdirectory(Path::new(path), Path::new(root))
+                    .as_deref(),
+                expected,
+                "{style:?}: {path} relative to {root}"
+            );
         }
     }
 

@@ -1507,10 +1507,17 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
     assert_eq!(request.path, main);
     // Merely receiving newer grouping labels did not change execution context.
     press(&mut application, KeyCode::Esc);
-    assert!(
-        rendered_application_rows_at(&application, 180, 25)
-            .join("\n")
-            .contains("nested")
+    let ApplicationTransition::ResolveWorkspace { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::WorktreeList,
+        )))
+        .unwrap()
+    else {
+        panic!("worktree navigation resolves the current execution context")
+    };
+    assert_eq!(
+        request.remembered_execution_directory.unwrap().path,
+        execution
     );
 }
 

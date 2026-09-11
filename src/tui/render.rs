@@ -73,6 +73,8 @@ const LANDING_LOGO: [&str; 7] = [
 ];
 /// Nerd Fonts `nf-cod-folder` (Codicons folder).
 const NF_COD_FOLDER: char = '\u{ea83}';
+/// Nerd Fonts `nf-fa-folder_tree` (Font Awesome folder tree).
+const NF_FA_FOLDER_TREE: char = '\u{ef81}';
 /// Nerd Fonts `nf-md-monitor` (Material Design monitor).
 const NF_MD_MONITOR: char = '\u{f0379}';
 /// Nerd Fonts `nf-cod-git_branch` (Codicons git-branch).
@@ -3201,8 +3203,8 @@ fn pad_to_width(text: &str, width: usize) -> String {
 /// when the Prompt was submitted.
 fn execution_context(state: &TuiState, show_icons: bool) -> String {
     match state.execution_directory.as_deref() {
-        Some(path) => {
-            let label = workspace_context(state, path, true);
+        Some(_) => {
+            let label = workspace_context(state, &state.workspace.path, true);
             let status = if matches!(
                 state.execution_status,
                 crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
@@ -3219,6 +3221,10 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
                 .and_then(|checkout| checkout_state_context(checkout, show_icons))
                 .map(|checkout| format!(" · {checkout}"))
                 .unwrap_or_default();
+            let subdirectory = state
+                .execution_subdirectory()
+                .map(|path| format!(" · {}", icon_label(show_icons, NF_FA_FOLDER_TREE, &path)))
+                .unwrap_or_default();
             // A pending intent is only ever said where there is a
             // Repository to make it in, and only until it has been carried
             // out: a Worktree already made is said by the path above and the
@@ -3234,7 +3240,7 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
             } else {
                 String::new()
             };
-            format!("{label}{status}{checkout}{intent}")
+            format!("{label}{status}{checkout}{subdirectory}{intent}")
         }
         None => {
             let intent = if state.new_worktree.is_some() {

@@ -1245,6 +1245,13 @@ impl TuiState {
             .or(resolved.reading.as_ref())
     }
 
+    pub(super) fn execution_subdirectory(&self) -> Option<String> {
+        let path = self.execution_directory.as_deref()?;
+        let checkout = self.outlook_execution_checkouts.get(&self.outlook)?;
+        let root = &checkout.association.as_ref()?.root;
+        self.paths_for(&self.outlook)?.subdirectory(path, root)
+    }
+
     /// The path facts a path of this Origin's is spelled by: the ones its own
     /// Server answered with, or — for the Client's own Server alone, which
     /// runs on this very machine — the ones this machine has. A Remote that
