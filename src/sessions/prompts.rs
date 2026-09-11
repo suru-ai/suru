@@ -175,6 +175,13 @@ impl SessionStore {
             return Err(CreateSessionError::EmptyPrompt);
         }
 
+        // A Prompt id is claimed for the life of the server, so a retry always
+        // finds the Session that Prompt already made — including one whose
+        // Prompt was withdrawn by an interrupt, which answers with that
+        // Session and its Cancelled Prompt rather than making a second Session
+        // or starting the withdrawn work again. Asking for that work again is
+        // a new Prompt, which is what a client's retry after a withdrawal
+        // submits (ADR 0024).
         let retry_execution_directory = {
             let state = self
                 .state

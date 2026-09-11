@@ -214,6 +214,142 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
         "the withdrawn Prompt never reaches the Provider"
     );
 
+    // Retrying the creation that made this Session finds the Session it
+    // already made, Cancelled Prompt and all: the Prompt id is what makes a
+    // creation idempotent, and withdrawing its Prompt neither deletes the
+    // Session nor frees the id to make another.
+    let retried = crate::support::create_session(
+        &descriptor,
+        &creation(workspace.path(), prompt_id, "Map the provider seams"),
+    )
+    .await;
+    assert_eq!(retried.session.id, created.session.id);
+    assert_eq!(retried.prompts[0].status, PromptStatus::Cancelled);
+    assert_eq!(retried.session.working_since, None);
+    assert!(retried.turns.is_empty());
+    assert!(
+        provider_session.try_next_turn().is_none(),
+        "a retry starts no work the withdrawal ended"
+    );
+
+    drop(provider_session);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_follow_up_prompt_on_an_idle_session_is_working_and_withdrawable() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "withdraw-follow-up-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = crate::support::create_session(
+        &descriptor,
+        &creation(workspace.path(), PromptId::new(), "Map the provider seams"),
+    )
+    .await;
+    // The first startup fails, which leaves the Session idle, with a Failed
+    // Turn and no Provider connection — so the follow-up below must start one
+    // of its own, and waits where this test can see it.
+    timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .fail("the Provider is not installed");
+    let idle = read_session_until(
+        &client,
+        &descriptor,
+        created.session.id,
+        "the failed startup leaves the Session standing",
+        |snapshot| !snapshot.turns.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        idle.session.working_since, None,
+        "a startup that fails ends the Working its admission began"
+    );
+    assert_eq!(idle.session.status, SessionStatus::Idle);
+
+    let follow_up = PromptId::new();
+    let admitted = client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&suru::protocol::AdmitPromptRequest {
+            delivery: suru::protocol::PromptDelivery::Steer,
+            prompt: InitialPrompt {
+                id: follow_up,
+                text: "Try that again".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("admit a follow-up Prompt");
+    assert_eq!(admitted.status(), reqwest::StatusCode::CREATED);
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("the follow-up starts the Provider");
+    let working = read_session_until(
+        &client,
+        &descriptor,
+        created.session.id,
+        "the follow-up Prompt puts the Session back to work",
+        |snapshot| snapshot.session.working_since.is_some(),
+    )
+    .await;
+    assert_eq!(working.session.status, SessionStatus::Active);
+    assert_eq!(working.turns.len(), 1, "no second Turn has begun");
+
+    let response = interrupt(&client, &descriptor, created.session.id).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let outcome = response
+        .json::<InterruptOutcome>()
+        .await
+        .expect("decode the interrupt outcome");
+    let InterruptOutcome::WithdrewPrompt { prompt } = outcome else {
+        panic!("one rule covers both Prompts owed a Turn: {outcome:?}")
+    };
+    assert_eq!(prompt.id, follow_up);
+    assert_eq!(prompt.text, "Try that again");
+
+    let withdrawn = read_session_until(
+        &client,
+        &descriptor,
+        created.session.id,
+        "the withdrawn follow-up leaves the Session standing",
+        |snapshot| snapshot.session.working_since.is_none(),
+    )
+    .await;
+    assert_eq!(withdrawn.session.status, SessionStatus::Idle);
+    assert_eq!(withdrawn.prompts[1].status, PromptStatus::Cancelled);
+    assert_eq!(withdrawn.turns.len(), 1);
+
+    let mut provider_session = start.succeed(suru::protocol::AgentIdentity {
+        agent: suru::protocol::AgentId::new("controlled-agent"),
+        selection: crate::support::controlled_selection("gpt-withdrawn", "high", "fast"),
+    });
+    let abandoned = read_session_until(
+        &client,
+        &descriptor,
+        created.session.id,
+        "the abandoned startup reaches the Session without beginning a Turn",
+        |snapshot| snapshot.session.agent_selection.is_some(),
+    )
+    .await;
+    assert_eq!(abandoned.turns.len(), 1, "no Turn was begun");
+    assert!(
+        provider_session.try_next_turn().is_none(),
+        "the withdrawn Prompt never reaches the Provider"
+    );
+
     drop(provider_session);
     server.shutdown().await.expect("shut down server");
 }
