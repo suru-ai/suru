@@ -245,6 +245,10 @@ impl SessionStore {
 
         let title = request.prompt.text.trim().to_owned();
         let session_id = intended_session.unwrap_or_else(SessionId::new);
+        // The Session is Working from this moment: its Prompt is admitted to
+        // begin a Turn, and the elapsed time every surface reads is attributed
+        // from here rather than from whenever the Provider answers (ADR 0024).
+        let timestamp = state.next_timestamp();
         let prompt = Prompt {
             id: request.prompt.id,
             text: request.prompt.text.clone(),
@@ -253,6 +257,7 @@ impl SessionStore {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
         };
+        let prompt_id = prompt.id;
         let snapshot = SessionSnapshot {
             title: title.clone(),
             emoji: None,
@@ -266,8 +271,8 @@ impl SessionStore {
                 workspace: location.workspace,
                 agent_selection: request.agent_selection.clone(),
                 agent_selection_availability: ModelAvailability::Available,
-                status: SessionStatus::Idle,
-                working_since: None,
+                status: SessionStatus::Active,
+                working_since: Some(timestamp),
                 parent: None,
             },
             revision: SessionRevision::INITIAL,
@@ -282,7 +287,6 @@ impl SessionStore {
             subagent_usage: None,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
-        let timestamp = state.next_timestamp();
         let summary = SessionSummary {
             checkout_state: None,
             session: snapshot.session.clone(),
@@ -323,7 +327,7 @@ impl SessionStore {
                 updates,
                 next_prompt_order: PromptOrder(2),
                 steer_targets: HashMap::new(),
-                pending_turn_starts: Default::default(),
+                turn_start_admissions: HashMap::from([(prompt_id, timestamp)]),
                 selection_operations: HashMap::new(),
                 viewed_operations: Default::default(),
                 selection_retry_prompt: None,
@@ -412,13 +416,19 @@ impl SessionStore {
         // marker goes before the commit, so the summary that commit persists is
         // the active one and the announcement follows the Prompt it belongs to.
         let reactivation = record.reactivate(session_id);
+        // An admission owed its own Turn begins Working with the commit that
+        // admits it, so the commit stamps the admission moment it derives
+        // that reading from (ADR 0024).
+        let turn_start = matches!(disposition, PromptAdmissionDisposition::StartImmediately)
+            .then_some(prompt.id);
         state
-            .commit(
+            .commit_admission(
                 &self.storage,
                 session_id,
                 vec![SessionChange::PromptAdded {
                     prompt: prompt.clone(),
                 }],
+                turn_start,
             )
             .expect("admission changes preserve Session invariants");
         let record = state
@@ -428,8 +438,6 @@ impl SessionStore {
         record.next_prompt_order = next_prompt_order;
         if let Some(turn_id) = steer_target {
             record.steer_targets.insert(prompt.id, turn_id);
-        } else if matches!(disposition, PromptAdmissionDisposition::StartImmediately) {
-            record.pending_turn_starts.insert(prompt.id);
         }
         state.prompts.insert(
             request.prompt.id,
@@ -508,7 +516,6 @@ impl SessionStore {
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
         record.steer_targets.remove(&prompt_id);
-        record.pending_turn_starts.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }
@@ -699,7 +706,7 @@ impl SessionStore {
                 .filter(|prompt| {
                     prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
-                        && !record.pending_turn_starts.contains(&prompt.id)
+                        && !record.turn_start_admissions.contains_key(&prompt.id)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -822,7 +829,6 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
-        record.pending_turn_starts.remove(&prompt_id);
         if record.selection_retry_prompt == Some(prompt_id) {
             record.selection_retry_prompt = None;
         }

@@ -67,7 +67,10 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
         suru::paths::canonical(&workspace).expect("canonicalize expected Workspace")
     );
     assert_eq!(snapshot.session.agent_selection, None);
-    assert_eq!(snapshot.session.status, SessionStatus::Idle);
+    // The Prompt was admitted to begin a Turn, so the Session is already at
+    // work over it (ADR 0024).
+    assert_eq!(snapshot.session.status, SessionStatus::Active);
+    assert!(snapshot.session.working_since.is_some());
     assert_eq!(snapshot.prompts.len(), 1);
     assert_eq!(snapshot.prompts[0].id, prompt_id);
     assert_eq!(snapshot.prompts[0].status, PromptStatus::Pending);

@@ -62,6 +62,23 @@ impl SessionStoreState {
             let reading = working.working_since();
             record.snapshot.session.working_since = reading;
             record.summary.session.working_since = reading;
+            // A Prompt admitted to begin a Turn is owed one only by the
+            // process that admitted it: nothing survives a restart to start
+            // it, so a restored Session is at work only where a durable Turn
+            // says so, and its status says the same thing its Working reading
+            // does (ADR 0024).
+            let status = if record
+                .snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.status == crate::protocol::TurnStatus::Active)
+            {
+                crate::protocol::SessionStatus::Active
+            } else {
+                crate::protocol::SessionStatus::Idle
+            };
+            record.snapshot.session.status = status;
+            record.summary.session.status = status;
             record.snapshot.subagent_usage = delegated;
             // Reads only this Session's Turns; child totals already include
             // their descendants and preserve absent measurements versus zero.

@@ -4,10 +4,12 @@
 
 use anyhow::anyhow;
 
+use std::collections::HashMap;
+
 use crate::protocol::{
-    PromptOrder, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStandingInputs, SessionStatus, SessionTimestamp, SessionUpdate, TurnId, TurnStatus,
-    UsageTotal,
+    Prompt, PromptId, PromptOrder, PromptStatus, SessionCatalogChange, SessionChange, SessionId,
+    SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus, SessionTimestamp,
+    SessionUpdate, TurnId, TurnStatus, UsageTotal,
 };
 use crate::session_projection::apply_update;
 use crate::storage::StorageSink;
@@ -41,12 +43,31 @@ impl SessionStoreState {
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
+        changes: Vec<SessionChange>,
+    ) -> anyhow::Result<SessionUpdate> {
+        self.commit_admission(storage, session_id, changes, None)
+    }
+
+    /// Commits a batch that admits `turn_start` to begin a Turn of its own.
+    /// The admission moment is the commit's own, because that is when the
+    /// Session began Working: the Prompt is owed a Turn from here until it is
+    /// delivered, fails, or is withdrawn, whatever the Provider is doing.
+    pub(super) fn commit_admission(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
         mut changes: Vec<SessionChange>,
+        turn_start: Option<PromptId>,
     ) -> anyhow::Result<SessionUpdate> {
         if self.is_deferred(session_id) {
             return Err(anyhow!("Session history must be hydrated before mutation"));
         }
         let updated_at = self.next_timestamp();
+        if let Some(prompt_id) = turn_start
+            && let Some(record) = self.sessions.get_mut(&session_id)
+        {
+            record.turn_start_admissions.insert(prompt_id, updated_at);
+        }
         // Working is a server derivation. Callers can describe the Turn
         // transition that changes it, but cannot inject a competing clock.
         changes.retain(|change| !matches!(change, SessionChange::SessionWorkingChanged { .. }));
@@ -261,7 +282,7 @@ impl SessionStoreState {
     /// This Session and every Subagent Session below it, to any depth, each
     /// reached after the Session that spawned it — so a walk in reverse
     /// answers the deepest first.
-    fn subtree(&self, session_id: SessionId) -> Vec<SessionId> {
+    pub(super) fn subtree(&self, session_id: SessionId) -> Vec<SessionId> {
         let mut walk = vec![session_id];
         let mut visit = 0;
         while visit < walk.len() {
@@ -338,14 +359,15 @@ impl SessionStoreState {
     ) -> Option<SessionTimestamp> {
         let mut intervals = Vec::new();
         for current in self.subtree(session_id) {
-            let snapshot = if current == session_id {
-                projected.or_else(|| self.sessions.get(&current).map(|record| &record.snapshot))
-            } else {
-                self.sessions.get(&current).map(|record| &record.snapshot)
-            };
-            let Some(snapshot) = snapshot else {
+            let Some(record) = self.sessions.get(&current) else {
                 continue;
             };
+            let snapshot = if current == session_id {
+                projected.unwrap_or(&record.snapshot)
+            } else {
+                &record.snapshot
+            };
+            intervals.extend(owed_turn_intervals(snapshot, &record.turn_start_admissions));
             intervals.extend(snapshot.turns.iter().filter_map(|turn| {
                 let started_at = turn.started_at?;
                 let settled_at = if turn.status.is_terminal() {
@@ -467,7 +489,7 @@ impl SessionRecord {
         };
         let mut next = self.snapshot.clone();
         apply_update(&mut next, &update)?;
-        let status = derived_session_status(&next)?;
+        let status = derived_session_status(&next, &self.turn_start_admissions)?;
         if next.session.status != status {
             next.session.status = status;
             changes.push(SessionChange::SessionStatusChanged { status });
@@ -605,10 +627,76 @@ pub(super) fn active_turn_id(snapshot: &SessionSnapshot) -> anyhow::Result<Optio
     Ok(first)
 }
 
-fn derived_session_status(snapshot: &SessionSnapshot) -> anyhow::Result<SessionStatus> {
-    Ok(if active_turn_id(snapshot)?.is_some() {
-        SessionStatus::Active
-    } else {
-        SessionStatus::Idle
-    })
+/// A Session is Active while it is running a Turn and while it still owes one
+/// to a Prompt it has admitted but not delivered: both are the Session at
+/// work, and a surface reading the status to explain Working must find one
+/// either side of the delivery that joins them (ADR 0024).
+fn derived_session_status(
+    snapshot: &SessionSnapshot,
+    turn_start_admissions: &HashMap<PromptId, SessionTimestamp>,
+) -> anyhow::Result<SessionStatus> {
+    Ok(
+        if active_turn_id(snapshot)?.is_some() || owes_a_turn(snapshot, turn_start_admissions) {
+            SessionStatus::Active
+        } else {
+            SessionStatus::Idle
+        },
+    )
+}
+
+/// Whether any Prompt admitted to begin a Turn is still waiting to be
+/// delivered.
+pub(super) fn owes_a_turn(
+    snapshot: &SessionSnapshot,
+    turn_start_admissions: &HashMap<PromptId, SessionTimestamp>,
+) -> bool {
+    undelivered_turn_starts(snapshot, turn_start_admissions)
+        .next()
+        .is_some()
+}
+
+/// Every Prompt this Session was admitted to begin a Turn with and has not
+/// delivered, earliest admission first.
+pub(super) fn undelivered_turn_starts<'a>(
+    snapshot: &'a SessionSnapshot,
+    turn_start_admissions: &'a HashMap<PromptId, SessionTimestamp>,
+) -> impl Iterator<Item = &'a Prompt> {
+    let mut owed = snapshot
+        .prompts
+        .iter()
+        .filter(|prompt| {
+            prompt.status == PromptStatus::Pending && turn_start_admissions.contains_key(&prompt.id)
+        })
+        .collect::<Vec<_>>();
+    owed.sort_unstable_by_key(|prompt| prompt.admission_order);
+    owed.into_iter()
+}
+
+/// The Working intervals this Session's own admissions contribute: one open
+/// interval for a Prompt still owed its Turn, and one closed at the Turn's
+/// start for a Prompt whose Turn has begun — which is what keeps Working
+/// continuous across a delivery instead of restarting it at the Turn. A
+/// Prompt that ended without a Turn — withdrawn, or cancelled where it stood —
+/// contributes nothing, so the Session stops Working the moment it does.
+fn owed_turn_intervals<'a>(
+    snapshot: &'a SessionSnapshot,
+    turn_start_admissions: &'a HashMap<PromptId, SessionTimestamp>,
+) -> impl Iterator<Item = (SessionTimestamp, Option<SessionTimestamp>)> {
+    turn_start_admissions
+        .iter()
+        .filter_map(|(prompt_id, admitted_at)| {
+            let prompt = snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == *prompt_id)?;
+            if prompt.status == PromptStatus::Pending {
+                return Some((*admitted_at, None));
+            }
+            let started_at = snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.prompt_id == Some(*prompt_id))?
+                .started_at?;
+            Some((*admitted_at, Some(started_at)))
+        })
 }

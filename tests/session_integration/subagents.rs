@@ -528,10 +528,15 @@ async fn working_duration_stays_continuous_when_only_subagents_remain() {
         SessionRevision(3),
     )
     .await;
-    let started_at = before_spawn.turns[0]
+    let turn_started_at = before_spawn.turns[0]
         .started_at
-        .expect("the parent Turn knows when Working began");
-    assert_eq!(before_spawn.working_since(), Some(started_at));
+        .expect("the parent Turn knows when it began");
+    // Working began when the Prompt that owed this Turn was admitted, which
+    // the Turn starting continues rather than restarts (ADR 0024).
+    let started_at = before_spawn
+        .working_since()
+        .expect("the Session is Working");
+    assert!(started_at < turn_started_at);
 
     fixture
         .provider_session
@@ -621,8 +626,10 @@ async fn working_duration_stays_continuous_when_only_subagents_remain() {
         .expect("decode restored parent");
     assert_eq!(
         restored_parent.working_since(),
-        Some(started_at),
-        "restart reconstructs the parent's uninterrupted subtree clock"
+        Some(turn_started_at),
+        "restart reconstructs the parent's uninterrupted subtree clock from \
+         the durable Turns, the admission that preceded the first of them \
+         having belonged to the process that admitted it"
     );
     let Activity::Subagent {
         session_id: child_id,

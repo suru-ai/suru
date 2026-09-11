@@ -93,9 +93,15 @@ struct SessionRecord {
     updates: broadcast::Sender<SessionUpdate>,
     next_prompt_order: PromptOrder,
     steer_targets: HashMap<PromptId, TurnId>,
-    /// Admissions owed their own Turn, even if their command reaches the actor
-    /// after the Continuation they were admitted during has settled.
-    pending_turn_starts: HashSet<PromptId>,
+    /// Every Prompt admitted to begin a Turn of its own, against the moment
+    /// it was admitted — the moment its Session began Working, before any
+    /// Provider was reached (ADR 0024). An entry outlives its Prompt's
+    /// delivery so the Working interval it opened can be closed against the
+    /// Turn that Prompt began, leaving no gap between admission and Turn; it
+    /// also keeps a queued admission owed its own Turn even when its command
+    /// reaches the actor after the Continuation it was admitted during has
+    /// settled.
+    turn_start_admissions: HashMap<PromptId, SessionTimestamp>,
     selection_operations: HashMap<AgentSelectionOperationId, AgentSelection>,
     viewed_operations: HashSet<ViewSessionOperationId>,
     selection_retry_prompt: Option<PromptId>,

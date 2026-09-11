@@ -274,6 +274,20 @@ async fn managed_clients_observe_durable_session_deletion() {
                 })
     ));
 
+    // The failed startup ends the Working the admission began, which every
+    // listing client hears before anything else moves (ADR 0024).
+    assert_eq!(
+        timeout(PROGRESS_DEADLINE, observing_client.next())
+            .await
+            .expect("the end of Working reaches the connected client"),
+        Some(ManagedEvent::SessionWorkingChanged(
+            suru::protocol::SessionWorkingChanged {
+                session_id,
+                working_since: None,
+            }
+        ))
+    );
+
     deleting_client
         .delete_session(session_id)
         .await

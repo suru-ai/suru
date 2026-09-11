@@ -113,7 +113,7 @@ impl SessionStore {
                 updates,
                 next_prompt_order: PromptOrder(1),
                 steer_targets: HashMap::new(),
-                pending_turn_starts: Default::default(),
+                turn_start_admissions: Default::default(),
                 selection_operations: HashMap::new(),
                 viewed_operations: Default::default(),
                 selection_retry_prompt: None,

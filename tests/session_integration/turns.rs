@@ -179,7 +179,10 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .expect("create Session without waiting for Provider startup");
     assert_eq!(created.revision, SessionRevision::INITIAL);
     assert_eq!(created.session.agent_selection, None);
-    assert_eq!(created.session.status, SessionStatus::Idle);
+    // The Session owes a Turn to the Prompt it was made with, so it is at
+    // work before the Provider has been reached (ADR 0024).
+    assert_eq!(created.session.status, SessionStatus::Active);
+    assert!(created.session.working_since.is_some());
     assert_eq!(created.prompts.len(), 1);
     assert_eq!(created.prompts[0].status, PromptStatus::Pending);
     assert!(created.turns.is_empty());
@@ -262,14 +265,13 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                 && message.role == MessageRole::User
                 && message.content == "Explain the provider seam")
     }));
-    assert!(first_delivery.changes.iter().any(|change| {
-        matches!(
-            change,
-            SessionChange::SessionStatusChanged {
-                status: SessionStatus::Active,
-            }
-        )
-    }));
+    assert!(
+        !first_delivery.changes.iter().any(|change| {
+            matches!(change, SessionChange::SessionStatusChanged { .. })
+        }),
+        "the Session has read as Active since its Prompt was admitted, so \
+         delivering that Prompt moves no status"
+    );
 
     turn_request.succeed();
     for event in [
@@ -1959,9 +1961,13 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
     );
     assert_eq!(
         running.session.working_since,
-        Some(started_at),
-        "a listing says live work has been running since its Turn began, \
-         which is what a client draws a Working duration from"
+        created.session.working_since,
+        "a listing says live work has been running since the Prompt that owed \
+         this Turn was admitted, which the Turn starting does not restart"
+    );
+    assert!(
+        running.session.working_since.is_some_and(|since| since < started_at),
+        "the admission moment precedes the Turn it began"
     );
     assert_eq!(
         running.standing_inputs.latest_turn,
@@ -2081,14 +2087,10 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
             _ => None,
         })
         .expect("Prompt delivery creates a Turn that knows when it started");
-    assert_eq!(
-        next_catalog_change(&mut catalog).await,
-        SessionCatalogChange::WorkingChanged {
-            session_id,
-            working_since: Some(started_at),
-        },
-        "a Turn starting reaches every client listing the Session, \
-         open or not, so a Sidebar's Working label can be true"
+    assert!(
+        created.session.working_since.is_some_and(|since| since < started_at),
+        "the Session was already Working when its Prompt was admitted, so the \
+         Turn starting moves no listing's reading and announces nothing"
     );
 
     provider_session.next_turn().await.succeed();

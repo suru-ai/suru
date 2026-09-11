@@ -439,7 +439,24 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
         .await
         .expect("decode Session summaries after restart");
     let after_restart = readable_session_summaries(after_restart);
-    assert_eq!(after_restart, before_restart);
+    // A Prompt admitted to begin a Turn is owed one only by the process that
+    // admitted it, so a restored Session with no durable Turn is no longer at
+    // work; everything else about its metadata survives (ADR 0024).
+    assert_eq!(before_restart[0].session.status, SessionStatus::Active);
+    assert!(before_restart[0].session.working_since.is_some());
+    assert_eq!(after_restart[0].session.status, SessionStatus::Idle);
+    assert_eq!(after_restart[0].session.working_since, None);
+    assert_eq!(
+        after_restart,
+        before_restart
+            .into_iter()
+            .map(|mut summary| {
+                summary.session.status = SessionStatus::Idle;
+                summary.session.working_since = None;
+                summary
+            })
+            .collect::<Vec<_>>()
+    );
 
     replacement
         .shutdown()
