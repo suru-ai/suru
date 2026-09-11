@@ -52,6 +52,10 @@ _Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
 The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names that location by its path and the Checkout State of the Worktree it lies in, drawn as a Sidebar row draws it, and says instead that a new Worktree will be made on submit while that intent is pending. The user may choose an existing Worktree or ask Suru to create a new one, whose branch, starting commit, and location Suru manages.
 _Avoid_: Home, launch view, start screen, welcome screen
 
+**Provisional Session**:
+The Session view a client shows from the moment the Landing's first Prompt is submitted until the Server answers with the Session it made, drawn from what the client already knows — the Prompt as a user Message, the Title the Prompt gives, the Execution Directory, the Agent Selection, and the Working Indicator — before any of it is confirmed. It is that client's own claim, never listed in the Sidebar, and replaced in place by the real Session when it arrives; its Working Indicator carries no elapsed time, because only the Server knows when Working began. Its composer takes a draft but delivers nothing until the Session arrives, and a newer route abandons it without pulling the client back. If the Server refuses, the view stands with the user Message in place and a client-local, transcript-shaped **Error: Could not create Session:** row where the Working Indicator was, saying that Enter retries and that a new prompt may be typed instead: an empty submit retries the same Prompt, and text submitted replaces it as a new Prompt. Leaving a failed Provisional Session discards it and keeps its text as the Landing's draft.
+_Avoid_: Optimistic session, pending session, draft session, creating state
+
 **Workspace**:
 The working context that groups Sessions on one Server by their shared Repository, including its Worktrees and their subdirectories, or by an individual directory outside source control. Separate clones and nested Repositories are separate Workspaces; a Workspace is presented by its main root, bare root, or repository metadata location when the main root is unknown, without making that label its identity or its Sessions' Execution Directory.
 _Avoid_: Project, working directory, location
@@ -85,7 +89,7 @@ The transition of a Turn or Activity into a terminal state — completed, failed
 _Avoid_: Finish, close, resolve; archive (for a settled Session)
 
 **Working**:
-The liveness of a Session whose current Turn has not Settled or whose surviving Subagents still work after that Turn Settles. Working is continuous across that boundary and applies at every depth of the Session tree.
+The liveness of a Session that owes a Turn to an admitted Prompt, whose current Turn has not Settled, or whose surviving Subagents still work after that Turn Settles. Working begins the moment a Prompt is admitted to begin a Turn, before the Agent has been reached, is continuous across each of those boundaries, and applies at every depth of the Session tree. Interrupting a Session that is Working only for a Prompt it has not yet delivered **withdraws** that Prompt instead of stopping a Turn: the Prompt is cancelled, the Session stays as it is, and the client returns the text to the composer.
 _Avoid_: Active, busy, running
 
 **Usage**:
@@ -169,7 +173,7 @@ The Activity recording one Provider-reported operation over one or more files in
 _Avoid_: Patch, file edit
 
 **Transcript**:
-The ordered, user-visible history of a Session: its Messages and Activities in presentation order.
+The ordered, user-visible history of a Session: its Messages and Activities in presentation order. A Prompt admitted to begin a Turn but not yet delivered is drawn by every client in the Transcript's position as the user Message it will become, so no reader waits on the Agent to see what was asked.
 _Avoid_: History, log, conversation
 
 **Working Indicator**:
