@@ -6,7 +6,7 @@ use crate::protocol::{
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 mod git;
@@ -485,11 +485,32 @@ impl SourceControlService {
         directory: &Path,
         known: Option<&Workspace>,
     ) -> ResolvedWorkspace {
-        let mut resolved = self.adapter.discover(directory).await;
+        self.resolve_in_batch(&mut DiscoveryBatch::default(), directory, known)
+            .await
+    }
+    /// Resolve within one discovery batch, so that several directories which
+    /// fall back to the same Repository metadata or main checkout are read from
+    /// source control once rather than once per directory.
+    pub(crate) async fn resolve_in_batch(
+        &self,
+        batch: &mut DiscoveryBatch,
+        directory: &Path,
+        known: Option<&Workspace>,
+    ) -> ResolvedWorkspace {
+        let mut resolved = batch.discover(self.adapter.as_ref(), directory).await;
         if resolved.workspace.repository.is_none()
             && let Some(repository) = known.and_then(|known| known.repository.as_ref())
         {
-            let remembered = self.adapter.discover(&repository.metadata_directory).await;
+            // A checkout of the known Repository already read in this batch
+            // is a better reading of it than its bare metadata directory.
+            let remembered = match batch.reading_of(&repository.id) {
+                Some(reading) => reading,
+                None => {
+                    batch
+                        .discover(self.adapter.as_ref(), &repository.metadata_directory)
+                        .await
+                }
+            };
             if remembered
                 .workspace
                 .repository
@@ -544,7 +565,7 @@ impl SourceControlService {
                     })
             });
         if let Some((id, root)) = remembered_main {
-            let main = self.adapter.discover(&root).await;
+            let main = batch.discover(self.adapter.as_ref(), &root).await;
             if main
                 .workspace
                 .repository
@@ -588,6 +609,37 @@ impl SourceControlService {
     }
 }
 
+/// Adapter readings memoized for the span of one discovery batch. Readings are
+/// keyed by the path handed to the adapter, so the batch never guesses that
+/// two spellings of a directory are the same place.
+#[derive(Default)]
+pub(crate) struct DiscoveryBatch {
+    readings: HashMap<PathBuf, ResolvedWorkspace>,
+}
+
+impl DiscoveryBatch {
+    async fn discover(&mut self, adapter: &dyn SourceControl, path: &Path) -> ResolvedWorkspace {
+        if let Some(reading) = self.readings.get(path) {
+            return reading.clone();
+        }
+        let reading = adapter.discover(path).await;
+        self.readings.insert(path.to_owned(), reading.clone());
+        reading
+    }
+    fn reading_of(&self, repository: &RepositoryId) -> Option<ResolvedWorkspace> {
+        self.readings
+            .values()
+            .find(|reading| {
+                reading
+                    .workspace
+                    .repository
+                    .as_ref()
+                    .is_some_and(|known| &known.id == repository)
+            })
+            .cloned()
+    }
+}
+
 pub(crate) fn repository_workspace(repository: &Repository) -> Workspace {
     Workspace {
         id: repository.id.workspace_id(),
@@ -603,4 +655,92 @@ pub(crate) struct ExecutionLease {
     pub(crate) guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     pub(crate) incarnation: u64,
     pub(crate) recreated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Knows one Repository by its metadata directory and nothing else.
+    struct MetadataOnly {
+        metadata: PathBuf,
+        metadata_readings: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SourceControl for MetadataOnly {
+        async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+            let mut resolved = ResolvedWorkspace::directory(directory.to_owned());
+            if directory == self.metadata {
+                self.metadata_readings.fetch_add(1, Ordering::SeqCst);
+                let repository = Repository {
+                    id: RepositoryId::from_metadata("fake", &self.metadata),
+                    system: "fake".to_owned(),
+                    metadata_directory: self.metadata.clone(),
+                    location: RepositoryLocation::Main {
+                        root: self.metadata.clone(),
+                    },
+                    availability: SourceControlAvailability::Available,
+                    capabilities: crate::protocol::SourceControlCapabilities::discovery_only(),
+                };
+                resolved.workspace = repository_workspace(&repository);
+            } else {
+                resolved.workspace.source_control = SourceControlAvailability::Unavailable {
+                    reason: "missing".to_owned(),
+                };
+            }
+            resolved
+        }
+    }
+
+    #[tokio::test]
+    async fn one_batch_reads_shared_repository_metadata_once() {
+        let metadata = PathBuf::from("repository-metadata");
+        let adapter = Arc::new(MetadataOnly {
+            metadata: metadata.clone(),
+            metadata_readings: AtomicUsize::new(0),
+        });
+        let service = SourceControlService::new(adapter.clone());
+        let known = adapter.discover(&metadata).await.workspace;
+        assert_eq!(adapter.metadata_readings.swap(0, Ordering::SeqCst), 1);
+
+        let mut batch = DiscoveryBatch::default();
+        service.resolve_in_batch(&mut batch, &metadata, None).await;
+        assert_eq!(adapter.metadata_readings.load(Ordering::SeqCst), 1);
+        for missing in ["missing-a", "missing-b", "missing-c"] {
+            let resolved = service
+                .resolve_in_batch(&mut batch, Path::new(missing), Some(&known))
+                .await;
+            let repository = resolved
+                .workspace
+                .repository
+                .expect("the known Repository survives a missing directory");
+            assert_eq!(repository.id, known.repository.as_ref().unwrap().id);
+        }
+        assert_eq!(
+            adapter.metadata_readings.load(Ordering::SeqCst),
+            1,
+            "missing directories reuse the batch's reading of their Repository"
+        );
+
+        let mut batch = DiscoveryBatch::default();
+        for missing in ["missing-a", "missing-b"] {
+            service
+                .resolve_in_batch(&mut batch, Path::new(missing), Some(&known))
+                .await;
+        }
+        assert_eq!(
+            adapter.metadata_readings.load(Ordering::SeqCst),
+            2,
+            "without a checkout reading, the metadata directory is read once per batch"
+        );
+
+        service.resolve(Path::new("missing-d"), Some(&known)).await;
+        assert_eq!(
+            adapter.metadata_readings.load(Ordering::SeqCst),
+            3,
+            "a fresh resolution outside the batch reads again"
+        );
+    }
 }

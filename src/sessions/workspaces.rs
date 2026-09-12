@@ -19,7 +19,7 @@ impl SessionStore {
         source_control: &SourceControlService,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
-        let sessions = self
+        let mut sessions = self
             .state
             .lock()
             .unwrap()
@@ -30,12 +30,16 @@ impl SessionStore {
         for session in &sessions {
             source_control.remember(&session.workspace);
         }
+        // Present directories first: a missing one then reuses the batch's
+        // reading of its Repository instead of reading the metadata directory.
+        sessions.sort_by_key(|session| !session.execution_directory.path.is_dir());
         let session_count = sessions.len();
         let mut resolutions = 0usize;
         let mut discovered: std::collections::HashMap<
             std::path::PathBuf,
             crate::protocol::ResolvedWorkspace,
         > = std::collections::HashMap::new();
+        let mut batch = crate::source_control::DiscoveryBatch::default();
         for session in sessions {
             let resolution =
                 if let Some(resolution) = discovered.get(&session.execution_directory.path) {
@@ -48,7 +52,11 @@ impl SessionStore {
                 } else {
                     resolutions += 1;
                     let resolution = source_control
-                        .resolve(&session.execution_directory.path, Some(&session.workspace))
+                        .resolve_in_batch(
+                            &mut batch,
+                            &session.execution_directory.path,
+                            Some(&session.workspace),
+                        )
                         .await;
                     discovered.insert(session.execution_directory.path.clone(), resolution.clone());
                     resolution
