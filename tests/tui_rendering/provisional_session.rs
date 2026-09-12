@@ -9,7 +9,7 @@ use suru::{
     protocol::{
         InitialPrompt, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
         PromptStatus, Session, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionTimestamp, Workspace,
+        SessionTimestamp, Turn, TurnId, TurnStatus, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -463,4 +463,278 @@ fn landing_submit_draws_the_provisional_session_at_once() {
     assert!(!drawn.contains("0s"), "{drawn}");
     // The composer stands empty and ready for a draft.
     assert!(drawn.contains("Type a prompt"), "{drawn}");
+}
+
+/// A steer another client admitted, or this one did: Pending and owed a Turn
+/// unless `turn` names one that has taken it.
+fn admitted_steer(text: &str, order: u64, id: PromptId) -> Prompt {
+    Prompt {
+        id,
+        text: text.to_owned(),
+        skill_invocations: Vec::new(),
+        delivery: PromptDelivery::Steer,
+        admission_order: PromptOrder(order),
+        status: PromptStatus::Pending,
+    }
+}
+
+/// A Turn that has taken the Prompt it names. Whatever became of it, that
+/// Prompt is no longer one the Session is waiting to deliver.
+fn turn_for(prompt_id: PromptId) -> Turn {
+    Turn {
+        id: TurnId::new(),
+        prompt_id: Some(prompt_id),
+        agent: None,
+        status: TurnStatus::Completed,
+        started_at: Some(SessionTimestamp::now()),
+        settled_at: Some(SessionTimestamp::now()),
+        usage: None,
+        cost: None,
+        cost_basis: None,
+    }
+}
+
+/// Opens a Session that is Working for the Prompts given, as a Server under
+/// this contract reports one: Working from admission, with no Turn unless the
+/// fixture names one.
+fn open_working_session(
+    application: &mut Application,
+    workspace: &std::path::Path,
+    prompts: Vec<Prompt>,
+    turns: Vec<Turn>,
+) -> (SessionId, SessionSnapshot) {
+    let session_id = SessionId::new();
+    let mut snapshot = created_session_snapshot(
+        session_id,
+        &InitialPrompt {
+            id: PromptId::new(),
+            text: "Held Session".to_owned(),
+            skill_invocations: Vec::new(),
+        },
+        workspace,
+        SessionTimestamp::now(),
+    );
+    snapshot.prompts = prompts;
+    snapshot.turns = turns;
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("open the Working Session");
+    (session_id, snapshot)
+}
+
+/// The same Session with every Prompt withdrawn, as it reads once an interrupt
+/// has cancelled what it was Working for.
+fn withdrawn(mut snapshot: SessionSnapshot) -> SessionSnapshot {
+    for prompt in &mut snapshot.prompts {
+        if prompt.status == PromptStatus::Pending {
+            prompt.status = PromptStatus::Cancelled;
+        }
+    }
+    snapshot.session.working_since = None;
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.revision = SessionRevision(snapshot.revision.0 + 1);
+    snapshot
+}
+
+fn composer_holds(application: &mut Application) -> Option<InitialPrompt> {
+    match application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit whatever the composer holds")
+    {
+        ApplicationTransition::AdmitPrompt { request, .. } => Some(request.prompt),
+        _ => None,
+    }
+}
+
+#[test]
+fn only_the_prompt_owed_a_turn_comes_back_from_an_interrupt() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let delivering = PromptId::new();
+    let owed = PromptId::new();
+    let (_, snapshot) = open_working_session(
+        &mut application,
+        workspace.path(),
+        vec![
+            admitted_steer("Already taken by a Turn", 0, delivering),
+            admitted_steer("Still owed a Turn", 1, owed),
+        ],
+        vec![turn_for(delivering)],
+    );
+
+    press_escape(&mut application);
+    press_escape(&mut application);
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            withdrawn(snapshot),
+        )))
+        .expect("take the withdrawal");
+
+    let returned = composer_holds(&mut application).expect("a withdrawn Prompt comes back");
+    assert_eq!(returned.id, owed);
+    assert_eq!(returned.text, "Still owed a Turn");
+}
+
+#[test]
+fn two_prompts_owed_a_turn_return_the_earliest_and_never_overwrite_it() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let earliest = PromptId::new();
+    let (_, snapshot) = open_working_session(
+        &mut application,
+        workspace.path(),
+        vec![
+            admitted_steer("Asked first", 0, earliest),
+            admitted_steer("Asked second", 1, PromptId::new()),
+        ],
+        Vec::new(),
+    );
+
+    press_escape(&mut application);
+    press_escape(&mut application);
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            withdrawn(snapshot),
+        )))
+        .expect("take the withdrawal");
+
+    let returned = composer_holds(&mut application).expect("a withdrawn Prompt comes back");
+    assert_eq!(returned.id, earliest);
+    assert_eq!(returned.text, "Asked first");
+}
+
+#[test]
+fn a_withdrawal_never_overwrites_a_draft_the_reader_is_writing() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let (_, snapshot) = open_working_session(
+        &mut application,
+        workspace.path(),
+        vec![admitted_steer("The withdrawn ask", 0, PromptId::new())],
+        Vec::new(),
+    );
+
+    press_escape(&mut application);
+    press_escape(&mut application);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Something else entirely".to_owned(),
+        )))
+        .expect("write a draft while the withdrawal travels");
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            withdrawn(snapshot),
+        )))
+        .expect("take the withdrawal");
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(drawn.contains("Something else entirely"), "{drawn}");
+    let held = composer_holds(&mut application).expect("the draft is still submittable");
+    assert_eq!(held.text, "Something else entirely");
+}
+
+#[test]
+fn leaving_a_session_gives_up_the_withdrawal_it_was_owed() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let (_, snapshot) = open_working_session(
+        &mut application,
+        workspace.path(),
+        vec![admitted_steer("The withdrawn ask", 0, PromptId::new())],
+        Vec::new(),
+    );
+
+    press_escape(&mut application);
+    press_escape(&mut application);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("leave for the Landing");
+    // Coming back to it, the reader has written something of their own.
+    application
+        .handle_event(ApplicationEvent::SessionAttached(withdrawn(snapshot)))
+        .expect("open it again, now withdrawn");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "A fresh ask".to_owned(),
+        )))
+        .expect("write a fresh ask");
+
+    let held = composer_holds(&mut application).expect("the fresh ask is submittable");
+    assert_eq!(held.text, "A fresh ask");
+}
+
+#[test]
+fn a_confirmed_interrupt_says_so_until_the_session_takes_it() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+    press_escape(&mut application);
+    press_escape(&mut application);
+    let confirmed = rendered_application_rows(&application).join("\n");
+    assert!(confirmed.contains("interrupting…"), "{confirmed}");
+    assert!(!confirmed.contains("to interrupt"), "{confirmed}");
+
+    // Escape again asks for nothing new and duplicates nothing.
+    press_escape(&mut application);
+    let again = rendered_application_rows(&application).join("\n");
+    assert_eq!(again, confirmed);
+
+    let transition = application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            SessionId::new(),
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the created Session");
+    assert!(
+        matches!(transition, ApplicationTransition::InterruptSession { .. }),
+        "{transition:?}"
+    );
+}
+
+#[test]
+fn a_session_carrying_another_prompt_neither_replaces_the_claim_nor_takes_its_interrupt() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+    press_escape(&mut application);
+    press_escape(&mut application);
+
+    let stranger = InitialPrompt {
+        id: PromptId::new(),
+        text: "Someone else's ask".to_owned(),
+        skill_invocations: Vec::new(),
+    };
+    let transition = application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            SessionId::new(),
+            &stranger,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take a creation that answers another Prompt");
+    assert_eq!(transition, ApplicationTransition::Continue);
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(!drawn.contains("Someone else's ask"), "{drawn}");
+    assert!(drawn.contains("Rename the widget"), "{drawn}");
+    assert!(drawn.contains("interrupting…"), "{drawn}");
+
+    // The claim's own Session still takes the interrupt it is owed.
+    let transition = application
+        .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+            SessionId::new(),
+            &prompt,
+            workspace.path(),
+            SessionTimestamp::now(),
+        )))
+        .expect("take the claim's own Session");
+    assert!(
+        matches!(transition, ApplicationTransition::InterruptSession { .. }),
+        "{transition:?}"
+    );
 }

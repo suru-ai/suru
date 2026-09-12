@@ -858,6 +858,7 @@ impl TuiState {
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
         self.abandon_provisional_session();
+        self.forget_awaited_withdrawals();
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -888,6 +889,7 @@ impl TuiState {
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
         self.abandon_provisional_session();
+        self.forget_awaited_withdrawals();
         // A refusal owed to the Landing is said the first time the Landing is
         // drawn after it, rather than in whatever the reader was looking at,
         // and the draft it hands back is put there with it.
@@ -904,6 +906,14 @@ impl TuiState {
         self.opening_error = None;
         self.stop_opening_loading();
         self.route.take().is_some()
+    }
+
+    /// Gives up the withdrawals this client was owed. A Prompt comes back to
+    /// the composer of the Session it was written in while the reader is
+    /// standing in it; once they have left, the answer is stale and the draft
+    /// they write next is theirs alone.
+    fn forget_awaited_withdrawals(&mut self) {
+        self.withdrawing.clear();
     }
 
     fn stop_opening_loading(&mut self) {
@@ -2760,13 +2770,14 @@ impl TuiState {
     /// is asked under the context the reader is in rather than one they have
     /// left, and a Worktree already made for this Prompt is never made twice.
     fn creation_transition(&mut self, prompt: InitialPrompt) -> ApplicationTransition {
+        // The Worktree this claim's Prompt was prepared for is where it is
+        // asked for again, wherever the reader has moved since: a retry is the
+        // same request, and a claim that prepared a Worktree never prepares a
+        // second one to strand the first.
         let prepared = self
             .provisional
             .as_ref()
-            .and_then(|claim| claim.prepared.clone())
-            .filter(|prepared| {
-                self.execution_directory.as_ref() == Some(&prepared.destination.path)
-            });
+            .and_then(|claim| claim.prepared.clone());
         if let Some(prepared) = prepared {
             return ApplicationTransition::CreateSession(CreateSessionRequest {
                 preparation_id: Some(prepared.id),
@@ -2883,28 +2894,65 @@ impl TuiState {
         ))
     }
 
-    /// Remembers the undelivered Prompts an interrupt just asked to withdraw,
-    /// so this client — the one that interrupted — is the one their text comes
-    /// back to when the Session says they were cancelled.
-    fn await_withdrawals(&mut self, session: &SessionReference) {
+    /// Remembers the one undelivered Prompt an interrupt just asked to withdraw,
+    /// so this client — the one that interrupted — is the one its text comes
+    /// back to when the Session says it was cancelled.
+    ///
+    /// An interrupt withdraws the Prompt the Session is Working for, which is
+    /// the one admitted to begin a Turn and named by no Turn yet: a queued
+    /// Prompt is left where it is, and one a Turn has already taken is being
+    /// delivered rather than waiting. Where more than one could answer that
+    /// description, this client's own is the one it is owed, and the earliest
+    /// admitted otherwise — never more than one, and never in place of a
+    /// withdrawal already awaited.
+    fn await_withdrawal(&mut self, session: &SessionReference, own: Option<PromptId>) {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
-        // Only a Prompt owed a Turn is withdrawn by an interrupt; a queued one
-        // is left where it is, and a Session that cancels it does so for reasons
-        // of its own.
-        for prompt in snapshot.prompts.iter().filter(|prompt| {
-            prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
-        }) {
-            self.withdrawing.push(HeldPrompt {
-                session: session.clone(),
-                prompt: InitialPrompt {
-                    id: prompt.id,
-                    text: prompt.text.clone(),
-                    skill_invocations: prompt.skill_invocations.clone(),
-                },
-            });
+        let mut candidates = snapshot
+            .prompts
+            .iter()
+            .filter(|prompt| {
+                prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
+            })
+            .filter(|prompt| {
+                !snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.prompt_id == Some(prompt.id))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|prompt| prompt.admission_order);
+        let owned = |id: PromptId| {
+            own == Some(id)
+                || self
+                    .pending_steers
+                    .iter()
+                    .any(|held| &held.session == session && held.prompt.id == id)
+        };
+        let Some(awaited) = candidates
+            .iter()
+            .find(|prompt| owned(prompt.id))
+            .or(candidates.first())
+            .map(|prompt| InitialPrompt {
+                id: prompt.id,
+                text: prompt.text.clone(),
+                skill_invocations: prompt.skill_invocations.clone(),
+            })
+        else {
+            return;
+        };
+        if self
+            .withdrawing
+            .iter()
+            .any(|held| held.prompt.id == awaited.id)
+        {
+            return;
         }
+        self.withdrawing.push(HeldPrompt {
+            session: session.clone(),
+            prompt: awaited,
+        });
     }
 
     /// Returns a withdrawn Prompt's text to the composer of the Session it was
@@ -2940,7 +2988,7 @@ impl TuiState {
         });
         for prompt in returned {
             self.composers
-                .admission_failed(ComposerKey::Session(session.clone()), &prompt);
+                .return_prompt(ComposerKey::Session(session.clone()), &prompt);
         }
     }
 
@@ -5595,7 +5643,7 @@ impl Application {
         if let Some(turn_id) = turn_id {
             self.state.keep_interrupted_turn_open(turn_id);
         } else {
-            self.state.await_withdrawals(&session);
+            self.state.await_withdrawal(&session, None);
         }
         ApplicationTransition::InterruptSession { session }
     }
@@ -5605,6 +5653,17 @@ impl Application {
         // Turn, the Subagents that outlived it, or the Prompt it has admitted
         // and not delivered. With none of them there is nothing to stop and the
         // key stays inert.
+        // A claim that has already taken the reader's confirmation is waiting
+        // on the Session to send it to; asking again would arm a gesture that
+        // has nothing left to say.
+        if self
+            .state
+            .provisional
+            .as_ref()
+            .is_some_and(ProvisionalSession::interrupt_intent)
+        {
+            return;
+        }
         let Some(target) = self.state.interrupt_target() else {
             return;
         };
@@ -5672,6 +5731,19 @@ impl Application {
     /// A claim the reader has since left is not replaced: a newer route stands,
     /// and no late answer pulls them back to a Session they stopped waiting on.
     fn take_created_session(&mut self, snapshot: SessionSnapshot) -> Result<ApplicationTransition> {
+        // A claim is answered by the Session carrying its Prompt and by no
+        // other: a creation that names a different one is not this claim's
+        // answer, so the claim stands and the interrupt it holds waits for the
+        // Session it was meant for.
+        let answers_claim = self.state.provisional.as_ref().is_some_and(|claim| {
+            snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == claim.prompt.id)
+        });
+        if self.state.provisional.is_some() && !answers_claim {
+            return Ok(ApplicationTransition::Continue);
+        }
         let claim = self.state.provisional.take();
         // Without a claim, the only creation this client could have walked away
         // from is the submission still waiting on an answer. A Session arriving
@@ -5683,10 +5755,10 @@ impl Application {
         self.state.new_worktree = None;
         self.state.session_events_blocked = false;
         self.state.apply_session(SessionEvent::snapshot(snapshot))?;
-        if claim.is_some_and(|claim| claim.interrupt_intent())
+        if let Some(claim) = claim.filter(ProvisionalSession::interrupt_intent)
             && let Some(session) = self.state.session_reference.clone()
         {
-            self.state.await_withdrawals(&session);
+            self.state.await_withdrawal(&session, Some(claim.prompt.id));
             return Ok(ApplicationTransition::InterruptSession { session });
         }
         Ok(ApplicationTransition::Continue)

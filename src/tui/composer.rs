@@ -380,6 +380,21 @@ impl ComposerMemory {
         self.composers.remove(&ComposerKey::Session(session));
     }
 
+    /// Hands a Prompt back to the composer it was written in, cursor at its
+    /// end, ready to be sent again as the very Prompt it was.
+    ///
+    /// A composer the reader has since written in keeps what they wrote: work
+    /// coming back to them is never worth a draft they are in the middle of, so
+    /// the returned text waits in that composer's history instead.
+    pub(super) fn return_prompt(&mut self, key: ComposerKey, prompt: &InitialPrompt) {
+        let composer = self.composer_mut(key);
+        if composer.text.is_empty() {
+            composer.admission_failed(prompt);
+        } else {
+            composer.push_history(prompt.text.clone());
+        }
+    }
+
     /// Gives up the draft standing in a composer, keeping it in that composer's
     /// history so the reader can call it back, and leaves the composer empty.
     pub(super) fn discard_draft(&mut self, key: ComposerKey) {
