@@ -51,6 +51,7 @@ struct Renderer<'a> {
     source: Option<copy::SourceRange>,
     table: Option<Table>,
     pending_list_marker: Option<usize>,
+    quote_depth: usize,
 }
 
 struct CodeBlock {
@@ -94,6 +95,7 @@ impl<'a> Renderer<'a> {
             source: None,
             table: None,
             pending_list_marker: None,
+            quote_depth: 0,
         }
     }
 
@@ -196,7 +198,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
-                self.push_chrome("│ ", self.theme.markdown.list_marker);
+                self.quote_depth = self.quote_depth.saturating_add(1);
             }
             Tag::Table(alignments) => {
                 self.flush_line();
@@ -254,26 +256,29 @@ impl<'a> Renderer<'a> {
             TagEnd::CodeBlock => {
                 if let Some(block) = self.code_block.take() {
                     let mut offset = 0;
-                    self.lines.extend(
-                        syntax::render(
-                            &block.content,
-                            &block.info,
-                            self.theme,
-                            self.prose_style(self.theme.markdown.code_block),
-                        )
-                        .into_iter()
-                        .map(|line| {
-                            let mut line = StyledLine::from(line);
-                            for span in &mut line.spans {
-                                span.source = block.source.as_ref().map(|source| {
-                                    source.slice(offset..offset + span.content.len())
-                                });
-                                offset += span.content.len();
-                            }
-                            offset += 1;
-                            line
-                        }),
-                    );
+                    let lines = syntax::render(
+                        &block.content,
+                        &block.info,
+                        self.theme,
+                        self.prose_style(self.theme.markdown.code_block),
+                    )
+                    .into_iter()
+                    .map(|line| {
+                        let mut line = StyledLine::from(line);
+                        for span in &mut line.spans {
+                            span.source = block
+                                .source
+                                .as_ref()
+                                .map(|source| source.slice(offset..offset + span.content.len()));
+                            offset += span.content.len();
+                        }
+                        offset += 1;
+                        line
+                    })
+                    .collect::<Vec<_>>();
+                    for line in lines {
+                        self.emit_line(line);
+                    }
                 }
                 self.blank_line();
             }
@@ -296,6 +301,8 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
+                self.remove_trailing_separator();
+                self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.blank_line();
             }
             TagEnd::TableCell => {
@@ -317,13 +324,15 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
-                    let mut lines = table.render(self.width, self.theme);
+                    let mut lines = table.render(self.content_width(), self.theme);
                     if self.subdued {
                         for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
                             span.style = self.prose_style(span.style);
                         }
                     }
-                    self.lines.extend(lines);
+                    for line in lines {
+                        self.emit_line(line);
+                    }
                 }
                 self.blank_line();
             }
@@ -417,21 +426,66 @@ impl<'a> Renderer<'a> {
     fn flush_line(&mut self) {
         self.pending_list_marker = None;
         if !self.current.is_empty() {
-            self.lines
-                .push(StyledLine::from(std::mem::take(&mut self.current)));
+            let line = StyledLine::from(std::mem::take(&mut self.current));
+            self.emit_line(line);
         }
     }
 
     fn blank_line(&mut self) {
         self.flush_line();
-        if !self.lines.last().is_some_and(|line| line.spans.is_empty()) {
-            self.lines.push(StyledLine::default());
+        if !self
+            .lines
+            .last()
+            .is_some_and(|line| self.is_separator(line))
+        {
+            self.emit_line(StyledLine::default());
         }
+    }
+
+    fn emit_line(&mut self, mut line: StyledLine) {
+        if self.quote_depth > 0 {
+            let style = self.prose_style(self.theme.markdown.list_marker);
+            line.spans.splice(
+                0..0,
+                (0..self.quote_depth).map(|_| StyledSpan::chrome("│ ", style)),
+            );
+        }
+        self.lines.push(line);
+    }
+
+    fn is_separator(&self, line: &StyledLine) -> bool {
+        if self.quote_depth == 0 {
+            return line.spans.is_empty();
+        }
+        line.spans.len() == self.quote_depth
+            && line
+                .spans
+                .iter()
+                .all(|span| span.chrome && span.content == "│ ")
+    }
+
+    fn remove_trailing_separator(&mut self) {
+        if self
+            .lines
+            .last()
+            .is_some_and(|line| self.is_separator(line))
+        {
+            self.lines.pop();
+        }
+    }
+
+    fn content_width(&self) -> u16 {
+        let prefix = u16::try_from(self.quote_depth.saturating_mul(2)).unwrap_or(u16::MAX);
+        self.width.saturating_sub(prefix)
     }
 
     fn finish(mut self) -> Vec<StyledLine> {
         self.flush_line();
-        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
+        while self
+            .lines
+            .last()
+            .is_some_and(|line| self.is_separator(line))
+        {
             self.lines.pop();
         }
         self.lines
@@ -834,6 +888,103 @@ mod tests {
     }
 
     #[test]
+    fn nested_quotes_prefix_each_line_at_its_depth() {
+        let theme = Theme::system();
+
+        let lines = render("> > nested words", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::from(vec![
+                StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                StyledSpan::text("nested words", theme.text.primary),
+            ])]
+        );
+    }
+
+    #[test]
+    fn quote_prefixes_both_list_items_without_dangling_lines() {
+        let theme = Theme::system();
+
+        let lines = render("> - first\n> - second", &theme);
+
+        assert_eq!(
+            lines,
+            vec![
+                StyledLine::from(vec![
+                    StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                    StyledSpan::chrome("• ", theme.markdown.list_marker),
+                    StyledSpan::text("first", theme.text.primary),
+                ]),
+                StyledLine::from(vec![
+                    StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                    StyledSpan::chrome("• ", theme.markdown.list_marker),
+                    StyledSpan::text("second", theme.text.primary),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn quote_prefixes_fence_labels_and_every_code_line() {
+        let theme = Theme::system();
+
+        let lines = render("> ```rust\n> let answer = 42;\n> ```", &theme);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["│ rust", "│ let answer = 42;"]);
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.chrome && span.content == "│ ")
+        }));
+    }
+
+    #[test]
+    fn quote_keeps_its_bar_on_authored_paragraph_separators() {
+        let theme = Theme::system();
+
+        let lines = render("> first\n>\n> second", &theme);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["│ first", "│ ", "│ second"]);
+        assert!(lines[1].spans[0].chrome);
+    }
+
+    #[test]
+    fn nested_quote_tables_fit_after_their_prefix_width_is_reserved() {
+        let theme = Theme::system();
+        let markdown =
+            "> > | first-column | second |\n> > | --- | --- |\n> > | alpha beta gamma | value |";
+
+        let lines = super::render(markdown, &theme, 28);
+
+        assert!(lines.len() > 3, "the table keeps its bordered projection");
+        assert!(lines.iter().all(|line| line.width() <= 28));
+        assert!(lines.iter().all(|line| {
+            line.spans.get(0).is_some_and(|span| span.content == "│ ")
+                && line.spans.get(1).is_some_and(|span| span.content == "│ ")
+        }));
+    }
+
+    #[test]
     fn tables_paint_light_borders_and_padding_as_chrome() {
         let theme = Theme::system();
         let header = theme.text.primary.patch(theme.markdown.strong);
@@ -1149,6 +1300,15 @@ mod tests {
                     (0, "│ quoted words that".to_owned()),
                     (2, "  wrap onto another".to_owned()),
                     (2, "  row".to_owned()),
+                ],
+            ),
+            (
+                "> > nested quoted words that wrap onto another row",
+                0,
+                vec![
+                    (0, "│ │ nested quoted".to_owned()),
+                    (4, "    words that wrap".to_owned()),
+                    (4, "    onto another row".to_owned()),
                 ],
             ),
         ];

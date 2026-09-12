@@ -7662,6 +7662,33 @@ fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
 }
 
 #[test]
+fn markdown_selection_ignores_quote_chrome_across_blocks_and_tables() {
+    let workspace = workspace_dir();
+    let source = "> first\n>\n> second\n>\n> - alpha\n> - beta\n>\n> | Key | Value |\n> | --- | --- |\n> | one | two |";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 32);
+    let start = text_position(&buffer, "first");
+    let end = text_position(&buffer, "two");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 2, end.1));
+
+    assert_eq!(content.text, source);
+    let html = content.html.expect("Markdown selection carries rich HTML");
+    assert!(html.starts_with("<blockquote>\n<p>first</p>"));
+    assert!(html.contains("<li>beta</li>"));
+    assert!(html.contains("<table><thead>"));
+    assert!(html.ends_with("</table>\n</blockquote>\n"));
+}
+
+#[test]
 fn markdown_selection_round_trips_task_items_and_strikethrough() {
     let workspace = workspace_dir();
     let source = "- [ ] pending\n  - [x] ~~done~~";
