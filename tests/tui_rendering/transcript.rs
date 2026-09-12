@@ -854,7 +854,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
             .modifier
             .contains(Modifier::ITALIC)
     );
-    assert_eq!(text_cell(&completed, "link").fg, Color::Blue);
+    assert_eq!(text_cell(&completed, "link").fg, Color::Cyan);
     assert!(
         text_cell(&completed, "link")
             .modifier

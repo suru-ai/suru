@@ -178,7 +178,7 @@ impl<'a> Renderer<'a> {
             width,
             lines: Vec::new(),
             current: Vec::new(),
-            styles: vec![theme.text.primary],
+            styles: vec![theme.markdown.text],
             lists: Vec::new(),
             list_plans,
             items: Vec::new(),
@@ -224,7 +224,7 @@ impl<'a> Renderer<'a> {
             }
             Event::Rule => {
                 self.flush_line();
-                self.push("────────", self.theme.border.subdued);
+                self.push("────────", self.theme.markdown.rule);
                 self.flush_line();
                 self.blank_line();
             }
@@ -289,7 +289,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::Item => {
                 self.flush_line();
-                let (marker, marker_width) = match self.lists.last_mut() {
+                let (marker, marker_width, marker_style) = match self.lists.last_mut() {
                     Some(ListState {
                         next: Some(next),
                         marker_width,
@@ -304,16 +304,18 @@ impl<'a> Renderer<'a> {
                                 " ".repeat(marker_width.saturating_sub(ordinal.len()))
                             ),
                             *marker_width,
+                            self.theme.markdown.list_enumeration,
                         )
                     }
-                    Some(list) => ("• ".to_owned(), list.marker_width),
-                    None => ("• ".to_owned(), 2),
+                    Some(list) => (
+                        "• ".to_owned(),
+                        list.marker_width,
+                        self.theme.markdown.list_marker,
+                    ),
+                    None => ("• ".to_owned(), 2, self.theme.markdown.list_marker),
                 };
                 self.items.push(ItemState {
-                    marker: Some(StyledSpan::chrome(
-                        marker,
-                        self.prose_style(self.theme.markdown.list_marker),
-                    )),
+                    marker: Some(StyledSpan::chrome(marker, self.prose_style(marker_style))),
                     marker_width,
                     quote_depth: self.quote_depth,
                 });
@@ -325,11 +327,11 @@ impl<'a> Renderer<'a> {
             }
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
-                self.push_style(self.theme.markdown.link);
+                self.push_style(self.theme.markdown.link_text);
             }
             Tag::Image { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
-                self.push_style(self.theme.markdown.link);
+                self.push_style(self.theme.markdown.image_text);
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
@@ -439,12 +441,21 @@ impl<'a> Renderer<'a> {
                 self.items.pop();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
-            TagEnd::Link | TagEnd::Image => {
+            TagEnd::Link => {
                 self.pop_style();
                 if let Some(destination) = self.links.pop() {
                     self.push_chrome(
                         format!(" ({destination})"),
                         self.current_style().patch(self.theme.markdown.link),
+                    );
+                }
+            }
+            TagEnd::Image => {
+                self.pop_style();
+                if let Some(destination) = self.links.pop() {
+                    self.push_chrome(
+                        format!(" ({destination})"),
+                        self.current_style().patch(self.theme.markdown.image),
                     );
                 }
             }
@@ -628,8 +639,8 @@ impl<'a> Renderer<'a> {
     }
 
     fn structural_prefix(&mut self, content: bool) -> Vec<StyledSpan> {
-        let indent_style = self.prose_style(self.theme.text.primary);
-        let quote_style = self.prose_style(self.theme.markdown.list_marker);
+        let indent_style = self.prose_style(self.theme.markdown.text);
+        let quote_style = self.prose_style(self.theme.markdown.block_quote);
         let mut prefix = Vec::new();
         // Quote depth records where an Item began so nested containers retain
         // source order: outer quote, parent Item indent, then inner quote.
@@ -789,9 +800,9 @@ impl Table {
                         .unwrap_or(copy::ColumnAlignment::None);
                     let (leading, trailing) = alignment_padding(alignment, remaining);
                     let padding_style = if row.header {
-                        theme.text.primary.patch(theme.markdown.strong)
+                        theme.markdown.text.patch(theme.markdown.strong)
                     } else {
-                        theme.text.primary
+                        theme.markdown.text
                     };
                     spans.push(StyledSpan::chrome(" ", padding_style));
                     push_padding(&mut spans, leading, padding_style);
@@ -922,7 +933,7 @@ fn wrapped_cell(
             if row.indent > 0 {
                 spans.push(StyledSpan::chrome(
                     " ".repeat(row.indent),
-                    theme.text.primary,
+                    theme.markdown.text,
                 ));
             }
             spans.extend(line.slice(row.start..row.end).spans);
@@ -961,7 +972,7 @@ fn pipe_row(row: &TableRow, columns: usize, theme: &Theme) -> StyledLine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
 
     use crate::tui::text_layout::StyledLayout;
 
@@ -1137,7 +1148,7 @@ mod tests {
         assert_eq!(
             lines[0],
             StyledLine::from(vec![
-                StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                StyledSpan::chrome("│ ", theme.markdown.block_quote),
                 StyledSpan::chrome("• ", theme.markdown.list_marker),
                 StyledSpan::text("Title", theme.markdown.heading),
             ])
@@ -1145,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_paint_markers_as_chrome_and_leave_item_text_primary() {
+    fn lists_paint_markers_as_chrome_and_use_markdown_text_for_the_item_body() {
         let theme = Theme::system();
 
         let lines = render("- first\n- second", &theme);
@@ -1155,11 +1166,11 @@ mod tests {
             vec![
                 StyledLine::from(vec![
                     StyledSpan::chrome("• ", theme.markdown.list_marker),
-                    StyledSpan::text("first", theme.text.primary),
+                    StyledSpan::text("first", theme.markdown.text),
                 ]),
                 StyledLine::from(vec![
                     StyledSpan::chrome("• ", theme.markdown.list_marker),
-                    StyledSpan::text("second", theme.text.primary),
+                    StyledSpan::text("second", theme.markdown.text),
                 ]),
             ]
         );
@@ -1338,11 +1349,11 @@ mod tests {
             vec![
                 StyledLine::from(vec![
                     StyledSpan::chrome("[ ] ", theme.markdown.list_marker),
-                    StyledSpan::text("pending", theme.text.primary),
+                    StyledSpan::text("pending", theme.markdown.text),
                 ]),
                 StyledLine::from(vec![
                     StyledSpan::chrome("[x] ", theme.markdown.list_marker),
-                    StyledSpan::text("done", theme.text.primary),
+                    StyledSpan::text("done", theme.markdown.text),
                 ]),
             ]
         );
@@ -1385,8 +1396,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![StyledLine::from(vec![
-                StyledSpan::chrome("│ ", theme.markdown.list_marker),
-                StyledSpan::text("quoted words", theme.text.primary),
+                StyledSpan::chrome("│ ", theme.markdown.block_quote),
+                StyledSpan::text("quoted words", theme.markdown.text),
             ])]
         );
         assert!(lines[0].spans[0].chrome);
@@ -1402,9 +1413,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![StyledLine::from(vec![
-                StyledSpan::chrome("│ ", theme.markdown.list_marker),
-                StyledSpan::chrome("│ ", theme.markdown.list_marker),
-                StyledSpan::text("nested words", theme.text.primary),
+                StyledSpan::chrome("│ ", theme.markdown.block_quote),
+                StyledSpan::chrome("│ ", theme.markdown.block_quote),
+                StyledSpan::text("nested words", theme.markdown.text),
             ])]
         );
     }
@@ -1419,14 +1430,14 @@ mod tests {
             lines,
             vec![
                 StyledLine::from(vec![
-                    StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                    StyledSpan::chrome("│ ", theme.markdown.block_quote),
                     StyledSpan::chrome("• ", theme.markdown.list_marker),
-                    StyledSpan::text("first", theme.text.primary),
+                    StyledSpan::text("first", theme.markdown.text),
                 ]),
                 StyledLine::from(vec![
-                    StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                    StyledSpan::chrome("│ ", theme.markdown.block_quote),
                     StyledSpan::chrome("• ", theme.markdown.list_marker),
-                    StyledSpan::text("second", theme.text.primary),
+                    StyledSpan::text("second", theme.markdown.text),
                 ]),
             ]
         );
@@ -1493,7 +1504,7 @@ mod tests {
     #[test]
     fn tables_paint_light_borders_and_padding_as_chrome() {
         let theme = Theme::system();
-        let header = theme.text.primary.patch(theme.markdown.strong);
+        let header = theme.markdown.text.patch(theme.markdown.strong);
 
         let lines = render("| Name | Value |\n| :--- | ---: |\n| alpha | 42 |", &theme);
 
@@ -1516,14 +1527,14 @@ mod tests {
                 StyledLine::chrome("├───────┼───────┤", theme.border.subdued),
                 StyledLine::from(vec![
                     StyledSpan::chrome("│", theme.border.subdued),
-                    StyledSpan::chrome(" ", theme.text.primary),
-                    StyledSpan::text("alpha", theme.text.primary),
-                    StyledSpan::chrome(" ", theme.text.primary),
+                    StyledSpan::chrome(" ", theme.markdown.text),
+                    StyledSpan::text("alpha", theme.markdown.text),
+                    StyledSpan::chrome(" ", theme.markdown.text),
                     StyledSpan::chrome("│", theme.border.subdued),
-                    StyledSpan::chrome(" ", theme.text.primary),
-                    StyledSpan::chrome("   ", theme.text.primary),
-                    StyledSpan::text("42", theme.text.primary),
-                    StyledSpan::chrome(" ", theme.text.primary),
+                    StyledSpan::chrome(" ", theme.markdown.text),
+                    StyledSpan::chrome("   ", theme.markdown.text),
+                    StyledSpan::text("42", theme.markdown.text),
+                    StyledSpan::chrome(" ", theme.markdown.text),
                     StyledSpan::chrome("│", theme.border.subdued),
                 ]),
                 StyledLine::chrome("└───────┴───────┘", theme.border.subdued),
@@ -1677,7 +1688,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![StyledLine::from(vec![
-                StyledSpan::text("Suru", theme.markdown.link),
+                StyledSpan::text("Suru", theme.markdown.link_text),
                 StyledSpan::chrome(" (https://example.test)", theme.markdown.link),
             ])]
         );
@@ -1692,14 +1703,57 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_rules_paint_a_subdued_line() {
+    fn optional_markdown_roles_paint_their_semantic_surfaces() {
+        let mut theme = Theme::system();
+        theme.markdown.text = Style::default().fg(Color::Indexed(101));
+        theme.markdown.link_text = Style::default().fg(Color::Indexed(102));
+        theme.markdown.link = Style::default().fg(Color::Indexed(103));
+        theme.markdown.image_text = Style::default().fg(Color::Indexed(104));
+        theme.markdown.image = Style::default().fg(Color::Indexed(105));
+        theme.markdown.block_quote = Style::default().fg(Color::Indexed(106));
+        theme.markdown.list_marker = Style::default().fg(Color::Indexed(107));
+        theme.markdown.list_enumeration = Style::default().fg(Color::Indexed(108));
+        theme.markdown.rule = Style::default().fg(Color::Indexed(109));
+
+        let markdown = "body [label](https://link.test) ![alt](https://image.test)\n\n> quote\n\n- bullet\n\n1. ordinal\n\n---";
+        let lines = render(markdown, &theme);
+        let span = |content| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == content)
+                .unwrap_or_else(|| panic!("missing span {content:?}"))
+        };
+
+        assert_eq!(span("body ").style, theme.markdown.text);
+        assert_eq!(span("label").style, theme.markdown.link_text);
+        assert_eq!(span(" (https://link.test)").style, theme.markdown.link);
+        assert_eq!(span("alt").style, theme.markdown.image_text);
+        assert_eq!(span(" (https://image.test)").style, theme.markdown.image);
+        assert_eq!(span("│ ").style, theme.markdown.block_quote);
+        assert_eq!(span("• ").style, theme.markdown.list_marker);
+        assert_eq!(span("1. ").style, theme.markdown.list_enumeration);
+        assert_eq!(span("────────").style, theme.markdown.rule);
+
+        let reasoning = render_reasoning(markdown, &theme);
+        assert!(
+            reasoning
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg == theme.text.subdued.fg),
+            "every Markdown role follows Reasoning's subdued posture"
+        );
+    }
+
+    #[test]
+    fn horizontal_rules_use_the_markdown_rule_role() {
         let theme = Theme::system();
 
         let lines = render("---", &theme);
 
         assert_eq!(
             lines,
-            vec![StyledLine::text("────────", theme.border.subdued)]
+            vec![StyledLine::text("────────", theme.markdown.rule)]
         );
         assert!(!lines[0].spans[0].chrome);
         assert!(lines[0].spans[0].style.add_modifier.is_empty());
@@ -1708,17 +1762,17 @@ mod tests {
     #[test]
     fn inline_emphasis_paints_italic_and_bold_modifiers() {
         let theme = Theme::system();
-        let italic = theme.text.primary.patch(theme.markdown.emphasis);
-        let bold = theme.text.primary.patch(theme.markdown.strong);
+        let italic = theme.markdown.text.patch(theme.markdown.emphasis);
+        let bold = theme.markdown.text.patch(theme.markdown.strong);
 
         let lines = render("plain *soft* and **strong**", &theme);
 
         assert_eq!(
             lines,
             vec![StyledLine::from(vec![
-                StyledSpan::text("plain ", theme.text.primary),
+                StyledSpan::text("plain ", theme.markdown.text),
                 StyledSpan::text("soft", italic),
-                StyledSpan::text(" and ", theme.text.primary),
+                StyledSpan::text(" and ", theme.markdown.text),
                 StyledSpan::text("strong", bold),
             ])]
         );
@@ -1777,7 +1831,7 @@ mod tests {
         assert!(code.style.add_modifier.contains(Modifier::CROSSED_OUT));
         assert_eq!(code.style.fg, theme.markdown.inline_code.fg);
         assert!(link.style.add_modifier.contains(Modifier::CROSSED_OUT));
-        assert_eq!(link.style.fg, theme.markdown.link.fg);
+        assert_eq!(link.style.fg, theme.markdown.link_text.fg);
         assert!(
             destination
                 .style

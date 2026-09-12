@@ -120,13 +120,20 @@ pub(crate) struct BorderRoles {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MarkdownRoles {
+    pub(crate) text: Style,
     pub(crate) heading: Style,
     pub(crate) emphasis: Style,
     pub(crate) strong: Style,
     pub(crate) link: Style,
+    pub(crate) link_text: Style,
     pub(crate) inline_code: Style,
     pub(crate) code_block: Style,
     pub(crate) list_marker: Style,
+    pub(crate) list_enumeration: Style,
+    pub(crate) block_quote: Style,
+    pub(crate) rule: Style,
+    pub(crate) image: Style,
+    pub(crate) image_text: Style,
 }
 
 /// The colors a Code Block paints its tokens with. A theme document names
@@ -157,6 +164,17 @@ const SYNTAX_KEYS: [&str; 9] = [
     "syntaxType",
     "syntaxOperator",
     "syntaxPunctuation",
+];
+
+#[cfg(test)]
+const OPTIONAL_MARKDOWN_KEYS: [&str; 7] = [
+    "markdownText",
+    "markdownLinkText",
+    "markdownBlockQuote",
+    "markdownHorizontalRule",
+    "markdownListEnumeration",
+    "markdownImage",
+    "markdownImageText",
 ];
 
 impl SyntaxRoles {
@@ -574,13 +592,20 @@ quantized_fields!(FeedbackRoles {
 });
 quantized_fields!(BorderRoles { default, subdued });
 quantized_fields!(MarkdownRoles {
+    text,
     heading,
     emphasis,
     strong,
     link,
+    link_text,
     inline_code,
     code_block,
     list_marker,
+    list_enumeration,
+    block_quote,
+    rule,
+    image,
+    image_text,
 });
 quantized_fields!(SyntaxRoles {
     comment,
@@ -928,6 +953,7 @@ impl Theme {
                 subdued: Style::default().fg(Color::DarkGray),
             },
             markdown: MarkdownRoles {
+                text: text.primary,
                 heading: Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -936,9 +962,21 @@ impl Theme {
                 link: Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::UNDERLINED),
+                link_text: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
                 inline_code: Style::default().fg(Color::Yellow),
                 code_block: Style::default().fg(Color::Green),
                 list_marker: Style::default().fg(Color::Cyan),
+                list_enumeration: Style::default().fg(Color::Cyan),
+                block_quote: Style::default().fg(Color::Yellow),
+                rule: Style::default().fg(Color::DarkGray),
+                image: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+                image_text: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
             },
             syntax: SyntaxRoles::from_terminal_roles(text, accent, feedback, Color::Blue),
             selection: SelectionRoles {
@@ -1047,13 +1085,20 @@ impl Theme {
                 subdued: style(grays.border_subtle()),
             },
             markdown: MarkdownRoles {
+                text: style(foreground),
                 heading: style(foreground).add_modifier(Modifier::BOLD),
                 emphasis: style(yellow).add_modifier(Modifier::ITALIC),
                 strong: style(foreground).add_modifier(Modifier::BOLD),
                 link: style(blue).add_modifier(Modifier::UNDERLINED),
+                link_text: style(primary).add_modifier(Modifier::UNDERLINED),
                 inline_code: style(green),
                 code_block: style(foreground),
                 list_marker: style(blue),
+                list_enumeration: style(primary),
+                block_quote: style(yellow),
+                rule: style(grays.border_subtle()),
+                image: style(blue).add_modifier(Modifier::UNDERLINED),
+                image_text: style(primary).add_modifier(Modifier::UNDERLINED),
             },
             syntax: SyntaxRoles::from_terminal_roles(text, accent, feedback, blue),
             selection: SelectionRoles {
@@ -1092,12 +1137,19 @@ impl Theme {
         let border_active = colors.required("borderActive")?;
         let border_subtle = colors.required("borderSubtle")?;
         let selected_text = colors.optional("selectedListItemText", "background")?;
+        let markdown_text = colors.optional("markdownText", "text")?;
         let heading = colors.required("markdownHeading")?;
         let link = colors.required("markdownLink")?;
+        let link_text = colors.optional("markdownLinkText", "markdownLink")?;
         let markdown_code = colors.required("markdownCode")?;
         let emphasis = colors.required("markdownEmph")?;
         let strong = colors.required("markdownStrong")?;
         let list_marker = colors.required("markdownListItem")?;
+        let list_enumeration = colors.optional("markdownListEnumeration", "markdownListItem")?;
+        let block_quote = colors.optional("markdownBlockQuote", "markdownListItem")?;
+        let rule = colors.optional("markdownHorizontalRule", "borderSubtle")?;
+        let image = colors.optional("markdownImage", "markdownLink")?;
+        let image_text = colors.optional("markdownImageText", "markdownLink")?;
         let code_block = colors.required("markdownCodeBlock")?;
         let mut syntax_role = |key| colors.optional(key, "markdownCodeBlock");
         let syntax = SyntaxRoles {
@@ -1162,13 +1214,20 @@ impl Theme {
                 subdued: style(border_subtle),
             },
             markdown: MarkdownRoles {
+                text: style(markdown_text),
                 heading: style(heading).add_modifier(Modifier::BOLD),
                 emphasis: style(emphasis).add_modifier(Modifier::ITALIC),
                 strong: style(strong).add_modifier(Modifier::BOLD),
                 link: style(link).add_modifier(Modifier::UNDERLINED),
+                link_text: style(link_text).add_modifier(Modifier::UNDERLINED),
                 inline_code: style(markdown_code),
                 code_block: style(code_block),
                 list_marker: style(list_marker),
+                list_enumeration: style(list_enumeration),
+                block_quote: style(block_quote),
+                rule: style(rule),
+                image: style(image).add_modifier(Modifier::UNDERLINED),
+                image_text: style(image_text).add_modifier(Modifier::UNDERLINED),
             },
             syntax,
             selection: SelectionRoles {
@@ -1322,6 +1381,73 @@ mod tests {
     }
 
     #[test]
+    fn optional_markdown_keys_resolve_into_their_semantic_roles() {
+        let source = document(
+            json!({}),
+            &[
+                ("markdownText", json!("#313131")),
+                ("markdownLinkText", json!("#323232")),
+                ("markdownBlockQuote", json!("#333333")),
+                ("markdownHorizontalRule", json!("#343434")),
+                ("markdownListEnumeration", json!("#353535")),
+                ("markdownImage", json!("#363636")),
+                ("markdownImageText", json!("#373737")),
+            ],
+        );
+        let theme = Theme::from_document(&source, ThemeVariant::Dark)
+            .expect("resolve optional Markdown keys");
+
+        assert_eq!(theme.markdown.text.fg, Some(Color::Rgb(0x31, 0x31, 0x31)));
+        assert_eq!(
+            theme.markdown.link_text.fg,
+            Some(Color::Rgb(0x32, 0x32, 0x32))
+        );
+        assert_eq!(
+            theme.markdown.block_quote.fg,
+            Some(Color::Rgb(0x33, 0x33, 0x33))
+        );
+        assert_eq!(theme.markdown.rule.fg, Some(Color::Rgb(0x34, 0x34, 0x34)));
+        assert_eq!(
+            theme.markdown.list_enumeration.fg,
+            Some(Color::Rgb(0x35, 0x35, 0x35))
+        );
+        assert_eq!(theme.markdown.image.fg, Some(Color::Rgb(0x36, 0x36, 0x36)));
+        assert_eq!(
+            theme.markdown.image_text.fg,
+            Some(Color::Rgb(0x37, 0x37, 0x37))
+        );
+    }
+
+    #[test]
+    fn absent_optional_markdown_keys_keep_the_existing_styles() {
+        let theme = Theme::from_document(&document(json!({}), &[]), ThemeVariant::Dark)
+            .expect("resolve Markdown fallbacks");
+
+        assert_eq!(theme.markdown.text, theme.text.primary);
+        assert_eq!(theme.markdown.link_text, theme.markdown.link);
+        assert_eq!(theme.markdown.block_quote, theme.markdown.list_marker);
+        assert_eq!(theme.markdown.rule, theme.border.subdued);
+        assert_eq!(theme.markdown.list_enumeration, theme.markdown.list_marker);
+        assert_eq!(theme.markdown.image, theme.markdown.link);
+        assert_eq!(theme.markdown.image_text, theme.markdown.link);
+    }
+
+    #[test]
+    fn system_theme_has_semantic_markdown_defaults() {
+        let theme = Theme::system();
+
+        assert_eq!(theme.markdown.text, theme.text.primary);
+        assert_eq!(theme.markdown.link.fg, Some(Color::Blue));
+        assert_eq!(theme.markdown.link_text.fg, Some(Color::Cyan));
+        assert_eq!(theme.markdown.block_quote.fg, Some(Color::Yellow));
+        assert_eq!(theme.markdown.rule, theme.border.subdued);
+        assert_eq!(theme.markdown.list_marker.fg, Some(Color::Cyan));
+        assert_eq!(theme.markdown.list_enumeration.fg, Some(Color::Cyan));
+        assert_eq!(theme.markdown.image, theme.markdown.link);
+        assert_eq!(theme.markdown.image_text, theme.markdown.link_text);
+    }
+
+    #[test]
     fn circular_references_are_rejected() {
         let source = document(
             json!({ "first": "second", "second": "first" }),
@@ -1393,13 +1519,35 @@ mod tests {
         let themes = built_in_themes();
         assert_eq!(themes.len(), 34);
         for (name, source) in themes {
+            let document: ThemeDocument = serde_json::from_str(source).unwrap();
+            for key in OPTIONAL_MARKDOWN_KEYS {
+                assert!(
+                    document.theme.contains_key(key),
+                    "built-in Theme {name:?} carries {key:?}"
+                );
+            }
             for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
-                Theme::from_document(source, variant).unwrap_or_else(|error| {
+                let theme = Theme::from_document(source, variant).unwrap_or_else(|error| {
                     panic!(
                         "built-in Theme {name:?} {} variant failed: {error}",
                         variant.key()
                     )
                 });
+                for (role, style) in [
+                    ("text", theme.markdown.text),
+                    ("link text", theme.markdown.link_text),
+                    ("block quote", theme.markdown.block_quote),
+                    ("rule", theme.markdown.rule),
+                    ("list enumeration", theme.markdown.list_enumeration),
+                    ("image", theme.markdown.image),
+                    ("image text", theme.markdown.image_text),
+                ] {
+                    assert!(
+                        style.fg.is_some(),
+                        "built-in Theme {name:?} {} variant resolves the Markdown {role} role",
+                        variant.key()
+                    );
+                }
             }
         }
     }
