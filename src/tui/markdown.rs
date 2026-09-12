@@ -366,34 +366,27 @@ impl<'a> Renderer<'a> {
     fn push(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            let mut span = StyledSpan::text(content, self.prose_style(style));
-            span.source = self.source.clone();
-            if let Some(cell) = self
-                .table
-                .as_mut()
-                .and_then(|table| table.current_cell.as_mut())
-            {
-                cell.spans.push(span);
-            } else {
-                self.current.push(span);
-            }
+            self.push_span(StyledSpan::text(content, self.prose_style(style)));
         }
     }
 
     fn push_chrome(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
-            let mut span = StyledSpan::chrome(content, self.prose_style(style));
-            span.source = self.source.clone();
-            if let Some(cell) = self
-                .table
-                .as_mut()
-                .and_then(|table| table.current_cell.as_mut())
-            {
-                cell.spans.push(span);
-            } else {
-                self.current.push(span);
-            }
+            self.push_span(StyledSpan::chrome(content, self.prose_style(style)));
+        }
+    }
+
+    fn push_span(&mut self, mut span: StyledSpan) {
+        span.source = self.source.clone();
+        if let Some(cell) = self
+            .table
+            .as_mut()
+            .and_then(|table| table.current_cell.as_mut())
+        {
+            cell.spans.push(span);
+        } else {
+            self.current.push(span);
         }
     }
 
