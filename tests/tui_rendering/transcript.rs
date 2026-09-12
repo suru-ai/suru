@@ -8200,6 +8200,63 @@ fn markdown_selection_preserves_escaped_link_metadata() {
 }
 
 #[test]
+fn markdown_rule_copy_is_valid_from_far_right_partial_cells_at_multiple_widths() {
+    let workspace = workspace_dir();
+    for width in [50, 83] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage("before\n\n---\n\nafter")],
+            )))
+            .unwrap();
+        let buffer = rendered_application_buffer(&application, width, 24);
+        let before = text_position(&buffer, "before").1;
+        let after = text_position(&buffer, "after").1;
+        let rows = buffer_rows(&buffer);
+        let (rule_row, rule) = rows
+            .iter()
+            .enumerate()
+            .skip(usize::from(before + 1))
+            .take(usize::from(after - before - 1))
+            .find(|(_, row)| row.contains('─'))
+            .expect("the rule is painted between its neighboring paragraphs");
+        let cells = rule.chars().collect::<Vec<_>>();
+        let first = cells
+            .iter()
+            .position(|character| *character == '─')
+            .expect("rule start") as u16;
+        let last = cells
+            .iter()
+            .rposition(|character| *character == '─')
+            .expect("rule end") as u16;
+        let rule_row = rule_row as u16;
+        assert!(
+            last > first + 2,
+            "the rule spans the message at width {width}"
+        );
+
+        for start in [last, last - 2] {
+            assert_eq!(
+                select_transcript_payload(
+                    &mut application,
+                    (start, rule_row),
+                    (first, rule_row + 1),
+                ),
+                suru::tui::ClipboardContent {
+                    text: "---".into(),
+                    html: Some("<hr />\n".into()),
+                },
+                "copying the far-right {} cell(s) at width {width}",
+                last - start + 1,
+            );
+        }
+    }
+}
+
+#[test]
 fn markdown_image_chrome_is_excluded_from_plain_and_rich_copy() {
     let workspace = workspace_dir();
     let source = "![diagram](https://example.test/diagram.png)";

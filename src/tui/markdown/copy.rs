@@ -124,7 +124,15 @@ impl Builder {
         id
     }
 
-    pub(super) fn event(&mut self, event: &Event<'_>) -> Option<SourceRange> {
+    pub(super) fn event(&mut self, event: &Event<'_>, content_width: u16) -> Option<SourceRange> {
+        if matches!(event, Event::Rule) {
+            let text = "─".repeat(usize::from(content_width));
+            let node = self.add(Kind::Rule, &text);
+            return Some(SourceRange {
+                node,
+                range: 0..text.len(),
+            });
+        }
         let (kind, text) = match event {
             Event::Start(tag) => {
                 let kind = match tag {
@@ -183,7 +191,6 @@ impl Builder {
             Event::Code(text) => (Kind::InlineCode, text.as_ref()),
             Event::SoftBreak => (Kind::Text, " "),
             Event::HardBreak => (Kind::Break, "\n"),
-            Event::Rule => (Kind::Rule, "────────"),
             Event::TaskListMarker(checked) => {
                 let item = self
                     .stack

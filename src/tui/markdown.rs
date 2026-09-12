@@ -30,7 +30,7 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<
     let mut renderer = Renderer::new(theme, subdued, width, list_plans.clone());
     let mut builder = copy::Builder::new(list_plans);
     for event in parser {
-        renderer.source = builder.event(&event);
+        renderer.source = builder.event(&event, renderer.content_width());
         renderer.event(event);
     }
     let document = std::sync::Arc::new(builder.finish());
@@ -224,7 +224,10 @@ impl<'a> Renderer<'a> {
             }
             Event::Rule => {
                 self.flush_line();
-                self.push("────────", self.theme.markdown.rule);
+                self.push_chrome(
+                    "─".repeat(usize::from(self.content_width())),
+                    self.theme.markdown.rule,
+                );
                 self.flush_line();
                 self.blank_line();
             }
@@ -1823,7 +1826,8 @@ mod tests {
         assert_eq!(span("│ ").style, theme.markdown.block_quote);
         assert_eq!(span("• ").style, theme.markdown.list_marker);
         assert_eq!(span("1. ").style, theme.markdown.list_enumeration);
-        assert_eq!(span("────────").style, theme.markdown.rule);
+        let rule = "─".repeat(80);
+        assert_eq!(span(&rule).style, theme.markdown.rule);
 
         let reasoning = render_reasoning(markdown, &theme);
         assert!(
@@ -1836,17 +1840,54 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_rules_use_the_markdown_rule_role() {
+    fn horizontal_rules_fill_each_available_width_as_rule_chrome() {
         let theme = Theme::system();
 
-        let lines = render("---", &theme);
+        for width in [9, 23] {
+            let lines = super::render("---", &theme, width);
 
-        assert_eq!(
-            lines,
-            vec![StyledLine::text("────────", theme.markdown.rule)]
-        );
-        assert!(!lines[0].spans[0].chrome);
-        assert!(lines[0].spans[0].style.add_modifier.is_empty());
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].width(), usize::from(width));
+            assert_eq!(lines[0].spans[0].content, "─".repeat(usize::from(width)));
+            assert_eq!(lines[0].spans[0].style, theme.markdown.rule);
+            assert!(lines[0].spans[0].chrome);
+            assert!(lines[0].spans[0].source.is_some());
+        }
+    }
+
+    #[test]
+    fn horizontal_rules_reserve_nested_quote_and_list_prefixes() {
+        let theme = Theme::system();
+        let lines = super::render("> - before\n>\n>   ---", &theme, 17);
+        let rule = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains('─')))
+            .expect("nested rule is painted");
+
+        assert_eq!(rule.width(), 17);
+        assert_eq!(rule.spans[0].content, "│ ");
+        assert_eq!(rule.spans[1].content, "  ");
+        assert_eq!(rule.spans[2].content, "─".repeat(13));
+    }
+
+    #[test]
+    fn horizontal_rules_handle_zero_and_one_cell_content_widths() {
+        let theme = Theme::system();
+
+        assert!(super::render("---", &theme, 0).is_empty());
+        let one_cell = super::render("---", &theme, 1);
+        assert_eq!(line_texts(&one_cell), ["─"]);
+        assert!(one_cell[0].spans[0].chrome);
+    }
+
+    #[test]
+    fn reasoning_rules_fill_width_in_the_subdued_style() {
+        let theme = Theme::system();
+        let lines = super::render_reasoning("---", &theme, 19);
+
+        assert_eq!(lines[0].width(), 19);
+        assert_eq!(lines[0].spans[0].style, theme.text.subdued);
+        assert!(lines[0].spans[0].chrome);
     }
 
     #[test]
