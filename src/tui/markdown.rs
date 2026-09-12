@@ -347,6 +347,8 @@ mod tests {
     use super::*;
     use ratatui::style::Modifier;
 
+    use crate::tui::text_layout::StyledLayout;
+
     // These tests assert paint, independently of the source metadata exercised
     // through rendered Application selections in the integration suite.
     fn painted(mut lines: Vec<StyledLine>) -> Vec<StyledLine> {
@@ -365,6 +367,246 @@ mod tests {
 
     fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> {
         painted(super::render_reasoning(content, theme))
+    }
+
+    #[test]
+    fn headings_paint_their_text_with_heading_emphasis() {
+        let theme = Theme::system();
+
+        let lines = render("## Heading", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::text("Heading", theme.markdown.heading)]
+        );
+        assert!(!lines[0].spans[0].chrome);
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn lists_paint_markers_as_chrome_and_leave_item_text_primary() {
+        let theme = Theme::system();
+
+        let lines = render("- first\n- second", &theme);
+
+        assert_eq!(
+            lines,
+            vec![
+                StyledLine::from(vec![
+                    StyledSpan::chrome("• ", theme.markdown.list_marker),
+                    StyledSpan::text("first", theme.text.primary),
+                ]),
+                StyledLine::from(vec![
+                    StyledSpan::chrome("• ", theme.markdown.list_marker),
+                    StyledSpan::text("second", theme.text.primary),
+                ]),
+            ]
+        );
+        assert!(lines.iter().all(|line| line.spans[0].chrome));
+        assert!(lines.iter().all(|line| !line.spans[1].chrome));
+    }
+
+    #[test]
+    fn quotes_paint_the_bar_as_chrome_and_the_words_as_text() {
+        let theme = Theme::system();
+
+        let lines = render("> quoted words", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::from(vec![
+                StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                StyledSpan::text("quoted words", theme.text.primary),
+            ])]
+        );
+        assert!(lines[0].spans[0].chrome);
+        assert!(!lines[0].spans[1].chrome);
+    }
+
+    #[test]
+    fn tables_paint_borders_and_alignment_rows_as_chrome() {
+        let theme = Theme::system();
+
+        let lines = render("| Name | Value |\n| :--- | ---: |\n| alpha | 42 |", &theme);
+
+        assert_eq!(
+            lines,
+            vec![
+                StyledLine::from(vec![
+                    StyledSpan::chrome("| ", theme.markdown.list_marker),
+                    StyledSpan::text("Name", theme.text.primary),
+                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                    StyledSpan::text("Value", theme.text.primary),
+                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                ]),
+                StyledLine::chrome("| :--- | ---: |", theme.markdown.list_marker),
+                StyledLine::from(vec![
+                    StyledSpan::chrome("| ", theme.markdown.list_marker),
+                    StyledSpan::text("alpha", theme.text.primary),
+                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                    StyledSpan::text("42", theme.text.primary),
+                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                ]),
+            ]
+        );
+        assert!(lines[1].spans[0].chrome);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.content.contains('|'))
+                .all(|span| span.chrome)
+        );
+    }
+
+    #[test]
+    fn links_paint_the_label_and_destination_with_link_emphasis() {
+        let theme = Theme::system();
+
+        let lines = render("[Suru](https://example.test)", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::from(vec![
+                StyledSpan::text("Suru", theme.markdown.link),
+                StyledSpan::chrome(" (https://example.test)", theme.markdown.link),
+            ])]
+        );
+        assert!(!lines[0].spans[0].chrome);
+        assert!(lines[0].spans[1].chrome);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+    }
+
+    #[test]
+    fn horizontal_rules_paint_a_subdued_line() {
+        let theme = Theme::system();
+
+        let lines = render("---", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::text("────────", theme.border.subdued)]
+        );
+        assert!(!lines[0].spans[0].chrome);
+        assert!(lines[0].spans[0].style.add_modifier.is_empty());
+    }
+
+    #[test]
+    fn inline_emphasis_paints_italic_and_bold_modifiers() {
+        let theme = Theme::system();
+        let italic = theme.text.primary.patch(theme.markdown.emphasis);
+        let bold = theme.text.primary.patch(theme.markdown.strong);
+
+        let lines = render("plain *soft* and **strong**", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::from(vec![
+                StyledSpan::text("plain ", theme.text.primary),
+                StyledSpan::text("soft", italic),
+                StyledSpan::text(" and ", theme.text.primary),
+                StyledSpan::text("strong", bold),
+            ])]
+        );
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            lines[0].spans[3]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(lines[0].spans.iter().all(|span| !span.chrome));
+    }
+
+    #[test]
+    fn markdown_structure_sets_the_continuation_indent_when_wrapped() {
+        let theme = Theme::system();
+        let cases = [
+            (
+                "- first item that wraps onto another row",
+                0,
+                vec![
+                    (0, "• first item that".to_owned()),
+                    (2, "  wraps onto another".to_owned()),
+                    (2, "  row".to_owned()),
+                ],
+            ),
+            (
+                "> quoted words that wrap onto another row",
+                0,
+                vec![
+                    (0, "│ quoted words that".to_owned()),
+                    (2, "  wrap onto another".to_owned()),
+                    (2, "  row".to_owned()),
+                ],
+            ),
+            (
+                "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |",
+                2,
+                vec![
+                    (0, "| alpha beta gamma |".to_owned()),
+                    (0, "delta |".to_owned()),
+                ],
+            ),
+        ];
+
+        for (markdown, line_index, expected) in cases {
+            let lines = super::render(markdown, &theme);
+            let rows = StyledLayout::new(&lines[line_index], 20)
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.indent,
+                        row.line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                            .trim_end()
+                            .to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "wrap changed for {markdown:?}");
+        }
+    }
+
+    #[test]
+    fn selected_rule_round_trips_as_markdown() {
+        let lines = super::render("---", &Theme::system());
+        let document = lines[0]
+            .markdown
+            .clone()
+            .expect("rendered Markdown carries its copy document");
+        let ranges = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.source.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            document.copy(&ranges, true),
+            crate::tui::ClipboardContent {
+                text: "---".into(),
+                html: Some("<hr />\n".into()),
+            }
+        );
     }
 
     #[test]
