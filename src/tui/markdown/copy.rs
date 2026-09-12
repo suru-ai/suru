@@ -57,9 +57,10 @@ enum Kind {
     Heading(usize),
     Quote,
     List(Option<u64>),
-    Item,
+    Item(Option<bool>),
     Emphasis,
     Strong,
+    Strikethrough,
     Link(String, String, bool),
     Code(String),
     InlineCode,
@@ -126,9 +127,10 @@ impl Builder {
                     Tag::Heading { level, .. } => Kind::Heading(*level as usize),
                     Tag::BlockQuote(_) => Kind::Quote,
                     Tag::List(first) => Kind::List(*first),
-                    Tag::Item => Kind::Item,
+                    Tag::Item => Kind::Item(None),
                     Tag::Emphasis => Kind::Emphasis,
                     Tag::Strong => Kind::Strong,
+                    Tag::Strikethrough => Kind::Strikethrough,
                     Tag::Link {
                         dest_url, title, ..
                     } => Kind::Link(dest_url.to_string(), title.to_string(), false),
@@ -172,6 +174,20 @@ impl Builder {
             Event::SoftBreak => (Kind::Text, " "),
             Event::HardBreak => (Kind::Break, "\n"),
             Event::Rule => (Kind::Rule, "────────"),
+            Event::TaskListMarker(checked) => {
+                let item = self
+                    .stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|id| matches!(self.document.nodes[*id].kind, Kind::Item(_)));
+                if let Some(item) = item
+                    && let Kind::Item(task) = &mut self.document.nodes[item].kind
+                {
+                    *task = Some(*checked);
+                }
+                return None;
+            }
             _ => return None,
         };
         let parent = *self.stack.last().unwrap();
@@ -318,7 +334,7 @@ impl Document {
                     text
                 }
             }
-            Kind::Item => {
+            Kind::Item(task) => {
                 let mut text = String::new();
                 for (child, fragment) in &children {
                     match self.nodes[*child].kind {
@@ -337,10 +353,13 @@ impl Document {
                     }
                     text.push_str(fragment);
                 }
-                // Tight list items have direct inline children; loose items
-                // contain Paragraphs that already protect their own text.
-                // Never escape syntax supplied by a selected block child.
-                if matches!(
+                if let Some(checked) = task {
+                    text.insert_str(0, if *checked { "[x] " } else { "[ ] " });
+                    text
+                } else if matches!(
+                    // Tight list items have direct inline children; loose items
+                    // contain Paragraphs that already protect their own text.
+                    // Never escape syntax supplied by a selected block child.
                     self.nodes[children[0].0].kind,
                     Kind::Text | Kind::Emphasis | Kind::Strong | Kind::Link(..) | Kind::InlineCode
                 ) {
@@ -366,6 +385,7 @@ impl Document {
             Kind::Heading(level) => format!("{} {}", "#".repeat(*level), inline()),
             Kind::Emphasis => wrap(&inline(), "*", "*"),
             Kind::Strong => wrap(&inline(), "**", "**"),
+            Kind::Strikethrough => wrap(&inline(), "~~", "~~"),
             Kind::Link(url, title, image) => {
                 let title = if title.is_empty() {
                     String::new()

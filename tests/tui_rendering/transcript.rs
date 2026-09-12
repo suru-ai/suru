@@ -7662,6 +7662,62 @@ fn markdown_selection_keeps_block_structure_and_partial_list_indentation() {
 }
 
 #[test]
+fn markdown_selection_round_trips_task_items_and_strikethrough() {
+    let workspace = workspace_dir();
+    let source = "- [ ] pending\n  - [x] ~~done~~";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "pending");
+    let end = text_position(&buffer, "done");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 3, end.1));
+
+    assert_eq!(content.text, source);
+    assert_eq!(
+        content.html.as_deref(),
+        Some(
+            "<ul>\n<li><input disabled=\"\" type=\"checkbox\"/>\npending\n<ul>\n<li><input disabled=\"\" type=\"checkbox\" checked=\"\"/>\n<del>done</del></li>\n</ul>\n</li>\n</ul>\n"
+        )
+    );
+}
+
+#[test]
+fn markdown_selection_keeps_task_state_from_loose_item_paragraphs() {
+    let workspace = workspace_dir();
+    let source = "- [x] one\n\n- [ ] two";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "one");
+    let end = text_position(&buffer, "two");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 2, end.1));
+
+    assert_eq!(content.text, "- [x] one\n- [ ] two");
+    assert_eq!(
+        content.html.as_deref(),
+        Some(
+            "<ul>\n<li><input disabled=\"\" type=\"checkbox\" checked=\"\"/>\none</li>\n<li><input disabled=\"\" type=\"checkbox\"/>\ntwo</li>\n</ul>\n"
+        )
+    );
+}
+
+#[test]
 fn markdown_selection_copies_complete_and_partial_pipe_tables() {
     let workspace = workspace_dir();
     let source = "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` | |\n| beta | left\\|right | |";

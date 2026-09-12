@@ -1,5 +1,5 @@
 //! The paired representations of one selected fragment.
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd, html};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardContent {
@@ -37,7 +37,8 @@ impl ClipboardContent {
             );
             output.push_str("</code></pre>\n");
         } else {
-            let events = Parser::new_ext(&text, Options::ENABLE_TABLES).map(|event| match event {
+            let parser = Parser::new_ext(&text, super::markdown::options());
+            let events = parser.map(|event| match event {
                 // Only parser-generated structure is active markup.
                 Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
                 Event::Start(Tag::Image {

@@ -1,7 +1,7 @@
 //! Practical Markdown projection for Agent-authored transcript content.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 
 use crate::theme::Theme;
 
@@ -9,6 +9,10 @@ use super::text_layout::{StyledLayout, StyledLine, StyledSpan};
 
 pub(super) mod copy;
 mod syntax;
+
+pub(super) fn options() -> Options {
+    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
+}
 
 pub(super) fn render(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
     render_prose(content, theme, false, width)
@@ -19,7 +23,7 @@ pub(super) fn render_reasoning(content: &str, theme: &Theme, width: u16) -> Vec<
 }
 
 fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<StyledLine> {
-    let parser = Parser::new_ext(content, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(content, options());
     let mut renderer = Renderer::new(theme, subdued, width);
     let mut builder = copy::Builder::new();
     for event in parser {
@@ -46,6 +50,7 @@ struct Renderer<'a> {
     code_block: Option<CodeBlock>,
     source: Option<copy::SourceRange>,
     table: Option<Table>,
+    pending_list_marker: Option<usize>,
 }
 
 struct CodeBlock {
@@ -88,6 +93,7 @@ impl<'a> Renderer<'a> {
             code_block: None,
             source: None,
             table: None,
+            pending_list_marker: None,
         }
     }
 
@@ -96,7 +102,10 @@ impl<'a> Renderer<'a> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.text(text.as_ref()),
-            Event::Code(code) => self.push(code.as_ref(), self.theme.markdown.inline_code),
+            Event::Code(code) => self.push(
+                code.as_ref(),
+                self.current_style().patch(self.theme.markdown.inline_code),
+            ),
             Event::InlineMath(math) | Event::DisplayMath(math) => {
                 self.push(math.as_ref(), self.current_style())
             }
@@ -126,10 +135,7 @@ impl<'a> Renderer<'a> {
                 self.flush_line();
                 self.blank_line();
             }
-            Event::TaskListMarker(checked) => self.push(
-                if checked { "[x] " } else { "[ ] " },
-                self.theme.markdown.list_marker,
-            ),
+            Event::TaskListMarker(checked) => self.task_marker(checked),
         }
     }
 
@@ -173,9 +179,13 @@ impl<'a> Renderer<'a> {
                     _ => "• ".to_owned(),
                 };
                 self.push_chrome(marker, self.theme.markdown.list_marker);
+                self.pending_list_marker = self.current.len().checked_sub(1);
             }
             Tag::Emphasis => self.push_style(self.theme.markdown.emphasis),
             Tag::Strong => self.push_style(self.theme.markdown.strong),
+            Tag::Strikethrough => {
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+            }
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
                 self.push_style(self.theme.markdown.link);
@@ -224,7 +234,6 @@ impl<'a> Renderer<'a> {
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::Strikethrough
             | Tag::Superscript
             | Tag::Subscript
             | Tag::MetadataBlock(_) => {}
@@ -275,11 +284,14 @@ impl<'a> Renderer<'a> {
                 }
             }
             TagEnd::Item => self.flush_line(),
-            TagEnd::Emphasis | TagEnd::Strong => self.pop_style(),
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
             TagEnd::Link | TagEnd::Image => {
                 self.pop_style();
                 if let Some(destination) = self.links.pop() {
-                    self.push_chrome(format!(" ({destination})"), self.theme.markdown.link);
+                    self.push_chrome(
+                        format!(" ({destination})"),
+                        self.current_style().patch(self.theme.markdown.link),
+                    );
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -320,7 +332,6 @@ impl<'a> Renderer<'a> {
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript
             | TagEnd::MetadataBlock(_) => {}
@@ -328,6 +339,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn text(&mut self, text: &str) {
+        self.pending_list_marker = None;
         if let Some(block) = &mut self.code_block {
             if block.source.is_none() {
                 block.source = self.source.clone();
@@ -377,6 +389,18 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn task_marker(&mut self, checked: bool) {
+        let marker = if checked { "[x] " } else { "[ ] " };
+        let span = StyledSpan::chrome(marker, self.prose_style(self.theme.markdown.list_marker));
+        if let Some(index) = self.pending_list_marker.take()
+            && let Some(pending) = self.current.get_mut(index)
+        {
+            *pending = span;
+        } else {
+            self.push_span(span);
+        }
+    }
+
     fn push_span(&mut self, mut span: StyledSpan) {
         span.source = self.source.clone();
         if let Some(cell) = self
@@ -391,6 +415,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn flush_line(&mut self) {
+        self.pending_list_marker = None;
         if !self.current.is_empty() {
             self.lines
                 .push(StyledLine::from(std::mem::take(&mut self.current)));
@@ -743,6 +768,55 @@ mod tests {
     }
 
     #[test]
+    fn task_items_replace_bullets_with_ascii_checkbox_chrome() {
+        let theme = Theme::system();
+
+        let lines = render("- [ ] pending\n- [x] done", &theme);
+
+        assert_eq!(
+            lines,
+            vec![
+                StyledLine::from(vec![
+                    StyledSpan::chrome("[ ] ", theme.markdown.list_marker),
+                    StyledSpan::text("pending", theme.text.primary),
+                ]),
+                StyledLine::from(vec![
+                    StyledSpan::chrome("[x] ", theme.markdown.list_marker),
+                    StyledSpan::text("done", theme.text.primary),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_task_text_hangs_beneath_the_checkbox() {
+        let theme = Theme::system();
+        let lines = super::render("- [x] first task that wraps onto another row", &theme, 20);
+
+        let layout = StyledLayout::new(&lines[0], 20);
+        let rows = layout.rows();
+        assert_eq!(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.indent,
+                        row.line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (0, "[x] first task that".into()),
+                (4, "    wraps onto".into()),
+                (4, "    another row".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn quotes_paint_the_bar_as_chrome_and_the_words_as_text() {
         let theme = Theme::system();
 
@@ -1004,6 +1078,55 @@ mod tests {
                 .contains(Modifier::BOLD)
         );
         assert!(lines[0].spans.iter().all(|span| !span.chrome));
+    }
+
+    #[test]
+    fn strikethrough_patches_crossed_out_onto_nested_inline_styles() {
+        let theme = Theme::system();
+
+        let lines = render(
+            "plain ~~gone **bold** `code` [link](https://example.test)~~",
+            &theme,
+        );
+        let gone = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "gone ")
+            .expect("struck prose is painted without its delimiters");
+        let bold = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "bold")
+            .expect("nested strong prose remains its own span");
+        let code = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "code")
+            .expect("nested inline code remains its own span");
+        let link = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "link")
+            .expect("nested link label remains its own span");
+        let destination = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("https://example.test"))
+            .expect("nested link destination remains visible chrome");
+
+        assert!(gone.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(bold.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert!(code.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_eq!(code.style.fg, theme.markdown.inline_code.fg);
+        assert!(link.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_eq!(link.style.fg, theme.markdown.link.fg);
+        assert!(
+            destination
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
