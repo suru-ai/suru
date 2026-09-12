@@ -1850,7 +1850,7 @@ impl TuiState {
     fn hydrate_session(&mut self, snapshot: SessionSnapshot) {
         // Any claim this client was drawing is answered by a Session arriving,
         // whether or not it is the one the claim was for.
-        self.provisional = None;
+        self.release_claim();
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -2825,12 +2825,7 @@ impl TuiState {
     /// the client back: the creation goes on, and its answer no longer decides
     /// where the reader is.
     fn abandon_provisional_session(&mut self) -> Option<ProvisionalSession> {
-        let reference = self.provisional_reference();
-        let abandoned = self.provisional.take()?;
-        if let Some(reference) = reference {
-            self.session_interactions.remove(&reference);
-        }
-        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        let abandoned = self.release_claim()?;
         // A refused Prompt is the reader's again: its text goes back to the
         // Landing as a draft, to be resubmitted as the very Prompt it was.
         if abandoned.refused() {
@@ -2838,6 +2833,19 @@ impl TuiState {
                 .admission_failed(ComposerKey::Landing, &abandoned.prompt);
         }
         Some(abandoned)
+    }
+
+    /// Lets go of a claim and the view state it kept, however it ended: given
+    /// up by the reader, or answered by the Session it was a claim on. Nothing
+    /// keyed by its local identity outlives it.
+    fn release_claim(&mut self) -> Option<ProvisionalSession> {
+        let reference = self.provisional_reference();
+        let released = self.provisional.take()?;
+        if let Some(reference) = reference {
+            self.session_interactions.remove(&reference);
+        }
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        Some(released)
     }
 
     /// The Session the Provisional Session draws as, built from what this
@@ -5756,7 +5764,7 @@ impl Application {
         if self.state.provisional.is_some() && !answers_claim {
             return Ok(ApplicationTransition::Continue);
         }
-        let claim = self.state.provisional.take();
+        let claim = self.state.release_claim();
         // Without a claim, the only creation this client could have walked away
         // from is the submission still waiting on an answer. A Session arriving
         // for anything else — a client that never drew a claim for it — is

@@ -592,6 +592,10 @@ fn two_prompts_owed_a_turn_return_the_earliest_and_never_overwrite_it() {
 
     press_escape(&mut application);
     press_escape(&mut application);
+    // Asked again while the Session is still Working for it, which owes the
+    // reader that one Prompt rather than a second copy of it.
+    press_escape(&mut application);
+    press_escape(&mut application);
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             withdrawn(snapshot),
