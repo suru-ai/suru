@@ -851,6 +851,7 @@ async fn resume_after_summary_mutation(
     let checkpoint = server::spawn_with_provider(config.clone(), checkpoint_runtime)
         .await
         .unwrap();
+    checkpoint.workspace_discovery_settled().await;
     let listed = client
         .get(format!("{}/v1/sessions", checkpoint.descriptor().base_url))
         .bearer_auth(&checkpoint.descriptor().token)
@@ -887,6 +888,7 @@ async fn resume_after_summary_mutation(
     let replacement = server::spawn_with_provider(config, replacement_runtime)
         .await
         .expect("spawn replacement server");
+    replacement.workspace_discovery_settled().await;
     let replacement_descriptor = replacement.descriptor().clone();
     client
         .post(format!(

@@ -195,6 +195,7 @@ pub struct RunningServer {
     session_events: SessionEventSink,
     shutdown: ShutdownController,
     serving: ServingController,
+    workspace_discovery: watch::Receiver<bool>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -222,6 +223,12 @@ impl SessionEventSink {
 }
 
 impl RunningServer {
+    /// Startup Workspace discovery runs behind readiness. Resolves once every
+    /// persisted Session has been regrouped, or discovery was abandoned.
+    pub async fn workspace_discovery_settled(&self) {
+        let mut discovery = self.workspace_discovery.clone();
+        let _ = discovery.wait_for(|settled| *settled).await;
+    }
     pub fn descriptor(&self) -> &RuntimeDescriptor {
         &self.descriptor
     }
@@ -547,7 +554,29 @@ pub async fn spawn_with_source_control(
         preparations.resumable_sessions(),
     );
     let source_control = crate::source_control::SourceControlService::new(source_control);
-    sessions.discover_workspaces(&source_control).await?;
+    // Persisted grouping is served at once; discovery regroups Sessions behind
+    // readiness and publishes catalog changes, so a cold source control
+    // system never delays the server's readiness.
+    let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
+    {
+        let sessions = sessions.clone();
+        let source_control = source_control.clone();
+        let mut shutdown = provider_shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => {
+                    tracing::info!("Workspace discovery abandoned for shutdown");
+                }
+                result = sessions.discover_workspaces(&source_control) => {
+                    if let Err(error) = result {
+                        tracing::error!("Workspace discovery failed: {error:#}");
+                    }
+                }
+            }
+            workspace_discovery.send_replace(true);
+        });
+    }
     sessions.observe_checkouts(
         source_control.clone(),
         timings.checkout_observation_interval,
@@ -738,6 +767,7 @@ pub async fn spawn_with_source_control(
         },
         shutdown,
         serving,
+        workspace_discovery: workspace_discovery_rx,
         task,
     })
 }

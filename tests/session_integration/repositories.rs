@@ -392,6 +392,7 @@ async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved()
         .unwrap();
     std::fs::remove_dir(&missing).unwrap();
     let resumed = spawn_with_failing_provider(config.clone()).await.unwrap();
+    resumed.workspace_discovery_settled().await;
     let rows = list(resumed.descriptor(), Some(&readable.session.workspace.id)).await;
     assert_eq!(rows.len(), 2);
     assert!(
@@ -431,6 +432,7 @@ async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved()
     );
     resumed.shutdown().await.unwrap();
     let restarted = spawn_with_failing_provider(config).await.unwrap();
+    restarted.workspace_discovery_settled().await;
     let restored = support::read_session(restarted.descriptor(), readable.session.id).await;
     assert_eq!(restored.session.workspace, readable.session.workspace);
     assert_eq!(restored.prompts, readable.prompts);
@@ -455,6 +457,7 @@ async fn missing_known_checkout_does_not_poison_readable_repository_on_restart()
     server.shutdown().await.unwrap();
     std::fs::remove_dir_all(&linked).unwrap();
     let server = spawn_with_failing_provider(config.clone()).await.unwrap();
+    server.workspace_discovery_settled().await;
     for row in list(
         server.descriptor(),
         Some(&main_session.session.workspace.id),
@@ -485,6 +488,7 @@ async fn missing_known_checkout_does_not_poison_readable_repository_on_restart()
     server.shutdown().await.unwrap();
     std::fs::rename(main.join(".git"), root.join("moved-metadata")).unwrap();
     let server = spawn_with_failing_provider(config).await.unwrap();
+    server.workspace_discovery_settled().await;
     let rows = list(
         server.descriptor(),
         Some(&main_session.session.workspace.id),
