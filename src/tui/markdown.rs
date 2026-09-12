@@ -1,5 +1,7 @@
 //! Practical Markdown projection for Agent-authored transcript content.
 
+use std::collections::VecDeque;
+
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 
@@ -23,9 +25,10 @@ pub(super) fn render_reasoning(content: &str, theme: &Theme, width: u16) -> Vec<
 }
 
 fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<StyledLine> {
+    let list_plans = list_plans(content);
     let parser = Parser::new_ext(content, options());
-    let mut renderer = Renderer::new(theme, subdued, width);
-    let mut builder = copy::Builder::new();
+    let mut renderer = Renderer::new(theme, subdued, width, list_plans.clone());
+    let mut builder = copy::Builder::new(list_plans);
     for event in parser {
         renderer.source = builder.event(&event);
         renderer.event(event);
@@ -38,6 +41,68 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<
     lines
 }
 
+#[derive(Clone, Copy)]
+struct ListPlan {
+    marker_width: usize,
+    delimiter: char,
+}
+
+/// Pulldown reports an ordered list's starting number, but not its delimiter
+/// or widest marker. Its source ranges retain both facts before paint begins.
+fn list_plans(content: &str) -> VecDeque<ListPlan> {
+    let mut plans = Vec::new();
+    let mut active = Vec::new();
+    for (event, range) in Parser::new_ext(content, options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(first)) => {
+                let delimiter = first
+                    .and_then(|_| {
+                        content[range]
+                            .bytes()
+                            .skip_while(u8::is_ascii_digit)
+                            .next()
+                            .map(char::from)
+                    })
+                    .filter(|delimiter| matches!(delimiter, '.' | ')'))
+                    .unwrap_or('.');
+                let index = plans.len();
+                plans.push(ListPlan {
+                    marker_width: 2,
+                    delimiter,
+                });
+                active.push((index, first, 0_u64));
+            }
+            Event::Start(Tag::Item) => {
+                if let Some((_, _, count)) = active.last_mut() {
+                    *count = count.saturating_add(1);
+                }
+            }
+            Event::End(TagEnd::List(_)) => {
+                if let Some((index, Some(first), count)) = active.pop() {
+                    let last = first.saturating_add(count.saturating_sub(1));
+                    plans[index].marker_width = last.to_string().len().saturating_add(2);
+                }
+            }
+            _ => {}
+        }
+    }
+    plans.into()
+}
+
+struct ListState {
+    next: Option<u64>,
+    marker_width: usize,
+    delimiter: char,
+}
+
+struct ItemState {
+    /// Present until the item's first content line is emitted; its width stays
+    /// behind as the continuation indent for every later line.
+    marker: Option<StyledSpan>,
+    marker_width: usize,
+    quote_depth: usize,
+}
+
 struct Renderer<'a> {
     theme: &'a Theme,
     subdued: bool,
@@ -45,12 +110,13 @@ struct Renderer<'a> {
     lines: Vec<StyledLine>,
     current: Vec<StyledSpan>,
     styles: Vec<Style>,
-    lists: Vec<Option<u64>>,
+    lists: Vec<ListState>,
+    list_plans: VecDeque<ListPlan>,
+    items: Vec<ItemState>,
     links: Vec<String>,
     code_block: Option<CodeBlock>,
     source: Option<copy::SourceRange>,
     table: Option<Table>,
-    pending_list_marker: Option<usize>,
     quote_depth: usize,
 }
 
@@ -81,7 +147,7 @@ struct TableCell {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(theme: &'a Theme, subdued: bool, width: u16) -> Self {
+    fn new(theme: &'a Theme, subdued: bool, width: u16, list_plans: VecDeque<ListPlan>) -> Self {
         Self {
             theme,
             subdued,
@@ -90,11 +156,12 @@ impl<'a> Renderer<'a> {
             current: Vec::new(),
             styles: vec![theme.text.primary],
             lists: Vec::new(),
+            list_plans,
+            items: Vec::new(),
             links: Vec::new(),
             code_block: None,
             source: None,
             table: None,
-            pending_list_marker: None,
             quote_depth: 0,
         }
     }
@@ -146,9 +213,9 @@ impl<'a> Renderer<'a> {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
                 let spaced_before = matches!(level, HeadingLevel::H1 | HeadingLevel::H2);
-                if self.pending_list_marker.is_some() {
+                if self.has_pending_list_marker() {
                     if spaced_before {
-                        self.blank_line_before_pending_marker();
+                        self.blank_line_before_block();
                     }
                 } else if spaced_before {
                     self.blank_line_before_block();
@@ -176,24 +243,53 @@ impl<'a> Renderer<'a> {
                     self.flush_line();
                 }
             }
-            Tag::List(first) => self.lists.push(first),
+            Tag::List(first) => {
+                if self.has_pending_list_marker() {
+                    if self.current.is_empty() {
+                        self.emit_line(StyledLine::default());
+                    } else {
+                        self.flush_line();
+                    }
+                }
+                let plan = self.list_plans.pop_front().unwrap_or(ListPlan {
+                    marker_width: 2,
+                    delimiter: '.',
+                });
+                self.lists.push(ListState {
+                    next: first,
+                    marker_width: plan.marker_width,
+                    delimiter: plan.delimiter,
+                });
+            }
             Tag::Item => {
                 self.flush_line();
-                let depth = self.lists.len().saturating_sub(1);
-                if depth > 0 {
-                    // Nesting indent is layout rather than the item's words.
-                    self.push_chrome("  ".repeat(depth), self.theme.text.primary);
-                }
-                let marker = match self.lists.last_mut() {
-                    Some(Some(next)) => {
-                        let marker = format!("{next}. ");
+                let (marker, marker_width) = match self.lists.last_mut() {
+                    Some(ListState {
+                        next: Some(next),
+                        marker_width,
+                        delimiter,
+                    }) => {
+                        let ordinal = format!("{next}{delimiter} ");
                         *next = next.saturating_add(1);
-                        marker
+                        (
+                            format!(
+                                "{}{ordinal}",
+                                " ".repeat(marker_width.saturating_sub(ordinal.len()))
+                            ),
+                            *marker_width,
+                        )
                     }
-                    _ => "• ".to_owned(),
+                    Some(list) => ("• ".to_owned(), list.marker_width),
+                    None => ("• ".to_owned(), 2),
                 };
-                self.push_chrome(marker, self.theme.markdown.list_marker);
-                self.pending_list_marker = self.current.len().checked_sub(1);
+                self.items.push(ItemState {
+                    marker: Some(StyledSpan::chrome(
+                        marker,
+                        self.prose_style(self.theme.markdown.list_marker),
+                    )),
+                    marker_width,
+                    quote_depth: self.quote_depth,
+                });
             }
             Tag::Emphasis => self.push_style(self.theme.markdown.emphasis),
             Tag::Strong => self.push_style(self.theme.markdown.strong),
@@ -297,12 +393,20 @@ impl<'a> Renderer<'a> {
                 self.blank_line();
             }
             TagEnd::List(_) => {
+                self.remove_trailing_separator();
                 self.lists.pop();
                 if self.lists.is_empty() {
                     self.blank_line();
                 }
             }
-            TagEnd::Item => self.flush_line(),
+            TagEnd::Item => {
+                if self.current.is_empty() && self.has_pending_list_marker() {
+                    self.emit_line(StyledLine::default());
+                } else {
+                    self.flush_line();
+                }
+                self.items.pop();
+            }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
             TagEnd::Link | TagEnd::Image => {
                 self.pop_style();
@@ -362,7 +466,6 @@ impl<'a> Renderer<'a> {
     }
 
     fn text(&mut self, text: &str) {
-        self.pending_list_marker = None;
         if let Some(block) = &mut self.code_block {
             if block.source.is_none() {
                 block.source = self.source.clone();
@@ -425,13 +528,21 @@ impl<'a> Renderer<'a> {
 
     fn task_marker(&mut self, checked: bool) {
         let marker = if checked { "[x] " } else { "[ ] " };
-        let span = StyledSpan::chrome(marker, self.prose_style(self.theme.markdown.list_marker));
-        if let Some(index) = self.pending_list_marker.take()
-            && let Some(pending) = self.current.get_mut(index)
+        let style = self.prose_style(self.theme.markdown.list_marker);
+        if let Some(item) = self.items.last_mut()
+            && item.marker.is_some()
         {
-            *pending = span;
+            item.marker_width = item.marker_width.max(marker.len());
+            item.marker = Some(StyledSpan::chrome(
+                format!(
+                    "{}{}",
+                    " ".repeat(item.marker_width.saturating_sub(marker.len())),
+                    marker
+                ),
+                style,
+            ));
         } else {
-            self.push_span(span);
+            self.push_chrome(marker, self.theme.markdown.list_marker);
         }
     }
 
@@ -449,7 +560,6 @@ impl<'a> Renderer<'a> {
     }
 
     fn flush_line(&mut self) {
-        self.pending_list_marker = None;
         if !self.current.is_empty() {
             let line = StyledLine::from(std::mem::take(&mut self.current));
             self.emit_line(line);
@@ -463,7 +573,7 @@ impl<'a> Renderer<'a> {
             .last()
             .is_some_and(|line| self.is_separator(line))
         {
-            self.emit_line(StyledLine::default());
+            self.emit_separator();
         }
     }
 
@@ -474,34 +584,53 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn blank_line_before_pending_marker(&mut self) {
-        let current = std::mem::take(&mut self.current);
-        let pending_list_marker = self.pending_list_marker.take();
-        self.blank_line_before_block();
-        self.current = current;
-        self.pending_list_marker = pending_list_marker;
-    }
-
     fn emit_line(&mut self, mut line: StyledLine) {
-        if self.quote_depth > 0 {
-            let style = self.prose_style(self.theme.markdown.list_marker);
-            line.spans.splice(
-                0..0,
-                (0..self.quote_depth).map(|_| StyledSpan::chrome("│ ", style)),
-            );
-        }
+        let prefix = self.structural_prefix(true);
+        line.spans.splice(0..0, prefix);
         self.lines.push(line);
     }
 
-    fn is_separator(&self, line: &StyledLine) -> bool {
-        if self.quote_depth == 0 {
-            return line.spans.is_empty();
+    fn emit_separator(&mut self) {
+        let mut line = StyledLine::default();
+        line.spans = self.structural_prefix(false);
+        self.lines.push(line);
+    }
+
+    fn structural_prefix(&mut self, content: bool) -> Vec<StyledSpan> {
+        let indent_style = self.prose_style(self.theme.text.primary);
+        let quote_style = self.prose_style(self.theme.markdown.list_marker);
+        let mut prefix = Vec::new();
+        // Quote depth records where an Item began so nested containers retain
+        // source order: outer quote, parent Item indent, then inner quote.
+        for depth in 0..=self.quote_depth {
+            for item in self
+                .items
+                .iter_mut()
+                .filter(|item| item.quote_depth == depth)
+            {
+                prefix.push(if content {
+                    item.marker.take().unwrap_or_else(|| {
+                        StyledSpan::chrome(" ".repeat(item.marker_width), indent_style)
+                    })
+                } else {
+                    StyledSpan::chrome(" ".repeat(item.marker_width), indent_style)
+                });
+            }
+            if depth < self.quote_depth {
+                prefix.push(StyledSpan::chrome("│ ", quote_style));
+            }
         }
-        line.spans.len() == self.quote_depth
-            && line
-                .spans
-                .iter()
-                .all(|span| span.chrome && span.content == "│ ")
+        prefix
+    }
+
+    fn has_pending_list_marker(&self) -> bool {
+        self.items.last().is_some_and(|item| item.marker.is_some())
+    }
+
+    fn is_separator(&self, line: &StyledLine) -> bool {
+        line.spans.iter().all(|span| {
+            span.chrome && (span.content == "│ " || span.content.chars().all(char::is_whitespace))
+        })
     }
 
     fn remove_trailing_separator(&mut self) {
@@ -515,7 +644,13 @@ impl<'a> Renderer<'a> {
     }
 
     fn content_width(&self) -> u16 {
-        let prefix = u16::try_from(self.quote_depth.saturating_mul(2)).unwrap_or(u16::MAX);
+        let prefix = self
+            .items
+            .iter()
+            .map(|item| item.marker_width)
+            .sum::<usize>()
+            .saturating_add(self.quote_depth.saturating_mul(2));
+        let prefix = u16::try_from(prefix).unwrap_or(u16::MAX);
         self.width.saturating_sub(prefix)
     }
 
@@ -819,6 +954,18 @@ mod tests {
         painted(super::render_reasoning(content, theme, 80))
     }
 
+    fn line_texts(lines: &[StyledLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn each_heading_level_paints_its_distinguishing_modifiers() {
         let theme = Theme::system();
@@ -938,12 +1085,12 @@ mod tests {
             text,
             [
                 "• before h2",
-                "",
+                "  ",
                 "• h2",
                 "• after h2",
-                "",
+                "  ",
                 "• h1",
-                "",
+                "  ",
                 "• after h1",
             ]
         );
@@ -987,6 +1134,144 @@ mod tests {
         );
         assert!(lines.iter().all(|line| line.spans[0].chrome));
         assert!(lines.iter().all(|line| !line.spans[1].chrome));
+    }
+
+    #[test]
+    fn nested_item_continuation_paragraphs_keep_all_ancestor_marker_widths() {
+        let theme = Theme::system();
+        let lines = render("- outer\n  - nested b\n\n    continuation", &theme);
+
+        assert_eq!(
+            line_texts(&lines),
+            ["• outer", "  • nested b", "    ", "    continuation"]
+        );
+    }
+
+    #[test]
+    fn an_item_whose_only_content_is_a_nested_list_keeps_markers_on_separate_lines() {
+        let theme = Theme::system();
+        let lines = render("- - inner", &theme);
+
+        assert_eq!(line_texts(&lines), ["• ", "  • inner"]);
+    }
+
+    #[test]
+    fn tight_and_loose_lists_have_distinct_item_spacing() {
+        let theme = Theme::system();
+
+        let tight = render("- first\n- second", &theme);
+        let loose = render("- first\n\n- second", &theme);
+
+        assert_eq!(line_texts(&tight), ["• first", "• second"]);
+        assert_eq!(line_texts(&loose), ["• first", "  ", "• second"]);
+    }
+
+    #[test]
+    fn a_loose_nested_list_does_not_add_spacing_to_its_tight_parent() {
+        let theme = Theme::system();
+        let lines = render("- outer\n  - inner one\n\n  - inner two\n- sibling", &theme);
+
+        assert_eq!(
+            line_texts(&lines),
+            [
+                "• outer",
+                "  • inner one",
+                "    ",
+                "  • inner two",
+                "• sibling",
+            ]
+        );
+    }
+
+    #[test]
+    fn twelve_ordered_items_right_align_to_the_widest_marker() {
+        let theme = Theme::system();
+        let markdown = (1..=12)
+            .map(|number| format!("{number}. item {number}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let lines = render(&markdown, &theme);
+
+        assert_eq!(lines.len(), 12);
+        assert_eq!(line_texts(&lines)[0], " 1. item 1");
+        assert_eq!(line_texts(&lines)[8], " 9. item 9");
+        assert_eq!(line_texts(&lines)[9], "10. item 10");
+        assert_eq!(line_texts(&lines)[11], "12. item 12");
+    }
+
+    #[test]
+    fn task_marker_width_and_list_quote_order_flow_into_nested_lines() {
+        let theme = Theme::system();
+        let task = render("- [x] parent\n  - child", &theme);
+        let ordered = render("10. parent\n    - child", &theme);
+        let quote = render("> - item\n>   > nested quote", &theme);
+
+        assert_eq!(line_texts(&task), ["[x] parent", "    • child"]);
+        assert_eq!(line_texts(&ordered), ["10. parent", "    • child"]);
+        assert_eq!(line_texts(&quote), ["│ • item", "│   │ nested quote"]);
+    }
+
+    #[test]
+    fn parent_marker_width_prefixes_code_and_reserves_table_width() {
+        let theme = Theme::system();
+        let code = render("- ```rust\n  let answer = 42;\n  ```", &theme);
+        assert_eq!(line_texts(&code), ["• rust", "  let answer = 42;"]);
+
+        let table = super::render(
+            "- table:\n\n  | first-column | second |\n  | --- | --- |\n  | alpha beta gamma | value |",
+            &theme,
+            28,
+        );
+        let table_lines = table
+            .iter()
+            .filter(|line| {
+                line.spans.iter().any(|span| span.content.contains('┌'))
+                    || line.spans.iter().any(|span| span.content.contains('│'))
+                    || line.spans.iter().any(|span| span.content.contains('└'))
+            })
+            .collect::<Vec<_>>();
+        assert!(!table_lines.is_empty());
+        assert!(table_lines.iter().all(|line| line.width() <= 28));
+        assert!(table_lines.iter().all(|line| line.spans[0].content == "  "));
+    }
+
+    #[test]
+    fn parenthesized_ordinals_wrap_beneath_their_text() {
+        let theme = Theme::system();
+        let lines = super::render(
+            "9) first item that wraps onto another row\n10) second",
+            &theme,
+            20,
+        );
+        let layout = StyledLayout::new(&lines[0], 20);
+
+        assert_eq!(
+            line_texts(&lines)[0],
+            " 9) first item that wraps onto another row"
+        );
+        assert_eq!(line_texts(&lines)[1], "10) second");
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| {
+                    (
+                        row.indent,
+                        row.line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (0, " 9) first item that".into()),
+                (4, "    wraps onto".into()),
+                (4, "    another row".into()),
+            ]
+        );
     }
 
     #[test]

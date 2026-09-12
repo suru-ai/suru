@@ -7689,6 +7689,32 @@ fn markdown_selection_ignores_quote_chrome_across_blocks_and_tables() {
 }
 
 #[test]
+fn markdown_selection_preserves_parenthesized_ordinal_shape_and_numbering() {
+    let workspace = workspace_dir();
+    let source = "9) nine\n10) ten";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "nine");
+    let end = text_position(&buffer, "ten");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 2, end.1));
+
+    assert_eq!(content.text, source);
+    assert_eq!(
+        content.html.as_deref(),
+        Some("<ol start=\"9\">\n<li>nine</li>\n<li>ten</li>\n</ol>\n")
+    );
+}
+
+#[test]
 fn markdown_selection_restores_a_heading_nested_in_a_quoted_list() {
     let workspace = workspace_dir();
     let source = "> - ## Title";

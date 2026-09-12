@@ -1,7 +1,10 @@
 //! Selection metadata built from the very events the Markdown renderer paints.
 //! Offsets address decoded event text, so escapes, entities and Unicode never
 //! require a second guess at where a painted character came from.
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::Range,
+};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Tag};
 
@@ -56,7 +59,7 @@ enum Kind {
     Paragraph,
     Heading(usize),
     Quote,
-    List(Option<u64>),
+    List(Option<u64>, char),
     Item(Option<bool>),
     Emphasis,
     Strong,
@@ -90,10 +93,11 @@ pub(crate) struct Document {
 pub(super) struct Builder {
     document: Document,
     stack: Vec<usize>,
+    list_plans: VecDeque<super::ListPlan>,
 }
 
 impl Builder {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(list_plans: VecDeque<super::ListPlan>) -> Self {
         Self {
             document: Document {
                 nodes: vec![Node {
@@ -103,6 +107,7 @@ impl Builder {
                 }],
             },
             stack: vec![0],
+            list_plans,
         }
     }
 
@@ -126,7 +131,12 @@ impl Builder {
                     Tag::Paragraph => Kind::Paragraph,
                     Tag::Heading { level, .. } => Kind::Heading(*level as usize),
                     Tag::BlockQuote(_) => Kind::Quote,
-                    Tag::List(first) => Kind::List(*first),
+                    Tag::List(first) => Kind::List(
+                        *first,
+                        self.list_plans
+                            .pop_front()
+                            .map_or('.', |plan| plan.delimiter),
+                    ),
                     Tag::Item => Kind::Item(None),
                     Tag::Emphasis => Kind::Emphasis,
                     Tag::Strong => Kind::Strong,
@@ -338,7 +348,7 @@ impl Document {
                 let mut text = String::new();
                 for (child, fragment) in &children {
                     match self.nodes[*child].kind {
-                        Kind::List(_) => text.push('\n'),
+                        Kind::List(..) => text.push('\n'),
                         Kind::Paragraph
                         | Kind::Code(_)
                         | Kind::Quote
@@ -369,13 +379,13 @@ impl Document {
                 }
             }
             Kind::Paragraph => protect_block_start(inline()),
-            Kind::List(first) => children
+            Kind::List(first, delimiter) => children
                 .iter()
                 .map(|(child, text)| {
                     let position = node.children.iter().position(|id| id == child).unwrap();
                     let marker = first.map_or_else(
                         || "- ".into(),
-                        |first| format!("{}. ", first.saturating_add(position as u64)),
+                        |first| format!("{}{} ", first.saturating_add(position as u64), delimiter),
                     );
                     let indent = " ".repeat(marker.len());
                     format!("{marker}{}", text.replace('\n', &format!("\n{indent}")))

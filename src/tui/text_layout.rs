@@ -714,7 +714,7 @@ fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize
         .count()
         + start;
     (digits_end > start
-        && symbol(digits_end) == Some(".")
+        && matches!(symbol(digits_end), Some("." | ")"))
         && symbols
             .get(digits_end + 1)
             .is_some_and(StyledSymbol::is_whitespace))
