@@ -7718,6 +7718,68 @@ fn markdown_selection_keeps_task_state_from_loose_item_paragraphs() {
 }
 
 #[test]
+fn markdown_selection_preserves_full_and_partial_standalone_strikethrough() {
+    let workspace = workspace_dir();
+    for (first, last, last_width, expected, expected_html) in [
+        (
+            "whole",
+            "strike",
+            6,
+            "~~whole strike~~",
+            "<p><del>whole strike</del></p>\n",
+        ),
+        (
+            "strike",
+            "strike",
+            6,
+            "~~strike~~",
+            "<p><del>strike</del></p>\n",
+        ),
+    ] {
+        let mut application = connected_application(workspace.path());
+        pin_release_copy(&mut application);
+        application
+            .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+                SessionId::new(),
+                workspace.path(),
+                &[RunEntry::AgentMessage("~~whole strike~~ plain")],
+            )))
+            .unwrap();
+
+        let buffer = rendered_application_buffer(&application, 80, 24);
+        let start = text_position(&buffer, first);
+        let end = text_position(&buffer, last);
+        let content =
+            select_transcript_payload(&mut application, start, (end.0 + last_width - 1, end.1));
+
+        assert_eq!(content.text, expected);
+        assert_eq!(content.html.as_deref(), Some(expected_html));
+    }
+}
+
+#[test]
+fn markdown_selection_keeps_escaped_literal_tildes_literal_in_html() {
+    let workspace = workspace_dir();
+    let source = "A \\~\\~literal\\~\\~";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "A ~~literal~~");
+    let content = select_transcript_payload(&mut application, start, (start.0 + 12, start.1));
+
+    assert_eq!(content.text, source);
+    assert_eq!(content.html.as_deref(), Some("<p>A ~~literal~~</p>\n"));
+}
+
+#[test]
 fn markdown_selection_copies_complete_and_partial_pipe_tables() {
     let workspace = workspace_dir();
     let source = "| Name | Value | Empty |\n| :--- | ---: | :---: |\n| **alpha** | `a\\|b` | |\n| beta | left\\|right | |";

@@ -515,7 +515,7 @@ fn escape(text: &str) -> String {
     for character in text.chars() {
         if matches!(
             character,
-            '\\' | '*' | '_' | '[' | ']' | '`' | '|' | '#' | '>' | '<' | '&'
+            '\\' | '*' | '_' | '[' | ']' | '`' | '|' | '#' | '>' | '<' | '&' | '~'
         ) {
             output.push('\\');
         }
@@ -554,7 +554,7 @@ fn protect_block_start(mut text: String) -> String {
     let leading = text.len() - text.trim_start_matches(' ').len();
     let content = &text[leading..];
     let digits = content.bytes().take_while(u8::is_ascii_digit).count();
-    let marker = if content.starts_with(['-', '+', '=', '~']) {
+    let marker = if content.starts_with(['-', '+', '=']) {
         Some(0)
     } else if (1..=9).contains(&digits)
         && matches!(content.as_bytes().get(digits), Some(b'.' | b')'))
