@@ -145,7 +145,7 @@ impl SessionStore {
         }
         // Queue complete recovered snapshots, including corrected subtree
         // readings, before releasing the lock that admits any mutation.
-        for id in hydrated {
+        for &id in &hydrated {
             let record = &state.sessions[&id];
             self.storage.hydrated(PersistedSession {
                 summary: record.summary.clone(),
@@ -153,6 +153,12 @@ impl SessionStore {
                 resume_states: record.resume_states.clone(),
             })?;
         }
+        // A Prompt owed a Turn is owed it by the process that admitted it, and
+        // this history has just outlived that process. Withdraw what nothing
+        // is left to deliver, in the same lock that first made it readable, so
+        // no reader ever sees it as a Message still waiting on an Agent
+        // (ADR 0024).
+        state.withdraw_stranded_prompts(&self.storage, hydrated);
         Ok(())
     }
 

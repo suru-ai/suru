@@ -16,6 +16,8 @@ use crate::protocol::{
     SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
 };
 
+use crate::storage::StorageSink;
+
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState, StoreOutcome,
     projection::active_turn_id,
@@ -131,6 +133,64 @@ fn steerable_turn(snapshot: &SessionSnapshot) -> Option<TurnId> {
         .iter()
         .find(|turn| turn.id == turn_id && !turn.is_continuation())
         .map(|turn| turn.id)
+}
+
+impl SessionStoreState {
+    /// Withdraws every Prompt that was admitted to begin a Turn and persisted
+    /// still waiting for it. A Prompt is owed its Turn by the process that
+    /// admitted it — nothing durable carries that debt across a restart, and
+    /// no reader can be asked to wait on an Agent that will never be asked to
+    /// answer — so restoring one is withdrawing it, exactly as interrupting it
+    /// would have (ADR 0024). A Prompt waiting behind a Turn in the queue is
+    /// not one of these: its delivery is the Session's own to make when that
+    /// Turn settles.
+    ///
+    /// The exception is a Session a stored Worktree preparation can still
+    /// bring to its first Turn: that intention is the durable record of a
+    /// Prompt still owed a Turn, and rejoining the preparation is what
+    /// delivers it. Once the preparation has recorded the Session it admitted,
+    /// the delivery was this process's to make and nothing survives it.
+    ///
+    /// Deferred Sessions are passed over rather than reported: their histories
+    /// have not been read yet, and hydrating one is what brings it here.
+    pub(super) fn withdraw_stranded_prompts(
+        &mut self,
+        storage: &StorageSink,
+        sessions: impl IntoIterator<Item = SessionId>,
+    ) {
+        for session_id in sessions {
+            if self.is_deferred(session_id) || self.resumable_preparations.contains(&session_id) {
+                continue;
+            }
+            let Some(record) = self.sessions.get(&session_id) else {
+                continue;
+            };
+            let stranded = record
+                .snapshot
+                .prompts
+                .iter()
+                .filter(|prompt| {
+                    prompt.status == PromptStatus::Pending
+                        && prompt.delivery == PromptDelivery::Steer
+                        && !record
+                            .snapshot
+                            .turns
+                            .iter()
+                            .any(|turn| turn.prompt_id == Some(prompt.id))
+                })
+                .map(|prompt| SessionChange::PromptStatusChanged {
+                    prompt_id: prompt.id,
+                    status: PromptStatus::Cancelled,
+                })
+                .collect::<Vec<_>>();
+            if stranded.is_empty() {
+                continue;
+            }
+            if let Err(error) = self.commit(storage, session_id, stranded) {
+                tracing::warn!("Restored Prompt could not be withdrawn: {error}");
+            }
+        }
+    }
 }
 
 impl SessionStore {

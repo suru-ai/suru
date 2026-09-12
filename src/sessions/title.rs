@@ -506,7 +506,7 @@ mod tests {
             .await
             .expect("open Session repository");
         let (_writer, storage) = StorageWriter::spawn(repository, &[]);
-        let store = SessionStore::new(Default::default(), storage);
+        let store = SessionStore::new(Default::default(), storage, Vec::new());
         let created = store
             .create(CreateSessionRequest {
                 preparation_id: None,

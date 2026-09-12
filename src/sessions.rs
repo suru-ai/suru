@@ -84,6 +84,10 @@ struct SessionStoreState {
     /// during that interest.
     observed_checkouts: HashMap<crate::protocol::CheckoutId, crate::protocol::CheckoutSummary>,
     deferred: Option<DeferredSessions>,
+    /// The Sessions whose undelivered Prompt a stored Worktree preparation can
+    /// still deliver, so restoring their history leaves that Prompt standing
+    /// where it withdraws every other one nothing is left to deliver.
+    resumable_preparations: HashSet<SessionId>,
 }
 
 struct SessionRecord {
@@ -129,7 +133,14 @@ pub(crate) enum DeleteSessionError {
 }
 
 impl SessionStore {
-    pub(crate) fn new(restored: RestoredSessions, storage: StorageSink) -> Self {
+    /// `resumable_preparations` names the Sessions a stored Worktree
+    /// preparation can still bring to their first Turn; their Prompts are the
+    /// one kind restoration leaves standing (ADR 0024).
+    pub(crate) fn new(
+        restored: RestoredSessions,
+        storage: StorageSink,
+        resumable_preparations: Vec<SessionId>,
+    ) -> Self {
         let started = std::time::Instant::now();
         let RestoredSessions {
             readable: persisted_sessions,
@@ -173,11 +184,16 @@ impl SessionStore {
             catalog,
             observed_checkouts: HashMap::new(),
             deferred,
+            resumable_preparations: resumable_preparations.into_iter().collect(),
         };
         // Durable Turns reconstruct Working and Usage before any Session can
         // be listed or opened, without committing synthetic changes.
         let projection_started = std::time::Instant::now();
         state.restore_projections();
+        // A history read eagerly rather than on access is withdrawn here
+        // instead; a deferred one waits for the hydration that reads it.
+        let readable = state.sessions.keys().copied().collect::<Vec<_>>();
+        state.withdraw_stranded_prompts(&storage, readable);
         tracing::debug!(
             sessions = state.sessions.len(),
             projection_ms = projection_started.elapsed().as_secs_f64() * 1000.0,

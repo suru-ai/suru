@@ -46,4 +46,27 @@ impl PreparationStore {
         })()
         .map_err(|e| format!("Cannot persist Worktree preparation: {e}"))
     }
+
+    /// The Sessions a stored preparation can still bring to their first Turn:
+    /// an intention that never recorded an admitted Session is one whose
+    /// creation did not finish, and rejoining it is how its Prompt reaches the
+    /// Provider it never reached. That makes this the durable record of who
+    /// still owes such a Prompt a Turn across a restart, which is what keeps
+    /// restoration from withdrawing it (ADR 0024). An unreadable intention
+    /// names no Session and holds nothing back.
+    pub(crate) fn resumable_sessions(&self) -> Vec<crate::protocol::SessionId> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let bytes = std::fs::read(entry.ok()?.path()).ok()?;
+                let preparation: PreparedCheckout = serde_json::from_slice(&bytes).ok()?;
+                preparation
+                    .admitted_session
+                    .is_none()
+                    .then_some(preparation.intended_session)
+            })
+            .collect()
+    }
 }

@@ -64,6 +64,76 @@ async fn interrupt(
 }
 
 #[tokio::test]
+async fn a_restart_cancels_the_prompt_no_one_is_left_to_deliver() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config =
+        ServerConfig::new(state_dir.path(), "stranded-prompt-test").expect("configure server");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(config.clone(), runtime)
+        .await
+        .expect("spawn server");
+    let client = reqwest::Client::new();
+    let created = crate::support::create_session(
+        server.descriptor(),
+        &creation(workspace.path(), PromptId::new(), "Map the provider seams"),
+    )
+    .await;
+    // The Provider never answers, so the Prompt is still owed its Turn when
+    // the process that owed it goes away.
+    let held = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    assert_eq!(created.prompts[0].status, PromptStatus::Pending);
+    assert!(created.session.working_since.is_some());
+    server.shutdown().await.expect("shut down server");
+    drop(held);
+
+    let (restarted_runtime, mut restarted_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config.clone(), restarted_runtime)
+        .await
+        .expect("respawn server");
+    let restored = crate::support::read_session(restarted.descriptor(), created.session.id).await;
+    assert_eq!(
+        restored.prompts[0].status,
+        PromptStatus::Cancelled,
+        "nothing in the new process owes this Prompt a Turn, so it is withdrawn \
+         rather than left standing as a Message no Agent will ever answer"
+    );
+    assert_eq!(restored.session.status, SessionStatus::Idle);
+    assert_eq!(restored.session.working_since, None);
+    assert!(restored.turns.is_empty());
+    assert!(restored.messages.is_empty());
+    assert!(
+        restarted_provider.try_next_start().is_none(),
+        "a restart starts no Provider for a Prompt it just withdrew"
+    );
+    let listing = list_sessions(restarted.descriptor()).await;
+    let summary = listing[0]
+        .readable()
+        .expect("the restored Session is readable");
+    assert_eq!(summary.session.working_since, None);
+    assert_eq!(summary.session.status, SessionStatus::Idle);
+    restarted.shutdown().await.expect("shut down server");
+
+    // The withdrawal is durable: the next process reads it back rather than
+    // deciding it again.
+    let (final_runtime, _final_provider) = ControlledProvider::new();
+    let final_server = server::spawn_with_provider(config, final_runtime)
+        .await
+        .expect("respawn server once more");
+    let again = crate::support::read_session(final_server.descriptor(), created.session.id).await;
+    assert_eq!(again.prompts[0].status, PromptStatus::Cancelled);
+    assert_eq!(
+        again.revision, restored.revision,
+        "the Prompt is withdrawn once"
+    );
+    assert_eq!(again.session.working_since, None);
+    drop(client);
+    final_server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn creation_begins_working_before_the_provider_is_reached() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

@@ -540,7 +540,12 @@ pub async fn spawn_with_source_control(
         shutdown_grace: timings.shutdown_grace,
     };
     let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
-    let sessions = SessionStore::new(persisted_sessions, storage.clone());
+    let preparations = crate::source_control::PreparationStore::new(config.data_dir());
+    let sessions = SessionStore::new(
+        persisted_sessions,
+        storage.clone(),
+        preparations.resumable_sessions(),
+    );
     let source_control = crate::source_control::SourceControlService::new(source_control);
     sessions.discover_workspaces(&source_control).await?;
     sessions.observe_checkouts(
@@ -582,7 +587,7 @@ pub async fn spawn_with_source_control(
         settings.subscribe(),
     );
     let state = AppState {
-        preparations: crate::source_control::PreparationStore::new(config.data_dir()),
+        preparations,
         source_control,
         workspace_paths: crate::protocol::WorkspacePaths::discover(),
         descriptor: Arc::new(descriptor.clone()),
