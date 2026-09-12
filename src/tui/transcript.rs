@@ -3741,9 +3741,9 @@ fn reasoning_header_text(label: &str, title: Option<&str>) -> String {
 }
 
 /// The lines a Reasoning block's stored content projects: the summary the
-/// Provider wrote, with subdued Markdown prose and syntax-colored Code Blocks,
-/// followed by the truncation marker when the cap cut it short. A lone block's Fold and a
-/// Group's expansion both open onto exactly this.
+/// Provider wrote, with subdued Markdown prose and flat Code Blocks in the
+/// same subdued posture, followed by the truncation marker when the cap cut it
+/// short. A lone block's Fold and a Group's expansion both open onto exactly this.
 fn reasoning_body_lines(
     reasoning: &ReasoningActivity<'_>,
     theme: &Theme,

@@ -321,7 +321,7 @@ The Theme that paints with the terminal's own colors and leaves its background t
 _Avoid_: Default theme, terminal theme, no theme
 
 **Code Block**:
-A fenced region of an agent's message or reasoning, painted by the language its fence names using the Theme's syntax colors, and painted plainly when the fence names nothing Suru knows. Shell output and file changes are not Code Blocks.
+A fenced region in an agent's answer or Reasoning; answer blocks use language syntax colors when recognized and plain code color otherwise, while Reasoning blocks stay plain and subdued. Shell output and file changes are not Code Blocks.
 _Avoid_: Snippet, code fence, highlighted code
 
 **Setting**:
