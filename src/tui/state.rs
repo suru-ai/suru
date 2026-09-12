@@ -2758,6 +2758,18 @@ impl TuiState {
         ))
     }
 
+    /// Whether the Worktree the Landing intends has already been made for the
+    /// Session being created. The reader is standing in it, so the intent has
+    /// nothing left to say about what a submit would do.
+    pub(super) fn intent_already_prepared(&self) -> bool {
+        self.provisional
+            .as_ref()
+            .and_then(|claim| claim.prepared.as_ref())
+            .is_some_and(|prepared| {
+                self.execution_directory.as_ref() == Some(&prepared.destination.path)
+            })
+    }
+
     pub(super) fn provisional_interaction(&self) -> Option<&SessionInteraction> {
         self.session_interaction(&self.provisional_reference()?)
     }

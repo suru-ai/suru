@@ -3220,8 +3220,13 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
                 .map(|checkout| format!(" · {checkout}"))
                 .unwrap_or_default();
             // A pending intent is only ever said where there is a
-            // Repository to make it in.
-            let intent = if state.new_worktree.is_some() && state.workspace.repository.is_some() {
+            // Repository to make it in, and only until it has been carried
+            // out: a Worktree already made is said by the path above and the
+            // Checkout State beside it.
+            let intent = if state.new_worktree.is_some()
+                && state.workspace.repository.is_some()
+                && !state.intent_already_prepared()
+            {
                 format!(
                     " · {}",
                     icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")

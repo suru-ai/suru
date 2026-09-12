@@ -995,6 +995,75 @@ fn new_worktree_intent_is_deferred_cancelable_and_first_prompt_automatically_adm
 }
 
 #[test]
+fn a_prepared_worktree_stands_in_place_of_the_pending_intent_beneath_the_claim() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Prepare and work");
+    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("first submit prepares")
+    };
+    assert!(text(&app).contains("New Worktree on submit"));
+    let result = prepared(&layout, &request);
+    let destination = result.preparation.destination.path.clone();
+    let ApplicationTransition::CreateSession(_) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap()
+    else {
+        panic!("a prepared Worktree continues to creation")
+    };
+
+    // The Worktree has been made: the claim names where it stands, not what it
+    // was going to do.
+    let drawn = text(&app);
+    assert!(!drawn.contains("New Worktree on submit"), "{drawn}");
+    assert!(
+        drawn.contains(&*destination.file_name().unwrap().to_string_lossy()),
+        "{drawn}"
+    );
+}
+
+#[test]
+fn a_retry_asks_again_for_the_worktree_it_prepared_wherever_the_reader_has_moved() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Prepare and work");
+    let ApplicationTransition::PrepareCheckout { prompt_id, request } =
+        key(&mut app, KeyCode::Enter)
+    else {
+        panic!("first submit prepares")
+    };
+    let result = prepared(&layout, &request);
+    let destination = result.preparation.destination.clone();
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared { prompt_id, result })
+        .unwrap()
+    else {
+        panic!("a prepared Worktree continues to creation")
+    };
+    app.handle_event(ApplicationEvent::SessionCreationFailed {
+        prompt_id: create.prompt.id,
+        error: "Provider unavailable".to_owned(),
+    })
+    .unwrap();
+
+    // The reader moves to the Worktree already in use, then retries the refused
+    // Prompt from the claim it is standing in.
+    open(&mut app, layout.at(&layout.main));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    let ApplicationTransition::CreateSession(retry) = key(&mut app, KeyCode::Enter) else {
+        panic!("a retry must ask for the Session, never prepare a second Worktree")
+    };
+    assert_eq!(retry.preparation_id, Some(request.id));
+    assert_eq!(retry.execution_directory, destination);
+    assert_eq!(retry.prompt.id, create.prompt.id);
+}
+
+#[test]
 fn preparation_failure_preserves_draft_and_id_and_late_results_cannot_replace_deliberate_choice() {
     let layout = Layout::new();
     let mut app = layout.app();
