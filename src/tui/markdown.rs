@@ -145,7 +145,12 @@ impl<'a> Renderer<'a> {
         match tag {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
-                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                let spaced_before = matches!(level, HeadingLevel::H1 | HeadingLevel::H2);
+                if self.pending_list_marker.is_some() {
+                    if spaced_before {
+                        self.blank_line_before_pending_marker();
+                    }
+                } else if spaced_before {
                     self.blank_line_before_block();
                 } else {
                     self.flush_line();
@@ -467,6 +472,14 @@ impl<'a> Renderer<'a> {
         if !self.lines.is_empty() {
             self.blank_line();
         }
+    }
+
+    fn blank_line_before_pending_marker(&mut self) {
+        let current = std::mem::take(&mut self.current);
+        let pending_list_marker = self.pending_list_marker.take();
+        self.blank_line_before_block();
+        self.current = current;
+        self.pending_list_marker = pending_list_marker;
     }
 
     fn emit_line(&mut self, mut line: StyledLine) {
@@ -883,6 +896,74 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0].spans[0].content, "first");
         }
+    }
+
+    #[test]
+    fn every_heading_level_stays_on_its_list_marker_line() {
+        let theme = Theme::system();
+
+        for (markdown, title) in [
+            ("- # H1", "H1"),
+            ("- ## H2", "H2"),
+            ("- ### H3", "H3"),
+            ("- #### H4", "H4"),
+            ("- ##### H5", "H5"),
+            ("- ###### H6", "H6"),
+        ] {
+            let lines = render(markdown, &theme);
+            assert_eq!(lines.len(), 1, "{markdown}");
+            assert_eq!(lines[0].spans[0].content, "• ", "{markdown}");
+            assert_eq!(lines[0].spans[1].content, title, "{markdown}");
+        }
+    }
+
+    #[test]
+    fn h1_and_h2_spacing_precedes_a_pending_list_marker() {
+        let theme = Theme::system();
+        let lines = render(
+            "- ### before h2\n- ## h2\n- #### after h2\n- # h1\n- ##### after h1",
+            &theme,
+        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            text,
+            [
+                "• before h2",
+                "",
+                "• h2",
+                "• after h2",
+                "",
+                "• h1",
+                "",
+                "• after h1",
+            ]
+        );
+    }
+
+    #[test]
+    fn heading_in_a_quoted_list_keeps_all_structural_prefixes_on_one_line() {
+        let theme = Theme::system();
+
+        let lines = render("> - ## Title", &theme);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            StyledLine::from(vec![
+                StyledSpan::chrome("│ ", theme.markdown.list_marker),
+                StyledSpan::chrome("• ", theme.markdown.list_marker),
+                StyledSpan::text("Title", theme.markdown.heading),
+            ])
+        );
     }
 
     #[test]

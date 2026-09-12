@@ -7689,6 +7689,31 @@ fn markdown_selection_ignores_quote_chrome_across_blocks_and_tables() {
 }
 
 #[test]
+fn markdown_selection_restores_a_heading_nested_in_a_quoted_list() {
+    let workspace = workspace_dir();
+    let source = "> - ## Title";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "Title");
+    let content = select_transcript_payload(&mut application, start, (start.0 + 4, start.1));
+
+    assert_eq!(content.text, source);
+    let html = content.html.expect("Markdown selection carries rich HTML");
+    assert!(html.starts_with("<blockquote>\n<ul>"));
+    assert!(html.contains("<h2>Title</h2>"));
+    assert!(html.ends_with("</ul>\n</blockquote>\n"));
+}
+
+#[test]
 fn markdown_selection_round_trips_task_items_and_strikethrough() {
     let workspace = workspace_dir();
     let source = "- [ ] pending\n  - [x] ~~done~~";
