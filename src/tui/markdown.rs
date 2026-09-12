@@ -45,6 +45,7 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<
 struct ListPlan {
     marker_width: usize,
     delimiter: char,
+    loose: bool,
 }
 
 /// Pulldown reports an ordered list's starting number, but not its delimiter
@@ -52,6 +53,7 @@ struct ListPlan {
 fn list_plans(content: &str) -> VecDeque<ListPlan> {
     let mut plans = Vec::new();
     let mut active = Vec::new();
+    let mut depth = 0_usize;
     for (event, range) in Parser::new_ext(content, options()).into_offset_iter() {
         match event {
             Event::Start(Tag::List(first)) => {
@@ -69,20 +71,41 @@ fn list_plans(content: &str) -> VecDeque<ListPlan> {
                 plans.push(ListPlan {
                     marker_width: 2,
                     delimiter,
+                    loose: false,
                 });
-                active.push((index, first, 0_u64));
+                active.push((index, first, 0_u64, None));
+                depth = depth.saturating_add(1);
             }
             Event::Start(Tag::Item) => {
-                if let Some((_, _, count)) = active.last_mut() {
+                if let Some((_, _, count, item_content_depth)) = active.last_mut() {
                     *count = count.saturating_add(1);
+                    *item_content_depth = Some(depth.saturating_add(1));
                 }
+                depth = depth.saturating_add(1);
+            }
+            Event::Start(Tag::Paragraph) => {
+                if let Some((index, _, _, Some(item_content_depth))) = active.last()
+                    && *item_content_depth == depth
+                {
+                    plans[*index].loose = true;
+                }
+                depth = depth.saturating_add(1);
             }
             Event::End(TagEnd::List(_)) => {
-                if let Some((index, Some(first), count)) = active.pop() {
+                depth = depth.saturating_sub(1);
+                if let Some((index, Some(first), count, _)) = active.pop() {
                     let last = first.saturating_add(count.saturating_sub(1));
                     plans[index].marker_width = last.to_string().len().saturating_add(2);
                 }
             }
+            Event::End(TagEnd::Item) => {
+                depth = depth.saturating_sub(1);
+                if let Some((_, _, _, item_content_depth)) = active.last_mut() {
+                    *item_content_depth = None;
+                }
+            }
+            Event::Start(_) => depth = depth.saturating_add(1),
+            Event::End(_) => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
@@ -93,6 +116,7 @@ struct ListState {
     next: Option<u64>,
     marker_width: usize,
     delimiter: char,
+    loose: bool,
 }
 
 struct ItemState {
@@ -254,11 +278,13 @@ impl<'a> Renderer<'a> {
                 let plan = self.list_plans.pop_front().unwrap_or(ListPlan {
                     marker_width: 2,
                     delimiter: '.',
+                    loose: false,
                 });
                 self.lists.push(ListState {
                     next: first,
                     marker_width: plan.marker_width,
                     delimiter: plan.delimiter,
+                    loose: plan.loose,
                 });
             }
             Tag::Item => {
@@ -268,6 +294,7 @@ impl<'a> Renderer<'a> {
                         next: Some(next),
                         marker_width,
                         delimiter,
+                        ..
                     }) => {
                         let ordinal = format!("{next}{delimiter} ");
                         *next = next.saturating_add(1);
@@ -395,7 +422,11 @@ impl<'a> Renderer<'a> {
             TagEnd::List(_) => {
                 self.remove_trailing_separator();
                 self.lists.pop();
-                if self.lists.is_empty() {
+                if self
+                    .lists
+                    .last()
+                    .is_none_or(|parent_list| parent_list.loose)
+                {
                     self.blank_line();
                 }
             }
@@ -1180,6 +1211,28 @@ mod tests {
                 "  • inner two",
                 "• sibling",
             ]
+        );
+    }
+
+    #[test]
+    fn a_nested_list_keeps_the_loose_parent_boundary_before_its_sibling() {
+        let theme = Theme::system();
+        let lines = render("- outer\n\n  - inner\n\n- sibling", &theme);
+
+        assert_eq!(
+            line_texts(&lines),
+            ["• outer", "  ", "  • inner", "  ", "• sibling"]
+        );
+    }
+
+    #[test]
+    fn a_nested_list_keeps_the_loose_parent_boundary_before_a_continuation() {
+        let theme = Theme::system();
+        let lines = render("- outer\n  - inner\n\n  continuation", &theme);
+
+        assert_eq!(
+            line_texts(&lines),
+            ["• outer", "  ", "  • inner", "  ", "  continuation"]
         );
     }
 
