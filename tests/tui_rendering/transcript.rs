@@ -8200,6 +8200,37 @@ fn markdown_selection_preserves_escaped_link_metadata() {
 }
 
 #[test]
+fn markdown_image_chrome_is_excluded_from_plain_and_rich_copy() {
+    let workspace = workspace_dir();
+    let source = "![diagram](https://example.test/diagram.png)";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 100, 24);
+    let start = text_position(&buffer, "[image:");
+    let destination = "https://example.test/diagram.png";
+    let end = text_position(&buffer, destination);
+
+    assert_eq!(
+        select_transcript_payload(
+            &mut application,
+            start,
+            (end.0 + destination.len() as u16 - 1, end.1),
+        ),
+        suru::tui::ClipboardContent {
+            text: source.into(),
+            html: Some("<p><a href=\"https://example.test/diagram.png\">diagram</a></p>\n".into()),
+        }
+    );
+}
+
+#[test]
 fn markdown_selection_uses_valid_fences_for_backticks_in_language_metadata() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());

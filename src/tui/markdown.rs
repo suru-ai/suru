@@ -330,6 +330,10 @@ impl<'a> Renderer<'a> {
                 self.push_style(self.theme.markdown.link_text);
             }
             Tag::Image { dest_url, .. } => {
+                self.push_chrome(
+                    "[image: ",
+                    self.current_style().patch(self.theme.markdown.image),
+                );
                 self.links.push(dest_url.into_string());
                 self.push_style(self.theme.markdown.image_text);
             }
@@ -441,8 +445,8 @@ impl<'a> Renderer<'a> {
                 self.items.pop();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
-            TagEnd::Link => self.close_destination(self.theme.markdown.link),
-            TagEnd::Image => self.close_destination(self.theme.markdown.image),
+            TagEnd::Link => self.close_destination(self.theme.markdown.link, None),
+            TagEnd::Image => self.close_destination(self.theme.markdown.image, Some("]")),
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.remove_trailing_separator();
@@ -512,13 +516,14 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn close_destination(&mut self, destination_style: Style) {
+    fn close_destination(&mut self, destination_style: Style, closing_chrome: Option<&str>) {
         self.pop_style();
+        let destination_style = self.current_style().patch(destination_style);
+        if let Some(closing_chrome) = closing_chrome {
+            self.push_chrome(closing_chrome, destination_style);
+        }
         if let Some(destination) = self.links.pop() {
-            self.push_chrome(
-                format!(" ({destination})"),
-                self.current_style().patch(destination_style),
-            );
+            self.push_chrome(format!(" ({destination})"), destination_style);
         }
     }
 
@@ -1694,6 +1699,97 @@ mod tests {
                 .iter()
                 .all(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
         );
+    }
+
+    #[test]
+    fn inline_autolink_and_reference_links_share_the_link_roles() {
+        let mut theme = Theme::system();
+        theme.markdown.link_text = Style::default().fg(Color::Indexed(121));
+        theme.markdown.link = Style::default().fg(Color::Indexed(122));
+        let lines = render(
+            "[inline](https://inline.test) <https://auto.test> [reference][target]\n\n[target]: https://reference.test",
+            &theme,
+        );
+
+        for label in ["inline", "https://auto.test", "reference"] {
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == label)
+                .unwrap_or_else(|| panic!("missing link label {label:?}"));
+            assert_eq!(span.style, theme.markdown.link_text, "{label}");
+            assert!(!span.chrome, "{label}");
+        }
+        for destination in [
+            " (https://inline.test)",
+            " (https://auto.test)",
+            " (https://reference.test)",
+        ] {
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == destination)
+                .unwrap_or_else(|| panic!("missing link destination {destination:?}"));
+            assert_eq!(span.style, theme.markdown.link, "{destination}");
+            assert!(span.chrome, "{destination}");
+        }
+    }
+
+    #[test]
+    fn images_paint_an_explicit_chrome_wrapper_with_distinct_roles() {
+        let mut theme = Theme::system();
+        theme.markdown.image_text = Style::default().fg(Color::Indexed(131));
+        theme.markdown.image = Style::default().fg(Color::Indexed(132));
+
+        let lines = render("![alt text](https://image.test)", &theme);
+
+        assert_eq!(
+            lines,
+            vec![StyledLine::from(vec![
+                StyledSpan::chrome("[image: ", theme.markdown.image),
+                StyledSpan::text("alt text", theme.markdown.image_text),
+                StyledSpan::chrome("]", theme.markdown.image),
+                StyledSpan::chrome(" (https://image.test)", theme.markdown.image),
+            ])]
+        );
+    }
+
+    #[test]
+    fn image_chrome_and_text_inherit_outer_inline_modifiers() {
+        let theme = Theme::system();
+        let lines = render("**![alt](https://image.test)**", &theme);
+
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| (span.content.as_str(), span.chrome))
+                .collect::<Vec<_>>(),
+            [
+                ("[image: ", true),
+                ("alt", false),
+                ("]", true),
+                (" (https://image.test)", true),
+            ]
+        );
+        assert!(lines[0].spans.iter().all(|span| {
+            span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.fg
+                    == if span.content == "alt" {
+                        theme.markdown.image_text.fg
+                    } else {
+                        theme.markdown.image.fg
+                    }
+        }));
+    }
+
+    #[test]
+    fn an_image_with_empty_alt_text_keeps_a_complete_visual_placeholder() {
+        let theme = Theme::system();
+        let lines = render("![](https://image.test)", &theme);
+
+        assert_eq!(line_texts(&lines), ["[image: ] (https://image.test)"]);
+        assert!(lines[0].spans.iter().all(|span| span.chrome));
     }
 
     #[test]
