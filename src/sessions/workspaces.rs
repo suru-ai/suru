@@ -18,6 +18,7 @@ impl SessionStore {
         &self,
         source_control: &SourceControlService,
     ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
         let sessions = self
             .state
             .lock()
@@ -29,6 +30,8 @@ impl SessionStore {
         for session in &sessions {
             source_control.remember(&session.workspace);
         }
+        let session_count = sessions.len();
+        let mut resolutions = 0usize;
         let mut discovered: std::collections::HashMap<
             std::path::PathBuf,
             crate::protocol::ResolvedWorkspace,
@@ -43,6 +46,7 @@ impl SessionStore {
                     discovered.insert(session.execution_directory.path.clone(), resolution.clone());
                     resolution
                 } else {
+                    resolutions += 1;
                     let resolution = source_control
                         .resolve(&session.execution_directory.path, Some(&session.workspace))
                         .await;
@@ -68,7 +72,15 @@ impl SessionStore {
                 resolution.checkout.or(session.checkout),
             )?;
         }
-        self.refresh_repository_labels(source_control)
+        let result = self.refresh_repository_labels(source_control);
+        tracing::info!(
+            sessions = session_count,
+            directories = discovered.len(),
+            resolutions,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Workspace discovery completed"
+        );
+        result
     }
     pub(crate) fn refresh_repository_labels(
         &self,

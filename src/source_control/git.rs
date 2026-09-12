@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::process::Command;
 mod preparation;
@@ -283,8 +283,31 @@ impl GitSourceControl {
         command
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0");
-        tokio::time::timeout(timeout, command.output())
-            .await
+        let started = Instant::now();
+        let result = tokio::time::timeout(timeout, command.output()).await;
+        let elapsed_ms = started.elapsed().as_millis();
+        match &result {
+            Ok(Ok(output)) => tracing::debug!(
+                directory = %directory.display(),
+                ?args,
+                elapsed_ms,
+                success = output.status.success(),
+                "Git command finished"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                directory = %directory.display(),
+                ?args,
+                elapsed_ms,
+                "Git command could not run: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                directory = %directory.display(),
+                ?args,
+                timeout_ms = timeout.as_millis(),
+                "Git command timed out"
+            ),
+        }
+        result
             .map_err(|_| "Git operation timed out".to_owned())?
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
