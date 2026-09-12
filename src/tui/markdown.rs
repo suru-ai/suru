@@ -457,12 +457,12 @@ impl<'a> Renderer<'a> {
             TagEnd::CodeBlock => {
                 if let Some(block) = self.code_block.take() {
                     let mut offset = 0;
-                    let lines = syntax::render(
-                        &block.content,
-                        &block.info,
-                        self.theme,
-                        self.prose_style(self.theme.markdown.code_block),
-                    )
+                    let flat_style = self.prose_style(self.theme.markdown.code_block);
+                    let lines = if self.subdued {
+                        syntax::flat_lines(&block.content, flat_style)
+                    } else {
+                        syntax::render(&block.content, &block.info, self.theme, flat_style)
+                    }
                     .into_iter()
                     .map(|line| {
                         let mut line = StyledLine::from(line);
@@ -2286,22 +2286,43 @@ mod tests {
     #[test]
     fn streaming_fences_keep_their_colors_when_closed() {
         let theme = Theme::system();
-        for render in [render, render_reasoning] {
-            for fence in ["```", "~~~"] {
-                let mut message = format!("Example:\n\n{fence}rust\n");
-                for delta in ["let", " name = ", "\"hello\";", "\n// note", "\n"] {
-                    message.push_str(delta);
-                    let partial = render(&message, &theme);
-                    assert!(partial.iter().flat_map(|line| &line.spans).any(|span| {
-                        span.content == "let"
-                            && span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
-                    }));
-                    let separator = if message.ends_with('\n') { "" } else { "\n" };
-                    assert_eq!(
-                        partial,
-                        render(&format!("{message}{separator}{fence}"), &theme)
-                    );
-                }
+        for fence in ["```", "~~~"] {
+            let mut message = format!("Example:\n\n{fence}rust\n");
+            for delta in ["let", " name = ", "\"hello\";", "\n// note", "\n"] {
+                message.push_str(delta);
+                let answer = render(&message, &theme);
+                assert!(answer.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content == "let"
+                        && span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
+                }));
+                let reasoning = render_reasoning(&message, &theme);
+                let code_style = theme
+                    .text
+                    .subdued
+                    .add_modifier(theme.markdown.code_block.add_modifier);
+                assert!(
+                    reasoning
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| { span.content.contains("let") && span.style == code_style })
+                );
+                assert!(!reasoning.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
+                }));
+                assert_eq!(
+                    reasoning
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .find(|span| span.content == "rust")
+                        .unwrap()
+                        .style,
+                    theme.text.subdued
+                );
+
+                let separator = if message.ends_with('\n') { "" } else { "\n" };
+                let closed = format!("{message}{separator}{fence}");
+                assert_eq!(answer, render(&closed, &theme));
+                assert_eq!(reasoning, render_reasoning(&closed, &theme));
             }
         }
     }
@@ -2309,28 +2330,42 @@ mod tests {
     #[test]
     fn oversized_code_blocks_fall_back_at_the_byte_boundary() {
         let theme = Theme::system();
-        for render in [render, render_reasoning] {
-            for bytes in [32_767, 32_768, 32_769] {
-                // Multibyte padding distinguishes a byte limit from a character limit.
-                let mut content = "let n = 42;\n//".to_owned();
-                content.push_str(&"é".repeat((bytes - content.len() - 1) / 2));
-                content.push_str(&" ".repeat(bytes - content.len() - 1));
-                content.push('\n');
-                let lines = render(&format!("```rust\n{content}```"), &theme);
-                if bytes > 32_768 {
-                    let mut flat = render(&format!("```unknown\n{content}```"), &theme);
-                    flat[0] = StyledLine::chrome("rust", theme.text.subdued);
-                    assert_eq!(lines, flat);
-                } else {
-                    assert!(
-                        lines[1].spans.iter().any(|span| {
-                            span.content == "let"
-                                && span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
-                        }),
-                        "{bytes} bytes should be highlighted"
-                    );
-                }
+        for bytes in [32_767, 32_768, 32_769] {
+            // Multibyte padding distinguishes a byte limit from a character limit.
+            let mut content = "let n = 42;\n//".to_owned();
+            content.push_str(&"é".repeat((bytes - content.len() - 1) / 2));
+            content.push_str(&" ".repeat(bytes - content.len() - 1));
+            content.push('\n');
+            let lines = render(&format!("```rust\n{content}```"), &theme);
+            if bytes > 32_768 {
+                let mut flat = render(&format!("```unknown\n{content}```"), &theme);
+                flat[0] = StyledLine::chrome("rust", theme.text.subdued);
+                assert_eq!(lines, flat);
+            } else {
+                assert!(
+                    lines[1].spans.iter().any(|span| {
+                        span.content == "let"
+                            && span.style == theme.syntax.keyword.add_modifier(Modifier::ITALIC)
+                    }),
+                    "{bytes} bytes should be highlighted"
+                );
             }
+        }
+    }
+
+    #[test]
+    fn reasoning_code_blocks_keep_the_same_markdown_copy_source() {
+        let source = "Example\n\n```rust\nlet answer = 42;\n```";
+        for render in [super::render, super::render_reasoning] {
+            let lines = render(source, &Theme::system(), 80);
+            let document = lines[0].markdown.clone().unwrap();
+            let ranges = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.source.clone())
+                .collect::<Vec<_>>();
+
+            assert_eq!(document.copy(&ranges, true).text, source);
         }
     }
 

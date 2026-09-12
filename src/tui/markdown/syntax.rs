@@ -77,7 +77,7 @@ fn render_with_syntaxes(
         .unwrap_or_else(|| flat_lines(content, flat_style))
 }
 
-fn flat_lines(content: &str, style: Style) -> Vec<Line<'static>> {
+pub(super) fn flat_lines(content: &str, style: Style) -> Vec<Line<'static>> {
     content
         .split_terminator('\n')
         .map(|line| {
