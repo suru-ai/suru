@@ -1,7 +1,7 @@
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum OpenTag {
+enum HtmlTag {
     Strong,
     Emphasis,
     Link,
@@ -10,109 +10,230 @@ enum OpenTag {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Open {
-    Html(OpenTag),
+    Html(HtmlTag),
     Markdown(TagEnd),
 }
 
+struct Normalizer {
+    output: Vec<Event<'static>>,
+    stack: Vec<Open>,
+    code: Option<String>,
+}
+
 pub(super) fn normalize<'a>(events: impl IntoIterator<Item = Event<'a>>) -> Vec<Event<'static>> {
-    let mut output = Vec::new();
-    let mut stack = Vec::new();
-    let mut code = None::<String>;
+    let mut normalizer = Normalizer {
+        output: Vec::new(),
+        stack: Vec::new(),
+        code: None,
+    };
     for event in events {
+        normalizer.event(event);
+    }
+    normalizer.finish()
+}
+
+impl Normalizer {
+    fn event(&mut self, event: Event<'_>) {
         match event {
-            Event::InlineHtml(raw) | Event::Html(raw) => {
-                tokenize(raw.as_ref(), &mut output, &mut stack, &mut code);
+            Event::InlineHtml(raw) | Event::Html(raw) => self.tokenize(raw.as_ref()),
+            Event::Start(Tag::HtmlBlock) => {
+                self.open_markdown(Event::Start(Tag::Paragraph), TagEnd::Paragraph);
             }
-            Event::Start(Tag::HtmlBlock) => open_markdown(
-                Event::Start(Tag::Paragraph),
-                TagEnd::Paragraph,
-                &mut output,
-                &mut stack,
-            ),
-            Event::End(TagEnd::HtmlBlock) => {
-                close_markdown(TagEnd::Paragraph, &mut output, &mut stack, &mut code);
+            Event::End(TagEnd::HtmlBlock) => self.close_markdown(TagEnd::Paragraph),
+            Event::Text(text) if self.code.is_some() => {
+                self.code.as_mut().unwrap().push_str(text.as_ref());
             }
-            Event::Text(text) if code.is_some() => code.as_mut().unwrap().push_str(text.as_ref()),
-            Event::SoftBreak if code.is_some() => code.as_mut().unwrap().push(' '),
-            Event::HardBreak if code.is_some() => code.as_mut().unwrap().push('\n'),
-            Event::Code(text) if code.is_some() => code.as_mut().unwrap().push_str(text.as_ref()),
-            Event::End(end) if stack.iter().any(|entry| *entry == Open::Markdown(end)) => {
-                close_markdown(end, &mut output, &mut stack, &mut code);
+            Event::SoftBreak if self.code.is_some() => self.code.as_mut().unwrap().push(' '),
+            Event::HardBreak if self.code.is_some() => self.code.as_mut().unwrap().push('\n'),
+            Event::Code(text) if self.code.is_some() => {
+                self.code.as_mut().unwrap().push_str(text.as_ref());
             }
-            Event::Start(_) if code.is_some() => {}
-            Event::End(_) if code.is_some() => {}
+            Event::End(end) if self.stack.iter().any(|entry| *entry == Open::Markdown(end)) => {
+                self.close_markdown(end);
+            }
+            Event::Start(_) if self.code.is_some() => {}
+            Event::End(_) if self.code.is_some() => {}
             Event::Start(tag) => {
                 let end = tag.to_end();
-                open_markdown(
-                    Event::Start(tag.into_static()),
-                    end,
-                    &mut output,
-                    &mut stack,
-                );
+                self.open_markdown(Event::Start(tag.into_static()), end);
             }
-            Event::End(end) => close_markdown(end, &mut output, &mut stack, &mut code),
-            event => output.push(event.into_static()),
+            Event::End(end) => self.close_markdown(end),
+            event => self.output.push(event.into_static()),
         }
     }
-    while let Some(entry) = stack.pop() {
-        if let Open::Html(tag) = entry {
-            close(tag, &mut output, &mut code);
+
+    fn finish(mut self) -> Vec<Event<'static>> {
+        while let Some(entry) = self.stack.pop() {
+            if let Open::Html(tag) = entry {
+                self.close(tag);
+            }
         }
+        self.output
     }
-    output
-}
 
-fn open_markdown(
-    event: Event<'static>,
-    end: TagEnd,
-    output: &mut Vec<Event<'static>>,
-    stack: &mut Vec<Open>,
-) {
-    output.push(event);
-    stack.push(Open::Markdown(end));
-}
+    fn open_markdown(&mut self, event: Event<'static>, end: TagEnd) {
+        self.output.push(event);
+        self.stack.push(Open::Markdown(end));
+    }
 
-fn close_markdown(
-    end: TagEnd,
-    output: &mut Vec<Event<'static>>,
-    stack: &mut Vec<Open>,
-    code: &mut Option<String>,
-) {
-    while let Some(entry) = stack.pop() {
-        match entry {
-            Open::Html(tag) => close(tag, output, code),
-            Open::Markdown(open) if open == end => break,
-            Open::Markdown(open) => output.push(Event::End(open)),
+    fn close_markdown(&mut self, end: TagEnd) {
+        while let Some(entry) = self.stack.pop() {
+            match entry {
+                Open::Html(tag) => self.close(tag),
+                Open::Markdown(open) if open == end => break,
+                Open::Markdown(open) => self.output.push(Event::End(open)),
+            }
         }
+        self.output.push(Event::End(end));
     }
-    output.push(Event::End(end));
-}
 
-fn tokenize(
-    raw: &str,
-    output: &mut Vec<Event<'static>>,
-    stack: &mut Vec<Open>,
-    code: &mut Option<String>,
-) {
-    let mut rest = raw;
-    while let Some(start) = rest.find('<') {
-        text(&rest[..start], output, code);
-        rest = &rest[start..];
-        if rest.starts_with("<!--") {
-            let Some(end) = rest.find("-->") else {
+    fn tokenize(&mut self, raw: &str) {
+        let mut rest = raw;
+        while let Some(start) = rest.find('<') {
+            self.text(&rest[..start]);
+            rest = &rest[start..];
+            if rest.starts_with("<!--") {
+                let Some(end) = rest.find("-->") else {
+                    return;
+                };
+                rest = &rest[end + 3..];
+                continue;
+            }
+            let Some(end) = tag_end(rest) else {
+                self.text(rest);
                 return;
             };
-            rest = &rest[end + 3..];
-            continue;
+            self.tag(&rest[1..end]);
+            rest = &rest[end + 1..];
         }
-        let Some(end) = tag_end(rest) else {
-            text(rest, output, code);
+        self.text(rest);
+    }
+
+    fn tag(&mut self, raw: &str) {
+        let raw = raw.trim();
+        if raw.starts_with('!') || raw.starts_with('?') {
+            return;
+        }
+        let closing = raw.starts_with('/');
+        let body = raw.trim_start_matches('/').trim_start();
+        let name_end = body
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(body.len());
+        let name = body[..name_end].to_ascii_lowercase();
+        if self.code.is_some() && !matches!(name.as_str(), "code" | "kbd") {
+            if !closing
+                && name == "img"
+                && let Some(alt) = attribute(body, "alt")
+            {
+                self.code.as_mut().unwrap().push_str(&alt);
+            }
+            return;
+        }
+        if closing {
+            self.close_named(&name);
+            return;
+        }
+        match name.as_str() {
+            "br" => self.output.push(Event::HardBreak),
+            "b" | "strong" => self.open_html(HtmlTag::Strong, Event::Start(Tag::Strong)),
+            "i" | "em" => self.open_html(HtmlTag::Emphasis, Event::Start(Tag::Emphasis)),
+            "code" | "kbd" if self.code.is_none() => {
+                self.code = Some(String::new());
+                self.stack.push(Open::Html(HtmlTag::Code));
+            }
+            "a" => {
+                let destination = attribute(body, "href").unwrap_or_default();
+                self.stack.push(Open::Html(HtmlTag::Link));
+                self.output.push(Event::Start(Tag::Link {
+                    link_type: LinkType::Inline,
+                    dest_url: CowStr::from(destination),
+                    title: CowStr::from(String::new()),
+                    id: CowStr::from(String::new()),
+                }));
+            }
+            "img" => {
+                let destination = attribute(body, "src").unwrap_or_default();
+                let alt = attribute(body, "alt").unwrap_or_default();
+                self.output.push(Event::Start(Tag::Image {
+                    link_type: LinkType::Inline,
+                    dest_url: CowStr::from(destination),
+                    title: CowStr::from(String::new()),
+                    id: CowStr::from(String::new()),
+                }));
+                self.output.push(Event::Text(CowStr::from(alt)));
+                self.output.push(Event::End(TagEnd::Image));
+            }
+            _ => {}
+        }
+    }
+
+    fn close_named(&mut self, name: &str) {
+        let expected = match name {
+            "b" | "strong" => Some(HtmlTag::Strong),
+            "i" | "em" => Some(HtmlTag::Emphasis),
+            "a" => Some(HtmlTag::Link),
+            "code" | "kbd" => Some(HtmlTag::Code),
+            _ => None,
+        };
+        let Some(expected) = expected else {
             return;
         };
-        handle_tag(&rest[1..end], output, stack, code);
-        rest = &rest[end + 1..];
+        let Some(position) = self
+            .stack
+            .iter()
+            .rposition(|entry| *entry == Open::Html(expected))
+        else {
+            return;
+        };
+        if !self.stack[position + 1..]
+            .iter()
+            .all(|entry| matches!(entry, Open::Html(_)))
+        {
+            return;
+        }
+        while self.stack.len() > position {
+            let Open::Html(tag) = self.stack.pop().unwrap() else {
+                unreachable!("Markdown scope was excluded above")
+            };
+            self.close(tag);
+        }
     }
-    text(rest, output, code);
+
+    fn open_html(&mut self, tag: HtmlTag, event: Event<'static>) {
+        self.stack.push(Open::Html(tag));
+        self.output.push(event);
+    }
+
+    fn close(&mut self, tag: HtmlTag) {
+        match tag {
+            HtmlTag::Strong => self.output.push(Event::End(TagEnd::Strong)),
+            HtmlTag::Emphasis => self.output.push(Event::End(TagEnd::Emphasis)),
+            HtmlTag::Link => self.output.push(Event::End(TagEnd::Link)),
+            HtmlTag::Code => self.output.push(Event::Code(CowStr::from(
+                self.code.take().unwrap_or_default(),
+            ))),
+        }
+    }
+
+    fn text(&mut self, raw: &str) {
+        if raw.is_empty() {
+            return;
+        }
+        if let Some(code) = &mut self.code {
+            code.push_str(&entities(raw));
+        } else {
+            for part in raw.split_inclusive('\n') {
+                let content = part.strip_suffix('\n').unwrap_or(part);
+                if !content.is_empty() {
+                    self.output
+                        .push(Event::Text(CowStr::from(entities(content))));
+                }
+                if part.ends_with('\n') {
+                    self.output.push(Event::HardBreak);
+                }
+            }
+        }
+    }
 }
 
 fn tag_end(raw: &str) -> Option<usize> {
@@ -126,135 +247,6 @@ fn tag_end(raw: &str) -> Option<usize> {
         }
     }
     None
-}
-
-fn handle_tag(
-    raw: &str,
-    output: &mut Vec<Event<'static>>,
-    stack: &mut Vec<Open>,
-    code: &mut Option<String>,
-) {
-    let raw = raw.trim();
-    if raw.starts_with('!') || raw.starts_with('?') {
-        return;
-    }
-    let closing = raw.starts_with('/');
-    let body = raw.trim_start_matches('/').trim_start();
-    let name_end = body
-        .find(|c: char| c.is_ascii_whitespace() || c == '/')
-        .unwrap_or(body.len());
-    let name = body[..name_end].to_ascii_lowercase();
-    if code.is_some() && !matches!(name.as_str(), "code" | "kbd") {
-        if !closing
-            && name == "img"
-            && let Some(alt) = attribute(body, "alt")
-        {
-            code.as_mut().unwrap().push_str(&alt);
-        }
-        return;
-    }
-    if closing {
-        let expected = match name.as_str() {
-            "b" | "strong" => Some(OpenTag::Strong),
-            "i" | "em" => Some(OpenTag::Emphasis),
-            "a" => Some(OpenTag::Link),
-            "code" | "kbd" => Some(OpenTag::Code),
-            _ => None,
-        };
-        if let Some(expected) = expected
-            && let Some(position) = stack
-                .iter()
-                .rposition(|entry| *entry == Open::Html(expected))
-            && stack[position + 1..]
-                .iter()
-                .all(|entry| matches!(entry, Open::Html(_)))
-        {
-            while stack.len() > position {
-                let Open::Html(tag) = stack.pop().unwrap() else {
-                    unreachable!("Markdown scope was excluded above")
-                };
-                close(tag, output, code);
-            }
-        }
-        return;
-    }
-    match name.as_str() {
-        "br" => output.push(Event::HardBreak),
-        "b" | "strong" => open(OpenTag::Strong, Event::Start(Tag::Strong), output, stack),
-        "i" | "em" => open(
-            OpenTag::Emphasis,
-            Event::Start(Tag::Emphasis),
-            output,
-            stack,
-        ),
-        "code" | "kbd" => {
-            if code.is_none() {
-                *code = Some(String::new());
-                stack.push(Open::Html(OpenTag::Code));
-            }
-        }
-        "a" => {
-            let destination = attribute(body, "href").unwrap_or_default();
-            stack.push(Open::Html(OpenTag::Link));
-            output.push(Event::Start(Tag::Link {
-                link_type: LinkType::Inline,
-                dest_url: CowStr::from(destination),
-                title: CowStr::from(String::new()),
-                id: CowStr::from(String::new()),
-            }));
-        }
-        "img" => {
-            let destination = attribute(body, "src").unwrap_or_default();
-            let alt = attribute(body, "alt").unwrap_or_default();
-            output.push(Event::Start(Tag::Image {
-                link_type: LinkType::Inline,
-                dest_url: CowStr::from(destination),
-                title: CowStr::from(String::new()),
-                id: CowStr::from(String::new()),
-            }));
-            output.push(Event::Text(CowStr::from(alt)));
-            output.push(Event::End(TagEnd::Image));
-        }
-        _ => {}
-    }
-}
-
-fn open(
-    tag: OpenTag,
-    event: Event<'static>,
-    output: &mut Vec<Event<'static>>,
-    stack: &mut Vec<Open>,
-) {
-    stack.push(Open::Html(tag));
-    output.push(event);
-}
-
-fn close(tag: OpenTag, output: &mut Vec<Event<'static>>, code: &mut Option<String>) {
-    match tag {
-        OpenTag::Strong => output.push(Event::End(TagEnd::Strong)),
-        OpenTag::Emphasis => output.push(Event::End(TagEnd::Emphasis)),
-        OpenTag::Link => output.push(Event::End(TagEnd::Link)),
-        OpenTag::Code => output.push(Event::Code(CowStr::from(code.take().unwrap_or_default()))),
-    }
-}
-
-fn text(raw: &str, output: &mut Vec<Event<'static>>, code: &mut Option<String>) {
-    if raw.is_empty() {
-        return;
-    }
-    if let Some(code) = code {
-        code.push_str(&entities(raw));
-    } else {
-        for part in raw.split_inclusive('\n') {
-            let content = part.strip_suffix('\n').unwrap_or(part);
-            if !content.is_empty() {
-                output.push(Event::Text(CowStr::from(entities(content))));
-            }
-            if part.ends_with('\n') {
-                output.push(Event::HardBreak);
-            }
-        }
-    }
 }
 
 fn attribute(body: &str, wanted: &str) -> Option<String> {
@@ -295,51 +287,83 @@ fn entities(raw: &str) -> String {
     while let Some(start) = rest.find('&') {
         output.push_str(&rest[..start]);
         rest = &rest[start..];
-        let Some(end) = rest.find(';') else {
-            output.push_str(rest);
-            return output;
+        let Some(end) = entity_end(rest) else {
+            output.push('&');
+            rest = &rest[1..];
+            continue;
         };
-        let entity = &rest[1..end];
-        let decoded = match entity {
-            "apos" => Some("'".to_owned()),
-            value if value.starts_with("#x") || value.starts_with("#X") => {
-                u32::from_str_radix(&value[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .map(|value| value.to_string())
-            }
-            value if value.starts_with('#') => value[1..]
-                .parse()
-                .ok()
-                .and_then(char::from_u32)
-                .map(|value| value.to_string()),
-            _ => {
-                let source = &rest[..=end];
-                let decoded = Parser::new(source)
-                    .filter_map(|event| match event {
-                        Event::Text(text) => Some(text.into_string()),
-                        _ => None,
-                    })
-                    .collect::<String>();
-                (decoded != source).then_some(decoded)
-            }
-        };
-        if let Some(decoded) = decoded {
-            output.push_str(&decoded);
+        let source = &rest[..=end];
+        let decoded = if source == "&apos;" {
+            Some("'".to_owned())
         } else {
-            output.push_str(&rest[..=end]);
-        }
+            let decoded = Parser::new(source)
+                .filter_map(|event| match event {
+                    Event::Text(text) => Some(text.into_string()),
+                    _ => None,
+                })
+                .collect::<String>();
+            (decoded != source).then_some(decoded)
+        };
+        output.push_str(decoded.as_deref().unwrap_or(source));
         rest = &rest[end + 1..];
     }
     output.push_str(rest);
     output
 }
 
+fn entity_end(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = 1;
+    let valid = if bytes.get(index) == Some(&b'#') {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'x' | b'X')) {
+            index += 1;
+            u8::is_ascii_hexdigit
+        } else {
+            u8::is_ascii_digit
+        }
+    } else {
+        u8::is_ascii_alphanumeric
+    };
+    let start = index;
+    while bytes.get(index).is_some_and(valid) {
+        index += 1;
+    }
+    (index > start && bytes.get(index) == Some(&b';')).then_some(index)
+}
+
 #[cfg(test)]
 mod tests {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-    use super::normalize;
+    use super::{attribute, entities, normalize};
+
+    #[test]
+    fn entity_decoding_preserves_non_entities_and_resumes_after_bare_ampersands() {
+        assert_eq!(
+            entities("R&D with *stars*; and `ticks`; then &copy;"),
+            "R&D with *stars*; and `ticks`; then ©"
+        );
+    }
+
+    #[test]
+    fn attribute_decoding_changes_only_valid_entities() {
+        for (tag, name) in [
+            (
+                "a href='https://example.test/R&D?q=*stars*;&amp;copy=&copy;'",
+                "href",
+            ),
+            (
+                "img src='https://example.test/R&D?q=*stars*;&amp;copy=&copy;'",
+                "src",
+            ),
+        ] {
+            assert_eq!(
+                attribute(tag, name).as_deref(),
+                Some("https://example.test/R&D?q=*stars*;&copy=©")
+            );
+        }
+    }
 
     #[test]
     fn code_html_is_one_balanced_atomic_event() {

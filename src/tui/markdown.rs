@@ -2121,7 +2121,7 @@ mod tests {
     fn harmless_inline_html_projects_to_markdown_paint() {
         let theme = Theme::system();
         let lines = render(
-            "one<br>two <b>bold</b> <i>soft</i> <code>code</code> <kbd>key</kbd> <a href='https://example.test/?a=1&amp;b=2'>site</a> <img alt=\"map &amp; key\" src='map.png'> <code><b>still</b></code>",
+            "one<br>two <b>bold</b> <i>soft</i> <code>code</code> <kbd>key</kbd> <a href='https://example.test/?q=R&D=*stars*;&amp;b=2'>site</a> <img alt=\"map &amp; key\" src='map.png'> <code><b>still</b></code>",
             &theme,
         );
 
@@ -2129,7 +2129,7 @@ mod tests {
             line_texts(&lines),
             [
                 "one",
-                "two bold soft code key site (https://example.test/?a=1&b=2) [image: map & key] (map.png) still"
+                "two bold soft code key site (https://example.test/?q=R&D=*stars*;&b=2) [image: map & key] (map.png) still"
             ]
         );
         let spans = lines
@@ -2171,13 +2171,19 @@ mod tests {
     fn html_blocks_keep_inner_text_and_malformed_tags_do_not_unbalance_paint() {
         let theme = Theme::system();
         let lines = render(
-            "<details><summary>x &amp; y &copy;</summary>body</details>\n\n<b>bold\n\nplain <b open",
+            "<details><summary>x &amp; y &copy;</summary>body R&D with *stars*; and `ticks`;</details>\n\n<b>bold\n\nplain <b open",
             &theme,
         );
 
         assert_eq!(
             line_texts(&lines),
-            ["x & y ©body", "", "bold", "", "plain <b open"]
+            [
+                "x & y ©body R&D with *stars*; and `ticks`;",
+                "",
+                "bold",
+                "",
+                "plain <b open"
+            ]
         );
         assert!(
             lines[2].spans[0]
