@@ -2258,6 +2258,82 @@ mod tests {
     }
 
     #[test]
+    fn html_blocks_preserve_comparison_text_that_only_looks_like_a_tag() {
+        let theme = Theme::system();
+        let lines = super::render(
+            "<details open class='example'>a < b and c > d; a < 2 then <b>bold</b></details>",
+            &theme,
+            80,
+        );
+
+        assert_eq!(line_texts(&lines), ["a < b and c > d; a < 2 then bold"]);
+        let spans = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .collect::<Vec<_>>();
+        assert_eq!(spans[0].style, theme.markdown.text);
+        assert!(
+            spans
+                .iter()
+                .find(|span| span.content == "bold")
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+
+        let document = lines[0].markdown.clone().unwrap();
+        let ranges = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.source.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            document.copy(&ranges, true),
+            crate::tui::ClipboardContent {
+                text: r"a \< b and c \> d; a \< 2 then **bold**".into(),
+                html: Some(
+                    "<p>a &lt; b and c &gt; d; a &lt; 2 then <strong>bold</strong></p>\n".into(),
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn html_code_and_kbd_keep_footnote_syntax_literal_and_atomic() {
+        let theme = Theme::system();
+        let source = "See <code>x[^n]y</code> and <kbd>k[^n]z</kbd>.\n\n[^n]: note";
+        let lines = super::render(source, &theme, 80);
+
+        assert_eq!(line_texts(&lines)[0], "See x[^n]y and k[^n]z.");
+        for content in ["x[^n]y", "k[^n]z"] {
+            let span = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == content)
+                .unwrap();
+            assert_eq!(span.style.fg, theme.markdown.inline_code.fg);
+        }
+
+        let document = lines[0].markdown.clone().unwrap();
+        let ranges = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.source.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            document.copy(&ranges, true),
+            crate::tui::ClipboardContent {
+                text: "See `x[^n]y` and `k[^n]z`.\n\n[^n]: note".into(),
+                html: Some(
+                    "<p>See <code>x[^n]y</code> and <code>k[^n]z</code>.</p>\n<div class=\"footnote-definition\" id=\"n\"><sup class=\"footnote-definition-label\">1</sup>\n<p>note</p>\n</div>\n"
+                        .into(),
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn footnotes_use_authored_numbers_and_move_definitions_after_a_rule() {
         let theme = Theme::system();
         let markdown = "Body[^later] then[^first].\n\n[^first]: first\n\n[^later]: later\n\n    9) nested\n\n1) main";

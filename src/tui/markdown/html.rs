@@ -48,6 +48,9 @@ impl Normalizer {
             Event::Code(text) if self.code.is_some() => {
                 self.code.as_mut().unwrap().push_str(text.as_ref());
             }
+            Event::FootnoteReference(label) if self.code.is_some() => {
+                self.code.as_mut().unwrap().push_str(&format!("[^{label}]"));
+            }
             Event::End(end) if self.stack.iter().any(|entry| *entry == Open::Markdown(end)) => {
                 self.close_markdown(end);
             }
@@ -103,14 +106,20 @@ impl Normalizer {
                 self.text(rest);
                 return;
             };
-            self.tag(&rest[1..end]);
+            let candidate = &rest[1..end];
+            if !valid_tag(candidate) {
+                self.text("<");
+                rest = &rest[1..];
+                continue;
+            }
+            self.tag(candidate);
             rest = &rest[end + 1..];
         }
         self.text(rest);
     }
 
     fn tag(&mut self, raw: &str) {
-        let raw = raw.trim();
+        let raw = raw.trim_end();
         if raw.starts_with('!') || raw.starts_with('?') {
             return;
         }
@@ -231,6 +240,107 @@ impl Normalizer {
                 if part.ends_with('\n') {
                     self.output.push(Event::HardBreak);
                 }
+            }
+        }
+    }
+}
+
+fn valid_tag(raw: &str) -> bool {
+    if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!doctype"))
+    {
+        return raw
+            .as_bytes()
+            .get(8)
+            .is_none_or(|byte| byte.is_ascii_whitespace());
+    }
+    if raw.starts_with("![CDATA[") {
+        return raw.ends_with("]]");
+    }
+    if let Some(instruction) = raw.strip_prefix('?') {
+        return instruction.ends_with('?')
+            && instruction
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic);
+    }
+
+    let bytes = raw.as_bytes();
+    let closing = bytes.first() == Some(&b'/');
+    let mut index = usize::from(closing);
+    if !bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        index += 1;
+    }
+    if closing {
+        return bytes[index..].iter().all(u8::is_ascii_whitespace);
+    }
+
+    loop {
+        let before_space = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return true;
+        }
+        if bytes[index] == b'/' {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+            }
+            return index == bytes.len();
+        }
+        if index == before_space {
+            return false;
+        }
+
+        let name_start = index;
+        while bytes.get(index).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'=' | b'\'' | b'"' | b'<')
+        }) {
+            index += 1;
+        }
+        if index == name_start {
+            return false;
+        }
+        let name_end = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'=') {
+            index = name_end;
+            continue;
+        }
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let Some(&first) = bytes.get(index) else {
+            return false;
+        };
+        if matches!(first, b'\'' | b'"') {
+            index += 1;
+            let Some(length) = bytes[index..].iter().position(|byte| *byte == first) else {
+                return false;
+            };
+            index += length + 1;
+        } else {
+            let value_start = index;
+            while bytes.get(index).is_some_and(|byte| {
+                !byte.is_ascii_whitespace() && !matches!(*byte, b'\'' | b'"' | b'=' | b'<' | b'`')
+            }) {
+                index += 1;
+            }
+            if index == value_start {
+                return false;
             }
         }
     }

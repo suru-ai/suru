@@ -5102,7 +5102,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_reasoning_preserves_code_colors_and_subdues_prose() {
+    fn expanded_reasoning_subdues_code_and_prose() {
         let activity = reasoning(
             ActivityStatus::Completed,
             None,
@@ -5121,10 +5121,14 @@ mod tests {
             std::path::Path::new(""),
         );
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+        let code_style = theme
+            .text
+            .subdued
+            .add_modifier(theme.markdown.code_block.add_modifier);
         assert!(
             spans
                 .iter()
-                .any(|span| span.content == "struct" && span.style.fg == theme.syntax.keyword.fg)
+                .any(|span| span.content.contains("struct Widget;") && span.style == code_style)
         );
         assert!(spans.iter().any(|span| span.content == "this"
             && span.style == theme.text.subdued.add_modifier(Modifier::BOLD)));
