@@ -366,6 +366,7 @@ struct ResolvedCheckout {
 
 #[derive(Clone, Debug)]
 pub struct TuiState {
+    hyperlinks: bool,
     left_press: Option<LeftPress>,
     last_click: Option<LastClick>,
     click_interval: Duration,
@@ -683,6 +684,7 @@ impl TuiState {
         // Workspace none of this client's Sessions match.
         let workspace = workspace_reading(workspace.as_ref());
         Self {
+            hyperlinks: false,
             left_press: None,
             last_click: None,
             click_interval: CLICK_INTERVAL,
@@ -2165,7 +2167,7 @@ impl TuiState {
         let snapshot = self.session.as_ref()?.snapshot();
         let interaction = self.session_interaction(self.session_reference.as_ref()?)?;
         let provisional = self.provisional_prompts(snapshot.session.id);
-        Some(self.transcript_cache.view(
+        Some(self.transcript_cache.view_with_hyperlinks(
             self.transcript_generation,
             snapshot,
             &provisional.iter().collect::<Vec<_>>(),
@@ -2177,6 +2179,7 @@ impl TuiState {
             },
             theme,
             width,
+            self.hyperlinks,
         ))
     }
 
@@ -2948,7 +2951,7 @@ impl TuiState {
         let folds = TranscriptFolds::default();
         let groups = TranscriptGroups::default();
         let turns = TranscriptTurnFolds::default();
-        Some(self.transcript_cache.view(
+        Some(self.transcript_cache.view_with_hyperlinks(
             self.transcript_generation,
             snapshot,
             &[&provisional.prompt],
@@ -2960,6 +2963,7 @@ impl TuiState {
             },
             theme,
             width,
+            self.hyperlinks,
         ))
     }
 
@@ -3669,6 +3673,7 @@ pub enum ApplicationTransition {
     /// Issue a fresh Invite containing exactly the addresses the reader chose.
     IssueInvite(crate::protocol::IssueInviteRequest),
     CopyToClipboard(super::ClipboardContent),
+    OpenHyperlink(String),
     RemovePeer(String),
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
@@ -3704,7 +3709,8 @@ impl Application {
         Self::from_state(TuiState::new(workspace), terminal_facts)
     }
 
-    fn from_state(state: TuiState, terminal_facts: TerminalFacts) -> Self {
+    fn from_state(mut state: TuiState, terminal_facts: TerminalFacts) -> Self {
+        state.hyperlinks = terminal_facts.hyperlinks;
         let mut application = Self {
             state,
             slots: RenderSlots::builtins(),
@@ -3751,6 +3757,7 @@ impl Application {
             return;
         }
         self.terminal_facts = terminal_facts;
+        self.state.hyperlinks = terminal_facts.hyperlinks;
         self.resolve_theme();
     }
 
@@ -4921,6 +4928,9 @@ impl Application {
                 id: SemanticCommandId::ComposerPlaceCursor,
                 subject: SemanticSubject::ComposerCursor(target),
             });
+        }
+        if let Some(target) = self.transcript_hyperlink(position) {
+            return self.invoke_semantic(SemanticCommandId::HyperlinkOpen.on_hyperlink(target));
         }
         match self.state.toggle_disclosure_at(position) {
             Some(invocation) => self.invoke_semantic(invocation),
@@ -6360,6 +6370,13 @@ impl Application {
         })
     }
 
+    fn transcript_hyperlink(&self, position: Position) -> Option<String> {
+        let cell = self.transcript_cell(position)?;
+        self.state
+            .transcript_cache
+            .hyperlink_at(cell.row, cell.column)
+    }
+
     /// Marks the word or whole Line under a Transcript cell.
     fn select_transcript_text(&mut self, position: Position, granularity: SelectionGranularity) {
         let Some(cell) = self.transcript_cell(position) else {
@@ -6551,6 +6568,15 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            SemanticCommandId::HyperlinkOpen => {
+                let SemanticSubject::Hyperlink(target) = invocation.subject else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                Ok(super::clipboard::safe_hyperlink_target(&target)
+                    .map_or(ApplicationTransition::Continue, |target| {
+                        ApplicationTransition::OpenHyperlink(target.to_owned())
+                    }))
+            }
             SemanticCommandId::PointerClick => {
                 let SemanticSubject::ScreenPosition(position) = invocation.subject else {
                     return Ok(ApplicationTransition::Continue);
@@ -6945,7 +6971,8 @@ impl Application {
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Questionnaire(_)
-                | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Origin(_)
+                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
@@ -6958,7 +6985,8 @@ impl Application {
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Questionnaire(_)
-                | SemanticSubject::Origin(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Origin(_)
+                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
             // Session has a parent to return to, so anywhere else the command
@@ -6995,7 +7023,8 @@ impl Application {
                     | SemanticSubject::ComposerCursor(_)
                     | SemanticSubject::Turn(_)
                     | SemanticSubject::Questionnaire(_)
-                    | SemanticSubject::Origin(_) => self.session_reference(),
+                    | SemanticSubject::Origin(_)
+                    | SemanticSubject::Hyperlink(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
                     ApplicationTransition::SettleSession { session, settled }
@@ -7041,7 +7070,8 @@ impl Application {
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Session(_)
-                | SemanticSubject::Questionnaire(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Questionnaire(_)
+                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
@@ -7409,6 +7439,12 @@ impl Application {
             &self.slots,
             &self.theme,
             self.terminal_facts.truecolor,
+        );
+        super::event_loop::frame_backend::finish_frame(
+            frame.buffer_mut(),
+            !self.state.overlay_owns_input()
+                && !self.state.reconnect_overlay_visible
+                && self.state.active_selection_overlay_area().is_none(),
         );
     }
 

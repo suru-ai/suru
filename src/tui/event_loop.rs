@@ -54,7 +54,7 @@ use crate::terminal::{TerminalEvents, TerminalFacts, TerminalInput, request_term
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 mod clipboard_thread;
-mod frame_backend;
+pub(super) mod frame_backend;
 
 /// termina's own writer is 128 bytes on Windows and 4 KiB on Unix, so a frame
 /// of a few KiB reached the console as dozens of writes and the terminal could
@@ -76,7 +76,8 @@ pub async fn run(client: ManagedClient) -> Result<()> {
     let mut session = TerminalSession::enter()?;
     let mut input = TerminalEvents::open()?;
     input.request_colors(session.terminal.backend_mut())?;
-    let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX);
+    let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX)
+        .with_hyperlinks(TerminalFacts::hyperlinks_from_environment());
     run_loop(
         &mut session.terminal,
         client,
@@ -511,7 +512,11 @@ async fn run_loop(
     loop {
         run.sync_skill_catalog();
         if run.needs_redraw && run.application.first_frame_ready() {
-            draw_frame(terminal, |frame| run.application.render(frame))?;
+            draw_frame(
+                terminal,
+                run.application.terminal_facts.hyperlinks,
+                |frame| run.application.render(frame),
+            )?;
             run.needs_redraw = false;
         }
         // Rendering records which animation is actually visible, including a
@@ -597,7 +602,9 @@ async fn run_loop(
 
 fn leave_run_loop(terminal: &mut TuiTerminal, application: &Application, exit: Exit) -> Result<()> {
     if exit == Exit::AfterFinalFrame {
-        draw_frame(terminal, |frame| application.render(frame))?;
+        draw_frame(terminal, application.terminal_facts.hyperlinks, |frame| {
+            application.render(frame)
+        })?;
     }
     Ok(())
 }
@@ -608,8 +615,10 @@ fn leave_run_loop(terminal: &mut TuiTerminal, application: &Application, exit: E
 /// ended the frame is the one reported.
 fn draw_frame<B: Backend + std::io::Write>(
     terminal: &mut Terminal<frame_backend::FrameBackend<B>>,
+    hyperlinks: bool,
     render: impl FnOnce(&mut Frame),
 ) -> std::io::Result<()> {
+    frame_backend::begin_frame(hyperlinks);
     let drawn = terminal.draw(render).map(|_| ());
     let ended = terminal.backend_mut().end_frame();
     drawn.and(ended)
@@ -989,6 +998,11 @@ impl RunLoop {
             ApplicationTransition::CopyToClipboard(_) => {
                 unreachable!("clipboard output is handled before task dispatch")
             }
+            ApplicationTransition::OpenHyperlink(target) => {
+                if let Err(error) = super::hyperlink::open(&target) {
+                    tracing::warn!("could not open hyperlink: {error}");
+                }
+            }
         }
         ControlFlow::Continue(())
     }
@@ -1148,6 +1162,7 @@ impl RunLoop {
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite(_)
             | ApplicationTransition::CopyToClipboard(_)
+            | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
@@ -3172,7 +3187,7 @@ mod tests {
         EnableMouseButtonReporting, FRAME_BUFFER_CAPACITY, NativeClipboard, NativeClipboardSink,
         PopModifiedKeyReporting, PushModifiedKeyReporting, TerminalSink, copy_to_clipboard,
         draw_frame, enter_terminal_display,
-        frame_backend::{FrameBackend, ansi},
+        frame_backend::{FrameBackend, ansi, finish_frame, register_hyperlink},
         ignore_unsupported, leave_terminal_display, remote_failure_from_session_error,
     };
     use crate::{
@@ -3420,19 +3435,23 @@ mod tests {
         let mut terminal = Terminal::new(FrameBackend::new(AnsiTranscriptBackend::over(buffered)))
             .expect("a counting Terminal always starts");
 
-        draw_frame(&mut terminal, |frame| a_busy_frame(frame, "suru\nis\nhere"))
-            .expect("a counting console never fails");
+        draw_frame(&mut terminal, false, |frame| {
+            a_busy_frame(frame, "suru\nis\nhere")
+        })
+        .expect("a counting console never fails");
         assert_eq!(writes.get(), 1, "a busy frame took more than one write");
 
-        draw_frame(&mut terminal, |frame| a_busy_frame(frame, "suru\nis\nhere"))
-            .expect("a counting console never fails");
+        draw_frame(&mut terminal, false, |frame| {
+            a_busy_frame(frame, "suru\nis\nhere")
+        })
+        .expect("a counting console never fails");
         assert_eq!(writes.get(), 2, "an idle frame took more than one write");
 
         let console = CountingWriter::default();
         let writes = console.counter();
         let mut unbuffered = Terminal::new(FrameBackend::new(AnsiTranscriptBackend::over(console)))
             .expect("a counting Terminal always starts");
-        draw_frame(&mut unbuffered, |frame| {
+        draw_frame(&mut unbuffered, false, |frame| {
             a_busy_frame(frame, "suru\nis\nhere")
         })
         .expect("a counting console never fails");
@@ -3449,7 +3468,7 @@ mod tests {
     fn a_frame_is_drawn_inside_one_synchronized_update() {
         let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
 
-        draw_frame(&mut terminal, |frame| {
+        draw_frame(&mut terminal, false, |frame| {
             frame.render_widget("suru", frame.area());
             frame.set_cursor_position(Position::new(3, 2));
         })
@@ -3489,7 +3508,7 @@ mod tests {
     fn a_frame_that_fails_to_draw_still_closes_its_synchronized_update() {
         let mut terminal = recording_terminal(AnsiTranscriptBackend::refusing_to_draw());
 
-        let failure = draw_frame(&mut terminal, |frame| {
+        let failure = draw_frame(&mut terminal, false, |frame| {
             frame.render_widget("suru", frame.area());
             frame.set_cursor_position(Position::new(3, 2));
         })
@@ -3525,7 +3544,7 @@ mod tests {
         text: &'static str,
     ) -> String {
         let before = terminal.backend().inner().transcript().len();
-        draw_frame(terminal, |frame| {
+        draw_frame(terminal, false, |frame| {
             frame.render_widget(text, frame.area());
             if let Some(caret) = caret {
                 frame.set_cursor_position(caret);
@@ -3551,6 +3570,125 @@ mod tests {
             second, "\x1b[?2026h\x1b[?2026l",
             "an unchanged frame re-emitted cursor traffic"
         );
+    }
+
+    fn draw_hyperlink_frame(
+        terminal: &mut RecordingTerminal,
+        enabled: bool,
+        text: &'static str,
+        target: Option<&str>,
+    ) -> String {
+        let before = terminal.backend().inner().transcript().len();
+        draw_frame(terminal, enabled, |frame| {
+            frame.render_widget(text, frame.area());
+            if let Some(target) = target {
+                let width =
+                    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX);
+                register_hyperlink(frame.buffer_mut(), 0, 0, width, target);
+            }
+            finish_frame(frame.buffer_mut(), true);
+        })
+        .expect("an ANSI transcript never fails to record");
+        terminal.backend().inner().transcript()[before..].to_owned()
+    }
+
+    #[test]
+    fn hyperlink_cells_emit_osc8_and_idle_frames_reuse_the_terminal_state() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let first = draw_hyperlink_frame(
+            &mut terminal,
+            true,
+            "link",
+            Some("https://example.test/one"),
+        );
+        assert!(first.contains("\x1b]8;;https://example.test/one\x1b\\"));
+        assert!(first.contains("\x1b]8;;\x1b\\"));
+
+        let idle = draw_hyperlink_frame(
+            &mut terminal,
+            true,
+            "link",
+            Some("https://example.test/one"),
+        );
+        assert_eq!(idle, "\x1b[?2026h\x1b[?2026l");
+    }
+
+    #[test]
+    fn changing_or_removing_only_a_target_repaints_its_visible_cell() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        draw_hyperlink_frame(&mut terminal, true, "界", Some("https://example.test/one"));
+
+        let changed =
+            draw_hyperlink_frame(&mut terminal, true, "界", Some("https://example.test/two"));
+        assert!(changed.contains("\x1b]8;;https://example.test/two\x1b\\"));
+        assert!(changed.contains('界'));
+        assert!(
+            !changed.contains("\x1b[1;2H"),
+            "wide trailing cell was repainted"
+        );
+
+        let removed = draw_hyperlink_frame(&mut terminal, true, "界", None);
+        assert!(removed.contains('界'));
+        assert!(!removed.contains("\x1b]8;;https://"));
+    }
+
+    #[test]
+    fn removing_a_link_cannot_repaint_over_a_new_wide_glyph() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        draw_hyperlink_frame(&mut terminal, true, "ab", Some("https://example.test/one"));
+
+        let replaced = draw_hyperlink_frame(&mut terminal, true, "界", None);
+        assert!(replaced.contains('界'));
+        assert!(!replaced.contains("\x1b[1;2H"));
+        assert!(!replaced.contains('b'));
+    }
+
+    #[test]
+    fn an_occluding_wide_glyph_also_clears_the_link_without_overlap() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        draw_hyperlink_frame(&mut terminal, true, "ab", Some("https://example.test/one"));
+        let before = terminal.backend().inner().transcript().len();
+        draw_frame(&mut terminal, true, |frame| {
+            frame.render_widget("界", frame.area());
+            finish_frame(frame.buffer_mut(), false);
+        })
+        .unwrap();
+        let replaced = &terminal.backend().inner().transcript()[before..];
+        assert!(replaced.contains('界'));
+        assert!(!replaced.contains("\x1b[1;2H"));
+        assert!(!replaced.contains('b'));
+    }
+
+    #[test]
+    fn ordinary_cells_keep_ratatuis_row_major_draw_order() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let before = terminal.backend().inner().transcript().len();
+        draw_frame(&mut terminal, false, |frame| {
+            for (x, y, symbol) in [(0, 0, "a"), (1, 0, "b"), (0, 1, "c"), (1, 1, "d")] {
+                frame.buffer_mut()[(x, y)].set_symbol(symbol);
+            }
+            finish_frame(frame.buffer_mut(), true);
+        })
+        .unwrap();
+        let frame = &terminal.backend().inner().transcript()[before..];
+        let positions =
+            AnsiTranscript::positions(frame, &["\x1b[1;1H", "\x1b[1;2H", "\x1b[2;1H", "\x1b[2;2H"]);
+        assert!(
+            positions.is_sorted(),
+            "cell diff became column-major: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_terminals_emit_no_hyperlink_sequences() {
+        let mut terminal = recording_terminal(AnsiTranscriptBackend::new());
+        let frame = draw_hyperlink_frame(
+            &mut terminal,
+            false,
+            "link",
+            Some("https://example.test/one"),
+        );
+        assert!(!frame.contains("\x1b]8;;"));
     }
 
     /// Hide and Show are transitions, not per-frame decorations: once the first

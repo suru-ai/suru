@@ -31,6 +31,7 @@ pub enum SemanticCommandId {
     ComposerPlaceCursor,
     PointerClick,
     PointerDrag,
+    HyperlinkOpen,
     TextSelectionCopy,
     TextSelectionClear,
     TextSelectionWord,
@@ -186,6 +187,7 @@ pub(super) enum SemanticSubject {
     View,
     ComposerCursor(CursorTarget),
     ScreenPosition(Position),
+    Hyperlink(String),
     Turn(TurnId),
     Questionnaire(QuestionnaireId),
     Origin(Outlook),
@@ -247,6 +249,13 @@ impl SemanticCommandId {
         }
     }
 
+    pub(super) fn on_hyperlink(self, target: String) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Hyperlink(target),
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QuestionnaireScrollUp => "questionnaire.scroll.up",
@@ -266,6 +275,7 @@ impl SemanticCommandId {
             Self::QuestionnaireDecline => "questionnaire.decline",
             Self::PointerClick => "pointer.click",
             Self::PointerDrag => "pointer.drag",
+            Self::HyperlinkOpen => "hyperlink.open",
             Self::TextSelectionCopy => "text_selection.copy",
             Self::TextSelectionClear => "text_selection.clear",
             Self::TextSelectionWord => "text_selection.word",
@@ -1006,6 +1016,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::PointerClick,
         title: "Click",
         description: "Act on a screen cell in the active surface",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::HyperlinkOpen,
+        title: "Open Hyperlink",
+        description: "Open the hyperlink named by a rendered Transcript cell",
         slash: None,
         keybinding: None,
     },

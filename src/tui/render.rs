@@ -4003,6 +4003,17 @@ fn render_session_surface(
             state.text_selection.set(None);
         }
     }
+    for link in &window.hyperlinks {
+        super::event_loop::frame_backend::register_hyperlink(
+            buffer,
+            transcript_area
+                .x
+                .saturating_add(u16::try_from(link.column).unwrap_or(u16::MAX)),
+            content_top.saturating_add(u16::try_from(link.row).unwrap_or(u16::MAX)),
+            u16::try_from(link.width).unwrap_or(u16::MAX),
+            &link.target,
+        );
+    }
     // The refusal is drawn after the projected rows rather than among them: it
     // resembles Transcript content without ever becoming part of it.
     if let SessionTail::Refused(error) = &tail {

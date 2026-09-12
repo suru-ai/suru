@@ -1,4 +1,8 @@
-use std::io::Write;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+};
 
 use crossterm::{
     Command,
@@ -7,9 +11,103 @@ use crossterm::{
 };
 use ratatui::{
     backend::{Backend, ClearType, WindowSize},
+    buffer::Buffer,
     buffer::Cell,
     layout::{Position, Size},
 };
+use unicode_width::UnicodeWidthStr;
+
+#[derive(Clone)]
+struct HyperlinkCell {
+    target: String,
+    cell: Cell,
+}
+
+#[derive(Default)]
+struct HyperlinkFrame {
+    enabled: bool,
+    targets: BTreeMap<(u16, u16), String>,
+    cells: BTreeMap<(u16, u16), HyperlinkCell>,
+    covered: BTreeSet<(u16, u16)>,
+}
+
+thread_local! {
+    static HYPERLINK_FRAME: RefCell<HyperlinkFrame> = RefCell::new(HyperlinkFrame::default());
+}
+
+pub(super) fn begin_frame(enabled: bool) {
+    HYPERLINK_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        frame.enabled = enabled;
+        frame.targets.clear();
+        frame.cells.clear();
+        frame.covered.clear();
+    });
+}
+
+pub(crate) fn register_hyperlink(buffer: &Buffer, x: u16, y: u16, width: u16, target: &str) {
+    HYPERLINK_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        if !frame.enabled || !buffer.area.contains(Position::new(x, y)) {
+            return;
+        }
+        let right = x.saturating_add(width).min(buffer.area.right());
+        let mut column = x;
+        while column < right {
+            frame.targets.insert((column, y), target.to_owned());
+            let symbol_width = buffer[(column, y)].symbol().width().max(1);
+            column = column.saturating_add(u16::try_from(symbol_width).unwrap_or(u16::MAX));
+        }
+    });
+}
+
+/// Captures the final cells after overlays and selection highlights have drawn,
+/// including the columns covered by wide graphemes. Those continuation cells
+/// must never be repainted independently during an attribute-only update.
+pub(crate) fn finish_frame(buffer: &Buffer, hyperlinks_visible: bool) {
+    HYPERLINK_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        for y in buffer.area.top()..buffer.area.bottom() {
+            let mut x = buffer.area.left();
+            while x < buffer.area.right() {
+                let width = buffer[(x, y)].symbol().width().max(1);
+                for continuation in 1..width {
+                    let continuation =
+                        x.saturating_add(u16::try_from(continuation).unwrap_or(u16::MAX));
+                    if continuation < buffer.area.right() {
+                        frame.covered.insert((continuation, y));
+                    }
+                }
+                x = x.saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
+            }
+        }
+        if !hyperlinks_visible {
+            frame.targets.clear();
+            return;
+        }
+        let targets = std::mem::take(&mut frame.targets);
+        for (position @ (x, y), target) in targets {
+            let cell = &buffer[(x, y)];
+            frame.cells.insert(
+                position,
+                HyperlinkCell {
+                    target,
+                    cell: cell.clone(),
+                },
+            );
+        }
+    });
+}
+
+fn take_frame() -> (BTreeMap<(u16, u16), HyperlinkCell>, BTreeSet<(u16, u16)>) {
+    HYPERLINK_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        (
+            std::mem::take(&mut frame.cells),
+            std::mem::take(&mut frame.covered),
+        )
+    })
+}
 
 /// Whether the terminal was last told to show or hide its cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +155,7 @@ pub(super) struct FrameBackend<B> {
     /// The last MoveTo written, or `None` when the terminal's cursor is
     /// somewhere else: unknown at start, or displaced by the diff's own moves.
     position: Option<Position>,
+    hyperlinks: BTreeMap<(u16, u16), HyperlinkCell>,
 }
 
 impl<B> FrameBackend<B> {
@@ -66,6 +165,7 @@ impl<B> FrameBackend<B> {
             frame_open: false,
             visibility: CursorVisibility::Unknown,
             position: None,
+            hyperlinks: BTreeMap::new(),
         }
     }
 
@@ -75,6 +175,7 @@ impl<B> FrameBackend<B> {
     pub(super) fn forget_cursor(&mut self) {
         self.visibility = CursorVisibility::Unknown;
         self.position = None;
+        self.hyperlinks.clear();
     }
 
     #[cfg(test)]
@@ -130,7 +231,37 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
             self.queue(BeginSynchronizedUpdate)?;
             self.frame_open = true;
         }
-        let mut content = content.peekable();
+        let (current_hyperlinks, covered) = take_frame();
+        let size = self.inner.size()?;
+        let mut cells = content
+            .map(|(x, y, cell)| ((x, y), cell.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let changed_targets = self
+            .hyperlinks
+            .keys()
+            .chain(current_hyperlinks.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for position in changed_targets {
+            if position.0 >= size.width || position.1 >= size.height {
+                continue;
+            }
+            if covered.contains(&position) {
+                continue;
+            }
+            let old = self.hyperlinks.get(&position).map(|cell| &cell.target);
+            let new = current_hyperlinks.get(&position).map(|cell| &cell.target);
+            if old != new {
+                let cell = current_hyperlinks
+                    .get(&position)
+                    .or_else(|| self.hyperlinks.get(&position))
+                    .expect("a changed hyperlink has an old or new cell")
+                    .cell
+                    .clone();
+                cells.entry(position).or_insert(cell);
+            }
+        }
+        let mut content = cells.iter().peekable();
         if content.peek().is_some() {
             // A cursor that might be shown is dragged across every repainted
             // cell on a terminal that presents the diff as it arrives, so it
@@ -142,7 +273,43 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
             // again afterwards.
             self.position = None;
         }
-        self.inner.draw(content)
+        let mut cells = content
+            .map(|(position, cell)| (*position, cell))
+            .collect::<Vec<_>>();
+        cells.sort_unstable_by_key(|((x, y), _)| (*y, *x));
+        let mut start = 0;
+        while start < cells.len() {
+            let target = current_hyperlinks
+                .get(&cells[start].0)
+                .map(|link| link.target.as_str());
+            let mut end = start + 1;
+            while end < cells.len()
+                && current_hyperlinks
+                    .get(&cells[end].0)
+                    .map(|link| link.target.as_str())
+                    == target
+            {
+                end += 1;
+            }
+            if let Some(target) = target {
+                self.inner
+                    .write_all(format!("\x1b]8;;{target}\x1b\\").as_bytes())?;
+            }
+            let drawn = self.inner.draw(
+                cells[start..end]
+                    .iter()
+                    .map(|((x, y), cell)| (*x, *y, *cell)),
+            );
+            let closed = if target.is_some() {
+                self.inner.write_all(b"\x1b]8;;\x1b\\")
+            } else {
+                Ok(())
+            };
+            drawn.and(closed)?;
+            start = end;
+        }
+        self.hyperlinks = current_hyperlinks;
+        Ok(())
     }
 
     fn hide_cursor(&mut self) -> std::io::Result<()> {
@@ -176,6 +343,7 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
 
     fn clear(&mut self) -> std::io::Result<()> {
         self.position = None;
+        self.hyperlinks.clear();
         self.inner.clear()
     }
 
@@ -187,6 +355,7 @@ impl<B: Backend + Write> Backend for FrameBackend<B> {
 
     fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
         self.position = None;
+        self.hyperlinks.clear();
         self.inner.append_lines(n)
     }
 

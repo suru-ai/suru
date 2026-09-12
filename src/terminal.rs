@@ -57,20 +57,53 @@ impl TerminalColorProbe {
     }
 }
 
-/// Everything the terminal told Suru that affects Theme resolution.
+/// Everything Suru knows about terminal presentation capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalFacts {
     pub probe: Option<TerminalColorProbe>,
     pub truecolor: bool,
+    /// Whether cells may safely carry OSC 8 hyperlink attributes.
+    pub hyperlinks: bool,
 }
 
 impl TerminalFacts {
     pub const fn new(probe: Option<TerminalColorProbe>, truecolor: bool) -> Self {
-        Self { probe, truecolor }
+        Self {
+            probe,
+            truecolor,
+            hyperlinks: false,
+        }
     }
 
     pub const fn unprobed(truecolor: bool) -> Self {
         Self::new(None, truecolor)
+    }
+
+    pub const fn with_hyperlinks(mut self, hyperlinks: bool) -> Self {
+        self.hyperlinks = hyperlinks;
+        self
+    }
+
+    /// Conservatively enables OSC 8 only for terminals whose own identifying
+    /// environment is known to support it. Multiplexers are excluded because
+    /// an inherited TERM_PROGRAM describes the terminal outside the session,
+    /// while passthrough may still be disabled inside it.
+    pub(crate) fn hyperlinks_from_environment() -> bool {
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        Self::supports_hyperlinks(
+            term_program.as_deref(),
+            std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some(),
+        )
+    }
+
+    fn supports_hyperlinks(term_program: Option<&str>, multiplexed: bool) -> bool {
+        !multiplexed
+            && term_program.is_some_and(|program| {
+                matches!(
+                    program,
+                    "WezTerm" | "iTerm.app" | "vscode" | "ghostty" | "Hyper"
+                )
+            })
     }
 
     pub(crate) fn merge_probe(&mut self, update: TerminalColorProbe) {
@@ -1206,6 +1239,25 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_detection_is_allowlisted_and_conservative_inside_multiplexers() {
+        for program in ["WezTerm", "iTerm.app", "vscode", "ghostty", "Hyper"] {
+            assert!(super::TerminalFacts::supports_hyperlinks(
+                Some(program),
+                false
+            ));
+            assert!(!super::TerminalFacts::supports_hyperlinks(
+                Some(program),
+                true
+            ));
+        }
+        assert!(!super::TerminalFacts::supports_hyperlinks(
+            Some("Apple_Terminal"),
+            false
+        ));
+        assert!(!super::TerminalFacts::supports_hyperlinks(None, false));
+    }
+
+    #[test]
     fn late_color_replies_merge_with_the_terminal_facts_already_observed() {
         let mut palette = [None; 16];
         palette[1] = Some(TerminalColor::new(10, 20, 30));
@@ -1216,7 +1268,8 @@ mod tests {
                 Some(TerminalColor::new(20, 20, 20)),
             )),
             true,
-        );
+        )
+        .with_hyperlinks(true);
         let mut update = [None; 16];
         update[1] = Some(TerminalColor::new(30, 20, 10));
         update[2] = Some(TerminalColor::new(40, 50, 60));
@@ -1243,6 +1296,10 @@ mod tests {
         assert_eq!(
             facts.probe.unwrap().background,
             Some(TerminalColor::new(250, 250, 250))
+        );
+        assert!(
+            facts.hyperlinks,
+            "a color reply cannot erase OSC 8 capability"
         );
     }
 

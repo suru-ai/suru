@@ -24,19 +24,52 @@ pub(super) fn options() -> Options {
         | Options::ENABLE_FOOTNOTES
 }
 
+#[cfg(test)]
 pub(super) fn render(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
-    render_prose(content, theme, false, width)
+    render_with_hyperlinks(content, theme, width, false)
 }
 
+pub(super) fn render_with_hyperlinks(
+    content: &str,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> Vec<StyledLine> {
+    render_prose(content, theme, false, width, hyperlinks)
+}
+
+#[cfg(test)]
 pub(super) fn render_reasoning(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
-    render_prose(content, theme, true, width)
+    render_reasoning_with_hyperlinks(content, theme, width, false)
 }
 
-fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<StyledLine> {
+pub(super) fn render_reasoning_with_hyperlinks(
+    content: &str,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> Vec<StyledLine> {
+    render_prose(content, theme, true, width, hyperlinks)
+}
+
+fn render_prose(
+    content: &str,
+    theme: &Theme,
+    subdued: bool,
+    width: u16,
+    hyperlinks: bool,
+) -> Vec<StyledLine> {
     let list_plans = list_plans(content);
     let events = html::normalize(Parser::new_ext(content, options()));
     let footnotes = footnote_numbers(&events);
-    let mut renderer = Renderer::new(theme, subdued, width, list_plans.clone(), footnotes.clone());
+    let mut renderer = Renderer::new(
+        theme,
+        subdued,
+        width,
+        hyperlinks,
+        list_plans.clone(),
+        footnotes.clone(),
+    );
     let mut builder = copy::Builder::new(list_plans, footnotes);
     for event in events {
         renderer.source = builder.event(&event, renderer.content_width());
@@ -161,13 +194,16 @@ struct Renderer<'a> {
     theme: &'a Theme,
     subdued: bool,
     width: u16,
+    hyperlinks: bool,
     lines: Vec<StyledLine>,
     current: Vec<StyledSpan>,
     styles: Vec<Style>,
     lists: Vec<ListState>,
     list_plans: VecDeque<ListPlan>,
     items: Vec<ItemState>,
-    links: Vec<String>,
+    /// Destinations currently enclosing paint. `true` identifies an anchor;
+    /// an Image nested inside one remains actionable through the outer Link.
+    links: Vec<(String, bool)>,
     code_block: Option<CodeBlock>,
     source: Option<copy::SourceRange>,
     table: Option<Table>,
@@ -208,6 +244,7 @@ impl<'a> Renderer<'a> {
         theme: &'a Theme,
         subdued: bool,
         width: u16,
+        hyperlinks: bool,
         list_plans: VecDeque<ListPlan>,
         footnote_numbers: HashMap<String, usize>,
     ) -> Self {
@@ -215,6 +252,7 @@ impl<'a> Renderer<'a> {
             theme,
             subdued,
             width,
+            hyperlinks,
             lines: Vec::new(),
             current: Vec::new(),
             styles: vec![theme.markdown.text],
@@ -370,7 +408,7 @@ impl<'a> Renderer<'a> {
                 self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
             }
             Tag::Link { dest_url, .. } => {
-                self.links.push(dest_url.into_string());
+                self.links.push((dest_url.into_string(), true));
                 self.push_style(self.theme.markdown.link_text);
             }
             Tag::Image { dest_url, .. } => {
@@ -378,7 +416,7 @@ impl<'a> Renderer<'a> {
                     "[image: ",
                     self.current_style().patch(self.theme.markdown.image),
                 );
-                self.links.push(dest_url.into_string());
+                self.links.push((dest_url.into_string(), false));
                 self.push_style(self.theme.markdown.image_text);
             }
             Tag::BlockQuote(_) => {
@@ -584,8 +622,21 @@ impl<'a> Renderer<'a> {
         if let Some(closing_chrome) = closing_chrome {
             self.push_chrome(closing_chrome, destination_style);
         }
-        if let Some(destination) = self.links.pop() {
-            self.push_chrome(format!(" ({destination})"), destination_style);
+        if let Some((destination, _)) = self.links.pop() {
+            let target = super::clipboard::safe_hyperlink_target(&destination);
+            if !self.hyperlinks || target.is_none() {
+                let visible = destination
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>();
+                let mut span = StyledSpan::chrome(
+                    format!(" ({})", visible.trim()),
+                    self.prose_style(destination_style),
+                )
+                .with_target(target);
+                span.source = self.source.clone();
+                self.push_span(span);
+            }
         }
     }
 
@@ -651,6 +702,17 @@ impl<'a> Renderer<'a> {
 
     fn push_span(&mut self, mut span: StyledSpan) {
         span.source = self.source.clone();
+        if span.target.is_none()
+            && let Some(target) = self
+                .links
+                .iter()
+                .rev()
+                .find(|(_, anchor)| *anchor)
+                .or_else(|| self.links.last())
+                .and_then(|(target, _)| super::clipboard::safe_hyperlink_target(target))
+        {
+            span.target = Some(target.to_owned());
+        }
         if let Some(cell) = self
             .table
             .as_mut()
@@ -1076,6 +1138,7 @@ mod tests {
             line.markdown = None;
             for span in &mut line.spans {
                 span.source = None;
+                span.target = None;
             }
         }
         lines
@@ -2539,5 +2602,103 @@ mod tests {
             );
         }
         assert_eq!(lines[0], StyledLine::chrome("rust", theme.text.subdued));
+    }
+
+    #[test]
+    fn supported_hyperlinks_hide_destination_chrome_and_keep_a_safe_target() {
+        let theme = Theme::system();
+        let supported = super::render_with_hyperlinks(
+            "Read [the guide]( https://example.test/guide ).",
+            &theme,
+            80,
+            true,
+        );
+        let fallback = super::render_with_hyperlinks(
+            "Read [the guide]( https://example.test/guide ).",
+            &theme,
+            80,
+            false,
+        );
+
+        assert_eq!(line_texts(&supported), ["Read the guide."]);
+        assert_eq!(
+            line_texts(&fallback),
+            ["Read the guide (https://example.test/guide)."]
+        );
+        let target = supported[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "the guide")
+            .and_then(|span| span.target.as_deref());
+        assert_eq!(target, Some("https://example.test/guide"));
+    }
+
+    #[test]
+    fn unsafe_decoded_destination_stays_visible_without_a_target() {
+        let theme = Theme::system();
+        let lines = super::render_with_hyperlinks(
+            "[label](https://example.test/a&#27;bad)",
+            &theme,
+            80,
+            true,
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.target.is_none())
+        );
+        assert!(line_texts(&lines)[0].contains("https://example.test/abad"));
+    }
+
+    #[test]
+    fn reasoning_links_use_the_same_capability_without_losing_subdued_style() {
+        let theme = Theme::system();
+        let lines = super::render_reasoning_with_hyperlinks(
+            "[guide](https://example.test/path)",
+            &theme,
+            80,
+            true,
+        );
+        assert_eq!(line_texts(&lines), ["guide"]);
+        let span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "guide")
+            .unwrap();
+        assert_eq!(span.target.as_deref(), Some("https://example.test/path"));
+        assert_eq!(span.style.fg, theme.text.subdued.fg);
+    }
+
+    #[test]
+    fn relative_links_keep_visible_chrome_without_an_invented_process_base() {
+        let theme = Theme::system();
+        let lines = super::render_with_hyperlinks("[guide](guide.md)", &theme, 80, true);
+        assert_eq!(line_texts(&lines), ["guide (guide.md)"]);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.target.is_none())
+        );
+    }
+
+    #[test]
+    fn a_linked_image_uses_the_outer_anchor_as_its_actionable_target() {
+        let theme = Theme::system();
+        let lines = super::render_with_hyperlinks(
+            "[![alt](image.png)](https://example.test/page)",
+            &theme,
+            80,
+            true,
+        );
+        assert_eq!(line_texts(&lines), ["[image: alt] (image.png)"]);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .filter(|span| span.content.contains("image:") || span.content == "alt")
+                .all(|span| span.target.as_deref() == Some("https://example.test/page"))
+        );
     }
 }

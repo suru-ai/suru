@@ -85,18 +85,35 @@ impl ClipboardContent {
 }
 
 fn safe_destination(destination: &str) -> bool {
+    safe_destination_target(destination).is_some()
+}
+
+fn safe_destination_target(destination: &str) -> Option<&str> {
     let destination = destination.trim();
     if destination.chars().any(char::is_control) {
-        return false;
+        return None;
     }
     let scheme = destination
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    match scheme.split_once(':') {
+    let safe = match scheme.split_once(':') {
         Some((scheme, _)) => ["https", "http", "mailto"]
             .iter()
             .any(|safe| scheme.eq_ignore_ascii_case(safe)),
         None => true,
-    }
+    };
+    safe.then_some(destination)
+}
+
+/// A destination the terminal and platform opener can act on without a base
+/// URL. Relative Markdown links remain copyable but keep visible destination
+/// chrome because the Session workspace, not Suru's process cwd, is their base.
+pub(super) fn safe_hyperlink_target(destination: &str) -> Option<&str> {
+    let destination = safe_destination_target(destination)?;
+    let (scheme, _) = destination.split_once(':')?;
+    ["https", "http", "mailto"]
+        .iter()
+        .any(|safe| scheme.eq_ignore_ascii_case(safe))
+        .then_some(destination)
 }

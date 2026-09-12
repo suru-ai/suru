@@ -307,6 +307,8 @@ pub(super) struct StyledSpan {
     /// The decoded Markdown event bytes painted by this span, when authored
     /// as Markdown. Slicing a span slices these offsets along with its text.
     pub(super) source: Option<super::markdown::copy::SourceRange>,
+    /// A validated hyperlink carried by the cells this span paints.
+    pub(super) target: Option<String>,
 }
 
 impl StyledSpan {
@@ -316,6 +318,7 @@ impl StyledSpan {
             style,
             chrome: false,
             source: None,
+            target: None,
         }
     }
 
@@ -325,7 +328,13 @@ impl StyledSpan {
             style,
             chrome: true,
             source: None,
+            target: None,
         }
+    }
+
+    pub(super) fn with_target(mut self, target: Option<&str>) -> Self {
+        self.target = target.map(ToOwned::to_owned);
+        self
     }
 
     pub(super) fn width(&self) -> usize {
@@ -400,6 +409,7 @@ impl StyledLine {
                     source: span.source.as_ref().map(|source| {
                         source.slice(start - span_range.start..end - span_range.start)
                     }),
+                    target: span.target.clone(),
                 });
             }
         }

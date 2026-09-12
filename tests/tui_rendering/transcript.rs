@@ -4,9 +4,9 @@ use crate::deadlines::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
-        buffer_rows, connected_application, failed_session_snapshot, navigable_session_snapshot,
-        rendered_application_buffer, rendered_application_rows_at, rendered_row, text_position,
-        workspace_dir,
+        buffer_rows, click_mouse, connected_application, connected_application_with_terminal_facts,
+        failed_session_snapshot, navigable_session_snapshot, rendered_application_buffer,
+        rendered_application_rows_at, rendered_row, text_position, workspace_dir,
     },
 };
 use crossterm::event::{
@@ -8230,6 +8230,95 @@ fn markdown_selection_preserves_escaped_link_metadata() {
 }
 
 #[test]
+fn supported_markdown_link_clicks_open_semantically_and_copy_as_markdown() {
+    let workspace = workspace_dir();
+    let source = "Read [guide](https://example.test/path).";
+    let facts = TerminalFacts::default().with_hyperlinks(true);
+    let mut application = connected_application_with_terminal_facts(workspace.path(), facts);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let position = text_position(&buffer, "guide");
+    assert!(
+        !buffer_rows(&buffer)
+            .join("\n")
+            .contains("https://example.test")
+    );
+    let transition = click_mouse(
+        &mut application,
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: position.0,
+            row: position.1,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        transition,
+        ApplicationTransition::OpenHyperlink("https://example.test/path".to_owned())
+    );
+
+    pin_release_copy(&mut application);
+    assert_eq!(
+        select_transcript(
+            &mut application,
+            position,
+            (position.0 + "guide".len() as u16 - 1, position.1),
+        ),
+        "[guide](https://example.test/path)"
+    );
+}
+
+#[test]
+fn dragging_from_a_markdown_link_selects_instead_of_opening_it() {
+    use crossterm::event::MouseButton;
+
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(
+        workspace.path(),
+        TerminalFacts::default().with_hyperlinks(true),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(
+                "Read [guide](https://example.test/path).",
+            )],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let start = text_position(&buffer, "guide");
+    let end = (start.0 + 2, start.1);
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        let position = if matches!(kind, MouseEventKind::Down(_)) {
+            start
+        } else {
+            end
+        };
+        let transition = application
+            .handle_terminal_event(selection_mouse(kind, position))
+            .unwrap();
+        assert!(!matches!(
+            transition,
+            ApplicationTransition::OpenHyperlink(_)
+        ));
+    }
+}
+
+#[test]
 fn markdown_rule_copy_is_valid_from_far_right_partial_cells_at_multiple_widths() {
     let workspace = workspace_dir();
     for width in [50, 83] {
@@ -8314,6 +8403,36 @@ fn markdown_image_chrome_is_excluded_from_plain_and_rich_copy() {
             text: source.into(),
             html: Some("<p><a href=\"https://example.test/diagram.png\">diagram</a></p>\n".into()),
         }
+    );
+}
+
+#[test]
+fn supported_linked_image_copy_keeps_both_authored_destinations() {
+    let workspace = workspace_dir();
+    let source = "[![diagram](image.png)](https://example.test/page)";
+    let mut application = connected_application_with_terminal_facts(
+        workspace.path(),
+        TerminalFacts::default().with_hyperlinks(true),
+    );
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+    let buffer = rendered_application_buffer(&application, 100, 24);
+    let start = text_position(&buffer, "[image:");
+    let end = text_position(&buffer, "diagram");
+
+    assert_eq!(
+        select_transcript(
+            &mut application,
+            start,
+            (end.0 + "diagram".len() as u16 - 1, end.1),
+        ),
+        source
     );
 }
 

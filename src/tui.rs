@@ -8,6 +8,7 @@ mod composer;
 mod connect_overlay;
 mod event_loop;
 mod fuzzy;
+mod hyperlink;
 mod keymap;
 mod markdown;
 mod model_options;

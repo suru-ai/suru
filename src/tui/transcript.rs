@@ -586,8 +586,13 @@ impl TranscriptCache {
         self.view.borrow().as_ref()?.line_cells(row)
     }
 
+    pub(super) fn hyperlink_at(&self, row: usize, column: usize) -> Option<String> {
+        self.view.borrow().as_ref()?.hyperlink_at(row, column)
+    }
+
     /// Returns the transcript view for the given content, rebuilding only the
     /// parts whose inputs changed since the previous frame.
+    #[cfg(test)]
     pub(super) fn view(
         &self,
         generation: u64,
@@ -597,12 +602,34 @@ impl TranscriptCache {
         theme: &Theme,
         width: u16,
     ) -> Ref<'_, TranscriptView> {
+        self.view_with_hyperlinks(
+            generation,
+            snapshot,
+            provisional,
+            disclosure,
+            theme,
+            width,
+            false,
+        )
+    }
+
+    pub(super) fn view_with_hyperlinks(
+        &self,
+        generation: u64,
+        snapshot: &SessionSnapshot,
+        provisional: &[&InitialPrompt],
+        disclosure: TranscriptDisclosure<'_>,
+        theme: &Theme,
+        width: u16,
+        hyperlinks: bool,
+    ) -> Ref<'_, TranscriptView> {
         let key = ViewKey {
             generation,
             session_id: snapshot.session.id,
             revision: snapshot.revision,
             theme: *theme,
             width,
+            hyperlinks,
             reasoning_visibility: disclosure.reasoning_visibility,
             provisional_fingerprint: provisional_fingerprint(provisional),
             folds_fingerprint: disclosure.folds.fingerprint(),
@@ -640,6 +667,7 @@ impl TranscriptCache {
                 old.generation == key.generation
                     && old.session_id == key.session_id
                     && old.width == key.width
+                    && old.hyperlinks == key.hyperlinks
                     && old.theme == key.theme
                     && old.reasoning_visibility == key.reasoning_visibility
                     && old.folds_fingerprint == key.folds_fingerprint
@@ -672,6 +700,7 @@ struct ViewKey {
     revision: SessionRevision,
     theme: Theme,
     width: u16,
+    hyperlinks: bool,
     /// Whether Reasoning is drawn at all, which the Settings decide rather than
     /// the reader's clicks. It is a rendering input outside the Session
     /// snapshot all the same, so ADR 0007 puts it in the key: a reader asking
@@ -743,6 +772,21 @@ pub(super) struct TranscriptLink {
 }
 
 impl TranscriptView {
+    fn hyperlink_at(&self, row: usize, column: usize) -> Option<String> {
+        let RowAt::Wrapped {
+            source,
+            row: wrapped,
+            ..
+        } = self.wrapped_row_at(row)?
+        else {
+            return None;
+        };
+        hyperlink_ranges(source, wrapped, 0, usize::from(self.key.width))
+            .into_iter()
+            .find(|link| column >= link.column && column < link.column + link.width)
+            .map(|link| link.target)
+    }
+
     fn copy_selection(
         &self,
         selection: super::selection::TextSelection,
@@ -1194,8 +1238,13 @@ impl TranscriptView {
     pub(super) fn window(&self, scroll_position: usize, viewport_rows: usize) -> TranscriptWindow {
         let mut rows = Vec::with_capacity(viewport_rows.min(self.row_count));
         let mut spinner_rows = Vec::new();
+        let mut hyperlinks = Vec::new();
         if viewport_rows == 0 {
-            return TranscriptWindow { rows, spinner_rows };
+            return TranscriptWindow {
+                rows,
+                spinner_rows,
+                hyperlinks,
+            };
         }
         let first_unit = self
             .units
@@ -1220,13 +1269,24 @@ impl TranscriptView {
                 if unit.spinner_rows.binary_search(&index).is_ok() {
                     spinner_rows.push(rows.len());
                 }
+                let window_row = rows.len();
+                hyperlinks.extend(hyperlink_ranges(
+                    &unit.lines[wrapped.line],
+                    &wrapped.row,
+                    window_row,
+                    usize::from(self.key.width),
+                ));
                 rows.push(wrapped.row.line.clone());
                 if rows.len() >= viewport_rows {
                     break 'units;
                 }
             }
         }
-        TranscriptWindow { rows, spinner_rows }
+        TranscriptWindow {
+            rows,
+            spinner_rows,
+            hyperlinks,
+        }
     }
 
     /// Draws the memoized Transcript followed by transient, one-row tail
@@ -1249,6 +1309,7 @@ impl TranscriptView {
             TranscriptWindow {
                 rows: Vec::new(),
                 spinner_rows: Vec::new(),
+                hyperlinks: Vec::new(),
             }
         };
         let first_tail = scroll_position.saturating_sub(self.row_count);
@@ -1267,6 +1328,57 @@ pub(super) struct TranscriptWindow {
     pub(super) rows: Vec<Line<'static>>,
     /// Indices into `rows` whose Marker cell holds a Spinner.
     pub(super) spinner_rows: Vec<usize>,
+    pub(super) hyperlinks: Vec<VisibleHyperlink>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct VisibleHyperlink {
+    pub(super) row: usize,
+    pub(super) column: usize,
+    pub(super) width: usize,
+    pub(super) target: String,
+}
+
+fn hyperlink_ranges(
+    source: &StyledLine,
+    wrapped: &StyledRow,
+    row: usize,
+    maximum: usize,
+) -> Vec<VisibleHyperlink> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut ranges: Vec<VisibleHyperlink> = Vec::new();
+    let mut column = wrapped.indent;
+    let mut span_start = 0;
+    for span in &source.spans {
+        let span_end = span_start + span.content.len();
+        let from = wrapped.start.clamp(span_start, span_end) - span_start;
+        let to = wrapped.end.clamp(span_start, span_end) - span_start;
+        for symbol in span.content[from..to].graphemes(true) {
+            let width = symbol.width();
+            if width == 0 || width > maximum || column >= maximum {
+                continue;
+            }
+            let width = width.min(maximum - column);
+            if let Some(target) = &span.target {
+                if let Some(previous) = ranges.last_mut()
+                    && previous.target == *target
+                    && previous.column + previous.width == column
+                {
+                    previous.width += width;
+                } else {
+                    ranges.push(VisibleHyperlink {
+                        row,
+                        column,
+                        width,
+                        target: target.clone(),
+                    });
+                }
+            }
+            column += width;
+        }
+        span_start = span_end;
+    }
+    ranges
 }
 
 /// One block of the Transcript the projection renders as a whole: the entries
@@ -1440,11 +1552,12 @@ impl RenderUnit<'_> {
         folds: &TranscriptFolds,
         theme: &Theme,
         width: u16,
+        hyperlinks: bool,
         workspace: &Path,
     ) -> Option<UnitAnchor> {
         match self {
             Self::Message(message) => {
-                render_message(lines, message, theme, width);
+                render_message(lines, message, theme, width, hyperlinks);
                 None
             }
             Self::Activity(activity) => render_activity(
@@ -1454,13 +1567,16 @@ impl RenderUnit<'_> {
                 resolved_fold_step(folds, activity),
                 theme,
                 width,
+                hyperlinks,
                 workspace,
             ),
             Self::Group {
                 kind,
                 members,
                 expanded,
-            } => Some(render_group(lines, *kind, members, *expanded, theme, width)),
+            } => Some(render_group(
+                lines, *kind, members, *expanded, theme, width, hyperlinks,
+            )),
             Self::GroupMember(activity) => {
                 let start = lines.len();
                 let anchor = render_activity(
@@ -1470,6 +1586,7 @@ impl RenderUnit<'_> {
                     resolved_fold_step(folds, activity),
                     theme,
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
+                    hyperlinks,
                     workspace,
                 );
                 indent_members(&mut lines[start..]);
@@ -1483,6 +1600,7 @@ impl RenderUnit<'_> {
                     folds,
                     theme,
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
+                    hyperlinks,
                     workspace,
                 );
                 indent_members(&mut lines[start..]);
@@ -2320,6 +2438,7 @@ fn rebuild(
                 && view.key.session_id == key.session_id
                 && view.key.theme == key.theme
                 && view.key.width == key.width
+                && view.key.hyperlinks == key.hyperlinks
         })
         .map(|view| {
             view.units
@@ -2344,6 +2463,7 @@ fn rebuild(
                 disclosure.folds,
                 theme,
                 width,
+                key.hyperlinks,
                 &snapshot.session.execution_directory.path,
             )
         })
@@ -2438,6 +2558,7 @@ fn reuse_or_render(
     folds: &TranscriptFolds,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
     workspace: &Path,
 ) -> UnitView {
     let key = unit.key();
@@ -2449,7 +2570,15 @@ fn reuse_or_render(
     }
     let mut rendered = Vec::new();
     let mut links = Vec::new();
-    let rendered_anchor = unit.render(&mut rendered, &mut links, folds, theme, width, workspace);
+    let rendered_anchor = unit.render(
+        &mut rendered,
+        &mut links,
+        folds,
+        theme,
+        width,
+        hyperlinks,
+        workspace,
+    );
     let source_lines = rendered.len();
     let mut lines = Vec::with_capacity(rendered.len());
     let mut rows = Vec::with_capacity(rendered.len());
@@ -2727,7 +2856,13 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn render_message(lines: &mut Vec<StyledLine>, message: &Message, theme: &Theme, width: u16) {
+fn render_message(
+    lines: &mut Vec<StyledLine>,
+    message: &Message,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) {
     match message.role {
         MessageRole::User => push_user_message(
             lines,
@@ -2736,9 +2871,14 @@ fn render_message(lines: &mut Vec<StyledLine>, message: &Message, theme: &Theme,
             theme,
             width,
         ),
-        MessageRole::Agent => {
-            push_agent_message(lines, &message.content, message.truncated, theme, width)
-        }
+        MessageRole::Agent => push_agent_message(
+            lines,
+            &message.content,
+            message.truncated,
+            theme,
+            width,
+            hyperlinks,
+        ),
     }
 }
 
@@ -2754,6 +2894,7 @@ fn render_activity(
     step: FoldStep,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
     workspace: &Path,
 ) -> Option<UnitAnchor> {
     let mut projection = ActivityProjection { lines, links };
@@ -2883,6 +3024,7 @@ fn render_activity(
                 step != FoldStep::Expanded,
                 theme,
                 width,
+                hyperlinks,
             )
         }),
         Activity::Subagent {
@@ -2936,6 +3078,7 @@ fn render_group(
     expanded: bool,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) -> UnitAnchor {
     match kind {
         GroupableKind::Command => render_command_group(
@@ -2947,7 +3090,9 @@ fn render_group(
             expanded,
             theme,
         ),
-        GroupableKind::Reasoning => render_reasoning_group(lines, members, expanded, theme, width),
+        GroupableKind::Reasoning => {
+            render_reasoning_group(lines, members, expanded, theme, width, hyperlinks)
+        }
     }
 }
 
@@ -2998,6 +3143,7 @@ fn render_reasoning_group(
     expanded: bool,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
@@ -3042,7 +3188,7 @@ fn render_reasoning_group(
     let mut opened_a_section = false;
     for member in members.iter().copied().filter_map(ReasoningActivity::of) {
         let mut section = Vec::new();
-        push_reasoning_section(&mut section, member, theme, width);
+        push_reasoning_section(&mut section, member, theme, width, hyperlinks);
         // A member that has started without saying anything or being headed
         // projects nothing, and a section that is not there takes no blank row
         // to stand apart from the one before it.
@@ -3083,6 +3229,7 @@ fn push_reasoning_section(
     reasoning: ReasoningActivity<'_>,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) {
     let style = theme.text.subdued;
     if let Some(title) = reasoning_heading(reasoning.title) {
@@ -3093,7 +3240,9 @@ fn push_reasoning_section(
             style.add_modifier(Modifier::BOLD),
         );
     }
-    lines.append(&mut reasoning_body_lines(&reasoning, theme, width));
+    lines.append(&mut reasoning_body_lines(
+        &reasoning, theme, width, hyperlinks,
+    ));
 }
 
 /// The description a settled Reasoning Group's row leads with, or `None` when
@@ -3748,14 +3897,16 @@ fn reasoning_body_lines(
     reasoning: &ReasoningActivity<'_>,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) -> Vec<StyledLine> {
     let content = sanitize_content(reasoning.content);
     let content_width =
         width.saturating_sub(u16::try_from(OUTPUT_INDENT.width()).unwrap_or(u16::MAX));
-    let mut body = markdown::render_reasoning(&content, theme, content_width)
-        .into_iter()
-        .map(|line| indented_reasoning_line(line, OUTPUT_INDENT, theme))
-        .collect::<Vec<_>>();
+    let mut body =
+        markdown::render_reasoning_with_hyperlinks(&content, theme, content_width, hyperlinks)
+            .into_iter()
+            .map(|line| indented_reasoning_line(line, OUTPUT_INDENT, theme))
+            .collect::<Vec<_>>();
     if reasoning.content_truncated {
         push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
     }
@@ -3772,6 +3923,7 @@ fn push_reasoning_activity(
     folded: bool,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) -> UnitAnchor {
     let (marker, label, style) = reasoning_marker(activity.status, theme);
     let mut header = reasoning_header_text(label, activity.title);
@@ -3781,7 +3933,7 @@ fn push_reasoning_activity(
     }
     // The body is projected whether or not it will be shown, because a Fold
     // that hides all of it still has to say how many lines that is.
-    let mut body = reasoning_body_lines(&activity, theme, width);
+    let mut body = reasoning_body_lines(&activity, theme, width, hyperlinks);
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
     // A Reasoning Fold hides the entry's whole body rather than the middle of
@@ -3963,10 +4115,11 @@ fn push_agent_message(
     truncated: bool,
     theme: &Theme,
     width: u16,
+    hyperlinks: bool,
 ) {
     let content = sanitize_content(content);
     let content_width = width.saturating_sub(2);
-    for mut line in markdown::render(&content, theme, content_width) {
+    for mut line in markdown::render_with_hyperlinks(&content, theme, content_width, hyperlinks) {
         if !line.spans.is_empty() {
             line.spans
                 .insert(0, StyledSpan::chrome("  ", theme.text.primary));
@@ -4020,30 +4173,41 @@ fn push_styled_prefixed_lines(
     theme: &Theme,
 ) {
     let mut style = SgrStyle::new(base_style);
-    let mut hyperlink_active = false;
+    let mut hyperlink_active: Option<String> = None;
     let mut spans = vec![StyledSpan::chrome(gutter.lead, base_style)];
     let mut line_has_content = false;
 
     for token in content_tokens(content) {
         match token {
             ContentToken::Text(text) if !text.is_empty() => {
-                spans.push(StyledSpan::text(
-                    text,
-                    activity_content_style(style.rendered, hyperlink_active, theme),
-                ));
+                spans.push(
+                    StyledSpan::text(
+                        text,
+                        activity_content_style(style.rendered, hyperlink_active.is_some(), theme),
+                    )
+                    .with_target(hyperlink_active.as_deref()),
+                );
                 line_has_content = true;
             }
             ContentToken::Sgr(sequence) => apply_sgr(&sequence, &mut style, base_style, theme),
             ContentToken::LinkStart(target) => {
-                projection.links.push(TranscriptLink { target });
-                hyperlink_active = true;
+                hyperlink_active =
+                    super::clipboard::safe_hyperlink_target(&target).map(ToOwned::to_owned);
+                if let Some(target) = &hyperlink_active {
+                    projection.links.push(TranscriptLink {
+                        target: target.clone(),
+                    });
+                }
             }
-            ContentToken::LinkEnd => hyperlink_active = false,
+            ContentToken::LinkEnd => hyperlink_active = None,
             ContentToken::Tab => {
-                spans.push(StyledSpan::text(
-                    "    ",
-                    activity_content_style(style.rendered, hyperlink_active, theme),
-                ));
+                spans.push(
+                    StyledSpan::text(
+                        "    ",
+                        activity_content_style(style.rendered, hyperlink_active.is_some(), theme),
+                    )
+                    .with_target(hyperlink_active.as_deref()),
+                );
                 line_has_content = true;
             }
             ContentToken::LineBreak => {
@@ -4586,6 +4750,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -4636,6 +4801,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -4916,6 +5082,7 @@ mod tests {
             FoldStep::Peek,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -4950,6 +5117,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
         let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
@@ -4984,6 +5152,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -5023,7 +5192,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, &theme, 80);
+        render_message(&mut lines, &message, &theme, 80, false);
 
         let marker = lines
             .iter()
@@ -5070,6 +5239,7 @@ mod tests {
             FoldStep::Peek,
             &theme,
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -5103,7 +5273,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, &theme, 80);
+        render_message(&mut lines, &message, &theme, 80, false);
 
         let marker_lines = lines
             .iter()
@@ -5141,9 +5311,10 @@ mod tests {
             &mut lines,
             &mut links,
             &activity,
-            FoldStep::Folded,
+            FoldStep::Expanded,
             &Theme::system(),
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -5152,7 +5323,23 @@ mod tests {
                 .into_iter()
                 .map(|link| link.target)
                 .collect::<Vec<_>>(),
-            ["https://example.com/first", "file:///tmp/second"]
+            ["https://example.com/first"]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "first")
+                .and_then(|span| span.target.as_deref()),
+            Some("https://example.com/first")
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "second")
+                .is_some_and(|span| span.target.is_none()),
+            "unsafe tool-output schemes do not reach OSC 8 or the opener"
         );
     }
 
@@ -6325,6 +6512,62 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_capability_reprojects_wrapped_targets_and_invalidates_selection() {
+        let snapshot = transcript_snapshot(vec![Entry::Message(agent_message(
+            "[界wide label](https://example.test/path)",
+        ))]);
+        let cache = TranscriptCache::default();
+        let folds = TranscriptFolds::default();
+        let groups = TranscriptGroups::default();
+        let turns = TranscriptTurnFolds::default();
+        let disclosure = || TranscriptDisclosure {
+            folds: &folds,
+            groups: &groups,
+            turns: &turns,
+            reasoning_visibility: ReasoningVisibility::Shown,
+        };
+
+        let fallback =
+            cache.view_with_hyperlinks(0, &snapshot, &[], disclosure(), &Theme::system(), 8, false);
+        let fallback_rows = row_text(&fallback.window(0, fallback.row_count()).rows);
+        assert!(
+            fallback_rows
+                .join("")
+                .replace(' ', "")
+                .contains("example.test"),
+            "fallback rows: {fallback_rows:?}"
+        );
+        let old_epoch = cache.selection_epoch();
+        drop(fallback);
+
+        let supported =
+            cache.view_with_hyperlinks(0, &snapshot, &[], disclosure(), &Theme::system(), 8, true);
+        let window = supported.window(0, supported.row_count());
+        assert_eq!(row_text(&window.rows), ["  界wide", "  label"]);
+        assert!(window.hyperlinks.len() >= 2, "wrapped link lost a target");
+        assert!(
+            window
+                .hyperlinks
+                .iter()
+                .all(|link| link.target == "https://example.test/path")
+        );
+        assert!(cache.selection_epoch() > old_epoch);
+        assert_eq!(
+            supported.hyperlink_at(0, 2).as_deref(),
+            Some("https://example.test/path")
+        );
+        assert_eq!(
+            supported.hyperlink_at(1, 2).as_deref(),
+            Some("https://example.test/path")
+        );
+        assert_eq!(
+            supported.hyperlink_at(0, 0),
+            None,
+            "message gutter is not a link"
+        );
+    }
+
+    #[test]
     fn a_separator_row_belongs_to_no_units_click_extent() {
         let noisy = command("cargo test", "running 2 tests\nall green");
         let noisy_id = noisy.id();
@@ -6638,6 +6881,7 @@ mod tests {
             FoldStep::Peek,
             &Theme::system(),
             80,
+            false,
             std::path::Path::new(""),
         );
 
@@ -6686,6 +6930,7 @@ mod tests {
             FoldStep::Folded,
             &Theme::system(),
             20,
+            false,
             std::path::Path::new(""),
         );
         assert_eq!(
@@ -6698,7 +6943,7 @@ mod tests {
     fn message_gutters_and_padding_are_chrome_and_prose_is_text() {
         let theme = Theme::system();
         let mut lines = Vec::new();
-        render_message(&mut lines, &user_message("hello there"), &theme, 20);
+        render_message(&mut lines, &user_message("hello there"), &theme, 20, false);
         assert_eq!(
             span_marks(&lines[0]),
             [(true, "┃ "), (false, "hello there"), (true, "       ")],
@@ -6711,6 +6956,7 @@ mod tests {
             &agent_message("- item one\n\n```rust\nlet x = 1;\n```"),
             &theme,
             40,
+            false,
         );
         assert_eq!(
             span_marks(&lines[0]),
@@ -6736,7 +6982,7 @@ mod tests {
         let table = "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |";
 
         let mut agent_lines = Vec::new();
-        render_message(&mut agent_lines, &agent_message(table), &theme, 24);
+        render_message(&mut agent_lines, &agent_message(table), &theme, 24, false);
         assert!(agent_lines.iter().all(|line| line.width() <= 24));
         assert_eq!(projected_text(&agent_lines[0]), "  ┌────────────┬───────┐");
 
@@ -6748,6 +6994,7 @@ mod tests {
             FoldStep::Expanded,
             &theme,
             26,
+            false,
             std::path::Path::new(""),
         );
         let body = &reasoning_lines[1..];
@@ -6770,6 +7017,7 @@ mod tests {
             FoldStep::Folded,
             &Theme::system(),
             80,
+            false,
             std::path::Path::new(""),
         );
         assert_eq!(
@@ -6790,6 +7038,7 @@ mod tests {
             FoldStep::Expanded,
             &Theme::system(),
             80,
+            false,
             std::path::Path::new(""),
         );
         assert_eq!(
@@ -7065,6 +7314,7 @@ mod tests {
                 FoldStep::Folded,
                 &Theme::system(),
                 width,
+                false,
                 std::path::Path::new(""),
             );
 
