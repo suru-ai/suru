@@ -441,24 +441,8 @@ impl<'a> Renderer<'a> {
                 self.items.pop();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
-            TagEnd::Link => {
-                self.pop_style();
-                if let Some(destination) = self.links.pop() {
-                    self.push_chrome(
-                        format!(" ({destination})"),
-                        self.current_style().patch(self.theme.markdown.link),
-                    );
-                }
-            }
-            TagEnd::Image => {
-                self.pop_style();
-                if let Some(destination) = self.links.pop() {
-                    self.push_chrome(
-                        format!(" ({destination})"),
-                        self.current_style().patch(self.theme.markdown.image),
-                    );
-                }
-            }
+            TagEnd::Link => self.close_destination(self.theme.markdown.link),
+            TagEnd::Image => self.close_destination(self.theme.markdown.image),
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.remove_trailing_separator();
@@ -525,6 +509,16 @@ impl<'a> Renderer<'a> {
     fn pop_style(&mut self) {
         if self.styles.len() > 1 {
             self.styles.pop();
+        }
+    }
+
+    fn close_destination(&mut self, destination_style: Style) {
+        self.pop_style();
+        if let Some(destination) = self.links.pop() {
+            self.push_chrome(
+                format!(" ({destination})"),
+                self.current_style().patch(destination_style),
+            );
         }
     }
 
