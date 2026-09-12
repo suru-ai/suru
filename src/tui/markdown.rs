@@ -1,6 +1,6 @@
 //! Practical Markdown projection for Agent-authored transcript content.
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 
 use crate::theme::Theme;
@@ -144,7 +144,14 @@ impl<'a> Renderer<'a> {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => {}
-            Tag::Heading { .. } => self.push_style(self.theme.markdown.heading),
+            Tag::Heading { level, .. } => {
+                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                    self.blank_line_before_block();
+                } else {
+                    self.flush_line();
+                }
+                self.push_style(self.heading_style(level));
+            }
             Tag::CodeBlock(kind) => {
                 self.flush_line();
                 self.code_block = Some(CodeBlock {
@@ -248,10 +255,12 @@ impl<'a> Renderer<'a> {
                 self.flush_line();
                 self.blank_line();
             }
-            TagEnd::Heading(_) => {
+            TagEnd::Heading(level) => {
                 self.pop_style();
                 self.flush_line();
-                self.blank_line();
+                if level == HeadingLevel::H1 {
+                    self.blank_line();
+                }
             }
             TagEnd::CodeBlock => {
                 if let Some(block) = self.code_block.take() {
@@ -384,6 +393,17 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn heading_style(&self, level: HeadingLevel) -> Style {
+        let modifiers = match level {
+            HeadingLevel::H1 => Modifier::BOLD | Modifier::UNDERLINED,
+            HeadingLevel::H2 | HeadingLevel::H3 => Modifier::BOLD,
+            HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => {
+                Modifier::BOLD | Modifier::DIM
+            }
+        };
+        self.theme.markdown.heading.add_modifier(modifiers)
+    }
+
     fn push(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
@@ -439,6 +459,13 @@ impl<'a> Renderer<'a> {
             .is_some_and(|line| self.is_separator(line))
         {
             self.emit_line(StyledLine::default());
+        }
+    }
+
+    fn blank_line_before_block(&mut self) {
+        self.flush_line();
+        if !self.lines.is_empty() {
+            self.blank_line();
         }
     }
 
@@ -780,22 +807,82 @@ mod tests {
     }
 
     #[test]
-    fn headings_paint_their_text_with_heading_emphasis() {
+    fn each_heading_level_paints_its_distinguishing_modifiers() {
+        let theme = Theme::system();
+        let distinguishing = Modifier::BOLD | Modifier::UNDERLINED | Modifier::DIM;
+
+        for (markdown, expected) in [
+            ("# H1", Modifier::BOLD | Modifier::UNDERLINED),
+            ("## H2", Modifier::BOLD),
+            ("### H3", Modifier::BOLD),
+            ("#### H4", Modifier::BOLD | Modifier::DIM),
+            ("##### H5", Modifier::BOLD | Modifier::DIM),
+            ("###### H6", Modifier::BOLD | Modifier::DIM),
+        ] {
+            let lines = render(markdown, &theme);
+            let heading = &lines[0].spans[0];
+
+            assert!(!heading.chrome);
+            assert_eq!(heading.style.fg, theme.markdown.heading.fg);
+            assert_eq!(heading.style.add_modifier & distinguishing, expected);
+        }
+    }
+
+    #[test]
+    fn heading_modifiers_compose_with_nested_inline_emphasis() {
         let theme = Theme::system();
 
-        let lines = render("## Heading", &theme);
+        let lines = render("#### faded *soft* and **strong**", &theme);
+        let soft = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "soft")
+            .expect("emphasized heading text remains a distinct span");
+        let strong = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "strong")
+            .expect("strong heading text remains a distinct span");
+
+        assert!(soft.style.add_modifier.contains(Modifier::BOLD));
+        assert!(soft.style.add_modifier.contains(Modifier::DIM));
+        assert!(soft.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(strong.style.add_modifier.contains(Modifier::BOLD));
+        assert!(strong.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn heading_levels_apply_only_their_decided_block_spacing() {
+        let theme = Theme::system();
+        let lines = render(
+            "### before h2\n## h2\n### after h2\n# h1\n#### after h1",
+            &theme,
+        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            lines,
-            vec![StyledLine::text("Heading", theme.markdown.heading)]
+            text,
+            ["before h2", "", "h2", "after h2", "", "h1", "", "after h1",]
         );
-        assert!(!lines[0].spans[0].chrome);
-        assert!(
-            lines[0].spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
-        );
+    }
+
+    #[test]
+    fn a_leading_h1_or_h2_does_not_create_a_blank_message_row() {
+        let theme = Theme::system();
+
+        for heading in ["# first", "## first"] {
+            let lines = render(heading, &theme);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].spans[0].content, "first");
+        }
     }
 
     #[test]
