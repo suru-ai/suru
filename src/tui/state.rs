@@ -492,11 +492,11 @@ pub struct TuiState {
     pub(super) reconnect_overlay_visible: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
-    pending_steers: Vec<PendingSteer>,
+    pending_steers: Vec<HeldPrompt>,
     /// The undelivered Prompts this client asked a Session to withdraw. Their
     /// text is this reader's to get back, which is why it is remembered here
     /// rather than derived from a Session every viewer reads the same.
-    withdrawing: Vec<WithdrawingPrompt>,
+    withdrawing: Vec<HeldPrompt>,
     pub(super) command_mode: CommandMode,
     pub(super) composer_completion: ComposerCompletion,
     skill_catalog: Option<(SkillCatalogRequest, SkillCatalog)>,
@@ -544,15 +544,50 @@ pub(super) struct ProvisionalSession {
     pub(super) session_id: SessionId,
     pub(super) prompt: InitialPrompt,
     /// The Worktree prepared for this Session, once one has been. A retry uses
-    /// it rather than preparing again, for as long as the reader is still
-    /// working there.
+    /// it rather than preparing again: a claim never makes two.
     prepared: Option<PreparedFor>,
-    /// Why the Server refused, which stands where the Working Indicator was
-    /// until the reader retries.
-    pub(super) error: Option<String>,
-    /// Whether the reader confirmed an interrupt with no Session to send it to
-    /// yet. The intent waits here and travels with the Session's arrival.
-    interrupt_intent: bool,
+    pub(super) standing: ClaimStanding,
+}
+
+/// Where a Provisional Session stands, which is one reading rather than two:
+/// a claim cannot be both waiting on an answer and refused, and an interrupt
+/// can only be owed by a claim that is still waiting.
+#[derive(Clone, Debug)]
+pub(super) enum ClaimStanding {
+    /// Asked for and not answered — Working, as far as this client can say.
+    /// `interrupt_intent` is a confirmed interrupt with nowhere to go yet: it
+    /// waits here and travels with the Session's arrival.
+    Claimed { interrupt_intent: bool },
+    /// Refused by the Server, the reason standing where the Working Indicator
+    /// was until the reader retries.
+    Refused { error: String },
+}
+
+impl ProvisionalSession {
+    fn refused(&self) -> bool {
+        matches!(self.standing, ClaimStanding::Refused { .. })
+    }
+
+    /// Records a confirmed interrupt, and answers whether this claim had not
+    /// already taken one — a second confirmation asks for nothing new.
+    fn hold_interrupt(&mut self) -> bool {
+        match &mut self.standing {
+            ClaimStanding::Claimed { interrupt_intent } if !*interrupt_intent => {
+                *interrupt_intent = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    const fn interrupt_intent(&self) -> bool {
+        matches!(
+            self.standing,
+            ClaimStanding::Claimed {
+                interrupt_intent: true
+            }
+        )
+    }
 }
 
 /// A Worktree already made for a Session that has not been created yet.
@@ -578,20 +613,24 @@ struct FailedSubmission {
 
 /// A refused creation the reader had already walked away from, kept until the
 /// Landing they wrote it in is drawn again.
+///
+/// Distinct from [`FailedSubmission`], which is a refusal waiting to be
+/// reconciled against a Session that may yet report the Prompt: this one names
+/// no Session, is answered by the Landing alone, and carries the words the
+/// reader is owed.
 #[derive(Clone, Debug)]
 struct DeferredRefusal {
     error: String,
     prompt: InitialPrompt,
 }
 
+/// A Prompt one client is holding on a Session's behalf: a steer it has
+/// admitted and drawn before the Session reports it, or one it has asked the
+/// Session to withdraw and owes the reader back. Both are the same shape
+/// because both are the same fact — this client, that Session, that Prompt —
+/// read at different moments.
 #[derive(Clone, Debug)]
-struct WithdrawingPrompt {
-    session: SessionReference,
-    prompt: InitialPrompt,
-}
-
-#[derive(Clone, Debug)]
-struct PendingSteer {
+struct HeldPrompt {
     session: SessionReference,
     prompt: InitialPrompt,
 }
@@ -2559,7 +2598,7 @@ impl TuiState {
         let refuses_claim = self
             .provisional
             .as_ref()
-            .is_some_and(|claim| claim.prompt.id == prompt_id)
+            .is_some_and(|claim| claim.prompt.id == prompt_id && !claim.refused())
             && self
                 .pending_submission
                 .as_ref()
@@ -2573,7 +2612,7 @@ impl TuiState {
         self.provisional
             .as_mut()
             .expect("the refused claim was just observed")
-            .error = Some(error);
+            .standing = ClaimStanding::Refused { error };
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
     }
 
@@ -2682,15 +2721,35 @@ impl TuiState {
         self.text_selection.set(None);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
+        let session_id = SessionId::new();
         self.provisional = Some(ProvisionalSession {
-            session_id: SessionId::new(),
+            session_id,
             prompt: prompt.clone(),
             prepared: None,
-            error: None,
-            interrupt_intent: false,
+            standing: ClaimStanding::Claimed {
+                interrupt_intent: false,
+            },
         });
+        // The claim is drawn by the Session view's own body, which reads view
+        // state — where the Transcript is scrolled, what is folded — from an
+        // interaction. It gets one of its own under its local identity, given
+        // up with the claim so nothing outlives what it was for.
+        self.ensure_interaction(SessionReference::new(self.outlook.clone(), session_id));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.creation_transition(prompt)
+    }
+
+    /// The origin-qualified reference a standing claim is keyed by. It names
+    /// nothing on any Server: the identity is this client's own.
+    fn provisional_reference(&self) -> Option<SessionReference> {
+        Some(SessionReference::new(
+            self.outlook.clone(),
+            self.provisional.as_ref()?.session_id,
+        ))
+    }
+
+    pub(super) fn provisional_interaction(&self) -> Option<&SessionInteraction> {
+        self.session_interaction(&self.provisional_reference()?)
     }
 
     /// Asks for the Session this Prompt is written for: the Worktree already
@@ -2743,11 +2802,15 @@ impl TuiState {
     /// the client back: the creation goes on, and its answer no longer decides
     /// where the reader is.
     fn abandon_provisional_session(&mut self) -> Option<ProvisionalSession> {
+        let reference = self.provisional_reference();
         let abandoned = self.provisional.take()?;
+        if let Some(reference) = reference {
+            self.session_interactions.remove(&reference);
+        }
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         // A refused Prompt is the reader's again: its text goes back to the
         // Landing as a draft, to be resubmitted as the very Prompt it was.
-        if abandoned.error.is_some() {
+        if abandoned.refused() {
             self.composers
                 .admission_failed(ComposerKey::Landing, &abandoned.prompt);
         }
@@ -2833,7 +2896,7 @@ impl TuiState {
         for prompt in snapshot.prompts.iter().filter(|prompt| {
             prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
         }) {
-            self.withdrawing.push(WithdrawingPrompt {
+            self.withdrawing.push(HeldPrompt {
                 session: session.clone(),
                 prompt: InitialPrompt {
                     id: prompt.id,
@@ -2887,7 +2950,7 @@ impl TuiState {
             .iter()
             .any(|pending| pending.prompt.id == prompt.id)
         {
-            self.pending_steers.push(PendingSteer { session, prompt });
+            self.pending_steers.push(HeldPrompt { session, prompt });
         }
     }
 
@@ -2963,7 +3026,7 @@ impl TuiState {
         if self
             .provisional
             .as_ref()
-            .is_some_and(|claim| claim.error.is_none())
+            .is_some_and(|claim| !claim.refused())
         {
             return Some(InterruptTarget::Prompt);
         }
@@ -5507,7 +5570,7 @@ impl Application {
             ) {
                 self.state.command_mode = CommandMode::Composer;
                 if let Some(claim) = self.state.provisional.as_mut() {
-                    claim.interrupt_intent = true;
+                    claim.hold_interrupt();
                 }
             } else {
                 self.request_interrupt();
@@ -5538,10 +5601,10 @@ impl Application {
     }
 
     fn request_interrupt(&mut self) {
-        // The gesture reaches whatever is running: the active Turn, the
-        // Subagents that outlived it, or the Prompt the Session is Working for
-        // and has not delivered. With none of them there is nothing to stop and
-        // the key stays inert.
+        // The gesture reaches whatever the Session is Working for: the active
+        // Turn, the Subagents that outlived it, or the Prompt it has admitted
+        // and not delivered. With none of them there is nothing to stop and the
+        // key stays inert.
         let Some(target) = self.state.interrupt_target() else {
             return;
         };
@@ -5588,7 +5651,9 @@ impl Application {
             .as_mut()
             .expect("a retry answers the claim that was refused");
         claim.prompt = prompt.clone();
-        claim.error = None;
+        claim.standing = ClaimStanding::Claimed {
+            interrupt_intent: false,
+        };
         self.state.transcript_generation = self.state.transcript_generation.wrapping_add(1);
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
@@ -5618,7 +5683,7 @@ impl Application {
         self.state.new_worktree = None;
         self.state.session_events_blocked = false;
         self.state.apply_session(SessionEvent::snapshot(snapshot))?;
-        if claim.is_some_and(|claim| claim.interrupt_intent)
+        if claim.is_some_and(|claim| claim.interrupt_intent())
             && let Some(session) = self.state.session_reference.clone()
         {
             self.state.await_withdrawals(&session);
@@ -5640,7 +5705,7 @@ impl Application {
             .state
             .provisional
             .as_ref()
-            .is_some_and(|claim| claim.error.is_some())
+            .is_some_and(ProvisionalSession::refused)
         {
             return self.retry_provisional_session();
         }
@@ -7383,12 +7448,6 @@ impl Application {
 
     pub(super) fn outlook(&self) -> &Outlook {
         &self.state.outlook
-    }
-
-    /// The Session the main view has open, and `None` on the Landing or in a
-    /// Provisional Session, neither of which is a Session the client watches.
-    pub(super) fn open_session(&self) -> Option<SessionId> {
-        self.state.open_session()
     }
 
     pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {

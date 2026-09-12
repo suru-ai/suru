@@ -1340,7 +1340,12 @@ impl RunLoop {
                 // watching that one. Taking its stream away for a Session they
                 // are not in would be the late answer pulling them back by
                 // another route.
-                if self.application.open_session() == Some(session_id) {
+                if self
+                    .application
+                    .session_reference()
+                    .map(|session| session.session_id)
+                    == Some(session_id)
+                {
                     self.tasks.resubscribe(
                         self.client.session_commands_for(outlook.clone()),
                         SessionReference::new(outlook, session_id),

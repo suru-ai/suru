@@ -46,11 +46,14 @@ use super::{
         truncate_slot_text, truncate_to_width,
     },
     spinner,
-    state::{CommandId, CommandMode, QueuedPrompt, TranscriptViewport, TuiState},
+    state::{
+        ClaimStanding, CommandId, CommandMode, QueuedPrompt, SessionInteraction,
+        TranscriptViewport, TuiState,
+    },
     subagent_picker::working_subagents,
     text_layout::{TextLayout, draw_row},
     theme_picker::ThemePickerRow,
-    transcript::client_error_lines,
+    transcript::{TranscriptView, client_error_lines},
     usage::{compact_cost, compact_count},
     workspace_picker::WorkspacePickerRow,
 };
@@ -3481,6 +3484,65 @@ fn render_opening_session(
 ///
 /// A refusal leaves every one of those readings standing and puts a
 /// client-local, transcript-shaped Error row where the Working Indicator was.
+/// What a Session view is drawn from: the Session a Server answered for, or the
+/// claim a client stands on until it does.
+///
+/// Everything the view reads that a claim cannot answer for itself is named
+/// here, so both are drawn by one body and a claim is replaced in place rather
+/// than giving way to a differently built view.
+struct SessionSurface<'a> {
+    snapshot: &'a SessionSnapshot,
+    /// The composer the keys write into: the Session's own, or the Landing's
+    /// while a claim waits for one, which is where the draft migration onto the
+    /// created Session's key reads from.
+    composer_key: ComposerKey,
+    interaction: &'a SessionInteraction,
+    transcript: std::cell::Ref<'a, TranscriptView>,
+    tail: SessionTail,
+    /// Whether the view names where it would execute, as the Landing does. Only
+    /// a claim does: a Session has a header that says so.
+    execution_line: bool,
+}
+
+/// What stands immediately after the latest Transcript row.
+enum SessionTail {
+    /// Nothing: the Session is not Working and nothing was refused.
+    Quiet,
+    Working {
+        state: WorkingIndicatorState,
+        /// Absent in a claim, whose Working began at a moment only the Server
+        /// knows.
+        working_since: Option<SessionTimestamp>,
+        interrupt: Option<WorkingIndicatorInterrupt>,
+    },
+    /// A refusal this client draws itself: transcript-shaped, and never part of
+    /// the Transcript.
+    Refused(String),
+}
+
+/// What the Working Indicator says about interrupting while nothing has been
+/// confirmed: armed for as long as the reader's first Escape stands, and ready
+/// to take one otherwise.
+fn interrupt_guidance(state: &TuiState) -> WorkingIndicatorInterrupt {
+    if matches!(
+        state.command_mode,
+        CommandMode::InterruptConfirmation { .. }
+    ) {
+        WorkingIndicatorInterrupt::Armed
+    } else {
+        WorkingIndicatorInterrupt::Ready
+    }
+}
+
+/// The Session view a client draws for its own claim on a Session it has asked
+/// for and not been answered about.
+///
+/// Everything in it is drawn from what the client already knows: the Prompt as
+/// the user Message it will become, the Title that Prompt gives, where it would
+/// execute, the Agent it would begin under, and a Working Indicator with no
+/// elapsed time, because only the Server knows when Working began. A refusal
+/// leaves every one of those readings standing and puts a client-local,
+/// transcript-shaped Error row where the Working Indicator was.
 fn render_provisional_session(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -3489,214 +3551,52 @@ fn render_provisional_session(
     theme: &Theme,
     truecolor: bool,
 ) -> RenderedComposer {
-    let provisional = state
+    let claim = state
         .provisional
         .as_ref()
         .expect("the Provisional Session renderer requires the claim it draws");
     let snapshot = state
         .provisional_snapshot()
         .expect("a Provisional Session draws the Session it claims");
-    let padding = horizontal_padding(area.width);
-    let normally_padded = horizontally_inset(area, padding);
-    let content_column = session_content_area(area, state);
-    let content_width = content_column.width;
-    let content_detail = ResponsiveDetail::for_width(content_width);
-    let header_detail = ResponsiveDetail::for_width(normally_padded.width);
-    let show_header = area.height >= SESSION_HEADER_MINIMUM_HEIGHT;
-    let session_id = snapshot.session.id;
-    let key = ComposerKey::Landing;
-    let composer_text = state.composers.text(key.clone());
-    let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key.clone());
-    let desired_composer_height =
-        composer_block_height(area.height, content_width, composer_text, composer_cursor);
-    let mut tail = match provisional.error {
-        // The refusal is drawn after the rows rather than projected among them:
-        // it resembles Transcript content without ever becoming part of it.
-        Some(_) => Vec::new(),
-        None => {
-            let context = WorkingIndicatorSlotContext {
-                session_id,
-                width: content_width,
-                state: WorkingIndicatorState::Working,
-                working_since: None,
-                interrupt: Some(
-                    if matches!(
-                        state.command_mode,
-                        CommandMode::InterruptConfirmation { .. }
-                    ) {
-                        WorkingIndicatorInterrupt::Armed
-                    } else {
-                        WorkingIndicatorInterrupt::Ready
-                    },
-                ),
-            };
-            let default = working_indicator_line(
-                &context,
-                SessionTimestamp::now().0,
-                binding_label(&CommandId::RequestInterrupt),
-                state
-                    .shimmer_clock
-                    .frame(working_indicator_label(context.state), state.spinner_frame),
-                theme,
-                truecolor,
-            );
-            rendered_slot_lines(
-                slots.working_indicator(&context, default),
-                content_width,
-                theme,
-            )
-        }
-    };
-    if !tail.is_empty() {
-        tail.insert(0, Line::default());
-    }
-    let footer = slots.prompt_footer(
-        &PromptFooterSlotContext {
-            session_id,
-            width: content_width,
-        },
-        &PromptContextSlotContext {
-            session_id,
-            agent: SlotText::new(
-                agent_selection_context(state, content_detail),
-                theme.text.subdued,
-            ),
-            usage: None,
-        },
-    );
-    // The execution line the Landing drew stays drawn, one row above the footer
-    // the Session view puts its Agent Selection in.
-    let execution_height = 1;
-    let footer_height = footer.height().saturating_add(execution_height);
-    let reserved_height = u16::from(show_header)
-        .saturating_add(footer_height)
-        .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
-        .saturating_add(1);
-    let composer_height =
-        desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
-    let [
-        header_area,
-        transcript_area,
-        _,
-        _,
-        _,
-        _,
-        composer_area,
-        status_area,
-    ] = session_areas(
-        area,
-        u16::from(show_header),
-        0,
-        0,
-        0,
-        composer_height,
-        footer_height.min(area.height.saturating_sub(composer_height)),
-    );
-    if show_header {
-        render_session_header(
-            frame,
-            state,
-            &snapshot,
-            horizontally_inset(header_area, padding),
-            header_detail,
-            theme,
-        );
-    }
-    let transcript_area = in_column(transcript_area, content_column);
-    let composer_area = in_column(composer_area, content_column);
-    let status_area = in_column(status_area, content_column);
-    let view = state
+    let interaction = state
+        .provisional_interaction()
+        .expect("a claim keeps its own view state while it stands");
+    let content_width = session_content_area(area, state).width;
+    let transcript = state
         .provisional_transcript_view(&snapshot, theme, content_width)
         .expect("a Provisional Session projects the Prompt it stands for");
-    let has_top_border = transcript_area.height > 1;
-    let border_rows = u16::from(has_top_border);
-    let visible_rows = usize::from(transcript_area.height.saturating_sub(border_rows));
-    let rows = view.row_count_with_tail(&tail);
-    let scroll_position = rows.saturating_sub(transcript_viewport_height(transcript_area));
-    let window = view.window_with_tail(&tail, scroll_position, visible_rows);
-    state
-        .session_animation_on_screen
-        .set(provisional.error.is_none());
-    if has_top_border {
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(theme.border.subdued),
-            transcript_area,
-        );
-    }
-    let content_top = transcript_area.y.saturating_add(border_rows);
-    let buffer = frame.buffer_mut();
-    for (index, row) in window.rows.iter().take(visible_rows).enumerate() {
-        draw_row(
-            buffer,
-            transcript_area.x,
-            content_top.saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-            transcript_area.width,
-            row,
-        );
-    }
-    if let Some(error) = provisional.error.as_deref() {
-        let top = content_top
-            .saturating_add(u16::try_from(view.row_count()).unwrap_or(u16::MAX))
-            .saturating_add(1);
-        if top < transcript_area.bottom() {
-            frame.render_widget(
-                Paragraph::new(client_error_lines(
-                    &format!(
-                        "Could not create Session: {error} · Enter to retry, or type a new prompt"
-                    ),
-                    theme,
-                ))
-                .wrap(Wrap { trim: false }),
-                Rect::new(
-                    transcript_area.x,
-                    top,
-                    transcript_area.width,
-                    transcript_area.bottom().saturating_sub(top),
-                ),
-            );
-        }
-    }
-    let cursor = Some(render_composer(
-        frame,
-        composer_area,
-        ComposerContent {
-            memory: &state.composers,
-            key,
-            text: composer_text,
-            cursor: composer_cursor,
-            skill_markers: &skill_markers,
+    let tail = match &claim.standing {
+        ClaimStanding::Refused { error } => SessionTail::Refused(format!(
+            "Could not create Session: {error} · Enter to retry, or type a new prompt"
+        )),
+        ClaimStanding::Claimed { interrupt_intent } => SessionTail::Working {
+            state: WorkingIndicatorState::Working,
+            working_since: None,
+            // An interrupt the reader has already confirmed says so until the
+            // Session it is waiting for arrives to take it.
+            interrupt: Some(if *interrupt_intent {
+                WorkingIndicatorInterrupt::Requested
+            } else {
+                interrupt_guidance(state)
+            }),
         },
-        state.composer_border_style(theme),
+    };
+    render_session_surface(
+        frame,
+        state,
+        area,
+        slots,
         theme,
-    ));
-    if status_area.height >= execution_height {
-        frame.render_widget(
-            Paragraph::new(truncate_to_width(
-                &execution_context(state, state.settings().appearance.show_icons),
-                usize::from(status_area.width),
-            ))
-            .style(theme.text.subdued),
-            Rect::new(status_area.x, status_area.y, status_area.width, 1),
-        );
-        render_slot(
-            frame,
-            Rect::new(
-                status_area.x,
-                status_area.y.saturating_add(execution_height),
-                status_area.width,
-                status_area.height.saturating_sub(execution_height),
-            ),
-            footer,
-            theme,
-        );
-    }
-    RenderedComposer {
-        area: composer_area,
-        cursor,
-    }
+        truecolor,
+        SessionSurface {
+            snapshot: &snapshot,
+            composer_key: ComposerKey::Landing,
+            interaction,
+            transcript,
+            tail,
+            execution_line: true,
+        },
+    )
 }
 
 fn render_session(
@@ -3712,6 +3612,67 @@ fn render_session(
         .as_ref()
         .expect("Session renderer requires a Session")
         .snapshot();
+    let session_reference = state
+        .session_reference
+        .as_ref()
+        .expect("Session renderer requires its origin-qualified reference");
+    let interaction = state
+        .session_interaction(session_reference)
+        .expect("Session interaction is initialized with its snapshot");
+    let content_width = session_content_area(area, state).width;
+    let transcript = state
+        .transcript_view(theme, content_width)
+        .expect("the rendered Session has its projection and interaction");
+    // A Subagent's Session is read rather than conversed with: Escape leaves it
+    // instead of interrupting, so its indicator carries elapsed work but no
+    // false gesture.
+    let subagent_view = snapshot.session.parent.is_some();
+    let tail = snapshot
+        .working_since()
+        .map_or(SessionTail::Quiet, |since| SessionTail::Working {
+            state: if snapshot.session.status == SessionStatus::Active {
+                WorkingIndicatorState::Working
+            } else {
+                WorkingIndicatorState::WaitingForSubagents
+            },
+            working_since: Some(since),
+            interrupt: (!subagent_view).then(|| interrupt_guidance(state)),
+        });
+    render_session_surface(
+        frame,
+        state,
+        area,
+        slots,
+        theme,
+        truecolor,
+        SessionSurface {
+            snapshot,
+            composer_key: ComposerKey::Session(session_reference.clone()),
+            interaction,
+            transcript,
+            tail,
+            execution_line: false,
+        },
+    )
+}
+
+fn render_session_surface(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    slots: &RenderSlots,
+    theme: &Theme,
+    truecolor: bool,
+    surface: SessionSurface<'_>,
+) -> RenderedComposer {
+    let SessionSurface {
+        snapshot,
+        composer_key: key,
+        interaction,
+        transcript: transcript_view,
+        tail,
+        execution_line,
+    } = surface;
     let padding = horizontal_padding(area.width);
     let normally_padded = horizontally_inset(area, padding);
     let content_column = session_content_area(area, state);
@@ -3724,11 +3685,6 @@ fn render_session(
     // stands down for a one-line way back, and Escape means leaving rather
     // than interrupting.
     let subagent_view = snapshot.session.parent.is_some();
-    let session_reference = state
-        .session_reference
-        .clone()
-        .expect("Session renderer requires its origin-qualified reference");
-    let key = ComposerKey::Session(session_reference.clone());
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let skill_markers = state.composers.skill_markers(key.clone());
@@ -3741,30 +3697,19 @@ fn render_session(
         session_id,
         width: content_width,
     });
-    let working_indicator = snapshot
-        .working_since()
-        .map_or_else(RenderedSlot::empty, |since| {
+    let working_indicator = match &tail {
+        SessionTail::Quiet | SessionTail::Refused(_) => RenderedSlot::empty(),
+        SessionTail::Working {
+            state: indicator_state,
+            working_since,
+            interrupt,
+        } => {
             let context = WorkingIndicatorSlotContext {
                 session_id,
                 width: content_width,
-                state: if snapshot.session.status == SessionStatus::Active {
-                    WorkingIndicatorState::Working
-                } else {
-                    WorkingIndicatorState::WaitingForSubagents
-                },
-                working_since: Some(since),
-                // Escape leaves a Subagent's Session instead of interrupting it,
-                // so its indicator carries elapsed work but no false gesture.
-                interrupt: (!subagent_view).then_some(
-                    if matches!(
-                        state.command_mode,
-                        CommandMode::InterruptConfirmation { .. }
-                    ) {
-                        WorkingIndicatorInterrupt::Armed
-                    } else {
-                        WorkingIndicatorInterrupt::Ready
-                    },
-                ),
+                state: *indicator_state,
+                working_since: *working_since,
+                interrupt: *interrupt,
             };
             let default = working_indicator_line(
                 &context,
@@ -3777,7 +3722,8 @@ fn render_session(
                 truecolor,
             );
             slots.working_indicator(&context, default)
-        });
+        }
+    };
     let mut working_indicator_lines = rendered_slot_lines(working_indicator, content_width, theme);
     if !working_indicator_lines.is_empty() {
         working_indicator_lines.insert(0, Line::default());
@@ -3812,6 +3758,10 @@ fn render_session(
             usage,
         },
     );
+    // The execution line the Landing drew stays drawn, one row above the footer
+    // the Session view puts its Agent Selection in.
+    let execution_height = u16::from(execution_line);
+    let footer_height = footer.height().saturating_add(execution_height);
     let queued_prompts = state.queued_prompts(session_id);
     let desired_pending_height = if queued_prompts.is_empty() {
         0
@@ -3821,7 +3771,7 @@ fn render_session(
     let core_height = u16::from(show_header)
         .saturating_add(desired_composer_height)
         .saturating_add(composer_top.height())
-        .saturating_add(footer.height())
+        .saturating_add(footer_height)
         .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
     let pending_room = area.height.saturating_sub(core_height);
@@ -3833,17 +3783,11 @@ fn render_session(
     let reserved_height = u16::from(show_header)
         .saturating_add(pending_height)
         .saturating_add(composer_top.height())
-        .saturating_add(footer.height())
+        .saturating_add(footer_height)
         .saturating_add(TRANSCRIPT_BOTTOM_MARGIN)
         .saturating_add(1);
     let composer_height =
         desired_composer_height.min(area.height.saturating_sub(reserved_height).max(1));
-    let interaction = state
-        .session_interaction(&session_reference)
-        .expect("Session interaction is initialized with its snapshot");
-    let transcript_view = state
-        .transcript_view(theme, content_width)
-        .expect("the rendered Session has its projection and interaction");
     let transcript_rows = transcript_view.row_count_with_tail(&working_indicator_lines);
     let [_, transcript_without_latest, _, _, _, _, _, _] = session_areas(
         area,
@@ -3852,7 +3796,7 @@ fn render_session(
         0,
         composer_top.height(),
         composer_height,
-        footer.height(),
+        footer_height,
     );
     let viewport_without_latest = transcript_viewport_height(transcript_without_latest);
     let [_, transcript_with_latest, _, _, _, _, _, _] = session_areas(
@@ -3862,7 +3806,7 @@ fn render_session(
         1,
         composer_top.height(),
         composer_height,
-        footer.height(),
+        footer_height,
     );
     let viewport_with_latest = transcript_viewport_height(transcript_with_latest);
     let (away_from_bottom, viewport_height, maximum_scroll, scroll_position) =
@@ -3919,7 +3863,7 @@ fn render_session(
         latest_height,
         composer_top.height(),
         composer_height,
-        footer.height(),
+        footer_height,
     );
     if show_header {
         render_session_header(
@@ -4011,6 +3955,27 @@ fn render_session(
             state.text_selection.set(None);
         }
     }
+    // The refusal is drawn after the projected rows rather than among them: it
+    // resembles Transcript content without ever becoming part of it.
+    if let SessionTail::Refused(error) = &tail {
+        let top = content_top
+            .saturating_add(
+                u16::try_from(transcript_view.row_count().saturating_sub(scroll_position))
+                    .unwrap_or(u16::MAX),
+            )
+            .saturating_add(1);
+        if top < transcript_area.bottom() {
+            frame.render_widget(
+                Paragraph::new(client_error_lines(error, theme)).wrap(Wrap { trim: false }),
+                Rect::new(
+                    transcript_area.x,
+                    top,
+                    transcript_area.width,
+                    transcript_area.bottom().saturating_sub(top),
+                ),
+            );
+        }
+    }
     if pending_height > 0 {
         render_pending_prompts(
             frame,
@@ -4056,7 +4021,27 @@ fn render_session(
             theme,
         ))
     };
-    render_slot(frame, footer_area, footer, theme);
+    if execution_height > 0 && footer_area.height >= execution_height {
+        frame.render_widget(
+            Paragraph::new(truncate_to_width(
+                &execution_context(state, state.settings().appearance.show_icons),
+                usize::from(footer_area.width),
+            ))
+            .style(theme.text.subdued),
+            Rect::new(footer_area.x, footer_area.y, footer_area.width, 1),
+        );
+    }
+    render_slot(
+        frame,
+        Rect::new(
+            footer_area.x,
+            footer_area.y.saturating_add(execution_height),
+            footer_area.width,
+            footer_area.height.saturating_sub(execution_height),
+        ),
+        footer,
+        theme,
+    );
     RenderedComposer {
         area: composer_area,
         cursor,
@@ -4116,25 +4101,20 @@ fn working_indicator_line(
 ) -> Line<'static> {
     let label = working_indicator_label(context.state);
     // A Provisional Session carries no elapsed time: only the Server knows when
-    // Working began, and it has not said so yet. The guidance stands either way.
+    // Working began, and it has not said so yet. The guidance stands either way,
+    // so elapsed time is a prefix to it rather than a case of its own.
     let elapsed = context
         .working_since
         .map(|since| working_indicator_elapsed(since, now));
-    let metadata = match (elapsed, context.interrupt) {
-        (Some(elapsed), None) => format!(" ({elapsed})"),
-        (Some(elapsed), Some(WorkingIndicatorInterrupt::Ready)) => {
-            format!(" ({elapsed} • {interrupt_binding} to interrupt)")
-        }
-        (Some(elapsed), Some(WorkingIndicatorInterrupt::Armed)) => {
-            format!(" ({elapsed} • {interrupt_binding} again to interrupt)")
-        }
+    let guidance = context.interrupt.map(|interrupt| match interrupt {
+        WorkingIndicatorInterrupt::Ready => format!("{interrupt_binding} to interrupt"),
+        WorkingIndicatorInterrupt::Armed => format!("{interrupt_binding} again to interrupt"),
+        WorkingIndicatorInterrupt::Requested => "interrupting…".to_owned(),
+    });
+    let metadata = match (elapsed, guidance) {
         (None, None) => String::new(),
-        (None, Some(WorkingIndicatorInterrupt::Ready)) => {
-            format!(" ({interrupt_binding} to interrupt)")
-        }
-        (None, Some(WorkingIndicatorInterrupt::Armed)) => {
-            format!(" ({interrupt_binding} again to interrupt)")
-        }
+        (Some(said), None) | (None, Some(said)) => format!(" ({said})"),
+        (Some(elapsed), Some(guidance)) => format!(" ({elapsed} • {guidance})"),
     };
     let label = shimmered_label_spans(
         label,

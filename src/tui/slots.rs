@@ -68,6 +68,10 @@ pub(super) enum WorkingIndicatorState {
 pub(super) enum WorkingIndicatorInterrupt {
     Ready,
     Armed,
+    /// The reader has confirmed an interrupt that has nowhere to go yet: it
+    /// waits for the Session being created, and the indicator says so rather
+    /// than offering the gesture again.
+    Requested,
 }
 
 #[derive(Clone, Copy, Debug)]
