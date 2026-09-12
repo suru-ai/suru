@@ -52,7 +52,29 @@ impl SessionStoreState {
     /// The admission moment is the commit's own, because that is when the
     /// Session began Working: the Prompt is owed a Turn from here until it is
     /// delivered, fails, or is withdrawn, whatever the Provider is doing.
+    ///
+    /// The admission is only recorded by a commit that lands. A batch that
+    /// fails changes nothing about the Session, so it must leave nothing
+    /// behind that would have it read as Working over a Prompt it never
+    /// admitted.
     pub(super) fn commit_admission(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        changes: Vec<SessionChange>,
+        turn_start: Option<PromptId>,
+    ) -> anyhow::Result<SessionUpdate> {
+        let committed = self.commit_admitted(storage, session_id, changes, turn_start);
+        if committed.is_err()
+            && let Some(prompt_id) = turn_start
+            && let Some(record) = self.sessions.get_mut(&session_id)
+        {
+            record.turn_start_admissions.remove(&prompt_id);
+        }
+        committed
+    }
+
+    fn commit_admitted(
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
@@ -111,10 +133,44 @@ impl SessionStoreState {
                 working_since,
             });
         }
+        self.forget_spent_admissions(session_id, working_since);
         self.reconcile_working(storage, session_id);
         self.reconcile_usage(storage, session_id);
         self.reconcile_questionnaires(storage, session_id);
         Ok(update)
+    }
+
+    /// Drops the admissions that can no longer move this Session's Working
+    /// reading. An admission anchors Working from the moment its Prompt was
+    /// admitted until the Turn it began has settled — and once nothing in the
+    /// subtree is Working at all, every interval it holds is closed and behind
+    /// the present, so no later Turn can merge with one. A Prompt withdrawn or
+    /// cancelled where it stood is spent the moment it is, because no Turn
+    /// will ever reference it. Keeping the rest would leave a Session's
+    /// bookkeeping growing with every Turn it has ever run, and make the
+    /// derivation walk it (ADR 0024).
+    fn forget_spent_admissions(
+        &mut self,
+        session_id: SessionId,
+        working_since: Option<SessionTimestamp>,
+    ) {
+        let Some(record) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if working_since.is_none() {
+            record.turn_start_admissions.clear();
+            return;
+        }
+        let cancelled = record
+            .snapshot
+            .prompts
+            .iter()
+            .filter(|prompt| prompt.status == PromptStatus::Cancelled)
+            .map(|prompt| prompt.id)
+            .collect::<Vec<_>>();
+        for prompt_id in cancelled {
+            record.turn_start_admissions.remove(&prompt_id);
+        }
     }
 
     /// Carries descendant availability to each ancestor without copying child
@@ -633,7 +689,7 @@ pub(super) fn active_turn_id(snapshot: &SessionSnapshot) -> anyhow::Result<Optio
 /// to a Prompt it has admitted but not delivered: both are the Session at
 /// work, and a surface reading the status to explain Working must find one
 /// either side of the delivery that joins them (ADR 0024).
-fn derived_session_status(
+pub(super) fn derived_session_status(
     snapshot: &SessionSnapshot,
     turn_start_admissions: &HashMap<PromptId, SessionTimestamp>,
 ) -> anyhow::Result<SessionStatus> {
@@ -701,4 +757,123 @@ fn owed_turn_intervals<'a>(
                 .started_at?;
             Some((*admitted_at, Some(started_at)))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        protocol::{
+            AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
+        },
+        sessions::{DeliveredTurnStatus, ProviderTurnOutcome, SessionStore, StoreOutcome},
+        storage::{StorageRepository, StorageWriter},
+    };
+
+    /// Admissions are bookkeeping the Working derivation reads, not a record
+    /// the Session keeps: each one is forgotten as soon as it can no longer
+    /// move that reading, so a long-lived Session's bookkeeping is the size of
+    /// the work in front of it rather than the work behind it.
+    #[tokio::test]
+    async fn admissions_are_forgotten_once_the_work_they_anchor_is_over() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new());
+        let first = PromptId::new();
+        let StoreOutcome::Created(snapshot) = store
+            .create(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: first,
+                    text: "Map the provider seams".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .expect("create Session")
+        else {
+            panic!("a fresh Prompt creates a Session")
+        };
+        let session_id = snapshot.session.id;
+        let admissions = |store: &SessionStore| {
+            store
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned")
+                .sessions[&session_id]
+                .turn_start_admissions
+                .len()
+        };
+        let admitted_at = snapshot
+            .session
+            .working_since
+            .expect("the created Session owes a Turn");
+        assert_eq!(admissions(&store), 1, "the Prompt is owed a Turn");
+
+        for prompt_id in [first, PromptId::new(), PromptId::new()] {
+            if prompt_id != first {
+                let StoreOutcome::Created(_) = store
+                    .admit(
+                        session_id,
+                        AdmitPromptRequest {
+                            delivery: PromptDelivery::Steer,
+                            prompt: InitialPrompt {
+                                id: prompt_id,
+                                text: "And again".to_owned(),
+                                skill_invocations: Vec::new(),
+                            },
+                        },
+                    )
+                    .expect("admit a follow-up Prompt")
+                else {
+                    panic!("a fresh Prompt is admitted")
+                };
+                assert_eq!(admissions(&store), 1, "one Turn is owed at a time");
+            }
+            let delivered = store
+                .deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Active)
+                .expect("deliver the Prompt")
+                .expect("the Prompt was still owed a Turn");
+            let working = store
+                .snapshot(session_id)
+                .and_then(|snapshot| snapshot.session.working_since)
+                .expect("a delivered Prompt leaves its Turn working");
+            if prompt_id == first {
+                assert_eq!(
+                    working, admitted_at,
+                    "delivery continues the Working its admission began"
+                );
+            }
+            assert_eq!(
+                admissions(&store),
+                1,
+                "the admission still anchors the Turn it began"
+            );
+            store
+                .finish_provider_turn(
+                    session_id,
+                    delivered.turn_id,
+                    ProviderTurnOutcome::Completed {
+                        trailing_output: Default::default(),
+                    },
+                )
+                .expect("settle the Turn");
+            assert_eq!(
+                store.snapshot(session_id).and_then(|s| s.working_since()),
+                None,
+                "a settled Turn leaves nothing working"
+            );
+            assert_eq!(
+                admissions(&store),
+                0,
+                "and nothing left to anchor it with either"
+            );
+        }
+    }
 }
