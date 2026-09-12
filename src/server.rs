@@ -2381,6 +2381,7 @@ async fn interrupt_session(
             SessionErrorCode::InterruptionFailed,
             message,
         ),
+        Err(InterruptSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

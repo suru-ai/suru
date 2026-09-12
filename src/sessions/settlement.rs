@@ -28,10 +28,15 @@ pub(crate) enum InterruptSessionError {
     /// per-Subagent stop.
     SubagentStopUnsupported,
     ProviderFailure(String),
+    /// The interrupt reached no Provider at all: withdrawing the Prompt the
+    /// Session was Working over is a store mutation, and the store refused it.
+    Storage(String),
 }
 
-/// What one interrupt of a Session should reach, resolved by the store so
-/// every caller asks the same question of the same snapshot.
+/// What one interrupt of a Session did, resolved by the store so every caller
+/// acts on the same reading of the same snapshot. Everything the interrupt
+/// still has to reach is the Provider's; the one thing the store settles
+/// itself, it has settled by the time it answers.
 pub(crate) enum InterruptTarget {
     /// The Session's active Turn. The Provider stops the Turn's background
     /// work — its Subagents included — before the loop, in the established
@@ -43,17 +48,27 @@ pub(crate) enum InterruptTarget {
     /// The Session is a Subagent's own, so the interrupt stops that one
     /// Subagent — through the Provider connection its root ancestor owns.
     Subagent { root: SessionId },
-    /// No work is under way: the Session is Working only because it owes a
-    /// Turn to this Prompt, which it has admitted and not delivered. Only
-    /// [`SessionStore::interrupt_or_withdraw`] answers with it, and it answers
-    /// with [`InterruptTarget::WithdrewPrompt`] instead once it has acted.
-    UndeliveredPrompt(Box<Prompt>),
     /// The Session was Working only because it owed a Turn to a Prompt it had
     /// not delivered, so the interrupt withdrew that Prompt where it stood.
     /// The Prompt is already Cancelled by the time this is returned: the
     /// decision and the mutation are one act under the store lock, so a
     /// delivery that wins the race is seen as a Turn to stop instead.
     WithdrewPrompt(Box<Prompt>),
+}
+
+/// What the store sees when it is asked what an interrupt should reach, before
+/// anything acts on it. It differs from [`InterruptTarget`] in the one case the
+/// store settles itself: an undelivered Prompt is something to withdraw here
+/// and something already withdrawn there.
+enum InterruptReading {
+    Turn(Box<Turn>),
+    Subagents,
+    Subagent {
+        root: SessionId,
+    },
+    /// No work is under way: the Session is Working only because it owes a
+    /// Turn to this Prompt, which it has admitted and not delivered.
+    UndeliveredPrompt(Box<Prompt>),
 }
 
 pub(crate) enum ProviderTurnOutcome {
@@ -282,9 +297,13 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let target = state.interrupt_target(session_id)?;
-        let InterruptTarget::UndeliveredPrompt(prompt) = target else {
-            return Ok(target);
+        let prompt = match state.interrupt_reading(session_id)? {
+            InterruptReading::Turn(turn) => return Ok(InterruptTarget::Turn(turn)),
+            InterruptReading::Subagents => return Ok(InterruptTarget::Subagents),
+            InterruptReading::Subagent { root } => {
+                return Ok(InterruptTarget::Subagent { root });
+            }
+            InterruptReading::UndeliveredPrompt(prompt) => prompt,
         };
         let prompt_id = prompt.id;
         state
@@ -296,31 +315,34 @@ impl SessionStore {
                     status: PromptStatus::Cancelled,
                 }],
             )
-            .map_err(|error| InterruptSessionError::ProviderFailure(error.to_string()))?;
+            .map_err(|error| InterruptSessionError::Storage(error.to_string()))?;
         let mut withdrawn = *prompt;
         withdrawn.status = PromptStatus::Cancelled;
         Ok(InterruptTarget::WithdrewPrompt(Box::new(withdrawn)))
     }
 
-    pub(crate) fn interrupt_target(
-        &self,
-        session_id: SessionId,
-    ) -> Result<InterruptTarget, InterruptSessionError> {
+    /// The Session whose Provider actor holds this one's conversation: a
+    /// Subagent's work runs over the connection its root ancestor owns, and
+    /// every other Session is its own.
+    pub(crate) fn actor_session(&self, session_id: SessionId) -> SessionId {
         let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        state.interrupt_target(session_id)
+        match state.interrupt_reading(session_id) {
+            Ok(InterruptReading::Subagent { root }) => root,
+            _ => session_id,
+        }
     }
 }
 
 impl SessionStoreState {
-    /// The reading itself, taken off a locked store so both the read-only
-    /// question and the one that acts ask it of the same state.
-    fn interrupt_target(
+    /// The reading itself, taken off a locked store so both the question that
+    /// only looks and the one that acts ask it of the same state.
+    fn interrupt_reading(
         &self,
         session_id: SessionId,
-    ) -> Result<InterruptTarget, InterruptSessionError> {
+    ) -> Result<InterruptReading, InterruptSessionError> {
         let record = self
             .sessions
             .get(&session_id)
@@ -338,7 +360,7 @@ impl SessionStoreState {
             {
                 root = parent;
             }
-            return Ok(InterruptTarget::Subagent { root });
+            return Ok(InterruptReading::Subagent { root });
         }
         if let Some(turn) = record
             .snapshot
@@ -346,7 +368,7 @@ impl SessionStoreState {
             .iter()
             .find(|turn| turn.status == TurnStatus::Active)
         {
-            return Ok(InterruptTarget::Turn(Box::new(turn.clone())));
+            return Ok(InterruptReading::Turn(Box::new(turn.clone())));
         }
         if self.subtree_working_since(session_id).is_some() {
             // Work below the Session outranks a Prompt waiting above it: an
@@ -366,9 +388,11 @@ impl SessionStoreState {
                 && let Some(prompt) =
                     undelivered_turn_starts(&record.snapshot, &record.turn_start_admissions).next()
             {
-                return Ok(InterruptTarget::UndeliveredPrompt(Box::new(prompt.clone())));
+                return Ok(InterruptReading::UndeliveredPrompt(Box::new(
+                    prompt.clone(),
+                )));
             }
-            return Ok(InterruptTarget::Subagents);
+            return Ok(InterruptReading::Subagents);
         }
         Err(InterruptSessionError::NothingToInterrupt)
     }

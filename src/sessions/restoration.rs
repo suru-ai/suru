@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::protocol::{SessionId, SessionTimestamp, UsageTotal};
 
-use super::SessionStoreState;
+use super::{SessionStoreState, projection::derived_session_status};
 
 impl SessionStoreState {
     /// Derive each Session once, after its children. The temporary index and
@@ -65,18 +65,11 @@ impl SessionStoreState {
             // A Prompt admitted to begin a Turn is owed one only by the
             // process that admitted it: nothing survives a restart to start
             // it, so a restored Session is at work only where a durable Turn
-            // says so, and its status says the same thing its Working reading
-            // does (ADR 0024).
-            let status = if record
-                .snapshot
-                .turns
-                .iter()
-                .any(|turn| turn.status == crate::protocol::TurnStatus::Active)
-            {
-                crate::protocol::SessionStatus::Active
-            } else {
-                crate::protocol::SessionStatus::Idle
-            };
+            // says so, and its status is derived the same way every other
+            // commit derives it (ADR 0024). A history whose Turns break that
+            // derivation keeps the status it was stored with.
+            let status = derived_session_status(&record.snapshot, &record.turn_start_admissions)
+                .unwrap_or(record.snapshot.session.status);
             record.snapshot.session.status = status;
             record.summary.session.status = status;
             record.snapshot.subagent_usage = delegated;

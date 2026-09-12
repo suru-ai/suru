@@ -898,10 +898,7 @@ impl ProviderOrchestrator {
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
     ) -> Result<(), String> {
-        let actor_id = match self.sessions.interrupt_target(session_id) {
-            Ok(InterruptTarget::Subagent { root }) => root,
-            _ => session_id,
-        };
+        let actor_id = self.sessions.actor_session(session_id);
         let (response, received) = oneshot::channel();
         self.schedule(
             actor_id,
@@ -945,9 +942,6 @@ impl ProviderOrchestrator {
             // exactly as a Session between Turns keeps its connection.
             InterruptTarget::WithdrewPrompt(prompt) => {
                 return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
-            }
-            InterruptTarget::UndeliveredPrompt(_) => {
-                unreachable!("the withdrawing resolution answers with the Prompt it withdrew")
             }
             InterruptTarget::Turn(turn) => {
                 let actor = actor_commands(session_id).ok_or_else(|| {
