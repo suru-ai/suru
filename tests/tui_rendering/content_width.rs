@@ -390,19 +390,21 @@ fn changing_width_keeps_a_scrolled_reader_anchored_to_the_same_message_and_row()
         session_with_reflowing_transcript(workspace.path(), SessionContentWidth::Maximum(50));
 
     rendered_application_rows_at(&application, 120, 20);
-    application
-        .handle_event(ApplicationEvent::Command(
-            CommandId::ScrollTranscriptLinesUp,
-        ))
-        .expect("move away from the latest Transcript row");
+    for _ in 0..4 {
+        application
+            .handle_event(ApplicationEvent::Command(
+                CommandId::ScrollTranscriptLinesUp,
+            ))
+            .expect("move the ninth Agent Message to the viewport boundary");
+    }
     let maximum = rendered_application_rows_at(&application, 120, 20);
-    let anchor_row = rendered_row(&maximum, "Prompt section 12");
+    let anchor_row = rendered_row(&maximum, "Agent section 9");
 
     change_content_width(&mut application, SessionContentWidth::Maximum(70));
 
     let wider_maximum = rendered_application_rows_at(&application, 120, 20);
     assert_eq!(
-        rendered_row(&wider_maximum, "Prompt section 12"),
+        rendered_row(&wider_maximum, "Agent section 9"),
         anchor_row,
         "the logical Message anchor stays on its screen row between maximum values"
     );
@@ -411,7 +413,7 @@ fn changing_width_keeps_a_scrolled_reader_anchored_to_the_same_message_and_row()
 
     let fill = rendered_application_rows_at(&application, 120, 20);
     assert_eq!(
-        rendered_row(&fill, "Prompt section 12"),
+        rendered_row(&fill, "Agent section 9"),
         anchor_row,
         "the logical Message anchor stays on its screen row after reflow"
     );

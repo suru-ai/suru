@@ -2261,12 +2261,12 @@ mod tests {
     fn html_blocks_preserve_comparison_text_that_only_looks_like_a_tag() {
         let theme = Theme::system();
         let lines = super::render(
-            "<details open class='example'>a < b and c > d; a < 2 then <b>bold</b></details>",
+            "<details open class='example'>a < b and c > d; x < 2 and it's <b>bold</b></details>",
             &theme,
             80,
         );
 
-        assert_eq!(line_texts(&lines), ["a < b and c > d; a < 2 then bold"]);
+        assert_eq!(line_texts(&lines), ["a < b and c > d; x < 2 and it's bold"]);
         let spans = lines
             .iter()
             .flat_map(|line| &line.spans)
@@ -2291,9 +2291,10 @@ mod tests {
         assert_eq!(
             document.copy(&ranges, true),
             crate::tui::ClipboardContent {
-                text: r"a \< b and c \> d; a \< 2 then **bold**".into(),
+                text: r"a \< b and c \> d; x \< 2 and it's **bold**".into(),
                 html: Some(
-                    "<p>a &lt; b and c &gt; d; a &lt; 2 then <strong>bold</strong></p>\n".into(),
+                    "<p>a &lt; b and c &gt; d; x &lt; 2 and it's <strong>bold</strong></p>\n"
+                        .into(),
                 ),
             }
         );

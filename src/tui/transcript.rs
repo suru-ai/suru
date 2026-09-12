@@ -4822,7 +4822,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_cache_recolors_code_blocks_when_only_syntax_colors_change() {
+    fn transcript_cache_recolors_answer_code_and_keeps_reasoning_subdued() {
         let content = "```rust\nlet value = 42;\n```";
         let activity = reasoning(ActivityStatus::Completed, None, content);
         let snapshot = transcript_snapshot(vec![
@@ -4877,12 +4877,25 @@ mod tests {
         };
         assert_eq!(
             keyword_colors(&first_lines),
-            vec![Some(Color::Rgb(1, 2, 3)); 2]
+            vec![Some(Color::Rgb(1, 2, 3))]
         );
         assert_eq!(
             keyword_colors(&second_lines),
-            vec![Some(Color::Rgb(4, 5, 6)); 2]
+            vec![Some(Color::Rgb(4, 5, 6))]
         );
+        let reasoning_style = first_theme
+            .text
+            .subdued
+            .add_modifier(first_theme.markdown.code_block.add_modifier);
+        for lines in [&first_lines, &second_lines] {
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("let value = 42;")
+                        && span.style == reasoning_style)
+            );
+        }
     }
 
     #[test]

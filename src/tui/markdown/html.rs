@@ -102,6 +102,11 @@ impl Normalizer {
                 rest = &rest[end + 3..];
                 continue;
             }
+            if !looks_like_tag_opening(rest) {
+                self.text("<");
+                rest = &rest[1..];
+                continue;
+            }
             let Some(end) = tag_end(rest) else {
                 self.text(rest);
                 return;
@@ -243,6 +248,28 @@ impl Normalizer {
             }
         }
     }
+}
+
+fn looks_like_tag_opening(raw: &str) -> bool {
+    let Some(after_open) = raw.strip_prefix('<') else {
+        return false;
+    };
+    let name = after_open.strip_prefix('/').unwrap_or(after_open);
+    if name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        return true;
+    }
+    if name.starts_with("![CDATA[") {
+        return true;
+    }
+    if name
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!doctype"))
+    {
+        return true;
+    }
+    name.strip_prefix('?')
+        .and_then(|instruction| instruction.as_bytes().first())
+        .is_some_and(u8::is_ascii_alphabetic)
 }
 
 fn valid_tag(raw: &str) -> bool {
