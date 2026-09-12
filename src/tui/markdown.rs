@@ -5,22 +5,22 @@ use ratatui::style::Style;
 
 use crate::theme::Theme;
 
-use super::text_layout::{StyledLine, StyledSpan};
+use super::text_layout::{StyledLayout, StyledLine, StyledSpan};
 
 pub(super) mod copy;
 mod syntax;
 
-pub(super) fn render(content: &str, theme: &Theme) -> Vec<StyledLine> {
-    render_prose(content, theme, false)
+pub(super) fn render(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
+    render_prose(content, theme, false, width)
 }
 
-pub(super) fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> {
-    render_prose(content, theme, true)
+pub(super) fn render_reasoning(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
+    render_prose(content, theme, true, width)
 }
 
-fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<StyledLine> {
+fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<StyledLine> {
     let parser = Parser::new_ext(content, Options::ENABLE_TABLES);
-    let mut renderer = Renderer::new(theme, subdued);
+    let mut renderer = Renderer::new(theme, subdued, width);
     let mut builder = copy::Builder::new();
     for event in parser {
         renderer.source = builder.event(&event);
@@ -37,6 +37,7 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool) -> Vec<StyledLine> 
 struct Renderer<'a> {
     theme: &'a Theme,
     subdued: bool,
+    width: u16,
     lines: Vec<StyledLine>,
     current: Vec<StyledSpan>,
     styles: Vec<Style>,
@@ -44,7 +45,7 @@ struct Renderer<'a> {
     links: Vec<String>,
     code_block: Option<CodeBlock>,
     source: Option<copy::SourceRange>,
-    table_alignments: Vec<copy::ColumnAlignment>,
+    table: Option<Table>,
 }
 
 struct CodeBlock {
@@ -53,11 +54,32 @@ struct CodeBlock {
     source: Option<copy::SourceRange>,
 }
 
+#[derive(Default)]
+struct Table {
+    alignments: Vec<copy::ColumnAlignment>,
+    rows: Vec<TableRow>,
+    current_row: Option<TableRow>,
+    current_cell: Option<TableCell>,
+}
+
+#[derive(Default)]
+struct TableRow {
+    header: bool,
+    cells: Vec<TableCell>,
+}
+
+#[derive(Default)]
+struct TableCell {
+    spans: Vec<StyledSpan>,
+    boundary: Option<copy::SourceRange>,
+}
+
 impl<'a> Renderer<'a> {
-    fn new(theme: &'a Theme, subdued: bool) -> Self {
+    fn new(theme: &'a Theme, subdued: bool, width: u16) -> Self {
         Self {
             theme,
             subdued,
+            width,
             lines: Vec::new(),
             current: Vec::new(),
             styles: vec![theme.text.primary],
@@ -65,7 +87,7 @@ impl<'a> Renderer<'a> {
             links: Vec::new(),
             code_block: None,
             source: None,
-            table_alignments: Vec::new(),
+            table: None,
         }
     }
 
@@ -91,7 +113,13 @@ impl<'a> Renderer<'a> {
                     self.push(" ", self.current_style());
                 }
             }
-            Event::HardBreak => self.flush_line(),
+            Event::HardBreak => {
+                if self.table.is_some() {
+                    self.push(" ", self.current_style());
+                } else {
+                    self.flush_line();
+                }
+            }
             Event::Rule => {
                 self.flush_line();
                 self.push("────────", self.theme.border.subdued);
@@ -162,21 +190,40 @@ impl<'a> Renderer<'a> {
             }
             Tag::Table(alignments) => {
                 self.flush_line();
-                self.table_alignments = alignments
-                    .into_iter()
-                    .map(copy::ColumnAlignment::from)
-                    .collect();
+                self.table = Some(Table {
+                    alignments: alignments
+                        .into_iter()
+                        .map(copy::ColumnAlignment::from)
+                        .collect(),
+                    ..Table::default()
+                });
             }
-            Tag::TableHead | Tag::TableRow => {
-                self.flush_line();
-                self.push_chrome("| ", self.theme.markdown.list_marker);
+            Tag::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.current_row = Some(TableRow {
+                        header: true,
+                        cells: Vec::new(),
+                    });
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.current_row = Some(TableRow {
+                        header: false,
+                        cells: Vec::new(),
+                    });
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.current_cell = Some(TableCell::default());
+                }
             }
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::TableCell
             | Tag::Strikethrough
             | Tag::Superscript
             | Tag::Subscript
@@ -239,20 +286,35 @@ impl<'a> Renderer<'a> {
                 self.flush_line();
                 self.blank_line();
             }
-            TagEnd::TableCell => self.push_chrome(" | ", self.theme.markdown.list_marker),
-            TagEnd::TableHead => {
-                self.flush_line();
-                let separator = self
-                    .table_alignments
-                    .iter()
-                    .map(copy::ColumnAlignment::separator)
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                self.push_chrome(format!("| {separator} |"), self.theme.markdown.list_marker);
-                self.flush_line();
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table
+                    && let Some(mut cell) = table.current_cell.take()
+                {
+                    cell.boundary = self.source.clone();
+                    if let Some(row) = &mut table.current_row {
+                        row.cells.push(cell);
+                    }
+                }
             }
-            TagEnd::TableRow => self.flush_line(),
-            TagEnd::Table => self.blank_line(),
+            TagEnd::TableHead | TagEnd::TableRow => {
+                if let Some(table) = &mut self.table
+                    && let Some(row) = table.current_row.take()
+                {
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    let mut lines = table.render(self.width, self.theme);
+                    if self.subdued {
+                        for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+                            span.style = self.prose_style(span.style);
+                        }
+                    }
+                    self.lines.extend(lines);
+                }
+                self.blank_line();
+            }
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
@@ -306,7 +368,15 @@ impl<'a> Renderer<'a> {
         if !content.is_empty() {
             let mut span = StyledSpan::text(content, self.prose_style(style));
             span.source = self.source.clone();
-            self.current.push(span);
+            if let Some(cell) = self
+                .table
+                .as_mut()
+                .and_then(|table| table.current_cell.as_mut())
+            {
+                cell.spans.push(span);
+            } else {
+                self.current.push(span);
+            }
         }
     }
 
@@ -315,7 +385,15 @@ impl<'a> Renderer<'a> {
         if !content.is_empty() {
             let mut span = StyledSpan::chrome(content, self.prose_style(style));
             span.source = self.source.clone();
-            self.current.push(span);
+            if let Some(cell) = self
+                .table
+                .as_mut()
+                .and_then(|table| table.current_cell.as_mut())
+            {
+                cell.spans.push(span);
+            } else {
+                self.current.push(span);
+            }
         }
     }
 
@@ -342,6 +420,266 @@ impl<'a> Renderer<'a> {
     }
 }
 
+const MIN_TABLE_COLUMN_WIDTH: usize = 3;
+
+impl TableCell {
+    fn width(&self) -> usize {
+        self.spans.iter().map(StyledSpan::width).sum()
+    }
+
+    fn line(&self, header: bool, theme: &Theme) -> StyledLine {
+        let mut spans = self.spans.clone();
+        if header {
+            for span in &mut spans {
+                span.style = span.style.patch(theme.markdown.strong);
+            }
+        }
+        StyledLine::from(spans)
+    }
+}
+
+impl Table {
+    fn render(self, width: u16, theme: &Theme) -> Vec<StyledLine> {
+        let columns = self
+            .rows
+            .iter()
+            .map(|row| row.cells.len())
+            .chain(std::iter::once(self.alignments.len()))
+            .max()
+            .unwrap_or(0);
+        if columns == 0 {
+            return Vec::new();
+        }
+        let natural = (0..columns)
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.cells.get(column))
+                    .map(TableCell::width)
+                    .max()
+                    .unwrap_or(0)
+                    .max(1)
+            })
+            .collect::<Vec<_>>();
+        let minimum = natural
+            .iter()
+            .map(|width| (*width).min(MIN_TABLE_COLUMN_WIDTH))
+            .collect::<Vec<_>>();
+        let available = usize::from(width);
+        if table_width(&minimum) > available {
+            return self.render_pipe(columns, theme);
+        }
+        let widths = fit_table_widths(&natural, &minimum, available);
+        self.render_bordered(&widths, theme)
+    }
+
+    fn render_bordered(self, widths: &[usize], theme: &Theme) -> Vec<StyledLine> {
+        let mut lines = vec![table_rule('┌', '┬', '┐', widths, theme)];
+        for row in &self.rows {
+            lines.extend(self.render_row(row, widths, theme));
+            if row.header {
+                lines.push(table_rule('├', '┼', '┤', widths, theme));
+            }
+        }
+        lines.push(table_rule('└', '┴', '┘', widths, theme));
+        lines
+    }
+
+    fn render_row(&self, row: &TableRow, widths: &[usize], theme: &Theme) -> Vec<StyledLine> {
+        let cells = widths
+            .iter()
+            .enumerate()
+            .map(|(column, width)| {
+                row.cells.get(column).map_or_else(
+                    || vec![Vec::new()],
+                    |cell| wrapped_cell(cell, *width, row.header, theme),
+                )
+            })
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        (0..height)
+            .map(|line_index| {
+                let mut spans = vec![StyledSpan::chrome("│", theme.border.subdued)];
+                for (column, width) in widths.iter().copied().enumerate() {
+                    let content = cells[column].get(line_index).cloned().unwrap_or_default();
+                    let content_width = content.iter().map(StyledSpan::width).sum::<usize>();
+                    let remaining = width.saturating_sub(content_width);
+                    let alignment = self
+                        .alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(copy::ColumnAlignment::None);
+                    let (leading, trailing) = alignment_padding(alignment, remaining);
+                    let padding_style = if row.header {
+                        theme.text.primary.patch(theme.markdown.strong)
+                    } else {
+                        theme.text.primary
+                    };
+                    spans.push(StyledSpan::chrome(" ", padding_style));
+                    push_padding(&mut spans, leading, padding_style);
+                    spans.extend(content);
+                    push_padding(&mut spans, trailing, padding_style);
+                    let mut boundary = StyledSpan::chrome(" ", padding_style);
+                    if line_index + 1 == cells[column].len() {
+                        // A selected empty cell still needs one painted byte
+                        // that names its copy node. Keep that witness no longer
+                        // than the one byte mapped here; the builder's complete
+                        // `" | "` range must never describe wider padding.
+                        boundary.source = row
+                            .cells
+                            .get(column)
+                            .and_then(|cell| cell.boundary.as_ref())
+                            .map(|source| source.slice(0..1));
+                    }
+                    spans.push(boundary);
+                    spans.push(StyledSpan::chrome("│", theme.border.subdued));
+                }
+                StyledLine::from(spans)
+            })
+            .collect()
+    }
+
+    fn render_pipe(self, columns: usize, theme: &Theme) -> Vec<StyledLine> {
+        let mut lines = Vec::new();
+        for row in &self.rows {
+            lines.push(pipe_row(row, columns, theme));
+            if row.header {
+                let separator = (0..columns)
+                    .map(|column| {
+                        self.alignments
+                            .get(column)
+                            .unwrap_or(&copy::ColumnAlignment::None)
+                            .separator()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                lines.push(StyledLine::chrome(
+                    format!("| {separator} |"),
+                    theme.border.subdued,
+                ));
+            }
+        }
+        lines
+    }
+}
+
+fn table_width(widths: &[usize]) -> usize {
+    widths
+        .iter()
+        .sum::<usize>()
+        .saturating_add(widths.len().saturating_mul(3))
+        .saturating_add(1)
+}
+
+fn fit_table_widths(natural: &[usize], minimum: &[usize], available: usize) -> Vec<usize> {
+    let overhead = natural.len().saturating_mul(3).saturating_add(1);
+    let content_budget = available.saturating_sub(overhead);
+    let mut low = 0;
+    let mut high = natural.iter().copied().max().unwrap_or(0);
+    while low < high {
+        let cap = low + (high - low).div_ceil(2);
+        let used = natural
+            .iter()
+            .zip(minimum)
+            .map(|(natural, minimum)| (*natural).min(cap).max(*minimum))
+            .sum::<usize>();
+        if used <= content_budget {
+            low = cap;
+        } else {
+            high = cap - 1;
+        }
+    }
+    let mut widths = natural
+        .iter()
+        .zip(minimum)
+        .map(|(natural, minimum)| (*natural).min(low).max(*minimum))
+        .collect::<Vec<_>>();
+    let mut remaining = content_budget.saturating_sub(widths.iter().sum());
+    for (width, natural) in widths.iter_mut().zip(natural) {
+        if remaining == 0 {
+            break;
+        }
+        if *width < *natural {
+            *width += 1;
+            remaining -= 1;
+        }
+    }
+    widths
+}
+
+fn table_rule(
+    left: char,
+    junction: char,
+    right: char,
+    widths: &[usize],
+    theme: &Theme,
+) -> StyledLine {
+    let mut rule = left.to_string();
+    rule.push_str(
+        &widths
+            .iter()
+            .map(|width| "─".repeat(width.saturating_add(2)))
+            .collect::<Vec<_>>()
+            .join(&junction.to_string()),
+    );
+    rule.push(right);
+    StyledLine::chrome(rule, theme.border.subdued)
+}
+
+fn wrapped_cell(
+    cell: &TableCell,
+    width: usize,
+    header: bool,
+    theme: &Theme,
+) -> Vec<Vec<StyledSpan>> {
+    let line = cell.line(header, theme);
+    if line.spans.is_empty() {
+        return vec![Vec::new()];
+    }
+    StyledLayout::new(&line, u16::try_from(width).unwrap_or(u16::MAX))
+        .rows()
+        .iter()
+        .map(|row| {
+            let mut spans = Vec::new();
+            if row.indent > 0 {
+                spans.push(StyledSpan::chrome(
+                    " ".repeat(row.indent),
+                    theme.text.primary,
+                ));
+            }
+            spans.extend(line.slice(row.start..row.end).spans);
+            spans
+        })
+        .collect()
+}
+
+fn alignment_padding(alignment: copy::ColumnAlignment, space: usize) -> (usize, usize) {
+    match alignment {
+        copy::ColumnAlignment::None | copy::ColumnAlignment::Left => (0, space),
+        copy::ColumnAlignment::Center => (space / 2, space - space / 2),
+        copy::ColumnAlignment::Right => (space, 0),
+    }
+}
+
+fn push_padding(spans: &mut Vec<StyledSpan>, width: usize, style: Style) {
+    if width > 0 {
+        spans.push(StyledSpan::chrome(" ".repeat(width), style));
+    }
+}
+
+fn pipe_row(row: &TableRow, columns: usize, theme: &Theme) -> StyledLine {
+    let mut spans = vec![StyledSpan::chrome("| ", theme.border.subdued)];
+    for column in 0..columns {
+        if let Some(cell) = row.cells.get(column) {
+            spans.extend(cell.line(row.header, theme).spans);
+        }
+        let mut boundary = StyledSpan::chrome(" | ", theme.border.subdued);
+        boundary.source = row.cells.get(column).and_then(|cell| cell.boundary.clone());
+        spans.push(boundary);
+    }
+    StyledLine::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +700,11 @@ mod tests {
     }
 
     fn render(content: &str, theme: &Theme) -> Vec<StyledLine> {
-        painted(super::render(content, theme))
+        painted(super::render(content, theme, 80))
     }
 
     fn render_reasoning(content: &str, theme: &Theme) -> Vec<StyledLine> {
-        painted(super::render_reasoning(content, theme))
+        painted(super::render_reasoning(content, theme, 80))
     }
 
     #[test]
@@ -429,39 +767,181 @@ mod tests {
     }
 
     #[test]
-    fn tables_paint_borders_and_alignment_rows_as_chrome() {
+    fn tables_paint_light_borders_and_padding_as_chrome() {
         let theme = Theme::system();
+        let header = theme.text.primary.patch(theme.markdown.strong);
 
         let lines = render("| Name | Value |\n| :--- | ---: |\n| alpha | 42 |", &theme);
 
         assert_eq!(
             lines,
             vec![
+                StyledLine::chrome("┌───────┬───────┐", theme.border.subdued),
                 StyledLine::from(vec![
-                    StyledSpan::chrome("| ", theme.markdown.list_marker),
-                    StyledSpan::text("Name", theme.text.primary),
-                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
-                    StyledSpan::text("Value", theme.text.primary),
-                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                    StyledSpan::chrome("│", theme.border.subdued),
+                    StyledSpan::chrome(" ", header),
+                    StyledSpan::text("Name", header),
+                    StyledSpan::chrome(" ", header),
+                    StyledSpan::chrome(" ", header),
+                    StyledSpan::chrome("│", theme.border.subdued),
+                    StyledSpan::chrome(" ", header),
+                    StyledSpan::text("Value", header),
+                    StyledSpan::chrome(" ", header),
+                    StyledSpan::chrome("│", theme.border.subdued),
                 ]),
-                StyledLine::chrome("| :--- | ---: |", theme.markdown.list_marker),
+                StyledLine::chrome("├───────┼───────┤", theme.border.subdued),
                 StyledLine::from(vec![
-                    StyledSpan::chrome("| ", theme.markdown.list_marker),
+                    StyledSpan::chrome("│", theme.border.subdued),
+                    StyledSpan::chrome(" ", theme.text.primary),
                     StyledSpan::text("alpha", theme.text.primary),
-                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                    StyledSpan::chrome(" ", theme.text.primary),
+                    StyledSpan::chrome("│", theme.border.subdued),
+                    StyledSpan::chrome(" ", theme.text.primary),
+                    StyledSpan::chrome("   ", theme.text.primary),
                     StyledSpan::text("42", theme.text.primary),
-                    StyledSpan::chrome(" | ", theme.markdown.list_marker),
+                    StyledSpan::chrome(" ", theme.text.primary),
+                    StyledSpan::chrome("│", theme.border.subdued),
                 ]),
+                StyledLine::chrome("└───────┴───────┘", theme.border.subdued),
             ]
         );
-        assert!(lines[1].spans[0].chrome);
         assert!(
             lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .filter(|span| span.content.contains('|'))
+                .filter(|span| span.content.chars().any(|character| {
+                    matches!(
+                        character,
+                        '┌' | '─' | '┬' | '┐' | '│' | '├' | '┼' | '┤' | '└' | '┴' | '┘'
+                    )
+                }))
                 .all(|span| span.chrome)
         );
+    }
+
+    #[test]
+    fn tables_measure_columns_and_honor_each_alignment() {
+        let theme = Theme::system();
+        let lines = render(
+            "| Left | Center | Right | None |\n| :--- | :---: | ---: | --- |\n| a | b | c | d |",
+            &theme,
+        );
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(StyledLine::written_text)
+                .collect::<Vec<_>>(),
+            [
+                "┌──────┬────────┬───────┬──────┐",
+                "│ Left │ Center │ Right │ None │",
+                "├──────┼────────┼───────┼──────┤",
+                "│ a    │   b    │     c │ d    │",
+                "└──────┴────────┴───────┴──────┘",
+            ]
+        );
+        for header in &lines[1].spans {
+            if !header.chrome {
+                assert!(header.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_table_wraps_its_widest_column_inside_continuous_borders() {
+        let theme = Theme::system();
+        let lines = painted(super::render(
+            "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |",
+            &theme,
+            22,
+        ));
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(StyledLine::written_text)
+                .collect::<Vec<_>>(),
+            [
+                "┌────────────┬───────┐",
+                "│ Name       │ Value │",
+                "├────────────┼───────┤",
+                "│ alpha beta │ delta │",
+                "│ gamma      │       │",
+                "└────────────┴───────┘",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.width() <= 22));
+    }
+
+    #[test]
+    fn a_table_falls_back_to_pipe_text_only_below_its_column_floor() {
+        let theme = Theme::system();
+        let source = "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |";
+
+        let at_floor = painted(super::render(source, &theme, 13));
+        assert!(at_floor[0].written_text().starts_with('┌'));
+        assert!(at_floor.iter().all(|line| line.width() <= 13));
+
+        let below_floor = painted(super::render(source, &theme, 12));
+        assert_eq!(
+            below_floor
+                .iter()
+                .map(StyledLine::written_text)
+                .collect::<Vec<_>>(),
+            [
+                "| Name | Value | ",
+                "| --- | --- |",
+                "| alpha beta gamma | delta | ",
+            ]
+        );
+        assert!(StyledLayout::new(&below_floor[2], 12).row_count() > 1);
+    }
+
+    #[test]
+    fn table_measurement_uses_terminal_width_for_multibyte_cells() {
+        let theme = Theme::system();
+        let lines = render("| A | B |\n| --- | --- |\n| 界界 | x |", &theme);
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(StyledLine::written_text)
+                .collect::<Vec<_>>(),
+            [
+                "┌──────┬───┐",
+                "│ A    │ B │",
+                "├──────┼───┤",
+                "│ 界界 │ x │",
+                "└──────┴───┘",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.width() == 12));
+    }
+
+    #[test]
+    fn table_cells_preserve_inline_styles_under_header_emphasis() {
+        let theme = Theme::system();
+        let lines = render(
+            "| **Name** | Detail |\n| --- | --- |\n| **bold** | [link](https://example.test) |",
+            &theme,
+        );
+
+        let span = |text| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == text)
+                .unwrap_or_else(|| panic!("missing table span {text:?}"))
+        };
+        assert!(span("Name").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            span("link")
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(span(" (https://example.test)").chrome);
     }
 
     #[test]
@@ -555,18 +1035,10 @@ mod tests {
                     (2, "  row".to_owned()),
                 ],
             ),
-            (
-                "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |",
-                2,
-                vec![
-                    (0, "| alpha beta gamma |".to_owned()),
-                    (0, "delta |".to_owned()),
-                ],
-            ),
         ];
 
         for (markdown, line_index, expected) in cases {
-            let lines = super::render(markdown, &theme);
+            let lines = super::render(markdown, &theme, 20);
             let rows = StyledLayout::new(&lines[line_index], 20)
                 .rows()
                 .iter()
@@ -589,7 +1061,7 @@ mod tests {
 
     #[test]
     fn selected_rule_round_trips_as_markdown() {
-        let lines = super::render("---", &Theme::system());
+        let lines = super::render("---", &Theme::system(), 80);
         let document = lines[0]
             .markdown
             .clone()

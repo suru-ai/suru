@@ -20,7 +20,7 @@ impl SourceRange {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ColumnAlignment {
     None,
     Left,

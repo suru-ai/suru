@@ -7708,6 +7708,35 @@ fn markdown_selection_copies_complete_and_partial_pipe_tables() {
 }
 
 #[test]
+fn markdown_selection_rejoins_a_wrapped_bordered_table_as_pipe_markdown() {
+    let workspace = workspace_dir();
+    let source =
+        "| Name | Value |\n| --- | --- |\n| alpha beta gamma epsilon zeta eta theta | delta |";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 32, 24);
+    let start = text_position(&buffer, "Name");
+    let end = text_position(&buffer, "theta");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 4, end.1));
+
+    assert_eq!(content.text, source);
+    assert_eq!(
+        content.html.as_deref(),
+        Some(
+            "<table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody>\n<tr><td>alpha beta gamma epsilon zeta eta theta</td><td>delta</td></tr>\n</tbody></table>\n"
+        )
+    );
+}
+
+#[test]
 fn markdown_selection_keeps_code_raw_inside_a_block_and_fenced_across_prose() {
     let workspace = workspace_dir();
     let source = "Before **code**\n\n````rust\nlet ticks = \"```\";\nlet 界 = 2;\n````\n\nAfter";

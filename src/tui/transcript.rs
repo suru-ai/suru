@@ -1460,7 +1460,7 @@ impl RenderUnit<'_> {
                 kind,
                 members,
                 expanded,
-            } => Some(render_group(lines, *kind, members, *expanded, theme)),
+            } => Some(render_group(lines, *kind, members, *expanded, theme, width)),
             Self::GroupMember(activity) => {
                 let start = lines.len();
                 let anchor = render_activity(
@@ -2736,7 +2736,9 @@ fn render_message(lines: &mut Vec<StyledLine>, message: &Message, theme: &Theme,
             theme,
             width,
         ),
-        MessageRole::Agent => push_agent_message(lines, &message.content, message.truncated, theme),
+        MessageRole::Agent => {
+            push_agent_message(lines, &message.content, message.truncated, theme, width)
+        }
     }
 }
 
@@ -2880,6 +2882,7 @@ fn render_activity(
                 reasoning,
                 step != FoldStep::Expanded,
                 theme,
+                width,
             )
         }),
         Activity::Subagent {
@@ -2932,6 +2935,7 @@ fn render_group(
     members: &[&Activity],
     expanded: bool,
     theme: &Theme,
+    width: u16,
 ) -> UnitAnchor {
     match kind {
         GroupableKind::Command => render_command_group(
@@ -2943,7 +2947,7 @@ fn render_group(
             expanded,
             theme,
         ),
-        GroupableKind::Reasoning => render_reasoning_group(lines, members, expanded, theme),
+        GroupableKind::Reasoning => render_reasoning_group(lines, members, expanded, theme, width),
     }
 }
 
@@ -2993,6 +2997,7 @@ fn render_reasoning_group(
     members: &[&Activity],
     expanded: bool,
     theme: &Theme,
+    width: u16,
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
@@ -3037,7 +3042,7 @@ fn render_reasoning_group(
     let mut opened_a_section = false;
     for member in members.iter().copied().filter_map(ReasoningActivity::of) {
         let mut section = Vec::new();
-        push_reasoning_section(&mut section, member, theme);
+        push_reasoning_section(&mut section, member, theme, width);
         // A member that has started without saying anything or being headed
         // projects nothing, and a section that is not there takes no blank row
         // to stand apart from the one before it.
@@ -3077,6 +3082,7 @@ fn push_reasoning_section(
     lines: &mut Vec<StyledLine>,
     reasoning: ReasoningActivity<'_>,
     theme: &Theme,
+    width: u16,
 ) {
     let style = theme.text.subdued;
     if let Some(title) = reasoning_heading(reasoning.title) {
@@ -3087,7 +3093,7 @@ fn push_reasoning_section(
             style.add_modifier(Modifier::BOLD),
         );
     }
-    lines.append(&mut reasoning_body_lines(&reasoning, theme));
+    lines.append(&mut reasoning_body_lines(&reasoning, theme, width));
 }
 
 /// The description a settled Reasoning Group's row leads with, or `None` when
@@ -3738,9 +3744,15 @@ fn reasoning_header_text(label: &str, title: Option<&str>) -> String {
 /// Provider wrote, with subdued Markdown prose and syntax-colored Code Blocks,
 /// followed by the truncation marker when the cap cut it short. A lone block's Fold and a
 /// Group's expansion both open onto exactly this.
-fn reasoning_body_lines(reasoning: &ReasoningActivity<'_>, theme: &Theme) -> Vec<StyledLine> {
+fn reasoning_body_lines(
+    reasoning: &ReasoningActivity<'_>,
+    theme: &Theme,
+    width: u16,
+) -> Vec<StyledLine> {
     let content = sanitize_content(reasoning.content);
-    let mut body = markdown::render_reasoning(&content, theme)
+    let content_width =
+        width.saturating_sub(u16::try_from(OUTPUT_INDENT.width()).unwrap_or(u16::MAX));
+    let mut body = markdown::render_reasoning(&content, theme, content_width)
         .into_iter()
         .map(|line| indented_reasoning_line(line, OUTPUT_INDENT, theme))
         .collect::<Vec<_>>();
@@ -3759,6 +3771,7 @@ fn push_reasoning_activity(
     activity: ReasoningActivity<'_>,
     folded: bool,
     theme: &Theme,
+    width: u16,
 ) -> UnitAnchor {
     let (marker, label, style) = reasoning_marker(activity.status, theme);
     let mut header = reasoning_header_text(label, activity.title);
@@ -3768,7 +3781,7 @@ fn push_reasoning_activity(
     }
     // The body is projected whether or not it will be shown, because a Fold
     // that hides all of it still has to say how many lines that is.
-    let mut body = reasoning_body_lines(&activity, theme);
+    let mut body = reasoning_body_lines(&activity, theme, width);
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
     // A Reasoning Fold hides the entry's whole body rather than the middle of
@@ -3944,9 +3957,16 @@ fn push_user_message_row(
     lines.push(StyledLine::from(spans));
 }
 
-fn push_agent_message(lines: &mut Vec<StyledLine>, content: &str, truncated: bool, theme: &Theme) {
+fn push_agent_message(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    truncated: bool,
+    theme: &Theme,
+    width: u16,
+) {
     let content = sanitize_content(content);
-    for mut line in markdown::render(&content, theme) {
+    let content_width = width.saturating_sub(2);
+    for mut line in markdown::render(&content, theme, content_width) {
         if !line.spans.is_empty() {
             line.spans
                 .insert(0, StyledSpan::chrome("  ", theme.text.primary));
@@ -6708,6 +6728,35 @@ mod tests {
             "the code itself is text: {:?}",
             lines[3]
         );
+    }
+
+    #[test]
+    fn markdown_tables_fit_inside_agent_and_reasoning_gutters() {
+        let theme = Theme::system();
+        let table = "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |";
+
+        let mut agent_lines = Vec::new();
+        render_message(&mut agent_lines, &agent_message(table), &theme, 24);
+        assert!(agent_lines.iter().all(|line| line.width() <= 24));
+        assert_eq!(projected_text(&agent_lines[0]), "  ┌────────────┬───────┐");
+
+        let mut reasoning_lines = Vec::new();
+        render_activity(
+            &mut reasoning_lines,
+            &mut Vec::new(),
+            &reasoning(ActivityStatus::Completed, None, table),
+            FoldStep::Expanded,
+            &theme,
+            26,
+            std::path::Path::new(""),
+        );
+        let body = &reasoning_lines[1..];
+        assert!(body.iter().all(|line| line.width() <= 26));
+        assert_eq!(projected_text(&body[0]), "    ┌────────────┬───────┐");
+        assert!(body.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.fg == theme.text.subdued.fg
+                && (span.content != "Name" || span.style.add_modifier.contains(Modifier::BOLD))
+        }));
     }
 
     #[test]
