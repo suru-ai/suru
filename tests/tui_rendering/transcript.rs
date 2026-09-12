@@ -8178,6 +8178,36 @@ fn markdown_selection_keeps_literal_entities_and_block_markers_as_selected_text(
 }
 
 #[test]
+fn markdown_selection_round_trips_html_and_reordered_footnotes() {
+    let workspace = workspace_dir();
+    let source = "[^word]: <b>detail</b>\n\nSee <a href='https://example.test/?a=1&amp;b=2'>source</a>[^word].";
+    let mut application = connected_application(workspace.path());
+    pin_release_copy(&mut application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(command_run_snapshot(
+            SessionId::new(),
+            workspace.path(),
+            &[RunEntry::AgentMessage(source)],
+        )))
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 100, 24);
+    let start = text_position(&buffer, "See source");
+    let end = text_position(&buffer, "detail");
+    let content = select_transcript_payload(&mut application, start, (end.0 + 5, end.1));
+
+    assert_eq!(
+        content.text,
+        "See [source](https://example.test/?a=1&amp;b=2)[^word].\n\n[^word]: **detail**"
+    );
+    let html = content.html.expect("Markdown selection carries rich HTML");
+    assert!(html.contains("href=\"https://example.test/?a=1&amp;b=2\""));
+    assert!(html.contains("<strong>detail</strong>"));
+    assert!(html.contains("footnote-reference"));
+    assert!(!html.contains("<b>"));
+}
+
+#[test]
 fn markdown_selection_preserves_escaped_link_metadata() {
     let workspace = workspace_dir();
     let source = r#"[link](https://example.test/a\\ "a&amp;copy;") and [next](https://example.test/a&amp;copy;)"#;

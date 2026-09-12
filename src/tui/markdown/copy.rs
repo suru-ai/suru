@@ -2,7 +2,7 @@
 //! Offsets address decoded event text, so escapes, entities and Unicode never
 //! require a second guess at where a painted character came from.
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ops::Range,
 };
 
@@ -75,6 +75,8 @@ enum Kind {
     Break,
     CellBoundary,
     Rule,
+    FootnoteReference(String),
+    FootnoteDefinition(String),
     Other,
 }
 
@@ -94,10 +96,14 @@ pub(super) struct Builder {
     document: Document,
     stack: Vec<usize>,
     list_plans: VecDeque<super::ListPlan>,
+    footnote_numbers: HashMap<String, usize>,
 }
 
 impl Builder {
-    pub(super) fn new(list_plans: VecDeque<super::ListPlan>) -> Self {
+    pub(super) fn new(
+        list_plans: VecDeque<super::ListPlan>,
+        footnote_numbers: HashMap<String, usize>,
+    ) -> Self {
         Self {
             document: Document {
                 nodes: vec![Node {
@@ -108,6 +114,7 @@ impl Builder {
             },
             stack: vec![0],
             list_plans,
+            footnote_numbers,
         }
     }
 
@@ -169,6 +176,7 @@ impl Builder {
                     Tag::TableHead => Kind::Head,
                     Tag::TableRow => Kind::Row,
                     Tag::TableCell => Kind::Cell,
+                    Tag::FootnoteDefinition(label) => Kind::FootnoteDefinition(label.to_string()),
                     _ => Kind::Other,
                 };
                 let id = self.add(kind, "");
@@ -191,6 +199,15 @@ impl Builder {
             Event::Code(text) => (Kind::InlineCode, text.as_ref()),
             Event::SoftBreak => (Kind::Text, " "),
             Event::HardBreak => (Kind::Break, "\n"),
+            Event::FootnoteReference(label) => {
+                let number = super::footnote_number(&self.footnote_numbers, label.as_ref());
+                let text = format!("[{number}]");
+                let node = self.add(Kind::FootnoteReference(label.to_string()), &text);
+                return Some(SourceRange {
+                    node,
+                    range: 0..text.len(),
+                });
+            }
             Event::TaskListMarker(checked) => {
                 let item = self
                     .stack
@@ -224,7 +241,13 @@ impl Builder {
         })
     }
 
-    pub(super) fn finish(self) -> Document {
+    pub(super) fn finish(mut self) -> Document {
+        let children = std::mem::take(&mut self.document.nodes[0].children);
+        let (mut body, definitions): (Vec<_>, Vec<_>) = children
+            .into_iter()
+            .partition(|id| !matches!(self.document.nodes[*id].kind, Kind::FootnoteDefinition(_)));
+        body.extend(definitions);
+        self.document.nodes[0].children = body;
         self.document
     }
 }
@@ -312,6 +335,7 @@ impl Document {
                 Kind::Rule => "---".into(),
                 Kind::CellBoundary => String::new(),
                 Kind::Break => "  \n".into(),
+                Kind::FootnoteReference(label) => format!("[^{label}]"),
                 _ => escape(&text),
             });
         }
@@ -400,6 +424,10 @@ impl Document {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Kind::Heading(level) => format!("{} {}", "#".repeat(*level), inline()),
+            Kind::FootnoteDefinition(label) => {
+                let text = blocks();
+                format!("[^{label}]: {}", text.replace('\n', "\n    "))
+            }
             Kind::Emphasis => wrap(&inline(), "*", "*"),
             Kind::Strong => wrap(&inline(), "**", "**"),
             Kind::Strikethrough => wrap(&inline(), "~~", "~~"),

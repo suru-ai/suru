@@ -1,6 +1,10 @@
 //! Practical Markdown projection for Agent-authored transcript content.
+//!
+//! Footnotes and a small safe HTML subset are projected deliberately. The
+//! Markdown math, definition-list, superscript and subscript extensions remain
+//! disabled; raw HTML super/subscript tags therefore keep only their text.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -10,10 +14,14 @@ use crate::theme::Theme;
 use super::text_layout::{StyledLayout, StyledLine, StyledSpan};
 
 pub(super) mod copy;
+mod html;
 mod syntax;
 
 pub(super) fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
 }
 
 pub(super) fn render(content: &str, theme: &Theme, width: u16) -> Vec<StyledLine> {
@@ -26,10 +34,11 @@ pub(super) fn render_reasoning(content: &str, theme: &Theme, width: u16) -> Vec<
 
 fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<StyledLine> {
     let list_plans = list_plans(content);
-    let parser = Parser::new_ext(content, options());
-    let mut renderer = Renderer::new(theme, subdued, width, list_plans.clone());
-    let mut builder = copy::Builder::new(list_plans);
-    for event in parser {
+    let events = html::normalize(Parser::new_ext(content, options()));
+    let footnotes = footnote_numbers(&events);
+    let mut renderer = Renderer::new(theme, subdued, width, list_plans.clone(), footnotes.clone());
+    let mut builder = copy::Builder::new(list_plans, footnotes);
+    for event in events {
         renderer.source = builder.event(&event, renderer.content_width());
         renderer.event(event);
     }
@@ -39,6 +48,27 @@ fn render_prose(content: &str, theme: &Theme, subdued: bool, width: u16) -> Vec<
         line.markdown = Some(document.clone());
     }
     lines
+}
+
+fn footnote_numbers(events: &[Event<'_>]) -> HashMap<String, usize> {
+    let mut numbers = HashMap::new();
+    for event in events {
+        if let Event::Start(Tag::FootnoteDefinition(label)) = event {
+            let next = numbers.len() + 1;
+            numbers.entry(label.to_string()).or_insert(next);
+        }
+    }
+    for event in events {
+        if let Event::FootnoteReference(label) = event {
+            let next = numbers.len() + 1;
+            numbers.entry(label.to_string()).or_insert(next);
+        }
+    }
+    numbers
+}
+
+fn footnote_number(numbers: &HashMap<String, usize>, label: &str) -> usize {
+    numbers.get(label).copied().unwrap_or(1)
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +172,9 @@ struct Renderer<'a> {
     source: Option<copy::SourceRange>,
     table: Option<Table>,
     quote_depth: usize,
+    footnote_numbers: HashMap<String, usize>,
+    footnote_lines: Vec<StyledLine>,
+    in_footnote: bool,
 }
 
 struct CodeBlock {
@@ -171,7 +204,13 @@ struct TableCell {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(theme: &'a Theme, subdued: bool, width: u16, list_plans: VecDeque<ListPlan>) -> Self {
+    fn new(
+        theme: &'a Theme,
+        subdued: bool,
+        width: u16,
+        list_plans: VecDeque<ListPlan>,
+        footnote_numbers: HashMap<String, usize>,
+    ) -> Self {
         Self {
             theme,
             subdued,
@@ -187,6 +226,9 @@ impl<'a> Renderer<'a> {
             source: None,
             table: None,
             quote_depth: 0,
+            footnote_numbers,
+            footnote_lines: Vec::new(),
+            in_footnote: false,
         }
     }
 
@@ -202,11 +244,10 @@ impl<'a> Renderer<'a> {
             Event::InlineMath(math) | Event::DisplayMath(math) => {
                 self.push(math.as_ref(), self.current_style())
             }
-            Event::Html(html) | Event::InlineHtml(html) => {
-                self.text(html.as_ref());
-            }
+            Event::Html(html) | Event::InlineHtml(html) => self.text(html.as_ref()),
             Event::FootnoteReference(label) => {
-                self.push(format!("[{label}]"), self.theme.text.subdued);
+                let number = footnote_number(&self.footnote_numbers, label.as_ref());
+                self.push(format!("[{number}]"), self.theme.text.subdued);
             }
             Event::SoftBreak => {
                 if let Some(block) = &mut self.code_block {
@@ -375,9 +416,23 @@ impl<'a> Renderer<'a> {
                     table.current_cell = Some(TableCell::default());
                 }
             }
-            Tag::HtmlBlock
-            | Tag::FootnoteDefinition(_)
-            | Tag::DefinitionList
+            Tag::HtmlBlock => {}
+            Tag::FootnoteDefinition(label) => {
+                self.flush_line();
+                self.in_footnote = true;
+                let number = footnote_number(&self.footnote_numbers, label.as_ref());
+                let marker = format!("  [{number}] ");
+                let marker_width = marker.len();
+                self.items.push(ItemState {
+                    marker: Some(StyledSpan::chrome(
+                        marker,
+                        self.prose_style(self.theme.text.subdued),
+                    )),
+                    marker_width,
+                    quote_depth: self.quote_depth,
+                });
+            }
+            Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
             | Tag::Superscript
@@ -487,9 +542,13 @@ impl<'a> Renderer<'a> {
                 }
                 self.blank_line();
             }
-            TagEnd::HtmlBlock
-            | TagEnd::FootnoteDefinition
-            | TagEnd::DefinitionList
+            TagEnd::HtmlBlock => {}
+            TagEnd::FootnoteDefinition => {
+                self.flush_line();
+                self.items.pop();
+                self.in_footnote = false;
+            }
+            TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
             | TagEnd::Superscript
@@ -613,7 +672,7 @@ impl<'a> Renderer<'a> {
     fn blank_line(&mut self) {
         self.flush_line();
         if !self
-            .lines
+            .output_lines()
             .last()
             .is_some_and(|line| self.is_separator(line))
         {
@@ -623,7 +682,7 @@ impl<'a> Renderer<'a> {
 
     fn blank_line_before_block(&mut self) {
         self.flush_line();
-        if !self.lines.is_empty() {
+        if !self.output_lines().is_empty() {
             self.blank_line();
         }
     }
@@ -631,13 +690,13 @@ impl<'a> Renderer<'a> {
     fn emit_line(&mut self, mut line: StyledLine) {
         let prefix = self.structural_prefix(true);
         line.spans.splice(0..0, prefix);
-        self.lines.push(line);
+        self.output_lines_mut().push(line);
     }
 
     fn emit_separator(&mut self) {
         let mut line = StyledLine::default();
         line.spans = self.structural_prefix(false);
-        self.lines.push(line);
+        self.output_lines_mut().push(line);
     }
 
     fn structural_prefix(&mut self, content: bool) -> Vec<StyledSpan> {
@@ -679,11 +738,27 @@ impl<'a> Renderer<'a> {
 
     fn remove_trailing_separator(&mut self) {
         if self
-            .lines
+            .output_lines()
             .last()
             .is_some_and(|line| self.is_separator(line))
         {
-            self.lines.pop();
+            self.output_lines_mut().pop();
+        }
+    }
+
+    fn output_lines(&self) -> &[StyledLine] {
+        if self.in_footnote {
+            &self.footnote_lines
+        } else {
+            &self.lines
+        }
+    }
+
+    fn output_lines_mut(&mut self) -> &mut Vec<StyledLine> {
+        if self.in_footnote {
+            &mut self.footnote_lines
+        } else {
+            &mut self.lines
         }
     }
 
@@ -706,6 +781,22 @@ impl<'a> Renderer<'a> {
             .is_some_and(|line| self.is_separator(line))
         {
             self.lines.pop();
+        }
+        while self
+            .footnote_lines
+            .last()
+            .is_some_and(|line| self.is_separator(line))
+        {
+            self.footnote_lines.pop();
+        }
+        if !self.footnote_lines.is_empty() {
+            let mut rule = StyledLine::default();
+            rule.spans.push(StyledSpan::chrome(
+                "─".repeat(usize::from(self.width)),
+                self.prose_style(self.theme.markdown.rule),
+            ));
+            self.lines.push(rule);
+            self.lines.append(&mut self.footnote_lines);
         }
         self.lines
     }
@@ -2024,6 +2115,144 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(rows, expected, "wrap changed for {markdown:?}");
         }
+    }
+
+    #[test]
+    fn harmless_inline_html_projects_to_markdown_paint() {
+        let theme = Theme::system();
+        let lines = render(
+            "one<br>two <b>bold</b> <i>soft</i> <code>code</code> <kbd>key</kbd> <a href='https://example.test/?a=1&amp;b=2'>site</a> <img alt=\"map &amp; key\" src='map.png'> <code><b>still</b></code>",
+            &theme,
+        );
+
+        assert_eq!(
+            line_texts(&lines),
+            [
+                "one",
+                "two bold soft code key site (https://example.test/?a=1&b=2) [image: map & key] (map.png) still"
+            ]
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .collect::<Vec<_>>();
+        assert!(
+            spans
+                .iter()
+                .find(|span| span.content == "bold")
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            spans
+                .iter()
+                .find(|span| span.content == "soft")
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        for content in ["code", "key", "still"] {
+            assert_eq!(
+                spans
+                    .iter()
+                    .find(|span| span.content == content)
+                    .unwrap()
+                    .style
+                    .fg,
+                theme.markdown.inline_code.fg
+            );
+        }
+    }
+
+    #[test]
+    fn html_blocks_keep_inner_text_and_malformed_tags_do_not_unbalance_paint() {
+        let theme = Theme::system();
+        let lines = render(
+            "<details><summary>x &amp; y &copy;</summary>body</details>\n\n<b>bold\n\nplain <b open",
+            &theme,
+        );
+
+        assert_eq!(
+            line_texts(&lines),
+            ["x & y ©body", "", "bold", "", "plain <b open"]
+        );
+        assert!(
+            lines[2].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(lines.last().unwrap().spans[0].style, theme.markdown.text);
+    }
+
+    #[test]
+    fn footnotes_use_authored_numbers_and_move_definitions_after_a_rule() {
+        let theme = Theme::system();
+        let markdown = "Body[^later] then[^first].\n\n[^first]: first\n\n[^later]: later\n\n    9) nested\n\n1) main";
+        let lines = render(markdown, &theme);
+        let text = line_texts(&lines);
+
+        assert_eq!(text[0], "Body[2] then[1].");
+        let rule = text
+            .iter()
+            .position(|line| !line.is_empty() && line.chars().all(|c| c == '─'))
+            .unwrap();
+        assert!(text[rule + 1].starts_with("  [1] first"), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("9) nested")));
+        assert_eq!(text[2], "1) main");
+        let reference = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "[2]")
+            .unwrap();
+        assert_eq!(reference.style, theme.text.subdued);
+
+        let reasoning = render_reasoning(markdown, &theme);
+        assert!(
+            reasoning
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg == theme.text.subdued.fg)
+        );
+    }
+
+    #[test]
+    fn html_and_footnotes_copy_as_safe_markdown_structure() {
+        let lines = super::render(
+            "[^note]: foot <kbd>key</kbd>\n\nSee <strong>bold</strong> <a href='https://example.test/?x=1&amp;y=2'>there</a>[^note]. <img alt='plot' src='https://example.test/p.png'>",
+            &Theme::system(),
+            80,
+        );
+        let document = lines[0].markdown.clone().unwrap();
+        let ranges = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.source.clone())
+            .collect::<Vec<_>>();
+        let copied = document.copy(&ranges, true);
+
+        assert_eq!(
+            copied.text,
+            "See **bold** [there](https://example.test/?x=1&amp;y=2)[^note]. ![plot](https://example.test/p.png)\n\n[^note]: foot `key`"
+        );
+        let html = copied.html.unwrap();
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("href=\"https://example.test/?x=1&amp;y=2\""));
+        assert!(html.contains("<code>key</code>"));
+        assert!(html.contains("href=\"https://example.test/p.png\""));
+    }
+
+    #[test]
+    fn disabled_markdown_extensions_stay_literal_while_html_super_subscripts_keep_text() {
+        let lines = render(
+            "$x^2$ and ^raised^, <sup>high</sup>/<sub>low</sub>",
+            &Theme::system(),
+        );
+
+        assert_eq!(line_texts(&lines), ["$x^2$ and ^raised^, high/low"]);
     }
 
     #[test]
