@@ -324,6 +324,14 @@ _Avoid_: Default theme, terminal theme, no theme
 A fenced region in an agent's answer or Reasoning; answer blocks use language syntax colors when recognized and plain code color otherwise, while Reasoning blocks stay plain and subdued. Shell output and file changes are not Code Blocks.
 _Avoid_: Snippet, code fence, highlighted code
 
+**Chrome**:
+What a client paints around a Message's or Activity's words to show their structure, such as list bullets, quote bars, Table borders, and fence labels. Chrome belongs to the screen rather than the content, so a Text Selection copies the words and never the Chrome.
+_Avoid_: Decoration, markers, prefix
+
+**Table**:
+A grid an agent authors in a Message or Reasoning, painted in bordered columns that fit the Transcript's width and copied as the grid it was written as, so a destination that understands tables receives one.
+_Avoid_: Pipe table, grid
+
 **Setting**:
 One user-tunable value governing Suru's behavior, carrying a built-in default that applies whenever no Config Document pins it. Every Setting declares a scope: a **Client Setting** governs a client's presentation, and a machine-local Config Document may one day overlay it, while a **Server Setting** governs server or Provider behavior and follows only the server's own Config Documents. Every Setting also declares what it accepts: a **Fixed Setting** — almost all of them — accepts a set of values named up front, which is what lets a reader cycle one through them and lets Suru say exactly what to type where a value is rejected, while an **Open Setting** holds something Suru only discovers while running, such as an Agent Selection, and so names the values it can and describes the rest. Every Setting also declares the **group** it keeps company with, which is the whole of what it says about its own presentation: a client maps a group to the tab that lists it, and the group of **Experimental** Settings holds the ones still finding their shape, so a reader meets them knowing as much. Distinct from a Model Option, which is Provider-advertised rather than user-authored.
 _Avoid_: Option, preference, config value
