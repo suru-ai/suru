@@ -551,7 +551,7 @@ mod tests {
                 cost_basis: None,
                 cost_details: None,
             }],
-            subagent_questionnaires: Vec::new(),
+            subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),

@@ -228,7 +228,14 @@ pub(super) fn render_with_slots(
     let subagent_questions = state.session.as_ref().map_or(0, |session| {
         session.snapshot().subagent_questionnaire_count()
     });
-    if subagent_questions > 0 && state.open_questionnaire().is_none() {
+    let subagent_approvals = state
+        .session
+        .as_ref()
+        .map_or(0, |session| session.snapshot().subagent_approval_count());
+    if (subagent_questions > 0 || subagent_approvals > 0)
+        && state.open_questionnaire().is_none()
+        && state.open_approval().is_none()
+    {
         let area = Rect::new(
             composer.area.x,
             composer
@@ -238,11 +245,19 @@ pub(super) fn render_with_slots(
             composer.area.width,
             1,
         );
+        let pending = match (subagent_questions, subagent_approvals) {
+            (questions, 0) => format!("{questions} Subagent questionnaires pending"),
+            (0, approvals) => format!("{approvals} Subagent Approvals pending"),
+            (questions, approvals) => {
+                format!(
+                    "{questions} Subagent questionnaire{} · {approvals} Approval{} pending",
+                    if questions == 1 { "" } else { "s" },
+                    if approvals == 1 { "" } else { "s" },
+                )
+            }
+        };
         frame.render_widget(
-            Paragraph::new(format!(
-                "{subagent_questions} Subagent questionnaires pending · ↓ browse Subagents"
-            ))
-            .style(theme.feedback.warning),
+            Paragraph::new(format!("{pending} · ↓ browse Subagents")).style(theme.feedback.warning),
             area,
         );
     }
@@ -1882,6 +1897,9 @@ fn session_picker_row_text(
     if row.pending_questionnaires > 0 {
         metadata.push(format!("{} pending questions", row.pending_questionnaires));
     }
+    if row.pending_approvals > 0 {
+        metadata.push(format!("{} pending Approvals", row.pending_approvals));
+    }
     let fixed_metadata_width = metadata.join(separator).width();
     if let Some(workspace) = row.workspace {
         let minimum_title_width = usize::from(available > 0);
@@ -2192,16 +2210,26 @@ fn render_subagent_picker(
             })
             .map(|model| format!(" · {model}"))
             .unwrap_or_default();
+        let mut interventions = Vec::new();
+        if entry.pending_questionnaires > 0 {
+            interventions.push(format!(
+                "{} pending questions",
+                entry.pending_questionnaires
+            ));
+        }
+        if entry.pending_approvals > 0 {
+            interventions.push(format!("{} pending Approvals", entry.pending_approvals));
+        }
+        let interventions = if interventions.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", interventions.join(" · "))
+        };
         let content = truncate_to_width(
             &format!(
-                "{guide} {} {}{model}{}: {}",
+                "{guide} {} {}{model}{interventions}: {}",
                 spinner::frame(state.spinner_frame / 3),
                 entry.name,
-                if entry.pending_questionnaires > 0 {
-                    format!(" · {} pending questions", entry.pending_questionnaires)
-                } else {
-                    String::new()
-                },
                 entry.description
             ),
             usize::from(content_width),
@@ -4919,7 +4947,7 @@ mod tests {
                 messages: Vec::new(),
                 activities: Vec::new(),
                 transcript: Vec::new(),
-                subagent_questionnaires: Vec::new(),
+                subagent_interventions: Vec::new(),
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: crate::protocol::SessionRevision(0),
@@ -5177,7 +5205,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
-                    subagent_questionnaires: Vec::new(),
+                    subagent_interventions: Vec::new(),
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),
@@ -5253,7 +5281,7 @@ mod tests {
                     messages: Vec::new(),
                     activities: Vec::new(),
                     transcript: Vec::new(),
-                    subagent_questionnaires: Vec::new(),
+                    subagent_interventions: Vec::new(),
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),

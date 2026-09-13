@@ -209,7 +209,7 @@ The one-column stripe down the left of an active Sidebar row, spanning every lin
 _Avoid_: Indicator bar, status stripe, gutter
 
 **Standing**:
-The one reading a listed Session presents about its work, from which both its Rail's color and its right slot's word derive: Needs Intervention, Working, Failed, Done, or nothing, in that order of precedence. Failed and Done hold only for a Settled latest Turn that no Client has Viewed since; an Interrupted Turn leaves nothing. Working maps to the Theme's info color, Needs Intervention to warning, Failed to error, and Done to success. Needs Intervention marks a Session with a pending Questionnaire awaiting an Answer, whether its own or one belonging to a Subagent at any depth; the Answer belongs in the owning Session.
+The one reading a listed Session presents about its work, from which both its Rail's color and its right slot's word derive: Needs Intervention, Working, Failed, Done, or nothing, in that order of precedence. Failed and Done hold only for a Settled latest Turn that no Client has Viewed since; an Interrupted Turn leaves nothing. Working maps to the Theme's info color, Needs Intervention to warning, Failed to error, and Done to success. Needs Intervention marks a Session with a pending Questionnaire awaiting an Answer or a pending Approval awaiting a Decision, whether its own or one belonging to a Subagent at any depth; the Answer or Decision belongs in the owning Session.
 _Avoid_: Status (taken by Idle and Active), attention, state, condition
 
 **Viewed**:

@@ -186,7 +186,7 @@ impl QuestionnairePanels {
             self.unlisted_sessions.insert(session.clone());
         }
 
-        self.reconcile_subagents(session, &snapshot.subagent_questionnaires);
+        self.reconcile_subagents(session, &snapshot.subagent_interventions);
         self.reconcile_available(
             session,
             snapshot.revision,
@@ -251,7 +251,7 @@ impl QuestionnairePanels {
     pub(super) fn reconcile_subagents(
         &mut self,
         owner: &SessionReference,
-        entries: &[crate::protocol::SubagentQuestionnaires],
+        entries: &[crate::protocol::SubagentInterventions],
     ) {
         for entry in entries {
             let session = SessionReference::new(owner.origin.clone(), entry.session_id);

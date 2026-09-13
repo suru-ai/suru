@@ -89,6 +89,7 @@ pub(super) struct SessionPickerRow<'a> {
     pub(super) current: bool,
     pub(super) active: bool,
     pub(super) pending_questionnaires: usize,
+    pub(super) pending_approvals: usize,
     pub(super) unreadable: bool,
     pub(super) updated_at: SessionTimestamp,
     pub(super) workspace: Option<&'a Path>,
@@ -512,6 +513,9 @@ impl SessionPicker {
                     origin: &summary.reference().origin,
                     pending_questionnaires: readable.map_or(0, |summary| {
                         summary.standing_inputs.pending_questionnaire_count()
+                    }),
+                    pending_approvals: readable.map_or(0, |summary| {
+                        summary.standing_inputs.pending_approval_count()
                     }),
                     title: summary.title(),
                     emoji: self.emoji.drawn_emoji(summary.emoji()),

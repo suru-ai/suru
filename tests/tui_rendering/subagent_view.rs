@@ -138,7 +138,7 @@ fn child_session_snapshot(
         }],
         activities: Vec::new(),
         transcript: vec![TranscriptItem::Message { message_id }],
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -464,7 +464,7 @@ fn a_subagent_session_streams_live_while_attached() {
 #[test]
 fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_child_drafts() {
     use suru::protocol::{
-        Question, Questionnaire, QuestionnaireId, QuestionnaireOutcome, SubagentQuestionnaires,
+        Question, Questionnaire, QuestionnaireId, QuestionnaireOutcome, SubagentInterventions,
     };
     let workspace = workspace_dir();
     let (mut parent, child_id) =
@@ -496,12 +496,14 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
         .transcript
         .push(TranscriptItem::Activity { activity_id });
     child.revision.0 += 1;
-    parent.subagent_questionnaires.push(SubagentQuestionnaires {
+    parent.subagent_interventions.push(SubagentInterventions {
         submitting_questionnaires: Vec::new(),
+        submitting_approvals: Vec::new(),
         session_id: child_id,
         via_session_id: child_id,
         revision: child.revision,
         pending_questionnaires: vec![questionnaire_id],
+        pending_approvals: Vec::new(),
     });
     let mut app = connected_application(workspace.path());
     app.handle_event(ApplicationEvent::SessionAttached(parent.clone()))
@@ -571,12 +573,14 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
             suru::protocol::SessionStandingInputsChanged {
                 session_id: parent.session.id,
                 inputs: suru::protocol::SessionStandingInputs {
-                    subagent_questionnaires: vec![SubagentQuestionnaires {
+                    subagent_interventions: vec![SubagentInterventions {
                         submitting_questionnaires: Vec::new(),
+                        submitting_approvals: Vec::new(),
                         session_id: child_id,
                         via_session_id: child_id,
                         revision: SessionRevision(child.revision.0 + 1),
                         pending_questionnaires: vec![],
+                        pending_approvals: Vec::new(),
                     }],
                     ..Default::default()
                 },
@@ -598,6 +602,83 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
         )))
         .unwrap(),
         ApplicationTransition::Continue
+    ));
+}
+
+#[test]
+fn child_approval_attention_opens_the_owning_session_and_submits_its_decision_there() {
+    use suru::protocol::{
+        Approval, ApprovalId, ApprovalOutcome, ApprovalSubject, Decision, QuestionnaireId,
+        SubagentInterventions,
+    };
+    let workspace = workspace_dir();
+    let (mut parent, child_id) =
+        parent_with_subagent_row(workspace.path(), ActivityStatus::Active, None, false);
+    let mut child = child_session_snapshot(child_id, parent.session.id, workspace.path());
+    let approval_id = ApprovalId::new();
+    let activity_id = suru::protocol::ActivityId::new();
+    child.activities.push(Activity::Approval {
+        id: activity_id,
+        turn_id: child.turns[0].id,
+        approval: Approval {
+            id: approval_id,
+            subject: ApprovalSubject::Network {
+                host_or_url: "https://child.example.test".into(),
+            },
+            reason: Some("Fetch child metadata".into()),
+        },
+        tool_activity_id: None,
+        detail_truncated: false,
+        outcome: ApprovalOutcome::Pending,
+        decision: None,
+    });
+    child
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    child.pending_approvals = vec![approval_id];
+    child.pending_approvals_revision = child.revision;
+    let question_id = QuestionnaireId::new();
+    parent.subagent_interventions.push(SubagentInterventions {
+        session_id: child_id,
+        via_session_id: child_id,
+        revision: child.revision,
+        pending_questionnaires: vec![question_id],
+        submitting_questionnaires: Vec::new(),
+        pending_approvals: vec![approval_id],
+        submitting_approvals: Vec::new(),
+    });
+
+    let mut app = connected_application(workspace.path());
+    app.handle_event(ApplicationEvent::SessionAttached(parent))
+        .unwrap();
+    let screen = rendered_application_rows_at(&app, 110, 26).join("\n");
+    assert!(screen.contains("1 Subagent questionnaire"), "{screen}");
+    assert!(screen.contains("1 Approval pending"), "{screen}");
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::SubagentBrowse,
+    )))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, 110, 26).join("\n");
+    assert!(screen.contains("1 pending question"), "{screen}");
+    assert!(screen.contains("1 pending Approval"), "{screen}");
+    assert!(
+        matches!(press_key(&mut app, KeyCode::Enter), ApplicationTransition::AttachSession(reference) if reference.session_id == child_id)
+    );
+    app.handle_event(ApplicationEvent::SessionAttached(child))
+        .unwrap();
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        SemanticCommandId::ApprovalOpen,
+    )))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, 110, 26).join("\n");
+    assert!(screen.contains("https://child.example.test"), "{screen}");
+    assert!(matches!(
+        press_key(&mut app, KeyCode::Char('3')),
+        ApplicationTransition::SubmitDecision {
+            session,
+            id,
+            decision: Decision::Decline,
+        } if session.session_id == child_id && id == approval_id
     ));
 }
 

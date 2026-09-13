@@ -222,6 +222,7 @@ impl SessionListing {
         let Some(origin) = self.awaited_origin_mut(request) else {
             return false;
         };
+        Self::preserve_newer_availability(&origin.sessions, &mut sessions);
         Self::order(&mut sessions);
         origin.sessions = ListedSession::stamp_all(request.outlook(), sessions);
         origin.loading = false;
@@ -269,6 +270,9 @@ impl SessionListing {
             return true;
         }
         let mut arriving = sessions.to_vec();
+        if let Some(origin) = origin {
+            Self::preserve_newer_availability(&origin.sessions, &mut arriving);
+        }
         Self::order(&mut arriving);
         let arriving = ListedSession::stamp_all(request.outlook(), arriving);
         origin.is_none_or(|origin| arriving != origin.sessions)
@@ -373,44 +377,64 @@ impl SessionListing {
         mut standing_inputs: SessionStandingInputs,
     ) {
         if let Some(summary) = self.readable_mut(&outlook, session_id) {
-            if standing_inputs.pending_questionnaires_revision.0
-                < summary.standing_inputs.pending_questionnaires_revision.0
-            {
-                standing_inputs
-                    .pending_questionnaires
-                    .clone_from(&summary.standing_inputs.pending_questionnaires);
-                standing_inputs
-                    .submitting_questionnaires
-                    .clone_from(&summary.standing_inputs.submitting_questionnaires);
-                standing_inputs.pending_questionnaires_revision =
-                    summary.standing_inputs.pending_questionnaires_revision;
-            }
-            if standing_inputs.pending_approvals_revision.0
-                < summary.standing_inputs.pending_approvals_revision.0
-            {
-                standing_inputs
-                    .pending_approvals
-                    .clone_from(&summary.standing_inputs.pending_approvals);
-                standing_inputs
-                    .submitting_approvals
-                    .clone_from(&summary.standing_inputs.submitting_approvals);
-                standing_inputs.pending_approvals_revision =
-                    summary.standing_inputs.pending_approvals_revision;
-            }
-            for known in &summary.standing_inputs.subagent_questionnaires {
-                match standing_inputs
-                    .subagent_questionnaires
-                    .iter_mut()
-                    .find(|entry| entry.session_id == known.session_id)
-                {
-                    Some(incoming) if incoming.revision.0 < known.revision.0 => {
-                        *incoming = known.clone()
-                    }
-                    None => standing_inputs.subagent_questionnaires.push(known.clone()),
-                    _ => {}
-                }
-            }
+            Self::preserve_newer_standing_inputs(&summary.standing_inputs, &mut standing_inputs);
             summary.standing_inputs = standing_inputs;
+        }
+    }
+
+    /// A listing reply may have been captured before a newer catalog event
+    /// reached this Client. Preserve the newer typed availability while still
+    /// taking every unrelated field from the reply.
+    fn preserve_newer_availability(known: &[ListedSession], arriving: &mut [SessionListItem]) {
+        for item in arriving {
+            let Some(known) = known.iter().find(|known| known.id() == item.id()) else {
+                continue;
+            };
+            let (Some(known), SessionListItem::Readable(arriving)) = (known.readable(), item)
+            else {
+                continue;
+            };
+            Self::preserve_newer_standing_inputs(
+                &known.standing_inputs,
+                &mut arriving.standing_inputs,
+            );
+        }
+    }
+
+    fn preserve_newer_standing_inputs(
+        known: &SessionStandingInputs,
+        arriving: &mut SessionStandingInputs,
+    ) {
+        if arriving.pending_questionnaires_revision.0 < known.pending_questionnaires_revision.0 {
+            arriving
+                .pending_questionnaires
+                .clone_from(&known.pending_questionnaires);
+            arriving
+                .submitting_questionnaires
+                .clone_from(&known.submitting_questionnaires);
+            arriving.pending_questionnaires_revision = known.pending_questionnaires_revision;
+        }
+        if arriving.pending_approvals_revision.0 < known.pending_approvals_revision.0 {
+            arriving
+                .pending_approvals
+                .clone_from(&known.pending_approvals);
+            arriving
+                .submitting_approvals
+                .clone_from(&known.submitting_approvals);
+            arriving.pending_approvals_revision = known.pending_approvals_revision;
+        }
+        for known in &known.subagent_interventions {
+            match arriving
+                .subagent_interventions
+                .iter_mut()
+                .find(|entry| entry.session_id == known.session_id)
+            {
+                Some(incoming) if incoming.revision.0 < known.revision.0 => {
+                    *incoming = known.clone()
+                }
+                None => arriving.subagent_interventions.push(known.clone()),
+                _ => {}
+            }
         }
     }
 

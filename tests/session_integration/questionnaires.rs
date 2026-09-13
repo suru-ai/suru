@@ -911,7 +911,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
     timeout(PROGRESS_DEADLINE, async {
         loop {
             if let suru::managed_client::SessionEvent::Updated(update) = feed.next().await.unwrap().unwrap()
-                && update.changes.iter().any(|c| matches!(c, SessionChange::SubagentQuestionnairesChanged { subagent_questionnaires } if subagent_questionnaires.iter().map(|q| q.pending_questionnaires.len()).sum::<usize>() == 1)) { break; }
+                && update.changes.iter().any(|c| matches!(c, SessionChange::SubagentInterventionsChanged { subagent_interventions } if subagent_interventions.iter().map(|q| q.pending_questionnaires.len()).sum::<usize>() == 1)) { break; }
         }
     }).await.unwrap();
     client

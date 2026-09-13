@@ -210,7 +210,7 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
                 pending_questionnaires: _,
                 submitting_questionnaires: _,
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                subagent_questionnaires: _,
+                subagent_interventions: _,
                 latest_turn: Some(LatestTurnStatus {
                     status: TurnStatus::Completed,
                     settled_at: Some(_),

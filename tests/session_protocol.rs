@@ -301,7 +301,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "emoji": "\u{1F5FA}\u{FE0F}",
         "settled_at": 1_755_497_600_999_u64,
         "standing_inputs": {
-            "subagent_questionnaires": [],
+            "subagent_interventions": [],
             "pending_questionnaires": [], "submitting_questionnaires": [],
             "pending_questionnaires_revision": 0,
             "pending_approvals": [], "submitting_approvals": [],
@@ -468,7 +468,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 )),
             },
         ],
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -567,7 +567,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
             }
         ],
-        "subagent_questionnaires": [],
+        "subagent_interventions": [],
         "pending_approvals": [],
         "submitting_approvals": [],
         "pending_approvals_revision": 0,

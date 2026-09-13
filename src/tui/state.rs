@@ -1365,7 +1365,7 @@ impl TuiState {
             ManagedEvent::SessionStandingInputsChanged(changed) => {
                 self.questionnaires.reconcile_subagents(
                     &SessionReference::new(origin.clone(), changed.session_id),
-                    &changed.inputs.subagent_questionnaires,
+                    &changed.inputs.subagent_interventions,
                 );
                 self.questionnaires.reconcile_available(
                     &SessionReference::new(origin.clone(), changed.session_id),
@@ -2956,7 +2956,7 @@ impl TuiState {
             transcript: Vec::new(),
             subagent_usage: None,
             total_cost: None,
-            subagent_questionnaires: Vec::new(),
+            subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),

@@ -3,9 +3,10 @@ use crate::support::{read_session_until, working_turn};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, Approval, ApprovalId, ApprovalOutcome, ApprovalSubject, Decision, SessionChange,
+        Activity, Approval, ApprovalId, ApprovalOutcome, ApprovalSubject, Decision, Question,
+        Questionnaire, QuestionnaireId, SessionChange,
     },
-    provider::{ProviderActivityId, ProviderEvent},
+    provider::{ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
 };
 use tokio::time::timeout;
 
@@ -272,6 +273,208 @@ fn has_outcome(snapshot: &suru::protocol::SessionSnapshot, expected: ApprovalOut
     snapshot.activities.iter().any(
         |activity| matches!(activity, Activity::Approval { outcome, .. } if *outcome == expected),
     )
+}
+
+#[tokio::test]
+async fn nested_subagent_approvals_roll_up_with_questions_survive_parent_settlement_and_clear_from_the_child()
+ {
+    use suru::protocol::{SessionId, TurnStatus};
+
+    async fn spawn(
+        live: &crate::support::WorkingTurn,
+        client: &ManagedClient,
+        parent: SessionId,
+        attribution: ProviderEventAttribution,
+        name: &str,
+    ) -> SessionId {
+        live.provider_session
+            .emit_attributed_and_wait_until_observed(
+                attribution,
+                ProviderEvent::SubagentStarted {
+                    subagent_id: ProviderSubagentId::new(name),
+                    name: name.into(),
+                    description: name.into(),
+                },
+            )
+            .await;
+        client
+            .read_session(parent)
+            .await
+            .unwrap()
+            .activities
+            .iter()
+            .find_map(|activity| match activity {
+                Activity::Subagent {
+                    name: found,
+                    session_id,
+                    ..
+                } if found == name => Some(*session_id),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "nested-approvals";
+    let mut live = working_turn(directory.path(), channel).await;
+    let client =
+        ManagedClient::connect(ManagedClientConfig::new(directory.path(), channel).unwrap())
+            .await
+            .unwrap();
+    let child = spawn(
+        &live,
+        &client,
+        live.session_id,
+        ProviderEventAttribution::OwningSession,
+        "child",
+    )
+    .await;
+    let grandchild = spawn(
+        &live,
+        &client,
+        child,
+        ProviderEventAttribution::Subagent(ProviderSubagentId::new("child")),
+        "grandchild",
+    )
+    .await;
+    let question = Questionnaire {
+        id: QuestionnaireId::new(),
+        questions: vec![Question {
+            id: "scope".into(),
+            title: None,
+            text: "Which scope?".into(),
+            choices: Vec::new(),
+            multiple: false,
+            freeform: true,
+            combine_freeform: false,
+            secret: false,
+            required: true,
+        }],
+    };
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("child")),
+            ProviderEvent::QuestionnaireRequested {
+                questionnaire: question.clone(),
+            },
+        )
+        .await;
+    let request = approval();
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("grandchild")),
+            ProviderEvent::ApprovalRequested {
+                approval: request.clone(),
+                tool_activity_id: None,
+            },
+        )
+        .await;
+
+    let root = read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "nested Approval and Questionnaire reach the root",
+        |snapshot| {
+            snapshot.subagent_questionnaire_count() == 1 && snapshot.subagent_approval_count() == 1
+        },
+    )
+    .await;
+    assert_eq!(root.pending_approvals_in_subagent(child), 1);
+    let child_snapshot = client.read_session(child).await.unwrap();
+    assert_eq!(child_snapshot.subagent_approval_count(), 1);
+    assert_eq!(child_snapshot.pending_approvals_in_subagent(grandchild), 1);
+    let listed = client.list_sessions(None).await.unwrap();
+    let standing = &listed[0].readable().unwrap().standing_inputs;
+    assert_eq!(standing.pending_questionnaire_count(), 1);
+    assert_eq!(standing.pending_approval_count(), 1);
+
+    live.provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let settled_parent = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(settled_parent.turns[0].status, TurnStatus::Completed);
+    assert_eq!(settled_parent.subagent_approval_count(), 1);
+    assert_eq!(
+        client
+            .read_session(grandchild)
+            .await
+            .unwrap()
+            .pending_approvals,
+        vec![request.id]
+    );
+
+    live.provider_session.gate_decision_deliveries();
+    let submission = client.submit_decision(grandchild, request.id, Decision::Decline);
+    let delivery = async {
+        let delivery = timeout(
+            PROGRESS_DEADLINE,
+            live.provider_session.next_decision_delivery(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivery.id, request.id);
+        assert_eq!(delivery.decision, Decision::Decline);
+        let root = read_session_until(
+            &live.client,
+            live.server.descriptor(),
+            live.session_id,
+            "submitting descendant Approval reaches every ancestor",
+            |snapshot| {
+                snapshot.subagent_interventions.iter().any(|entry| {
+                    entry.session_id == grandchild && entry.submitting_approvals == vec![request.id]
+                })
+            },
+        )
+        .await;
+        assert_eq!(root.subagent_approval_count(), 0);
+        delivery.succeed();
+    };
+    let (submitted, ()) = tokio::join!(submission, delivery);
+    submitted.unwrap();
+    let root = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(root.subagent_approval_count(), 0);
+    assert_eq!(root.subagent_questionnaire_count(), 1);
+    assert_eq!(
+        client
+            .read_session(child)
+            .await
+            .unwrap()
+            .subagent_approval_count(),
+        0
+    );
+    assert!(matches!(
+        client
+            .read_session(grandchild)
+            .await
+            .unwrap()
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Approval { approval, .. } if approval.id == request.id)),
+        Some(Activity::Approval {
+            outcome: ApprovalOutcome::Decided,
+            decision: Some(Decision::Decline),
+            ..
+        })
+    ));
+    let listed = client.list_sessions(None).await.unwrap();
+    let standing = &listed[0].readable().unwrap().standing_inputs;
+    assert_eq!(standing.pending_approval_count(), 0);
+    assert_eq!(standing.pending_questionnaire_count(), 1);
+
+    live.provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("child")),
+            ProviderEvent::QuestionnaireWithdrawn { id: question.id },
+        )
+        .await;
+    let root = client.read_session(live.session_id).await.unwrap();
+    assert_eq!(root.subagent_questionnaire_count(), 0);
+    let listed = client.list_sessions(None).await.unwrap();
+    let standing = &listed[0].readable().unwrap().standing_inputs;
+    assert_eq!(standing.pending_questionnaire_count(), 0);
+    assert_eq!(standing.pending_approval_count(), 0);
+    live.server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

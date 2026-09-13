@@ -355,7 +355,7 @@ async fn native_child_questionnaire_is_correlated_to_its_tool_call_and_survives_
             .iter()
             .any(|a| matches!(a, Activity::Questionnaire { .. }))
     );
-    let child_id = parent.subagent_questionnaires[0].session_id;
+    let child_id = parent.subagent_interventions[0].session_id;
     let child = live.client.read_session(child_id).await.unwrap();
     let question = child
         .activities

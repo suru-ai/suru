@@ -2118,7 +2118,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
                 pending_questionnaires: Vec::new(),
                 submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                subagent_questionnaires: Vec::new(),
+                subagent_interventions: Vec::new(),
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: suru::protocol::SessionRevision(0),

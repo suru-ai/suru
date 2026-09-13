@@ -5542,7 +5542,7 @@ mod tests {
             messages,
             activities,
             transcript,
-            subagent_questionnaires: Vec::new(),
+            subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),

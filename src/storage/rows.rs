@@ -408,7 +408,7 @@ impl SessionRow {
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: crate::protocol::SessionRevision(0),
-                subagent_questionnaires: Vec::new(),
+                subagent_interventions: Vec::new(),
                 latest_turn: None,
                 viewed_at: self
                     .viewed_at

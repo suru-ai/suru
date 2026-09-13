@@ -23,15 +23,16 @@ use ratatui::{buffer::Buffer, style::Color};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityStatus, AutoSettle, EffectiveSettings, EmojiVisibility,
-        LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session, SessionCatalogRevision,
-        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
-        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
-        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
-        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
-        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
-        TextSelectionCopy, TitleSettings, TurnStatus, UnreadableSessionSummary, Workspace,
+        Activity, ActivityId, ActivityStatus, ApprovalId, AutoSettle, EffectiveSettings,
+        EmojiVisibility, LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus,
+        ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
+        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
+        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
+        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
+        SidebarSettings, SidebarVisibility, SubagentInterventions, TextSelectionCopy,
+        TitleSettings, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -473,7 +474,7 @@ fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
                     pending_questionnaires: Vec::new(),
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                    subagent_questionnaires: Vec::new(),
+                    subagent_interventions: Vec::new(),
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -4106,7 +4107,7 @@ fn standing_elsewhere(
                     pending_questionnaires: Vec::new(),
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                    subagent_questionnaires: Vec::new(),
+                    subagent_interventions: Vec::new(),
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -4207,7 +4208,7 @@ fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) ->
         pending_questionnaires: Vec::new(),
         submitting_questionnaires: Vec::new(),
         pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -6372,7 +6373,7 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
                     pending_questionnaires: Vec::new(),
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                    subagent_questionnaires: Vec::new(),
+                    subagent_interventions: Vec::new(),
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: suru::protocol::SessionRevision(0),
@@ -9177,24 +9178,57 @@ fn a_pending_approval_marks_the_sidebar_as_needing_intervention() {
     };
     summary.session.status = SessionStatus::Active;
     summary.session.working_since = Some(SessionTimestamp(now()));
-    summary.standing_inputs.pending_approvals = vec![suru::protocol::ApprovalId::new()];
-    summary.standing_inputs.pending_approvals_revision = SessionRevision(3);
+    let child_id = SessionId::new();
+    let approval_id = ApprovalId::new();
+    summary.standing_inputs.subagent_interventions = vec![SubagentInterventions {
+        session_id: child_id,
+        via_session_id: child_id,
+        revision: SessionRevision(3),
+        pending_questionnaires: Vec::new(),
+        submitting_questionnaires: Vec::new(),
+        pending_approvals: vec![approval_id],
+        submitting_approvals: Vec::new(),
+    }];
+    let stale = row.clone();
     let mut app = sidebar_showing(workspace.path(), vec![row]);
     let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
     assert!(screen.contains("Needs Intervention"), "{screen}");
 
-    app.handle_event(ApplicationEvent::Managed(
-        ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
-            session_id,
-            inputs: SessionStandingInputs {
-                pending_approvals_revision: SessionRevision(4),
-                ..Default::default()
-            },
-        }),
-    ))
-    .unwrap();
+    let transition = app
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+                session_id,
+                inputs: SessionStandingInputs {
+                    subagent_interventions: vec![SubagentInterventions {
+                        session_id: child_id,
+                        via_session_id: child_id,
+                        revision: SessionRevision(4),
+                        pending_questionnaires: Vec::new(),
+                        submitting_questionnaires: Vec::new(),
+                        pending_approvals: Vec::new(),
+                        submitting_approvals: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            }),
+        ))
+        .unwrap();
     let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
     assert!(!screen.contains("Needs Intervention"), "{screen}");
+
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("catalog event catches up the Sidebar listing")
+    };
+    app.handle_event(ApplicationEvent::SessionsListed {
+        request,
+        sessions: vec![stale],
+    })
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(
+        !screen.contains("Needs Intervention") && !screen.contains("pending Approvals"),
+        "stale catalog reply restored settled child Approval: {screen}"
+    );
 }
 
 #[test]

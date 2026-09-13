@@ -21,6 +21,7 @@ pub(super) struct WorkingSubagent<'a> {
     pub(super) session_id: SessionId,
     pub(super) name: &'a str,
     pub(super) pending_questionnaires: usize,
+    pub(super) pending_approvals: usize,
     pub(super) description: &'a str,
     pub(super) model: Option<&'a ModelId>,
 }
@@ -42,6 +43,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 ..
             } => Some(WorkingSubagent {
                 pending_questionnaires: snapshot.pending_questionnaires_in_subagent(*session_id),
+                pending_approvals: snapshot.pending_approvals_in_subagent(*session_id),
                 session_id: *session_id,
                 name,
                 description,

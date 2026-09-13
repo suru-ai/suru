@@ -60,7 +60,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         messages: Vec::new(),
         activities: Vec::new(),
         transcript: Vec::new(),
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),

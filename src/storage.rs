@@ -492,7 +492,7 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 messages: Vec::new(),
                 activities: Vec::new(),
                 transcript: Vec::new(),
-                subagent_questionnaires: Vec::new(),
+                subagent_interventions: Vec::new(),
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: crate::protocol::SessionRevision(0),
@@ -619,7 +619,7 @@ fn load_session(
         // A child's Usage lives in the child's own stored Turns, so the
         // roll-up is re-derived across the subtree once every Session is
         // loaded rather than stored twice.
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: crate::protocol::SessionRevision(0),

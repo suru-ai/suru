@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1735,8 +1735,9 @@ pub struct LatestTurnStatus {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStandingInputs {
+    /// Live Questionnaires and Approvals owned by descendants at any depth.
     #[serde(default)]
-    pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
+    pub subagent_interventions: Vec<SubagentInterventions>,
     /// Live Questionnaires awaiting an Answer in this Session.
     #[serde(default)]
     pub pending_questionnaires: Vec<QuestionnaireId>,
@@ -1767,7 +1768,7 @@ impl SessionStandingInputs {
     pub fn pending_questionnaire_count(&self) -> usize {
         self.pending_questionnaires.len()
             + self
-                .subagent_questionnaires
+                .subagent_interventions
                 .iter()
                 .map(|entry| entry.pending_questionnaires.len())
                 .sum::<usize>()
@@ -1775,11 +1776,16 @@ impl SessionStandingInputs {
 
     pub fn pending_approval_count(&self) -> usize {
         self.pending_approvals.len()
+            + self
+                .subagent_interventions
+                .iter()
+                .map(|entry| entry.pending_approvals.len())
+                .sum::<usize>()
     }
 
     pub(crate) fn from_turns(turns: &[Turn]) -> Self {
         Self {
-            subagent_questionnaires: Vec::new(),
+            subagent_interventions: Vec::new(),
             pending_questionnaires: Vec::new(),
             submitting_questionnaires: Vec::new(),
             pending_questionnaires_revision: SessionRevision(0),
@@ -2481,17 +2487,20 @@ pub enum TranscriptItem {
     Activity { activity_id: ActivityId },
 }
 
-/// Live Questionnaire availability from one descendant, without its Questions
-/// or Answers. Every ancestor names the immediate child through which it is
-/// reached; the revision belongs to the owning descendant Session.
+/// Live intervention availability from one descendant, without its Approval
+/// detail, Questions, Answers, or Decisions. Every ancestor names the
+/// immediate child through which it is reached; the revision belongs to the
+/// owning descendant Session.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SubagentQuestionnaires {
+pub struct SubagentInterventions {
     pub session_id: SessionId,
     pub via_session_id: SessionId,
     pub revision: SessionRevision,
     pub pending_questionnaires: Vec<QuestionnaireId>,
     pub submitting_questionnaires: Vec<QuestionnaireId>,
+    pub pending_approvals: Vec<ApprovalId>,
+    pub submitting_approvals: Vec<ApprovalId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2518,8 +2527,9 @@ pub struct SessionSnapshot {
     /// Derived from durable Turn measurements by the owning server.
     #[serde(default)]
     pub total_cost: Option<CostTotal>,
+    /// Live Questionnaires and Approvals owned by descendants at any depth.
     #[serde(default)]
-    pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
+    pub subagent_interventions: Vec<SubagentInterventions>,
     /// Answerable Approvals owned by this Session.
     #[serde(default)]
     pub pending_approvals: Vec<ApprovalId>,
@@ -2533,16 +2543,32 @@ pub struct SessionSnapshot {
 
 impl SessionSnapshot {
     pub fn subagent_questionnaire_count(&self) -> usize {
-        self.subagent_questionnaires
+        self.subagent_interventions
             .iter()
             .map(|entry| entry.pending_questionnaires.len())
             .sum()
     }
+
     pub fn pending_questionnaires_in_subagent(&self, session_id: SessionId) -> usize {
-        self.subagent_questionnaires
+        self.subagent_interventions
             .iter()
             .filter(|entry| entry.via_session_id == session_id)
             .map(|entry| entry.pending_questionnaires.len())
+            .sum()
+    }
+
+    pub fn subagent_approval_count(&self) -> usize {
+        self.subagent_interventions
+            .iter()
+            .map(|entry| entry.pending_approvals.len())
+            .sum()
+    }
+
+    pub fn pending_approvals_in_subagent(&self, session_id: SessionId) -> usize {
+        self.subagent_interventions
+            .iter()
+            .filter(|entry| entry.via_session_id == session_id)
+            .map(|entry| entry.pending_approvals.len())
             .sum()
     }
 
@@ -2639,12 +2665,12 @@ pub enum SessionChange {
         turn_id: TurnId,
         observed_at: SessionTimestamp,
     },
-    /// What this Session's Subagent subtree has consumed, rolled up whole by
-    /// the server. It carries the new reading entire rather than a delta,
-    /// because a client holding it must never have to add a change to a total
-    /// it may have joined the stream too late to hold.
-    SubagentQuestionnairesChanged {
-        subagent_questionnaires: Vec<SubagentQuestionnaires>,
+    /// Live intervention availability in this Session's Subagent subtree,
+    /// rolled up whole by the server. It carries the new reading entire rather
+    /// than a delta, because a client holding it must never have to reconstruct
+    /// a descendant lifecycle it may have joined too late to observe.
+    SubagentInterventionsChanged {
+        subagent_interventions: Vec<SubagentInterventions>,
     },
     SubagentUsageChanged {
         subagent_usage: Option<UsageTotal>,

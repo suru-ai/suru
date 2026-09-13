@@ -169,7 +169,7 @@ fn child_with_working_subagent(
             session_id: grandchild_id,
             duration_ms: None,
         }],
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),

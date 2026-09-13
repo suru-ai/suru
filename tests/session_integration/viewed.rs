@@ -256,7 +256,7 @@ async fn viewing_a_session_stamps_its_summary_and_announces_the_reading() {
                 pending_questionnaires: Vec::new(),
                 submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: suru::protocol::SessionRevision(0),
-                subagent_questionnaires: Vec::new(),
+                subagent_interventions: Vec::new(),
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: suru::protocol::SessionRevision(0),

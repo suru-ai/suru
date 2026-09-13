@@ -945,7 +945,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             turn_id,
             text: "No Agent is selected".to_owned(),
         }],
-        subagent_questionnaires: Vec::new(),
+        subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),

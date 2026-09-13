@@ -220,11 +220,11 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                         .map_or(*observed_at, |current| current.max(*observed_at)),
                 );
             }
-            SessionChange::SubagentQuestionnairesChanged {
-                subagent_questionnaires,
+            SessionChange::SubagentInterventionsChanged {
+                subagent_interventions,
             } => {
-                next.subagent_questionnaires
-                    .clone_from(subagent_questionnaires);
+                next.subagent_interventions
+                    .clone_from(subagent_interventions);
             }
             SessionChange::SubagentUsageChanged { subagent_usage } => {
                 // The reading arrives whole, derived by the one party that
@@ -862,7 +862,7 @@ mod tests {
             messages: Vec::new(),
             activities: Vec::new(),
             transcript: Vec::new(),
-            subagent_questionnaires: Vec::new(),
+            subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
