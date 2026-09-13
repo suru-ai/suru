@@ -479,6 +479,8 @@ enum CappedStream {
     CommandOutput,
     /// The summary of a Reasoning block, stored on its Activity.
     Reasoning,
+    /// The typed subject and reason stored on an Approval Activity.
+    ApprovalDetail,
 }
 
 impl CappedStream {
@@ -492,6 +494,7 @@ impl CappedStream {
             Self::Message => "[Message truncated]",
             Self::CommandOutput => "[output truncated]",
             Self::Reasoning => "[Reasoning truncated]",
+            Self::ApprovalDetail => "[Approval detail truncated]",
         }
     }
 }
@@ -2713,10 +2716,18 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
     (step as u8).hash(&mut hasher);
     match activity {
         Activity::Approval {
-            outcome, decision, ..
+            approval,
+            tool_activity_id,
+            detail_truncated,
+            outcome,
+            decision,
+            ..
         } => {
             (*outcome as u8).hash(&mut hasher);
             decision.map(|value| value as u8).hash(&mut hasher);
+            serde_json::to_string(approval).ok().hash(&mut hasher);
+            tool_activity_id.hash(&mut hasher);
+            detail_truncated.hash(&mut hasher);
         }
         Activity::Questionnaire { outcome, .. } => (*outcome as u8).hash(&mut hasher),
         Activity::Status { .. } | Activity::Error { .. } => {}
@@ -2906,36 +2917,60 @@ fn render_activity(
     let mut projection = ActivityProjection { lines, links };
     match activity {
         Activity::Approval {
-            outcome, decision, ..
+            approval,
+            tool_activity_id,
+            detail_truncated,
+            outcome,
+            decision,
+            ..
         } => {
-            projection
-                .lines
-                .push(StyledLine::from(vec![StyledSpan::text(
+            let folded = step != FoldStep::Expanded;
+            let detail = super::approval::detail_lines(approval, *tool_activity_id);
+            let hidden = detail.len() + usize::from(*detail_truncated);
+            let fold = if folded && hidden > 0 {
+                format!(" · … {}", fold_marker_text(hidden, "lines"))
+            } else {
+                String::new()
+            };
+            projection.lines.push(StyledLine::from(vec![
+                StyledSpan::chrome(
+                    format!("  {} ", if folded { "▸" } else { "▾" }),
+                    theme.accent.primary,
+                ),
+                StyledSpan::text(
                     format!(
-                        "  Approval · {}",
-                        match (outcome, decision) {
-                            (crate::protocol::ApprovalOutcome::Pending, _) => "Pending".into(),
-                            (crate::protocol::ApprovalOutcome::Submitting, _) =>
-                                "Submitting".into(),
-                            (crate::protocol::ApprovalOutcome::SubmissionRejected, _) => {
-                                "Decision not delivered; retry".into()
-                            }
-                            (crate::protocol::ApprovalOutcome::Decided, Some(decision)) => {
-                                format!("{decision:?}")
-                            }
-                            (crate::protocol::ApprovalOutcome::Decided, None) => "Decided".into(),
-                            (crate::protocol::ApprovalOutcome::Withdrawn, _) => "Withdrawn".into(),
-                            (crate::protocol::ApprovalOutcome::TurnEnded, _) => "Turn ended".into(),
-                            (crate::protocol::ApprovalOutcome::Unavailable, _) =>
-                                "Unavailable".into(),
-                            (crate::protocol::ApprovalOutcome::DeliveryUncertain, _) => {
-                                "Delivery uncertain".into()
-                            }
-                        }
+                        "Approval · {} · {}{}{}",
+                        super::approval::subject_summary(&approval.subject),
+                        super::approval::outcome_text(*outcome, *decision),
+                        if outcome.is_answerable() {
+                            " · Ctrl+Y decide"
+                        } else {
+                            ""
+                        },
+                        fold,
                     ),
                     theme.accent.primary,
-                )]));
-            None
+                ),
+            ]));
+            if !folded {
+                for line in detail {
+                    for line in line.split('\n') {
+                        projection.lines.push(StyledLine::from(vec![
+                            StyledSpan::chrome(OUTPUT_INDENT, Style::default()),
+                            StyledSpan::text(line.to_owned(), Style::default()),
+                        ]));
+                    }
+                }
+                if *detail_truncated {
+                    push_truncation_marker(
+                        projection.lines,
+                        CappedStream::ApprovalDetail,
+                        OUTPUT_INDENT,
+                        theme,
+                    );
+                }
+            }
+            Some(UnitAnchor::binary(1, folded && hidden > 0))
         }
         Activity::Questionnaire {
             questionnaire,

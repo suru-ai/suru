@@ -22,6 +22,71 @@ fn approval() -> Approval {
 }
 
 #[tokio::test]
+async fn provider_input_is_bounded_only_in_durable_approval_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "approval-stored-detail-cap";
+    let live = working_turn(directory.path(), channel).await;
+    let empty_children = (0..100_000)
+        .map(|index| (format!("empty-{index}"), serde_json::json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        subject: ApprovalSubject::OtherTool {
+            name: "large_native_tool".into(),
+            input: serde_json::json!({
+                "empty_children": empty_children,
+                "payload": "x".repeat(100_000),
+            }),
+        },
+        reason: Some("The Provider keeps this native request whole".into()),
+    };
+    let original_chars = serde_json::to_string(&approval).unwrap().chars().count();
+    live.provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: approval.clone(),
+            tool_activity_id: None,
+        })
+        .await;
+    let snapshot = read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "bounded Approval history",
+        |snapshot| {
+            snapshot.activities.iter().any(|activity| {
+                matches!(activity, Activity::Approval { approval: stored, .. } if stored.id == approval.id)
+            })
+        },
+    )
+    .await;
+    let (stored, detail_truncated) = snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Approval {
+                approval: stored,
+                detail_truncated,
+                ..
+            } if stored.id == approval.id => Some((stored, *detail_truncated)),
+            _ => None,
+        })
+        .unwrap();
+    let stored_chars = serde_json::to_string(stored).unwrap().chars().count();
+    assert!(detail_truncated);
+    assert!(
+        stored_chars <= 65 * 1024,
+        "stored {stored_chars} characters"
+    );
+    assert!(stored_chars < original_chars);
+    assert_eq!(
+        serde_json::to_string(&approval).unwrap().chars().count(),
+        original_chars,
+        "presentation storage must not mutate the Provider-owned request"
+    );
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_events_and_standing_follow_pending_submitting_and_settled_approval() {
     let directory = tempfile::tempdir().unwrap();
     let channel = "approval-live-state";

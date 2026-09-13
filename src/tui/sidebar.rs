@@ -411,8 +411,7 @@ pub(super) enum SessionStanding {
     Done,
 }
 
-/// The facts from which a Session's Standing is read. Needs Intervention is
-/// reserved; the remaining inputs come from the Session listing.
+/// The facts from which a Session's Standing is read.
 #[derive(Clone, Copy, Debug, Default)]
 struct StandingInputs {
     needs_intervention: bool,

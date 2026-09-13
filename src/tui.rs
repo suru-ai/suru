@@ -1,5 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod approval;
 mod attachment;
 mod clipboard;
 mod commands;

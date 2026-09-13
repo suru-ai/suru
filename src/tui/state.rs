@@ -404,6 +404,7 @@ pub struct TuiState {
     checkout_states:
         HashMap<(Outlook, crate::protocol::CheckoutId), crate::protocol::CheckoutSummary>,
     pub(super) composers: ComposerMemory,
+    pub(super) approvals: super::approval::ApprovalPanel,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
     /// The effective value of every Setting, as the server last pushed it.
@@ -716,6 +717,7 @@ impl TuiState {
             outlook_execution_checkouts: HashMap::new(),
             checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
+            approvals: super::approval::ApprovalPanel::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
             settings: EffectiveSettings::default(),
@@ -2272,6 +2274,27 @@ impl TuiState {
                     .activities
                     .iter()
                     .find_map(|activity| match activity {
+                        crate::protocol::Activity::Approval { id, approval, .. }
+                            if *id == activity_id
+                                && self.pending_approvals().any(|pending| {
+                                    matches!(pending, Activity::Approval { approval: candidate, .. } if candidate.id == approval.id)
+                                }) =>
+                        {
+                            Some(approval.id)
+                        }
+                        _ => None,
+                    })
+            })
+        {
+            return Some(SemanticCommandId::ApprovalOpen.on_approval(id));
+        }
+        if let UnitKey::Activity(activity_id) = start.key
+            && let Some(id) = self.session.as_ref().and_then(|session| {
+                session
+                    .snapshot()
+                    .activities
+                    .iter()
+                    .find_map(|activity| match activity {
                         crate::protocol::Activity::Questionnaire {
                             id, questionnaire, ..
                         } if *id == activity_id
@@ -2567,6 +2590,7 @@ impl TuiState {
             || self.workspace_picker.is_open()
             || self.worktree_picker.open
             || self.subagent_picker.is_open()
+            || self.approvals.is_open(self.session_reference.as_ref())
             || self.questionnaires.is_open(self.session_reference.as_ref())
     }
 
@@ -3419,6 +3443,12 @@ pub enum ApplicationEvent {
         snapshot: Option<SessionSnapshot>,
         error: Option<String>,
     },
+    ApprovalSubmissionReconciled {
+        id: crate::protocol::ApprovalId,
+        session: SessionReference,
+        snapshot: Option<SessionSnapshot>,
+        error: Option<String>,
+    },
     /// The effective settings an accepted edit left in force.
     SettingMutated(SettingsSnapshot),
     SettingMutationFailed(String),
@@ -3589,6 +3619,11 @@ pub enum CommandId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationTransition {
+    SubmitDecision {
+        session: SessionReference,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    },
     SubmitQuestionnaire {
         session: SessionReference,
         id: crate::protocol::QuestionnaireId,
@@ -3890,6 +3925,7 @@ impl Application {
                 if let SessionEvent::Snapshot(snapshot) = &event {
                     let reference =
                         SessionReference::new(self.state.outlook.clone(), snapshot.session.id);
+                    self.state.approvals.reconcile(&reference, snapshot);
                     for questionnaire in super::questionnaire::pending(snapshot) {
                         self.state.questionnaires.reconcile_submission(
                             &reference,
@@ -3989,6 +4025,46 @@ impl Application {
                 if self.state.session_reference.as_ref() == Some(&session) {
                     let confirmed = self.state.session.as_ref().is_some_and(|current| current.snapshot().activities.iter().any(|activity| matches!(activity,
                         Activity::Questionnaire { questionnaire, outcome: crate::protocol::QuestionnaireOutcome::Answered | crate::protocol::QuestionnaireOutcome::Declined, .. } if questionnaire.id == id)));
+                    self.state.submission_error = if confirmed { None } else { error };
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ApprovalSubmissionReconciled {
+                session,
+                id,
+                snapshot,
+                error,
+            } => {
+                if let Some(snapshot) = snapshot {
+                    if self.state.session_reference.as_ref() == Some(&session)
+                        && self.state.session.as_ref().is_some_and(|current| {
+                            current.snapshot().revision.0 > snapshot.revision.0
+                        })
+                    {
+                        return Ok(ApplicationTransition::Continue);
+                    }
+                    self.state
+                        .approvals
+                        .reconcile_submission(&session, id, &snapshot);
+                    if self.state.session_reference.as_ref() == Some(&session)
+                        && self.state.session.as_ref().is_none_or(|current| {
+                            current.snapshot().revision.0 <= snapshot.revision.0
+                        })
+                    {
+                        self.state
+                            .apply_session(SessionEvent::Snapshot(Box::new(snapshot)))?;
+                    }
+                }
+                if self.state.session_reference.as_ref() == Some(&session) {
+                    let confirmed = self.state.session.as_ref().is_some_and(|current| {
+                        current.snapshot().activities.iter().any(|activity| {
+                            matches!(activity, Activity::Approval {
+                                approval,
+                                outcome: crate::protocol::ApprovalOutcome::Decided,
+                                ..
+                            } if approval.id == id)
+                        })
+                    });
                     self.state.submission_error = if confirmed { None } else { error };
                 }
                 Ok(ApplicationTransition::Continue)
@@ -6853,6 +6929,51 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(Self::session_picker_listing_transition(listing))
             }
+            SemanticCommandId::ApprovalOpen => {
+                let approval = self
+                    .state
+                    .pending_approvals()
+                    .find_map(|activity| match activity {
+                        Activity::Approval { approval, .. }
+                            if match &invocation.subject {
+                                SemanticSubject::Approval(id) => approval.id == *id,
+                                _ => true,
+                            } =>
+                        {
+                            Some(approval.id)
+                        }
+                        _ => None,
+                    });
+                if let (Some(session), Some(id)) = (self.state.session_reference.clone(), approval)
+                {
+                    self.state.questionnaires.hide();
+                    self.state.approvals.open(session, id);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ApprovalHide => {
+                self.state.approvals.hide();
+                Ok(ApplicationTransition::Continue)
+            }
+            command @ (SemanticCommandId::ApprovalChoicePrevious
+            | SemanticCommandId::ApprovalChoiceNext
+            | SemanticCommandId::ApprovalChoose
+            | SemanticCommandId::ApprovalAccept
+            | SemanticCommandId::ApprovalAcceptForSession
+            | SemanticCommandId::ApprovalDecline
+            | SemanticCommandId::ApprovalDeclineAndInterrupt) => {
+                if self.state.open_approval().is_some()
+                    && let Some((id, decision)) = self.state.approvals.command(command)
+                    && let Some(session) = self.state.session_reference.clone()
+                {
+                    return Ok(ApplicationTransition::SubmitDecision {
+                        session,
+                        id,
+                        decision,
+                    });
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::QuestionnaireRequestPrevious
             | SemanticCommandId::QuestionnaireRequestNext => {
                 if let Some(session) = self.state.session_reference.clone() {
@@ -6887,6 +7008,7 @@ impl Application {
                 if let (Some(session), Some(questionnaire)) =
                     (self.state.session_reference.clone(), questionnaire)
                 {
+                    self.state.approvals.hide();
                     self.state.questionnaires.open(session, &questionnaire);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -6973,6 +7095,7 @@ impl Application {
                 | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
+                | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
@@ -6987,6 +7110,7 @@ impl Application {
                 | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
+                | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
@@ -7025,6 +7149,7 @@ impl Application {
                     | SemanticSubject::ScreenPosition(_)
                     | SemanticSubject::ComposerCursor(_)
                     | SemanticSubject::Turn(_)
+                    | SemanticSubject::Approval(_)
                     | SemanticSubject::Questionnaire(_)
                     | SemanticSubject::Origin(_)
                     | SemanticSubject::Hyperlink(_) => self.session_reference(),
@@ -7073,6 +7198,7 @@ impl Application {
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Session(_)
+                | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
             }),
@@ -7634,6 +7760,32 @@ impl Application {
         }
         if self
             .state
+            .approvals
+            .is_open(self.state.session_reference.as_ref())
+        {
+            if matches!(self.state.command_mode, CommandMode::Leader) {
+                return command_for_leader_event(event);
+            }
+            if let Some(command) = super::approval::key(&event) {
+                return Some(command);
+            }
+            return match command_for_terminal_event(event) {
+                Some(
+                    command @ (CommandId::ScrollTranscriptPageUp
+                    | CommandId::ScrollTranscriptPageDown
+                    | CommandId::ScrollTranscriptLinesUp
+                    | CommandId::ScrollTranscriptLinesDown
+                    | CommandId::FollowLatest
+                    | CommandId::BeginLeader
+                    | CommandId::InvokeSemantic(_)
+                    | CommandId::ClickAt { .. }
+                    | CommandId::OpenContextMenuAt { .. }),
+                ) => Some(command),
+                _ => None,
+            };
+        }
+        if self
+            .state
             .questionnaires
             .is_open(self.state.session_reference.as_ref())
         {
@@ -7777,6 +7929,29 @@ fn is_reader_interaction(event: &InputEvent) -> bool {
 }
 
 impl TuiState {
+    pub(super) fn pending_approvals(&self) -> impl Iterator<Item = &Activity> {
+        self.session
+            .as_ref()
+            .into_iter()
+            .flat_map(|session| super::approval::pending(session.snapshot()))
+    }
+
+    pub(super) fn open_approval(&self) -> Option<&Activity> {
+        if !self.approvals.is_open(self.session_reference.as_ref()) {
+            return None;
+        }
+        let id = self.approvals.id()?;
+        self.session
+            .as_ref()?
+            .snapshot()
+            .activities
+            .iter()
+            .find(|activity| {
+                matches!(activity, Activity::Approval { approval, outcome, .. }
+                    if approval.id == id && outcome.is_live())
+            })
+    }
+
     pub(super) fn pending_questionnaires(
         &self,
     ) -> impl Iterator<Item = &crate::protocol::Questionnaire> {

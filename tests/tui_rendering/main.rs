@@ -9,6 +9,7 @@ mod deadlines;
 #[path = "../support/failing_provider.rs"]
 mod failing_provider_support;
 
+mod approvals;
 mod commands;
 mod composer;
 mod connecting;

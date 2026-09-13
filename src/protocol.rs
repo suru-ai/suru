@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 46;
+pub const PROTOCOL_VERSION: u32 = 47;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1531,6 +1531,10 @@ pub enum Activity {
         /// The Tool Activity this Approval gates, when orchestration could
         /// resolve the Provider's native identity to an existing row.
         tool_activity_id: Option<ActivityId>,
+        /// The durable subject or reason reached Suru's storage cap. The live
+        /// Provider request remains whole and owns Decision translation.
+        #[serde(default)]
+        detail_truncated: bool,
         outcome: ApprovalOutcome,
         decision: Option<Decision>,
     },

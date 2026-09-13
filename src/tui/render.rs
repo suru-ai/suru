@@ -169,7 +169,31 @@ pub(super) fn render_with_slots(
     if let Some(surface) = state.composers.selection_frame() {
         state.selection_frames.borrow_mut().push(surface);
     }
+    let pending_approvals: Vec<_> = state.pending_approvals().collect();
     let pending: Vec<_> = state.pending_questionnaires().collect();
+    if let Some(approval) = state.open_approval() {
+        state
+            .approvals
+            .render(frame, composer.area, approval, theme);
+    } else if !pending_approvals.is_empty() {
+        let area = Rect::new(
+            composer.area.x,
+            composer
+                .area
+                .y
+                .saturating_sub(if pending.is_empty() { 1 } else { 2 }),
+            composer.area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Approval pending ({}) · Ctrl+Y decide",
+                pending_approvals.len()
+            ))
+            .style(theme.feedback.warning),
+            area,
+        );
+    }
     if let Some(questionnaire) = state.open_questionnaire() {
         state.questionnaires.render(
             frame,
@@ -2286,9 +2310,6 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme, trueco
 /// glyph takes the block's text foreground instead, so the Rail is never
 /// painted invisibly. Settled rows contribute no span here.
 ///
-/// Needs Intervention has no producer yet; issue #168
-/// (<https://github.com/jake-tucker/suru/issues/168>) tracks the Approval and Input labels that
-/// will eventually feed it.
 fn paint_standing_rails(
     frame: &mut Frame<'_>,
     rails: &[StandingRail],
@@ -2385,7 +2406,7 @@ impl SessionStanding {
         match self {
             Self::NeedsIntervention => StandingPresentation {
                 feedback: StandingFeedback::Warning,
-                slot: StandingSlot::Word("Questions"),
+                slot: StandingSlot::Word("Needs Intervention"),
             },
             Self::Working => StandingPresentation {
                 feedback: StandingFeedback::Info,

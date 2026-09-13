@@ -9133,7 +9133,7 @@ fn pending_questionnaires_mark_both_session_listings_and_clear_when_unavailable(
     summary.standing_inputs.pending_questionnaires_revision = SessionRevision(3);
     let mut app = sidebar_showing(workspace.path(), vec![row.clone()]);
     let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
-    assert!(screen.contains("Questions"), "{screen}");
+    assert!(screen.contains("Needs Intervention"), "{screen}");
     let ApplicationTransition::ListSessions(request) = app
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::SessionList,
@@ -9162,9 +9162,39 @@ fn pending_questionnaires_mark_both_session_listings_and_clear_when_unavailable(
     .unwrap();
     let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
     assert!(
-        !screen.contains("Questions") && !screen.contains("pending questions"),
+        !screen.contains("Needs Intervention") && !screen.contains("pending questions"),
         "{screen}"
     );
+}
+
+#[test]
+fn a_pending_approval_marks_the_sidebar_as_needing_intervention() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut row = listed_as(session_id, "Needs a decision", workspace.path(), 1);
+    let SessionListItem::Readable(summary) = &mut row else {
+        unreachable!()
+    };
+    summary.session.status = SessionStatus::Active;
+    summary.session.working_since = Some(SessionTimestamp(now()));
+    summary.standing_inputs.pending_approvals = vec![suru::protocol::ApprovalId::new()];
+    summary.standing_inputs.pending_approvals_revision = SessionRevision(3);
+    let mut app = sidebar_showing(workspace.path(), vec![row]);
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(screen.contains("Needs Intervention"), "{screen}");
+
+    app.handle_event(ApplicationEvent::Managed(
+        ManagedEvent::SessionStandingInputsChanged(SessionStandingInputsChanged {
+            session_id,
+            inputs: SessionStandingInputs {
+                pending_approvals_revision: SessionRevision(4),
+                ..Default::default()
+            },
+        }),
+    ))
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, WIDE, 25).join("\n");
+    assert!(!screen.contains("Needs Intervention"), "{screen}");
 }
 
 #[test]

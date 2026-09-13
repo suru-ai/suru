@@ -15,6 +15,11 @@ use crate::{
     sessions::SessionStore,
 };
 
+/// Approval detail is structured but can contain arbitrary Provider input.
+/// Bound the durable copy at the same generous size as command output while
+/// the Provider keeps its native request whole for Decision translation.
+const MAX_STORED_APPROVAL_DETAIL_CHARS: usize = 64 * 1024;
+
 #[derive(Default)]
 pub(super) struct LiveApprovals {
     registered: HashMap<ApprovalId, ActivityId>,
@@ -37,6 +42,9 @@ impl LiveApprovals {
         }) {
             return Ok(());
         }
+        let approval_id = approval.id;
+        let (approval, detail_truncated) =
+            approval.into_bounded_history(MAX_STORED_APPROVAL_DETAIL_CHARS);
         let activity_id = ActivityId::new();
         sessions.publish_agent_output(
             session_id,
@@ -46,12 +54,13 @@ impl LiveApprovals {
                     turn_id,
                     approval: approval.clone(),
                     tool_activity_id,
+                    detail_truncated,
                     outcome: ApprovalOutcome::Pending,
                     decision: None,
                 },
             },
         )?;
-        self.registered.insert(approval.id, activity_id);
+        self.registered.insert(approval_id, activity_id);
         Ok(())
     }
 

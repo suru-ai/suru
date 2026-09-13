@@ -5,12 +5,22 @@ use ratatui::layout::Position;
 
 use super::text_layout::CursorTarget;
 
-use crate::protocol::{Outlook, QuestionnaireId, SessionReference, TurnId};
+use crate::protocol::{ApprovalId, Outlook, QuestionnaireId, SessionReference, TurnId};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticCommandId {
+    ApprovalOpen,
+    ApprovalHide,
+    ApprovalChoicePrevious,
+    ApprovalChoiceNext,
+    ApprovalChoose,
+    ApprovalAccept,
+    ApprovalAcceptForSession,
+    ApprovalDecline,
+    ApprovalDeclineAndInterrupt,
+
     QuestionnaireScrollUp,
     QuestionnaireScrollDown,
     QuestionnaireRequestPrevious,
@@ -190,6 +200,7 @@ pub(super) enum SemanticSubject {
     Hyperlink(String),
     Turn(TurnId),
     Questionnaire(QuestionnaireId),
+    Approval(ApprovalId),
     Origin(Outlook),
     /// One Session, which is what a reader names by acting on its row rather
     /// than on the Session they have open.
@@ -215,6 +226,13 @@ impl From<SemanticCommandId> for SemanticInvocation {
 }
 
 impl SemanticCommandId {
+    pub(super) const fn on_approval(self, id: ApprovalId) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Approval(id),
+        }
+    }
+
     pub(super) const fn on_questionnaire(self, id: QuestionnaireId) -> SemanticInvocation {
         SemanticInvocation {
             id: self,
@@ -258,6 +276,15 @@ impl SemanticCommandId {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ApprovalOpen => "approval.open",
+            Self::ApprovalHide => "approval.hide",
+            Self::ApprovalChoicePrevious => "approval.choice.previous",
+            Self::ApprovalChoiceNext => "approval.choice.next",
+            Self::ApprovalChoose => "approval.choose",
+            Self::ApprovalAccept => "approval.decision.accept",
+            Self::ApprovalAcceptForSession => "approval.decision.accept-for-session",
+            Self::ApprovalDecline => "approval.decision.decline",
+            Self::ApprovalDeclineAndInterrupt => "approval.decision.decline-and-interrupt",
             Self::QuestionnaireScrollUp => "questionnaire.scroll.up",
             Self::QuestionnaireScrollDown => "questionnaire.scroll.down",
             Self::QuestionnaireRequestPrevious => "questionnaire.request.previous",
@@ -421,6 +448,74 @@ const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
 const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalOpen,
+        title: "Open Approval",
+        description: "Focus a pending Approval and choose a Decision",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+Y",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalHide,
+        title: "Hide Approval",
+        description: "Return focus to the composer without deciding",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalChoicePrevious,
+        title: "Previous Decision",
+        description: "Focus the previous Decision without submitting it",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalChoiceNext,
+        title: "Next Decision",
+        description: "Focus the next Decision without submitting it",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalChoose,
+        title: "Choose Decision",
+        description: "Submit the focused Decision",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalAccept,
+        title: "Accept Approval",
+        description: "Accept this request once",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalAcceptForSession,
+        title: "Accept Approval for Session",
+        description: "Accept this kind of request for the Session",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalDecline,
+        title: "Decline Approval",
+        description: "Decline this request and let the Turn continue",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalDeclineAndInterrupt,
+        title: "Decline Approval and Interrupt",
+        description: "Decline this request and interrupt the Turn",
+        slash: None,
+        keybinding: None,
+    },
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireRequestNext,
         title: "Next pending Questionnaire",

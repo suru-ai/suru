@@ -829,6 +829,8 @@ enum StoredActivityPayload {
     Approval {
         approval: crate::protocol::Approval,
         tool_activity_id: Option<ActivityId>,
+        #[serde(default)]
+        detail_truncated: bool,
         outcome: crate::protocol::ApprovalOutcome,
         decision: Option<crate::protocol::Decision>,
     },
@@ -879,6 +881,7 @@ impl StoredActivityPayload {
             Self::Approval {
                 approval,
                 tool_activity_id,
+                detail_truncated,
                 outcome,
                 decision,
             } => Activity::Approval {
@@ -886,6 +889,7 @@ impl StoredActivityPayload {
                 turn_id,
                 approval,
                 tool_activity_id,
+                detail_truncated,
                 outcome,
                 decision,
             },
@@ -967,12 +971,14 @@ impl From<Activity> for StoredActivityPayload {
             Activity::Approval {
                 approval,
                 tool_activity_id,
+                detail_truncated,
                 outcome,
                 decision,
                 ..
             } => Self::Approval {
                 approval,
                 tool_activity_id,
+                detail_truncated,
                 outcome,
                 decision,
             },

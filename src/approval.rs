@@ -96,3 +96,185 @@ impl ApprovalOutcome {
         self.is_answerable() || matches!(self, Self::Submitting)
     }
 }
+
+impl Approval {
+    /// Keeps the durable, user-visible copy of an Approval bounded without
+    /// changing the Provider-owned request used to deliver a Decision. The
+    /// typed subject remains intact; strings, collections, and JSON children
+    /// are retained in order until the shared character budget is exhausted.
+    pub(crate) fn into_bounded_history(mut self, max_chars: usize) -> (Self, bool) {
+        let Ok(encoded) = serde_json::to_string(&self) else {
+            return (self, false);
+        };
+        if encoded.chars().count() <= max_chars {
+            return (self, false);
+        }
+        let mut budget = CharacterBudget(max_chars);
+        self.subject.retain_within(&mut budget);
+        if let Some(reason) = &mut self.reason {
+            budget.retain_string(reason);
+            if reason.is_empty() {
+                self.reason = None;
+            }
+        }
+        (self, true)
+    }
+}
+
+struct CharacterBudget(usize);
+
+impl CharacterBudget {
+    fn charge(&mut self, chars: usize) {
+        self.0 = self.0.saturating_sub(chars);
+    }
+
+    fn retain_string(&mut self, value: &mut String) {
+        self.charge(2);
+        let keep = value.chars().count().min(self.0);
+        if keep < value.chars().count() {
+            value.truncate(
+                value
+                    .char_indices()
+                    .nth(keep)
+                    .map_or(value.len(), |(at, _)| at),
+            );
+        }
+        self.0 = self.0.saturating_sub(keep);
+    }
+
+    fn retain_path(&mut self, value: &mut PathBuf) {
+        let mut rendered = value.to_string_lossy().into_owned();
+        self.retain_string(&mut rendered);
+        *value = PathBuf::from(rendered);
+    }
+
+    fn retain_json(&mut self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::Null => self.charge(4),
+            Value::Bool(value) => self.charge(if *value { 4 } else { 5 }),
+            Value::Number(value) => self.charge(value.to_string().chars().count()),
+            Value::String(value) => self.retain_string(value),
+            Value::Array(values) => {
+                self.charge(2);
+                let mut retained = 0;
+                for value in values.iter_mut() {
+                    if self.0 == 0 {
+                        break;
+                    }
+                    if retained > 0 {
+                        self.charge(1);
+                    }
+                    self.retain_json(value);
+                    retained += 1;
+                }
+                values.truncate(retained);
+            }
+            Value::Object(values) => {
+                self.charge(2);
+                let source = std::mem::take(values);
+                for (key, mut value) in source {
+                    if self.0 == 0 {
+                        break;
+                    }
+                    let entry_cost = key.chars().count().saturating_add(3);
+                    if entry_cost > self.0 {
+                        self.0 = 0;
+                        break;
+                    }
+                    self.charge(entry_cost + usize::from(!values.is_empty()));
+                    self.retain_json(&mut value);
+                    values.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
+impl ApprovalSubject {
+    fn retain_within(&mut self, budget: &mut CharacterBudget) {
+        match self {
+            Self::Command {
+                command,
+                cwd,
+                actions,
+            } => {
+                budget.retain_string(command);
+                if let Some(cwd) = cwd {
+                    budget.retain_path(cwd);
+                }
+                let mut retained = 0;
+                for action in actions.iter_mut() {
+                    if budget.0 < 64 {
+                        break;
+                    }
+                    // Variant and field names remain even when every value is
+                    // empty, so each retained action pays a conservative
+                    // structural cost before its content.
+                    budget.charge(64);
+                    action.retain_within(budget);
+                    retained += 1;
+                }
+                actions.truncate(retained);
+            }
+            Self::FileChange { paths, grant_root } => {
+                let mut retained = 0;
+                for path in paths.iter_mut() {
+                    if budget.0 < 3 {
+                        break;
+                    }
+                    budget.charge(1);
+                    budget.retain_path(path);
+                    retained += 1;
+                }
+                paths.truncate(retained);
+                if let Some(root) = grant_root {
+                    budget.retain_path(root);
+                }
+            }
+            Self::Read { path } => budget.retain_path(path),
+            Self::Network { host_or_url } => budget.retain_string(host_or_url),
+            Self::PermissionGrant { profile } => budget.retain_json(profile),
+            Self::OtherTool { name, input } => {
+                budget.retain_string(name);
+                budget.retain_json(input);
+            }
+        }
+    }
+}
+
+impl CommandAction {
+    fn retain_within(&mut self, budget: &mut CharacterBudget) {
+        match self {
+            Self::Read {
+                command,
+                name,
+                path,
+            } => {
+                budget.retain_string(command);
+                budget.retain_string(name);
+                budget.retain_path(path);
+            }
+            Self::ListFiles { command, path } => {
+                budget.retain_string(command);
+                if let Some(path) = path {
+                    budget.retain_path(path);
+                }
+            }
+            Self::Search {
+                command,
+                query,
+                path,
+            } => {
+                budget.retain_string(command);
+                if let Some(query) = query {
+                    budget.retain_string(query);
+                }
+                if let Some(path) = path {
+                    budget.retain_path(path);
+                }
+            }
+            Self::Unknown { command } => budget.retain_string(command),
+        }
+    }
+}

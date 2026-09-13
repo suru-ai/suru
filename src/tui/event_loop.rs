@@ -815,6 +815,21 @@ impl RunLoop {
                     },
                 );
             }
+            ApplicationTransition::SubmitDecision {
+                session,
+                id,
+                decision,
+            } => {
+                let session_id = session.session_id;
+                self.spawn_operation(
+                    session,
+                    SessionOperation::SubmitDecision {
+                        session_id,
+                        id,
+                        decision,
+                    },
+                );
+            }
             ApplicationTransition::InterruptSession { session } => {
                 let session_id = session.session_id;
                 self.spawn_operation(session, SessionOperation::InterruptSession { session_id });
@@ -1149,6 +1164,7 @@ impl RunLoop {
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
             | ApplicationTransition::SubmitQuestionnaire { .. }
+            | ApplicationTransition::SubmitDecision { .. }
             | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
@@ -1440,6 +1456,20 @@ impl RunLoop {
                         error,
                     },
                 )?;
+            }
+            SubmissionResult::ApprovalReconciled {
+                session,
+                id,
+                snapshot,
+                error,
+            } => {
+                self.application
+                    .handle_event(ApplicationEvent::ApprovalSubmissionReconciled {
+                        session,
+                        id,
+                        snapshot,
+                        error,
+                    })?;
             }
             SubmissionResult::OperationSucceeded(session) => {
                 if self.application.outlook() != &session.origin {
@@ -2191,6 +2221,12 @@ enum SubmissionResult {
         snapshot: Option<SessionSnapshot>,
         error: Option<String>,
     },
+    ApprovalReconciled {
+        id: crate::protocol::ApprovalId,
+        session: SessionReference,
+        snapshot: Option<SessionSnapshot>,
+        error: Option<String>,
+    },
     OperationSucceeded(SessionReference),
     SessionSettled(SessionReference),
     OperationFailed {
@@ -2471,6 +2507,11 @@ fn spawn_session_attachment(
 }
 
 enum SessionOperation {
+    SubmitDecision {
+        session_id: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    },
     SubmitQuestionnaire {
         session_id: SessionId,
         id: crate::protocol::QuestionnaireId,
@@ -2503,6 +2544,49 @@ impl SessionOperation {
         session: SessionReference,
     ) -> SubmissionResult {
         match self {
+            Self::SubmitDecision {
+                session_id,
+                id,
+                decision,
+            } => {
+                let delivery = commands.submit_decision(session_id, id, decision).await;
+                // The request can fail after server arbitration. Read the
+                // authoritative lifecycle before enabling a retry so a stale
+                // local Pending snapshot never resends a Decision.
+                let snapshot = commands.read_session(session_id).await.ok();
+                let outcome = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .activities
+                        .iter()
+                        .rev()
+                        .find_map(|activity| match activity {
+                            crate::protocol::Activity::Approval {
+                                approval, outcome, ..
+                            } if approval.id == id => Some(*outcome),
+                            _ => None,
+                        })
+                });
+                let error = match outcome {
+                    Some(crate::protocol::ApprovalOutcome::Decided) => None,
+                    Some(crate::protocol::ApprovalOutcome::DeliveryUncertain) => Some(
+                        "Provider delivery is uncertain. This Decision will not be resent.".into(),
+                    ),
+                    Some(crate::protocol::ApprovalOutcome::SubmissionRejected) => {
+                        Some("Decision was not delivered. Review and retry.".into())
+                    }
+                    _ if snapshot.is_none() => Some(
+                        "Decision status is unconfirmed. Reconnect to check before retrying."
+                            .into(),
+                    ),
+                    _ => delivery.err().map(|error| error.to_string()),
+                };
+                SubmissionResult::ApprovalReconciled {
+                    session,
+                    id,
+                    snapshot,
+                    error,
+                }
+            }
             Self::DeleteSession { session_id } => match commands.delete_session(session_id).await {
                 Ok(()) => SubmissionResult::OperationSucceeded(session),
                 Err(error) => SubmissionResult::SessionDeletionFailed {
