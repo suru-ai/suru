@@ -14,11 +14,13 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
+        ApprovalPosture, ApprovalPostureApplication, CodexApprovalPolicy, CodexSandboxMode,
         CreateSessionRequest, FileChange, InitialPrompt, LatestTurnStatus, MessageRole,
         MessageStatus, ModelId, PromptDelivery, PromptId, PromptStatus, ProviderId,
-        SessionCatalogChange, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionListItem, SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus,
-        SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus,
+        SessionApprovalPosture, SessionCatalogChange, SessionChange, SessionError,
+        SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
+        SessionStandingInputs, SessionStatus, SessionSummary, SessionUpdate, SkillId,
+        SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderEventAttribution,
@@ -27,6 +29,23 @@ use suru::{
     server::{self, ServerConfig},
 };
 use tokio::time::timeout;
+
+fn assert_default_codex_posture(update: &SessionUpdate, revision: SessionRevision) {
+    assert_eq!(update.revision, revision);
+    assert_eq!(
+        update.changes,
+        vec![SessionChange::ApprovalPostureChanged {
+            approval_posture: Some(SessionApprovalPosture {
+                value: ApprovalPosture::Codex {
+                    approval_policy: CodexApprovalPolicy::OnRequest,
+                    sandbox_mode: CodexSandboxMode::WorkspaceWrite,
+                },
+                pinned: false,
+                application: ApprovalPostureApplication::Applying,
+            }),
+        }]
+    );
+}
 
 #[tokio::test]
 async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them() {
@@ -237,10 +256,15 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         }]
     );
 
+    let first_posture = next_session_update(&mut first_feed).await;
+    let second_posture = next_session_update(&mut second_feed).await;
+    assert_eq!(first_posture, second_posture);
+    assert_default_codex_posture(&first_posture, SessionRevision(3));
+
     let first_delivery = next_session_update(&mut first_feed).await;
     let second_delivery = next_session_update(&mut second_feed).await;
     assert_eq!(first_delivery, second_delivery);
-    assert_eq!(first_delivery.revision, SessionRevision(3));
+    assert_eq!(first_delivery.revision, SessionRevision(4));
     let turn_id = first_delivery
         .changes
         .iter()
@@ -337,7 +361,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
         .read_session(created.session.id)
         .await
         .expect("read completed Session");
-    assert_eq!(completed.revision, SessionRevision(15));
+    assert_eq!(completed.revision, SessionRevision(16));
     assert_eq!(
         completed.session.agent_selection,
         Some(identity.selection.clone())
@@ -1624,8 +1648,10 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         next_session_update(&mut feed).await.revision,
         SessionRevision(4)
     );
+    let posture = next_session_update(&mut feed).await;
+    assert_default_codex_posture(&posture, SessionRevision(5));
     let delivery = next_session_update(&mut feed).await;
-    assert_eq!(delivery.revision, SessionRevision(5));
+    assert_eq!(delivery.revision, SessionRevision(6));
     let execution_turn_id = delivery
         .changes
         .iter()
@@ -1639,7 +1665,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
         .await
         .fail("the deterministic Provider rejected the Turn");
     let execution_failure = next_session_update(&mut feed).await;
-    assert_eq!(execution_failure.revision, SessionRevision(6));
+    assert_eq!(execution_failure.revision, SessionRevision(7));
     assert!(execution_failure.changes.iter().any(|change| {
         matches!(change, SessionChange::ActivityAdded {
             activity: Activity::Error { turn_id, text, .. },
@@ -1672,10 +1698,10 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     assert_eq!(recovery_prompt.status, PromptStatus::Pending);
     assert_eq!(
         next_session_update(&mut feed).await.revision,
-        SessionRevision(7)
+        SessionRevision(8)
     );
     let recovery_delivery = next_session_update(&mut feed).await;
-    assert_eq!(recovery_delivery.revision, SessionRevision(8));
+    assert_eq!(recovery_delivery.revision, SessionRevision(9));
     let recovery_turn_id = recovery_delivery
         .changes
         .iter()
@@ -1687,7 +1713,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
     provider_session.next_turn().await.succeed();
     provider_session.emit(ProviderEvent::TurnCompleted);
     let recovered = next_session_update(&mut feed).await;
-    assert_eq!(recovered.revision, SessionRevision(9));
+    assert_eq!(recovered.revision, SessionRevision(10));
 
     let snapshot = client
         .read_session(created.session.id)
