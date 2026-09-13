@@ -18,6 +18,7 @@ mod scripted_binary_support;
 mod provider_support;
 
 mod activity;
+mod approvals;
 mod availability;
 mod context_fill;
 mod errands;

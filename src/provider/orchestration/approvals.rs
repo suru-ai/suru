@@ -138,6 +138,11 @@ impl DecisionDeliveries {
                 ApprovalOutcome::Decided
             } else if delivery
                 .as_ref()
+                .is_err_and(|error| error.is_decision_withdrawn())
+            {
+                ApprovalOutcome::Withdrawn
+            } else if delivery
+                .as_ref()
                 .is_err_and(|error| error.is_decision_rejected())
             {
                 ApprovalOutcome::SubmissionRejected

@@ -79,7 +79,10 @@ fn opening_at(posture: FoldPosture) -> EffectiveSettings {
 fn without_copilot() -> EffectiveSettings {
     EffectiveSettings {
         provider: ProviderSettings {
-            copilot: CopilotSettings { enabled: false },
+            copilot: CopilotSettings {
+                enabled: false,
+                ..CopilotSettings::default()
+            },
             ..ProviderSettings::default()
         },
         ..EffectiveSettings::default()
@@ -1540,33 +1543,28 @@ fn a_providers_enablement_never_appears_inside_its_own_expansion() {
     );
 }
 
-/// A Provider with nothing further to configure has nothing to expand, so it
-/// offers no affordance and Enter on it does nothing at all.
 #[test]
-fn a_provider_with_no_further_settings_offers_no_expansion() {
+fn copilot_permissions_appear_under_the_copilot_provider() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     assert!(row(&application, "Codex").contains('▸'));
     assert!(row(&application, "Claude").contains('▸'));
-    assert!(!row(&application, "Copilot").contains('▸'));
+    assert!(row(&application, "Copilot").contains('▸'));
 
     focus_setting(&mut application, "provider.copilot.enabled");
-    let before = rendered_application_rows(&application);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let permissions = row(&application, "Permissions");
     assert!(
-        !before.join("\n").contains("Enter expand"),
-        "the panel does not teach a key this row has no answer to: {before:?}"
+        permissions.contains("ask") && permissions.contains("[default]"),
+        "{permissions:?}"
     );
+    let rows = rendered_application_rows(&application);
     assert_eq!(
-        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::Continue,
-        "Enter on such a Provider emits nothing"
+        row_index(&rows, "Permissions"),
+        row_index(&rows, "Copilot") + 1
     );
-    assert_eq!(
-        rendered_application_rows(&application),
-        before,
-        "and changes nothing on screen"
-    );
+    assert!(label_column(&application, "Permissions") > label_column(&application, "Copilot"));
 }
 
 #[test]

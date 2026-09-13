@@ -22,6 +22,7 @@
 //! module asks the CLI about before every discovery. Suru handles no credentials itself, so the
 //! catalog refresh re-running all three checks is the whole of its part in the recovery.
 
+mod approval;
 mod catalog;
 mod errand;
 mod event_drain;

@@ -295,7 +295,7 @@ async fn a_prompt_streams_a_copilot_message_into_the_transcript_and_settles_the_
     assert_eq!(
         parameters["requestPermission"],
         Value::Bool(true),
-        "the harness answers Copilot's permission requests itself"
+        "Suru installs the permission handler before opening the native Session"
     );
     assert_eq!(
         parameters["workingDirectory"].as_str(),
@@ -487,65 +487,6 @@ async fn a_modelless_session_with_no_chosen_selection_runs_under_the_catalog_def
         switched["params"]["modelId"], "auto",
         "the first Turn puts the catalog default in force"
     );
-
-    server.shutdown().await.expect("shut the server down");
-}
-
-/// Copilot answers the Prompt with a permission request rather than a Message.
-const PERMISSION_REQUEST: &str = r#"      event e1 permission.requested '{"requestId":"p1","permissionRequest":{"kind":"shell","toolCallId":"t1"}}'
-      event e2 assistant.message '{"messageId":"m1","content":"Ran it"}'
-      event e3 session.idle '{}'
-"#;
-
-#[tokio::test]
-async fn a_permission_request_is_answered_inside_the_harness() {
-    let copilot = conversation_fixture(PERMISSION_REQUEST);
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "copilot-auto-approval").expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), "copilot-auto-approval").await;
-
-    let created = client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "Run something that needs permission".to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .await
-        .expect("create Session");
-
-    let settled = settled_session(&client, created.session.id, 0).await;
-    assert_eq!(
-        settled.turns[0].status,
-        TurnStatus::Completed,
-        "the agent works on without an approval interruption"
-    );
-
-    let decision = copilot
-        .wait_for_request("session.permissions.handlePendingPermissionRequest")
-        .await;
-    assert_eq!(decision["params"]["requestId"], "p1");
-    assert_eq!(
-        agent_messages(&settled)
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>(),
-        ["Ran it"],
-        "no approval concept crosses the Provider seam into the Transcript"
-    );
-    assert!(settled.activities.is_empty());
 
     server.shutdown().await.expect("shut the server down");
 }

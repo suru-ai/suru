@@ -39,8 +39,9 @@ use super::{
 };
 use crate::{
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ModelOptionChoiceId,
-        ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId,
+        AgentId, AgentIdentity, AgentSelection, CopilotPermissions, Decision, ModelDescriptor,
+        ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue,
+        ProviderId,
     },
     provider::{
         ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
@@ -71,20 +72,26 @@ const RESUME_CONTEXT: &str = "Copilot Session resume failed";
 /// one the Resume State names when the Suru Session was restored with one, and creating a fresh one
 /// otherwise.
 ///
-/// Either way the harness answers Copilot's permission requests itself, matching the Codex posture:
-/// full auto, with no approval concept crossing the Provider seam.
+/// Both paths install Suru's permission bridge before the native Session opens, so requests that
+/// arrive during creation and after resume follow the fixed posture captured for this Session.
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
     skills: CopilotSkills,
     interrupt_request_timeout: Duration,
+    permissions: CopilotPermissions,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     let handle = Arc::new(handle);
-    let (questionnaire_events, questionnaire_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (request_events, request_rx) = tokio::sync::mpsc::unbounded_channel();
     let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
-        questionnaire_events,
+        request_events.clone(),
     ));
     let execution_directory = request.execution_directory.clone();
+    let approvals = Arc::new(super::approval::CopilotApprovals::new(
+        request_events,
+        permissions,
+        execution_directory.clone(),
+    ));
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an
@@ -101,7 +108,7 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
-                .approve_all_permissions()
+                .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             let native = until_crash(
                 &handle,
@@ -125,7 +132,7 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
-                .approve_all_permissions()
+                .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             let native = until_crash(
                 &handle,
@@ -136,6 +143,7 @@ pub(super) async fn start_copilot_session(
             (STARTUP_CONTEXT, session_id, native)
         }
     };
+    let native = Arc::new(native);
     let current = until_crash(&handle, context, native.rpc().model().get_current()).await?;
     let in_force = agent_selection(current);
     let selection = match &in_force {
@@ -163,9 +171,21 @@ pub(super) async fn start_copilot_session(
         event_drain,
         correlation.clone(),
         skills.clone(),
+        approvals.clone(),
     );
     let question_lifecycle = questionnaires.clone();
+    let approval_lifecycle = approvals.clone();
     let events = futures_util::StreamExt::inspect(events, move |event| {
+        if let Ok(crate::provider::AttributedProviderEvent { attribution, event }) = event
+            && matches!(
+                event,
+                crate::provider::ProviderEvent::TurnCompleted
+                    | crate::provider::ProviderEvent::TurnInterrupted
+                    | crate::provider::ProviderEvent::TurnFailed { .. }
+            )
+        {
+            approval_lifecycle.settle(attribution);
+        }
         if matches!(
             event,
             Ok(crate::provider::AttributedProviderEvent {
@@ -177,14 +197,18 @@ pub(super) async fn start_copilot_session(
         ) || event.is_err()
         {
             question_lifecycle.cancel();
+            if event.is_err() {
+                approval_lifecycle.clear();
+            }
         }
     });
-    let requests = futures_util::stream::unfold(questionnaire_rx, |mut rx| async move {
+    let requests = futures_util::stream::unfold(request_rx, |mut rx| async move {
         rx.recv().await.map(|event| (event, rx))
     });
     let events = Box::pin(futures_util::stream::select(events, Box::pin(requests)));
     let session = Arc::new(CopilotSession {
         questionnaires,
+        approvals,
         native,
         handle,
         correlation,
@@ -310,7 +334,8 @@ fn context_tier(choice: &ModelOptionChoiceId) -> Option<ContextTier> {
 
 struct CopilotSession {
     questionnaires: Arc<super::questionnaire::CopilotQuestionnaires>,
-    native: NativeSession,
+    approvals: Arc<super::approval::CopilotApprovals>,
+    native: Arc<NativeSession>,
     handle: Arc<SharedHarnessHandle<CopilotConnection>>,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     /// The Agent Selection in force on the Copilot Session — nothing until the CLI has resolved a
@@ -411,6 +436,39 @@ pub(super) fn lower_selection_options(
 }
 
 impl ProviderSession for CopilotSession {
+    fn submit_decision(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: Decision,
+    ) -> ProviderFuture<'_, crate::provider::ProviderDecisionDelivery> {
+        Box::pin(async move {
+            let delivery = self.approvals.submit(&self.native, id, decision).await?;
+            let native = self.native.clone();
+            let handle = self.handle.clone();
+            let approvals = self.approvals.clone();
+            let interrupt_timeout = self.interrupt_request_timeout;
+            Ok(crate::provider::ProviderDecisionDelivery::with_follow_up(
+                Box::pin(async move {
+                    drop(delivery.settlement);
+                    if decision != Decision::DeclineAndInterrupt {
+                        return Ok(());
+                    }
+                    const CONTEXT: &str = "Copilot Turn interruption failed";
+                    let aborted = until_crash(&handle, CONTEXT, native.abort());
+                    let result = match timeout(interrupt_timeout, aborted).await {
+                        Ok(aborted) => aborted,
+                        Err(_) => Err(copilot_error(format!(
+                            "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
+                        ))),
+                    };
+                    if result.is_ok() {
+                        approvals.clear();
+                    }
+                    result
+                }),
+            ))
+        })
+    }
     fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,
@@ -505,12 +563,16 @@ impl ProviderSession for CopilotSession {
             // why an unanswered abort is bounded here rather than left to the loop to end.
             const CONTEXT: &str = "Copilot Turn interruption failed";
             let aborted = until_crash(&self.handle, CONTEXT, self.native.abort());
-            match timeout(self.interrupt_request_timeout, aborted).await {
+            let result = match timeout(self.interrupt_request_timeout, aborted).await {
                 Ok(aborted) => aborted,
                 Err(_elapsed) => Err(copilot_error(format!(
                     "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
                 ))),
+            };
+            if result.is_ok() {
+                self.approvals.clear();
             }
+            result
         })
     }
 

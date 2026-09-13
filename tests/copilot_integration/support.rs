@@ -518,6 +518,7 @@ pub fn resumable_conversation_fixture(timeline: &str) -> ScriptedCopilot {
 pub struct LiveTurn {
     _state_dir: tempfile::TempDir,
     _workspace: tempfile::TempDir,
+    _config_dir: Option<tempfile::TempDir>,
     server: RunningServer,
     pub client: ManagedClient,
     pub feed: SessionSubscription,
@@ -529,14 +530,39 @@ impl LiveTurn {
     /// Opens a Session on `runtime` under `name`, delivers `prompt`, and comes back once the Turn
     /// it began is running. `name` is the client channel, so each test needs its own.
     pub async fn start(runtime: CopilotRuntime, name: &'static str, prompt: &str) -> Self {
+        Self::start_with_config(runtime, name, prompt, None).await
+    }
+
+    pub async fn start_configured(
+        runtime: CopilotRuntime,
+        name: &'static str,
+        prompt: &str,
+        document: &str,
+    ) -> Self {
+        Self::start_with_config(runtime, name, prompt, Some(document)).await
+    }
+
+    async fn start_with_config(
+        runtime: CopilotRuntime,
+        name: &'static str,
+        prompt: &str,
+        document: Option<&str>,
+    ) -> Self {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
-        let server = server::spawn_with_provider(
-            ServerConfig::new(state_dir.path(), name).expect("configure server"),
-            std::sync::Arc::new(runtime),
-        )
-        .await
-        .expect("spawn server");
+        let config_dir = document.map(|document| {
+            let directory = tempfile::tempdir().expect("create isolated config directory");
+            std::fs::write(directory.path().join("suru.jsonc"), document)
+                .expect("write Config Document");
+            directory
+        });
+        let mut config = ServerConfig::new(state_dir.path(), name).expect("configure server");
+        if let Some(directory) = &config_dir {
+            config = config.with_config_dir(directory.path());
+        }
+        let server = server::spawn_with_provider(config, std::sync::Arc::new(runtime))
+            .await
+            .expect("spawn server");
         let client = connect(state_dir.path(), name).await;
         let created = client
             .create_session(CreateSessionRequest {
@@ -573,6 +599,7 @@ impl LiveTurn {
         Self {
             _state_dir: state_dir,
             _workspace: workspace,
+            _config_dir: config_dir,
             server,
             client,
             feed,
@@ -602,6 +629,7 @@ impl LiveTurn {
             server,
             client,
             feed,
+            _config_dir: _,
             ..
         } = self;
         drop(feed);

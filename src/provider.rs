@@ -319,6 +319,8 @@ enum ProviderErrorKind {
     SelectionRejected,
     QuestionnaireRejected,
     DecisionRejected,
+    /// The Provider knows the native request was already resolved elsewhere.
+    DecisionWithdrawn,
     /// The Provider itself cannot be used yet, for a reason the user fixes
     /// outside Suru. Carried on the error so whatever asked the runtime to
     /// work — Model discovery above all — can report the condition rather
@@ -363,6 +365,18 @@ impl ProviderError {
         self.kind == ProviderErrorKind::DecisionRejected
     }
 
+    pub fn decision_withdrawn(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            session_lost: false,
+            kind: ProviderErrorKind::DecisionWithdrawn,
+        }
+    }
+
+    pub(crate) fn is_decision_withdrawn(&self) -> bool {
+        self.kind == ProviderErrorKind::DecisionWithdrawn
+    }
+
     pub fn selection_rejected(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -399,7 +413,8 @@ impl ProviderError {
             ProviderErrorKind::Failure
             | ProviderErrorKind::SelectionRejected
             | ProviderErrorKind::QuestionnaireRejected
-            | ProviderErrorKind::DecisionRejected => None,
+            | ProviderErrorKind::DecisionRejected
+            | ProviderErrorKind::DecisionWithdrawn => None,
         }
     }
 

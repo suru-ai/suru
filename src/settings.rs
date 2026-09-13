@@ -32,10 +32,11 @@ use serde_json::Value;
 
 use crate::protocol::{
     AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
-    CodexSandboxMode, CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture,
-    LandingPage, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-    SettingMutation, SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity,
-    SettingsSnapshot, SidebarScope, SidebarVisibility, TextSelectionCopy, TitleErrand,
+    CodexSandboxMode, CommandAutoExpand, CopilotPermissions, EffectiveSettings, EmojiVisibility,
+    FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
+    SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
+    TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -68,6 +69,7 @@ const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary"
 const PROVIDER_CODEX_APPROVAL_POLICY: &str = "provider.codex.approvalPolicy";
 const PROVIDER_CODEX_SANDBOX_MODE: &str = "provider.codex.sandboxMode";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
+const PROVIDER_COPILOT_PERMISSIONS: &str = "provider.copilot.permissions";
 const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
 const PROVIDER_CLAUDE_PERMISSION_MODE: &str = "provider.claude.permissionMode";
 const SERVING_ENABLED: &str = "serving.enabled";
@@ -535,6 +537,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::ProviderCopilotEnabled { value } => {
             *value == Some(settings.provider.copilot.enabled)
+        }
+        SettingMutation::ProviderCopilotPermissions { value } => {
+            *value == Some(settings.provider.copilot.permissions)
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
             *value == Some(settings.provider.claude.enabled)
@@ -1130,6 +1135,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
+        key: PROVIDER_COPILOT_PERMISSIONS,
+        label: "Permissions",
+        description: "When Copilot asks before using a Tool",
+        group: SettingGroup::Providers,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "ask",
+                build_mutation: || SettingMutation::ProviderCopilotPermissions {
+                    value: Some(CopilotPermissions::Ask),
+                },
+            },
+            SettingChoice {
+                value: "allowAll",
+                build_mutation: || SettingMutation::ProviderCopilotPermissions {
+                    value: Some(CopilotPermissions::AllowAll),
+                },
+            },
+        ]),
+        reset: SettingMutation::ProviderCopilotPermissions { value: None },
+        apply: |settings, value| {
+            apply_value(value, |permissions| {
+                settings.provider.copilot.permissions = permissions;
+            })
+        },
+    },
+    SettingDescriptor {
         key: PROVIDER_CLAUDE_ENABLED,
         label: "Claude Provider",
         description: "Whether Suru offers Claude, or leaves it entirely alone",
@@ -1496,6 +1528,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::ProviderCopilotEnabled { value } => {
             (PROVIDER_COPILOT_ENABLED, pinned(value))
+        }
+        SettingMutation::ProviderCopilotPermissions { value } => {
+            (PROVIDER_COPILOT_PERMISSIONS, pinned(value))
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
             (PROVIDER_CLAUDE_ENABLED, pinned(value))

@@ -326,6 +326,7 @@ pub(super) fn provider_events(
     drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
+    approvals: Arc<super::approval::CopilotApprovals>,
 ) -> ProviderEventStream {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
@@ -344,6 +345,7 @@ pub(super) fn provider_events(
             drain,
             correlation,
             skills,
+            approvals,
             pending: VecDeque::new(),
             ended: false,
         },
@@ -401,6 +403,7 @@ struct CopilotEvents {
     drain: EventDrainCheckpoint,
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
+    approvals: Arc<super::approval::CopilotApprovals>,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
     ended: bool,
 }
@@ -447,6 +450,16 @@ async fn next_provider_event(
                 return Some((Err(error), events));
             }
             Some(Ok(event)) => {
+                if let TimelineEvent::Native(event) = &event {
+                    if matches!(
+                        event.parsed_type(),
+                        SessionEventType::SessionIdle
+                            | SessionEventType::SubagentCompleted
+                            | SessionEventType::SubagentFailed
+                    ) {
+                        events.approvals.wait_for_settled_decision().await;
+                    }
+                }
                 queue_projected(&mut events, event);
             }
         }
@@ -482,6 +495,32 @@ fn queue_projected(events: &mut CopilotEvents, event: TimelineEvent) {
         }
         TimelineEvent::Native(event) => event,
     };
+    match event.parsed_type() {
+        SessionEventType::PermissionRequested => {
+            if let Some(request_id) = event.data["requestId"]
+                .as_str()
+                .map(github_copilot_sdk::RequestId::new)
+            {
+                let attribution = event
+                    .agent_id
+                    .as_deref()
+                    .map_or(ProviderEventAttribution::OwningSession, |agent| {
+                        ProviderEventAttribution::Subagent(ProviderSubagentId::new(agent))
+                    });
+                events.approvals.observe(request_id, attribution);
+            }
+        }
+        SessionEventType::PermissionCompleted => {
+            if let Some(request_id) = event.data["requestId"]
+                .as_str()
+                .map(github_copilot_sdk::RequestId::new)
+                && let Some(withdrawn) = events.approvals.complete(&request_id)
+            {
+                events.pending.push_back(Ok(withdrawn));
+            }
+        }
+        _ => {}
+    }
     if matches!(
         event.parsed_type(),
         SessionEventType::CommandsChanged | SessionEventType::SessionSkillsLoaded

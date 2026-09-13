@@ -1,6 +1,9 @@
 //! The Copilot Provider runtime and the one shared harness process behind it.
 
-use std::ffi::{OsStr, OsString};
+use std::{
+    ffi::{OsStr, OsString},
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use serde_json::Value;
 use tokio::{sync::watch, time::Duration};
@@ -16,8 +19,9 @@ use super::{
 };
 use crate::{
     protocol::{
-        AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, ProviderId, ProviderUnavailability, SkillCatalog,
+        AgentSelection, CopilotPermissions, EffectiveSettings, ModelId, ModelOptionChoiceId,
+        ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId, ProviderUnavailability,
+        SkillCatalog,
     },
     provider::{
         ProviderErrand, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
@@ -46,6 +50,7 @@ pub struct CopilotRuntime {
     harness: SharedHarness<CopilotConnector>,
     skills: CopilotSkills,
     interrupt_request_timeout: Duration,
+    permissions: Arc<StdMutex<CopilotPermissions>>,
 }
 
 impl CopilotRuntime {
@@ -60,6 +65,7 @@ impl CopilotRuntime {
             harness: SharedHarness::new(spec, CopilotConnector::new()),
             skills: CopilotSkills::default(),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
+            permissions: Arc::new(StdMutex::new(CopilotPermissions::default())),
         }
     }
 
@@ -151,14 +157,27 @@ impl ProviderRuntime for CopilotRuntime {
             // Launches the shared process if this is the first demand, or the first since a crash,
             // which is how the Prompt after a harness crash recovers without a restart.
             let handle = self.harness.demand().await?;
+            let permissions = *self
+                .permissions
+                .lock()
+                .expect("Copilot permissions Setting lock is not poisoned");
             start_copilot_session(
                 handle,
                 request,
                 self.skills.clone(),
                 self.interrupt_request_timeout,
+                permissions,
             )
             .await
         })
+    }
+
+    fn apply_settings(&self, settings: &EffectiveSettings) {
+        *self
+            .permissions
+            .lock()
+            .expect("Copilot permissions Setting lock is not poisoned") =
+            settings.provider.copilot.permissions;
     }
 
     fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value> {

@@ -12,9 +12,10 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
-        CodexSandboxMode, CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId, ProviderId,
-        ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
-        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
+        CodexSandboxMode, CommandAutoExpand, CopilotPermissions, EmojiVisibility, FoldPosture,
+        ModelId, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+        SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
+        SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -1584,6 +1585,47 @@ async fn codex_posture_defaults_pin_through_the_config_document_and_reset() {
     );
     assert_eq!(reset.pinned, [] as [String; 0]);
 
+    drop(client);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn copilot_permissions_default_pins_through_the_config_document_and_resets() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-copilot-permissions")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (client, initial) = attach(state_dir.path(), "settings-copilot-permissions").await;
+    assert_eq!(
+        initial.settings.provider.copilot.permissions,
+        CopilotPermissions::Ask
+    );
+    let pinned = client
+        .mutate_setting(SettingMutation::ProviderCopilotPermissions {
+            value: Some(CopilotPermissions::AllowAll),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.settings.provider.copilot.permissions,
+        CopilotPermissions::AllowAll
+    );
+    assert_eq!(pinned.pinned, ["provider.copilot.permissions"]);
+    assert!(config_document(config_dir.path()).contains("\"permissions\": \"allowAll\""));
+    let reset = client
+        .mutate_setting(SettingMutation::ProviderCopilotPermissions { value: None })
+        .await
+        .unwrap();
+    assert_eq!(
+        reset.settings.provider.copilot.permissions,
+        CopilotPermissions::Ask
+    );
+    assert_eq!(reset.pinned, [] as [String; 0]);
     drop(client);
     server.shutdown().await.unwrap();
 }

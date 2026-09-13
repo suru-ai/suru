@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1124,12 +1124,24 @@ pub enum CodexSandboxMode {
 #[serde(deny_unknown_fields)]
 pub struct CopilotSettings {
     pub enabled: bool,
+    pub permissions: CopilotPermissions,
 }
 
 impl Default for CopilotSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            permissions: CopilotPermissions::default(),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CopilotPermissions {
+    #[default]
+    Ask,
+    AllowAll,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1446,6 +1458,9 @@ pub enum SettingMutation {
     },
     ProviderCopilotEnabled {
         value: Option<bool>,
+    },
+    ProviderCopilotPermissions {
+        value: Option<CopilotPermissions>,
     },
     ProviderClaudeEnabled {
         value: Option<bool>,
