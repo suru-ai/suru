@@ -145,11 +145,25 @@ async fn an_existing_session_applies_permission_mode_over_the_native_control_cha
 }
 
 #[tokio::test]
-async fn a_rejected_live_permission_mode_update_is_visible_and_keeps_the_requested_posture() {
+async fn a_failed_live_mode_update_is_visible_and_retried_without_restarting_on_the_next_turn() {
+    let posture_arm = r#"    *'"subtype":"set_permission_mode"'*)
+      posture_updates=$(( ${posture_updates:-0} + 1 ))
+      if [ "$posture_updates" -gt 1 ]; then
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{}}}'
+      fi
+      ;;
+"#;
     let fixture = ScriptedClaude::new(&format!(
-        "{}{}",
+        "{}{}{}",
         discovery_arms(CLAUDE_MODELS),
-        user_turn_arm("      :\n"),
+        posture_arm,
+        user_turn_arm(
+            r#"      (
+        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
+      ) &
+"#,
+        ),
     ));
     let live = LiveTurn::start(
         ClaudeRuntime::new(fixture.executable())
@@ -179,6 +193,40 @@ async fn a_rejected_live_permission_mode_update_is_visible_and_keeps_the_request
     assert_eq!(
         posture.application,
         suru::protocol::ApprovalPostureApplication::Failed
+    );
+    fixture.release();
+    settled_session(&live.client, live.session_id, 0).await;
+    live.client
+        .admit_prompt(
+            live.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Retry".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+    settled_session(&live.client, live.session_id, 1).await;
+    assert_eq!(
+        fixture
+            .exact_launches()
+            .into_iter()
+            .filter(|launch| launch.carries("--permission-prompt-tool"))
+            .count(),
+        1,
+        "retrying the native control keeps the existing Claude process"
+    );
+    assert_eq!(
+        fixture
+            .requests()
+            .iter()
+            .filter(|request| request["request"]["subtype"] == "set_permission_mode")
+            .count(),
+        2
     );
     live.shutdown().await;
 }

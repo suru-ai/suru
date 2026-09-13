@@ -87,6 +87,16 @@ async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_an
         let update = native.next_posture_update().await;
         assert_eq!(update.posture, automatic);
         assert!(update.has_active_work);
+        assert_eq!(
+            crate::support::read_session(server.descriptor(), created.session.id)
+                .await
+                .session
+                .approval_posture
+                .unwrap()
+                .application,
+            ApprovalPostureApplication::Applying,
+            "the requested posture is not advertised as applied before native acknowledgement"
+        );
         update.next_turn();
     };
     let (updated, ()) = tokio::join!(update, native_update);
@@ -227,6 +237,139 @@ async fn an_unpinned_active_session_adopts_server_posture_without_losing_its_del
             .application,
         ApprovalPostureApplication::NextTurn,
         "unrelated Settings adoption and hydration preserve the delayed native state"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_applies() {
+    let state = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let channel = "approval-posture-ordered-ack";
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![hosted_model("codex", "gpt-test")],
+    );
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state.path(), channel)
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let config = ManagedClientConfig::new(state.path(), channel).unwrap();
+    let mut settings_client = ManagedClient::connect(config.clone()).await.unwrap();
+    receive_managed_client_initial_state(&mut settings_client).await;
+    let mut turn_client = ManagedClient::connect(config).await.unwrap();
+    receive_managed_client_initial_state(&mut turn_client).await;
+
+    let create = |text: &str| CreateSessionRequest {
+        preparation_id: None,
+        agent_selection: Some(hosted_selection("codex", "gpt-test")),
+        execution_directory: suru::protocol::ExecutionDirectory {
+            path: workspace.path().into(),
+        },
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: text.into(),
+            skill_invocations: Vec::new(),
+        },
+    };
+    let first = turn_client.create_session(create("first")).await.unwrap();
+    let mut first_native = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: hosted_selection("codex", "gpt-test"),
+    });
+    first_native.next_turn().await.succeed();
+    let second = turn_client.create_session(create("second")).await.unwrap();
+    let mut second_native = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: hosted_selection("codex", "gpt-test"),
+    });
+    second_native.next_turn().await.succeed();
+    first_native.drain_posture_updates();
+    second_native.drain_posture_updates();
+    first_native.gate_posture_updates();
+    second_native.gate_posture_updates();
+
+    let setting = settings_client.mutate_setting(SettingMutation::ProviderCodexSandboxMode {
+        value: Some(CodexSandboxMode::ReadOnly),
+    });
+    let actors = async {
+        let first_update = tokio::time::timeout(
+            crate::server_support::PROGRESS_DEADLINE,
+            first_native.next_posture_update(),
+        )
+        .await
+        .expect("first Session receives its Settings posture update");
+        let second_update = tokio::time::timeout(
+            crate::server_support::PROGRESS_DEADLINE,
+            second_native.next_posture_update(),
+        )
+        .await
+        .expect("second Session receives its Settings posture update");
+        first_update.next_turn();
+        first_native
+            .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+            .await;
+        turn_client
+            .admit_prompt(
+                first.session.id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "apply now".into(),
+                        skill_invocations: Vec::new(),
+                    },
+                    delivery: PromptDelivery::Queue,
+                },
+            )
+            .await
+            .unwrap();
+        first_native.next_turn().await.succeed();
+        tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+            loop {
+                let posture = crate::support::read_session(server.descriptor(), first.session.id)
+                    .await
+                    .session
+                    .approval_posture
+                    .unwrap();
+                if posture.application == ApprovalPostureApplication::Applied {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first Session records its successfully applied next Turn");
+        second_update.next_turn();
+    };
+    let (setting, ()) = tokio::join!(setting, actors);
+    setting.unwrap();
+    assert_eq!(
+        turn_client
+            .read_session(first.session.id)
+            .await
+            .unwrap()
+            .session
+            .approval_posture
+            .unwrap()
+            .application,
+        ApprovalPostureApplication::Applied,
+        "the other Session's late Settings acknowledgement cannot restore NextTurn"
+    );
+    assert_eq!(
+        turn_client
+            .read_session(second.session.id)
+            .await
+            .unwrap()
+            .session
+            .approval_posture
+            .unwrap()
+            .application,
+        ApprovalPostureApplication::NextTurn
     );
     server.shutdown().await.unwrap();
 }

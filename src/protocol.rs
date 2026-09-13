@@ -1494,6 +1494,7 @@ pub struct SessionApprovalPosture {
 pub enum ApprovalPostureApplication {
     #[default]
     Applied,
+    Applying,
     NextTurn,
     Failed,
 }

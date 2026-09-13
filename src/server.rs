@@ -554,7 +554,12 @@ pub async fn spawn_with_source_control(
         storage.clone(),
         preparations.resumable_sessions(),
     );
-    sessions.reconcile_approval_postures(&opening_settings.settings);
+    for update in sessions.reconcile_approval_postures(&opening_settings.settings) {
+        sessions.mark_approval_posture_application(
+            update,
+            crate::protocol::ApprovalPostureApplication::Applied,
+        );
+    }
     let source_control = crate::source_control::SourceControlService::new(source_control);
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
@@ -2036,47 +2041,25 @@ async fn update_approval_posture(
         .sessions
         .apply_approval_posture_command(session_id, request, &settings)
     {
-        Ok(posture) => {
-            match state
-                .providers
-                .update_approval_posture(session_id, posture.value)
-                .await
-            {
-                Ok(application) => {
-                    let application = match application {
-                        crate::provider::ProviderPostureApplication::Applied => {
-                            crate::protocol::ApprovalPostureApplication::Applied
-                        }
-                        crate::provider::ProviderPostureApplication::NextTurn => {
-                            crate::protocol::ApprovalPostureApplication::NextTurn
-                        }
-                    };
-                    state.sessions.mark_approval_posture_application(
-                        session_id,
-                        posture.value,
-                        application,
-                    );
-                    Json(
-                        state
-                            .sessions
-                            .snapshot(session_id)
-                            .and_then(|snapshot| snapshot.session.approval_posture)
-                            .unwrap_or(posture),
-                    )
-                    .into_response()
-                }
-                Err(error) => {
-                    state.sessions.mark_approval_posture_application(
-                        session_id,
-                        posture.value,
-                        crate::protocol::ApprovalPostureApplication::Failed,
-                    );
-                    session_error_response(
-                        StatusCode::CONFLICT,
-                        SessionErrorCode::InvalidCommand,
-                        error,
-                    )
-                }
+        Ok(mutation) => {
+            let applied = match mutation.update {
+                Some(update) => state.providers.update_approval_posture(update).await,
+                None => Ok(crate::provider::ProviderPostureApplication::Applied),
+            };
+            match applied {
+                Ok(_) => Json(
+                    state
+                        .sessions
+                        .snapshot(session_id)
+                        .and_then(|snapshot| snapshot.session.approval_posture)
+                        .unwrap_or(mutation.posture),
+                )
+                .into_response(),
+                Err(error) => session_error_response(
+                    StatusCode::CONFLICT,
+                    SessionErrorCode::InvalidCommand,
+                    error,
+                ),
             }
         }
         Err(ApprovalPostureMutationError::SessionNotFound) => session_error_response(
@@ -2107,28 +2090,15 @@ async fn update_approval_posture(
 
 async fn apply_live_posture_updates(
     state: &AppState,
-    changed: Vec<(SessionId, crate::protocol::ApprovalPosture)>,
+    changed: Vec<crate::sessions::ApprovalPostureUpdate>,
 ) {
-    let updates = changed.into_iter().map(|(session_id, posture)| async move {
-        let application = match state.providers.update_approval_posture(session_id, posture).await {
-            Ok(crate::provider::ProviderPostureApplication::Applied) => {
-                crate::protocol::ApprovalPostureApplication::Applied
-            }
-            Ok(crate::provider::ProviderPostureApplication::NextTurn) => {
-                crate::protocol::ApprovalPostureApplication::NextTurn
-            }
-            Err(error) => {
-                tracing::error!(session = %session_id, "could not apply live Approval Posture: {error}");
-                crate::protocol::ApprovalPostureApplication::Failed
-            }
-        };
-        (session_id, posture, application)
+    let updates = changed.into_iter().map(|update| async move {
+        let session_id = update.session_id;
+        if let Err(error) = state.providers.update_approval_posture(update).await {
+            tracing::error!(session = %session_id, "could not apply live Approval Posture: {error}");
+        }
     });
-    for (session_id, posture, application) in futures_util::future::join_all(updates).await {
-        state
-            .sessions
-            .mark_approval_posture_application(session_id, posture, application);
-    }
+    futures_util::future::join_all(updates).await;
 }
 
 async fn update_agent_selection(
@@ -2735,17 +2705,29 @@ async fn hydrate_session_request(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if request.method() != axum::http::Method::DELETE {
-        if let Some(id) = parameters
+        let session_id = parameters
             .get("session_id")
             .and_then(|id| Uuid::parse_str(id).ok())
-            && let Err(error) = state.sessions.hydrate(SessionId::from_uuid(id)).await
+            .map(SessionId::from_uuid);
+        if let Some(id) = session_id
+            && let Err(error) = state.sessions.hydrate(id).await
         {
             tracing::warn!("Session hydration failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        state
+        let changed = state
             .sessions
             .reconcile_approval_postures(&state.settings.borrow().settings);
+        for update in changed {
+            if Some(update.session_id) == session_id
+                && !state.providers.has_session_actor(update.session_id)
+            {
+                state.sessions.mark_approval_posture_application(
+                    update,
+                    crate::protocol::ApprovalPostureApplication::Applied,
+                );
+            }
+        }
     }
     next.run(request).await
 }

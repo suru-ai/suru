@@ -16,13 +16,25 @@ pub(crate) enum ApprovalPostureMutationError {
     Storage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ApprovalPostureUpdate {
+    pub(crate) session_id: SessionId,
+    pub(crate) value: ApprovalPosture,
+    pub(crate) generation: u64,
+}
+
+pub(crate) struct ApprovalPostureMutation {
+    pub(crate) posture: SessionApprovalPosture,
+    pub(crate) update: Option<ApprovalPostureUpdate>,
+}
+
 impl SessionStore {
     pub(crate) fn apply_approval_posture_command(
         &self,
         session_id: SessionId,
         request: UpdateApprovalPostureRequest,
         settings: &EffectiveSettings,
-    ) -> Result<SessionApprovalPosture, ApprovalPostureMutationError> {
+    ) -> Result<ApprovalPostureMutation, ApprovalPostureMutationError> {
         let mut state = self
             .state
             .lock()
@@ -40,40 +52,25 @@ impl SessionStore {
             .agent_selection
             .clone()
             .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?;
-        let value = match request.posture {
+        let (desired, pinned) = match request.posture {
             Some(posture) => {
                 if posture.provider() != selection.provider {
                     return Err(ApprovalPostureMutationError::ProviderConflict);
                 }
-                let application = session
-                    .approval_posture
-                    .as_ref()
-                    .filter(|current| current.value == posture)
-                    .map_or(ApprovalPostureApplication::Applied, |current| {
-                        current.application
-                    });
-                SessionApprovalPosture {
-                    value: posture,
-                    pinned: true,
-                    application,
-                }
+                (posture, true)
             }
-            None => {
-                let desired = ApprovalPosture::for_provider(&selection.provider, settings)
-                    .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?;
-                let application = session
-                    .approval_posture
-                    .as_ref()
-                    .filter(|current| current.value == desired)
-                    .map_or(ApprovalPostureApplication::Applied, |current| {
-                        current.application
-                    });
-                SessionApprovalPosture {
-                    value: desired,
-                    pinned: false,
-                    application,
-                }
-            }
+            None => (
+                ApprovalPosture::for_provider(&selection.provider, settings)
+                    .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?,
+                false,
+            ),
+        };
+        let (application, begin_generation) =
+            application_for_desired(session.approval_posture.as_ref(), desired, true);
+        let value = SessionApprovalPosture {
+            value: desired,
+            pinned,
+            application,
         };
         if state.sessions[&session_id]
             .snapshot
@@ -94,22 +91,39 @@ impl SessionStore {
         }
         reconcile_child_approval_postures(&mut state, &self.storage)
             .map_err(|_| ApprovalPostureMutationError::Storage)?;
-        Ok(value)
+        let update = if application == ApprovalPostureApplication::Applying {
+            let generation = if begin_generation {
+                next_posture_generation(&mut state, session_id)
+            } else {
+                *state.posture_generations.entry(session_id).or_default()
+            };
+            Some(ApprovalPostureUpdate {
+                session_id,
+                value: desired,
+                generation,
+            })
+        } else {
+            None
+        };
+        Ok(ApprovalPostureMutation {
+            posture: value,
+            update,
+        })
     }
 
-    /// Refreshes the effective reading of every loaded, unpinned Session.
-    /// Each change is a normal durable revision so every local or remote
-    /// viewer observes the same authoritative posture.
+    /// Refreshes every loaded, unpinned Session and returns all roots whose
+    /// native application remains outstanding. Returning the durable Applying
+    /// set, rather than only values changed by this caller, means an ordinary
+    /// reader cannot consume work owed by the Settings mutation that follows.
     pub(crate) fn reconcile_approval_postures(
         &self,
         settings: &EffectiveSettings,
-    ) -> Vec<(SessionId, ApprovalPosture)> {
+    ) -> Vec<ApprovalPostureUpdate> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let ids = state.sessions.keys().copied().collect::<Vec<_>>();
-        let mut changed = Vec::new();
         for id in ids {
             let next = state.sessions.get(&id).and_then(|record| {
                 if record.snapshot.session.is_subagent()
@@ -124,15 +138,11 @@ impl SessionStore {
                 }
                 let provider = &record.snapshot.session.agent_selection.as_ref()?.provider;
                 let value = ApprovalPosture::for_provider(provider, settings)?;
-                let application = record
-                    .snapshot
-                    .session
-                    .approval_posture
-                    .as_ref()
-                    .filter(|current| current.value == value)
-                    .map_or(ApprovalPostureApplication::Applied, |current| {
-                        current.application
-                    });
+                let (application, _) = application_for_desired(
+                    record.snapshot.session.approval_posture.as_ref(),
+                    value,
+                    false,
+                );
                 Some(SessionApprovalPosture {
                     value,
                     pinned: false,
@@ -157,22 +167,22 @@ impl SessionStore {
                 }],
             ) {
                 tracing::error!(session = %id, "could not reconcile Approval Posture: {error:#}");
-            } else {
-                changed.push((id, next.value));
+            } else if next.application == ApprovalPostureApplication::Applying {
+                next_posture_generation(&mut state, id);
             }
         }
         if let Err(error) = reconcile_child_approval_postures(&mut state, &self.storage) {
             tracing::error!("could not reconcile inherited Subagent Approval Posture: {error:#}");
         }
-        changed
+        pending_posture_updates(&mut state)
     }
 
     pub(crate) fn mark_approval_posture_application(
         &self,
-        session_id: SessionId,
-        value: ApprovalPosture,
+        update: ApprovalPostureUpdate,
         application: ApprovalPostureApplication,
-    ) {
+    ) -> bool {
+        let session_id = update.session_id;
         let mut state = self
             .state
             .lock()
@@ -182,10 +192,18 @@ impl SessionStore {
             .get(&session_id)
             .and_then(|record| record.snapshot.session.approval_posture.clone())
         else {
-            return;
+            return false;
         };
-        if current.value != value || current.application == application {
-            return;
+        if current.value != update.value
+            || state
+                .posture_generations
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default()
+                != update.generation
+            || current.application == application
+        {
+            return false;
         }
         let next = SessionApprovalPosture {
             application,
@@ -199,12 +217,101 @@ impl SessionStore {
             }],
         ) {
             tracing::error!(session = %session_id, "could not record Approval Posture application: {error:#}");
-            return;
+            return false;
         }
         if let Err(error) = reconcile_child_approval_postures(&mut state, &self.storage) {
             tracing::error!("could not reconcile inherited Subagent Approval Posture: {error:#}");
         }
+        true
     }
+
+    pub(crate) fn current_approval_posture_update(
+        &self,
+        session_id: SessionId,
+    ) -> Option<ApprovalPostureUpdate> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let value = state
+            .sessions
+            .get(&session_id)?
+            .snapshot
+            .session
+            .approval_posture
+            .as_ref()?
+            .value;
+        let generation = *state.posture_generations.entry(session_id).or_default();
+        Some(ApprovalPostureUpdate {
+            session_id,
+            value,
+            generation,
+        })
+    }
+
+    pub(crate) fn approval_posture_update_is_pending(&self, update: ApprovalPostureUpdate) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state
+            .sessions
+            .get(&update.session_id)
+            .and_then(|record| record.snapshot.session.approval_posture.as_ref())
+            .is_some_and(|posture| {
+                posture.value == update.value
+                    && posture.application == ApprovalPostureApplication::Applying
+                    && state
+                        .posture_generations
+                        .get(&update.session_id)
+                        .copied()
+                        .unwrap_or_default()
+                        == update.generation
+            })
+    }
+}
+
+fn application_for_desired(
+    current: Option<&SessionApprovalPosture>,
+    desired: ApprovalPosture,
+    retry_failed: bool,
+) -> (ApprovalPostureApplication, bool) {
+    match current {
+        Some(current) if current.value == desired => match current.application {
+            ApprovalPostureApplication::Failed if retry_failed => {
+                (ApprovalPostureApplication::Applying, true)
+            }
+            application => (application, false),
+        },
+        _ => (ApprovalPostureApplication::Applying, true),
+    }
+}
+
+fn next_posture_generation(state: &mut SessionStoreState, session_id: SessionId) -> u64 {
+    let generation = state.posture_generations.entry(session_id).or_default();
+    *generation = generation.wrapping_add(1);
+    *generation
+}
+
+fn pending_posture_updates(state: &mut SessionStoreState) -> Vec<ApprovalPostureUpdate> {
+    let pending = state
+        .sessions
+        .iter()
+        .filter_map(|(session_id, record)| {
+            let posture = record.snapshot.session.approval_posture.as_ref()?;
+            (!record.snapshot.session.is_subagent()
+                && posture.application == ApprovalPostureApplication::Applying)
+                .then_some((*session_id, posture.value))
+        })
+        .collect::<Vec<_>>();
+    pending
+        .into_iter()
+        .map(|(session_id, value)| ApprovalPostureUpdate {
+            session_id,
+            value,
+            generation: *state.posture_generations.entry(session_id).or_default(),
+        })
+        .collect()
 }
 
 /// Child Sessions share their root Session's native Provider actor, so their

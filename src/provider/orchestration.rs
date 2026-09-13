@@ -33,9 +33,10 @@ use crate::protocol::{
     ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
-    DeliveredTurn, DeliveredTurnStatus, InterruptSessionError, InterruptTarget,
-    ProviderTurnOutcome, SessionStore, TrailingCommandOutput, command_output_changes,
-    earliest_pending_prompt, message_content_changes, reasoning_content_changes,
+    ApprovalPostureUpdate, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
+    InterruptTarget, ProviderTurnOutcome, SessionStore, TrailingCommandOutput,
+    command_output_changes, earliest_pending_prompt, message_content_changes,
+    reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 
@@ -200,7 +201,7 @@ enum ProviderCommand {
         response: oneshot::Sender<Result<(), InterruptSessionError>>,
     },
     UpdateApprovalPosture {
-        posture: crate::protocol::ApprovalPosture,
+        update: ApprovalPostureUpdate,
         response: oneshot::Sender<Result<ProviderPostureApplication, String>>,
     },
 }
@@ -1015,9 +1016,9 @@ impl ProviderOrchestrator {
 
     pub(crate) async fn update_approval_posture(
         &self,
-        session_id: SessionId,
-        posture: crate::protocol::ApprovalPosture,
+        update: ApprovalPostureUpdate,
     ) -> Result<ProviderPostureApplication, String> {
+        let session_id = update.session_id;
         let actor_id = self.sessions.actor_session(session_id);
         let commands = self
             .actors
@@ -1027,15 +1028,33 @@ impl ProviderOrchestrator {
             .get(&actor_id)
             .map(|actor| actor.commands.clone());
         let Some(commands) = commands else {
+            self.sessions.mark_approval_posture_application(
+                update,
+                crate::protocol::ApprovalPostureApplication::Applied,
+            );
             return Ok(ProviderPostureApplication::Applied);
         };
         let (response, received) = oneshot::channel();
-        commands
-            .send(ProviderCommand::UpdateApprovalPosture { posture, response })
-            .map_err(|_| "Approval Posture update could not reach the Provider".to_owned())?;
-        received
-            .await
-            .map_err(|_| "Approval Posture update could not be confirmed".to_owned())?
+        if commands
+            .send(ProviderCommand::UpdateApprovalPosture { update, response })
+            .is_err()
+        {
+            self.sessions.mark_approval_posture_application(
+                update,
+                crate::protocol::ApprovalPostureApplication::Failed,
+            );
+            return Err("Approval Posture update could not reach the Provider".to_owned());
+        }
+        match received.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.sessions.mark_approval_posture_application(
+                    update,
+                    crate::protocol::ApprovalPostureApplication::Failed,
+                );
+                Err("Approval Posture update could not be confirmed".to_owned())
+            }
+        }
     }
 
     /// Stops what a Session is doing, whatever that is: the active Turn along
@@ -1516,25 +1535,29 @@ async fn run_provider_session(
                     );
                     continue;
                 }
-                ProviderCommand::UpdateApprovalPosture { posture, response } => {
-                    if !approval_posture_is_current(&sessions, session_id, posture) {
+                ProviderCommand::UpdateApprovalPosture { update, response } => {
+                    if !sessions.approval_posture_update_is_pending(update) {
                         let _ = response.send(Ok(ProviderPostureApplication::Applied));
                         continue;
                     }
                     let updated = if let Some(connected) = provider.as_ref() {
-                        connected
-                            .session
-                            .update_approval_posture(
-                                posture,
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.wait() => Err(
+                                "Approval Posture update failed: the Provider Session is shutting down."
+                                    .to_owned(),
+                            ),
+                            updated = connected.session.update_approval_posture(
+                                update.value,
                                 !subagents.routes.is_empty() || !subagents.rows.is_empty(),
-                            )
-                            .await
-                            .map_err(|error| {
+                            ) => updated.map_err(|error| {
                                 failure_message("Approval Posture update failed", &error)
-                            })
+                            }),
+                        }
                     } else {
                         Ok(ProviderPostureApplication::Applied)
                     };
+                    record_posture_application(&sessions, update, &updated);
                     let _ = response.send(updated);
                     continue;
                 }
@@ -1645,17 +1668,15 @@ async fn run_provider_session(
                 }
             }
             if provider.is_none() {
+                let session_posture =
+                    effective_approval_posture(&snapshot, &settings.borrow(), &provider_id);
                 let connection = tokio::select! {
                     biased;
                     _ = shutdown.wait() => break 'actor,
                     connection = runtime.start_session(ProviderSessionRequest {
                         execution_directory: execution_directory.clone(),
                         resume_state: sessions.resume_state(session_id, &provider_id),
-                        approval_posture: effective_approval_posture(
-                            &snapshot,
-                            &settings.borrow(),
-                            &provider_id,
-                        ),
+                        approval_posture: session_posture,
                     }) => connection,
                 };
                 let connection = match connection {
@@ -1724,7 +1745,16 @@ async fn run_provider_session(
                 // Provider discovery can supply the Session's first Agent Selection. Derive the
                 // corresponding unpinned posture immediately so snapshots do not remain empty
                 // until a later HTTP mutation happens to reconcile them.
-                sessions.reconcile_approval_postures(&settings.borrow().settings);
+                let posture_updates =
+                    sessions.reconcile_approval_postures(&settings.borrow().settings);
+                if let Some(update) = posture_updates.into_iter().find(|update| {
+                    update.session_id == session_id && Some(update.value) == session_posture
+                }) {
+                    sessions.mark_approval_posture_application(
+                        update,
+                        crate::protocol::ApprovalPostureApplication::Applied,
+                    );
+                }
                 connected_incarnations
                     .lock()
                     .unwrap()
@@ -1804,6 +1834,11 @@ async fn run_provider_session(
             let posture = sessions.snapshot(session_id).and_then(|snapshot| {
                 effective_approval_posture(&snapshot, &settings.borrow(), &provider_id)
             });
+            let posture_update = posture.and_then(|posture| {
+                sessions
+                    .current_approval_posture_update(session_id)
+                    .filter(|update| update.value == posture)
+            });
             let (turn_id, input) = provider_turn_start(delivered, posture);
             let started = tokio::select! {
                 biased;
@@ -1822,10 +1857,9 @@ async fn run_provider_session(
                 }
                 continue;
             }
-            if let Some(posture) = posture {
+            if let Some(update) = posture_update {
                 sessions.mark_approval_posture_application(
-                    session_id,
-                    posture,
+                    update,
                     crate::protocol::ApprovalPostureApplication::Applied,
                 );
             }
@@ -1970,17 +2004,24 @@ async fn run_provider_session(
             }
 
             ProviderInput::Command(Some(ProviderCommand::UpdateApprovalPosture {
-                posture,
+                update,
                 response,
             })) => {
-                if !approval_posture_is_current(&sessions, session_id, posture) {
+                if !sessions.approval_posture_update_is_pending(update) {
                     let _ = response.send(Ok(ProviderPostureApplication::Applied));
                     continue;
                 }
-                let updated = provider_session
-                    .update_approval_posture(posture, true)
-                    .await
-                    .map_err(|error| failure_message("Approval Posture update failed", &error));
+                let updated = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => Err(
+                        "Approval Posture update failed: the Provider Session is shutting down."
+                            .to_owned(),
+                    ),
+                    updated = provider_session.update_approval_posture(update.value, true) => {
+                        updated.map_err(|error| failure_message("Approval Posture update failed", &error))
+                    }
+                };
+                record_posture_application(&sessions, update, &updated);
                 let _ = response.send(updated);
             }
 
@@ -2455,15 +2496,21 @@ fn effective_approval_posture(
         .or_else(|| crate::protocol::ApprovalPosture::for_provider(provider, &settings.settings))
 }
 
-fn approval_posture_is_current(
+fn record_posture_application(
     sessions: &SessionStore,
-    session_id: SessionId,
-    posture: crate::protocol::ApprovalPosture,
-) -> bool {
-    sessions
-        .snapshot(session_id)
-        .and_then(|snapshot| snapshot.session.approval_posture)
-        .is_some_and(|current| current.value == posture)
+    update: ApprovalPostureUpdate,
+    result: &Result<ProviderPostureApplication, String>,
+) {
+    let application = match result {
+        Ok(ProviderPostureApplication::Applied) => {
+            crate::protocol::ApprovalPostureApplication::Applied
+        }
+        Ok(ProviderPostureApplication::NextTurn) => {
+            crate::protocol::ApprovalPostureApplication::NextTurn
+        }
+        Err(_) => crate::protocol::ApprovalPostureApplication::Failed,
+    };
+    sessions.mark_approval_posture_application(update, application);
 }
 
 fn project_turn_start_failure(

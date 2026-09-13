@@ -42,7 +42,7 @@ mod workspaces;
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
 };
-pub(crate) use posture::ApprovalPostureMutationError;
+pub(crate) use posture::{ApprovalPostureMutationError, ApprovalPostureUpdate};
 pub(crate) use prompts::{
     AdmitPromptError, CreateSessionError, DeliveredTurn, DeliveredTurnStatus,
     PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt, effective_delivery,
@@ -90,6 +90,10 @@ struct SessionStoreState {
     /// still deliver, so restoring their history leaves that Prompt standing
     /// where it withdraws every other one nothing is left to deliver.
     resumable_preparations: HashSet<SessionId>,
+    /// Orders live Approval Posture application without exposing bookkeeping
+    /// in the public snapshot. Provider actors do not survive restoration, so
+    /// restored Sessions begin a fresh local generation sequence.
+    posture_generations: HashMap<SessionId, u64>,
 }
 
 struct SessionRecord {
@@ -187,6 +191,7 @@ impl SessionStore {
             observed_checkouts: HashMap::new(),
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
+            posture_generations: HashMap::new(),
         };
         // Durable Turns reconstruct Working and Usage before any Session can
         // be listed or opened, without committing synthetic changes.
@@ -400,6 +405,7 @@ impl SessionStore {
                 .deleted(*doomed_id)
                 .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
             state.sessions.remove(doomed_id);
+            state.posture_generations.remove(doomed_id);
             state.unreadable_sessions.remove(doomed_id);
             if let Some(deferred) = &mut state.deferred {
                 deferred.summaries.remove(doomed_id);

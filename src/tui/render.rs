@@ -4465,6 +4465,7 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
             };
             let application = match posture.application {
                 crate::protocol::ApprovalPostureApplication::Applied => "",
+                crate::protocol::ApprovalPostureApplication::Applying => "applying · ",
                 crate::protocol::ApprovalPostureApplication::NextTurn => {
                     "takes effect next Turn · "
                 }

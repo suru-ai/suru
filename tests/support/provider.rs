@@ -557,6 +557,10 @@ impl ControlledProviderSession {
             .expect("Provider remains connected")
     }
 
+    pub fn drain_posture_updates(&mut self) {
+        while self.posture_updates.try_recv().is_ok() {}
+    }
+
     pub async fn next_decision(
         &mut self,
     ) -> (suru::protocol::ApprovalId, suru::protocol::Decision) {

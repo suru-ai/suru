@@ -282,6 +282,34 @@ impl ClaudeChild {
 }
 
 impl ClaudeSession {
+    async fn apply_permission_mode(
+        &self,
+        slot: &mut ChildSlot,
+        permission_mode: ClaudePermissionMode,
+        context: &'static str,
+    ) -> Result<(), ProviderError> {
+        if let Some(child) = slot.running.as_mut()
+            && child.permission_mode != permission_mode
+        {
+            child
+                .transport
+                .control_request(
+                    &ControlRequest::SetPermissionMode {
+                        mode: permission_mode,
+                    },
+                    self.posture_request_timeout,
+                )
+                .await
+                .map_err(|error| claude_error_context(context, error.into_error()))?;
+            child.permission_mode = permission_mode;
+        }
+        *self
+            .permission_mode
+            .lock()
+            .expect("Claude posture lock is not poisoned") = permission_mode;
+        Ok(())
+    }
+
     /// Stops every background task the CLI has reported running, so nothing the Turn spawned
     /// outlives the interrupt that follows it. The stops go out together and each is bounded by
     /// the interrupt's own timeout; one the CLI refuses or never answers is passed over, because
@@ -322,30 +350,12 @@ impl ProviderSession for ClaudeSession {
                 return Err(claude_error("Approval Posture belongs to another Provider"));
             };
             let mut slot = self.child.lock().await;
-            if let Some(child) = slot.running.as_mut()
-                && child.permission_mode != permission_mode
-            {
-                child
-                    .transport
-                    .control_request(
-                        &ControlRequest::SetPermissionMode {
-                            mode: permission_mode,
-                        },
-                        self.posture_request_timeout,
-                    )
-                    .await
-                    .map_err(|error| {
-                        claude_error_context(
-                            "Claude Approval Posture update failed",
-                            error.into_error(),
-                        )
-                    })?;
-                child.permission_mode = permission_mode;
-            }
-            *self
-                .permission_mode
-                .lock()
-                .expect("Claude posture lock is not poisoned") = permission_mode;
+            self.apply_permission_mode(
+                &mut slot,
+                permission_mode,
+                "Claude Approval Posture update failed",
+            )
+            .await?;
             Ok(crate::provider::ProviderPostureApplication::Applied)
         })
     }
@@ -385,12 +395,14 @@ impl ProviderSession for ClaudeSession {
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
             }
-            // The Model and its Options are spawn-time flags, so a Turn selected under different
-            // ones needs a child of its own; one selected under the flags the running child
-            // carries needs nothing.
-            if slot.running.as_ref().is_none_or(|child| {
-                child.selection != input.selection || child.permission_mode != permission_mode
-            }) {
+            // The Model and its Options are spawn-time flags, so only a Selection change replaces
+            // the child. Permission mode is a live control; restarting for it would kill background
+            // work and turn a retryable control failure into a conversation restart.
+            if slot
+                .running
+                .as_ref()
+                .is_none_or(|child| child.selection != input.selection)
+            {
                 // The Selection is lowered onto flags before anything is torn down, so one the CLI
                 // has no flags for leaves the Session running on the child it had.
                 let args = spawn_args(
@@ -434,6 +446,12 @@ impl ProviderSession for ClaudeSession {
                     permission_mode,
                 });
             }
+            self.apply_permission_mode(
+                &mut slot,
+                permission_mode,
+                "Claude Turn permission mode update failed",
+            )
+            .await?;
             let child = slot
                 .running
                 .as_ref()
