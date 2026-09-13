@@ -122,7 +122,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"id":"unsupported-correlation","method":"$CODEX_FIXTURE_METHOD","params":{"fixture":true}}'
       read -r response
-      while :; do sleep 1; done
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
   esac
 done < "$request_pipe"
@@ -223,12 +223,8 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
 }
 
 #[tokio::test]
-async fn unsupported_server_interactions_are_rejected_and_fail_the_active_turn() {
+async fn unsupported_elicitation_and_dynamic_tools_are_rejected_without_ending_the_turn() {
     for (method, channel) in [
-        (
-            "item/commandExecution/requestApproval",
-            "codex-unsupported-approval",
-        ),
         (
             "mcpServer/elicitation/request",
             "codex-unsupported-elicitation",
@@ -237,7 +233,51 @@ async fn unsupported_server_interactions_are_rejected_and_fail_the_active_turn()
     ] {
         let script = UNSUPPORTED_SERVER_REQUEST.replace("$CODEX_FIXTURE_METHOD", method);
         let fixture = ScriptedCodex::new(&script);
-        assert_provider_failure(fixture.executable(), channel, method).await;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state.path(), channel).unwrap(),
+            Arc::new(CodexRuntime::new(fixture.executable())),
+        )
+        .await
+        .unwrap();
+        let mut client =
+            ManagedClient::connect(ManagedClientConfig::new(state.path(), channel).unwrap())
+                .await
+                .unwrap();
+        receive_initial_state(&mut client).await;
+        let created = client
+            .create_session(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Continue after unsupported callback".into(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+        timeout(PROGRESS_DEADLINE, async {
+            loop {
+                if client
+                    .read_session(created.session.id)
+                    .await
+                    .unwrap()
+                    .turns
+                    .first()
+                    .is_some_and(|turn| turn.status == TurnStatus::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unsupported request is nonfatal");
 
         let response = fixture
             .requests()
@@ -253,6 +293,8 @@ async fn unsupported_server_interactions_are_rejected_and_fail_the_active_turn()
                 .is_some_and(|message| message.contains(method))
         );
         assert!(response.get("result").is_none());
+        drop(client);
+        server.shutdown().await.unwrap();
     }
 }
 

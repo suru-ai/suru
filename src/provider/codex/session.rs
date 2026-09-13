@@ -5,6 +5,7 @@
 //! stopping the process once the Session is done with it.
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     sync::{
         Arc, Mutex as StdMutex,
@@ -26,10 +27,10 @@ use super::{
     skills::CodexSkills,
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
-        ModelListParams, NativeField, NativeModelList, THREAD_APPROVAL_POLICY, THREAD_SANDBOX,
-        ThreadConnectionResult, ThreadResumeParams, ThreadStartParams, TurnInterruptParams,
-        TurnStartParams, TurnStartResult, TurnSteerParams, TurnSteerResult,
-        lower_reasoning_summary, lower_turn_options,
+        CodexPosture, ModelListParams, NativeField, NativeModelList, ThreadConnectionResult,
+        ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
+        TurnStartResult, TurnSteerParams, TurnSteerResult, lower_reasoning_summary,
+        lower_turn_options,
     },
 };
 use crate::{
@@ -65,6 +66,7 @@ pub struct CodexRuntime {
     /// this runtime started so the value each Turn sends is the one in force
     /// when it starts rather than the one its Session opened with.
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
+    posture: Arc<StdMutex<CodexPosture>>,
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
     /// The rate table every Session this runtime starts estimates its Costs
@@ -97,6 +99,7 @@ impl CodexRuntime {
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
+            posture: Arc::new(StdMutex::new(CodexPosture::default())),
             skills: CodexSkills::default(),
             skill_catalog_invalidations,
             pricing: None,
@@ -218,6 +221,10 @@ impl ProviderRuntime for CodexRuntime {
                 shutdown_interrupt: self.shutdown_interrupt_timeout,
             },
             reasoning_summary: self.reasoning_summary.clone(),
+            posture: *self
+                .posture
+                .lock()
+                .expect("Codex posture Setting lock is not poisoned"),
             skills: self.skills.clone(),
             skill_catalog_invalidations: self.skill_catalog_invalidations.clone(),
             execution_directory: request.execution_directory.clone(),
@@ -248,6 +255,13 @@ impl ProviderRuntime for CodexRuntime {
             .lock()
             .expect("Codex Reasoning summary Setting lock is not poisoned") =
             settings.provider.codex.reasoning_summary;
+        *self
+            .posture
+            .lock()
+            .expect("Codex posture Setting lock is not poisoned") = CodexPosture {
+            approval_policy: settings.provider.codex.approval_policy,
+            sandbox_mode: settings.provider.codex.sandbox_mode,
+        };
     }
 }
 
@@ -318,6 +332,7 @@ struct SessionTimeouts {
 struct SessionContext {
     timeouts: SessionTimeouts,
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
+    posture: CodexPosture,
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
     execution_directory: std::path::PathBuf,
@@ -357,27 +372,29 @@ async fn start_codex_thread(
         .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
         .map(|state| state.thread_id);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
+        let posture = context.posture;
         let result = transport
             .request(
                 "thread/resume",
                 &ThreadResumeParams {
                     thread_id: thread_id.as_str(),
                     cwd,
-                    approval_policy: THREAD_APPROVAL_POLICY,
-                    sandbox: THREAD_SANDBOX,
+                    approval_policy: posture.approval_policy(),
+                    sandbox: posture.sandbox(),
                 },
             )
             .await
             .map_err(|error| codex_error_context("Codex Session resume failed", error))?;
         ("thread/resume", result)
     } else {
+        let posture = context.posture;
         let result = transport
             .request(
                 "thread/start",
                 &ThreadStartParams {
                     cwd,
-                    approval_policy: THREAD_APPROVAL_POLICY,
-                    sandbox: THREAD_SANDBOX,
+                    approval_policy: posture.approval_policy(),
+                    sandbox: posture.sandbox(),
                     ephemeral: false,
                 },
             )
@@ -435,6 +452,7 @@ async fn start_codex_thread(
         started.thread.id.clone(),
         ModelId::new(started.model.clone()),
         transport.questionnaires(),
+        transport.approvals(),
     )));
     let turn_start_changed = Arc::new(Notify::new());
     let skill_catalog_invalidations = context.skill_catalog_invalidations.clone();
@@ -444,6 +462,7 @@ async fn start_codex_thread(
     let attachment = ChildThreadAttachment {
         transport: transport.clone(),
         cwd: cwd.to_owned(),
+        posture: context.posture,
     };
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
@@ -453,6 +472,7 @@ async fn start_codex_thread(
         turn_start_changed,
         process: process.clone(),
         shutdown_started: AtomicBool::new(false),
+        post_decision_interrupts: StdMutex::new(HashMap::new()),
         pricing_refresh,
     });
     let events = provider_events(
@@ -486,6 +506,7 @@ struct CodexSession {
     turn_start_changed: Arc<Notify>,
     process: Arc<ProcessGuard>,
     shutdown_started: AtomicBool,
+    post_decision_interrupts: StdMutex<HashMap<crate::protocol::ApprovalId, (String, String)>>,
     pricing_refresh: Option<crate::pricing::PricingRefresh>,
 }
 
@@ -525,6 +546,54 @@ impl CodexSession {
 }
 
 impl ProviderSession for CodexSession {
+    fn submit_decision(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let interrupt = self.transport.submit_decision(id, decision).await?;
+            if let Some((thread_id, turn_id)) = interrupt {
+                self.post_decision_interrupts
+                    .lock()
+                    .expect("Codex post-Decision interrupt lock is not poisoned")
+                    .insert(id, (thread_id, turn_id));
+            }
+            Ok(())
+        })
+    }
+
+    fn after_decision_settled(
+        &self,
+        id: crate::protocol::ApprovalId,
+        _decision: crate::protocol::Decision,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let target = self
+                .post_decision_interrupts
+                .lock()
+                .expect("Codex post-Decision interrupt lock is not poisoned")
+                .remove(&id);
+            let Some((thread_id, turn_id)) = target else {
+                return Ok(());
+            };
+            self.transport
+                .request_with_timeout(
+                    "turn/interrupt",
+                    &TurnInterruptParams {
+                        thread_id: &thread_id,
+                        turn_id: &turn_id,
+                    },
+                    self.context.timeouts.interrupt_request,
+                )
+                .await
+                .map_err(|error| {
+                    codex_error_context("Codex permission interruption failed", error)
+                })?;
+            Ok(())
+        })
+    }
+
     fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,
@@ -615,6 +684,7 @@ impl ProviderSession for CodexSession {
                 .active_turn_id()
                 .ok_or_else(|| codex_error("Codex has no active Turn to interrupt"))?;
             self.transport.questionnaires().clear();
+            self.transport.approvals().clear();
             // The interrupt ends the Session's own turn and leaves the child
             // threads it spawned running, so the children go first — the
             // established ordering every Provider keeps.
@@ -685,6 +755,7 @@ impl ProviderSession for CodexSession {
                 refresh.stop();
             }
             self.transport.questionnaires().clear();
+            self.transport.approvals().clear();
             if self.shutdown_started.swap(true, Ordering::AcqRel) {
                 return self.process.wait_until_stopped().await;
             }

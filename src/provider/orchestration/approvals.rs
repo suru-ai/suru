@@ -153,6 +153,14 @@ impl DecisionDeliveries {
                     },
                 )
             });
+            if delivered && matches!(settled, Some(Ok(_))) {
+                // Some native APIs express reject-and-interrupt as two
+                // operations. The interrupt begins only after the Decision is
+                // durable, so an early Turn-ended event cannot erase it.
+                if let Err(error) = provider.after_decision_settled(id, decision).await {
+                    tracing::warn!("Provider post-Decision action failed: {error}");
+                }
+            }
             let result = if !matches!(settled, Some(Ok(_))) {
                 Err("Decision delivery could not be confirmed".into())
             } else if delivered {
@@ -173,16 +181,16 @@ impl DecisionDeliveries {
             if task.is_finished() {
                 return false;
             }
-            let submitting = sessions.snapshot(*session_id).is_some_and(|snapshot| {
+            let keep_running = sessions.snapshot(*session_id).is_some_and(|snapshot| {
                 snapshot.activities.iter().any(|activity| {
-                    matches!(activity, Activity::Approval { id, outcome: ApprovalOutcome::Submitting, .. }
+                    matches!(activity, Activity::Approval { id, outcome: ApprovalOutcome::Submitting | ApprovalOutcome::Decided, .. }
                         if id == activity_id)
                 })
             });
-            if !submitting {
+            if !keep_running {
                 task.abort();
             }
-            submitting
+            keep_running
         });
     }
 }

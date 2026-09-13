@@ -7,6 +7,7 @@
 //! [`reasoning`](super::reasoning) splitter taking the title off a streamed Reasoning summary, and
 //! [`session`] composes them into the Provider runtime and Session the rest of Suru uses.
 
+mod approval;
 mod errand;
 mod projection;
 mod questionnaire;

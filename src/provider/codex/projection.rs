@@ -25,21 +25,21 @@ use tokio::sync::mpsc;
 use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
+    approval::{CodexApprovals, NativeApprovalIdentity, NativeApprovalKind},
     codex_error,
     transport::JsonRpcTransport,
     wire::{
-        NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus, NativeCollabTool,
-        NativeCommandStatus, NativeCumulativeUsage, NativeField, NativeFileChange,
-        NativeFileChangeStatus, NativeNotification, NativeSubagentActivityKind,
-        NativeTurnFailureKind, NativeTurnOutcome, THREAD_APPROVAL_POLICY, THREAD_SANDBOX,
-        ThreadConnectionResult, ThreadResumeParams,
+        CodexPosture, NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus,
+        NativeCollabTool, NativeCommandStatus, NativeCumulativeUsage, NativeField,
+        NativeFileChange, NativeFileChangeStatus, NativeNotification, NativeSubagentActivityKind,
+        NativeTurnFailureKind, NativeTurnOutcome, ThreadConnectionResult, ThreadResumeParams,
     },
 };
 use crate::{
     pricing::{ModelsDevModel, PricingSource},
     protocol::{
-        AgentSelection, FileChange, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, Usage,
+        AgentSelection, Approval, ApprovalSubject, CommandAction, FileChange, ModelId,
+        ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, Usage,
     },
     provider::{
         AttributedProviderEvent, MeteredCost, ProviderActivityId, ProviderCommandStatus,
@@ -63,6 +63,7 @@ const CHILD_THREAD_TURN: &str = "";
 /// Everything the projection must remember between notifications for one Codex connection.
 pub(super) struct NativeCorrelation {
     questionnaires: super::questionnaire::CodexQuestionnaires,
+    approvals: CodexApprovals,
     thread_id: String,
     turn_starting: bool,
     active_turn_id: Option<String>,
@@ -245,10 +246,12 @@ impl NativeCorrelation {
         thread_id: String,
         metered_model: ModelId,
         questionnaires: super::questionnaire::CodexQuestionnaires,
+        approvals: CodexApprovals,
     ) -> Self {
         Self {
             thread_id,
             questionnaires,
+            approvals,
             turn_starting: false,
             active_turn_id: None,
             effective_selection: None,
@@ -499,6 +502,7 @@ impl NativeCorrelation {
             return Vec::new();
         }
         self.questionnaires.end_thread(child_thread_id);
+        self.approvals.end_thread(child_thread_id);
         self.settled_children.insert(child_thread_id.to_owned());
         vec![AttributedProviderEvent {
             attribution: ProviderEventAttribution::OwningSession,
@@ -564,6 +568,7 @@ pub(super) fn provider_events(
 pub(super) struct ChildThreadAttachment {
     pub(super) transport: JsonRpcTransport,
     pub(super) cwd: String,
+    pub(super) posture: CodexPosture,
 }
 
 impl ChildThreadAttachment {
@@ -577,6 +582,7 @@ impl ChildThreadAttachment {
     fn attach(&self, thread_id: String, results: mpsc::UnboundedSender<(String, ModelId)>) {
         let transport = self.transport.clone();
         let cwd = self.cwd.clone();
+        let posture = self.posture;
         tokio::spawn(async move {
             let Ok(result) = transport
                 .request(
@@ -584,8 +590,8 @@ impl ChildThreadAttachment {
                     &ThreadResumeParams {
                         thread_id: &thread_id,
                         cwd: &cwd,
-                        approval_policy: THREAD_APPROVAL_POLICY,
-                        sandbox: THREAD_SANDBOX,
+                        approval_policy: posture.approval_policy(),
+                        sandbox: posture.sandbox(),
                     },
                 )
                 .await
@@ -804,15 +810,30 @@ fn project_native_notification(
                 vec![ProviderEvent::QuestionnaireRequested { questionnaire }],
             ))
         }
+        NativeNotification::CommandApprovalRequested { id, params } => {
+            project_command_approval(correlation, id, params)
+        }
+        NativeNotification::FileChangeApprovalRequested { id, params } => {
+            project_file_change_approval(correlation, id, params)
+        }
+        NativeNotification::PermissionsApprovalRequested {
+            id,
+            params,
+            native_permissions,
+        } => project_permissions_approval(correlation, id, params, native_permissions),
         NativeNotification::QuestionnaireResolved {
             thread_id,
             request_id,
         } => {
             let id = correlation.questionnaires.resolve(&thread_id, &request_id);
-            Ok(match (id, correlation.spawner_attribution(&thread_id)) {
-                (Some(id), Some(attribution)) => attributed(
+            let approval_id = correlation.approvals.resolve(&request_id);
+            Ok(match correlation.spawner_attribution(&thread_id) {
+                Some(attribution) if id.is_some() || approval_id.is_some() => attributed(
                     &attribution,
-                    vec![ProviderEvent::QuestionnaireWithdrawn { id }],
+                    id.map(|id| ProviderEvent::QuestionnaireWithdrawn { id })
+                        .into_iter()
+                        .chain(approval_id.map(|id| ProviderEvent::ApprovalWithdrawn { id }))
+                        .collect(),
                 ),
                 _ => Vec::new(),
             })
@@ -999,6 +1020,7 @@ fn project_native_notification(
                 turns.observe(&turn_id);
             }
             let withdrawn = correlation.questionnaires.end_turn(&thread_id, &turn_id);
+            let withdrawn_approvals = correlation.approvals.end_turn(&thread_id, &turn_id);
             if thread_id == correlation.thread_id {
                 project_turn_completed(
                     correlation,
@@ -1017,6 +1039,11 @@ fn project_native_notification(
                             withdrawn
                                 .into_iter()
                                 .map(|id| ProviderEvent::QuestionnaireWithdrawn { id })
+                                .chain(
+                                    withdrawn_approvals
+                                        .into_iter()
+                                        .map(|id| ProviderEvent::ApprovalWithdrawn { id }),
+                                )
                                 .collect(),
                         )
                     })
@@ -1052,6 +1079,175 @@ fn project_native_notification(
             &agent_path,
         )),
     }
+}
+
+fn project_command_approval(
+    correlation: &mut NativeCorrelation,
+    request_id: super::wire::RequestId,
+    params: super::wire::CommandApprovalParams,
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((_, attribution)) = correlation.item_thread(&params.thread_id, &params.turn_id) else {
+        return Ok(Vec::new());
+    };
+    let subject = if let Some(command) = params.command.clone() {
+        ApprovalSubject::Command {
+            command,
+            cwd: params.cwd.clone(),
+            actions: params
+                .command_actions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(lower_command_action)
+                .collect(),
+        }
+    } else if let Some(network) = &params.network_approval_context {
+        ApprovalSubject::Network {
+            host_or_url: format!("{}://{}", network.protocol, network.host),
+        }
+    } else {
+        ApprovalSubject::OtherTool {
+            name: "Codex command execution".to_owned(),
+            input: serde_json::json!({ "itemId": params.item_id }),
+        }
+    };
+    let id = correlation.approvals.register(NativeApprovalIdentity {
+        request_id,
+        thread_id: params.thread_id,
+        turn_id: params.turn_id,
+        kind: NativeApprovalKind::Command,
+    })?;
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::ApprovalRequested {
+            approval: Approval {
+                id,
+                subject,
+                reason: params.reason,
+            },
+            tool_activity_id: Some(ProviderActivityId::new(params.item_id)),
+        }],
+    ))
+}
+
+fn lower_command_action(action: &Value) -> CommandAction {
+    let command = action
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match action.get("type").and_then(Value::as_str) {
+        Some("read") => match (
+            action.get("name").and_then(Value::as_str),
+            action.get("path").and_then(Value::as_str),
+        ) {
+            (Some(name), Some(path)) => CommandAction::Read {
+                command,
+                name: name.to_owned(),
+                path: PathBuf::from(path),
+            },
+            _ => CommandAction::Unknown { command },
+        },
+        Some("listFiles") => CommandAction::ListFiles {
+            command,
+            path: action
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+        },
+        Some("search") => CommandAction::Search {
+            command,
+            query: action
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            path: action
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+        },
+        _ => CommandAction::Unknown { command },
+    }
+}
+
+fn project_file_change_approval(
+    correlation: &mut NativeCorrelation,
+    request_id: super::wire::RequestId,
+    params: super::wire::FileChangeApprovalParams,
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((thread, attribution)) = correlation.item_thread(&params.thread_id, &params.turn_id)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(file_change) = thread.active_file_changes.get(&params.item_id) else {
+        return Err(codex_error(
+            "Codex requested file-change Approval before starting its item",
+        ));
+    };
+    let paths = file_change
+        .changes
+        .iter()
+        .flat_map(|change| match change {
+            FileChange::Add { path } | FileChange::Delete { path } => vec![path.clone()],
+            FileChange::Update { path, moved_to } => {
+                let mut paths = vec![path.clone()];
+                paths.extend(moved_to.clone());
+                paths
+            }
+        })
+        .collect();
+    let id = correlation.approvals.register(NativeApprovalIdentity {
+        request_id,
+        thread_id: params.thread_id,
+        turn_id: params.turn_id,
+        kind: NativeApprovalKind::FileChange,
+    })?;
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::ApprovalRequested {
+            approval: Approval {
+                id,
+                subject: ApprovalSubject::FileChange {
+                    paths,
+                    grant_root: params.grant_root,
+                },
+                reason: params.reason,
+            },
+            tool_activity_id: Some(ProviderActivityId::new(params.item_id)),
+        }],
+    ))
+}
+
+fn project_permissions_approval(
+    correlation: &mut NativeCorrelation,
+    request_id: super::wire::RequestId,
+    params: super::wire::PermissionsApprovalParams,
+    native_permissions: Value,
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    let Some((_, attribution)) = correlation.item_thread(&params.thread_id, &params.turn_id) else {
+        return Ok(Vec::new());
+    };
+    let id = correlation.approvals.register(NativeApprovalIdentity {
+        request_id,
+        thread_id: params.thread_id,
+        turn_id: params.turn_id,
+        kind: NativeApprovalKind::Permissions {
+            requested: native_permissions,
+        },
+    })?;
+    Ok(attributed(
+        &attribution,
+        vec![ProviderEvent::ApprovalRequested {
+            approval: Approval {
+                id,
+                subject: ApprovalSubject::PermissionGrant {
+                    profile: params.permissions,
+                },
+                reason: params.reason,
+            },
+            tool_activity_id: Some(ProviderActivityId::new(params.item_id)),
+        }],
+    ))
 }
 
 /// One step of a spawned agent's lifecycle, as the spawner's thread reports
@@ -1979,6 +2175,7 @@ mod tests {
         let mut correlation = NativeCorrelation::new(
             THREAD.to_owned(),
             ModelId::new("gpt-fixture"),
+            Default::default(),
             Default::default(),
         );
         correlation.begin_turn_start().expect("claim the Turn slot");

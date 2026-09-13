@@ -294,8 +294,8 @@ async fn codex_resumes_the_known_thread_after_active_process_loss() {
         resume["params"]["cwd"],
         fixture.workspace.path().to_string_lossy().as_ref()
     );
-    assert_eq!(resume["params"]["approvalPolicy"], "never");
-    assert_eq!(resume["params"]["sandbox"], "danger-full-access");
+    assert_eq!(resume["params"]["approvalPolicy"], "on-request");
+    assert_eq!(resume["params"]["sandbox"], "workspace-write");
     assert_eq!(
         requests.last().expect("second Turn request")["params"]["threadId"],
         "recoverable-thread"

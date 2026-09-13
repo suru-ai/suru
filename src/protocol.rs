@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1087,6 +1087,8 @@ impl Default for AppearanceSettings {
 pub struct CodexSettings {
     pub enabled: bool,
     pub reasoning_summary: ReasoningSummaryDetail,
+    pub approval_policy: CodexApprovalPolicy,
+    pub sandbox_mode: CodexSandboxMode,
 }
 
 impl Default for CodexSettings {
@@ -1094,8 +1096,28 @@ impl Default for CodexSettings {
         Self {
             enabled: true,
             reasoning_summary: ReasoningSummaryDetail::default(),
+            approval_policy: CodexApprovalPolicy::default(),
+            sandbox_mode: CodexSandboxMode::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    Untrusted,
+    #[default]
+    OnRequest,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1388,6 +1410,12 @@ pub enum SettingMutation {
     },
     ProviderCodexReasoningSummary {
         value: Option<ReasoningSummaryDetail>,
+    },
+    ProviderCodexApprovalPolicy {
+        value: Option<CodexApprovalPolicy>,
+    },
+    ProviderCodexSandboxMode {
+        value: Option<CodexSandboxMode>,
     },
     ProviderCopilotEnabled {
         value: Option<bool>,

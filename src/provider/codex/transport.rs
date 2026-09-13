@@ -57,6 +57,7 @@ type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
     questionnaires: super::questionnaire::CodexQuestionnaires,
+    approvals: super::approval::CodexApprovals,
     events: mpsc::UnboundedSender<Result<NativeNotification, ProviderError>>,
     terminated: AtomicBool,
 }
@@ -102,6 +103,7 @@ impl JsonRpcTransport {
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
             questionnaires: super::questionnaire::CodexQuestionnaires::default(),
+            approvals: super::approval::CodexApprovals::default(),
             events,
             terminated: AtomicBool::new(false),
         });
@@ -222,6 +224,10 @@ impl JsonRpcTransport {
         self.state.questionnaires.clone()
     }
 
+    pub(super) fn approvals(&self) -> super::approval::CodexApprovals {
+        self.state.approvals.clone()
+    }
+
     pub(super) async fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,
@@ -234,6 +240,24 @@ impl JsonRpcTransport {
             "answer Codex user-input request",
         )
         .await
+    }
+
+    pub(super) async fn submit_decision(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> Result<Option<(String, String)>, ProviderError> {
+        let native = self.state.approvals.take_decision(id, decision)?;
+        write_json_line(
+            &self.writer,
+            &super::wire::ClientResponse {
+                id: native.request_id,
+                result: native.result,
+            },
+            "answer Codex Approval request",
+        )
+        .await?;
+        Ok(native.interrupt)
     }
 
     pub(super) async fn close(&self) {
@@ -378,6 +402,38 @@ async fn route_message(
                 }
                 return Ok(());
             }
+            let approval = match method {
+                "item/commandExecution/requestApproval" => {
+                    Some(NativeNotification::CommandApprovalRequested {
+                        id: id.clone(),
+                        params: decode_notification_params(method, message.params.as_ref())?,
+                    })
+                }
+                "item/fileChange/requestApproval" => {
+                    Some(NativeNotification::FileChangeApprovalRequested {
+                        id: id.clone(),
+                        params: decode_notification_params(method, message.params.as_ref())?,
+                    })
+                }
+                "item/permissions/requestApproval" => {
+                    let params = decode_notification_params::<
+                        super::wire::PermissionsApprovalParams,
+                    >(method, message.params.as_ref())?;
+                    let native_permissions = params.permissions.clone();
+                    Some(NativeNotification::PermissionsApprovalRequested {
+                        id: id.clone(),
+                        params,
+                        native_permissions,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(approval) = approval {
+                for event in state.questionnaires.redact_notification(approval) {
+                    let _ = state.events.send(Ok(event));
+                }
+                return Ok(());
+            }
             if is_unsupported_interaction(method) {
                 reject_server_request(
                     writer,
@@ -386,9 +442,11 @@ async fn route_message(
                     format!("Suru does not support interactive request `{display_method}`"),
                 )
                 .await?;
-                return Err(codex_error(format!(
-                    "Codex app-server requested unsupported interaction `{display_method}`"
-                )));
+                tracing::warn!(
+                    method = %display_method,
+                    "Codex app-server requested an unsupported interaction"
+                );
+                return Ok(());
             }
             reject_server_request(
                 writer,
@@ -453,14 +511,7 @@ async fn reject_server_request(
 }
 
 fn is_unsupported_interaction(method: &str) -> bool {
-    matches!(
-        method,
-        "item/commandExecution/requestApproval"
-            | "item/fileChange/requestApproval"
-            | "item/permissions/requestApproval"
-            | "mcpServer/elicitation/request"
-            | "item/tool/call"
-    )
+    matches!(method, "mcpServer/elicitation/request" | "item/tool/call")
 }
 
 fn decode_notification(

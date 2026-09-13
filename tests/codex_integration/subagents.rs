@@ -275,6 +275,8 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
         resumed["params"]["threadId"], "child-thread",
         "the attach names the spawned child thread"
     );
+    assert_eq!(resumed["params"]["approvalPolicy"], "on-request");
+    assert_eq!(resumed["params"]["sandbox"], "workspace-write");
 
     opened.server.shutdown().await.expect("shut down server");
 }

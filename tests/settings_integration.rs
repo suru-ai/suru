@@ -11,10 +11,10 @@ use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EmojiVisibility,
-        FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
-        SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot,
-        SidebarScope, SidebarVisibility, TitleErrand,
+        AgentSelection, AppearanceMode, AutoSettle, CodexApprovalPolicy, CodexSandboxMode,
+        CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId, ProviderId,
+        ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -1509,6 +1509,83 @@ async fn pinning_the_built_in_default_still_writes_it_and_unset_takes_it_back_ou
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn codex_posture_defaults_pin_through_the_config_document_and_reset() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-codex-posture")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (client, initial) = attach(state_dir.path(), "settings-codex-posture").await;
+    assert_eq!(
+        initial.settings.provider.codex.approval_policy,
+        CodexApprovalPolicy::OnRequest
+    );
+    assert_eq!(
+        initial.settings.provider.codex.sandbox_mode,
+        CodexSandboxMode::WorkspaceWrite
+    );
+
+    let pinned = client
+        .mutate_setting(SettingMutation::ProviderCodexApprovalPolicy {
+            value: Some(CodexApprovalPolicy::Never),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.settings.provider.codex.approval_policy,
+        CodexApprovalPolicy::Never
+    );
+    let pinned = client
+        .mutate_setting(SettingMutation::ProviderCodexSandboxMode {
+            value: Some(CodexSandboxMode::DangerFullAccess),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.settings.provider.codex.sandbox_mode,
+        CodexSandboxMode::DangerFullAccess
+    );
+    assert!(
+        pinned
+            .pinned
+            .contains(&"provider.codex.approvalPolicy".to_owned())
+    );
+    assert!(
+        pinned
+            .pinned
+            .contains(&"provider.codex.sandboxMode".to_owned())
+    );
+    let document = config_document(config_dir.path());
+    assert!(document.contains("\"approvalPolicy\": \"never\""));
+    assert!(document.contains("\"sandboxMode\": \"danger-full-access\""));
+
+    client
+        .mutate_setting(SettingMutation::ProviderCodexApprovalPolicy { value: None })
+        .await
+        .unwrap();
+    let reset = client
+        .mutate_setting(SettingMutation::ProviderCodexSandboxMode { value: None })
+        .await
+        .unwrap();
+    assert_eq!(
+        reset.settings.provider.codex.approval_policy,
+        CodexApprovalPolicy::OnRequest
+    );
+    assert_eq!(
+        reset.settings.provider.codex.sandbox_mode,
+        CodexSandboxMode::WorkspaceWrite
+    );
+    assert_eq!(reset.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

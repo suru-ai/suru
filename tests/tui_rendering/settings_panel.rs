@@ -1405,6 +1405,24 @@ fn enter_reveals_a_providers_further_settings_beneath_it_and_hides_them_again() 
         summary.contains("auto") && summary.contains("[default]"),
         "and reading as an ordinary Setting row, value and provenance alike: {summary:?}"
     );
+    let policy = row(&application, "Approval policy");
+    assert!(
+        policy.contains("on-request") && policy.contains("[default]"),
+        "Codex's native Approval policy appears under its row: {policy:?}"
+    );
+    let sandbox = row(&application, "Sandbox mode");
+    assert!(
+        sandbox.contains("workspace-write") && sandbox.contains("[default]"),
+        "Codex's native sandbox appears under its row: {sandbox:?}"
+    );
+    assert_eq!(
+        row_index(&rows, "Approval policy"),
+        row_index(&rows, "Reasoning summary") + 1
+    );
+    assert_eq!(
+        row_index(&rows, "Sandbox mode"),
+        row_index(&rows, "Approval policy") + 1
+    );
 
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     assert!(

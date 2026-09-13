@@ -1112,6 +1112,19 @@ pub trait ProviderSession: Send + Sync + 'static {
         Box::pin(async { Err(ProviderError::new("Approval is unavailable")) })
     }
 
+    /// Completes Provider work that must begin only after Suru has durably
+    /// recorded a delivered Decision. Providers normally have nothing to do;
+    /// a native permission API may require Suru to interrupt after first
+    /// returning its rejection callback.
+    fn after_decision_settled(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> ProviderFuture<'_, ()> {
+        let _ = (id, decision);
+        Box::pin(async { Ok(()) })
+    }
+
     fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,

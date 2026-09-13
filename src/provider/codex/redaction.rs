@@ -97,6 +97,18 @@ impl SecretRedactor {
             *path = self.text(text).into();
         }
     }
+    fn json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.text(text),
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(|value| self.json(value));
+            }
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|value| self.json(value));
+            }
+            _ => {}
+        }
+    }
     fn delta(&mut self, key: Stream, delta: &mut String) {
         let mut input = self.tails.remove(&key).unwrap_or_default();
         input.push_str(delta);
@@ -238,6 +250,30 @@ impl SecretRedactor {
                 if let Some(cwd) = cwd {
                     self.path(cwd);
                 }
+            }
+            Event::CommandApprovalRequested { params, .. } => {
+                params.reason = params.reason.as_ref().map(|text| self.text(text));
+                params.command = params.command.as_ref().map(|text| self.text(text));
+                if let Some(cwd) = &mut params.cwd {
+                    self.path(cwd);
+                }
+                if let Some(network) = &mut params.network_approval_context {
+                    network.host = self.text(&network.host);
+                    network.protocol = self.text(&network.protocol);
+                }
+                if let Some(actions) = &mut params.command_actions {
+                    actions.iter_mut().for_each(|action| self.json(action));
+                }
+            }
+            Event::FileChangeApprovalRequested { params, .. } => {
+                params.reason = params.reason.as_ref().map(|text| self.text(text));
+                if let Some(root) = &mut params.grant_root {
+                    self.path(root);
+                }
+            }
+            Event::PermissionsApprovalRequested { params, .. } => {
+                params.reason = params.reason.as_ref().map(|text| self.text(text));
+                self.json(&mut params.permissions);
             }
             Event::FileChangeStarted { changes, .. }
             | Event::FileChangeUpdated { changes, .. }

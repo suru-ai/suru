@@ -31,11 +31,11 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AppearanceMode, AutoSettle, CommandAutoExpand, EffectiveSettings,
-    EmojiVisibility, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
-    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
-    TextSelectionCopy, TitleErrand,
+    AgentSelection, AppearanceMode, AutoSettle, CodexApprovalPolicy, CodexSandboxMode,
+    CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture, LandingPage, ProviderId,
+    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
+    SidebarVisibility, TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -65,6 +65,8 @@ const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
+const PROVIDER_CODEX_APPROVAL_POLICY: &str = "provider.codex.approvalPolicy";
+const PROVIDER_CODEX_SANDBOX_MODE: &str = "provider.codex.sandboxMode";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
 const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
 const SERVING_ENABLED: &str = "serving.enabled";
@@ -523,6 +525,12 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             *value == Some(settings.provider.codex.reasoning_summary)
+        }
+        SettingMutation::ProviderCodexApprovalPolicy { value } => {
+            *value == Some(settings.provider.codex.approval_policy)
+        }
+        SettingMutation::ProviderCodexSandboxMode { value } => {
+            *value == Some(settings.provider.codex.sandbox_mode)
         }
         SettingMutation::ProviderCopilotEnabled { value } => {
             *value == Some(settings.provider.copilot.enabled)
@@ -1029,6 +1037,72 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
+        key: PROVIDER_CODEX_APPROVAL_POLICY,
+        label: "Approval policy",
+        description: "When Codex asks before running a Tool",
+        group: SettingGroup::Providers,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "untrusted",
+                build_mutation: || SettingMutation::ProviderCodexApprovalPolicy {
+                    value: Some(CodexApprovalPolicy::Untrusted),
+                },
+            },
+            SettingChoice {
+                value: "on-request",
+                build_mutation: || SettingMutation::ProviderCodexApprovalPolicy {
+                    value: Some(CodexApprovalPolicy::OnRequest),
+                },
+            },
+            SettingChoice {
+                value: "never",
+                build_mutation: || SettingMutation::ProviderCodexApprovalPolicy {
+                    value: Some(CodexApprovalPolicy::Never),
+                },
+            },
+        ]),
+        reset: SettingMutation::ProviderCodexApprovalPolicy { value: None },
+        apply: |settings, value| {
+            apply_value(value, |policy| {
+                settings.provider.codex.approval_policy = policy;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: PROVIDER_CODEX_SANDBOX_MODE,
+        label: "Sandbox mode",
+        description: "What Codex may access without an Approval",
+        group: SettingGroup::Providers,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "read-only",
+                build_mutation: || SettingMutation::ProviderCodexSandboxMode {
+                    value: Some(CodexSandboxMode::ReadOnly),
+                },
+            },
+            SettingChoice {
+                value: "workspace-write",
+                build_mutation: || SettingMutation::ProviderCodexSandboxMode {
+                    value: Some(CodexSandboxMode::WorkspaceWrite),
+                },
+            },
+            SettingChoice {
+                value: "danger-full-access",
+                build_mutation: || SettingMutation::ProviderCodexSandboxMode {
+                    value: Some(CodexSandboxMode::DangerFullAccess),
+                },
+            },
+        ]),
+        reset: SettingMutation::ProviderCodexSandboxMode { value: None },
+        apply: |settings, value| {
+            apply_value(value, |mode| {
+                settings.provider.codex.sandbox_mode = mode;
+            })
+        },
+    },
+    SettingDescriptor {
         key: PROVIDER_COPILOT_ENABLED,
         label: "Copilot Provider",
         description: "Whether Suru offers Copilot, or leaves it entirely alone",
@@ -1364,6 +1438,12 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
+        }
+        SettingMutation::ProviderCodexApprovalPolicy { value } => {
+            (PROVIDER_CODEX_APPROVAL_POLICY, pinned(value))
+        }
+        SettingMutation::ProviderCodexSandboxMode { value } => {
+            (PROVIDER_CODEX_SANDBOX_MODE, pinned(value))
         }
         SettingMutation::ProviderCopilotEnabled { value } => {
             (PROVIDER_COPILOT_ENABLED, pinned(value))

@@ -607,8 +607,8 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         requests[2]["params"]["cwd"],
         workspace.path().to_string_lossy().as_ref()
     );
-    assert_eq!(requests[2]["params"]["approvalPolicy"], "never");
-    assert_eq!(requests[2]["params"]["sandbox"], "danger-full-access");
+    assert_eq!(requests[2]["params"]["approvalPolicy"], "on-request");
+    assert_eq!(requests[2]["params"]["sandbox"], "workspace-write");
     assert_eq!(requests[2]["params"]["ephemeral"], false);
     assert!(requests[2]["params"].get("model").is_none());
     assert_eq!(requests[3]["params"]["threadId"], "native-thread");
@@ -842,6 +842,12 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     let fixture = ScriptedCodex::new_multiprocess(PERSISTED_RESUME_CODEX);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{"provider":{"codex":{"approvalPolicy":"never","sandboxMode":"danger-full-access"}}}"#,
+    )
+    .unwrap();
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let execution_directory = workspace.path().join("packages/nested agent directory");
     std::fs::create_dir_all(&execution_directory).unwrap();
@@ -849,7 +855,8 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
     let channel = "codex-persisted-resume-state";
     let config = ServerConfig::new(state_dir.path(), channel)
         .expect("configure original server")
-        .with_data_dir(data_dir.path());
+        .with_data_dir(data_dir.path())
+        .with_config_dir(config_dir.path());
 
     let original = server::spawn_with_provider(
         config.clone(),
@@ -970,6 +977,8 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
             request["params"]["cwd"],
             execution_directory.to_string_lossy().as_ref()
         );
+        assert_eq!(request["params"]["approvalPolicy"], "never");
+        assert_eq!(request["params"]["sandbox"], "danger-full-access");
     }
 
     drop(replacement_client);

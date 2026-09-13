@@ -12,9 +12,10 @@ use serde_json::Value;
 use super::{DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID};
 use crate::{
     protocol::{
-        AgentSelection, FileChange, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionValue, ProviderId, ReasoningSummaryDetail, Usage,
+        AgentSelection, CodexApprovalPolicy, CodexSandboxMode, FileChange, ModelAvailability,
+        ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
+        ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue, ProviderId,
+        ReasoningSummaryDetail, Usage,
     },
     provider::{ProviderError, exclusive_count, humanized_wire_id, reported_count},
 };
@@ -63,6 +64,50 @@ pub(super) struct ServerRequestResolvedParams {
 pub(super) struct ClientResponse<T> {
     pub(super) id: RequestId,
     pub(super) result: T,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CommandApprovalParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
+    #[serde(default)]
+    pub(super) reason: Option<String>,
+    #[serde(default)]
+    pub(super) network_approval_context: Option<NetworkApprovalContext>,
+    #[serde(default)]
+    pub(super) command: Option<String>,
+    #[serde(default)]
+    pub(super) cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) command_actions: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct NetworkApprovalContext {
+    pub(super) host: String,
+    pub(super) protocol: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct FileChangeApprovalParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
+    pub(super) reason: Option<String>,
+    pub(super) grant_root: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PermissionsApprovalParams {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) item_id: String,
+    pub(super) reason: Option<String>,
+    pub(super) permissions: Value,
 }
 
 // JSON-RPC envelope.
@@ -277,19 +322,45 @@ impl From<NativeModel> for ModelDescriptor {
 
 // Thread lifecycle.
 
-/// Codex cannot ask the user anything through Suru, so every thread — the
-/// Session's own and each attached collab child — starts pre-approved with the
-/// sandbox open. One declaration, so a policy change reaches every site that
-/// speaks for a thread.
-pub(super) const THREAD_APPROVAL_POLICY: &str = "never";
-pub(super) const THREAD_SANDBOX: &str = "danger-full-access";
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CodexPosture {
+    pub(super) approval_policy: CodexApprovalPolicy,
+    pub(super) sandbox_mode: CodexSandboxMode,
+}
+
+impl Default for CodexPosture {
+    fn default() -> Self {
+        Self {
+            approval_policy: CodexApprovalPolicy::default(),
+            sandbox_mode: CodexSandboxMode::default(),
+        }
+    }
+}
+
+impl CodexPosture {
+    pub(super) const fn approval_policy(self) -> &'static str {
+        match self.approval_policy {
+            CodexApprovalPolicy::Untrusted => "untrusted",
+            CodexApprovalPolicy::OnRequest => "on-request",
+            CodexApprovalPolicy::Never => "never",
+        }
+    }
+
+    pub(super) const fn sandbox(self) -> &'static str {
+        match self.sandbox_mode {
+            CodexSandboxMode::ReadOnly => "read-only",
+            CodexSandboxMode::WorkspaceWrite => "workspace-write",
+            CodexSandboxMode::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ThreadStartParams<'a> {
     pub(super) cwd: &'a str,
-    pub(super) approval_policy: &'static str,
-    pub(super) sandbox: &'static str,
+    pub(super) approval_policy: &'a str,
+    pub(super) sandbox: &'a str,
     pub(super) ephemeral: bool,
 }
 
@@ -298,8 +369,8 @@ pub(super) struct ThreadStartParams<'a> {
 pub(super) struct ThreadResumeParams<'a> {
     pub(super) thread_id: &'a str,
     pub(super) cwd: &'a str,
-    pub(super) approval_policy: &'static str,
-    pub(super) sandbox: &'static str,
+    pub(super) approval_policy: &'a str,
+    pub(super) sandbox: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -986,6 +1057,21 @@ pub(super) enum NativeNotification {
     QuestionnaireRequested {
         id: RequestId,
         params: UserInputParams,
+    },
+    CommandApprovalRequested {
+        id: RequestId,
+        params: CommandApprovalParams,
+    },
+    FileChangeApprovalRequested {
+        id: RequestId,
+        params: FileChangeApprovalParams,
+    },
+    PermissionsApprovalRequested {
+        id: RequestId,
+        params: PermissionsApprovalParams,
+        /// Provider-owned callback payload, kept apart from the redacted copy
+        /// projected into durable history.
+        native_permissions: Value,
     },
     QuestionnaireResolved {
         thread_id: String,

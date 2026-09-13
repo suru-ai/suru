@@ -6,9 +6,9 @@ use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent, SessionSubscription},
     protocol::{
-        Activity, Answer, CreateSessionRequest, InitialPrompt, PromptId, QuestionAnswer,
-        Questionnaire, QuestionnaireOutcome, QuestionnaireSubmission, SessionId, SessionSnapshot,
-        TurnStatus,
+        Activity, Answer, ApprovalOutcome, ApprovalSubject, CreateSessionRequest, Decision,
+        InitialPrompt, PromptId, QuestionAnswer, Questionnaire, QuestionnaireOutcome,
+        QuestionnaireSubmission, SessionId, SessionSnapshot, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -329,9 +329,23 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
             "options":[{"label":SECRET,"description":SECRET}]
         }]),
     );
+    let permission_request = json!({
+        "id": "secret-permission",
+        "method": "item/permissions/requestApproval",
+        "params": {
+            "threadId": "native-thread",
+            "turnId": "native-turn",
+            "itemId": "secret-tool",
+            "startedAtMs": 2,
+            "cwd": "project",
+            "reason": format!("read {SECRET}"),
+            "permissions": {"fileSystem": {"read": [format!("cache/{SECRET}")]}}
+        }
+    });
     let responses = format!(
         r#"    *'"id":"secret-request","result"'*)
       printf '%s\n' "$line" >&2
+      printf '%s\n' '{permission_request}'
 {echo_request}      ;;
     *'"id":"echo-option","result"'*)
       printf '%s\n' "$line" >&2
@@ -373,6 +387,50 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
     assert_eq!(
         response(&fixture, json!("secret-request")).await["answers"]["token"],
         json!({"answers":[format!("user_note: {SECRET}")]})
+    );
+    let approval_snapshot = live
+        .until(|snapshot| {
+            snapshot.activities.iter().any(|activity| {
+                matches!(
+                    activity,
+                    Activity::Approval {
+                        outcome: ApprovalOutcome::Pending,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    let approval = approval_snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                outcome: ApprovalOutcome::Pending,
+                ..
+            } => Some(approval.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(approval.reason.as_deref(), Some("read [redacted]"));
+    assert_eq!(
+        approval.subject,
+        ApprovalSubject::PermissionGrant {
+            profile: json!({"fileSystem": {"read": ["cache/[redacted]"]}}),
+        }
+    );
+    live.client
+        .submit_decision(live.id, approval.id, Decision::Accept)
+        .await
+        .unwrap();
+    assert_eq!(
+        response(&fixture, json!("secret-permission")).await,
+        json!({
+            "permissions": {"fileSystem": {"read": [format!("cache/{SECRET}")]}},
+            "scope": "turn",
+        }),
+        "redaction never mutates the Provider-owned grant payload"
     );
     let echo = live.pending().await;
     assert!(!serde_json::to_string(&echo).unwrap().contains(SECRET));
