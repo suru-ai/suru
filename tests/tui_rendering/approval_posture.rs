@@ -30,6 +30,7 @@ fn session_chrome_cycle_and_picker_use_the_typed_approval_posture_without_losing
             sandbox_mode: CodexSandboxMode::WorkspaceWrite,
         },
         pinned: true,
+        application: suru::protocol::ApprovalPostureApplication::Applied,
     });
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -134,6 +135,7 @@ fn a_subagents_inherited_posture_has_no_independent_controls() {
             permission_mode: suru::protocol::ClaudePermissionMode::DontAsk,
         },
         pinned: true,
+        application: suru::protocol::ApprovalPostureApplication::Applied,
     });
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -157,4 +159,34 @@ fn a_subagents_inherited_posture_has_no_independent_controls() {
     assert!(frame.contains("inherited"), "{frame}");
     assert!(!frame.contains("pinned"), "{frame}");
     assert!(!frame.contains("Follow Server Settings (reset)"), "{frame}");
+}
+
+#[test]
+fn codex_posture_delay_is_visible_in_normal_session_chrome() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let session_id = SessionId::new();
+    let mut snapshot = selected_session_snapshot(
+        session_id,
+        workspace.path(),
+        AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-test"),
+            options: Vec::new(),
+        },
+    );
+    snapshot.session.approval_posture = Some(SessionApprovalPosture {
+        value: ApprovalPosture::Codex {
+            approval_policy: CodexApprovalPolicy::Never,
+            sandbox_mode: CodexSandboxMode::DangerFullAccess,
+        },
+        pinned: true,
+        application: suru::protocol::ApprovalPostureApplication::NextTurn,
+    });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+
+    let frame = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(frame.contains("takes effect next Turn"), "{frame}");
 }

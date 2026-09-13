@@ -7,13 +7,229 @@ use crate::{
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        Activity, AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, CodexApprovalPolicy,
-        CodexSandboxMode, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        ProviderId, SessionApprovalPosture, SettingMutation, UpdateApprovalPostureRequest,
+        Activity, AdmitPromptRequest, AgentId, AgentIdentity, Approval, ApprovalId,
+        ApprovalOutcome, ApprovalPosture, ApprovalPostureApplication, ApprovalSubject,
+        CodexApprovalPolicy, CodexSandboxMode, CreateSessionRequest, Decision, InitialPrompt,
+        PromptDelivery, PromptId, ProviderId, SessionApprovalPosture, SettingMutation,
+        UpdateApprovalPostureRequest,
     },
     provider::{ProviderEvent, ProviderSubagentId},
     server::{self, ServerConfig},
 };
+
+#[tokio::test]
+async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_answerable() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![hosted_model("codex", "gpt-test")],
+    );
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state.path(), "approval-posture-live").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "approval-posture-live").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_managed_client_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: Some(hosted_selection("codex", "gpt-test")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().into(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "work".into(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let mut native = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: hosted_selection("codex", "gpt-test"),
+    });
+    native.next_turn().await.succeed();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        subject: ApprovalSubject::Command {
+            command: "cargo nextest run".into(),
+            cwd: None,
+            actions: Vec::new(),
+        },
+        reason: Some("run checks".into()),
+    };
+    native
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: approval.clone(),
+            tool_activity_id: None,
+        })
+        .await;
+    native.gate_posture_updates();
+    let automatic = ApprovalPosture::Codex {
+        approval_policy: CodexApprovalPolicy::Never,
+        sandbox_mode: CodexSandboxMode::DangerFullAccess,
+    };
+    let update = client.update_approval_posture(
+        created.session.id,
+        UpdateApprovalPostureRequest {
+            posture: Some(automatic),
+        },
+    );
+    let native_update = async {
+        let update = native.next_posture_update().await;
+        assert_eq!(update.posture, automatic);
+        assert!(update.has_active_work);
+        update.next_turn();
+    };
+    let (updated, ()) = tokio::join!(update, native_update);
+    assert_eq!(
+        updated.unwrap().application,
+        ApprovalPostureApplication::NextTurn
+    );
+    let snapshot = client.read_session(created.session.id).await.unwrap();
+    assert!(snapshot.pending_approvals.contains(&approval.id));
+    assert!(snapshot.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Approval { approval: stored, outcome: ApprovalOutcome::Pending, .. }
+            if stored.id == approval.id
+    )));
+
+    let decision = client.submit_decision(created.session.id, approval.id, Decision::Accept);
+    let delivered = async {
+        let (id, value) = native.next_decision().await;
+        assert_eq!((id, value), (approval.id, Decision::Accept));
+    };
+    let (decided, ()) = tokio::join!(decision, delivered);
+    decided.unwrap();
+
+    native
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "next".into(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+    let next = native.next_turn().await;
+    assert_eq!(next.approval_posture(), Some(&automatic));
+    next.succeed();
+    assert_eq!(
+        client
+            .read_session(created.session.id)
+            .await
+            .unwrap()
+            .session
+            .approval_posture
+            .unwrap()
+            .application,
+        ApprovalPostureApplication::Applied
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unpinned_active_session_adopts_server_posture_without_losing_its_delay_on_reads() {
+    let state = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![hosted_model("codex", "gpt-test")],
+    );
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state.path(), "approval-posture-setting-live")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "approval-posture-setting-live").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_managed_client_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: Some(hosted_selection("codex", "gpt-test")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().into(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "work".into(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    let mut native = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: hosted_selection("codex", "gpt-test"),
+    });
+    native.next_turn().await.succeed();
+    native.gate_posture_updates();
+
+    let setting = client.mutate_setting(SettingMutation::ProviderCodexSandboxMode {
+        value: Some(CodexSandboxMode::ReadOnly),
+    });
+    let apply = async {
+        let update = native.next_posture_update().await;
+        assert_eq!(
+            update.posture,
+            ApprovalPosture::Codex {
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_mode: CodexSandboxMode::ReadOnly,
+            }
+        );
+        assert!(update.has_active_work);
+        update.next_turn();
+    };
+    let (setting, ()) = tokio::join!(setting, apply);
+    setting.unwrap();
+    let delayed = client.read_session(created.session.id).await.unwrap();
+    assert_eq!(
+        delayed.session.approval_posture.unwrap().application,
+        ApprovalPostureApplication::NextTurn
+    );
+
+    client
+        .mutate_setting(SettingMutation::AppearanceShowIcons { value: Some(false) })
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .read_session(created.session.id)
+            .await
+            .unwrap()
+            .session
+            .approval_posture
+            .unwrap()
+            .application,
+        ApprovalPostureApplication::NextTurn,
+        "unrelated Settings adoption and hydration preserve the delayed native state"
+    );
+    server.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_turn_starts() {
@@ -79,6 +295,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
         Some(SessionApprovalPosture {
             value: default,
             pinned: false,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         }),
         "native Provider selection publishes its effective posture before the Turn"
     );
@@ -103,6 +320,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
         SessionApprovalPosture {
             value: pinned.clone(),
             pinned: true,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         }
     );
     client
@@ -126,7 +344,8 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
             .approval_posture,
         Some(SessionApprovalPosture {
             value: pinned.clone(),
-            pinned: true
+            pinned: true,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         })
     );
 
@@ -163,7 +382,8 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
             .unwrap(),
         SessionApprovalPosture {
             value: followed.clone(),
-            pinned: false
+            pinned: false,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         }
     );
     drop(native);
@@ -180,7 +400,8 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
         restored.session.approval_posture,
         Some(SessionApprovalPosture {
             value: followed,
-            pinned: false
+            pinned: false,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         })
     );
     restarted.shutdown().await.unwrap();
@@ -306,7 +527,8 @@ async fn a_pinned_approval_posture_survives_server_restart() {
         restored.session.approval_posture,
         Some(SessionApprovalPosture {
             value: pinned,
-            pinned: true
+            pinned: true,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         })
     );
     restarted.shutdown().await.unwrap();
@@ -395,6 +617,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
         Some(SessionApprovalPosture {
             value: pinned,
             pinned: true,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         })
     );
     let error = client
@@ -437,6 +660,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
         Some(SessionApprovalPosture {
             value: pinned,
             pinned: true,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         }),
         "global Settings do not overwrite a native posture inherited from a pinned parent"
     );
@@ -461,6 +685,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
         Some(SessionApprovalPosture {
             value: followed,
             pinned: false,
+            application: suru::protocol::ApprovalPostureApplication::Applied,
         }),
         "resetting the owning Session refreshes every child's inherited reading"
     );

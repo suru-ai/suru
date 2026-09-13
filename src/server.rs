@@ -990,9 +990,10 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
             match adopt_settings(&state.settings, &state.runtimes, &state.serving, &snapshot).await
             {
                 Ok(()) => {
-                    state
+                    let changed = state
                         .sessions
                         .reconcile_approval_postures(&snapshot.settings);
+                    apply_live_posture_updates(&state, changed).await;
                     Json(snapshot).into_response()
                 }
                 Err(error) => {
@@ -2030,12 +2031,54 @@ async fn update_approval_posture(
         Ok(request) => request,
         Err(response) => return response,
     };
-    match state.sessions.apply_approval_posture_command(
-        session_id,
-        request,
-        &state.settings.borrow().settings,
-    ) {
-        Ok(posture) => Json(posture).into_response(),
+    let settings = state.settings.borrow().settings.clone();
+    match state
+        .sessions
+        .apply_approval_posture_command(session_id, request, &settings)
+    {
+        Ok(posture) => {
+            match state
+                .providers
+                .update_approval_posture(session_id, posture.value)
+                .await
+            {
+                Ok(application) => {
+                    let application = match application {
+                        crate::provider::ProviderPostureApplication::Applied => {
+                            crate::protocol::ApprovalPostureApplication::Applied
+                        }
+                        crate::provider::ProviderPostureApplication::NextTurn => {
+                            crate::protocol::ApprovalPostureApplication::NextTurn
+                        }
+                    };
+                    state.sessions.mark_approval_posture_application(
+                        session_id,
+                        posture.value,
+                        application,
+                    );
+                    Json(
+                        state
+                            .sessions
+                            .snapshot(session_id)
+                            .and_then(|snapshot| snapshot.session.approval_posture)
+                            .unwrap_or(posture),
+                    )
+                    .into_response()
+                }
+                Err(error) => {
+                    state.sessions.mark_approval_posture_application(
+                        session_id,
+                        posture.value,
+                        crate::protocol::ApprovalPostureApplication::Failed,
+                    );
+                    session_error_response(
+                        StatusCode::CONFLICT,
+                        SessionErrorCode::InvalidCommand,
+                        error,
+                    )
+                }
+            }
+        }
         Err(ApprovalPostureMutationError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
@@ -2059,6 +2102,32 @@ async fn update_approval_posture(
         Err(ApprovalPostureMutationError::Storage) => {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+async fn apply_live_posture_updates(
+    state: &AppState,
+    changed: Vec<(SessionId, crate::protocol::ApprovalPosture)>,
+) {
+    let updates = changed.into_iter().map(|(session_id, posture)| async move {
+        let application = match state.providers.update_approval_posture(session_id, posture).await {
+            Ok(crate::provider::ProviderPostureApplication::Applied) => {
+                crate::protocol::ApprovalPostureApplication::Applied
+            }
+            Ok(crate::provider::ProviderPostureApplication::NextTurn) => {
+                crate::protocol::ApprovalPostureApplication::NextTurn
+            }
+            Err(error) => {
+                tracing::error!(session = %session_id, "could not apply live Approval Posture: {error}");
+                crate::protocol::ApprovalPostureApplication::Failed
+            }
+        };
+        (session_id, posture, application)
+    });
+    for (session_id, posture, application) in futures_util::future::join_all(updates).await {
+        state
+            .sessions
+            .mark_approval_posture_application(session_id, posture, application);
     }
 }
 

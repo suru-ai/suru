@@ -12,8 +12,9 @@
 //! as is Resume State Suru cannot read — a Session that quietly opened an empty conversation would
 //! read as continuous while having forgotten everything.
 //!
-//! The child is launched under the Server's fixed native permission mode, with Suru's stdio
-//! permission-prompt channel and the Session's Workspace as its working directory. A Prompt is
+//! The child is launched under the Session's effective native permission mode, which later changes
+//! reach the same process over its control channel. Suru's stdio permission-prompt channel and the
+//! Session's Workspace are carried with it. A Prompt is
 //! delivered as a stream-json user message; the Turn's output streams back through
 //! [`super::projection`] and the CLI's terminal result message Settles it.
 //!
@@ -26,7 +27,7 @@ use std::{
     ffi::OsString,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -169,7 +170,8 @@ pub(super) async fn start_claude_session(
         }),
         turn,
         skills,
-        permission_mode,
+        permission_mode: StdMutex::new(permission_mode),
+        posture_request_timeout: timings.control_request,
         interrupt_request_timeout: timings.interrupt_request,
         shutdown_started: AtomicBool::new(false),
     });
@@ -243,7 +245,8 @@ struct ClaudeSession {
     /// What the Session and the projection of its conversation agree on about the Turn in flight.
     turn: Arc<TurnInFlight>,
     skills: ClaudeSkills,
-    permission_mode: ClaudePermissionMode,
+    permission_mode: StdMutex<ClaudePermissionMode>,
+    posture_request_timeout: Duration,
     interrupt_request_timeout: Duration,
     shutdown_started: AtomicBool,
 }
@@ -309,6 +312,44 @@ impl ClaudeSession {
 }
 
 impl ProviderSession for ClaudeSession {
+    fn update_approval_posture(
+        &self,
+        posture: crate::protocol::ApprovalPosture,
+        _has_active_work: bool,
+    ) -> ProviderFuture<'_, crate::provider::ProviderPostureApplication> {
+        Box::pin(async move {
+            let crate::protocol::ApprovalPosture::Claude { permission_mode } = posture else {
+                return Err(claude_error("Approval Posture belongs to another Provider"));
+            };
+            let mut slot = self.child.lock().await;
+            if let Some(child) = slot.running.as_mut()
+                && child.permission_mode != permission_mode
+            {
+                child
+                    .transport
+                    .control_request(
+                        &ControlRequest::SetPermissionMode {
+                            mode: permission_mode,
+                        },
+                        self.posture_request_timeout,
+                    )
+                    .await
+                    .map_err(|error| {
+                        claude_error_context(
+                            "Claude Approval Posture update failed",
+                            error.into_error(),
+                        )
+                    })?;
+                child.permission_mode = permission_mode;
+            }
+            *self
+                .permission_mode
+                .lock()
+                .expect("Claude posture lock is not poisoned") = permission_mode;
+            Ok(crate::provider::ProviderPostureApplication::Applied)
+        })
+    }
+
     fn submit_decision(
         &self,
         id: crate::protocol::ApprovalId,
@@ -336,7 +377,10 @@ impl ProviderSession for ClaudeSession {
                 Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => {
                     *permission_mode
                 }
-                _ => self.permission_mode,
+                _ => *self
+                    .permission_mode
+                    .lock()
+                    .expect("Claude posture lock is not poisoned"),
             };
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
@@ -651,7 +695,10 @@ mod tests {
                 }),
                 turn: TurnInFlight::new(),
                 skills: ClaudeSkills::default(),
-                permission_mode: crate::protocol::ClaudePermissionMode::Default,
+                permission_mode: std::sync::Mutex::new(
+                    crate::protocol::ClaudePermissionMode::Default,
+                ),
+                posture_request_timeout: Duration::from_millis(200),
                 interrupt_request_timeout: Duration::from_millis(200),
                 shutdown_started: AtomicBool::new(false),
             })

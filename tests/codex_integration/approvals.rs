@@ -9,9 +9,10 @@ use std::{collections::HashMap, sync::Arc};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
-        CodexApprovalPolicy, CodexSandboxMode, CommandAction, CreateSessionRequest, Decision,
-        InitialPrompt, PromptDelivery, PromptId, TurnStatus, UpdateApprovalPostureRequest,
+        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalPostureApplication,
+        ApprovalSubject, CodexApprovalPolicy, CodexSandboxMode, CommandAction,
+        CreateSessionRequest, Decision, InitialPrompt, PromptDelivery, PromptId, TurnStatus,
+        UpdateApprovalPostureRequest,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -162,16 +163,7 @@ async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_tur
             .is_some_and(|turn| turn.status == TurnStatus::Active)
     })
     .await;
-    client.interrupt_session(session_id).await.unwrap();
-    snapshot_until(&client, session_id, |snapshot| {
-        snapshot
-            .turns
-            .first()
-            .is_some_and(|turn| turn.status == TurnStatus::Interrupted)
-    })
-    .await;
-
-    client
+    let updated = client
         .update_approval_posture(
             session_id,
             UpdateApprovalPostureRequest {
@@ -183,6 +175,16 @@ async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_tur
         )
         .await
         .unwrap();
+    assert_eq!(updated.application, ApprovalPostureApplication::NextTurn);
+    client.interrupt_session(session_id).await.unwrap();
+    snapshot_until(&client, session_id, |snapshot| {
+        snapshot
+            .turns
+            .first()
+            .is_some_and(|turn| turn.status == TurnStatus::Interrupted)
+    })
+    .await;
+
     client
         .admit_prompt(
             session_id,

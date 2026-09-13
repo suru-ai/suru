@@ -4463,7 +4463,17 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
             } else {
                 ""
             };
-            format!("Approval Posture: {}{source}", posture.value.summary())
+            let application = match posture.application {
+                crate::protocol::ApprovalPostureApplication::Applied => "",
+                crate::protocol::ApprovalPostureApplication::NextTurn => {
+                    "takes effect next Turn · "
+                }
+                crate::protocol::ApprovalPostureApplication::Failed => "update failed · ",
+            };
+            format!(
+                "Approval Posture: {application}{}{source}",
+                posture.value.summary()
+            )
         })
     });
     posture.map_or(agent.clone(), |posture| format!("{agent} · {posture}"))

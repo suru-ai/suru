@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 53;
+pub const PROTOCOL_VERSION: u32 = 54;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1482,6 +1482,20 @@ impl ApprovalPosture {
 pub struct SessionApprovalPosture {
     pub value: ApprovalPosture,
     pub pinned: bool,
+    #[serde(default)]
+    pub application: ApprovalPostureApplication,
+}
+
+/// How the effective posture has reached the Provider connection that owns
+/// this Session. A requested value remains authoritative when native delivery
+/// fails, while the status keeps clients from claiming it is already active.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPostureApplication {
+    #[default]
+    Applied,
+    NextTurn,
+    Failed,
 }
 
 impl EffectiveSettings {

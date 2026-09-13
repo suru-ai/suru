@@ -21,9 +21,10 @@ use tokio::{
 
 use super::{
     AttributedProviderEvent, MeteredCost, ProviderCommandStatus, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderPrompt,
-    ProviderRuntime, ProviderSession, ProviderSessionRequest, ProviderSteerInput,
-    ProviderSubagentId, ProviderSubagentStatus, ProviderTurnInput,
+    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
+    ProviderPostureApplication, ProviderPrompt, ProviderRuntime, ProviderSession,
+    ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderSubagentStatus,
+    ProviderTurnInput,
 };
 use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
@@ -197,6 +198,10 @@ enum ProviderCommand {
     StopSubagent {
         target: SessionId,
         response: oneshot::Sender<Result<(), InterruptSessionError>>,
+    },
+    UpdateApprovalPosture {
+        posture: crate::protocol::ApprovalPosture,
+        response: oneshot::Sender<Result<ProviderPostureApplication, String>>,
     },
 }
 
@@ -1008,6 +1013,31 @@ impl ProviderOrchestrator {
             .map_err(|_| "Decision delivery could not be confirmed".to_owned())?
     }
 
+    pub(crate) async fn update_approval_posture(
+        &self,
+        session_id: SessionId,
+        posture: crate::protocol::ApprovalPosture,
+    ) -> Result<ProviderPostureApplication, String> {
+        let actor_id = self.sessions.actor_session(session_id);
+        let commands = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .entries
+            .get(&actor_id)
+            .map(|actor| actor.commands.clone());
+        let Some(commands) = commands else {
+            return Ok(ProviderPostureApplication::Applied);
+        };
+        let (response, received) = oneshot::channel();
+        commands
+            .send(ProviderCommand::UpdateApprovalPosture { posture, response })
+            .map_err(|_| "Approval Posture update could not reach the Provider".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Approval Posture update could not be confirmed".to_owned())?
+    }
+
     /// Stops what a Session is doing, whatever that is: the active Turn along
     /// with the Subagents it spawned, or — with no Turn running — the
     /// Subagents alone. Interrupting a Subagent's own Session stops that one
@@ -1486,6 +1516,28 @@ async fn run_provider_session(
                     );
                     continue;
                 }
+                ProviderCommand::UpdateApprovalPosture { posture, response } => {
+                    if !approval_posture_is_current(&sessions, session_id, posture) {
+                        let _ = response.send(Ok(ProviderPostureApplication::Applied));
+                        continue;
+                    }
+                    let updated = if let Some(connected) = provider.as_ref() {
+                        connected
+                            .session
+                            .update_approval_posture(
+                                posture,
+                                !subagents.routes.is_empty() || !subagents.rows.is_empty(),
+                            )
+                            .await
+                            .map_err(|error| {
+                                failure_message("Approval Posture update failed", &error)
+                            })
+                    } else {
+                        Ok(ProviderPostureApplication::Applied)
+                    };
+                    let _ = response.send(updated);
+                    continue;
+                }
                 ProviderCommand::SteerPrompt => continue,
             };
             let Some(snapshot) = sessions.snapshot(session_id) else {
@@ -1770,6 +1822,13 @@ async fn run_provider_session(
                 }
                 continue;
             }
+            if let Some(posture) = posture {
+                sessions.mark_approval_posture_application(
+                    session_id,
+                    posture,
+                    crate::protocol::ApprovalPostureApplication::Applied,
+                );
+            }
             active = Some(ActiveProviderTurn::new(turn_id));
             subagents.late_settle_owes_continuation = false;
             continue;
@@ -1908,6 +1967,21 @@ async fn run_provider_session(
                 } else {
                     let _ = response.send(Err("Approval is unavailable".into()));
                 }
+            }
+
+            ProviderInput::Command(Some(ProviderCommand::UpdateApprovalPosture {
+                posture,
+                response,
+            })) => {
+                if !approval_posture_is_current(&sessions, session_id, posture) {
+                    let _ = response.send(Ok(ProviderPostureApplication::Applied));
+                    continue;
+                }
+                let updated = provider_session
+                    .update_approval_posture(posture, true)
+                    .await
+                    .map_err(|error| failure_message("Approval Posture update failed", &error));
+                let _ = response.send(updated);
             }
 
             ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
@@ -2379,6 +2453,17 @@ fn effective_approval_posture(
         .map(|posture| posture.value.clone())
         .filter(|posture| posture.provider() == *provider)
         .or_else(|| crate::protocol::ApprovalPosture::for_provider(provider, &settings.settings))
+}
+
+fn approval_posture_is_current(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    posture: crate::protocol::ApprovalPosture,
+) -> bool {
+    sessions
+        .snapshot(session_id)
+        .and_then(|snapshot| snapshot.session.approval_posture)
+        .is_some_and(|current| current.value == posture)
 }
 
 fn project_turn_start_failure(

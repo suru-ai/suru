@@ -559,6 +559,35 @@ impl CodexSession {
 }
 
 impl ProviderSession for CodexSession {
+    fn update_approval_posture(
+        &self,
+        posture: crate::protocol::ApprovalPosture,
+        has_active_work: bool,
+    ) -> ProviderFuture<'_, crate::provider::ProviderPostureApplication> {
+        Box::pin(async move {
+            let crate::protocol::ApprovalPosture::Codex {
+                approval_policy,
+                sandbox_mode,
+            } = posture
+            else {
+                return Err(codex_error("Approval Posture belongs to another Provider"));
+            };
+            *self
+                .context
+                .posture
+                .lock()
+                .expect("Codex Session posture lock is not poisoned") = CodexPosture {
+                approval_policy,
+                sandbox_mode,
+            };
+            Ok(if has_active_work {
+                crate::provider::ProviderPostureApplication::NextTurn
+            } else {
+                crate::provider::ProviderPostureApplication::Applied
+            })
+        })
+    }
+
     fn submit_decision(
         &self,
         id: crate::protocol::ApprovalId,

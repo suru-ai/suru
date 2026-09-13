@@ -150,7 +150,25 @@ pub struct ControlledProviderSession {
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
     subagent_stops: mpsc::UnboundedReceiver<SubagentStop>,
+    posture_updates: mpsc::UnboundedReceiver<PostureUpdate>,
+    gate_posture_updates: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ControlledProviderEvent>,
+}
+
+pub struct PostureUpdate {
+    pub posture: suru::protocol::ApprovalPosture,
+    pub has_active_work: bool,
+    response:
+        Option<oneshot::Sender<Result<suru::provider::ProviderPostureApplication, ProviderError>>>,
+}
+
+impl PostureUpdate {
+    pub fn next_turn(self) {
+        self.response
+            .expect("posture updates must be gated")
+            .send(Ok(suru::provider::ProviderPostureApplication::NextTurn))
+            .ok();
+    }
 }
 
 type ControlledProviderEvent = (
@@ -197,6 +215,8 @@ struct ControlledSessionHandle {
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
     subagent_stops: mpsc::UnboundedSender<SubagentStop>,
+    posture_updates: mpsc::UnboundedSender<PostureUpdate>,
+    gate_posture_updates: Arc<AtomicBool>,
 }
 
 impl ControlledProvider {
@@ -463,6 +483,8 @@ impl StartRequest {
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
         let (subagent_stops_tx, subagent_stops_rx) = mpsc::unbounded_channel();
+        let (posture_updates_tx, posture_updates_rx) = mpsc::unbounded_channel();
+        let gate_posture_updates = Arc::new(AtomicBool::new(false));
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ControlledProviderEvent>();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
             events.recv().await.map(|(event, observed)| {
@@ -486,6 +508,8 @@ impl StartRequest {
                     interruptions: interruptions_tx,
                     subagents_stops: subagents_stops_tx,
                     subagent_stops: subagent_stops_tx,
+                    posture_updates: posture_updates_tx,
+                    gate_posture_updates: gate_posture_updates.clone(),
                 }),
                 events,
             )))
@@ -500,6 +524,8 @@ impl StartRequest {
             interruptions: interruptions_rx,
             subagents_stops: subagents_stops_rx,
             subagent_stops: subagent_stops_rx,
+            posture_updates: posture_updates_rx,
+            gate_posture_updates,
             events: events_tx,
         }
     }
@@ -520,6 +546,17 @@ impl StartRequest {
 }
 
 impl ControlledProviderSession {
+    pub fn gate_posture_updates(&self) {
+        self.gate_posture_updates.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn next_posture_update(&mut self) -> PostureUpdate {
+        self.posture_updates
+            .recv()
+            .await
+            .expect("Provider remains connected")
+    }
+
     pub async fn next_decision(
         &mut self,
     ) -> (suru::protocol::ApprovalId, suru::protocol::Decision) {
@@ -1001,6 +1038,31 @@ fn dispatch_steer_operation(
 }
 
 impl ProviderSession for ControlledSessionHandle {
+    fn update_approval_posture(
+        &self,
+        posture: suru::protocol::ApprovalPosture,
+        has_active_work: bool,
+    ) -> ProviderFuture<'_, suru::provider::ProviderPostureApplication> {
+        Box::pin(async move {
+            let (response, received) = oneshot::channel();
+            let gated = self.gate_posture_updates.load(Ordering::SeqCst);
+            self.posture_updates
+                .send(PostureUpdate {
+                    posture,
+                    has_active_work,
+                    response: gated.then_some(response),
+                })
+                .map_err(|_| ProviderError::new("test posture controller disconnected"))?;
+            if gated {
+                received
+                    .await
+                    .map_err(|_| ProviderError::new("test posture update abandoned"))?
+            } else {
+                Ok(suru::provider::ProviderPostureApplication::Applied)
+            }
+        })
+    }
+
     fn submit_decision(
         &self,
         id: suru::protocol::ApprovalId,

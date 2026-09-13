@@ -45,6 +45,9 @@ pub(super) enum ControlRequest {
     /// Refreshes and returns only enabled, user-invocable native Skills. Unlike the broader
     /// `initialize.commands` list, this excludes built-in and other non-Skill slash commands.
     ReloadSkills,
+    SetPermissionMode {
+        mode: crate::protocol::ClaudePermissionMode,
+    },
     /// Stops the running loop. The CLI answers with an interrupt receipt and ends the Turn with a
     /// terminal result of its own.
     Interrupt {
@@ -71,6 +74,7 @@ impl ControlRequest {
             Self::GetBinaryVersion => "get_binary_version",
             Self::Initialize => "initialize",
             Self::ReloadSkills => "reload_skills",
+            Self::SetPermissionMode { .. } => "set_permission_mode",
             Self::Interrupt { .. } => "interrupt",
             Self::StopTask { .. } => "stop_task",
         }

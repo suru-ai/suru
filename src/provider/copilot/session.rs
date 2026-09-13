@@ -460,6 +460,22 @@ pub(super) fn lower_selection_options(
 }
 
 impl ProviderSession for CopilotSession {
+    fn update_approval_posture(
+        &self,
+        posture: crate::protocol::ApprovalPosture,
+        _has_active_work: bool,
+    ) -> ProviderFuture<'_, crate::provider::ProviderPostureApplication> {
+        Box::pin(async move {
+            let crate::protocol::ApprovalPosture::Copilot { permissions } = posture else {
+                return Err(copilot_error(
+                    "Approval Posture belongs to another Provider",
+                ));
+            };
+            self.approvals.adopt_posture(permissions);
+            Ok(crate::provider::ProviderPostureApplication::Applied)
+        })
+    }
+
     fn submit_decision(
         &self,
         id: crate::protocol::ApprovalId,

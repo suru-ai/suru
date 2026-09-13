@@ -1,8 +1,8 @@
 //! Session Approval Posture overrides and live Server Setting reconciliation.
 
 use crate::protocol::{
-    ApprovalPosture, EffectiveSettings, SessionApprovalPosture, SessionChange, SessionId,
-    UpdateApprovalPostureRequest,
+    ApprovalPosture, ApprovalPostureApplication, EffectiveSettings, SessionApprovalPosture,
+    SessionChange, SessionId, UpdateApprovalPostureRequest,
 };
 
 use super::{SessionStore, SessionStoreState};
@@ -45,16 +45,35 @@ impl SessionStore {
                 if posture.provider() != selection.provider {
                     return Err(ApprovalPostureMutationError::ProviderConflict);
                 }
+                let application = session
+                    .approval_posture
+                    .as_ref()
+                    .filter(|current| current.value == posture)
+                    .map_or(ApprovalPostureApplication::Applied, |current| {
+                        current.application
+                    });
                 SessionApprovalPosture {
                     value: posture,
                     pinned: true,
+                    application,
                 }
             }
-            None => SessionApprovalPosture {
-                value: ApprovalPosture::for_provider(&selection.provider, settings)
-                    .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?,
-                pinned: false,
-            },
+            None => {
+                let desired = ApprovalPosture::for_provider(&selection.provider, settings)
+                    .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?;
+                let application = session
+                    .approval_posture
+                    .as_ref()
+                    .filter(|current| current.value == desired)
+                    .map_or(ApprovalPostureApplication::Applied, |current| {
+                        current.application
+                    });
+                SessionApprovalPosture {
+                    value: desired,
+                    pinned: false,
+                    application,
+                }
+            }
         };
         if state.sessions[&session_id]
             .snapshot
@@ -81,12 +100,16 @@ impl SessionStore {
     /// Refreshes the effective reading of every loaded, unpinned Session.
     /// Each change is a normal durable revision so every local or remote
     /// viewer observes the same authoritative posture.
-    pub(crate) fn reconcile_approval_postures(&self, settings: &EffectiveSettings) {
+    pub(crate) fn reconcile_approval_postures(
+        &self,
+        settings: &EffectiveSettings,
+    ) -> Vec<(SessionId, ApprovalPosture)> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let ids = state.sessions.keys().copied().collect::<Vec<_>>();
+        let mut changed = Vec::new();
         for id in ids {
             let next = state.sessions.get(&id).and_then(|record| {
                 if record.snapshot.session.is_subagent()
@@ -100,9 +123,20 @@ impl SessionStore {
                     return None;
                 }
                 let provider = &record.snapshot.session.agent_selection.as_ref()?.provider;
+                let value = ApprovalPosture::for_provider(provider, settings)?;
+                let application = record
+                    .snapshot
+                    .session
+                    .approval_posture
+                    .as_ref()
+                    .filter(|current| current.value == value)
+                    .map_or(ApprovalPostureApplication::Applied, |current| {
+                        current.application
+                    });
                 Some(SessionApprovalPosture {
-                    value: ApprovalPosture::for_provider(provider, settings)?,
+                    value,
                     pinned: false,
+                    application,
                 })
             });
             let Some(next) = next else { continue };
@@ -119,11 +153,53 @@ impl SessionStore {
                 &self.storage,
                 id,
                 vec![SessionChange::ApprovalPostureChanged {
-                    approval_posture: Some(next),
+                    approval_posture: Some(next.clone()),
                 }],
             ) {
                 tracing::error!(session = %id, "could not reconcile Approval Posture: {error:#}");
+            } else {
+                changed.push((id, next.value));
             }
+        }
+        if let Err(error) = reconcile_child_approval_postures(&mut state, &self.storage) {
+            tracing::error!("could not reconcile inherited Subagent Approval Posture: {error:#}");
+        }
+        changed
+    }
+
+    pub(crate) fn mark_approval_posture_application(
+        &self,
+        session_id: SessionId,
+        value: ApprovalPosture,
+        application: ApprovalPostureApplication,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(current) = state
+            .sessions
+            .get(&session_id)
+            .and_then(|record| record.snapshot.session.approval_posture.clone())
+        else {
+            return;
+        };
+        if current.value != value || current.application == application {
+            return;
+        }
+        let next = SessionApprovalPosture {
+            application,
+            ..current
+        };
+        if let Err(error) = state.commit(
+            &self.storage,
+            session_id,
+            vec![SessionChange::ApprovalPostureChanged {
+                approval_posture: Some(next),
+            }],
+        ) {
+            tracing::error!(session = %session_id, "could not record Approval Posture application: {error:#}");
+            return;
         }
         if let Err(error) = reconcile_child_approval_postures(&mut state, &self.storage) {
             tracing::error!("could not reconcile inherited Subagent Approval Posture: {error:#}");

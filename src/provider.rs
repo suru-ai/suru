@@ -572,6 +572,13 @@ pub struct ProviderTurnInput {
     pub approval_posture: Option<ApprovalPosture>,
 }
 
+/// A live Provider connection's answer to an Approval Posture change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderPostureApplication {
+    Applied,
+    NextTurn,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSteerInput {
     pub prompt: ProviderPrompt,
@@ -1140,6 +1147,14 @@ pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), Provider
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
+    /// Applies a changed Approval Posture as far as this Provider permits.
+    /// `has_active_work` includes routed Subagents that outlive the root Turn.
+    fn update_approval_posture(
+        &self,
+        posture: ApprovalPosture,
+        has_active_work: bool,
+    ) -> ProviderFuture<'_, ProviderPostureApplication>;
+
     /// Delivers a user's Decision to a live Provider Approval. Providers that
     /// do not expose Approvals refuse by default.
     fn submit_decision(

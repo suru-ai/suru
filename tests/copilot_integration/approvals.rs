@@ -56,6 +56,35 @@ fn approval(
 }
 
 #[tokio::test]
+async fn an_active_permission_handler_uses_the_changed_posture_on_its_next_request() {
+    let timeline = r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      event live permission.requested '{"requestId":"live-update","permissionRequest":{"kind":"read","path":"next.txt","intention":"Use changed posture"}}'
+"#;
+    let copilot = fixture(timeline, "      event idle session.idle '{}'\n");
+    let live = LiveTurn::start(
+        CopilotRuntime::new(copilot.executable()),
+        "copilot-live-posture",
+        "Wait",
+    )
+    .await;
+    live.client
+        .update_approval_posture(
+            live.session_id,
+            UpdateApprovalPostureRequest {
+                posture: Some(ApprovalPosture::Copilot {
+                    permissions: CopilotPermissions::AllowAll,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    copilot.release();
+    let response = native_response(&copilot, "live-update").await;
+    assert_eq!(response["result"]["kind"], "approve-once");
+    live.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
     let timeline = r#"      sends=$(( ${sends:-0} + 1 ))
       if [ "$sends" -eq 1 ]; then

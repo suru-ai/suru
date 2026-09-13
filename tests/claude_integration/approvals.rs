@@ -73,13 +73,20 @@ async fn configured_permission_mode_is_fixed_on_the_user_session_launch() {
 }
 
 #[tokio::test]
-async fn the_next_turn_launches_with_the_sessions_current_permission_mode() {
+async fn an_existing_session_applies_permission_mode_over_the_native_control_channel() {
+    let posture_arm = r#"    *'"subtype":"set_permission_mode"'*)
+      emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{}}}'
+      ;;
+"#;
     let fixture = ScriptedClaude::new(&format!(
-        "{}{}",
+        "{}{}{}",
         discovery_arms(CLAUDE_MODELS),
+        posture_arm,
         user_turn_arm(
-            r#"      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
-      emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
+            r#"      (
+        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
+      ) &
 "#,
         ),
     ));
@@ -89,9 +96,6 @@ async fn the_next_turn_launches_with_the_sessions_current_permission_mode() {
         "First",
     )
     .await;
-    fixture.release();
-    settled_session(&live.client, live.session_id, 0).await;
-
     live.client
         .update_approval_posture(
             live.session_id,
@@ -103,6 +107,8 @@ async fn the_next_turn_launches_with_the_sessions_current_permission_mode() {
         )
         .await
         .unwrap();
+    fixture.release();
+    settled_session(&live.client, live.session_id, 0).await;
     live.client
         .admit_prompt(
             live.session_id,
@@ -124,9 +130,56 @@ async fn the_next_turn_launches_with_the_sessions_current_permission_mode() {
         .into_iter()
         .filter(|launch| launch.carries("--permission-prompt-tool"))
         .collect::<Vec<_>>();
-    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        sessions.len(),
+        1,
+        "changing posture does not restart Claude"
+    );
     assert_eq!(sessions[0].value("--permission-mode"), "default");
-    assert_eq!(sessions[1].value("--permission-mode"), "auto");
+    assert!(fixture.requests().iter().any(|request| {
+        request["type"] == "control_request"
+            && request["request"]["subtype"] == "set_permission_mode"
+            && request["request"]["mode"] == "auto"
+    }));
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rejected_live_permission_mode_update_is_visible_and_keeps_the_requested_posture() {
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm("      :\n"),
+    ));
+    let live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable())
+            .with_control_request_timeout(tokio::time::Duration::from_millis(50)),
+        "claude-live-posture-failure",
+        "Wait",
+    )
+    .await;
+    let requested = ApprovalPosture::Claude {
+        permission_mode: ClaudePermissionMode::Auto,
+    };
+    let error = live
+        .client
+        .update_approval_posture(
+            live.session_id,
+            UpdateApprovalPostureRequest {
+                posture: Some(requested),
+            },
+        )
+        .await
+        .expect_err("a native control timeout reaches the caller");
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let snapshot = live.client.read_session(live.session_id).await.unwrap();
+    let posture = snapshot.session.approval_posture.unwrap();
+    assert_eq!(posture.value, requested);
+    assert!(posture.pinned);
+    assert_eq!(
+        posture.application,
+        suru::protocol::ApprovalPostureApplication::Failed
+    );
     live.shutdown().await;
 }
 
