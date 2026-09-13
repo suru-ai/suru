@@ -644,18 +644,6 @@ async fn restart_keeps_approval_history_but_disables_abandoned_provider_requests
     drop(client);
     live.server.shutdown().await.unwrap();
 
-    // Persisted active Turns are deliberately not resumed from history alone.
-    // Mark this fixture's Turn terminal so hydration can isolate the Approval
-    // request recovery this test exercises.
-    {
-        use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
-        let mut database =
-            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
-                .unwrap();
-        database
-            .batch_execute("UPDATE turns SET payload = json_set(payload, '$.status', 'completed');")
-            .unwrap();
-    }
     drop(delivery);
     let restarted = suru::server::spawn_with_provider(config, live.runtime)
         .await

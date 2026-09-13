@@ -946,57 +946,19 @@ impl SessionRecord {
             .clone_from(&self.snapshot.subagent_questionnaires);
         self.summary.standing_inputs.latest_turn =
             SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
-        let pending_approvals =
-            self.snapshot
-                .activities
-                .iter()
-                .filter_map(|activity| match activity {
-                    crate::protocol::Activity::Approval {
-                        approval,
-                        outcome,
-                        turn_id,
-                        ..
-                    } if outcome.is_answerable()
-                        && self.snapshot.turns.iter().any(|turn| {
-                            turn.id == *turn_id && turn.status == TurnStatus::Active
-                        }) =>
-                    {
-                        Some(approval.id)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-        let submitting_approvals = self
-            .snapshot
-            .activities
-            .iter()
-            .filter_map(|activity| match activity {
-                crate::protocol::Activity::Approval {
-                    approval,
-                    outcome: crate::protocol::ApprovalOutcome::Submitting,
-                    ..
-                } => Some(approval.id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if self.snapshot.pending_approvals != pending_approvals
-            || self.snapshot.submitting_approvals != submitting_approvals
-        {
-            self.snapshot
-                .pending_approvals
-                .clone_from(&pending_approvals);
-            self.snapshot
-                .submitting_approvals
-                .clone_from(&submitting_approvals);
-            self.snapshot.pending_approvals_revision = self.snapshot.revision;
-        }
-        if self.summary.standing_inputs.pending_approvals != pending_approvals
-            || self.summary.standing_inputs.submitting_approvals != submitting_approvals
-        {
-            self.summary.standing_inputs.pending_approvals = pending_approvals;
-            self.summary.standing_inputs.submitting_approvals = submitting_approvals;
-            self.summary.standing_inputs.pending_approvals_revision = self.snapshot.revision;
-        }
+        // `apply_update` is the shared projection boundary for Approval
+        // availability. The catalog copies that typed reading instead of
+        // independently deriving lifecycle rules from Activities.
+        self.summary
+            .standing_inputs
+            .pending_approvals
+            .clone_from(&self.snapshot.pending_approvals);
+        self.summary
+            .standing_inputs
+            .submitting_approvals
+            .clone_from(&self.snapshot.submitting_approvals);
+        self.summary.standing_inputs.pending_approvals_revision =
+            self.snapshot.pending_approvals_revision;
         let pending =
             self.snapshot
                 .activities
