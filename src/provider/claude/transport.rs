@@ -398,7 +398,13 @@ async fn route_message(message: Value, state: &Arc<TransportState>) -> Result<()
     // init message, the CLI's own control requests — which the launched
     // Session's sink consumes, and a discovery leaves unread.
     if kind != "control_response" {
-        if kind == "result" {
+        // A root Turn ends on `result`; a child Turn ends when its task
+        // notification settles the Subagent. Either may be emitted as soon as
+        // Claude consumes a permission response, so neither may overtake the
+        // durable Decision that releases the settlement receipt.
+        let settles_session_history =
+            kind == "result" || (kind == "system" && message["subtype"] == "task_notification");
+        if settles_session_history {
             state.decision_settlements.wait().await;
         }
         if let Some(conversation) = &state.conversation {

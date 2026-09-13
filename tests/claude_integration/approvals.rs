@@ -227,6 +227,79 @@ async fn child_approval_is_attributed_to_its_tool_and_survives_the_parent_result
 }
 
 #[tokio::test]
+async fn immediate_native_child_completion_waits_for_its_decision_to_be_recorded() {
+    let input = json!({"command":"cargo check"});
+    let child_message = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"child-immediate-bash","name":"Bash","input":input}]} ,"parent_tool_use_id":"spawn-immediate-child","session_id":"prov-session"});
+    let request = json!({"type":"control_request","request_id":"child-immediate-approval","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"child-immediate-bash","agent_id":"native-agent","input":input}});
+    let timeline = format!(
+        r#"      emit '{{"type":"system","subtype":"task_started","task_id":"task-immediate-child","tool_use_id":"spawn-immediate-child","task_type":"local_agent","description":"Run immediate child checks"}}'
+      emit '{child_message}'
+      emit '{request}'
+"#
+    );
+    let completion = r#"    *'"type":"control_response"'*)
+      emit '{"type":"system","subtype":"task_notification","task_id":"task-immediate-child","status":"completed","summary":"Done","session_id":"prov-session"}'
+      ;;
+"#;
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&timeline),
+        completion,
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-immediate-child-approval-completion",
+        "Delegate a command",
+    )
+    .await;
+    let parent = live
+        .wait_for("child Approval is pending", |snapshot| {
+            snapshot.subagent_approval_count() == 1
+        })
+        .await;
+    let child_id = parent.subagent_interventions[0].session_id;
+    let child = live.client.read_session(child_id).await.unwrap();
+    let approval_id = child.pending_approvals[0];
+    let mut child_feed = live.client.subscribe_session(child_id).await.unwrap();
+
+    live.client
+        .submit_decision(child_id, approval_id, Decision::Accept)
+        .await
+        .unwrap();
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let snapshot = live.client.read_session(child_id).await.unwrap();
+            if snapshot.activities.iter().any(|activity| matches!(activity,
+                Activity::Approval { approval, outcome: ApprovalOutcome::Decided, decision: Some(Decision::Accept), .. }
+                    if approval.id == approval_id))
+            {
+                return;
+            }
+            child_feed.next().await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("child completion follows the durable Decision");
+    let parent = live
+        .wait_for("native child completion settles its row", |snapshot| {
+            snapshot.activities.iter().any(|activity| matches!(activity,
+                Activity::Subagent { status: suru::protocol::ActivityStatus::Completed, session_id, .. }
+                    if *session_id == child_id))
+        })
+        .await;
+    assert!(parent.activities.iter().any(|activity| matches!(activity,
+        Activity::Subagent { status: suru::protocol::ActivityStatus::Completed, session_id, .. }
+            if *session_id == child_id)));
+    let child = live.client.read_session(child_id).await.unwrap();
+    assert!(child.activities.iter().any(|activity| matches!(activity,
+        Activity::Approval { approval, outcome: ApprovalOutcome::Decided, decision: Some(Decision::Accept), .. }
+            if approval.id == approval_id)));
+    drop(child_feed);
+    live.shutdown().await;
+}
+
+#[tokio::test]
 async fn native_cancellation_withdraws_the_correlated_approval() {
     let timeline = format!(
         "{}      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n        emit '{{\"type\":\"control_cancel_request\",\"request_id\":\"withdraw-approval\"}}'\n      ) &\n",

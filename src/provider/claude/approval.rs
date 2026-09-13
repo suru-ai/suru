@@ -94,7 +94,13 @@ impl ClaudeApprovals {
                     return Ok(None);
                 }
                 let Some(attribution) = attribution else {
-                    self.respond(request_id, json!({"behavior":"deny", "message":"The owning Subagent could not be identified", "interrupt":false})).await?;
+                    let transport = self.transport()?;
+                    Self::send_response(
+                        &transport,
+                        request_id,
+                        json!({"behavior":"deny", "message":"The owning Subagent could not be identified", "interrupt":false}),
+                    )
+                    .await?;
                     return Ok(Some(vec![]));
                 };
                 let input = request["input"].clone();
@@ -184,16 +190,9 @@ impl ClaudeApprovals {
                 json!({"behavior":"deny", "message":DECLINED_MESSAGE, "interrupt":true})
             }
         };
-        let transport = self
-            .transport
-            .lock()
-            .expect("Claude Approval transport lock is not poisoned")
-            .clone()
-            .ok_or_else(|| claude_error("Claude Approval transport is unavailable"))?;
+        let transport = self.transport()?;
         let settlement = transport.decision_settlement()?;
-        transport
-            .send(&json!({"type":"control_response","response":{"subtype":"success","request_id":native.request_id,"response":response}}))
-            .await?;
+        Self::send_response(&transport, &native.request_id, response).await?;
         Ok(ProviderDecisionDelivery::with_follow_up(Box::pin(
             async move {
                 drop(settlement);
@@ -202,13 +201,19 @@ impl ClaudeApprovals {
         )))
     }
 
-    async fn respond(&self, request_id: &str, response: Value) -> Result<(), ProviderError> {
-        let transport = self
-            .transport
+    fn transport(&self) -> Result<StreamJsonTransport, ProviderError> {
+        self.transport
             .lock()
             .expect("Claude Approval transport lock is not poisoned")
             .clone()
-            .ok_or_else(|| claude_error("Claude Approval transport is unavailable"))?;
+            .ok_or_else(|| claude_error("Claude Approval transport is unavailable"))
+    }
+
+    async fn send_response(
+        transport: &StreamJsonTransport,
+        request_id: &str,
+        response: Value,
+    ) -> Result<(), ProviderError> {
         transport
             .send(&json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}}))
             .await
