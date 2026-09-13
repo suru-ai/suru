@@ -73,6 +73,43 @@ fn pending_application() -> (Application, ApprovalId, suru::protocol::SessionSna
     (app, approval_id, snapshot)
 }
 
+#[test]
+fn local_and_descendant_intervention_notices_keep_both_actions_visible() {
+    use suru::protocol::{QuestionnaireId, SessionId, SubagentInterventions};
+
+    let (mut app, _, mut snapshot) = pending_application();
+    let child_id = SessionId::new();
+    snapshot.subagent_interventions = vec![SubagentInterventions {
+        session_id: child_id,
+        via_session_id: child_id,
+        revision: snapshot.revision,
+        pending_questionnaires: vec![QuestionnaireId::new()],
+        submitting_questionnaires: Vec::new(),
+        pending_approvals: vec![ApprovalId::new()],
+        submitting_approvals: Vec::new(),
+    }];
+    app.handle_event(ApplicationEvent::Session(
+        suru::managed_client::SessionEvent::snapshot(snapshot),
+    ))
+    .unwrap();
+
+    let rows = rendered_application_rows_at(&app, 110, 24);
+    let local = rows
+        .iter()
+        .position(|row| row.contains("Approval pending (1) · Ctrl+Y decide"))
+        .expect("the owning Session's Approval action remains visible");
+    let descendants = rows
+        .iter()
+        .position(|row| {
+            row.contains("1 Subagent questionnaire · 1 Approval pending · ↓ browse Subagents")
+        })
+        .expect("the descendant intervention counts and browse action remain visible");
+    assert_ne!(
+        local, descendants,
+        "intervention notices occupy distinct rows"
+    );
+}
+
 fn invoke(app: &mut Application, command: SemanticCommandId) -> ApplicationTransition {
     app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
         command,

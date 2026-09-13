@@ -175,26 +175,7 @@ pub(super) fn render_with_slots(
         state
             .approvals
             .render(frame, composer.area, approval, theme);
-    } else if !pending_approvals.is_empty() {
-        let area = Rect::new(
-            composer.area.x,
-            composer
-                .area
-                .y
-                .saturating_sub(if pending.is_empty() { 1 } else { 2 }),
-            composer.area.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Approval pending ({}) · Ctrl+Y decide",
-                pending_approvals.len()
-            ))
-            .style(theme.feedback.warning),
-            area,
-        );
-    }
-    if let Some(questionnaire) = state.open_questionnaire() {
+    } else if let Some(questionnaire) = state.open_questionnaire() {
         state.questionnaires.render(
             frame,
             composer.area,
@@ -209,57 +190,58 @@ pub(super) fn render_with_slots(
                 pending.len(),
             ),
         );
-    } else if !pending.is_empty() {
-        let area = Rect::new(
-            composer.area.x,
-            composer.area.y.saturating_sub(1),
-            composer.area.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
+    } else {
+        // Allocate every intervention notice as one stack so a descendant
+        // notice cannot paint over the owning Session's controls.
+        let subagent_questions = state.session.as_ref().map_or(0, |session| {
+            session.snapshot().subagent_questionnaire_count()
+        });
+        let subagent_approvals = state
+            .session
+            .as_ref()
+            .map_or(0, |session| session.snapshot().subagent_approval_count());
+        let mut intervention_notices = Vec::new();
+        if subagent_questions > 0 || subagent_approvals > 0 {
+            let pending = match (subagent_questions, subagent_approvals) {
+                (questions, 0) => format!("{questions} Subagent questionnaires pending"),
+                (0, approvals) => format!("{approvals} Subagent Approvals pending"),
+                (questions, approvals) => {
+                    format!(
+                        "{questions} Subagent questionnaire{} · {approvals} Approval{} pending",
+                        if questions == 1 { "" } else { "s" },
+                        if approvals == 1 { "" } else { "s" },
+                    )
+                }
+            };
+            intervention_notices.push(format!("{pending} · ↓ browse Subagents"));
+        }
+        if !pending_approvals.is_empty() {
+            intervention_notices.push(format!(
+                "Approval pending ({}) · Ctrl+Y decide",
+                pending_approvals.len()
+            ));
+        }
+        if !pending.is_empty() {
+            intervention_notices.push(format!(
                 "Questionnaire pending ({}) · Ctrl+Q answer",
                 pending.len()
-            ))
-            .style(theme.feedback.warning),
-            area,
-        );
-    }
-    let subagent_questions = state.session.as_ref().map_or(0, |session| {
-        session.snapshot().subagent_questionnaire_count()
-    });
-    let subagent_approvals = state
-        .session
-        .as_ref()
-        .map_or(0, |session| session.snapshot().subagent_approval_count());
-    if (subagent_questions > 0 || subagent_approvals > 0)
-        && state.open_questionnaire().is_none()
-        && state.open_approval().is_none()
-    {
-        let area = Rect::new(
-            composer.area.x,
-            composer
-                .area
-                .y
-                .saturating_sub(if pending.is_empty() { 1 } else { 2 }),
-            composer.area.width,
-            1,
-        );
-        let pending = match (subagent_questions, subagent_approvals) {
-            (questions, 0) => format!("{questions} Subagent questionnaires pending"),
-            (0, approvals) => format!("{approvals} Subagent Approvals pending"),
-            (questions, approvals) => {
-                format!(
-                    "{questions} Subagent questionnaire{} · {approvals} Approval{} pending",
-                    if questions == 1 { "" } else { "s" },
-                    if approvals == 1 { "" } else { "s" },
-                )
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(format!("{pending} · ↓ browse Subagents")).style(theme.feedback.warning),
-            area,
-        );
+            ));
+        }
+        let available_rows = usize::from(composer.area.y.saturating_sub(frame.area().y));
+        let first_visible = intervention_notices.len().saturating_sub(available_rows);
+        let visible = &intervention_notices[first_visible..];
+        let first_y = composer.area.y.saturating_sub(visible.len() as u16);
+        for (offset, notice) in visible.iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(notice.as_str()).style(theme.feedback.warning),
+                Rect::new(
+                    composer.area.x,
+                    first_y.saturating_add(offset as u16),
+                    composer.area.width,
+                    1,
+                ),
+            );
+        }
     }
     if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
         render_composer_completion(frame, state, composer.area, theme);
