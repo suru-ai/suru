@@ -111,6 +111,10 @@ pub(super) async fn start_claude_session(
     timings: ClaudeTimings,
     permission_mode: ClaudePermissionMode,
 ) -> Result<ProviderSessionConnection, ProviderError> {
+    let permission_mode = match request.approval_posture.as_ref() {
+        Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => *permission_mode,
+        _ => permission_mode,
+    };
     // Read before anything is launched: Resume State Suru cannot read fails the startup outright
     // rather than after a discovery the Session will never use.
     let restored = known_session_id(request.resume_state)?;
@@ -260,6 +264,7 @@ struct ClaudeChild {
     transport: StreamJsonTransport,
     process: Arc<ProcessGuard>,
     selection: AgentSelection,
+    permission_mode: ClaudePermissionMode,
 }
 
 impl ClaudeChild {
@@ -327,24 +332,28 @@ impl ProviderSession for ClaudeSession {
                 .begin_turn(input.turn_id, input.selection.model.as_str());
             let prompt = self.skills.lower(&self.execution_directory, input.prompt)?;
             let mut slot = self.child.lock().await;
+            let permission_mode = match input.approval_posture.as_ref() {
+                Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => {
+                    *permission_mode
+                }
+                _ => self.permission_mode,
+            };
             if self.shutdown_started.load(Ordering::Acquire) {
                 return Err(claude_error("Claude Session is shutting down"));
             }
             // The Model and its Options are spawn-time flags, so a Turn selected under different
             // ones needs a child of its own; one selected under the flags the running child
             // carries needs nothing.
-            if slot
-                .running
-                .as_ref()
-                .is_none_or(|child| child.selection != input.selection)
-            {
+            if slot.running.as_ref().is_none_or(|child| {
+                child.selection != input.selection || child.permission_mode != permission_mode
+            }) {
                 // The Selection is lowered onto flags before anything is torn down, so one the CLI
                 // has no flags for leaves the Session running on the child it had.
                 let args = spawn_args(
                     &self.provider_session_id,
                     &input.selection,
                     slot.next_spawn,
-                    self.permission_mode,
+                    permission_mode,
                 )?;
                 if let Some(previous) = slot.running.take() {
                     previous
@@ -378,6 +387,7 @@ impl ProviderSession for ClaudeSession {
                     transport,
                     process,
                     selection: input.selection.clone(),
+                    permission_mode,
                 });
             }
             let child = slot
@@ -667,6 +677,7 @@ mod tests {
                     turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
+                    approval_posture: None,
                 })
                 .await
                 .expect("the first Turn spawns the child");
@@ -714,6 +725,7 @@ mod tests {
                     turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Say hello"),
                     selection: selection(Vec::new()),
+                    approval_posture: None,
                 })
                 .await
                 .expect("the first Turn spawns the child");
@@ -728,6 +740,7 @@ mod tests {
                     turn_id: crate::protocol::TurnId::new(),
                     prompt: crate::provider::ProviderPrompt::plain("Too late"),
                     selection: selection(Vec::new()),
+                    approval_posture: None,
                 })
                 .await
                 .expect_err("a shut-down Session refuses further Turns");

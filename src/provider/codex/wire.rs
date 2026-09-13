@@ -353,6 +353,22 @@ impl CodexPosture {
             CodexSandboxMode::DangerFullAccess => "danger-full-access",
         }
     }
+
+    pub(super) const fn sandbox_policy(self) -> NativeSandboxPolicy {
+        match self.sandbox_mode {
+            CodexSandboxMode::ReadOnly => NativeSandboxPolicy::ReadOnly,
+            CodexSandboxMode::WorkspaceWrite => NativeSandboxPolicy::WorkspaceWrite,
+            CodexSandboxMode::DangerFullAccess => NativeSandboxPolicy::DangerFullAccess,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(super) enum NativeSandboxPolicy {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
 }
 
 #[derive(Serialize)]
@@ -449,6 +465,7 @@ pub(super) struct TurnStartParams<'a> {
     /// omits it inherits the Model's own default, which is why Suru always
     /// states one.
     pub(super) summary: &'static str,
+    pub(super) sandbox_policy: NativeSandboxPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<&'a str>,
     #[serde(

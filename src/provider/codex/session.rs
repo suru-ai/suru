@@ -221,10 +221,19 @@ impl ProviderRuntime for CodexRuntime {
                 shutdown_interrupt: self.shutdown_interrupt_timeout,
             },
             reasoning_summary: self.reasoning_summary.clone(),
-            posture: *self
-                .posture
-                .lock()
-                .expect("Codex posture Setting lock is not poisoned"),
+            posture: Arc::new(StdMutex::new(match request.approval_posture.as_ref() {
+                Some(crate::protocol::ApprovalPosture::Codex {
+                    approval_policy,
+                    sandbox_mode,
+                }) => CodexPosture {
+                    approval_policy: *approval_policy,
+                    sandbox_mode: *sandbox_mode,
+                },
+                _ => *self
+                    .posture
+                    .lock()
+                    .expect("Codex posture Setting lock is not poisoned"),
+            })),
             skills: self.skills.clone(),
             skill_catalog_invalidations: self.skill_catalog_invalidations.clone(),
             execution_directory: request.execution_directory.clone(),
@@ -332,7 +341,7 @@ struct SessionTimeouts {
 struct SessionContext {
     timeouts: SessionTimeouts,
     reasoning_summary: Arc<StdMutex<ReasoningSummaryDetail>>,
-    posture: CodexPosture,
+    posture: Arc<StdMutex<CodexPosture>>,
     skills: CodexSkills,
     skill_catalog_invalidations: watch::Sender<u64>,
     execution_directory: std::path::PathBuf,
@@ -372,7 +381,10 @@ async fn start_codex_thread(
         .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
         .map(|state| state.thread_id);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
-        let posture = context.posture;
+        let posture = *context
+            .posture
+            .lock()
+            .expect("Codex Session posture lock is not poisoned");
         let result = transport
             .request(
                 "thread/resume",
@@ -387,7 +399,10 @@ async fn start_codex_thread(
             .map_err(|error| codex_error_context("Codex Session resume failed", error))?;
         ("thread/resume", result)
     } else {
-        let posture = context.posture;
+        let posture = *context
+            .posture
+            .lock()
+            .expect("Codex Session posture lock is not poisoned");
         let result = transport
             .request(
                 "thread/start",
@@ -462,7 +477,7 @@ async fn start_codex_thread(
     let attachment = ChildThreadAttachment {
         transport: transport.clone(),
         cwd: cwd.to_owned(),
-        posture: context.posture,
+        posture: context.posture.clone(),
     };
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
@@ -594,6 +609,20 @@ impl ProviderSession for CodexSession {
 
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(crate::protocol::ApprovalPosture::Codex {
+                approval_policy,
+                sandbox_mode,
+            }) = input.approval_posture.as_ref()
+            {
+                *self
+                    .context
+                    .posture
+                    .lock()
+                    .expect("Codex Session posture lock is not poisoned") = CodexPosture {
+                    approval_policy: *approval_policy,
+                    sandbox_mode: *sandbox_mode,
+                };
+            }
             {
                 let mut correlation = self
                     .correlation
@@ -619,6 +648,11 @@ impl ProviderSession for CodexSession {
                 prompt: input.prompt,
                 selection: input.selection,
                 summary,
+                posture: *self
+                    .context
+                    .posture
+                    .lock()
+                    .expect("Codex Session posture lock is not poisoned"),
                 skills: self.context.skills.clone(),
                 execution_directory: self.context.execution_directory.clone(),
                 transport: self.transport.clone(),
@@ -792,6 +826,7 @@ struct NativeTurnStartRequest {
     prompt: ProviderPrompt,
     selection: AgentSelection,
     summary: &'static str,
+    posture: CodexPosture,
     skills: CodexSkills,
     execution_directory: std::path::PathBuf,
     transport: JsonRpcTransport,
@@ -805,6 +840,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
         prompt,
         selection,
         summary,
+        posture,
         skills,
         execution_directory,
         transport,
@@ -822,6 +858,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
                     input: &native_input,
                     model: selection.model.as_str(),
                     summary,
+                    sandbox_policy: posture.sandbox_policy(),
                     effort: options.effort,
                     service_tier: options.service_tier,
                 },

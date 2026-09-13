@@ -21,7 +21,7 @@ use crate::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
         ModelCatalog, Outlook, PromptId, ResolveWorkspaceRequest, SessionId, SessionListItem,
         SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, SkillCatalog,
-        SkillCatalogRequest, UpdateAgentSelectionRequest,
+        SkillCatalogRequest, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
     },
 };
 use anyhow::{Result, anyhow};
@@ -911,6 +911,14 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
+            ApplicationTransition::UpdateApprovalPosture { session, request } => {
+                spawn_approval_posture_update(
+                    self.client.session_commands_for(session.origin.clone()),
+                    session,
+                    request,
+                    self.channels.submissions.clone(),
+                );
+            }
             ApplicationTransition::MutateSetting(mutation) => {
                 spawn_setting_mutation(
                     self.client.session_commands(),
@@ -1174,6 +1182,7 @@ impl RunLoop {
             | ApplicationTransition::RefreshSkills(_)
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
             | ApplicationTransition::UpdateAgentSelection { .. }
+            | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite(_)
@@ -2396,6 +2405,27 @@ fn spawn_agent_selection_update(
             Err(error) => SubmissionResult::AgentSelectionUpdateFailed {
                 session,
                 operation_id,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    });
+}
+
+fn spawn_approval_posture_update(
+    commands: SessionCommandClient,
+    session: SessionReference,
+    request: UpdateApprovalPostureRequest,
+    results: UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        let result = match commands
+            .update_approval_posture(session.session_id, request)
+            .await
+        {
+            Ok(_) => SubmissionResult::OperationSucceeded(session),
+            Err(error) => SubmissionResult::OperationFailed {
+                session,
                 error: error.to_string(),
             },
         };
@@ -4305,6 +4335,7 @@ mod tests {
                         workspace: Workspace::directory(workspace.clone()),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
+                        approval_posture: None,
                         status: SessionStatus::Idle,
                         working_since: None,
                         parent: None,

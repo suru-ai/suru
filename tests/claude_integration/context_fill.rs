@@ -599,6 +599,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
         .start_session(ProviderSessionRequest {
             execution_directory: workspace.path().to_owned(),
             resume_state: None,
+            approval_posture: None,
         })
         .await
         .unwrap()
@@ -608,6 +609,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
             turn_id: TurnId::new(),
             prompt: ProviderPrompt::plain("First"),
             selection: identity.selection,
+            approval_posture: None,
         })
         .await
         .unwrap();
@@ -635,6 +637,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
                     },
                 }],
             },
+            approval_posture: None,
         })
         .await
         .expect_err("unsupported native option fails before replacing the old child");

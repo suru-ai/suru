@@ -24,6 +24,7 @@ use crate::{
 };
 
 use super::{
+    approval_posture_picker::ApprovalPostureChoice,
     completion::CompletionRow,
     composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
     keymap::binding_label,
@@ -283,6 +284,9 @@ pub(super) fn render_with_slots(
     if state.model_picker.is_open() && !state.reconnect_overlay_visible {
         render_model_picker(frame, state, main, theme);
     }
+    if state.approval_posture_picker.is_open() && !state.reconnect_overlay_visible {
+        render_approval_posture_picker(frame, state, main, theme);
+    }
     if state.theme_picker.is_open() && !state.reconnect_overlay_visible {
         render_theme_picker(frame, state, main, theme);
     }
@@ -298,6 +302,7 @@ pub(super) fn render_with_slots(
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
         && !state.model_picker.is_open()
+        && !state.approval_posture_picker.is_open()
         && !state.theme_picker.is_open()
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
@@ -1213,6 +1218,51 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         area,
     );
     record_overlay_selection(frame, state, area, SelectionSurface::Models, true);
+}
+
+fn render_approval_posture_picker(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    main: Rect,
+    theme: &Theme,
+) {
+    let rows = state.approval_posture_picker.rows().collect::<Vec<_>>();
+    let height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(main.height.saturating_sub(2));
+    let area = centered_rect(main, main.width.saturating_sub(8).min(58), height);
+    let width = usize::from(area.width.saturating_sub(2));
+    let lines = rows
+        .into_iter()
+        .take(usize::from(area.height.saturating_sub(2)))
+        .map(|(row, selected)| {
+            let label = match row {
+                ApprovalPostureChoice::Value { label, .. } => label,
+                ApprovalPostureChoice::Reset => "Follow Server Settings (reset)",
+            };
+            let marker = if selected { "› " } else { "  " };
+            Line::styled(
+                truncate_to_width(&format!("{marker}{label}"), width),
+                if selected {
+                    theme.text.primary
+                } else {
+                    theme.text.subdued
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Approval Posture ")
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
 }
 
 fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -4384,7 +4434,7 @@ fn checkout_branch_context(
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
-    match state.agent_selection() {
+    let agent = match state.agent_selection() {
         None => "Agent unavailable".to_owned(),
         Some(selection) => {
             let detailed = detail.shows_secondary();
@@ -4399,7 +4449,16 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
                 summary
             }
         }
-    }
+    };
+    let posture = state
+        .session
+        .as_ref()
+        .and_then(|session| session.snapshot().session.approval_posture.as_ref())
+        .map(|posture| {
+            let pin = if posture.pinned { " · pinned" } else { "" };
+            format!("Approval Posture: {}{pin}", posture.value.summary())
+        });
+    posture.map_or(agent.clone(), |posture| format!("{agent} · {posture}"))
 }
 
 /// A Provider's Nerd Font glyph where Suru knows one. Unknown Provider IDs
@@ -4919,6 +4978,7 @@ mod tests {
                     workspace: Workspace::directory(workspace.path().to_owned()),
                     agent_selection: None,
                     agent_selection_availability: ModelAvailability::Available,
+                    approval_posture: None,
                     status: SessionStatus::Active,
                     working_since: None,
                     parent: None,
@@ -5177,6 +5237,7 @@ mod tests {
                         workspace: Workspace::directory(PathBuf::from("/workspace")),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
+                        approval_posture: None,
                         status: SessionStatus::Active,
                         working_since: Some(SessionTimestamp(1)),
                         parent: None,
@@ -5253,6 +5314,7 @@ mod tests {
                         workspace: Workspace::directory(PathBuf::from("/workspace")),
                         agent_selection: None,
                         agent_selection_availability: ModelAvailability::Available,
+                        approval_posture: None,
                         status: SessionStatus::Idle,
                         working_since: None,
                         parent: None,

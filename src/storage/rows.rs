@@ -352,6 +352,7 @@ impl SessionRow {
                 workspace: Some(session.workspace.clone()),
                 execution_directory: Some(session.execution_directory.clone()),
                 checkout: session.checkout.clone(),
+                approval_posture: session.approval_posture.clone(),
             },
         )
     }
@@ -368,6 +369,7 @@ impl SessionRow {
             .map(|value| decode::<StoredAgentSelection>(&session_id, "Agent Selection", value))
             .transpose()?
             .map(AgentSelection::from);
+        let approval_posture = workspace.approval_posture.clone();
         let summary = SessionSummary {
             checkout_state: None,
             session: Session {
@@ -386,6 +388,7 @@ impl SessionRow {
                     "Agent Selection availability",
                     &self.agent_selection_availability,
                 )?,
+                approval_posture,
                 status: decode(&session_id, "Session status", &self.status)?,
                 working_since: None,
                 parent: self
@@ -660,6 +663,8 @@ struct StoredSessionLocation {
     checkout: Option<crate::protocol::CheckoutAssociation>,
     #[serde(default)]
     execution_directory: Option<crate::protocol::ExecutionDirectory>,
+    #[serde(default)]
+    approval_posture: Option<crate::protocol::SessionApprovalPosture>,
 }
 
 impl StoredSessionLocation {

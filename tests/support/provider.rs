@@ -441,6 +441,10 @@ impl StartRequest {
         self.request.resume_state.as_ref()
     }
 
+    pub fn approval_posture(&self) -> Option<&suru::protocol::ApprovalPosture> {
+        self.request.approval_posture.as_ref()
+    }
+
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
         self.succeed_with_resume(identity, None)
     }
@@ -656,6 +660,10 @@ impl PromptOperation {
 
     pub fn selection(&self) -> &suru::protocol::AgentSelection {
         &self.input.selection
+    }
+
+    pub fn approval_posture(&self) -> Option<&suru::protocol::ApprovalPosture> {
+        self.input.approval_posture.as_ref()
     }
 
     pub fn succeed(self) {
@@ -929,6 +937,7 @@ async fn run_errand_through_a_session(
         ProviderSessionRequest {
             execution_directory: errand.execution_directory,
             resume_state: None,
+            approval_posture: None,
         },
     )
     .await?;
@@ -938,6 +947,7 @@ async fn run_errand_through_a_session(
             turn_id: suru::protocol::TurnId::new(),
             prompt: ProviderPrompt::plain(errand.prompt),
             selection: errand.selection,
+            approval_posture: None,
         })
         .await?;
     let mut reply = String::new();

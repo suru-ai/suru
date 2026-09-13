@@ -129,6 +129,27 @@ pub(super) fn command_for_subagent_picker_event(event: InputEvent) -> Option<Com
     }
 }
 
+pub(super) fn command_for_approval_posture_picker_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let command = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ApprovalPosturePrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ApprovalPostureNext
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::ApprovalPostureSelect,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::ApprovalPostureClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
+}
+
 /// The Serve overlay owns the keys while it is visible. Its address picker
 /// follows the other picker surfaces, with Space changing membership rather
 /// than typing and Enter issuing the Invite for the complete chosen set.

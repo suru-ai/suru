@@ -15,10 +15,10 @@ use tokio::sync::watch;
 
 use crate::pricing::{EstimatedCost, PricingSource};
 use crate::protocol::{
-    AgentIdentity, AgentSelection, Cost, CostBasis, CostCoverage, EffectiveSettings, FileChange,
-    ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId, ProviderUnavailability,
-    SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillId, SkillInvocation,
-    SkillMarkerSpan, SkillPromptDelivery, Usage,
+    AgentIdentity, AgentSelection, ApprovalPosture, Cost, CostBasis, CostCoverage,
+    EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId,
+    ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillId,
+    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Usage,
 };
 
 mod claude;
@@ -448,6 +448,7 @@ impl Error for ProviderError {}
 pub struct ProviderSessionRequest {
     pub execution_directory: PathBuf,
     pub resume_state: Option<ProviderResumeState>,
+    pub approval_posture: Option<ApprovalPosture>,
 }
 
 /// One Errand: a single Provider call Suru makes for its own purposes rather
@@ -568,6 +569,7 @@ pub struct ProviderTurnInput {
     pub turn_id: crate::protocol::TurnId,
     pub prompt: ProviderPrompt,
     pub selection: AgentSelection,
+    pub approval_posture: Option<ApprovalPosture>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

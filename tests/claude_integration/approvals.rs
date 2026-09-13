@@ -2,11 +2,17 @@
 
 use crate::{
     server_support::PROGRESS_DEADLINE,
-    support::{CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, user_turn_arm},
+    support::{
+        CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, settled_session, user_turn_arm,
+    },
 };
 use serde_json::{Value, json};
 use suru::{
-    protocol::{Activity, ApprovalOutcome, ApprovalSubject, Decision},
+    protocol::{
+        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
+        ClaudePermissionMode, Decision, InitialPrompt, PromptDelivery, PromptId,
+        UpdateApprovalPostureRequest,
+    },
     provider::ClaudeRuntime,
 };
 use tokio::time::timeout;
@@ -63,6 +69,64 @@ async fn configured_permission_mode_is_fixed_on_the_user_session_launch() {
     assert_eq!(launch.value("--permission-prompt-tool"), "stdio");
     assert!(!launch.carries("--dangerously-skip-permissions"));
     assert_eq!(launch.value("--setting-sources"), "user,project");
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_next_turn_launches_with_the_sessions_current_permission_mode() {
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(
+            r#"      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
+"#,
+        ),
+    ));
+    let live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-next-turn-posture",
+        "First",
+    )
+    .await;
+    fixture.release();
+    settled_session(&live.client, live.session_id, 0).await;
+
+    live.client
+        .update_approval_posture(
+            live.session_id,
+            UpdateApprovalPostureRequest {
+                posture: Some(ApprovalPosture::Claude {
+                    permission_mode: ClaudePermissionMode::Auto,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    live.client
+        .admit_prompt(
+            live.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Second".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+    settled_session(&live.client, live.session_id, 1).await;
+
+    let sessions = fixture
+        .exact_launches()
+        .into_iter()
+        .filter(|launch| launch.carries("--permission-prompt-tool"))
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].value("--permission-mode"), "default");
+    assert_eq!(sessions[1].value("--permission-mode"), "auto");
     live.shutdown().await;
 }
 

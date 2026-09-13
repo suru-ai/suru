@@ -532,6 +532,7 @@ mod tests {
                 workspace: Workspace::directory(PathBuf::from("/workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
+                approval_posture: None,
                 status: SessionStatus::Active,
                 working_since: None,
                 parent: None,

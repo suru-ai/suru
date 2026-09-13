@@ -905,6 +905,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
             parent: None,

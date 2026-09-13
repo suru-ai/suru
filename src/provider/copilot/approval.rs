@@ -44,7 +44,7 @@ struct Shared {
     events: mpsc::UnboundedSender<Result<AttributedProviderEvent, ProviderError>>,
     pending: Mutex<Pending>,
     settlements: Arc<AsyncMutex<()>>,
-    permissions: CopilotPermissions,
+    permissions: Mutex<CopilotPermissions>,
     execution_directory: PathBuf,
 }
 
@@ -76,7 +76,7 @@ impl CopilotApprovals {
                 events,
                 pending: Mutex::new(Pending::default()),
                 settlements: Arc::new(AsyncMutex::new(())),
-                permissions,
+                permissions: Mutex::new(permissions),
                 execution_directory,
             }),
         }
@@ -127,6 +127,14 @@ impl CopilotApprovals {
             .lock()
             .expect("Copilot Approval lock is not poisoned");
         *pending = Pending::default();
+    }
+
+    pub(super) fn adopt_posture(&self, permissions: CopilotPermissions) {
+        *self
+            .shared
+            .permissions
+            .lock()
+            .expect("Copilot Approval Posture lock is not poisoned") = permissions;
     }
 
     pub(super) fn settle(&self, attribution: &ProviderEventAttribution) {
@@ -200,12 +208,17 @@ impl PermissionHandler for CopilotApprovals {
             || request(&data)["managedSettingsEnabled"]
                 .as_bool()
                 .unwrap_or(false);
+        let permissions = *self
+            .shared
+            .permissions
+            .lock()
+            .expect("Copilot Approval Posture lock is not poisoned");
         let managed_user_decision =
-            self.shared.permissions == CopilotPermissions::AllowAll && managed_settings_enabled;
+            permissions == CopilotPermissions::AllowAll && managed_settings_enabled;
         if !managed_user_decision && data.managed_approval_required == Some(true) {
             return PermissionResult::no_result();
         }
-        if self.shared.permissions == CopilotPermissions::AllowAll && !managed_user_decision {
+        if permissions == CopilotPermissions::AllowAll && !managed_user_decision {
             return PermissionResult::approve_once();
         }
         let event = {

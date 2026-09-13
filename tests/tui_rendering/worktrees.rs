@@ -184,6 +184,7 @@ fn summary(context: &ResolvedWorkspace, title: &str) -> SessionListItem {
             context_fill: None,
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
             parent: None,

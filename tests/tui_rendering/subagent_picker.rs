@@ -131,6 +131,7 @@ fn child_with_working_subagent(
             workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(SessionTimestamp::now()),
             parent: Some(parent_id),

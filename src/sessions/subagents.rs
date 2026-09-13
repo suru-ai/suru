@@ -63,6 +63,7 @@ impl SessionStore {
                 workspace: parent_session.workspace.clone(),
                 agent_selection: None,
                 agent_selection_availability: parent_session.agent_selection_availability,
+                approval_posture: parent_session.approval_posture.clone(),
                 status: SessionStatus::Active,
                 working_since: Some(timestamp),
                 parent: Some(parent_id),

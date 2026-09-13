@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 52;
+pub const PROTOCOL_VERSION: u32 = 53;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1370,6 +1370,120 @@ pub struct EffectiveSettings {
     pub serving: ServingSettings,
 }
 
+/// The Provider-native controls that govern which tool uses require an
+/// Approval. Each variant retains the complete tuple its Provider accepts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApprovalPosture {
+    Codex {
+        approval_policy: CodexApprovalPolicy,
+        sandbox_mode: CodexSandboxMode,
+    },
+    Claude {
+        permission_mode: ClaudePermissionMode,
+    },
+    Copilot {
+        permissions: CopilotPermissions,
+    },
+}
+
+impl ApprovalPosture {
+    pub fn for_provider(provider: &ProviderId, settings: &EffectiveSettings) -> Option<Self> {
+        match provider.as_str() {
+            "codex" => Some(Self::Codex {
+                approval_policy: settings.provider.codex.approval_policy,
+                sandbox_mode: settings.provider.codex.sandbox_mode,
+            }),
+            "claude" => Some(Self::Claude {
+                permission_mode: settings.provider.claude.permission_mode,
+            }),
+            "copilot" => Some(Self::Copilot {
+                permissions: settings.provider.copilot.permissions,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn provider(&self) -> ProviderId {
+        ProviderId::new(match self {
+            Self::Codex { .. } => "codex",
+            Self::Claude { .. } => "claude",
+            Self::Copilot { .. } => "copilot",
+        })
+    }
+
+    pub const fn cycle_primary(self) -> Self {
+        match self {
+            Self::Codex {
+                approval_policy,
+                sandbox_mode,
+            } => Self::Codex {
+                approval_policy: match approval_policy {
+                    CodexApprovalPolicy::Untrusted => CodexApprovalPolicy::OnRequest,
+                    CodexApprovalPolicy::OnRequest => CodexApprovalPolicy::Never,
+                    CodexApprovalPolicy::Never => CodexApprovalPolicy::Untrusted,
+                },
+                sandbox_mode,
+            },
+            Self::Claude { permission_mode } => Self::Claude {
+                permission_mode: match permission_mode {
+                    ClaudePermissionMode::Default => ClaudePermissionMode::AcceptEdits,
+                    ClaudePermissionMode::AcceptEdits => ClaudePermissionMode::DontAsk,
+                    ClaudePermissionMode::DontAsk => ClaudePermissionMode::BypassPermissions,
+                    ClaudePermissionMode::BypassPermissions => ClaudePermissionMode::Auto,
+                    ClaudePermissionMode::Auto => ClaudePermissionMode::Default,
+                },
+            },
+            Self::Copilot { permissions } => Self::Copilot {
+                permissions: match permissions {
+                    CopilotPermissions::Ask => CopilotPermissions::AllowAll,
+                    CopilotPermissions::AllowAll => CopilotPermissions::Ask,
+                },
+            },
+        }
+    }
+
+    pub fn summary(self) -> String {
+        match self {
+            Self::Codex {
+                approval_policy,
+                sandbox_mode,
+            } => format!(
+                "Codex {} · {}",
+                match approval_policy {
+                    CodexApprovalPolicy::Untrusted => "untrusted",
+                    CodexApprovalPolicy::OnRequest => "on-request",
+                    CodexApprovalPolicy::Never => "never",
+                },
+                match sandbox_mode {
+                    CodexSandboxMode::ReadOnly => "read-only",
+                    CodexSandboxMode::WorkspaceWrite => "workspace-write",
+                    CodexSandboxMode::DangerFullAccess => "danger-full-access",
+                }
+            ),
+            Self::Claude { permission_mode } => {
+                format!("Claude {}", permission_mode.as_wire_value())
+            }
+            Self::Copilot { permissions } => format!(
+                "Copilot {}",
+                match permissions {
+                    CopilotPermissions::Ask => "ask",
+                    CopilotPermissions::AllowAll => "allowAll",
+                }
+            ),
+        }
+    }
+}
+
+/// The effective Approval Posture reported by a Session. `pinned` distinguishes
+/// a Session override from a live reading of the Server Setting.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionApprovalPosture {
+    pub value: ApprovalPosture,
+    pub pinned: bool,
+}
+
 impl EffectiveSettings {
     /// Whether the user has left `provider` on. This is the one predicate every
     /// site consults before asking a Provider for anything, and the only place
@@ -1772,6 +1886,12 @@ pub struct Session {
     pub checkout: Option<CheckoutAssociation>,
     pub agent_selection: Option<AgentSelection>,
     pub agent_selection_availability: ModelAvailability,
+    /// The effective Approval Posture for this Session's immutable Provider.
+    /// A pinned value is the durable Session override; otherwise it is the
+    /// latest Server Setting. Sessions without a selected or supported
+    /// Provider have no posture.
+    #[serde(default)]
+    pub approval_posture: Option<SessionApprovalPosture>,
     pub status: SessionStatus,
     /// When this Session's uninterrupted Working interval began, including
     /// work continued by surviving Subagents after its own Turn Settles.
@@ -2702,6 +2822,9 @@ pub enum SessionChange {
     AgentSelectionAvailabilityChanged {
         availability: ModelAvailability,
     },
+    ApprovalPostureChanged {
+        approval_posture: Option<SessionApprovalPosture>,
+    },
     PromptAdded {
         prompt: Prompt,
     },
@@ -2906,6 +3029,14 @@ pub struct ViewSessionRequest {
 pub struct UpdateAgentSelectionRequest {
     pub operation_id: AgentSelectionOperationId,
     pub selection: AgentSelection,
+}
+
+/// Pins one Provider-native Approval Posture on a Session, or resets it to
+/// follow the current Server Setting when `posture` is absent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateApprovalPostureRequest {
+    pub posture: Option<ApprovalPosture>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

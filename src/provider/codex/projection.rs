@@ -568,7 +568,7 @@ pub(super) fn provider_events(
 pub(super) struct ChildThreadAttachment {
     pub(super) transport: JsonRpcTransport,
     pub(super) cwd: String,
-    pub(super) posture: CodexPosture,
+    pub(super) posture: Arc<std::sync::Mutex<CodexPosture>>,
 }
 
 impl ChildThreadAttachment {
@@ -582,8 +582,11 @@ impl ChildThreadAttachment {
     fn attach(&self, thread_id: String, results: mpsc::UnboundedSender<(String, ModelId)>) {
         let transport = self.transport.clone();
         let cwd = self.cwd.clone();
-        let posture = self.posture;
+        let posture = self.posture.clone();
         tokio::spawn(async move {
+            let posture = *posture
+                .lock()
+                .expect("Codex Session posture lock is not poisoned");
             let Ok(result) = transport
                 .request(
                     "thread/resume",

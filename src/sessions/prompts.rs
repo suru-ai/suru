@@ -338,6 +338,7 @@ impl SessionStore {
                 workspace: location.workspace,
                 agent_selection: request.agent_selection.clone(),
                 agent_selection_availability: ModelAvailability::Available,
+                approval_posture: None,
                 status: SessionStatus::Active,
                 working_since: Some(timestamp),
                 parent: None,

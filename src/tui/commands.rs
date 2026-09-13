@@ -20,6 +20,12 @@ pub enum SemanticCommandId {
     ApprovalAcceptForSession,
     ApprovalDecline,
     ApprovalDeclineAndInterrupt,
+    ApprovalPostureCycle,
+    ApprovalPostureOpen,
+    ApprovalPosturePrevious,
+    ApprovalPostureNext,
+    ApprovalPostureSelect,
+    ApprovalPostureClose,
 
     QuestionnaireScrollUp,
     QuestionnaireScrollDown,
@@ -285,6 +291,12 @@ impl SemanticCommandId {
             Self::ApprovalAcceptForSession => "approval.decision.accept-for-session",
             Self::ApprovalDecline => "approval.decision.decline",
             Self::ApprovalDeclineAndInterrupt => "approval.decision.decline-and-interrupt",
+            Self::ApprovalPostureCycle => "approval-posture.cycle",
+            Self::ApprovalPostureOpen => "approval-posture.open",
+            Self::ApprovalPosturePrevious => "approval-posture.previous",
+            Self::ApprovalPostureNext => "approval-posture.next",
+            Self::ApprovalPostureSelect => "approval-posture.select",
+            Self::ApprovalPostureClose => "approval-posture.close",
             Self::QuestionnaireScrollUp => "questionnaire.scroll.up",
             Self::QuestionnaireScrollDown => "questionnaire.scroll.down",
             Self::QuestionnaireRequestPrevious => "questionnaire.request.previous",
@@ -448,6 +460,61 @@ const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
 const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPostureCycle,
+        title: "Cycle Approval Posture",
+        description: "Advance this Session's Provider-native Approval Posture",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+G",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPostureOpen,
+        title: "Choose Approval Posture",
+        description: "Choose every Provider-native Approval Posture value or follow Settings",
+        slash: Some(SlashCommand {
+            name: "posture",
+            aliases: &["approvals"],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X P",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPosturePrevious,
+        title: "Previous Approval Posture",
+        description: "Focus the previous Approval Posture choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPostureNext,
+        title: "Next Approval Posture",
+        description: "Focus the next Approval Posture choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPostureSelect,
+        title: "Select Approval Posture",
+        description: "Apply the focused Approval Posture choice",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ApprovalPostureClose,
+        title: "Close Approval Posture Picker",
+        description: "Close the Approval Posture picker",
+        slash: None,
+        keybinding: None,
+    },
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalOpen,
         title: "Open Approval",

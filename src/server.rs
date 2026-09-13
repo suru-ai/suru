@@ -39,7 +39,7 @@ use crate::protocol::{
     ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
     SessionId, SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot,
     SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery,
-    TurnId, UpdateAgentSelectionRequest, ViewSessionRequest,
+    TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -47,9 +47,10 @@ use crate::provider::{
 use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
-    AdmitPromptError, AgentSelectionMutationError, CreateSessionError, DeleteSessionError,
-    InterruptSessionError, PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed,
-    SessionFeed, SessionStore, SettleSessionError, StoreOutcome, TitleDerivation,
+    AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
+    CreateSessionError, DeleteSessionError, InterruptSessionError, PromptAdmissionDisposition,
+    PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore, SettleSessionError,
+    StoreOutcome, TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -553,6 +554,7 @@ pub async fn spawn_with_source_control(
         storage.clone(),
         preparations.resumable_sessions(),
     );
+    sessions.reconcile_approval_postures(&opening_settings.settings);
     let source_control = crate::source_control::SourceControlService::new(source_control);
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
@@ -678,6 +680,10 @@ pub async fn spawn_with_source_control(
                 .route(
                     "/v1/sessions/{session_id}/agent-selection",
                     post(update_agent_selection),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/approval-posture",
+                    post(update_approval_posture),
                 )
                 .route("/v1/sessions/{session_id}/settlement", post(settle_session))
                 .route("/v1/sessions/{session_id}/viewed", post(view_session))
@@ -983,7 +989,12 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
         Ok(snapshot) => {
             match adopt_settings(&state.settings, &state.runtimes, &state.serving, &snapshot).await
             {
-                Ok(()) => Json(snapshot).into_response(),
+                Ok(()) => {
+                    state
+                        .sessions
+                        .reconcile_approval_postures(&snapshot.settings);
+                    Json(snapshot).into_response()
+                }
                 Err(error) => {
                     tracing::error!("could not adopt Serving settings: {error:#}");
                     session_error_response(
@@ -1920,7 +1931,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         state.sessions.create_in(request, location)
     };
     match admission {
-        Ok(StoreOutcome::Created(snapshot)) => {
+        Ok(StoreOutcome::Created(mut snapshot)) => {
+            state
+                .sessions
+                .reconcile_approval_postures(&state.settings.borrow().settings);
+            snapshot = state
+                .sessions
+                .snapshot(snapshot.session.id)
+                .unwrap_or(snapshot);
             if let Some(plan) = &mut preparation {
                 if let Err(error) = state.sessions.persist_prepared_session(snapshot.session.id) {
                     return preparation_error(error.to_string());
@@ -1997,6 +2015,48 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     }
 }
 
+async fn update_approval_posture(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let request = match decode_session_command::<UpdateApprovalPostureRequest>(
+        &state,
+        request,
+        "Approval Posture update",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.sessions.apply_approval_posture_command(
+        session_id,
+        request,
+        &state.settings.borrow().settings,
+    ) {
+        Ok(posture) => Json(posture).into_response(),
+        Err(ApprovalPostureMutationError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(ApprovalPostureMutationError::ProviderUnavailable) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::InvalidCommand,
+            "Session has no Provider Approval Posture",
+        ),
+        Err(ApprovalPostureMutationError::ProviderConflict) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::InvalidCommand,
+            "Approval Posture belongs to another Provider",
+        ),
+        Err(ApprovalPostureMutationError::Storage) => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn update_agent_selection(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<SessionId>,
@@ -2025,6 +2085,9 @@ async fn update_agent_selection(
         .apply_agent_selection_command(session_id, request)
     {
         Ok(mutation) => {
+            state
+                .sessions
+                .reconcile_approval_postures(&state.settings.borrow().settings);
             if let Some(prompt_id) = mutation.retry_prompt_id {
                 state
                     .providers
@@ -2606,6 +2669,9 @@ async fn hydrate_session_request(
             tracing::warn!("Session hydration failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        state
+            .sessions
+            .reconcile_approval_postures(&state.settings.borrow().settings);
     }
     next.run(request).await
 }

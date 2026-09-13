@@ -25,6 +25,7 @@ mod checkouts;
 mod emoji;
 mod hydration;
 mod output;
+mod posture;
 mod projection;
 mod prompts;
 mod restoration;
@@ -41,6 +42,7 @@ mod workspaces;
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
 };
+pub(crate) use posture::ApprovalPostureMutationError;
 pub(crate) use prompts::{
     AdmitPromptError, CreateSessionError, DeliveredTurn, DeliveredTurnStatus,
     PromptAdmissionDisposition, PromptMutationError, earliest_pending_prompt, effective_delivery,

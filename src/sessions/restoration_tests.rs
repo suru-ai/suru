@@ -510,6 +510,7 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
         workspace: Workspace::directory(workspace.to_owned()),
         agent_selection: None,
         agent_selection_availability: ModelAvailability::Unavailable,
+        approval_posture: None,
         status: SessionStatus::Idle,
         working_since: None,
         parent,

@@ -3,13 +3,17 @@
 use crate::{
     server_support::PROGRESS_DEADLINE,
     support::{
-        LiveTurn, ScriptedCopilot, abort_arm, conversation_arms, permission_decision_arm, send_arm,
-        session_where,
+        LiveTurn, ScriptedCopilot, abort_arm, conversation_arms, hosting, permission_decision_arm,
+        send_arm, session_where, settled_session,
     },
 };
 use serde_json::Value;
 use suru::{
-    protocol::{Activity, ApprovalOutcome, ApprovalSubject, Decision, TurnStatus},
+    protocol::{
+        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
+        CopilotPermissions, CreateSessionRequest, Decision, InitialPrompt, PromptDelivery,
+        PromptId, TurnStatus, UpdateApprovalPostureRequest,
+    },
     provider::CopilotRuntime,
 };
 use tokio::time::timeout;
@@ -49,6 +53,72 @@ fn approval(
             _ => None,
         })
         .unwrap_or_else(|| panic!("pending Approval for {request}"))
+}
+
+#[tokio::test]
+async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
+    let timeline = r#"      sends=$(( ${sends:-0} + 1 ))
+      if [ "$sends" -eq 1 ]; then
+        event first_idle session.idle '{}'
+      else
+        event next permission.requested '{"requestId":"next-turn","permissionRequest":{"kind":"read","path":"next.txt","intention":"Use the new posture"}}'
+      fi
+"#;
+    let arms = conversation_arms().replace(
+        &permission_decision_arm(),
+        &permission_response_arm("      event second_idle session.idle '{}'\n"),
+    );
+    let copilot = ScriptedCopilot::new(&format!("{}{}", arms, send_arm(timeline)));
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (server, client) = hosting(&copilot, "copilot-next-turn-posture", state.path()).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "First".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+    settled_session(&client, created.session.id, 0).await;
+
+    client
+        .update_approval_posture(
+            created.session.id,
+            UpdateApprovalPostureRequest {
+                posture: Some(ApprovalPosture::Copilot {
+                    permissions: CopilotPermissions::AllowAll,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Second".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+    settled_session(&client, created.session.id, 1).await;
+
+    let response = native_response(&copilot, "next-turn").await;
+    assert_eq!(response["result"]["kind"], "approve-once");
+    server.shutdown().await.unwrap();
 }
 
 async fn native_response(fixture: &ScriptedCopilot, request_id: &str) -> Value {

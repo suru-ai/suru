@@ -274,6 +274,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
                 options: Vec::new(),
             }),
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(SessionTimestamp(1_755_497_600_100)),
             parent: None,
@@ -328,6 +329,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "options": []
         },
         "agent_selection_availability": "available",
+        "approval_posture": null,
         "status": "active",
         "parent": null,
         "context_fill": null,
@@ -359,6 +361,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     fields.remove("settled_at");
     fields.remove("working_since");
     fields.remove("total_usage");
+    fields.remove("approval_posture");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
         .expect("decode a Session summary carrying none of them");
     assert_eq!(decoded.emoji, None);
@@ -394,6 +397,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 }],
             }),
             agent_selection_availability: ModelAvailability::Unavailable,
+            approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
             parent: None,
@@ -497,6 +501,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 }]
             },
             "agent_selection_availability": "unavailable",
+            "approval_posture": null,
             "status": "idle",
             "working_since": null,
             "parent": null,

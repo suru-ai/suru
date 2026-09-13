@@ -36,6 +36,7 @@ pub fn created_session_snapshot(
             workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(working_since),
             parent: None,

@@ -1,6 +1,7 @@
 //! Ratatui view state and terminal lifecycle.
 
 mod approval;
+mod approval_posture_picker;
 mod attachment;
 mod clipboard;
 mod commands;

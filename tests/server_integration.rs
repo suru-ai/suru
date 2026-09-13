@@ -11,12 +11,16 @@ use suru::{
     logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
-        LifecycleState, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId, RedeemInviteRequest,
-        RemoteStatus, ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
+        AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, CodexApprovalPolicy,
+        CodexSandboxMode, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
+        LifecycleState, ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION,
+        PromptDelivery, PromptId, ProviderId, RedeemInviteRequest, RemoteStatus,
+        ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason,
+        UpdateApprovalPostureRequest,
     },
+    provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1447,7 +1451,19 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
 
 #[tokio::test]
 async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
-    let pair = paired_servers("remote-outlook-client").await;
+    let (runtime, mut provider) = provider_support::ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("codex"),
+            id: ModelId::new("gpt-test"),
+            display_name: "Codex fixture".into(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let pair = paired_servers_with_runtime("remote-outlook-client", false, Some(runtime)).await;
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let remote = pair
         .connecting_client
@@ -1513,6 +1529,33 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
             .unwrap()
             .is_empty()
     );
+
+    let start = provider.next_start().await;
+    let mut native = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: suru::protocol::AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-test"),
+            options: Vec::new(),
+        },
+    });
+    native.next_turn().await.succeed();
+    let pinned = ApprovalPosture::Codex {
+        approval_policy: CodexApprovalPolicy::Never,
+        sandbox_mode: CodexSandboxMode::ReadOnly,
+    };
+    let updated = remote
+        .update_approval_posture(
+            created.session.id,
+            UpdateApprovalPostureRequest {
+                posture: Some(pinned),
+            },
+        )
+        .await
+        .expect("pin Approval Posture through the Remote Outlook");
+    assert_eq!(updated.value, pinned);
+    assert!(updated.pinned);
+    native.emit(ProviderEvent::TurnCompleted);
 
     let mut stream = remote
         .subscribe_session(created.session.id)

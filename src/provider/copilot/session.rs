@@ -81,6 +81,10 @@ pub(super) async fn start_copilot_session(
     interrupt_request_timeout: Duration,
     permissions: CopilotPermissions,
 ) -> Result<ProviderSessionConnection, ProviderError> {
+    let permissions = match request.approval_posture.as_ref() {
+        Some(crate::protocol::ApprovalPosture::Copilot { permissions }) => *permissions,
+        _ => permissions,
+    };
     let handle = Arc::new(handle);
     let (request_events, request_rx) = tokio::sync::mpsc::unbounded_channel();
     let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
@@ -500,6 +504,11 @@ impl ProviderSession for CopilotSession {
 
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(crate::protocol::ApprovalPosture::Copilot { permissions }) =
+                input.approval_posture.as_ref()
+            {
+                self.approvals.adopt_posture(*permissions);
+            }
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")

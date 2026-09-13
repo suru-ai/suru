@@ -34,14 +34,15 @@ use crate::{
 };
 
 use super::{
+    approval_posture_picker::ApprovalPosturePicker,
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::ConnectOverlay,
     keymap::{
-        command_for_completion_event, command_for_connect_overlay_event,
-        command_for_interrupt_confirmation_event, command_for_leader_event,
-        command_for_model_options_event, command_for_model_picker_event,
+        command_for_approval_posture_picker_event, command_for_completion_event,
+        command_for_connect_overlay_event, command_for_interrupt_confirmation_event,
+        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_serve_overlay_event, command_for_session_picker_event,
         command_for_settings_panel_event, command_for_sidebar_event,
@@ -505,6 +506,7 @@ pub struct TuiState {
     pending_model_options: bool,
     pub(super) model_options: ModelOptions,
     pub(super) model_picker: ModelPicker,
+    pub(super) approval_posture_picker: ApprovalPosturePicker,
     pub(super) theme_picker: ThemePicker,
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
@@ -761,6 +763,7 @@ impl TuiState {
             pending_model_options: false,
             model_options: ModelOptions::default(),
             model_picker: ModelPicker::default(),
+            approval_posture_picker: ApprovalPosturePicker::default(),
             theme_picker: ThemePicker::default(),
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
@@ -2944,6 +2947,7 @@ impl TuiState {
                 checkout: None,
                 agent_selection: self.landing_agent_selection.clone(),
                 agent_selection_availability: crate::protocol::ModelAvailability::Available,
+                approval_posture: None,
                 status: crate::protocol::SessionStatus::Active,
                 working_since: None,
                 parent: None,
@@ -3699,6 +3703,10 @@ pub enum ApplicationTransition {
     UpdateAgentSelection {
         session: SessionReference,
         request: UpdateAgentSelectionRequest,
+    },
+    UpdateApprovalPosture {
+        session: SessionReference,
+        request: crate::protocol::UpdateApprovalPostureRequest,
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
@@ -6879,6 +6887,49 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListModels(request))
             }
+            SemanticCommandId::ApprovalPostureOpen => {
+                if let Some(posture) = self.state.session.as_ref().and_then(|session| {
+                    session
+                        .snapshot()
+                        .session
+                        .approval_posture
+                        .as_ref()
+                        .map(|posture| posture.value)
+                }) {
+                    self.state.approval_posture_picker.open(posture);
+                    self.state.command_mode = CommandMode::Composer;
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ApprovalPostureCycle => {
+                let request = self.state.session.as_ref().and_then(|session| {
+                    session
+                        .snapshot()
+                        .session
+                        .approval_posture
+                        .as_ref()
+                        .map(|posture| crate::protocol::UpdateApprovalPostureRequest {
+                            posture: Some(posture.value.cycle_primary()),
+                        })
+                });
+                Ok(self.approval_posture_transition(request))
+            }
+            SemanticCommandId::ApprovalPosturePrevious => {
+                self.state.approval_posture_picker.previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ApprovalPostureNext => {
+                self.state.approval_posture_picker.next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ApprovalPostureSelect => {
+                let request = self.state.approval_posture_picker.choose();
+                Ok(self.approval_posture_transition(request))
+            }
+            SemanticCommandId::ApprovalPostureClose => {
+                self.state.approval_posture_picker.close();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ThemeList => {
                 self.refresh_user_themes();
                 let current = self.state.settings.appearance.theme.clone();
@@ -7208,6 +7259,18 @@ impl Application {
                 ))
             }
             SemanticCommandId::SessionNew => Ok(self.open_landing()),
+        }
+    }
+
+    fn approval_posture_transition(
+        &self,
+        request: Option<crate::protocol::UpdateApprovalPostureRequest>,
+    ) -> ApplicationTransition {
+        match (self.state.session_reference.clone(), request) {
+            (Some(session), Some(request)) => {
+                ApplicationTransition::UpdateApprovalPosture { session, request }
+            }
+            _ => ApplicationTransition::Continue,
         }
     }
 
@@ -7718,6 +7781,9 @@ impl Application {
     }
 
     fn command_for_input_mode(&self, event: InputEvent) -> Option<CommandId> {
+        if self.state.approval_posture_picker.is_open() {
+            return command_for_approval_posture_picker_event(event);
+        }
         match self.state.top_selection_overlay() {
             Some(SelectionSurface::Connect) => {
                 return command_for_connect_overlay_event(

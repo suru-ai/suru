@@ -19,11 +19,12 @@ use crate::{
         InterruptOutcome, InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState,
         ModelCatalog, Outlook, Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest,
         Remote, RemoteHealth, ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown,
-        SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError, SessionId,
-        SessionListItem, SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged,
-        SessionSummary, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
-        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, UpdateAgentSelectionRequest, ViewSessionRequest,
+        SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
+        SessionError, SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot,
+        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
+        SessionWorkingChanged, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        UpdateApprovalPostureRequest, ViewSessionRequest,
     },
 };
 
@@ -397,6 +398,16 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn update_approval_posture(
+        &self,
+        session_id: SessionId,
+        request: UpdateApprovalPostureRequest,
+    ) -> Result<SessionApprovalPosture> {
+        self.session_commands()
+            .update_approval_posture(session_id, request)
+            .await
+    }
+
     pub async fn confirm_landing_agent_selection(
         &self,
         selection: AgentSelection,
@@ -629,6 +640,16 @@ impl OutlookClient {
     ) -> Result<AgentSelection> {
         self.commands
             .update_agent_selection(session_id, request)
+            .await
+    }
+
+    pub async fn update_approval_posture(
+        &self,
+        session_id: SessionId,
+        request: UpdateApprovalPostureRequest,
+    ) -> Result<SessionApprovalPosture> {
+        self.commands
+            .update_approval_posture(session_id, request)
             .await
     }
 
@@ -900,6 +921,19 @@ impl SessionCommandClient {
             &format!("/v1/sessions/{session_id}/agent-selection"),
             &request,
             "Agent Selection update",
+        )
+        .await
+    }
+
+    pub(crate) async fn update_approval_posture(
+        &self,
+        session_id: SessionId,
+        request: UpdateApprovalPostureRequest,
+    ) -> Result<SessionApprovalPosture> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/approval-posture"),
+            &request,
+            "Approval Posture update",
         )
         .await
     }

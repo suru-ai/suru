@@ -218,6 +218,7 @@ struct ProviderSessionContext {
     session_id: SessionId,
     execution_directory: PathBuf,
     updates: ProviderUpdateGate,
+    settings: watch::Receiver<SettingsSnapshot>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -893,6 +894,7 @@ impl ProviderOrchestrator {
                 session_id,
                 execution_directory,
                 updates: self.updates.clone(),
+                settings: self.settings.clone(),
             },
             commands_rx,
             ProviderShutdown {
@@ -1211,6 +1213,7 @@ async fn run_provider_session(
         session_id,
         execution_directory,
         updates,
+        settings,
     } = context;
     let _checkout_cleanup = CheckoutActorCleanup {
         session_id,
@@ -1596,6 +1599,11 @@ async fn run_provider_session(
                     connection = runtime.start_session(ProviderSessionRequest {
                         execution_directory: execution_directory.clone(),
                         resume_state: sessions.resume_state(session_id, &provider_id),
+                        approval_posture: effective_approval_posture(
+                            &snapshot,
+                            &settings.borrow(),
+                            &provider_id,
+                        ),
                     }) => connection,
                 };
                 let connection = match connection {
@@ -1661,6 +1669,10 @@ async fn run_provider_session(
                     defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     continue;
                 }
+                // Provider discovery can supply the Session's first Agent Selection. Derive the
+                // corresponding unpinned posture immediately so snapshots do not remain empty
+                // until a later HTTP mutation happens to reconcile them.
+                sessions.reconcile_approval_postures(&settings.borrow().settings);
                 connected_incarnations
                     .lock()
                     .unwrap()
@@ -1737,7 +1749,10 @@ async fn run_provider_session(
                 .expect("Provider connection exists before Prompt delivery")
                 .session
                 .clone();
-            let (turn_id, input) = provider_turn_start(delivered);
+            let posture = sessions.snapshot(session_id).and_then(|snapshot| {
+                effective_approval_posture(&snapshot, &settings.borrow(), &provider_id)
+            });
+            let (turn_id, input) = provider_turn_start(delivered, posture);
             let started = tokio::select! {
                 biased;
                 _ = shutdown.wait() => break 'actor,
@@ -2328,7 +2343,10 @@ fn fail_active_turn(
     let _ = updates.apply(|| sessions.fail_turn(session_id, turn_id, trailing_output, message));
 }
 
-fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) {
+fn provider_turn_start(
+    delivered: DeliveredTurn,
+    approval_posture: Option<crate::protocol::ApprovalPosture>,
+) -> (TurnId, ProviderTurnInput) {
     let turn_id = delivered.turn_id;
     let selection = delivered
         .agent
@@ -2343,8 +2361,24 @@ fn provider_turn_start(delivered: DeliveredTurn) -> (TurnId, ProviderTurnInput) 
                 delivered.prompt.skill_invocations,
             ),
             selection,
+            approval_posture,
         },
     )
+}
+
+fn effective_approval_posture(
+    snapshot: &crate::protocol::SessionSnapshot,
+    settings: &SettingsSnapshot,
+    provider: &crate::protocol::ProviderId,
+) -> Option<crate::protocol::ApprovalPosture> {
+    snapshot
+        .session
+        .approval_posture
+        .as_ref()
+        .filter(|posture| posture.pinned)
+        .map(|posture| posture.value.clone())
+        .filter(|posture| posture.provider() == *provider)
+        .or_else(|| crate::protocol::ApprovalPosture::for_provider(provider, &settings.settings))
 }
 
 fn project_turn_start_failure(

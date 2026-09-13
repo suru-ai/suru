@@ -1724,6 +1724,7 @@ fn session_summary(
             workspace: Workspace::directory(workspace.to_owned()),
             agent_selection: None,
             agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
             status,
             working_since: None,
             parent: None,

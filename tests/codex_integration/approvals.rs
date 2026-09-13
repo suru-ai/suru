@@ -154,6 +154,12 @@ async fn native_approvals_preserve_subjects_callback_identity_decisions_and_inte
         .unwrap();
     assert_eq!(start["params"]["approvalPolicy"], "untrusted");
     assert_eq!(start["params"]["sandbox"], "read-only");
+    let turn_start = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/start")
+        .unwrap();
+    assert_eq!(turn_start["params"]["sandboxPolicy"]["type"], "readOnly");
 
     let approvals = snapshot
         .activities

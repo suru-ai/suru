@@ -33,6 +33,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             SessionChange::AgentSelectionAvailabilityChanged { availability } => {
                 next.session.agent_selection_availability = *availability;
             }
+            SessionChange::ApprovalPostureChanged { approval_posture } => {
+                next.session.approval_posture = approval_posture.clone();
+            }
             SessionChange::PromptAdded { prompt } => {
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {
                     bail!("Session update reused a Prompt identity");
@@ -862,6 +865,7 @@ mod tests {
                 workspace: Workspace::directory(PathBuf::from("/workspace")),
                 agent_selection: None,
                 agent_selection_availability: ModelAvailability::Available,
+                approval_posture: None,
                 status: SessionStatus::Idle,
                 working_since: None,
                 parent: None,
