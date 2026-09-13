@@ -351,6 +351,9 @@ impl SessionStore {
             // A Session begins having delegated nothing, so there is nothing
             // below it to roll up.
             subagent_questionnaires: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
             subagent_usage: None,
             total_cost: None,
         };

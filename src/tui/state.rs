@@ -2933,6 +2933,9 @@ impl TuiState {
             subagent_usage: None,
             total_cost: None,
             subagent_questionnaires: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
         })
     }
 

@@ -296,6 +296,7 @@ enum ProviderErrorKind {
     Failure,
     SelectionRejected,
     QuestionnaireRejected,
+    DecisionRejected,
     /// The Provider itself cannot be used yet, for a reason the user fixes
     /// outside Suru. Carried on the error so whatever asked the runtime to
     /// work — Model discovery above all — can report the condition rather
@@ -324,6 +325,20 @@ impl ProviderError {
 
     pub(crate) fn is_questionnaire_rejected(&self) -> bool {
         self.kind == ProviderErrorKind::QuestionnaireRejected
+    }
+
+    /// Delivery definitely did not occur and the native Approval remains live.
+    /// Only this failure permits an explicit Decision retry.
+    pub fn decision_rejected(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            session_lost: false,
+            kind: ProviderErrorKind::DecisionRejected,
+        }
+    }
+
+    pub(crate) fn is_decision_rejected(&self) -> bool {
+        self.kind == ProviderErrorKind::DecisionRejected
     }
 
     pub fn selection_rejected(message: impl Into<String>) -> Self {
@@ -361,7 +376,8 @@ impl ProviderError {
             ProviderErrorKind::Unavailable(reason) => Some(reason),
             ProviderErrorKind::Failure
             | ProviderErrorKind::SelectionRejected
-            | ProviderErrorKind::QuestionnaireRejected => None,
+            | ProviderErrorKind::QuestionnaireRejected
+            | ProviderErrorKind::DecisionRejected => None,
         }
     }
 
@@ -570,6 +586,15 @@ pub enum ProviderEvent {
     },
     QuestionnaireWithdrawn {
         id: crate::protocol::QuestionnaireId,
+    },
+    ApprovalRequested {
+        approval: crate::protocol::Approval,
+        /// Native identity of the gated Tool row, when one exists. Session
+        /// orchestration resolves it to the public Activity identity.
+        tool_activity_id: Option<ProviderActivityId>,
+    },
+    ApprovalWithdrawn {
+        id: crate::protocol::ApprovalId,
     },
     AgentSelectionChanged {
         selection: AgentSelection,
@@ -1076,6 +1101,17 @@ pub(crate) fn validate_models(models: &[ModelDescriptor]) -> Result<(), Provider
 }
 
 pub trait ProviderSession: Send + Sync + 'static {
+    /// Delivers a user's Decision to a live Provider Approval. Providers that
+    /// do not expose Approvals refuse by default.
+    fn submit_decision(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> ProviderFuture<'_, ()> {
+        let _ = (id, decision);
+        Box::pin(async { Err(ProviderError::new("Approval is unavailable")) })
+    }
+
     fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,

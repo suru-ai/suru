@@ -479,6 +479,17 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn submit_decision(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> Result<()> {
+        self.session_commands()
+            .submit_decision(session_id, id, decision)
+            .await
+    }
+
     pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
         self.session_commands().interrupt_session(session_id).await
     }
@@ -648,6 +659,17 @@ impl OutlookClient {
         prompt_id: PromptId,
     ) -> Result<Prompt> {
         self.commands.cancel_prompt(session_id, prompt_id).await
+    }
+
+    pub async fn submit_decision(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> Result<()> {
+        self.commands
+            .submit_decision(session_id, id, decision)
+            .await
     }
 
     pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
@@ -946,6 +968,28 @@ impl SessionCommandClient {
             .await
             .context("send Questionnaire submission")?;
         decode_empty_api_response(response, "Questionnaire submission").await
+    }
+
+    pub(crate) async fn submit_decision(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/approvals/{id}/decision"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&decision)
+            .send()
+            .await
+            .context("send Approval Decision")?;
+        decode_empty_api_response(response, "Approval Decision").await
     }
 
     pub(crate) async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
@@ -1349,7 +1393,8 @@ impl Drop for ManagedClient {
 
 #[cfg(test)]
 mod tests {
-    use super::remote_probe_url;
+    use super::{remote_probe_url, server_url};
+    use crate::protocol::Outlook;
 
     #[test]
     fn remote_probe_url_encodes_a_freely_editable_name_as_one_path_segment() {
@@ -1359,6 +1404,21 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/pairing/remotes/lab%2Feast%3F%23/health"
+        );
+    }
+
+    #[test]
+    fn approval_decision_uses_the_remote_session_command_route() {
+        let url = server_url(
+            "http://127.0.0.1:7777",
+            &Outlook::Remote("workstation".into()),
+            "/v1/sessions/session-id/approvals/approval-id/decision",
+        )
+        .expect("build remote Decision URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/remotes/workstation/v1/sessions/session-id/approvals/approval-id/decision"
         );
     }
 }

@@ -170,6 +170,9 @@ fn child_with_working_subagent(
             duration_ms: None,
         }],
         subagent_questionnaires: Vec::new(),
+        pending_approvals: Vec::new(),
+        submitting_approvals: Vec::new(),
+        pending_approvals_revision: suru::protocol::SessionRevision(0),
         subagent_usage: None,
         total_cost: None,
         transcript: vec![

@@ -539,6 +539,9 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
             subagent_usage: None,
             total_cost: None,
             subagent_questionnaires: vec![],
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
         },
         resume_states: HashMap::new(),
     }

@@ -434,6 +434,18 @@ pub(super) fn settle_in_flight_changes(
             continue;
         }
         match activity {
+            Activity::Approval {
+                id,
+                outcome:
+                    crate::protocol::ApprovalOutcome::Pending
+                    | crate::protocol::ApprovalOutcome::SubmissionRejected
+                    | crate::protocol::ApprovalOutcome::Submitting,
+                ..
+            } => changes.push(SessionChange::ApprovalSettled {
+                activity_id: *id,
+                outcome: crate::protocol::ApprovalOutcome::TurnEnded,
+                decision: None,
+            }),
             Activity::Questionnaire {
                 id,
                 outcome:
@@ -540,6 +552,9 @@ mod tests {
                 cost_details: None,
             }],
             subagent_questionnaires: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
             subagent_usage: None,
             total_cost: None,
             transcript: messages

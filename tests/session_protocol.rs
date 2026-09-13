@@ -3,22 +3,71 @@ use std::path::PathBuf;
 use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    AgentSelection, AgentSelectionOperationId, Cost, CostBasis, CreateSessionRequest, FileChange,
-    InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-    ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
-    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
-    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
-    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TranscriptItem, Turn, TurnId,
-    TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
-    ViewSessionRequest, Workspace,
+    AgentSelection, AgentSelectionOperationId, ApprovalSubject, Cost, CostBasis,
+    CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId, MessageRole,
+    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+    ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
+    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal,
+    ViewSessionOperationId, ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
 fn fixture_id(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("parse fixture identity")
+}
+
+#[test]
+fn approval_subjects_have_strict_provider_neutral_wire_shapes() {
+    let subjects = [
+        json!({
+            "kind": "command",
+            "command": "cat Cargo.toml",
+            "cwd": "workspace",
+            "actions": [{
+                "kind": "read",
+                "command": "cat Cargo.toml",
+                "name": "Cargo.toml",
+                "path": "workspace/Cargo.toml"
+            }]
+        }),
+        json!({
+            "kind": "file_change",
+            "paths": ["src/lib.rs", "src/main.rs"],
+            "grant_root": "src"
+        }),
+        json!({"kind": "read", "path": "secrets.txt"}),
+        json!({"kind": "network", "host_or_url": "api.example.test"}),
+        json!({
+            "kind": "permission_grant",
+            "profile": {"sandbox": "workspace-write", "network": false}
+        }),
+        json!({
+            "kind": "other_tool",
+            "name": "database_query",
+            "input": {"table": "sessions", "limit": 10}
+        }),
+    ];
+
+    for expected in subjects {
+        let subject = serde_json::from_value::<ApprovalSubject>(expected.clone())
+            .expect("decode typed Approval subject");
+        assert_eq!(
+            serde_json::to_value(subject).expect("encode typed Approval subject"),
+            expected
+        );
+    }
+    assert!(
+        serde_json::from_value::<ApprovalSubject>(
+            json!({"kind": "network", "host_or_url": "example.test", "opaque": true})
+        )
+        .is_err(),
+        "Approval subjects reject untyped extension fields"
+    );
 }
 
 #[test]
@@ -255,6 +304,8 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "subagent_questionnaires": [],
             "pending_questionnaires": [], "submitting_questionnaires": [],
             "pending_questionnaires_revision": 0,
+            "pending_approvals": [], "submitting_approvals": [],
+            "pending_approvals_revision": 0,
             "latest_turn": null,
             "viewed_at": null
         },
@@ -418,6 +469,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             },
         ],
         subagent_questionnaires: Vec::new(),
+        pending_approvals: Vec::new(),
+        submitting_approvals: Vec::new(),
+        pending_approvals_revision: suru::protocol::SessionRevision(0),
         subagent_usage: Some(UsageTotal {
             fresh_input_tokens: Some(2_000),
             output_tokens: Some(500),
@@ -514,6 +568,9 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             }
         ],
         "subagent_questionnaires": [],
+        "pending_approvals": [],
+        "submitting_approvals": [],
+        "pending_approvals_revision": 0,
         "subagent_usage": {
             "fresh_input_tokens": 2_000,
             "cache_read_tokens": null,

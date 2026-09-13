@@ -226,7 +226,7 @@ pub(super) fn restored_record(
     mut persisted: PersistedSession,
     prompts: &mut std::collections::HashMap<PromptId, PromptOwner>,
 ) -> SessionRecord {
-    recover_questionnaires(&mut persisted);
+    recover_interventions(&mut persisted);
     let next_prompt_order = persisted
         .snapshot
         .prompts
@@ -265,17 +265,29 @@ pub(super) fn restored_record(
     }
 }
 
-fn recover_questionnaires(persisted: &mut PersistedSession) {
-    use crate::protocol::{Activity, QuestionnaireOutcome};
+fn recover_interventions(persisted: &mut PersistedSession) {
+    use crate::protocol::{Activity, ApprovalOutcome, QuestionnaireOutcome};
     for activity in &mut persisted.snapshot.activities {
-        if let Activity::Questionnaire { outcome, .. } = activity {
-            *outcome = match *outcome {
-                QuestionnaireOutcome::Submitting => QuestionnaireOutcome::DeliveryUncertain,
-                QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected => {
-                    QuestionnaireOutcome::Unavailable
-                }
-                other => other,
-            };
+        match activity {
+            Activity::Approval { outcome, .. } => {
+                *outcome = match *outcome {
+                    ApprovalOutcome::Submitting => ApprovalOutcome::DeliveryUncertain,
+                    ApprovalOutcome::Pending | ApprovalOutcome::SubmissionRejected => {
+                        ApprovalOutcome::Unavailable
+                    }
+                    other => other,
+                };
+            }
+            Activity::Questionnaire { outcome, .. } => {
+                *outcome = match *outcome {
+                    QuestionnaireOutcome::Submitting => QuestionnaireOutcome::DeliveryUncertain,
+                    QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected => {
+                        QuestionnaireOutcome::Unavailable
+                    }
+                    other => other,
+                };
+            }
+            _ => {}
         }
     }
 }

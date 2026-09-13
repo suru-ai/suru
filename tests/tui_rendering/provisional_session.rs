@@ -54,6 +54,9 @@ pub fn created_session_snapshot(
         activities: Vec::new(),
         transcript: Vec::new(),
         subagent_questionnaires: Vec::new(),
+        pending_approvals: Vec::new(),
+        submitting_approvals: Vec::new(),
+        pending_approvals_revision: suru::protocol::SessionRevision(0),
         subagent_usage: None,
         total_cost: None,
     }

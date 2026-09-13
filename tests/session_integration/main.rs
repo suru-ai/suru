@@ -35,6 +35,7 @@ mod usage;
 mod viewed;
 mod working;
 
+mod approvals;
 mod questionnaires;
 mod repositories;
 

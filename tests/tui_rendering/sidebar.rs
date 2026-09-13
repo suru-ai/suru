@@ -474,6 +474,9 @@ fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
+                    pending_approvals: Vec::new(),
+                    submitting_approvals: Vec::new(),
+                    pending_approvals_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status: TurnStatus::Completed,
                         settled_at: Some(settled_at),
@@ -4104,6 +4107,9 @@ fn standing_elsewhere(
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
+                    pending_approvals: Vec::new(),
+                    submitting_approvals: Vec::new(),
+                    pending_approvals_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status,
                         settled_at: Some(settled_at),
@@ -4202,6 +4208,9 @@ fn latest_turn(session: SessionListItem, status: TurnStatus, settled_at: u64) ->
         submitting_questionnaires: Vec::new(),
         pending_questionnaires_revision: suru::protocol::SessionRevision(0),
         subagent_questionnaires: Vec::new(),
+        pending_approvals: Vec::new(),
+        submitting_approvals: Vec::new(),
+        pending_approvals_revision: suru::protocol::SessionRevision(0),
         latest_turn: Some(LatestTurnStatus {
             status,
             settled_at: Some(SessionTimestamp(settled_at)),
@@ -6364,6 +6373,9 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
                     submitting_questionnaires: Vec::new(),
                     pending_questionnaires_revision: suru::protocol::SessionRevision(0),
                     subagent_questionnaires: Vec::new(),
+                    pending_approvals: Vec::new(),
+                    submitting_approvals: Vec::new(),
+                    pending_approvals_revision: suru::protocol::SessionRevision(0),
                     latest_turn: Some(LatestTurnStatus {
                         status: TurnStatus::Failed,
                         settled_at: Some(SessionTimestamp(now())),

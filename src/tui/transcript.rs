@@ -2712,6 +2712,12 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     (step as u8).hash(&mut hasher);
     match activity {
+        Activity::Approval {
+            outcome, decision, ..
+        } => {
+            (*outcome as u8).hash(&mut hasher);
+            decision.map(|value| value as u8).hash(&mut hasher);
+        }
         Activity::Questionnaire { outcome, .. } => (*outcome as u8).hash(&mut hasher),
         Activity::Status { .. } | Activity::Error { .. } => {}
         Activity::Command {
@@ -2899,6 +2905,38 @@ fn render_activity(
 ) -> Option<UnitAnchor> {
     let mut projection = ActivityProjection { lines, links };
     match activity {
+        Activity::Approval {
+            outcome, decision, ..
+        } => {
+            projection
+                .lines
+                .push(StyledLine::from(vec![StyledSpan::text(
+                    format!(
+                        "  Approval · {}",
+                        match (outcome, decision) {
+                            (crate::protocol::ApprovalOutcome::Pending, _) => "Pending".into(),
+                            (crate::protocol::ApprovalOutcome::Submitting, _) =>
+                                "Submitting".into(),
+                            (crate::protocol::ApprovalOutcome::SubmissionRejected, _) => {
+                                "Decision not delivered; retry".into()
+                            }
+                            (crate::protocol::ApprovalOutcome::Decided, Some(decision)) => {
+                                format!("{decision:?}")
+                            }
+                            (crate::protocol::ApprovalOutcome::Decided, None) => "Decided".into(),
+                            (crate::protocol::ApprovalOutcome::Withdrawn, _) => "Withdrawn".into(),
+                            (crate::protocol::ApprovalOutcome::TurnEnded, _) => "Turn ended".into(),
+                            (crate::protocol::ApprovalOutcome::Unavailable, _) =>
+                                "Unavailable".into(),
+                            (crate::protocol::ApprovalOutcome::DeliveryUncertain, _) => {
+                                "Delivery uncertain".into()
+                            }
+                        }
+                    ),
+                    theme.accent.primary,
+                )]));
+            None
+        }
         Activity::Questionnaire {
             questionnaire,
             outcome,
@@ -5473,6 +5511,9 @@ mod tests {
             activities,
             transcript,
             subagent_questionnaires: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
             subagent_usage: None,
             total_cost: None,
         }
@@ -5684,7 +5725,8 @@ mod tests {
     /// entries belong to without spelling out every Activity kind.
     fn set_turn(activity: &mut Activity, turn_id: TurnId) {
         match activity {
-            Activity::Questionnaire { turn_id: id, .. }
+            Activity::Approval { turn_id: id, .. }
+            | Activity::Questionnaire { turn_id: id, .. }
             | Activity::Status { turn_id: id, .. }
             | Activity::Error { turn_id: id, .. }
             | Activity::Command { turn_id: id, .. }

@@ -1,5 +1,7 @@
+mod approvals;
 mod questionnaires;
 
+use approvals::{DecisionDeliveries, LiveApprovals};
 use questionnaires::{LiveQuestionnaires, QuestionnaireDeliveries};
 
 use std::{
@@ -168,6 +170,12 @@ impl ProviderUpdateGate {
 }
 
 enum ProviderCommand {
+    SubmitDecision {
+        target: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     SubmitQuestionnaire {
         target: SessionId,
         id: crate::protocol::QuestionnaireId,
@@ -220,6 +228,7 @@ enum ContinuationExecution {
 
 struct ActiveProviderTurn {
     turn_id: TurnId,
+    approvals: LiveApprovals,
     questionnaires: LiveQuestionnaires,
     /// Whether this Turn is a Continuation — the one kind of Turn no Prompt
     /// began, opened by this actor for output that arrived after the previous
@@ -265,6 +274,7 @@ impl ActiveProviderTurn {
     fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
+            approvals: LiveApprovals::default(),
             questionnaires: LiveQuestionnaires::default(),
             continuation: None,
             streaming_message: None,
@@ -290,6 +300,13 @@ impl ActiveProviderTurn {
         self.command_activities.contains_key(activity_id)
             || self.file_change_activities.contains_key(activity_id)
             || self.reasoning_activities.contains_key(activity_id)
+    }
+
+    fn tool_activity_id(&self, activity_id: &super::ProviderActivityId) -> Option<ActivityId> {
+        self.command_activities
+            .get(activity_id)
+            .map(|command| command.id)
+            .or_else(|| self.file_change_activities.get(activity_id).copied())
     }
 
     /// Drains what the Turn's streams hold that only this actor knows: the
@@ -366,6 +383,13 @@ struct SubagentIdentityRoute {
 }
 
 impl SubagentRoutes {
+    fn live_approvals(&mut self, session_id: SessionId) -> Option<&mut LiveApprovals> {
+        self.routes
+            .values_mut()
+            .find(|route| route.session_id == session_id)
+            .map(|route| &mut route.turn.approvals)
+    }
+
     fn live_questionnaires(&mut self, session_id: SessionId) -> Option<&mut LiveQuestionnaires> {
         self.routes
             .values_mut()
@@ -959,6 +983,29 @@ impl ProviderOrchestrator {
             .map_err(|_| "Questionnaire delivery could not be confirmed".to_owned())?
     }
 
+    pub(crate) async fn submit_decision(
+        &self,
+        session_id: SessionId,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> Result<(), String> {
+        let actor_id = self.sessions.actor_session(session_id);
+        let (response, received) = oneshot::channel();
+        self.schedule(
+            actor_id,
+            ProviderCommand::SubmitDecision {
+                target: session_id,
+                id,
+                decision,
+                response,
+            },
+        )
+        .map_err(|_| "Approval is unavailable".to_owned())?;
+        received
+            .await
+            .map_err(|_| "Decision delivery could not be confirmed".to_owned())?
+    }
+
     /// Stops what a Session is doing, whatever that is: the active Turn along
     /// with the Subagents it spawned, or — with no Turn running — the
     /// Subagents alone. Interrupting a Subagent's own Session stops that one
@@ -1173,13 +1220,15 @@ async fn run_provider_session(
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
     let mut subagents = SubagentRoutes::default();
-    let mut deliveries = QuestionnaireDeliveries::default();
+    let mut questionnaire_deliveries = QuestionnaireDeliveries::default();
+    let mut decision_deliveries = DecisionDeliveries::default();
     let mut deferred_prompt_id = None;
     let mut pending_turn_starts = VecDeque::new();
     let provider_id = runtime.provider_id();
 
     'actor: loop {
-        deliveries.reconcile(&sessions);
+        questionnaire_deliveries.reconcile(&sessions);
+        decision_deliveries.reconcile(&sessions);
         if shutdown.requested() {
             break;
         }
@@ -1328,6 +1377,30 @@ async fn run_provider_session(
             };
             let Some(command) = command else { break };
             let prompt_id = match command {
+                ProviderCommand::SubmitDecision {
+                    target,
+                    id,
+                    decision,
+                    response,
+                } => {
+                    if let (Some(connected), Some(live)) =
+                        (provider.as_ref(), subagents.live_approvals(target))
+                    {
+                        decision_deliveries.submit(
+                            &sessions,
+                            &updates,
+                            target,
+                            live,
+                            connected.session.clone(),
+                            id,
+                            decision,
+                            response,
+                        );
+                    } else {
+                        let _ = response.send(Err("Approval is unavailable".into()));
+                    }
+                    continue;
+                }
                 ProviderCommand::SubmitQuestionnaire {
                     target,
                     id,
@@ -1337,7 +1410,7 @@ async fn run_provider_session(
                     if let (Some(connected), Some(live)) =
                         (provider.as_ref(), subagents.live_questionnaires(target))
                     {
-                        deliveries.submit(
+                        questionnaire_deliveries.submit(
                             &sessions,
                             &updates,
                             target,
@@ -1781,7 +1854,7 @@ async fn run_provider_session(
                     subagents.live_questionnaires(target)
                 };
                 if let Some(live) = live {
-                    deliveries.submit(
+                    questionnaire_deliveries.submit(
                         &sessions,
                         &updates,
                         target,
@@ -1793,6 +1866,32 @@ async fn run_provider_session(
                     );
                 } else {
                     let _ = response.send(Err("Questionnaire is unavailable".into()));
+                }
+            }
+            ProviderInput::Command(Some(ProviderCommand::SubmitDecision {
+                target,
+                id,
+                decision,
+                response,
+            })) => {
+                let live = if target == session_id {
+                    active.as_mut().map(|turn| &mut turn.approvals)
+                } else {
+                    subagents.live_approvals(target)
+                };
+                if let Some(live) = live {
+                    decision_deliveries.submit(
+                        &sessions,
+                        &updates,
+                        target,
+                        live,
+                        provider_session,
+                        id,
+                        decision,
+                        response,
+                    );
+                } else {
+                    let _ = response.send(Err("Approval is unavailable".into()));
                 }
             }
 
@@ -2139,7 +2238,8 @@ async fn run_provider_session(
         );
     }
     subagents.fail_all(&sessions, &updates, SUBAGENT_CONNECTION_LOST_MESSAGE);
-    drop(deliveries);
+    drop(questionnaire_deliveries);
+    drop(decision_deliveries);
 
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
@@ -2362,6 +2462,54 @@ fn project_provider_event(
                     next_agent.agent.clone(),
                     selection,
                 ).map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ApprovalRequested {
+                approval,
+                tool_activity_id,
+            } => {
+                let tool_activity_id = tool_activity_id
+                    .as_ref()
+                    .and_then(|native| active.tool_activity_id(native));
+                active
+                    .approvals
+                    .register(
+                        sessions,
+                        session_id,
+                        active.turn_id,
+                        approval,
+                        tool_activity_id,
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ApprovalWithdrawn { id } => {
+                active.approvals.withdraw(id);
+                let activity = sessions.snapshot(session_id).and_then(|snapshot| {
+                    snapshot.activities.into_iter().find(|activity| {
+                        matches!(
+                            activity,
+                            Activity::Approval {
+                                approval,
+                                outcome: crate::protocol::ApprovalOutcome::Pending
+                                    | crate::protocol::ApprovalOutcome::SubmissionRejected
+                                    | crate::protocol::ApprovalOutcome::Submitting,
+                                ..
+                            } if approval.id == id
+                        )
+                    })
+                });
+                match activity {
+                    Some(activity) => sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ApprovalSettled {
+                                activity_id: activity.id(),
+                                outcome: crate::protocol::ApprovalOutcome::Withdrawn,
+                                decision: None,
+                            },
+                        )
+                        .map(|_| ProviderEventProjection::Continue),
+                    None => Ok(ProviderEventProjection::Continue),
+                }
             }
             ProviderEvent::QuestionnaireRequested { questionnaire } => active
                 .questionnaires

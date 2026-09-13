@@ -695,6 +695,10 @@ pub async fn spawn_with_source_control(
                     post(submit_questionnaire),
                 )
                 .route(
+                    "/v1/sessions/{session_id}/approvals/{id}/decision",
+                    post(submit_decision),
+                )
+                .route(
                     "/v1/sessions/{session_id}/interrupt",
                     post(interrupt_session),
                 )
@@ -2374,6 +2378,29 @@ async fn submit_questionnaire(
         Err(message) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::QuestionnaireSubmissionFailed,
+            &message,
+        ),
+    }
+}
+
+async fn submit_decision(
+    State(state): State<AppState>,
+    AxumPath((session_id, id)): AxumPath<(SessionId, crate::protocol::ApprovalId)>,
+    headers: HeaderMap,
+    Json(decision): Json<crate::protocol::Decision>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .providers
+        .submit_decision(session_id, id, decision)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(message) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::DecisionSubmissionFailed,
             &message,
         ),
     }

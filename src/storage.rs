@@ -493,6 +493,9 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 activities: Vec::new(),
                 transcript: Vec::new(),
                 subagent_questionnaires: Vec::new(),
+                pending_approvals: Vec::new(),
+                submitting_approvals: Vec::new(),
+                pending_approvals_revision: crate::protocol::SessionRevision(0),
                 subagent_usage: None,
                 total_cost: None,
             };
@@ -617,6 +620,9 @@ fn load_session(
         // roll-up is re-derived across the subtree once every Session is
         // loaded rather than stored twice.
         subagent_questionnaires: Vec::new(),
+        pending_approvals: Vec::new(),
+        submitting_approvals: Vec::new(),
+        pending_approvals_revision: crate::protocol::SessionRevision(0),
         subagent_usage: None,
         total_cost: None,
     };

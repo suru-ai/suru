@@ -385,6 +385,18 @@ impl SessionListing {
                 standing_inputs.pending_questionnaires_revision =
                     summary.standing_inputs.pending_questionnaires_revision;
             }
+            if standing_inputs.pending_approvals_revision.0
+                < summary.standing_inputs.pending_approvals_revision.0
+            {
+                standing_inputs
+                    .pending_approvals
+                    .clone_from(&summary.standing_inputs.pending_approvals);
+                standing_inputs
+                    .submitting_approvals
+                    .clone_from(&summary.standing_inputs.submitting_approvals);
+                standing_inputs.pending_approvals_revision =
+                    summary.standing_inputs.pending_approvals_revision;
+            }
             for known in &summary.standing_inputs.subagent_questionnaires {
                 match standing_inputs
                     .subagent_questionnaires

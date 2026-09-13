@@ -219,7 +219,9 @@ fn agent_output_turn_id(
             .map(|message| message.turn_id)
             .ok_or_else(|| anyhow!("Agent output referenced an unknown Agent Message")),
         SessionChange::ActivityAdded { activity } => Ok(activity.turn_id()),
-        SessionChange::QuestionnaireAccepted { activity_id }
+        SessionChange::DecisionAccepted { activity_id }
+        | SessionChange::ApprovalSettled { activity_id, .. }
+        | SessionChange::QuestionnaireAccepted { activity_id }
         | SessionChange::QuestionnaireSettled { activity_id, .. }
         | SessionChange::CommandOutputAppended { activity_id, .. }
         | SessionChange::CommandOutputTruncated { activity_id }

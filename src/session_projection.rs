@@ -308,6 +308,52 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 message.status = MessageStatus::Completed;
             }
+            SessionChange::DecisionAccepted { activity_id } => {
+                let Some(Activity::Approval {
+                    outcome, turn_id, ..
+                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                else {
+                    bail!("Unknown Approval Activity");
+                };
+                if !outcome.is_answerable()
+                    || !next.turns.iter().any(|turn| {
+                        turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
+                    })
+                {
+                    bail!("Approval is unavailable");
+                }
+                *outcome = crate::protocol::ApprovalOutcome::Submitting;
+            }
+            SessionChange::ApprovalSettled {
+                activity_id,
+                outcome,
+                decision,
+            } => {
+                let Some(Activity::Approval {
+                    outcome: current,
+                    decision: stored,
+                    ..
+                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                else {
+                    bail!("Unknown Approval Activity");
+                };
+                if !current.is_live()
+                    || (*outcome == crate::protocol::ApprovalOutcome::SubmissionRejected
+                        && (*current != crate::protocol::ApprovalOutcome::Submitting
+                            || decision.is_some()))
+                    || matches!(
+                        outcome,
+                        crate::protocol::ApprovalOutcome::Pending
+                            | crate::protocol::ApprovalOutcome::Submitting
+                    )
+                    || (*outcome == crate::protocol::ApprovalOutcome::Decided && decision.is_none())
+                    || (*outcome != crate::protocol::ApprovalOutcome::Decided && decision.is_some())
+                {
+                    bail!("Approval is already unavailable");
+                }
+                *current = *outcome;
+                *stored = *decision;
+            }
             SessionChange::QuestionnaireAccepted { activity_id } => {
                 let Some(Activity::Questionnaire {
                     outcome, turn_id, ..
@@ -697,6 +743,43 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
         }
     }
     next.revision = update.revision;
+    let pending = next
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                outcome,
+                turn_id,
+                ..
+            } if outcome.is_answerable()
+                && next
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
+            {
+                Some(approval.id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let submitting = next
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                outcome: crate::protocol::ApprovalOutcome::Submitting,
+                ..
+            } => Some(approval.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if next.pending_approvals != pending || next.submitting_approvals != submitting {
+        next.pending_approvals = pending;
+        next.submitting_approvals = submitting;
+        next.pending_approvals_revision = update.revision;
+    }
     Ok(())
 }
 
@@ -780,6 +863,9 @@ mod tests {
             activities: Vec::new(),
             transcript: Vec::new(),
             subagent_questionnaires: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
             subagent_usage: None,
             total_cost: None,
         };

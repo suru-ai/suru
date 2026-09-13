@@ -216,6 +216,7 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
                     settled_at: Some(_),
                 }),
                 viewed_at: None,
+                ..
             },
         } if session_id == fixture.session_id
     ));

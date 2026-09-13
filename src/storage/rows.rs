@@ -405,6 +405,9 @@ impl SessionRow {
                 pending_questionnaires: Vec::new(),
                 submitting_questionnaires: Vec::new(),
                 pending_questionnaires_revision: crate::protocol::SessionRevision(0),
+                pending_approvals: Vec::new(),
+                submitting_approvals: Vec::new(),
+                pending_approvals_revision: crate::protocol::SessionRevision(0),
                 subagent_questionnaires: Vec::new(),
                 latest_turn: None,
                 viewed_at: self
@@ -823,6 +826,12 @@ struct StoredMessagePayload {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredActivityPayload {
+    Approval {
+        approval: crate::protocol::Approval,
+        tool_activity_id: Option<ActivityId>,
+        outcome: crate::protocol::ApprovalOutcome,
+        decision: Option<crate::protocol::Decision>,
+    },
     Questionnaire {
         questionnaire: crate::protocol::Questionnaire,
         outcome: crate::protocol::QuestionnaireOutcome,
@@ -867,6 +876,19 @@ enum StoredActivityPayload {
 impl StoredActivityPayload {
     fn into_activity(self, id: ActivityId, turn_id: TurnId) -> Activity {
         match self {
+            Self::Approval {
+                approval,
+                tool_activity_id,
+                outcome,
+                decision,
+            } => Activity::Approval {
+                id,
+                turn_id,
+                approval,
+                tool_activity_id,
+                outcome,
+                decision,
+            },
             Self::Questionnaire {
                 questionnaire,
                 outcome,
@@ -942,6 +964,18 @@ impl StoredActivityPayload {
 impl From<Activity> for StoredActivityPayload {
     fn from(activity: Activity) -> Self {
         match activity {
+            Activity::Approval {
+                approval,
+                tool_activity_id,
+                outcome,
+                decision,
+                ..
+            } => Self::Approval {
+                approval,
+                tool_activity_id,
+                outcome,
+                decision,
+            },
             Activity::Questionnaire {
                 questionnaire,
                 outcome,

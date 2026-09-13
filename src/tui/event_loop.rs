@@ -4247,6 +4247,9 @@ mod tests {
                     activities: vec![],
                     transcript: vec![TranscriptItem::Message { message_id }],
                     subagent_questionnaires: vec![],
+                    pending_approvals: Vec::new(),
+                    submitting_approvals: Vec::new(),
+                    pending_approvals_revision: crate::protocol::SessionRevision(0),
                     subagent_usage: None,
                     total_cost: None,
                 }))

@@ -1,4 +1,5 @@
 mod ansi;
+pub mod approval;
 pub mod build_identity;
 mod errands;
 pub mod logging;

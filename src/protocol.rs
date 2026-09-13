@@ -11,8 +11,9 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 45;
+pub const PROTOCOL_VERSION: u32 = 46;
 mod source_control;
+pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
@@ -70,6 +71,7 @@ session_identity!(AgentSelectionOperationId);
 session_identity!(ViewSessionOperationId);
 
 session_identity!(QuestionnaireId);
+session_identity!(ApprovalId);
 
 macro_rules! named_identity {
     ($name:ident) => {
@@ -1522,6 +1524,16 @@ pub enum FileChange {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Activity {
+    Approval {
+        id: ActivityId,
+        turn_id: TurnId,
+        approval: Approval,
+        /// The Tool Activity this Approval gates, when orchestration could
+        /// resolve the Provider's native identity to an existing row.
+        tool_activity_id: Option<ActivityId>,
+        outcome: ApprovalOutcome,
+        decision: Option<Decision>,
+    },
     Questionnaire {
         id: ActivityId,
         turn_id: TurnId,
@@ -1605,7 +1617,8 @@ pub enum Activity {
 impl Activity {
     pub const fn id(&self) -> ActivityId {
         match self {
-            Self::Questionnaire { id, .. }
+            Self::Approval { id, .. }
+            | Self::Questionnaire { id, .. }
             | Self::Status { id, .. }
             | Self::Error { id, .. }
             | Self::Command { id, .. }
@@ -1617,7 +1630,8 @@ impl Activity {
 
     pub const fn turn_id(&self) -> TurnId {
         match self {
-            Self::Questionnaire { turn_id, .. }
+            Self::Approval { turn_id, .. }
+            | Self::Questionnaire { turn_id, .. }
             | Self::Status { turn_id, .. }
             | Self::Error { turn_id, .. }
             | Self::Command { turn_id, .. }
@@ -1631,6 +1645,13 @@ impl Activity {
     /// that report a moment rather than work in progress.
     pub const fn status(&self) -> Option<ActivityStatus> {
         match self {
+            Self::Approval { outcome, .. } => Some(match outcome {
+                ApprovalOutcome::Pending
+                | ApprovalOutcome::SubmissionRejected
+                | ApprovalOutcome::Submitting => ActivityStatus::Active,
+                ApprovalOutcome::Decided => ActivityStatus::Completed,
+                _ => ActivityStatus::Failed,
+            }),
             Self::Questionnaire { outcome, .. } => Some(match outcome {
                 QuestionnaireOutcome::Pending
                 | QuestionnaireOutcome::SubmissionRejected
@@ -1721,6 +1742,15 @@ pub struct SessionStandingInputs {
     /// Session revision at which live Questionnaire availability last changed.
     #[serde(default)]
     pub pending_questionnaires_revision: SessionRevision,
+    /// Live Approvals awaiting a Decision in this Session.
+    #[serde(default)]
+    pub pending_approvals: Vec<ApprovalId>,
+    /// Accepted Decisions still awaiting Provider delivery.
+    #[serde(default)]
+    pub submitting_approvals: Vec<ApprovalId>,
+    /// Session revision at which live Approval availability last changed.
+    #[serde(default)]
+    pub pending_approvals_revision: SessionRevision,
     #[serde(default)]
     pub latest_turn: Option<LatestTurnStatus>,
     /// When any Client last reported this Session open in its main view.
@@ -1739,12 +1769,19 @@ impl SessionStandingInputs {
                 .sum::<usize>()
     }
 
+    pub fn pending_approval_count(&self) -> usize {
+        self.pending_approvals.len()
+    }
+
     pub(crate) fn from_turns(turns: &[Turn]) -> Self {
         Self {
             subagent_questionnaires: Vec::new(),
             pending_questionnaires: Vec::new(),
             submitting_questionnaires: Vec::new(),
             pending_questionnaires_revision: SessionRevision(0),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: SessionRevision(0),
             latest_turn: turns.last().map(|turn| LatestTurnStatus {
                 status: turn.status,
                 settled_at: turn.settled_at,
@@ -2479,6 +2516,15 @@ pub struct SessionSnapshot {
     pub total_cost: Option<CostTotal>,
     #[serde(default)]
     pub subagent_questionnaires: Vec<SubagentQuestionnaires>,
+    /// Answerable Approvals owned by this Session.
+    #[serde(default)]
+    pub pending_approvals: Vec<ApprovalId>,
+    /// Approvals whose accepted Decision is awaiting Provider delivery.
+    #[serde(default)]
+    pub submitting_approvals: Vec<ApprovalId>,
+    /// Revision at which either live Approval list last changed.
+    #[serde(default)]
+    pub pending_approvals_revision: SessionRevision,
 }
 
 impl SessionSnapshot {
@@ -2629,6 +2675,14 @@ pub enum SessionChange {
         outcome: QuestionnaireOutcome,
         answer: Option<Answer>,
     },
+    DecisionAccepted {
+        activity_id: ActivityId,
+    },
+    ApprovalSettled {
+        activity_id: ActivityId,
+        outcome: ApprovalOutcome,
+        decision: Option<Decision>,
+    },
     ActivityAdded {
         activity: Activity,
     },
@@ -2759,6 +2813,7 @@ pub enum SessionErrorCode {
     NothingToInterrupt,
     InterruptionFailed,
     QuestionnaireSubmissionFailed,
+    DecisionSubmissionFailed,
     /// A per-Subagent stop named a Subagent whose Provider offers none.
     SubagentStopUnsupported,
     AgentSelectionOperationConflict,

@@ -91,6 +91,37 @@ pub struct QuestionnaireDelivery {
     response: Option<oneshot::Sender<Result<(), ProviderError>>>,
 }
 
+/// Holding one exposes Decision arbitration while Provider acknowledgement waits.
+pub struct DecisionDelivery {
+    pub id: suru::protocol::ApprovalId,
+    pub decision: suru::protocol::Decision,
+    response: Option<oneshot::Sender<Result<(), ProviderError>>>,
+}
+
+impl DecisionDelivery {
+    pub fn reject(self) {
+        self.response
+            .expect("delivery must be gated")
+            .send(Err(ProviderError::decision_rejected(
+                "controlled definite rejection",
+            )))
+            .ok();
+    }
+
+    pub fn fail(self) {
+        self.response
+            .expect("delivery must be gated")
+            .send(Err(ProviderError::new("controlled uncertain failure")))
+            .ok();
+    }
+
+    pub fn succeed(self) {
+        if let Some(response) = self.response {
+            let _ = response.send(Ok(()));
+        }
+    }
+}
+
 impl QuestionnaireDelivery {
     pub fn reject(self) {
         self.response
@@ -109,6 +140,8 @@ impl QuestionnaireDelivery {
 }
 
 pub struct ControlledProviderSession {
+    decisions: mpsc::UnboundedReceiver<DecisionDelivery>,
+    gate_decisions: Arc<AtomicBool>,
     questionnaires: mpsc::UnboundedReceiver<QuestionnaireDelivery>,
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedReceiver<TurnStart>,
@@ -154,6 +187,8 @@ pub struct SubagentStop {
 }
 
 struct ControlledSessionHandle {
+    decisions: mpsc::UnboundedSender<DecisionDelivery>,
+    gate_decisions: Arc<AtomicBool>,
     questionnaires: mpsc::UnboundedSender<QuestionnaireDelivery>,
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedSender<TurnStart>,
@@ -414,6 +449,8 @@ impl StartRequest {
         identity: AgentIdentity,
         resume: Option<suru::provider::ProviderResumeState>,
     ) -> ControlledProviderSession {
+        let (decisions_tx, decisions_rx) = mpsc::unbounded_channel();
+        let gate_decisions = Arc::new(AtomicBool::new(false));
         let (questionnaires_tx, questionnaires_rx) = mpsc::unbounded_channel();
         let gate_questionnaires = Arc::new(AtomicBool::new(false));
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
@@ -435,6 +472,8 @@ impl StartRequest {
                 identity,
                 resume,
                 Arc::new(ControlledSessionHandle {
+                    decisions: decisions_tx,
+                    gate_decisions: gate_decisions.clone(),
                     questionnaires: questionnaires_tx,
                     gate_questionnaires: gate_questionnaires.clone(),
                     turns: turns_tx,
@@ -447,6 +486,8 @@ impl StartRequest {
             )))
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
         ControlledProviderSession {
+            decisions: decisions_rx,
+            gate_decisions,
             questionnaires: questionnaires_rx,
             gate_questionnaires,
             turns: turns_rx,
@@ -474,6 +515,26 @@ impl StartRequest {
 }
 
 impl ControlledProviderSession {
+    pub async fn next_decision(
+        &mut self,
+    ) -> (suru::protocol::ApprovalId, suru::protocol::Decision) {
+        let delivery = self.next_decision_delivery().await;
+        let result = (delivery.id, delivery.decision);
+        delivery.succeed();
+        result
+    }
+
+    pub fn gate_decision_deliveries(&self) {
+        self.gate_decisions.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn next_decision_delivery(&mut self) -> DecisionDelivery {
+        self.decisions
+            .recv()
+            .await
+            .expect("Provider remains connected")
+    }
+
     pub async fn next_questionnaire_submission(
         &mut self,
     ) -> (
@@ -929,6 +990,31 @@ fn dispatch_steer_operation(
 }
 
 impl ProviderSession for ControlledSessionHandle {
+    fn submit_decision(
+        &self,
+        id: suru::protocol::ApprovalId,
+        decision: suru::protocol::Decision,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let (response, delivered) = oneshot::channel();
+            let gated = self.gate_decisions.load(Ordering::SeqCst);
+            self.decisions
+                .send(DecisionDelivery {
+                    id,
+                    decision,
+                    response: gated.then_some(response),
+                })
+                .map_err(|_| ProviderError::new("test controller disconnected"))?;
+            if gated {
+                delivered
+                    .await
+                    .map_err(|_| ProviderError::new("test delivery abandoned"))?
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     fn submit_questionnaire(
         &self,
         id: suru::protocol::QuestionnaireId,
