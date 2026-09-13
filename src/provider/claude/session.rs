@@ -12,10 +12,10 @@
 //! as is Resume State Suru cannot read — a Session that quietly opened an empty conversation would
 //! read as continuous while having forgotten everything.
 //!
-//! The child is launched full-auto — permissions bypassed, matching the house posture — with the
-//! Suru Session's Workspace as its working directory. A Prompt is delivered as a stream-json user
-//! message; the Turn's output streams back through [`super::projection`] and the CLI's terminal
-//! result message Settles it.
+//! The child is launched under the Server's fixed native permission mode, with Suru's stdio
+//! permission-prompt channel and the Session's Workspace as its working directory. A Prompt is
+//! delivered as a stream-json user message; the Turn's output streams back through
+//! [`super::projection`] and the CLI's terminal result message Settles it.
 //!
 //! Steering and interrupting act on the Turn the child is running, which nothing on this wire
 //! names: a steer is simply another user message on the running loop's stdin, and the interrupt is
@@ -46,11 +46,11 @@ use super::{
     wire::{ControlRequest, UserMessageEnvelope},
 };
 use crate::{
-    protocol::{AgentId, AgentIdentity, AgentSelection, ModelDescriptor},
+    protocol::{AgentId, AgentIdentity, AgentSelection, ClaudePermissionMode, ModelDescriptor},
     provider::{
-        ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
-        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-        ProviderTurnInput,
+        ProviderDecisionDelivery, ProviderError, ProviderFuture, ProviderResumeState,
+        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+        ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
     },
 };
@@ -109,6 +109,7 @@ pub(super) async fn start_claude_session(
     availability: ClaudeAvailability,
     skills: ClaudeSkills,
     timings: ClaudeTimings,
+    permission_mode: ClaudePermissionMode,
 ) -> Result<ProviderSessionConnection, ProviderError> {
     // Read before anything is launched: Resume State Suru cannot read fails the startup outright
     // rather than after a discovery the Session will never use.
@@ -138,17 +139,21 @@ pub(super) async fn start_claude_session(
     let (conversation, messages) = tokio::sync::mpsc::unbounded_channel();
     let turn = TurnInFlight::new();
     let questionnaires = Arc::new(super::questionnaire::ClaudeQuestionnaires::default());
+    let approvals = Arc::new(super::approval::ClaudeApprovals::default());
     let (context, reports) = super::context::ContextQueries::new(timings.context_request);
     let events = provider_events(
         messages,
         turn.clone(),
         questionnaires.clone(),
+        approvals.clone(),
+        request.execution_directory.clone(),
         context.clone(),
         reports,
     );
     let session = Arc::new(ClaudeSession {
         context,
         questionnaires,
+        approvals,
         executable,
         processes,
         execution_directory: request.execution_directory,
@@ -160,6 +165,7 @@ pub(super) async fn start_claude_session(
         }),
         turn,
         skills,
+        permission_mode,
         interrupt_request_timeout: timings.interrupt_request,
         shutdown_started: AtomicBool::new(false),
     });
@@ -219,6 +225,7 @@ async fn default_selection(
 struct ClaudeSession {
     context: Arc<super::context::ContextQueries>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
+    approvals: Arc<super::approval::ClaudeApprovals>,
     executable: OsString,
     processes: ProcessRegistry,
     execution_directory: PathBuf,
@@ -232,6 +239,7 @@ struct ClaudeSession {
     /// What the Session and the projection of its conversation agree on about the Turn in flight.
     turn: Arc<TurnInFlight>,
     skills: ClaudeSkills,
+    permission_mode: ClaudePermissionMode,
     interrupt_request_timeout: Duration,
     shutdown_started: AtomicBool,
 }
@@ -296,6 +304,14 @@ impl ClaudeSession {
 }
 
 impl ProviderSession for ClaudeSession {
+    fn submit_decision(
+        &self,
+        id: crate::protocol::ApprovalId,
+        decision: crate::protocol::Decision,
+    ) -> ProviderFuture<'_, ProviderDecisionDelivery> {
+        Box::pin(async move { self.approvals.submit(id, decision).await })
+    }
+
     fn submit_questionnaire(
         &self,
         id: crate::protocol::QuestionnaireId,
@@ -324,8 +340,12 @@ impl ProviderSession for ClaudeSession {
             {
                 // The Selection is lowered onto flags before anything is torn down, so one the CLI
                 // has no flags for leaves the Session running on the child it had.
-                let args =
-                    spawn_args(&self.provider_session_id, &input.selection, slot.next_spawn)?;
+                let args = spawn_args(
+                    &self.provider_session_id,
+                    &input.selection,
+                    slot.next_spawn,
+                    self.permission_mode,
+                )?;
                 if let Some(previous) = slot.running.take() {
                     previous
                         .stop()
@@ -352,6 +372,7 @@ impl ProviderSession for ClaudeSession {
                 // it rather than asking for it to be minted again.
                 self.context.connect(transport.clone());
                 self.questionnaires.connect(transport.clone());
+                self.approvals.connect(transport.clone());
                 slot.next_spawn = ProviderSessionSpawn::Resume;
                 slot.running = Some(ClaudeChild {
                     transport,
@@ -427,6 +448,7 @@ impl ProviderSession for ClaudeSession {
             // not on this acknowledgement — which is why an unanswered interrupt is bounded here
             // rather than left to the loop to end.
             self.questionnaires.clear();
+            self.approvals.clear();
             self.stop_background_tasks(&transport).await;
             transport
                 .control_request(
@@ -459,6 +481,7 @@ impl ProviderSession for ClaudeSession {
             };
             if let Some(transport) = transport {
                 self.questionnaires.clear();
+                self.approvals.clear();
                 self.stop_background_tasks(&transport).await;
             }
             Ok(())
@@ -485,6 +508,10 @@ impl ProviderSession for ClaudeSession {
                 .settle(&crate::provider::ProviderEventAttribution::Subagent(
                     subagent_id.clone(),
                 ));
+            self.approvals
+                .settle(&crate::provider::ProviderEventAttribution::Subagent(
+                    subagent_id.clone(),
+                ));
             transport
                 .control_request(
                     &ControlRequest::StopTask {
@@ -506,6 +533,7 @@ impl ProviderSession for ClaudeSession {
             self.shutdown_started.store(true, Ordering::Release);
             self.context.disconnect();
             self.questionnaires.clear();
+            self.approvals.clear();
             let slot = self.child.lock().await;
             let Some(child) = slot.running.as_ref() else {
                 return Ok(());
@@ -523,15 +551,17 @@ fn no_live_turn(operation: &str) -> ProviderError {
 }
 
 /// The flags one Turn's Agent Selection spawns the child under, beside the conversation `spawn`
-/// addresses and the full-auto posture every Claude Session launches with.
+/// addresses and the fixed permission posture every Claude Session launches with.
 fn spawn_args(
     provider_session_id: &str,
     selection: &AgentSelection,
     spawn: ProviderSessionSpawn,
+    permission_mode: ClaudePermissionMode,
 ) -> Result<Vec<OsString>, ProviderError> {
     let mut args: Vec<OsString> = [
         "--include-partial-messages",
-        "--dangerously-skip-permissions",
+        "--permission-mode",
+        permission_mode.as_wire_value(),
         "--permission-prompt-tool",
         "stdio",
         spawn.identity_flag(),
@@ -599,6 +629,7 @@ mod tests {
                 questionnaires: Arc::new(
                     crate::provider::claude::questionnaire::ClaudeQuestionnaires::default(),
                 ),
+                approvals: Arc::new(crate::provider::claude::approval::ClaudeApprovals::default()),
                 executable: executable.into(),
                 processes,
                 execution_directory: directory.path().to_owned(),
@@ -610,6 +641,7 @@ mod tests {
                 }),
                 turn: TurnInFlight::new(),
                 skills: ClaudeSkills::default(),
+                permission_mode: crate::protocol::ClaudePermissionMode::Default,
                 interrupt_request_timeout: Duration::from_millis(200),
                 shutdown_started: AtomicBool::new(false),
             })
@@ -726,13 +758,15 @@ mod tests {
             "11111111-2222-3333-4444-555555555555",
             &selection(vec![effort("low")]),
             ProviderSessionSpawn::Mint,
+            crate::protocol::ClaudePermissionMode::Default,
         )
         .expect("a reasoning-effort selection lowers");
         assert_eq!(
             args,
             [
                 "--include-partial-messages",
-                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "default",
                 "--permission-prompt-tool",
                 "stdio",
                 "--session-id",
@@ -752,10 +786,11 @@ mod tests {
             "11111111-2222-3333-4444-555555555555",
             &selection(Vec::new()),
             ProviderSessionSpawn::Resume,
+            crate::protocol::ClaudePermissionMode::Default,
         )
         .expect("a resuming spawn lowers");
         assert_eq!(
-            args[4..6],
+            args[5..7],
             ["--resume", "11111111-2222-3333-4444-555555555555"].map(OsString::from),
             "the child continues the conversation rather than asking for a new one: {args:?}"
         );
@@ -767,8 +802,13 @@ mod tests {
 
     #[test]
     fn a_selection_without_effort_spawns_no_effort_flag() {
-        let args = spawn_args("id", &selection(Vec::new()), ProviderSessionSpawn::Mint)
-            .expect("an effortless selection lowers");
+        let args = spawn_args(
+            "id",
+            &selection(Vec::new()),
+            ProviderSessionSpawn::Mint,
+            crate::protocol::ClaudePermissionMode::Default,
+        )
+        .expect("an effortless selection lowers");
         assert!(!args.contains(&OsString::from("--effort")));
     }
 
@@ -783,6 +823,7 @@ mod tests {
                 },
             }]),
             ProviderSessionSpawn::Mint,
+            crate::protocol::ClaudePermissionMode::Default,
         )
         .expect_err("an unknown Model Option is a rejected selection");
         assert!(error.is_selection_rejected());
@@ -795,6 +836,7 @@ mod tests {
             "id",
             &selection(vec![effort("low"), effort("high")]),
             ProviderSessionSpawn::Mint,
+            crate::protocol::ClaudePermissionMode::Default,
         )
         .expect_err("a duplicated Model Option is a rejected selection");
         assert!(error.is_selection_rejected());

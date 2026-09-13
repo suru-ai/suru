@@ -24,6 +24,7 @@
 //! guidance, while a CLI too old to answer the probe is incompatible. A catalog refresh re-runs
 //! conditions that need the user to fix something outside Suru.
 
+mod approval;
 mod availability;
 mod catalog;
 mod context;

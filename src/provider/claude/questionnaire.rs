@@ -74,7 +74,7 @@ impl ClaudeQuestionnaires {
         match message.get("type").and_then(Value::as_str) {
             Some("control_cancel_request") => {
                 let Some(request_id) = message.get("request_id").and_then(Value::as_str) else {
-                    return Ok(Some(vec![]));
+                    return Ok(None);
                 };
                 let mut pending = self
                     .pending
@@ -83,17 +83,12 @@ impl ClaudeQuestionnaires {
                 let id = pending
                     .iter()
                     .find_map(|(id, q)| (q.request_id == request_id).then_some(*id));
-                Ok(Some(
-                    id.into_iter()
-                        .map(|id| {
-                            let native = pending.remove(&id).expect("pending correlation exists");
-                            AttributedProviderEvent {
-                                attribution: native.attribution,
-                                event: ProviderEvent::QuestionnaireWithdrawn { id },
-                            }
-                        })
-                        .collect(),
-                ))
+                let Some(id) = id else { return Ok(None) };
+                let native = pending.remove(&id).expect("pending correlation exists");
+                Ok(Some(vec![AttributedProviderEvent {
+                    attribution: native.attribution,
+                    event: ProviderEvent::QuestionnaireWithdrawn { id },
+                }]))
             }
             Some("control_request") => {
                 let request_id = message
@@ -106,17 +101,10 @@ impl ClaudeQuestionnaires {
                 if request["subtype"] != "can_use_tool" {
                     return Ok(None);
                 }
-                let input = request["input"].clone();
-                // The callback is also Claude's permission seam. Other tools retain
-                // Suru's established full-auto posture, without becoming Questions.
                 if request["tool_name"] != "AskUserQuestion" {
-                    self.respond(
-                        request_id,
-                        json!({"behavior":"allow", "updatedInput":input}),
-                    )
-                    .await?;
-                    return Ok(Some(vec![]));
+                    return Ok(None);
                 }
+                let input = request["input"].clone();
                 let Some(attribution) = attribution else {
                     self.respond(request_id, json!({"behavior":"deny", "message":"The owning Subagent could not be identified", "interrupt":false})).await?;
                     return Ok(Some(vec![]));

@@ -1,4 +1,4 @@
-//! Native stdio can_use_tool requests under the unchanged full-auto Session posture.
+//! Native stdio AskUserQuestion callbacks remain Questionnaires under Claude's permission mode.
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, flag_value, user_turn_arm,
@@ -11,7 +11,7 @@ use suru::{
     },
     provider::ClaudeRuntime,
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 fn input() -> Value {
     json!({"questions":[
@@ -107,12 +107,8 @@ async fn claude_batches_preserve_metadata_and_deliver_multiple_choices_with_cust
             .all(|q| q.required && q.freeform)
     );
     let launch = fixture.launch_carrying("--session-id");
-    assert!(
-        launch
-            .arguments
-            .iter()
-            .any(|arg| arg == "--dangerously-skip-permissions")
-    );
+    assert!(!launch.carries("--dangerously-skip-permissions"));
+    assert_eq!(launch.value("--permission-mode"), "default");
     assert_eq!(
         flag_value(&launch.arguments, "--permission-prompt-tool"),
         "stdio"

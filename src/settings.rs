@@ -31,11 +31,11 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AppearanceMode, AutoSettle, CodexApprovalPolicy, CodexSandboxMode,
-    CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture, LandingPage, ProviderId,
-    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
-    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-    SidebarVisibility, TextSelectionCopy, TitleErrand,
+    AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
+    CodexSandboxMode, CommandAutoExpand, EffectiveSettings, EmojiVisibility, FoldPosture,
+    LandingPage, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+    SettingMutation, SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity,
+    SettingsSnapshot, SidebarScope, SidebarVisibility, TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -69,6 +69,7 @@ const PROVIDER_CODEX_APPROVAL_POLICY: &str = "provider.codex.approvalPolicy";
 const PROVIDER_CODEX_SANDBOX_MODE: &str = "provider.codex.sandboxMode";
 const PROVIDER_COPILOT_ENABLED: &str = "provider.copilot.enabled";
 const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
+const PROVIDER_CLAUDE_PERMISSION_MODE: &str = "provider.claude.permissionMode";
 const SERVING_ENABLED: &str = "serving.enabled";
 const SERVING_PORT: &str = "serving.port";
 const SERVING_BIND_ADDRESS: &str = "serving.bindAddress";
@@ -537,6 +538,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
             *value == Some(settings.provider.claude.enabled)
+        }
+        SettingMutation::ProviderClaudePermissionMode { value } => {
+            *value == Some(settings.provider.claude.permission_mode)
         }
         SettingMutation::ServingEnabled { value } => *value == Some(settings.serving.enabled),
         SettingMutation::ServingPort { value } => *value == Some(settings.serving.port),
@@ -1148,6 +1152,51 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    SettingDescriptor {
+        key: PROVIDER_CLAUDE_PERMISSION_MODE,
+        label: "Permission mode",
+        description: "When Claude asks before using a Tool",
+        group: SettingGroup::Providers,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "default",
+                build_mutation: || SettingMutation::ProviderClaudePermissionMode {
+                    value: Some(ClaudePermissionMode::Default),
+                },
+            },
+            SettingChoice {
+                value: "acceptEdits",
+                build_mutation: || SettingMutation::ProviderClaudePermissionMode {
+                    value: Some(ClaudePermissionMode::AcceptEdits),
+                },
+            },
+            SettingChoice {
+                value: "dontAsk",
+                build_mutation: || SettingMutation::ProviderClaudePermissionMode {
+                    value: Some(ClaudePermissionMode::DontAsk),
+                },
+            },
+            SettingChoice {
+                value: "bypassPermissions",
+                build_mutation: || SettingMutation::ProviderClaudePermissionMode {
+                    value: Some(ClaudePermissionMode::BypassPermissions),
+                },
+            },
+            SettingChoice {
+                value: "auto",
+                build_mutation: || SettingMutation::ProviderClaudePermissionMode {
+                    value: Some(ClaudePermissionMode::Auto),
+                },
+            },
+        ]),
+        reset: SettingMutation::ProviderClaudePermissionMode { value: None },
+        apply: |settings, value| {
+            apply_value(value, |mode| {
+                settings.provider.claude.permission_mode = mode
+            })
+        },
+    },
     // The experimental Settings stand last, as the tab presenting them does.
     SettingDescriptor {
         key: SESSION_TITLE_EMOJI,
@@ -1450,6 +1499,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::ProviderClaudeEnabled { value } => {
             (PROVIDER_CLAUDE_ENABLED, pinned(value))
+        }
+        SettingMutation::ProviderClaudePermissionMode { value } => {
+            (PROVIDER_CLAUDE_PERMISSION_MODE, pinned(value))
         }
         SettingMutation::ServingEnabled { value } => (SERVING_ENABLED, pinned(value)),
         SettingMutation::ServingPort { value } => (SERVING_PORT, pinned(value)),

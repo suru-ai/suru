@@ -22,8 +22,12 @@ pub fn write_executable(path: &Path, script: &str) {
 /// The requests a scripted program recorded, one JSON object per line. An absent log is no
 /// requests, so a test may ask before the program has been launched.
 pub fn captured_requests(log: &Path) -> Vec<Value> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
+    let contents = std::fs::read_to_string(log).unwrap_or_default();
+    let complete = contents.strip_suffix('\n').map_or_else(
+        || contents.rsplit_once('\n').map_or("", |(lines, _)| lines),
+        |lines| lines,
+    );
+    complete
         .lines()
         .map(|line| serde_json::from_str(line).expect("decode captured request"))
         .collect()

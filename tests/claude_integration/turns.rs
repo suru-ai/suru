@@ -264,10 +264,7 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
         ],
         "the Session child loads Claude's personal and project settings with partial messages enabled"
     );
-    assert!(
-        arguments.contains(&"--dangerously-skip-permissions".to_owned()),
-        "the child is launched full-auto, got: {arguments:?}"
-    );
+    assert!(!arguments.contains(&"--dangerously-skip-permissions".to_owned()));
     let flag_value = |flag: &str| {
         let position = arguments
             .iter()
@@ -277,6 +274,7 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
     };
     uuid::Uuid::parse_str(&flag_value("--session-id"))
         .expect("the provider-session identifier is the UUID Suru minted");
+    assert_eq!(flag_value("--permission-mode"), "default");
     assert_eq!(
         flag_value("--model"),
         "default",

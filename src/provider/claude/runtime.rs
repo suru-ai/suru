@@ -5,7 +5,10 @@
 //! process to keep alive. A discovery's process lives for one control request; a Session's lives
 //! from its first Turn until the Session shuts down (see [`super::session`]).
 
-use std::ffi::{OsStr, OsString};
+use std::{
+    ffi::{OsStr, OsString},
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use tokio::time::Duration;
 
@@ -21,7 +24,10 @@ use super::{
     wire::{ControlRequest, NativeModelList},
 };
 use crate::{
-    protocol::{AgentSelection, ModelDescriptor, ProviderId, SkillCatalog},
+    protocol::{
+        AgentSelection, ClaudePermissionMode, EffectiveSettings, ModelDescriptor, ProviderId,
+        SkillCatalog,
+    },
     provider::{
         ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
         ProviderSessionConnection, ProviderSessionRequest, harness::ProcessRegistry,
@@ -46,6 +52,7 @@ pub struct ClaudeRuntime {
     interrupt_request_timeout: Duration,
     context_request_timeout: Duration,
     skills: ClaudeSkills,
+    permission_mode: Arc<StdMutex<ClaudePermissionMode>>,
 }
 
 impl ClaudeRuntime {
@@ -58,6 +65,7 @@ impl ClaudeRuntime {
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             context_request_timeout: Duration::from_secs(5),
             skills: ClaudeSkills::default(),
+            permission_mode: Arc::new(StdMutex::new(ClaudePermissionMode::default())),
         }
     }
 
@@ -175,6 +183,10 @@ impl ProviderRuntime for ClaudeRuntime {
             context_request: self.context_request_timeout,
         };
         let skills = self.skills.clone();
+        let permission_mode = *self
+            .permission_mode
+            .lock()
+            .expect("Claude permission mode Setting lock is not poisoned");
         Box::pin(async move {
             start_claude_session(
                 executable,
@@ -183,6 +195,7 @@ impl ProviderRuntime for ClaudeRuntime {
                 availability,
                 skills,
                 timings,
+                permission_mode,
             )
             .await
         })
@@ -207,6 +220,14 @@ impl ProviderRuntime for ClaudeRuntime {
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.processes.shutdown().await })
+    }
+
+    fn apply_settings(&self, settings: &EffectiveSettings) {
+        *self
+            .permission_mode
+            .lock()
+            .expect("Claude permission mode Setting lock is not poisoned") =
+            settings.provider.claude.permission_mode;
     }
 }
 

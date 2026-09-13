@@ -11,8 +11,8 @@ use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AppearanceMode, AutoSettle, CodexApprovalPolicy, CodexSandboxMode,
-        CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId, ProviderId,
+        AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
+        CodexSandboxMode, CommandAutoExpand, EmojiVisibility, FoldPosture, ModelId, ProviderId,
         ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
         SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
     },
@@ -1584,6 +1584,58 @@ async fn codex_posture_defaults_pin_through_the_config_document_and_reset() {
     );
     assert_eq!(reset.pinned, [] as [String; 0]);
 
+    drop(client);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_permission_mode_defaults_pins_through_the_config_document_and_resets() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-claude-permission-mode")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (client, initial) = attach(state_dir.path(), "settings-claude-permission-mode").await;
+    assert_eq!(
+        initial.settings.provider.claude.permission_mode,
+        ClaudePermissionMode::Default
+    );
+
+    for (mode, wire) in [
+        (ClaudePermissionMode::Default, "default"),
+        (ClaudePermissionMode::AcceptEdits, "acceptEdits"),
+        (ClaudePermissionMode::DontAsk, "dontAsk"),
+        (ClaudePermissionMode::BypassPermissions, "bypassPermissions"),
+        (ClaudePermissionMode::Auto, "auto"),
+    ] {
+        let pinned = client
+            .mutate_setting(SettingMutation::ProviderClaudePermissionMode { value: Some(mode) })
+            .await
+            .unwrap();
+        assert_eq!(pinned.settings.provider.claude.permission_mode, mode);
+        assert!(
+            pinned
+                .pinned
+                .contains(&"provider.claude.permissionMode".to_owned())
+        );
+        assert!(
+            config_document(config_dir.path()).contains(&format!("\"permissionMode\": \"{wire}\""))
+        );
+    }
+
+    let reset = client
+        .mutate_setting(SettingMutation::ProviderClaudePermissionMode { value: None })
+        .await
+        .unwrap();
+    assert_eq!(
+        reset.settings.provider.claude.permission_mode,
+        ClaudePermissionMode::Default
+    );
+    assert_eq!(reset.pinned, [] as [String; 0]);
     drop(client);
     server.shutdown().await.unwrap();
 }

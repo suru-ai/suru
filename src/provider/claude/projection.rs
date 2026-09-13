@@ -74,6 +74,8 @@ pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     turn: Arc<TurnInFlight>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
+    approvals: Arc<super::approval::ClaudeApprovals>,
+    execution_directory: std::path::PathBuf,
     context: Arc<super::context::ContextQueries>,
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
 ) -> ProviderEventStream {
@@ -82,6 +84,8 @@ pub(super) fn provider_events(
             context,
             reports,
             questionnaires,
+            approvals,
+            execution_directory,
             messages,
             projection: ClaudeProjection::new(turn),
             pending: VecDeque::new(),
@@ -94,6 +98,8 @@ struct EventReceiver {
     context: Arc<super::context::ContextQueries>,
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
+    approvals: Arc<super::approval::ClaudeApprovals>,
+    execution_directory: std::path::PathBuf,
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
     projection: ClaudeProjection,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
@@ -121,16 +127,33 @@ async fn next_provider_event(
         match message {
             Err(error) => {
                 events.questionnaires.clear();
+                events.approvals.clear();
                 return Some((Err(error), events));
             }
             Ok(message) => {
                 events.context.observe(&message);
+                let attribution = events.projection.intervention_attribution(&message);
                 match events
                     .questionnaires
-                    .receive(
-                        &message,
-                        events.projection.questionnaire_attribution(&message),
-                    )
+                    .receive(&message, attribution.clone())
+                    .await
+                {
+                    Ok(Some(projected)) => {
+                        events
+                            .context
+                            .observe_output(&projected, events.projection.turn.is_running());
+                        events.pending.extend(projected.into_iter().map(Ok));
+                        continue;
+                    }
+                    Err(error) => {
+                        events.pending.push_back(Err(error));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+                match events
+                    .approvals
+                    .receive(&message, attribution, &events.execution_directory)
                     .await
                 {
                     Ok(Some(projected)) => {
@@ -156,19 +179,23 @@ async fn next_provider_event(
                                 | ProviderEvent::TurnInterrupted
                                 | ProviderEvent::TurnFailed { .. } => {
                                     events.questionnaires.settle(&event.attribution);
+                                    events.approvals.settle(&event.attribution);
                                     if event.attribution == ProviderEventAttribution::OwningSession
                                     {
                                         events.context.request();
                                         events
                                             .projection
-                                            .question_tools
+                                            .intervention_tools
                                             .retain(|_, owner| owner.is_some());
                                     }
                                 }
                                 ProviderEvent::SubagentCompleted { subagent_id, .. } => {
                                     events.questionnaires.settle(
                                         &ProviderEventAttribution::Subagent(subagent_id.clone()),
-                                    )
+                                    );
+                                    events.approvals.settle(&ProviderEventAttribution::Subagent(
+                                        subagent_id.clone(),
+                                    ));
                                 }
                                 _ => {}
                             }
@@ -253,7 +280,7 @@ struct SubagentTask {
 /// What the projection remembers between conversation messages, across every conversation the
 /// wire carries at once.
 struct ClaudeProjection {
-    question_tools: BTreeMap<String, ConversationKey>,
+    intervention_tools: BTreeMap<String, ConversationKey>,
     conversations: BTreeMap<ConversationKey, ConversationInFlight>,
     /// The commands whose tool results are still to be echoed back, by tool-use id — the CLI's
     /// ids are unique across conversations, so one table serves them all.
@@ -282,10 +309,10 @@ impl ClaudeProjection {
     /// can_use_tool identifies the tool call, while its preceding native
     /// assistant block names the spawning tool use through parent_tool_use_id.
     /// agent_id alone is not interchangeable with that spawning tool identity.
-    fn questionnaire_attribution(&mut self, message: &Value) -> Option<ProviderEventAttribution> {
+    fn intervention_attribution(&self, message: &Value) -> Option<ProviderEventAttribution> {
         let request = &message["request"];
         if let Some(tool) = request["tool_use_id"].as_str()
-            && let Some(owner) = self.question_tools.remove(tool)
+            && let Some(owner) = self.intervention_tools.get(tool)
         {
             return Some(match owner {
                 None => ProviderEventAttribution::OwningSession,
@@ -299,7 +326,7 @@ impl ClaudeProjection {
 
     fn new(turn: Arc<TurnInFlight>) -> Self {
         Self {
-            question_tools: BTreeMap::new(),
+            intervention_tools: BTreeMap::new(),
             conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
             spawn_tools: BTreeMap::new(),
@@ -443,7 +470,7 @@ impl ClaudeProjection {
         // The settle is the last of the Subagent's events: whatever its streams leave open, the
         // settle closes in the child Session, and nothing more of the conversation's can land.
         self.conversations.remove(&Some(task.subagent.clone()));
-        self.question_tools
+        self.intervention_tools
             .retain(|_, owner| owner.as_deref() != Some(task.subagent.as_str()));
         self.running_commands
             .retain(|_, command| command.owner.as_deref() != Some(task.subagent.as_str()));
@@ -675,9 +702,7 @@ impl ClaudeProjection {
         let (Some(index), Some(id), Some(name)) = (index, block.id, block.name) else {
             return;
         };
-        if name == "AskUserQuestion" {
-            self.question_tools.insert(id.clone(), owner.clone());
-        }
+        self.intervention_tools.insert(id.clone(), owner.clone());
         if name == TASK_TOOL || name == AGENT_TOOL {
             self.spawn_tools.insert(id.clone(), owner.clone());
         }

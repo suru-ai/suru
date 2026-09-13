@@ -15,7 +15,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
 };
 
@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Notify, mpsc, oneshot},
     time::{Duration, timeout},
 };
 
@@ -104,6 +104,49 @@ struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
     terminated: AtomicBool,
     conversation: Option<ConversationSink>,
+    decision_settlements: Arc<DecisionSettlements>,
+}
+
+#[derive(Default)]
+struct DecisionSettlements {
+    active: AtomicUsize,
+    changed: Notify,
+}
+
+pub(super) struct DecisionSettlement(Arc<DecisionSettlements>);
+
+impl Drop for DecisionSettlement {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            });
+        self.0.changed.notify_waiters();
+    }
+}
+
+impl DecisionSettlements {
+    fn acquire(self: &Arc<Self>) -> DecisionSettlement {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        DecisionSettlement(self.clone())
+    }
+
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release_all(&self) {
+        self.active.store(0, Ordering::Release);
+        self.changed.notify_waiters();
+    }
 }
 
 /// Cancellation must not leave an optional query registered indefinitely.
@@ -168,6 +211,7 @@ impl StreamJsonTransport {
             pending: StdMutex::new(HashMap::new()),
             terminated: AtomicBool::new(false),
             conversation,
+            decision_settlements: Arc::new(DecisionSettlements::default()),
         });
         let writer = Arc::new(Mutex::new(Some(stdin)));
         let link = TransportLink {
@@ -240,6 +284,13 @@ impl StreamJsonTransport {
             return Err(claude_error("Claude Code CLI transport has ended").mark_session_lost());
         }
         write_json_line(&self.writer, message, "write to Claude Code CLI").await
+    }
+
+    pub(super) fn decision_settlement(&self) -> Result<DecisionSettlement, ProviderError> {
+        if self.state.terminated.load(Ordering::Acquire) {
+            return Err(claude_error("Claude Code CLI transport has ended").mark_session_lost());
+        }
+        Ok(self.state.decision_settlements.acquire())
     }
 
     pub(super) async fn close(&self) {
@@ -330,14 +381,14 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
                 return;
             }
         };
-        if let Err(error) = route_message(message, &state) {
+        if let Err(error) = route_message(message, &state).await {
             terminate_transport(&state, error);
             return;
         }
     }
 }
 
-fn route_message(message: Value, state: &Arc<TransportState>) -> Result<(), ProviderError> {
+async fn route_message(message: Value, state: &Arc<TransportState>) -> Result<(), ProviderError> {
     let Some(kind) = message.get("type").and_then(Value::as_str) else {
         return Err(claude_error(
             "Claude Code CLI sent a message without a type field",
@@ -347,6 +398,9 @@ fn route_message(message: Value, state: &Arc<TransportState>) -> Result<(), Prov
     // init message, the CLI's own control requests — which the launched
     // Session's sink consumes, and a discovery leaves unread.
     if kind != "control_response" {
+        if kind == "result" {
+            state.decision_settlements.wait().await;
+        }
         if let Some(conversation) = &state.conversation {
             let _ = conversation.send(Ok(message));
         }
@@ -409,6 +463,7 @@ fn finish_transport(state: &TransportState, error: ProviderError, conversation_l
     if state.terminated.swap(true, Ordering::AcqRel) {
         return;
     }
+    state.decision_settlements.release_all();
     let pending = {
         let mut pending = state
             .pending

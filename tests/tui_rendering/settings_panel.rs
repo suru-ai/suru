@@ -1547,12 +1547,11 @@ fn a_provider_with_no_further_settings_offers_no_expansion() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
-    assert!(
-        row(&application, "Codex").contains('▸') && !row(&application, "Claude").contains('▸'),
-        "the Provider that can be expanded says so, and the one that cannot stays quiet"
-    );
+    assert!(row(&application, "Codex").contains('▸'));
+    assert!(row(&application, "Claude").contains('▸'));
+    assert!(!row(&application, "Copilot").contains('▸'));
 
-    focus_setting(&mut application, "provider.claude.enabled");
+    focus_setting(&mut application, "provider.copilot.enabled");
     let before = rendered_application_rows(&application);
     assert!(
         !before.join("\n").contains("Enter expand"),
@@ -1568,6 +1567,27 @@ fn a_provider_with_no_further_settings_offers_no_expansion() {
         before,
         "and changes nothing on screen"
     );
+}
+
+#[test]
+fn claude_permission_mode_appears_under_the_claude_provider() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+    focus_setting(&mut application, "provider.claude.enabled");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    let permission = row(&application, "Permission mode");
+    assert!(
+        permission.contains("default") && permission.contains("[default]"),
+        "{permission:?}"
+    );
+    let rows = rendered_application_rows(&application);
+    assert_eq!(
+        row_index(&rows, "Permission mode"),
+        row_index(&rows, "Claude") + 1
+    );
+    assert!(label_column(&application, "Permission mode") > label_column(&application, "Claude"));
 }
 
 /// Expansion is view state the panel forgets: a reader returning to the panel

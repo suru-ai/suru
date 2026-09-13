@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1136,11 +1136,38 @@ impl Default for CopilotSettings {
 #[serde(deny_unknown_fields)]
 pub struct ClaudeSettings {
     pub enabled: bool,
+    pub permission_mode: ClaudePermissionMode,
 }
 
 impl Default for ClaudeSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            permission_mode: ClaudePermissionMode::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaudePermissionMode {
+    #[default]
+    Default,
+    AcceptEdits,
+    DontAsk,
+    BypassPermissions,
+    Auto,
+}
+
+impl ClaudePermissionMode {
+    pub const fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::DontAsk => "dontAsk",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::Auto => "auto",
+        }
     }
 }
 
@@ -1422,6 +1449,9 @@ pub enum SettingMutation {
     },
     ProviderClaudeEnabled {
         value: Option<bool>,
+    },
+    ProviderClaudePermissionMode {
+        value: Option<ClaudePermissionMode>,
     },
     ServingEnabled {
         value: Option<bool>,
