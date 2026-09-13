@@ -5,13 +5,14 @@ use crate::protocol::{
     UpdateApprovalPostureRequest,
 };
 
-use super::SessionStore;
+use super::{SessionStore, SessionStoreState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApprovalPostureMutationError {
     SessionNotFound,
     ProviderUnavailable,
     ProviderConflict,
+    InheritedByParent,
     Storage,
 }
 
@@ -26,12 +27,16 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let selection = state
+        let session = &state
             .sessions
             .get(&session_id)
             .ok_or(ApprovalPostureMutationError::SessionNotFound)?
             .snapshot
-            .session
+            .session;
+        if session.is_subagent() {
+            return Err(ApprovalPostureMutationError::InheritedByParent);
+        }
+        let selection = session
             .agent_selection
             .clone()
             .ok_or(ApprovalPostureMutationError::ProviderUnavailable)?;
@@ -68,6 +73,8 @@ impl SessionStore {
                 )
                 .map_err(|_| ApprovalPostureMutationError::Storage)?;
         }
+        reconcile_child_approval_postures(&mut state, &self.storage)
+            .map_err(|_| ApprovalPostureMutationError::Storage)?;
         Ok(value)
     }
 
@@ -82,12 +89,13 @@ impl SessionStore {
         let ids = state.sessions.keys().copied().collect::<Vec<_>>();
         for id in ids {
             let next = state.sessions.get(&id).and_then(|record| {
-                if record
-                    .snapshot
-                    .session
-                    .approval_posture
-                    .as_ref()
-                    .is_some_and(|posture| posture.pinned)
+                if record.snapshot.session.is_subagent()
+                    || record
+                        .snapshot
+                        .session
+                        .approval_posture
+                        .as_ref()
+                        .is_some_and(|posture| posture.pinned)
                 {
                     return None;
                 }
@@ -117,5 +125,46 @@ impl SessionStore {
                 tracing::error!(session = %id, "could not reconcile Approval Posture: {error:#}");
             }
         }
+        if let Err(error) = reconcile_child_approval_postures(&mut state, &self.storage) {
+            tracing::error!("could not reconcile inherited Subagent Approval Posture: {error:#}");
+        }
     }
+}
+
+/// Child Sessions share their root Session's native Provider actor, so their
+/// posture is an inherited reading rather than an independently mutable value.
+fn reconcile_child_approval_postures(
+    state: &mut SessionStoreState,
+    storage: &crate::storage::StorageSink,
+) -> anyhow::Result<()> {
+    let children = state
+        .sessions
+        .iter()
+        .filter_map(|(id, record)| record.snapshot.session.is_subagent().then_some(*id))
+        .collect::<Vec<_>>();
+    for child in children {
+        let mut root = child;
+        while let Some(parent) = state
+            .sessions
+            .get(&root)
+            .and_then(|record| record.snapshot.session.parent)
+        {
+            root = parent;
+        }
+        let inherited = state
+            .sessions
+            .get(&root)
+            .and_then(|record| record.snapshot.session.approval_posture);
+        if state.sessions[&child].snapshot.session.approval_posture == inherited {
+            continue;
+        }
+        state.commit(
+            storage,
+            child,
+            vec![SessionChange::ApprovalPostureChanged {
+                approval_posture: inherited,
+            }],
+        )?;
+    }
+    Ok(())
 }

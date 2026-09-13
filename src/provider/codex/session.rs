@@ -857,6 +857,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
                     thread_id: &thread_id,
                     input: &native_input,
                     model: selection.model.as_str(),
+                    approval_policy: posture.approval_policy(),
                     summary,
                     sandbox_policy: posture.sandbox_policy(),
                     effort: options.effort,

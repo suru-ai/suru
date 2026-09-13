@@ -9,8 +9,9 @@ use std::{collections::HashMap, sync::Arc};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        Activity, ApprovalOutcome, ApprovalSubject, CommandAction, CreateSessionRequest, Decision,
-        InitialPrompt, PromptId, TurnStatus,
+        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
+        CodexApprovalPolicy, CodexSandboxMode, CommandAction, CreateSessionRequest, Decision,
+        InitialPrompt, PromptDelivery, PromptId, TurnStatus, UpdateApprovalPostureRequest,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -80,6 +81,27 @@ while IFS= read -r line; do
 done
 "#;
 
+const TWO_TURN_POSTURE: &str = r#"#!/bin/sh
+turns=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":'"$id"',"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"turn/start"'*)
+      turns=$((turns + 1))
+      current_turn="native-turn-$turns"
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"'"$current_turn"'"}}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"'"$current_turn"'","status":"interrupted","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
 async fn snapshot_until(
     client: &ManagedClient,
     session_id: suru::protocol::SessionId,
@@ -97,6 +119,106 @@ async fn snapshot_until(
     })
     .await
     .expect("Session reaches expected Approval state")
+}
+
+#[tokio::test]
+async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_turn() {
+    let fixture = ScriptedCodex::new(TWO_TURN_POSTURE);
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state.path(), "codex-two-turn-posture").unwrap(),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .unwrap();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "codex-two-turn-posture").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut client).await;
+    let session_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "First".into(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    snapshot_until(&client, session_id, |snapshot| {
+        snapshot
+            .turns
+            .first()
+            .is_some_and(|turn| turn.status == TurnStatus::Active)
+    })
+    .await;
+    client.interrupt_session(session_id).await.unwrap();
+    snapshot_until(&client, session_id, |snapshot| {
+        snapshot
+            .turns
+            .first()
+            .is_some_and(|turn| turn.status == TurnStatus::Interrupted)
+    })
+    .await;
+
+    client
+        .update_approval_posture(
+            session_id,
+            UpdateApprovalPostureRequest {
+                posture: Some(ApprovalPosture::Codex {
+                    approval_policy: CodexApprovalPolicy::Never,
+                    sandbox_mode: CodexSandboxMode::WorkspaceWrite,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Second".into(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .unwrap();
+    snapshot_until(&client, session_id, |snapshot| {
+        snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Active
+    })
+    .await;
+
+    let starts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0]["params"]["approvalPolicy"], "on-request");
+    assert_eq!(
+        starts[0]["params"]["sandboxPolicy"]["type"],
+        "workspaceWrite"
+    );
+    assert_eq!(starts[1]["params"]["approvalPolicy"], "never");
+    assert_eq!(
+        starts[1]["params"]["sandboxPolicy"]["type"],
+        "workspaceWrite"
+    );
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -159,6 +281,7 @@ async fn native_approvals_preserve_subjects_callback_identity_decisions_and_inte
         .into_iter()
         .find(|request| request["method"] == "turn/start")
         .unwrap();
+    assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
     assert_eq!(turn_start["params"]["sandboxPolicy"]["type"], "readOnly");
 
     let approvals = snapshot

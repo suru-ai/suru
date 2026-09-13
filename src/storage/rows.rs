@@ -318,7 +318,7 @@ impl SessionRow {
                 .transpose()?,
             created_at: u64_to_i64(session_id, "created_at", summary.created_at.0)?,
             updated_at: u64_to_i64(session_id, "updated_at", summary.updated_at.0)?,
-            workspace: Self::location_payload(&summary.session)?,
+            workspace: Self::session_metadata_payload(&summary.session)?,
             agent_selection: summary
                 .session
                 .agent_selection
@@ -343,11 +343,11 @@ impl SessionRow {
         })
     }
 
-    pub(super) fn location_payload(session: &Session) -> Result<String, StorageError> {
+    pub(super) fn session_metadata_payload(session: &Session) -> Result<String, StorageError> {
         encode(
             session.id,
-            "Session location",
-            &StoredSessionLocation {
+            "Session metadata",
+            &StoredSessionMetadata {
                 path: session.workspace.path.clone(),
                 workspace: Some(session.workspace.clone()),
                 execution_directory: Some(session.execution_directory.clone()),
@@ -362,26 +362,27 @@ impl SessionRow {
     ) -> Result<(SessionSummary, SessionRevision), StorageError> {
         let session_id = self.id.clone();
         let id = parse_id(&session_id, "Session ID", SessionId::from_uuid)?;
-        let workspace: StoredSessionLocation = decode(&session_id, "Workspace", &self.workspace)?;
+        let metadata: StoredSessionMetadata =
+            decode(&session_id, "Session metadata", &self.workspace)?;
         let agent_selection = self
             .agent_selection
             .as_deref()
             .map(|value| decode::<StoredAgentSelection>(&session_id, "Agent Selection", value))
             .transpose()?
             .map(AgentSelection::from);
-        let approval_posture = workspace.approval_posture.clone();
+        let approval_posture = metadata.approval_posture;
         let summary = SessionSummary {
             checkout_state: None,
             session: Session {
-                checkout: workspace.checkout.clone(),
+                checkout: metadata.checkout.clone(),
                 context_fill: self
                     .context_fill
                     .as_deref()
                     .map(|fill| decode(&session_id, "Context Fill", fill))
                     .transpose()?,
                 id,
-                execution_directory: workspace.execution_directory(),
-                workspace: workspace.into(),
+                execution_directory: metadata.execution_directory(),
+                workspace: metadata.into(),
                 agent_selection,
                 agent_selection_availability: decode(
                     &session_id,
@@ -445,7 +446,7 @@ impl SessionRow {
             title: self.title.clone(),
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
-            workspace: serde_json::from_str::<StoredSessionLocation>(&self.workspace)
+            workspace: serde_json::from_str::<StoredSessionMetadata>(&self.workspace)
                 .ok()
                 .map(Workspace::from),
         })
@@ -652,10 +653,11 @@ fn transcript_identity(item: TranscriptItem) -> TranscriptIdentity {
     }
 }
 
-/// Session location metadata stays readable without opening its Transcript.
-/// Path-only records predate the grouping/execution split and retain that exact path.
+/// Session metadata needed by listings and restoration stays readable without
+/// opening the Transcript. Path-only records predate the grouping/execution
+/// split and retain that exact path.
 #[derive(Deserialize, Serialize)]
-struct StoredSessionLocation {
+struct StoredSessionMetadata {
     path: PathBuf,
     #[serde(default)]
     workspace: Option<Workspace>,
@@ -667,7 +669,7 @@ struct StoredSessionLocation {
     approval_posture: Option<crate::protocol::SessionApprovalPosture>,
 }
 
-impl StoredSessionLocation {
+impl StoredSessionMetadata {
     fn execution_directory(&self) -> crate::protocol::ExecutionDirectory {
         self.execution_directory
             .clone()
@@ -677,11 +679,11 @@ impl StoredSessionLocation {
     }
 }
 
-impl From<StoredSessionLocation> for Workspace {
-    fn from(workspace: StoredSessionLocation) -> Self {
-        workspace
+impl From<StoredSessionMetadata> for Workspace {
+    fn from(metadata: StoredSessionMetadata) -> Self {
+        metadata
             .workspace
-            .unwrap_or_else(|| Workspace::directory(workspace.path))
+            .unwrap_or_else(|| Workspace::directory(metadata.path))
     }
 }
 

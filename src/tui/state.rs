@@ -6889,6 +6889,7 @@ impl Application {
             }
             SemanticCommandId::ApprovalPostureOpen => {
                 if let Some(posture) = self.state.session.as_ref().and_then(|session| {
+                    (!session.snapshot().session.is_subagent()).then_some(())?;
                     session
                         .snapshot()
                         .session
@@ -6903,6 +6904,7 @@ impl Application {
             }
             SemanticCommandId::ApprovalPostureCycle => {
                 let request = self.state.session.as_ref().and_then(|session| {
+                    (!session.snapshot().session.is_subagent()).then_some(())?;
                     session
                         .snapshot()
                         .session

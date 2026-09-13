@@ -461,6 +461,7 @@ pub(super) struct TurnStartParams<'a> {
     pub(super) thread_id: &'a str,
     pub(super) input: &'a [UserInput],
     pub(super) model: &'a str,
+    pub(super) approval_policy: &'a str,
     /// How much detail Codex should summarize its Reasoning in. A Turn that
     /// omits it inherits the Model's own default, which is why Suru always
     /// states one.

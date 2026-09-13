@@ -91,6 +91,11 @@ fn session_chrome_cycle_and_picker_use_the_typed_approval_posture_without_losing
             )))
             .unwrap();
     }
+    let short_picker = rendered_application_rows_at(&application, 80, 12).join("\n");
+    assert!(
+        short_picker.contains("Follow Server Settings (reset)"),
+        "the focused reset remains visible in a short picker: {short_picker}"
+    );
     assert_eq!(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -107,4 +112,49 @@ fn session_chrome_cycle_and_picker_use_the_typed_approval_posture_without_losing
     );
     let frame = rendered_application_rows_at(&application, 80, 24).join("\n");
     assert!(frame.contains("draft survives posture changes"), "{frame}");
+}
+
+#[test]
+fn a_subagents_inherited_posture_has_no_independent_controls() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    let session_id = SessionId::new();
+    let mut snapshot = selected_session_snapshot(
+        session_id,
+        workspace.path(),
+        AgentSelection {
+            provider: ProviderId::new("claude"),
+            model: ModelId::new("claude-test"),
+            options: Vec::new(),
+        },
+    );
+    snapshot.session.parent = Some(SessionId::new());
+    snapshot.session.approval_posture = Some(SessionApprovalPosture {
+        value: ApprovalPosture::Claude {
+            permission_mode: suru::protocol::ClaudePermissionMode::DontAsk,
+        },
+        pinned: true,
+    });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .unwrap();
+    for command in [
+        SemanticCommandId::ApprovalPostureCycle,
+        SemanticCommandId::ApprovalPostureOpen,
+    ] {
+        assert_eq!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    command
+                )))
+                .unwrap(),
+            ApplicationTransition::Continue,
+            "a Subagent cannot issue an independent posture mutation"
+        );
+    }
+    let frame = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(frame.contains("Claude dontAsk"), "{frame}");
+    assert!(frame.contains("inherited"), "{frame}");
+    assert!(!frame.contains("pinned"), "{frame}");
+    assert!(!frame.contains("Follow Server Settings (reset)"), "{frame}");
 }

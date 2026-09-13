@@ -1233,9 +1233,12 @@ fn render_approval_posture_picker(
         .min(main.height.saturating_sub(2));
     let area = centered_rect(main, main.width.saturating_sub(8).min(58), height);
     let width = usize::from(area.width.saturating_sub(2));
-    let lines = rows
-        .into_iter()
-        .take(usize::from(area.height.saturating_sub(2)))
+    let capacity = usize::from(area.height.saturating_sub(2));
+    let selected = rows
+        .iter()
+        .position(|(_, selected)| *selected)
+        .unwrap_or_default();
+    let lines = visible_window(rows, selected, capacity)
         .map(|(row, selected)| {
             let label = match row {
                 ApprovalPostureChoice::Value { label, .. } => label,
@@ -4450,14 +4453,19 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
             }
         }
     };
-    let posture = state
-        .session
-        .as_ref()
-        .and_then(|session| session.snapshot().session.approval_posture.as_ref())
-        .map(|posture| {
-            let pin = if posture.pinned { " · pinned" } else { "" };
-            format!("Approval Posture: {}{pin}", posture.value.summary())
-        });
+    let posture = state.session.as_ref().and_then(|session| {
+        let snapshot = session.snapshot();
+        snapshot.session.approval_posture.as_ref().map(|posture| {
+            let source = if snapshot.session.is_subagent() {
+                " · inherited"
+            } else if posture.pinned {
+                " · pinned"
+            } else {
+                ""
+            };
+            format!("Approval Posture: {}{source}", posture.value.summary())
+        })
+    });
     posture.map_or(agent.clone(), |posture| format!("{agent} · {posture}"))
 }
 

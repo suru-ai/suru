@@ -378,7 +378,7 @@ impl StorageRepository {
         })?;
         diesel::update(sessions::table.filter(sessions::id.eq(session.id.to_string())))
             .set((
-                sessions::workspace.eq(SessionRow::location_payload(session)?),
+                sessions::workspace.eq(SessionRow::session_metadata_payload(session)?),
                 sessions::revision.eq(revision),
             ))
             .execute(&mut connection)

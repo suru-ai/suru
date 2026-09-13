@@ -2051,6 +2051,11 @@ async fn update_approval_posture(
             SessionErrorCode::InvalidCommand,
             "Approval Posture belongs to another Provider",
         ),
+        Err(ApprovalPostureMutationError::InheritedByParent) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::InvalidCommand,
+            "Subagent Approval Posture is inherited from its parent Session",
+        ),
         Err(ApprovalPostureMutationError::Storage) => {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
