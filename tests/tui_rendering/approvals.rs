@@ -1,8 +1,10 @@
 use crate::support::{
-    connected_application, enter_active_session, rendered_application_rows_at, type_terminal_text,
-    workspace_dir,
+    connected_application, enter_active_session, rendered_application_buffer,
+    rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use suru::{
@@ -458,11 +460,12 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
     let long_tail = "final available input";
     let foldable = approval_activity(
         turn_id,
-        ApprovalSubject::OtherTool {
-            name: "bulk_tool".into(),
-            input: json!({"lines": format!("{}{}", "detail line\n".repeat(30), long_tail)}),
+        ApprovalSubject::Command {
+            command: format!("printf '{}{}'", "detail line\n".repeat(30), long_tail),
+            cwd: None,
+            actions: Vec::new(),
         },
-        Some("Review every argument"),
+        Some("Review every argument\nbefore choosing"),
         ApprovalOutcome::Pending,
         None,
     );
@@ -506,6 +509,10 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
         "Fold marker must count hidden detail:\n{folded}"
     );
     assert!(
+        folded.contains("+33"),
+        "Fold counts every logical Command and reason Line:\n{folded}"
+    );
+    assert!(
         !folded.contains(long_tail),
         "Fold hides available stored detail"
     );
@@ -534,4 +541,72 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
             "long detail hid {choice:?}:\n{panel}"
         );
     }
+}
+
+#[test]
+fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    let hidden_tail = "HIDDEN-COMMAND-TAIL";
+    let command = format!("echo {}{hidden_tail}\nsecond line", "x".repeat(2_000));
+    add_approval(
+        &mut snapshot,
+        approval_activity(
+            turn_id,
+            ApprovalSubject::Command {
+                command,
+                cwd: None,
+                actions: Vec::new(),
+            },
+            Some("Explain this request"),
+            ApprovalOutcome::Pending,
+            None,
+        ),
+    );
+    app.handle_event(ApplicationEvent::Session(
+        suru::managed_client::SessionEvent::snapshot(snapshot),
+    ))
+    .unwrap();
+
+    let buffer = rendered_application_buffer(&app, 100, 24);
+    let start = text_position(&buffer, "Approval · Command");
+    let marker = text_position(&buffer, "+3 lines");
+    assert!(
+        !crate::support::buffer_rows(&buffer)
+            .join("\n")
+            .contains(hidden_tail),
+        "folded summary exposed the long Command tail"
+    );
+    app.handle_terminal_event(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: start.0,
+        row: start.1,
+        modifiers: KeyModifiers::NONE,
+    }))
+    .unwrap();
+    app.handle_terminal_event(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: marker.0 + 7,
+        row: marker.1,
+        modifiers: KeyModifiers::NONE,
+    }))
+    .unwrap();
+    let copied = app
+        .handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: marker.0 + 7,
+            row: marker.1,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    let ApplicationTransition::CopyToClipboard(copied) = copied else {
+        panic!("folded Approval selection did not copy: {copied:?}")
+    };
+    assert!(
+        copied.text.contains("Approval · Command"),
+        "{}",
+        copied.text
+    );
+    assert!(!copied.text.contains("+3 lines"), "{}", copied.text);
 }

@@ -2927,39 +2927,36 @@ fn render_activity(
             let folded = step != FoldStep::Expanded;
             let detail = super::approval::detail_lines(approval, *tool_activity_id);
             let hidden = detail.len() + usize::from(*detail_truncated);
-            let fold = if folded && hidden > 0 {
-                format!(" · … {}", fold_marker_text(hidden, "lines"))
-            } else {
-                String::new()
-            };
-            projection.lines.push(StyledLine::from(vec![
+            let mut header = vec![
                 StyledSpan::chrome(
                     format!("  {} ", if folded { "▸" } else { "▾" }),
                     theme.accent.primary,
                 ),
                 StyledSpan::text(
                     format!(
-                        "Approval · {} · {}{}{}",
+                        "Approval · {} · {}",
                         super::approval::subject_summary(&approval.subject),
                         super::approval::outcome_text(*outcome, *decision),
-                        if outcome.is_answerable() {
-                            " · Ctrl+Y decide"
-                        } else {
-                            ""
-                        },
-                        fold,
                     ),
                     theme.accent.primary,
                 ),
-            ]));
+            ];
+            if outcome.is_answerable() {
+                header.push(StyledSpan::chrome(" · Ctrl+Y decide", theme.accent.primary));
+            }
+            if folded && hidden > 0 {
+                header.push(StyledSpan::chrome(
+                    format!(" · … {}", fold_marker_text(hidden, "lines")),
+                    theme.accent.primary,
+                ));
+            }
+            projection.lines.push(StyledLine::from(header));
             if !folded {
                 for line in detail {
-                    for line in line.split('\n') {
-                        projection.lines.push(StyledLine::from(vec![
-                            StyledSpan::chrome(OUTPUT_INDENT, Style::default()),
-                            StyledSpan::text(line.to_owned(), Style::default()),
-                        ]));
-                    }
+                    projection.lines.push(StyledLine::from(vec![
+                        StyledSpan::chrome(OUTPUT_INDENT, Style::default()),
+                        StyledSpan::text(line, Style::default()),
+                    ]));
                 }
                 if *detail_truncated {
                     push_truncation_marker(

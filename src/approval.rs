@@ -103,21 +103,14 @@ impl Approval {
     /// typed subject remains intact; strings, collections, and JSON children
     /// are retained in order until the shared character budget is exhausted.
     pub(crate) fn into_bounded_history(mut self, max_chars: usize) -> (Self, bool) {
-        let Ok(encoded) = serde_json::to_string(&self) else {
-            return (self, false);
-        };
-        if encoded.chars().count() <= max_chars {
-            return (self, false);
-        }
+        let original = self.clone();
         let mut budget = CharacterBudget(max_chars);
         self.subject.retain_within(&mut budget);
         if let Some(reason) = &mut self.reason {
             budget.retain_string(reason);
-            if reason.is_empty() {
-                self.reason = None;
-            }
         }
-        (self, true)
+        let truncated = self != original;
+        (self, truncated)
     }
 }
 
@@ -144,6 +137,10 @@ impl CharacterBudget {
 
     fn retain_path(&mut self, value: &mut PathBuf) {
         let mut rendered = value.to_string_lossy().into_owned();
+        if rendered.chars().count().saturating_add(2) <= self.0 {
+            self.charge(rendered.chars().count().saturating_add(2));
+            return;
+        }
         self.retain_string(&mut rendered);
         *value = PathBuf::from(rendered);
     }

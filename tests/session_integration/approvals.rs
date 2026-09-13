@@ -87,6 +87,59 @@ async fn provider_input_is_bounded_only_in_durable_approval_history() {
 }
 
 #[tokio::test]
+async fn serialized_escape_overhead_does_not_claim_untruncated_approval_content_was_cut() {
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "approval-stored-detail-boundary";
+    let live = working_turn(directory.path(), channel).await;
+    let approval = Approval {
+        id: ApprovalId::new(),
+        subject: ApprovalSubject::Network {
+            // Each character needs escaping on the JSON wire, but the
+            // Provider supplied fewer content characters than the durable
+            // detail budget permits.
+            host_or_url: "\n\"".repeat(32_750),
+        },
+        reason: None,
+    };
+    assert!(serde_json::to_string(&approval).unwrap().chars().count() > 64 * 1024);
+    live.provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: approval.clone(),
+            tool_activity_id: None,
+        })
+        .await;
+    let snapshot = read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "near-boundary Approval history",
+        |snapshot| {
+            snapshot.activities.iter().any(|activity| {
+                matches!(activity, Activity::Approval { approval: stored, .. } if stored.id == approval.id)
+            })
+        },
+    )
+    .await;
+    let Activity::Approval {
+        approval: stored,
+        detail_truncated,
+        ..
+    } = snapshot
+        .activities
+        .iter()
+        .find(|activity| {
+            matches!(activity, Activity::Approval { approval: stored, .. } if stored.id == approval.id)
+        })
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(stored, &approval);
+    assert!(!detail_truncated);
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_events_and_standing_follow_pending_submitting_and_settled_approval() {
     let directory = tempfile::tempdir().unwrap();
     let channel = "approval-live-state";

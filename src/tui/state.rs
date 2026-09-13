@@ -7941,15 +7941,14 @@ impl TuiState {
             return None;
         }
         let id = self.approvals.id()?;
-        self.session
-            .as_ref()?
-            .snapshot()
-            .activities
-            .iter()
-            .find(|activity| {
-                matches!(activity, Activity::Approval { approval, outcome, .. }
-                    if approval.id == id && outcome.is_live())
-            })
+        let snapshot = self.session.as_ref()?.snapshot();
+        if !snapshot.pending_approvals.contains(&id) && !snapshot.submitting_approvals.contains(&id)
+        {
+            return None;
+        }
+        snapshot.activities.iter().find(
+            |activity| matches!(activity, Activity::Approval { approval, .. } if approval.id == id),
+        )
     }
 
     pub(super) fn pending_questionnaires(

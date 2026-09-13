@@ -217,10 +217,8 @@ impl ApprovalPanel {
 
 pub(super) fn pending(snapshot: &SessionSnapshot) -> impl Iterator<Item = &Activity> {
     snapshot.activities.iter().filter(|activity| {
-        matches!(activity, Activity::Approval { approval, outcome, turn_id, .. }
-            if outcome.is_answerable()
-                && snapshot.pending_approvals.contains(&approval.id)
-                && snapshot.turns.iter().any(|turn| turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active))
+        matches!(activity, Activity::Approval { approval, .. }
+            if snapshot.pending_approvals.contains(&approval.id))
     })
 }
 
@@ -277,16 +275,35 @@ pub(super) fn outcome_text(outcome: ApprovalOutcome, decision: Option<Decision>)
 
 pub(super) fn subject_summary(subject: &ApprovalSubject) -> String {
     match subject {
-        ApprovalSubject::Command { command, .. } => format!("Command · {command}"),
+        ApprovalSubject::Command { command, .. } => compact_subject("Command", Some(command)),
         ApprovalSubject::FileChange { paths, .. } => paths.first().map_or_else(
-            || "File Change".into(),
-            |path| format!("File Change · {}", path.display()),
+            || compact_subject("File Change", None),
+            |path| compact_subject("File Change", Some(&path.to_string_lossy())),
         ),
-        ApprovalSubject::Read { path } => format!("Read · {}", path.display()),
-        ApprovalSubject::Network { host_or_url } => format!("Network · {host_or_url}"),
-        ApprovalSubject::PermissionGrant { .. } => "Permission Grant".into(),
-        ApprovalSubject::OtherTool { name, .. } => format!("Other Tool · {name}"),
+        ApprovalSubject::Read { path } => compact_subject("Read", Some(&path.to_string_lossy())),
+        ApprovalSubject::Network { host_or_url } => compact_subject("Network", Some(host_or_url)),
+        ApprovalSubject::PermissionGrant { .. } => compact_subject("Permission Grant", None),
+        ApprovalSubject::OtherTool { name, .. } => compact_subject("Other Tool", Some(name)),
     }
+}
+
+/// A Fold header identifies the subject without repeating arbitrary Provider
+/// input. Everything omitted here remains available in the expanded detail.
+fn compact_subject(kind: &str, detail: Option<&str>) -> String {
+    const MAX_CHARS: usize = 40;
+    let Some(detail) = detail else {
+        return kind.into();
+    };
+    let prefix = format!("{kind} · ");
+    let first_line = detail.split('\n').next().unwrap_or_default();
+    let available = MAX_CHARS
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(1);
+    let mut kept = first_line.chars().take(available).collect::<String>();
+    if detail.contains('\n') || first_line.chars().count() > available {
+        kept.push('…');
+    }
+    format!("{prefix}{kept}")
 }
 
 pub(super) fn detail_lines(
@@ -375,7 +392,11 @@ pub(super) fn detail_lines(
     if let Some(reason) = &approval.reason {
         lines.push(format!("Reason: {reason}"));
     }
-    lines
+    let mut logical_lines = Vec::new();
+    for line in lines {
+        logical_lines.extend(line.split('\n').map(str::to_owned));
+    }
+    logical_lines
 }
 
 fn push_json(lines: &mut Vec<String>, label: &str, value: &serde_json::Value) {
