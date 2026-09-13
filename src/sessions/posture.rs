@@ -144,17 +144,25 @@ fn reconcile_child_approval_postures(
         .collect::<Vec<_>>();
     for child in children {
         let mut root = child;
-        while let Some(parent) = state
-            .sessions
-            .get(&root)
-            .and_then(|record| record.snapshot.session.parent)
-        {
-            root = parent;
-        }
-        let inherited = state
-            .sessions
-            .get(&root)
-            .and_then(|record| record.snapshot.session.approval_posture);
+        let mut visited = std::collections::HashSet::new();
+        let inherited = loop {
+            if !visited.insert(root) {
+                break None;
+            }
+            let Some(record) = state.sessions.get(&root) else {
+                break None;
+            };
+            match record.snapshot.session.parent {
+                Some(parent) => root = parent,
+                None => break Some(record.snapshot.session.approval_posture),
+            }
+        };
+        // Restoration deliberately retains readable cyclic components and children whose parent
+        // is missing, but does not promote either into a root. They have no authoritative root
+        // posture to inherit, so leave their persisted reading untouched.
+        let Some(inherited) = inherited else {
+            continue;
+        };
         if state.sessions[&child].snapshot.session.approval_posture == inherited {
             continue;
         }

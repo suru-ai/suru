@@ -490,6 +490,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
         sink,
         Vec::new(),
     );
+    store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
     writer.shutdown().await.unwrap();
