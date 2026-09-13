@@ -354,6 +354,23 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current = *outcome;
                 *stored = *decision;
             }
+            SessionChange::ApprovalFollowUpFailed { activity_id, error } => {
+                let Some(Activity::Approval {
+                    outcome,
+                    follow_up_error,
+                    ..
+                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                else {
+                    bail!("Unknown Approval Activity");
+                };
+                if *outcome != crate::protocol::ApprovalOutcome::Decided
+                    || follow_up_error.is_some()
+                    || error.is_empty()
+                {
+                    bail!("Approval follow-up failure is invalid");
+                }
+                *follow_up_error = Some(error.clone());
+            }
             SessionChange::QuestionnaireAccepted { activity_id } => {
                 let Some(Activity::Questionnaire {
                     outcome, turn_id, ..

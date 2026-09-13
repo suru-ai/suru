@@ -5,7 +5,6 @@
 //! stopping the process once the Session is done with it.
 
 use std::{
-    collections::HashMap,
     ffi::{OsStr, OsString},
     sync::{
         Arc, Mutex as StdMutex,
@@ -41,9 +40,10 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderPrompt,
-        ProviderResumeState, ProviderRuntime, ProviderSession, ProviderSessionConnection,
-        ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
+        ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderFuture,
+        ProviderModelDiscovery, ProviderPrompt, ProviderResumeState, ProviderRuntime,
+        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+        ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -472,7 +472,6 @@ async fn start_codex_thread(
         turn_start_changed,
         process: process.clone(),
         shutdown_started: AtomicBool::new(false),
-        post_decision_interrupts: StdMutex::new(HashMap::new()),
         pricing_refresh,
     });
     let events = provider_events(
@@ -506,7 +505,6 @@ struct CodexSession {
     turn_start_changed: Arc<Notify>,
     process: Arc<ProcessGuard>,
     shutdown_started: AtomicBool,
-    post_decision_interrupts: StdMutex<HashMap<crate::protocol::ApprovalId, (String, String)>>,
     pricing_refresh: Option<crate::pricing::PricingRefresh>,
 }
 
@@ -550,47 +548,39 @@ impl ProviderSession for CodexSession {
         &self,
         id: crate::protocol::ApprovalId,
         decision: crate::protocol::Decision,
-    ) -> ProviderFuture<'_, ()> {
+    ) -> ProviderFuture<'_, ProviderDecisionDelivery> {
         Box::pin(async move {
-            let interrupt = self.transport.submit_decision(id, decision).await?;
-            if let Some((thread_id, turn_id)) = interrupt {
-                self.post_decision_interrupts
-                    .lock()
-                    .expect("Codex post-Decision interrupt lock is not poisoned")
-                    .insert(id, (thread_id, turn_id));
-            }
-            Ok(())
-        })
-    }
-
-    fn after_decision_settled(
-        &self,
-        id: crate::protocol::ApprovalId,
-        _decision: crate::protocol::Decision,
-    ) -> ProviderFuture<'_, ()> {
-        Box::pin(async move {
-            let target = self
-                .post_decision_interrupts
-                .lock()
-                .expect("Codex post-Decision interrupt lock is not poisoned")
-                .remove(&id);
-            let Some((thread_id, turn_id)) = target else {
-                return Ok(());
-            };
-            self.transport
-                .request_with_timeout(
-                    "turn/interrupt",
-                    &TurnInterruptParams {
-                        thread_id: &thread_id,
-                        turn_id: &turn_id,
-                    },
-                    self.context.timeouts.interrupt_request,
-                )
-                .await
-                .map_err(|error| {
-                    codex_error_context("Codex permission interruption failed", error)
-                })?;
-            Ok(())
+            let native = self.transport.submit_decision(id, decision).await?;
+            let transport = self.transport.clone();
+            let interrupt_timeout = self.context.timeouts.interrupt_request;
+            Ok(ProviderDecisionDelivery::with_follow_up(Box::pin(
+                async move {
+                    let super::transport::NativeDecisionDelivery {
+                        settlement,
+                        interrupt,
+                    } = native;
+                    // Release native completion before sending an interrupt
+                    // whose response shares the same reader.
+                    drop(settlement);
+                    let Some(target) = interrupt else {
+                        return Ok(());
+                    };
+                    transport
+                        .request_with_timeout(
+                            "turn/interrupt",
+                            &TurnInterruptParams {
+                                thread_id: &target.thread_id,
+                                turn_id: &target.turn_id,
+                            },
+                            interrupt_timeout,
+                        )
+                        .await
+                        .map_err(|error| {
+                            codex_error_context("Codex permission interruption failed", error)
+                        })?;
+                    Ok(())
+                },
+            )))
         })
     }
 

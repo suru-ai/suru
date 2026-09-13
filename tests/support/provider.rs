@@ -11,10 +11,11 @@ use suru::protocol::{
     SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ProviderErrand, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderModelDiscovery,
-    ProviderPrompt, ProviderRuntime, ProviderSession, ProviderSessionConnection,
-    ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
+    AttributedProviderEvent, ProviderDecisionDelivery, ProviderErrand, ProviderError,
+    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture,
+    ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
+    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+    ProviderTurnInput,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -994,7 +995,7 @@ impl ProviderSession for ControlledSessionHandle {
         &self,
         id: suru::protocol::ApprovalId,
         decision: suru::protocol::Decision,
-    ) -> ProviderFuture<'_, ()> {
+    ) -> ProviderFuture<'_, ProviderDecisionDelivery> {
         Box::pin(async move {
             let (response, delivered) = oneshot::channel();
             let gated = self.gate_decisions.load(Ordering::SeqCst);
@@ -1008,10 +1009,9 @@ impl ProviderSession for ControlledSessionHandle {
             if gated {
                 delivered
                     .await
-                    .map_err(|_| ProviderError::new("test delivery abandoned"))?
-            } else {
-                Ok(())
+                    .map_err(|_| ProviderError::new("test delivery abandoned"))??;
             }
+            Ok(ProviderDecisionDelivery::complete())
         })
     }
 

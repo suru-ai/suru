@@ -29,6 +29,18 @@ pub(super) struct NativeApprovalIdentity {
     pub(super) kind: NativeApprovalKind,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct NativeApprovalTurn {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeInterruptTarget {
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+}
+
 #[derive(Clone)]
 pub(super) enum NativeApprovalKind {
     Command,
@@ -43,7 +55,8 @@ struct NativeApproval {
 pub(super) struct NativeDecision {
     pub(super) request_id: RequestId,
     pub(super) result: Value,
-    pub(super) interrupt: Option<(String, String)>,
+    pub(super) turn: NativeApprovalTurn,
+    pub(super) interrupt: Option<NativeInterruptTarget>,
 }
 
 impl CodexApprovals {
@@ -101,17 +114,19 @@ impl CodexApprovals {
                     // command/file decision enum. Suru grants only this Turn.
                     "scope": "turn",
                 }),
-                matches!(decision, Decision::DeclineAndInterrupt).then(|| {
-                    (
-                        native.identity.thread_id.clone(),
-                        native.identity.turn_id.clone(),
-                    )
+                matches!(decision, Decision::DeclineAndInterrupt).then(|| NativeInterruptTarget {
+                    thread_id: native.identity.thread_id.clone(),
+                    turn_id: native.identity.turn_id.clone(),
                 }),
             ),
         };
         Ok(NativeDecision {
             request_id: native.identity.request_id,
             result,
+            turn: NativeApprovalTurn {
+                thread_id: native.identity.thread_id,
+                turn_id: native.identity.turn_id,
+            },
             interrupt,
         })
     }

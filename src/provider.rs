@@ -234,6 +234,28 @@ pub type ProviderFuture<'a, T> =
 pub type ProviderEventStream =
     Pin<Box<dyn Stream<Item = Result<AttributedProviderEvent, ProviderError>> + Send>>;
 
+/// A Decision the Provider has definitively received, together with any work
+/// that must wait until Suru has durably recorded that delivery. Owning the
+/// follow-up future also owns its cleanup: cancellation drops it rather than
+/// stranding a Provider-side stream barrier.
+pub struct ProviderDecisionDelivery {
+    after_settled: ProviderFuture<'static, ()>,
+}
+
+impl ProviderDecisionDelivery {
+    pub fn complete() -> Self {
+        Self::with_follow_up(Box::pin(async { Ok(()) }))
+    }
+
+    pub fn with_follow_up(after_settled: ProviderFuture<'static, ()>) -> Self {
+        Self { after_settled }
+    }
+
+    pub(crate) async fn finish(self) -> Result<(), ProviderError> {
+        self.after_settled.await
+    }
+}
+
 /// One Provider event together with the attribution naming the Session it
 /// lands in. A Provider knows nothing of Suru Sessions, so the attribution
 /// speaks in the Provider's own terms — the conversation itself, or a Subagent
@@ -1107,22 +1129,9 @@ pub trait ProviderSession: Send + Sync + 'static {
         &self,
         id: crate::protocol::ApprovalId,
         decision: crate::protocol::Decision,
-    ) -> ProviderFuture<'_, ()> {
+    ) -> ProviderFuture<'_, ProviderDecisionDelivery> {
         let _ = (id, decision);
         Box::pin(async { Err(ProviderError::new("Approval is unavailable")) })
-    }
-
-    /// Completes Provider work that must begin only after Suru has durably
-    /// recorded a delivered Decision. Providers normally have nothing to do;
-    /// a native permission API may require Suru to interrupt after first
-    /// returning its rejection callback.
-    fn after_decision_settled(
-        &self,
-        id: crate::protocol::ApprovalId,
-        decision: crate::protocol::Decision,
-    ) -> ProviderFuture<'_, ()> {
-        let _ = (id, decision);
-        Box::pin(async { Ok(()) })
     }
 
     fn submit_questionnaire(

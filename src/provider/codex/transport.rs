@@ -26,6 +26,7 @@ use tokio::{
 };
 
 use super::{
+    approval::{NativeApprovalTurn, NativeInterruptTarget},
     codex_error, codex_error_context, concise_remote_message,
     wire::{
         ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
@@ -58,8 +59,76 @@ struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
     questionnaires: super::questionnaire::CodexQuestionnaires,
     approvals: super::approval::CodexApprovals,
+    decision_settlements: NativeDecisionSettlements,
     events: mpsc::UnboundedSender<Result<NativeNotification, ProviderError>>,
     terminated: AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct NativeDecisionSettlements(Arc<StdMutex<HashMap<NativeApprovalTurn, watch::Sender<usize>>>>);
+
+impl NativeDecisionSettlements {
+    fn begin(&self, turn: NativeApprovalTurn) -> NativeDecisionSettlement {
+        let mut turns = self
+            .0
+            .lock()
+            .expect("Codex Decision settlement lock is not poisoned");
+        let pending = turns
+            .entry(turn.clone())
+            .or_insert_with(|| watch::channel(0).0);
+        let next = (*pending.borrow()).saturating_add(1);
+        pending.send_replace(next);
+        NativeDecisionSettlement {
+            settlements: self.clone(),
+            turn: Some(turn),
+        }
+    }
+
+    fn finish(&self, turn: &NativeApprovalTurn) {
+        let mut turns = self
+            .0
+            .lock()
+            .expect("Codex Decision settlement lock is not poisoned");
+        let remove = turns.get(turn).is_some_and(|pending| {
+            let next = (*pending.borrow()).saturating_sub(1);
+            pending.send_replace(next);
+            next == 0
+        });
+        if remove {
+            turns.remove(turn);
+        }
+    }
+
+    async fn wait(&self, turn: &NativeApprovalTurn) {
+        let Some(mut pending) = self
+            .0
+            .lock()
+            .expect("Codex Decision settlement lock is not poisoned")
+            .get(turn)
+            .map(watch::Sender::subscribe)
+        else {
+            return;
+        };
+        while *pending.borrow_and_update() > 0 && pending.changed().await.is_ok() {}
+    }
+}
+
+pub(super) struct NativeDecisionSettlement {
+    settlements: NativeDecisionSettlements,
+    turn: Option<NativeApprovalTurn>,
+}
+
+impl Drop for NativeDecisionSettlement {
+    fn drop(&mut self) {
+        if let Some(turn) = self.turn.take() {
+            self.settlements.finish(&turn);
+        }
+    }
+}
+
+pub(super) struct NativeDecisionDelivery {
+    pub(super) settlement: NativeDecisionSettlement,
+    pub(super) interrupt: Option<NativeInterruptTarget>,
 }
 
 /// An initialized connection to one supervised Codex app-server.
@@ -104,6 +173,7 @@ impl JsonRpcTransport {
             pending: StdMutex::new(HashMap::new()),
             questionnaires: super::questionnaire::CodexQuestionnaires::default(),
             approvals: super::approval::CodexApprovals::default(),
+            decision_settlements: NativeDecisionSettlements::default(),
             events,
             terminated: AtomicBool::new(false),
         });
@@ -246,8 +316,9 @@ impl JsonRpcTransport {
         &self,
         id: crate::protocol::ApprovalId,
         decision: crate::protocol::Decision,
-    ) -> Result<Option<(String, String)>, ProviderError> {
+    ) -> Result<NativeDecisionDelivery, ProviderError> {
         let native = self.state.approvals.take_decision(id, decision)?;
+        let settlement = self.state.decision_settlements.begin(native.turn.clone());
         write_json_line(
             &self.writer,
             &super::wire::ClientResponse {
@@ -257,7 +328,10 @@ impl JsonRpcTransport {
             "answer Codex Approval request",
         )
         .await?;
-        Ok(native.interrupt)
+        Ok(NativeDecisionDelivery {
+            settlement,
+            interrupt: native.interrupt,
+        })
     }
 
     pub(super) async fn close(&self) {
@@ -458,6 +532,18 @@ async fn route_message(
             return Ok(());
         }
         if let Some(event) = decode_notification(method, message.params.as_ref())? {
+            if let NativeNotification::TurnCompleted {
+                thread_id, turn_id, ..
+            } = &event
+            {
+                state
+                    .decision_settlements
+                    .wait(&NativeApprovalTurn {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    })
+                    .await;
+            }
             for event in state.questionnaires.redact_notification(event) {
                 let _ = state.events.send(Ok(event));
             }

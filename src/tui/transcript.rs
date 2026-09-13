@@ -2721,6 +2721,7 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             detail_truncated,
             outcome,
             decision,
+            follow_up_error,
             ..
         } => {
             (*outcome as u8).hash(&mut hasher);
@@ -2728,6 +2729,7 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             serde_json::to_string(approval).ok().hash(&mut hasher);
             tool_activity_id.hash(&mut hasher);
             detail_truncated.hash(&mut hasher);
+            follow_up_error.hash(&mut hasher);
         }
         Activity::Questionnaire { outcome, .. } => (*outcome as u8).hash(&mut hasher),
         Activity::Status { .. } | Activity::Error { .. } => {}
@@ -2922,6 +2924,7 @@ fn render_activity(
             detail_truncated,
             outcome,
             decision,
+            follow_up_error,
             ..
         } => {
             let folded = step != FoldStep::Expanded;
@@ -2936,7 +2939,11 @@ fn render_activity(
                     format!(
                         "Approval · {} · {}",
                         super::approval::subject_summary(&approval.subject),
-                        super::approval::outcome_text(*outcome, *decision),
+                        super::approval::outcome_text(
+                            *outcome,
+                            *decision,
+                            follow_up_error.as_deref(),
+                        ),
                     ),
                     theme.accent.primary,
                 ),

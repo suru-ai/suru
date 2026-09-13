@@ -2567,7 +2567,9 @@ impl SessionOperation {
                         })
                 });
                 let error = match outcome {
-                    Some(crate::protocol::ApprovalOutcome::Decided) => None,
+                    Some(crate::protocol::ApprovalOutcome::Decided) => {
+                        delivery.err().map(|error| error.to_string())
+                    }
                     Some(crate::protocol::ApprovalOutcome::DeliveryUncertain) => Some(
                         "Provider delivery is uncertain. This Decision will not be resent.".into(),
                     ),

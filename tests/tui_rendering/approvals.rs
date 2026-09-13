@@ -34,6 +34,7 @@ fn approval_activity(
         detail_truncated: false,
         outcome,
         decision,
+        follow_up_error: None,
     }
 }
 
@@ -429,6 +430,49 @@ fn decision_retry_waits_for_authoritative_reconciliation_and_uncertainty_stays_t
         invoke(&mut app, SemanticCommandId::ApprovalDecline),
         ApplicationTransition::Continue
     ));
+}
+
+#[test]
+fn delivered_decision_keeps_a_failed_interrupt_visible_after_reconciliation() {
+    let (mut app, id, mut snapshot) = pending_application();
+    let session =
+        suru::protocol::SessionReference::new(suru::protocol::Outlook::Local, snapshot.session.id);
+    let failure = "Provider post-Decision action failed: interrupt refused";
+    let Activity::Approval {
+        outcome,
+        decision,
+        follow_up_error,
+        ..
+    } = snapshot
+        .activities
+        .iter_mut()
+        .find(
+            |activity| matches!(activity, Activity::Approval { approval, .. } if approval.id == id),
+        )
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    *outcome = ApprovalOutcome::Decided;
+    *decision = Some(Decision::DeclineAndInterrupt);
+    *follow_up_error = Some(failure.into());
+    snapshot.pending_approvals.clear();
+    snapshot.revision.0 += 1;
+
+    app.handle_event(ApplicationEvent::ApprovalSubmissionReconciled {
+        session,
+        id,
+        snapshot: Some(snapshot),
+        error: Some(failure.into()),
+    })
+    .unwrap();
+    let screen = rendered_application_rows_at(&app, 120, 30).join("\n");
+    assert!(
+        screen.contains("Declined; interruption")
+            && screen.contains("failed: Provider post-Decision action failed: interrupt refused")
+            && screen.contains("Error: Provider post-Decision action failed: interrupt refused"),
+        "the durable row and operation failure both remain visible:\n{screen}"
+    );
 }
 
 #[test]

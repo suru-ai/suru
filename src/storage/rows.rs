@@ -833,6 +833,8 @@ enum StoredActivityPayload {
         detail_truncated: bool,
         outcome: crate::protocol::ApprovalOutcome,
         decision: Option<crate::protocol::Decision>,
+        #[serde(default)]
+        follow_up_error: Option<String>,
     },
     Questionnaire {
         questionnaire: crate::protocol::Questionnaire,
@@ -884,6 +886,7 @@ impl StoredActivityPayload {
                 detail_truncated,
                 outcome,
                 decision,
+                follow_up_error,
             } => Activity::Approval {
                 id,
                 turn_id,
@@ -892,6 +895,7 @@ impl StoredActivityPayload {
                 detail_truncated,
                 outcome,
                 decision,
+                follow_up_error,
             },
             Self::Questionnaire {
                 questionnaire,
@@ -974,6 +978,7 @@ impl From<Activity> for StoredActivityPayload {
                 detail_truncated,
                 outcome,
                 decision,
+                follow_up_error,
                 ..
             } => Self::Approval {
                 approval,
@@ -981,6 +986,7 @@ impl From<Activity> for StoredActivityPayload {
                 detail_truncated,
                 outcome,
                 decision,
+                follow_up_error,
             },
             Activity::Questionnaire {
                 questionnaire,

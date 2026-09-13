@@ -15,7 +15,7 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::timeout;
+use tokio::time::{Duration, timeout};
 
 const APPROVALS: &str = r#"#!/bin/sh
 while IFS= read -r line; do
@@ -44,6 +44,38 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
       printf '%s\n' '{"id":4,"result":{}}'
       ;;
+  esac
+done
+"#;
+
+const IMMEDIATE_COMPLETION: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":"immediate","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","command":"cargo check"}}'
+      ;;
+    *'"id":"immediate","result"'*)
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"$STATUS","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+const PERMISSION_INTERRUPT_FAILURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":"permission","method":"item/permissions/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","permissions":{"network":{"enabled":true}}}}'
+      ;;
+    *'"method":"turn/interrupt"'*) $INTERRUPT_RESPONSE ;;
   esac
 done
 "#;
@@ -268,4 +300,172 @@ async fn native_approvals_preserve_subjects_callback_identity_decisions_and_inte
     );
 
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn immediate_native_completion_waits_for_definitive_decision_history() {
+    for (decision, native, status, expected) in [
+        (
+            Decision::Accept,
+            "accept",
+            "completed",
+            TurnStatus::Completed,
+        ),
+        (
+            Decision::DeclineAndInterrupt,
+            "cancel",
+            "interrupted",
+            TurnStatus::Interrupted,
+        ),
+    ] {
+        let fixture = ScriptedCodex::new(&IMMEDIATE_COMPLETION.replace("$STATUS", status));
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = format!("codex-immediate-{native}");
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state.path(), &channel).unwrap(),
+            Arc::new(CodexRuntime::new(fixture.executable())),
+        )
+        .await
+        .unwrap();
+        let mut client =
+            ManagedClient::connect(ManagedClientConfig::new(state.path(), &channel).unwrap())
+                .await
+                .unwrap();
+        receive_initial_state(&mut client).await;
+        let session_id = client
+            .create_session(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Complete immediately".into(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .unwrap()
+            .session
+            .id;
+        let pending = snapshot_until(&client, session_id, |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+        let Activity::Approval { approval, .. } = pending
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Approval { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        client
+            .submit_decision(session_id, approval.id, decision)
+            .await
+            .unwrap();
+        let settled = snapshot_until(&client, session_id, |snapshot| {
+            snapshot.turns[0].status == expected
+        })
+        .await;
+        assert!(settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Approval {
+                outcome: ApprovalOutcome::Decided,
+                decision: Some(found),
+                follow_up_error: None,
+                ..
+            } if *found == decision
+        )));
+        let callback = fixture
+            .requests()
+            .into_iter()
+            .find(|message| message["id"] == "immediate" && message.get("result").is_some())
+            .unwrap();
+        assert_eq!(callback["result"], json!({"decision": native}));
+        server.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn permission_interrupt_rejection_and_timeout_remain_visible_after_delivery() {
+    for (label, response, expected_error) in [
+        (
+            "rejected",
+            "printf '%s\\n' '{\"id\":4,\"error\":{\"code\":-32001,\"message\":\"interrupt refused\"}}'",
+            "interrupt refused",
+        ),
+        ("timeout", ":", "timed out"),
+    ] {
+        let fixture = ScriptedCodex::new(
+            &PERMISSION_INTERRUPT_FAILURE.replace("$INTERRUPT_RESPONSE", response),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = format!("codex-permission-interrupt-{label}");
+        let runtime = CodexRuntime::new(fixture.executable())
+            .with_interrupt_request_timeout(Duration::from_millis(20))
+            .with_shutdown_interrupt_timeout(Duration::from_millis(20))
+            .with_process_exit_grace(Duration::from_millis(20));
+        let server = server::spawn_with_provider(
+            ServerConfig::new(state.path(), &channel).unwrap(),
+            Arc::new(runtime),
+        )
+        .await
+        .unwrap();
+        let mut client =
+            ManagedClient::connect(ManagedClientConfig::new(state.path(), &channel).unwrap())
+                .await
+                .unwrap();
+        receive_initial_state(&mut client).await;
+        let session_id = client
+            .create_session(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Reject then interrupt".into(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .unwrap()
+            .session
+            .id;
+        let pending = snapshot_until(&client, session_id, |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+        let (approval_id, activity_id) = pending
+            .activities
+            .iter()
+            .find_map(|activity| match activity {
+                Activity::Approval { id, approval, .. } => Some((approval.id, *id)),
+                _ => None,
+            })
+            .unwrap();
+        let error = client
+            .submit_decision(session_id, approval_id, Decision::DeclineAndInterrupt)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error}");
+        let snapshot = client.read_session(session_id).await.unwrap();
+        assert_eq!(snapshot.turns[0].status, TurnStatus::Active);
+        assert!(snapshot.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Approval {
+                id,
+                outcome: ApprovalOutcome::Decided,
+                decision: Some(Decision::DeclineAndInterrupt),
+                follow_up_error: Some(error),
+                ..
+            } if *id == activity_id && error.contains(expected_error)
+        )));
+        server.shutdown().await.unwrap();
+    }
 }

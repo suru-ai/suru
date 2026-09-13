@@ -57,6 +57,7 @@ impl LiveApprovals {
                     detail_truncated,
                     outcome: ApprovalOutcome::Pending,
                     decision: None,
+                    follow_up_error: None,
                 },
             },
         )?;
@@ -153,16 +154,35 @@ impl DecisionDeliveries {
                     },
                 )
             });
-            if delivered && matches!(settled, Some(Ok(_))) {
-                // Some native APIs express reject-and-interrupt as two
-                // operations. The interrupt begins only after the Decision is
-                // durable, so an early Turn-ended event cannot erase it.
-                if let Err(error) = provider.after_decision_settled(id, decision).await {
-                    tracing::warn!("Provider post-Decision action failed: {error}");
+            let follow_up_error = match delivery {
+                Ok(delivery) if matches!(settled, Some(Ok(_))) => {
+                    delivery.finish().await.err().map(|error| {
+                        super::failure_message("Provider post-Decision action failed", &error)
+                    })
                 }
+                // Dropping a delivered receipt releases any Provider stream
+                // barrier when core could not durably record the Decision.
+                Ok(delivery) => {
+                    drop(delivery);
+                    None
+                }
+                Err(_) => None,
+            };
+            if let Some(error) = &follow_up_error {
+                let _ = updates.apply(|| {
+                    sessions.publish_agent_output(
+                        accepted.session_id,
+                        SessionChange::ApprovalFollowUpFailed {
+                            activity_id: accepted.activity_id,
+                            error: error.clone(),
+                        },
+                    )
+                });
             }
             let result = if !matches!(settled, Some(Ok(_))) {
                 Err("Decision delivery could not be confirmed".into())
+            } else if let Some(error) = follow_up_error {
+                Err(error)
             } else if delivered {
                 Ok(())
             } else if outcome == ApprovalOutcome::SubmissionRejected {

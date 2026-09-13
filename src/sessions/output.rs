@@ -113,6 +113,21 @@ impl SessionStore {
                             return Err(anyhow!("Agent output referenced a settled Subagent"));
                         }
                     }
+                    // A post-Decision action begins only after delivery is
+                    // durable. Its result can therefore arrive after the
+                    // native Turn has independently settled.
+                    SessionChange::ApprovalFollowUpFailed { activity_id, .. } => {
+                        if !record
+                            .snapshot
+                            .activities
+                            .iter()
+                            .any(|activity| activity.id() == *activity_id)
+                        {
+                            return Err(anyhow!(
+                                "Agent output referenced an unknown Approval Activity"
+                            ));
+                        }
+                    }
                     change => {
                         let turn_id = agent_output_turn_id(&record.snapshot, change)?;
                         let turn = record
@@ -221,6 +236,7 @@ fn agent_output_turn_id(
         SessionChange::ActivityAdded { activity } => Ok(activity.turn_id()),
         SessionChange::DecisionAccepted { activity_id }
         | SessionChange::ApprovalSettled { activity_id, .. }
+        | SessionChange::ApprovalFollowUpFailed { activity_id, .. }
         | SessionChange::QuestionnaireAccepted { activity_id }
         | SessionChange::QuestionnaireSettled { activity_id, .. }
         | SessionChange::CommandOutputAppended { activity_id, .. }

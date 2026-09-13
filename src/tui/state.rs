@@ -4056,16 +4056,7 @@ impl Application {
                     }
                 }
                 if self.state.session_reference.as_ref() == Some(&session) {
-                    let confirmed = self.state.session.as_ref().is_some_and(|current| {
-                        current.snapshot().activities.iter().any(|activity| {
-                            matches!(activity, Activity::Approval {
-                                approval,
-                                outcome: crate::protocol::ApprovalOutcome::Decided,
-                                ..
-                            } if approval.id == id)
-                        })
-                    });
-                    self.state.submission_error = if confirmed { None } else { error };
+                    self.state.submission_error = error;
                 }
                 Ok(ApplicationTransition::Continue)
             }

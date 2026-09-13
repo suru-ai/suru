@@ -631,6 +631,7 @@ fn child_approval_attention_opens_the_owning_session_and_submits_its_decision_th
         detail_truncated: false,
         outcome: ApprovalOutcome::Pending,
         decision: None,
+        follow_up_error: None,
     });
     child
         .transcript

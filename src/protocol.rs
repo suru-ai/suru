@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1565,6 +1565,10 @@ pub enum Activity {
         detail_truncated: bool,
         outcome: ApprovalOutcome,
         decision: Option<Decision>,
+        /// A Provider action that followed definitive Decision delivery failed.
+        /// The Decision remains recorded because resending it is unsafe.
+        #[serde(default)]
+        follow_up_error: Option<String>,
     },
     Questionnaire {
         id: ActivityId,
@@ -2740,6 +2744,10 @@ pub enum SessionChange {
         activity_id: ActivityId,
         outcome: ApprovalOutcome,
         decision: Option<Decision>,
+    },
+    ApprovalFollowUpFailed {
+        activity_id: ActivityId,
+        error: String,
     },
     ActivityAdded {
         activity: Activity,

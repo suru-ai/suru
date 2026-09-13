@@ -253,7 +253,22 @@ pub(super) fn decision_text(decision: Decision) -> &'static str {
     }
 }
 
-pub(super) fn outcome_text(outcome: ApprovalOutcome, decision: Option<Decision>) -> String {
+pub(super) fn outcome_text(
+    outcome: ApprovalOutcome,
+    decision: Option<Decision>,
+    follow_up_error: Option<&str>,
+) -> String {
+    if outcome == ApprovalOutcome::Decided
+        && let Some(error) = follow_up_error
+    {
+        return match decision {
+            Some(Decision::DeclineAndInterrupt) => {
+                format!("Declined; interruption failed: {error}")
+            }
+            Some(decision) => format!("{}; follow-up failed: {error}", decision_text(decision)),
+            None => format!("Decision delivered; follow-up failed: {error}"),
+        };
+    }
     match (outcome, decision) {
         (ApprovalOutcome::Pending, _) => "Pending".into(),
         (ApprovalOutcome::Submitting, _) => "Submitting".into(),
