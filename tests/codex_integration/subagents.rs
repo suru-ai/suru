@@ -10,8 +10,9 @@ use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, CreateSessionRequest, InitialPrompt,
-        MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, ApprovalOutcome, CreateSessionRequest,
+        Decision, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot,
+        TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -65,6 +66,130 @@ async fn opened_session(codex: &ScriptedCodex, name: &'static str, prompt: &str)
         session_id: created.session.id,
         _state_dir: state_dir,
         _workspace: workspace,
+    }
+}
+
+const CHILD_APPROVAL_IMMEDIATE_TERMINAL_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo check","cwd":"project","status":"inProgress"}}}'
+      printf '%s\n' '{"id":"child-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"child-thread","turnId":"child-turn","itemId":"child-command","reason":"finish the delegated check","command":"cargo check"}}'
+      ;;
+    *'"id":"child-approval","result"'*)
+      $TERMINAL
+      ;;
+"#;
+
+#[tokio::test]
+async fn immediate_native_child_terminal_notifications_wait_for_decision_history() {
+    for (label, terminal) in [
+        (
+            "activity",
+            r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'"#,
+        ),
+        (
+            "collab",
+            r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-wait","tool":"wait","status":"completed","senderThreadId":"root-thread","receiverThreadIds":["child-thread"],"agentsStates":{"child-thread":{"status":"completed"}}}}}'"#,
+        ),
+    ] {
+        let fixture = ScriptedCodex::new_multiprocess(
+            &CHILD_APPROVAL_IMMEDIATE_TERMINAL_CODEX.replace("$TERMINAL", terminal),
+        );
+        let opened = opened_session(
+            &fixture,
+            match label {
+                "activity" => "codex-child-decision-activity-terminal",
+                "collab" => "codex-child-decision-collab-terminal",
+                _ => unreachable!(),
+            },
+            "Delegate a check",
+        )
+        .await;
+        let parent = session_where(
+            &opened.client,
+            opened.session_id,
+            "the child opens",
+            |snapshot| matches!(snapshot.activities.first(), Some(Activity::Subagent { .. })),
+        )
+        .await;
+        let Activity::Subagent {
+            session_id: child_id,
+            ..
+        } = the_subagent_row(&parent)
+        else {
+            unreachable!()
+        };
+        let child_id = *child_id;
+        let pending = session_where(
+            &opened.client,
+            child_id,
+            "the child's Approval arrives",
+            |snapshot| snapshot.pending_approvals.len() == 1,
+        )
+        .await;
+        let Activity::Approval { approval, .. } = pending
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Approval { .. }))
+            .expect("the child owns its Approval")
+        else {
+            unreachable!()
+        };
+
+        opened
+            .client
+            .submit_decision(child_id, approval.id, Decision::Accept)
+            .await
+            .expect("Codex accepts the child Decision");
+
+        let settled_child = session_where(
+            &opened.client,
+            child_id,
+            "the child settles after its Decision is durable",
+            |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+        )
+        .await;
+        assert!(settled_child.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Approval {
+                outcome: ApprovalOutcome::Decided,
+                decision: Some(Decision::Accept),
+                ..
+            }
+        )));
+        session_where(
+            &opened.client,
+            opened.session_id,
+            "the child row settles",
+            |snapshot| {
+                matches!(
+                    the_subagent_row(snapshot),
+                    Activity::Subagent {
+                        status: ActivityStatus::Completed,
+                        ..
+                    }
+                )
+            },
+        )
+        .await;
+        let callback = fixture
+            .requests()
+            .into_iter()
+            .find(|message| message["id"] == "child-approval" && message.get("result").is_some())
+            .expect("Suru answers the child's native callback");
+        assert_eq!(callback["result"], json!({"decision":"accept"}));
+
+        opened.server.shutdown().await.expect("shut down server");
     }
 }
 

@@ -717,6 +717,15 @@ pub(super) enum NativeCollabAgentStatus {
     Other,
 }
 
+impl NativeCollabAgentStatus {
+    pub(super) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted | Self::Completed | Self::Errored | Self::Shutdown | Self::NotFound
+        )
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum NativeSubagentActivityKind {
@@ -726,6 +735,12 @@ pub(super) enum NativeSubagentActivityKind {
     Completed,
     #[serde(other)]
     Other,
+}
+
+impl NativeSubagentActivityKind {
+    pub(super) fn is_terminal(self) -> bool {
+        matches!(self, Self::Interrupted | Self::Completed)
+    }
 }
 
 /// One step of an item Codex is streaming: which item, and the text it added.

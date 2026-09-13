@@ -100,7 +100,7 @@ impl NativeDecisionSettlements {
     }
 
     async fn wait(&self, turn: &NativeApprovalTurn) {
-        let Some(mut pending) = self
+        let Some(pending) = self
             .0
             .lock()
             .expect("Codex Decision settlement lock is not poisoned")
@@ -109,8 +109,61 @@ impl NativeDecisionSettlements {
         else {
             return;
         };
-        while *pending.borrow_and_update() > 0 && pending.changed().await.is_ok() {}
+        wait_for_settlements(pending).await;
     }
+
+    /// Waits for Decision deliveries owned by a followed child thread. Child
+    /// terminal notifications name the native thread but omit its Turn, so
+    /// every already-open delivery on that thread must cross the same durable
+    /// settlement boundary as `turn/completed`. A Decision begins its lease
+    /// before its callback is written, which means a terminal notification
+    /// provoked by that callback cannot race ahead of this snapshot.
+    async fn wait_thread(&self, thread_id: &str) {
+        let pending = self
+            .0
+            .lock()
+            .expect("Codex Decision settlement lock is not poisoned")
+            .iter()
+            .filter(|(turn, _)| turn.thread_id == thread_id)
+            .map(|(_, pending)| pending.subscribe())
+            .collect::<Vec<_>>();
+        for pending in pending {
+            wait_for_settlements(pending).await;
+        }
+    }
+
+    async fn wait_for_terminal_notification(&self, event: &NativeNotification) {
+        match event {
+            NativeNotification::TurnCompleted {
+                thread_id, turn_id, ..
+            } => {
+                self.wait(&NativeApprovalTurn {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                })
+                .await;
+            }
+            NativeNotification::SubagentActivity {
+                kind,
+                agent_thread_id,
+                ..
+            } if kind.is_terminal() => self.wait_thread(agent_thread_id).await,
+            NativeNotification::CollabCallCompleted { agents_states, .. } => {
+                for child_thread_id in agents_states
+                    .iter()
+                    .filter(|(_, state)| state.status.is_terminal())
+                    .map(|(thread_id, _)| thread_id)
+                {
+                    self.wait_thread(child_thread_id).await;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_settlements(mut pending: watch::Receiver<usize>) {
+    while *pending.borrow_and_update() > 0 && pending.changed().await.is_ok() {}
 }
 
 pub(super) struct NativeDecisionSettlement {
@@ -532,18 +585,10 @@ async fn route_message(
             return Ok(());
         }
         if let Some(event) = decode_notification(method, message.params.as_ref())? {
-            if let NativeNotification::TurnCompleted {
-                thread_id, turn_id, ..
-            } = &event
-            {
-                state
-                    .decision_settlements
-                    .wait(&NativeApprovalTurn {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                    })
-                    .await;
-            }
+            state
+                .decision_settlements
+                .wait_for_terminal_notification(&event)
+                .await;
             for event in state.questionnaires.redact_notification(event) {
                 let _ = state.events.send(Ok(event));
             }
