@@ -480,11 +480,16 @@ async fn an_already_resolved_native_callback_withdraws_instead_of_becoming_retry
         })
         .await;
     let id = pending.pending_approvals[0];
+    let error = live
+        .client
+        .submit_decision(live.session_id, id, Decision::Accept)
+        .await
+        .expect_err("already-resolved native request is refused");
     assert!(
-        live.client
-            .submit_decision(live.session_id, id, Decision::Accept)
-            .await
-            .is_err()
+        error
+            .to_string()
+            .contains("Approval was already resolved and is no longer available"),
+        "the public error reports the definite native outcome: {error}"
     );
     live.wait_for("stale native callback is unavailable", |snapshot| {
         snapshot.pending_approvals.is_empty()

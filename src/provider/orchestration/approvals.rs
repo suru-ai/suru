@@ -192,6 +192,8 @@ impl DecisionDeliveries {
                 Ok(())
             } else if outcome == ApprovalOutcome::SubmissionRejected {
                 Err("Decision was not delivered. Review and retry.".into())
+            } else if outcome == ApprovalOutcome::Withdrawn {
+                Err("Approval was already resolved and is no longer available.".into())
             } else {
                 Err("Provider delivery is uncertain. This Decision will not be resent.".into())
             };

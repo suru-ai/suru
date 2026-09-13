@@ -348,6 +348,26 @@ struct CopilotSession {
 }
 
 impl CopilotSession {
+    async fn abort_native_loop(
+        native: &NativeSession,
+        handle: &SharedHarnessHandle<CopilotConnection>,
+        approvals: &super::approval::CopilotApprovals,
+        request_timeout: Duration,
+        context: &'static str,
+    ) -> Result<(), ProviderError> {
+        let aborted = until_crash(handle, context, native.abort());
+        let result = match timeout(request_timeout, aborted).await {
+            Ok(aborted) => aborted,
+            Err(_) => Err(copilot_error(format!(
+                "{context}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
+            ))),
+        };
+        if result.is_ok() {
+            approvals.clear();
+        }
+        result
+    }
+
     /// Fails unless a Turn is running for `operation` to act on. Copilot takes both live-Turn
     /// operations as Session-level requests, so nothing about them says which Turn they meant:
     /// delivered with no Turn running, a steer would begin one and an interrupt would stop
@@ -446,6 +466,7 @@ impl ProviderSession for CopilotSession {
             let native = self.native.clone();
             let handle = self.handle.clone();
             let approvals = self.approvals.clone();
+            let questionnaires = self.questionnaires.clone();
             let interrupt_timeout = self.interrupt_request_timeout;
             Ok(crate::provider::ProviderDecisionDelivery::with_follow_up(
                 Box::pin(async move {
@@ -453,18 +474,15 @@ impl ProviderSession for CopilotSession {
                     if decision != Decision::DeclineAndInterrupt {
                         return Ok(());
                     }
-                    const CONTEXT: &str = "Copilot Turn interruption failed";
-                    let aborted = until_crash(&handle, CONTEXT, native.abort());
-                    let result = match timeout(interrupt_timeout, aborted).await {
-                        Ok(aborted) => aborted,
-                        Err(_) => Err(copilot_error(format!(
-                            "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
-                        ))),
-                    };
-                    if result.is_ok() {
-                        approvals.clear();
-                    }
-                    result
+                    questionnaires.cancel();
+                    CopilotSession::abort_native_loop(
+                        &native,
+                        &handle,
+                        &approvals,
+                        interrupt_timeout,
+                        "Copilot Turn interruption failed",
+                    )
+                    .await
                 }),
             ))
         })
@@ -561,18 +579,14 @@ impl ProviderSession for CopilotSession {
             // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
             // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
             // why an unanswered abort is bounded here rather than left to the loop to end.
-            const CONTEXT: &str = "Copilot Turn interruption failed";
-            let aborted = until_crash(&self.handle, CONTEXT, self.native.abort());
-            let result = match timeout(self.interrupt_request_timeout, aborted).await {
-                Ok(aborted) => aborted,
-                Err(_elapsed) => Err(copilot_error(format!(
-                    "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
-                ))),
-            };
-            if result.is_ok() {
-                self.approvals.clear();
-            }
-            result
+            Self::abort_native_loop(
+                &self.native,
+                &self.handle,
+                &self.approvals,
+                self.interrupt_request_timeout,
+                "Copilot Turn interruption failed",
+            )
+            .await
         })
     }
 
@@ -583,14 +597,14 @@ impl ProviderSession for CopilotSession {
             // interrupt is — with the Turn already settled, the loop holds
             // nothing else to lose. Deliberately not gated on a running Turn,
             // because this is exactly the stop that arrives after one.
-            const CONTEXT: &str = "Copilot Subagent stop failed";
-            let aborted = until_crash(&self.handle, CONTEXT, self.native.abort());
-            match timeout(self.interrupt_request_timeout, aborted).await {
-                Ok(aborted) => aborted,
-                Err(_elapsed) => Err(copilot_error(format!(
-                    "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.abort`"
-                ))),
-            }
+            Self::abort_native_loop(
+                &self.native,
+                &self.handle,
+                &self.approvals,
+                self.interrupt_request_timeout,
+                "Copilot Subagent stop failed",
+            )
+            .await
         })
     }
 

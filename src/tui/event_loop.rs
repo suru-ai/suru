@@ -2576,6 +2576,9 @@ impl SessionOperation {
                     Some(crate::protocol::ApprovalOutcome::SubmissionRejected) => {
                         Some("Decision was not delivered. Review and retry.".into())
                     }
+                    Some(crate::protocol::ApprovalOutcome::Withdrawn) => {
+                        Some("Approval was already resolved and is no longer available.".into())
+                    }
                     _ if snapshot.is_none() => Some(
                         "Decision status is unconfirmed. Reconnect to check before retrying."
                             .into(),
