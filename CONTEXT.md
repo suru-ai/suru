@@ -148,6 +148,18 @@ _Avoid_: Prompt, field
 The user's submitted response to a Questionnaire, distinct from a Prompt.
 _Avoid_: Reply, response message
 
+**Approval**:
+A Provider-native request for the user's consent before an Agent's Tool may act during a Turn, with a subject naming what is asked — a Command, a File Change, a read, network access, a permission grant, or another Tool by name. Distinct from a Questionnaire, which asks for input rather than consent, and from a question written in an Agent's ordinary prose. An Approval is answered with a Decision, and an Approval the Provider settles itself under its own rules never reaches the user.
+_Avoid_: Permission prompt, confirmation, consent request
+
+**Decision**:
+The user's response to an Approval: Accept, Accept for Session, Decline, or Decline and Interrupt. Accept for Session lets the same request pass unasked for the rest of the Session; Decline and Interrupt refuses and ends the Turn.
+_Avoid_: Answer, verdict, response
+
+**Approval Posture**:
+The Provider-native permission configuration under which a Session's Agent acts: for each Provider, the native values that Provider offers for deciding which Tool uses need an Approval. A Session follows its Provider's Setting until the user overrides it, and an override is then the Session's own, surviving resume and restart until reset. A change takes effect at once where the Provider allows it and at the next Turn where it does not, and never decides an Approval already pending. Subagents act under the posture of the Session that spawned them.
+_Avoid_: Permission mode, approval mode, trust level
+
 **Subagent**:
 An agent to which a Turn's Agent delegates work through its Provider, running its own conversation in its own Session — a child of the Session whose Turn spawned it. The parent's Transcript records each Subagent as an Activity of its own kind: one row naming the Subagent and what it was asked to do, wearing the usual Marker while it works and its outcome and duration once it settles, and standing — live or settled — as the way into the Subagent's Session. That row is all the parent's Transcript carries of it: the Subagent's work belongs to its own Transcript, never interleaved into the parent's. A Subagent may outlive the Turn that spawned it; while any Subagent still works the Session is still Working, and output one provokes after its Turn Settled lands in whatever Turn is active or begins a Continuation. Subagents may spawn Subagents, each recorded the same way one level down. Interrupting a Session whose Subagents still work stops them along with whatever else the Session is doing, and a single Subagent may be stopped on its own where its Provider allows it; neither asks before acting, as interrupting never does.
 _Avoid_: Task, child agent, background agent, worker
