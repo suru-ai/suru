@@ -508,16 +508,18 @@ impl Reclaimer {
             reclaim: None,
         };
         let rule = ReclaimRule::FailedPreparation { days };
+        let retire_branch = !current.checkout_created;
         match self
-            .finish_failed_preparation(&current, &checkout, rule, !current.checkout_created)
+            .finish_failed_preparation(&current, &checkout, rule, retire_branch)
             .await
         {
-            Ok(outcome) => tracing::info!(
+            Ok(outcome) if retire_branch => tracing::info!(
                 checkout = %checkout.root.display(),
                 rule = rule.log_name(),
                 branch_outcome = branch_outcome(outcome),
                 "Managed Worktree Reclaimed"
             ),
+            Ok(_) => {}
             Err(error) => self.failed(&checkout, rule, &error),
         }
     }

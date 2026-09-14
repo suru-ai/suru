@@ -1353,6 +1353,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
     let intent = age_preparation(&config, &preparation);
     let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
     preparing.shutdown().await.unwrap();
+    reclaim_log().lock().unwrap().clear();
 
     let adapter = Arc::new(FailFirstPreparationRetirement {
         git: GitSourceControl::default(),
@@ -1388,6 +1389,15 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
     assert_eq!(retired.prompts[0].id, withheld.id);
     assert_eq!(retired.prompts[0].status, PromptStatus::Cancelled);
     server.shutdown().await.unwrap();
+    let path = preparation.destination.path.display().to_string();
+    let log = String::from_utf8_lossy(&reclaim_log().lock().unwrap()).into_owned();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains(&path) && line.contains("Managed Worktree Reclaimed"))
+            .count(),
+        1,
+        "metadata retirement does not log a second Worktree removal: {log}"
+    );
 }
 
 #[tokio::test]
