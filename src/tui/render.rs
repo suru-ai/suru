@@ -4433,7 +4433,7 @@ fn checkout_branch_context(
 }
 
 fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String {
-    let agent = match state.agent_selection() {
+    match state.agent_selection() {
         None => "Agent unavailable".to_owned(),
         Some(selection) => {
             let detailed = detail.shows_secondary();
@@ -4448,32 +4448,7 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
                 summary
             }
         }
-    };
-    let posture = state.session.as_ref().and_then(|session| {
-        let snapshot = session.snapshot();
-        snapshot.session.approval_posture.as_ref().map(|posture| {
-            let source = if snapshot.session.is_subagent() {
-                " · inherited"
-            } else if posture.pinned {
-                " · pinned"
-            } else {
-                ""
-            };
-            let application = match posture.application {
-                crate::protocol::ApprovalPostureApplication::Applied => "",
-                crate::protocol::ApprovalPostureApplication::Applying => "applying · ",
-                crate::protocol::ApprovalPostureApplication::NextTurn => {
-                    "takes effect next Turn · "
-                }
-                crate::protocol::ApprovalPostureApplication::Failed => "update failed · ",
-            };
-            format!(
-                "Approval Posture: {application}{}{source}",
-                posture.value.summary()
-            )
-        })
-    });
-    posture.map_or(agent.clone(), |posture| format!("{agent} · {posture}"))
+    }
 }
 
 /// A Provider's Nerd Font glyph where Suru knows one. Unknown Provider IDs
