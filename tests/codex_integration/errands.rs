@@ -179,8 +179,8 @@ fn errand_invocation(codex: &ScriptedCodex) -> Vec<String> {
         .collect()
 }
 
-/// The Title one Session in a listing carries, alongside the Emoji beside it.
-async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String, Option<String>) {
+/// The Title one Session in a listing carries.
+async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
     let listed = client
         .list_sessions(None)
         .await
@@ -188,21 +188,18 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String,
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed");
-    (
-        listed.title().to_owned(),
-        listed.emoji().map(ToOwned::to_owned),
-    )
+    listed.title().to_owned()
 }
 
 /// The whole of Codex's Errand: one non-interactive run that persists nothing,
 /// sandboxes itself as tightly as the harness allows, is handed the schema
-/// natively, and answers in the Session's own Workspace — with the Title and
-/// Emoji it writes landing on the Session that asked for them.
+/// natively, and answers in the Session's own Workspace — with the Title it
+/// writes landing on the Session that asked for it.
 #[tokio::test]
 async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     let codex = scripted_codex(
         CATALOG_WITH_ERRAND_MODEL,
-        r#"  printf '%s' '{"title":"Fix reasoning group flicker","emoji":"🐛"}' > "$answer"
+        r#"  printf '%s' '{"title":"Fix reasoning group flicker"}' > "$answer"
   exit 0"#,
     );
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -253,9 +250,7 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     );
     let schema = codex.errand_schema();
     assert!(
-        schema["properties"]["title"].is_object()
-            && schema["properties"]["emoji"].is_object()
-            && schema["additionalProperties"] == false,
+        schema["properties"]["title"].is_object() && schema["additionalProperties"] == false,
         "the schema Suru asked for is handed to Codex natively: {schema}"
     );
 
@@ -264,15 +259,11 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
         SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
-            emoji: Some("\u{1F41B}".to_owned()),
         }
     );
     assert_eq!(
         listed_title(&client, session_id).await,
-        (
-            "Fix reasoning group flicker".to_owned(),
-            Some("\u{1F41B}".to_owned())
-        )
+        "Fix reasoning group flicker".to_owned()
     );
 
     server.shutdown().await.expect("shut down server");
@@ -299,7 +290,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
     );
     let codex = scripted_codex_with_app_server_arms(
         CATALOG_WITH_ERRAND_MODEL,
-        r#"  printf '%s' '{"title":"Fix automatic titles","emoji":"🏷️"}' > "$answer"
+        r#"  printf '%s' '{"title":"Fix automatic titles"}' > "$answer"
   exit 0"#,
         &skill_arm,
     );
@@ -356,7 +347,6 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
         SessionTitleChanged {
             session_id: created.session.id,
             title: "Fix automatic titles".to_owned(),
-            emoji: Some("🏷️".to_owned()),
         }
     );
 
@@ -421,7 +411,7 @@ async fn a_failing_codex_errand_leaves_the_prompt_derived_title_standing() {
 
     assert_eq!(
         listed_title(&client, session_id).await,
-        (FIRST_PROMPT.to_owned(), None),
+        FIRST_PROMPT.to_owned(),
         "the Title the first Prompt gave the Session stands"
     );
     assert_no_title_reaches(
@@ -455,7 +445,7 @@ async fn a_codex_errand_that_never_answers_leaves_the_prompt_derived_title_stand
     // is waiting for any more.
     assert_process_exited(codex.errand_pid()).await;
     assert_eq!(
-        listed_title(&client, session_id).await.0,
+        listed_title(&client, session_id).await,
         FIRST_PROMPT,
         "the Title the first Prompt gave the Session stands"
     );

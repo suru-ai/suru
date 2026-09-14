@@ -312,11 +312,11 @@ impl SessionListing {
         }
     }
 
-    /// Takes a Session's newly derived Title and Emoji into a listing already
-    /// drawn, so a Title landing while a surface shows it moves the row it is
-    /// on rather than waiting for the reader to ask for the listing again.
-    pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
-        self.retitle_origin(self.outlook.clone(), session_id, title, emoji);
+    /// Takes a Session's newly derived Title into a listing already drawn, so a
+    /// Title landing while a surface shows it moves the row it is on rather
+    /// than waiting for the reader to ask for the listing again.
+    pub(super) fn retitle(&mut self, session_id: SessionId, title: String) {
+        self.retitle_origin(self.outlook.clone(), session_id, title);
     }
 
     pub(super) fn retitle_origin(
@@ -324,11 +324,9 @@ impl SessionListing {
         outlook: Outlook,
         session_id: SessionId,
         title: String,
-        emoji: Option<String>,
     ) {
         if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.title = title;
-            summary.emoji = emoji;
         }
     }
 
@@ -792,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_title_and_emoji_land_on_the_session_they_name() {
+    fn a_derived_title_lands_on_the_session_it_names() {
         let workspace = tempfile::tempdir().expect("create Workspace");
         let mut listing = SessionListing::new(
             SessionListSurface::SessionPicker,
@@ -802,10 +800,9 @@ mod tests {
         listing.load(&request, vec![summary("Ask about tests", 1)]);
         let session_id = listing.sessions()[0].id();
 
-        listing.retitle(session_id, "Testing".to_owned(), Some("🧪".to_owned()));
+        listing.retitle(session_id, "Testing".to_owned());
 
         assert_eq!(titles(&listing), vec!["Testing"]);
-        assert_eq!(listing.sessions()[0].emoji(), Some("🧪"));
     }
 
     #[test]
@@ -1117,7 +1114,6 @@ mod tests {
                 parent: None,
             },
             title: title.to_owned(),
-            emoji: None,
             settled_at: None,
             standing_inputs: Default::default(),
             total_usage: None,

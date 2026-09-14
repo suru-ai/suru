@@ -101,7 +101,6 @@ impl LandingAgentSelectionRow {
 pub(super) struct SessionRow {
     pub(super) id: String,
     title: String,
-    emoji: Option<String>,
     settled_at: Option<i64>,
     viewed_at: Option<i64>,
     created_at: i64,
@@ -307,7 +306,6 @@ impl SessionRow {
         Ok(Self {
             id: session_id.to_string(),
             title: summary.title,
-            emoji: summary.emoji,
             settled_at: summary
                 .settled_at
                 .map(|settled_at| u64_to_i64(session_id, "settled_at", settled_at.0))
@@ -400,7 +398,6 @@ impl SessionRow {
                     .transpose()?,
             },
             title: self.title,
-            emoji: self.emoji,
             settled_at: self
                 .settled_at
                 .map(|settled_at| i64_to_u64(&session_id, "settled_at", settled_at))

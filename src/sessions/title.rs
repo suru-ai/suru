@@ -1,10 +1,10 @@
-//! Deriving a Session's Title and Emoji from its first Prompt.
+//! Deriving a Session's Title from its first Prompt.
 //!
 //! A Session is titled with the verbatim text of its first Prompt, which is a
 //! real Title rather than a placeholder but rarely a good one. The moment that
 //! Prompt is admitted, Suru asks a Provider — through an Errand — for a short
-//! line naming the subject and the outcome, with an Emoji to stand beside it,
-//! and replaces the Title with what comes back.
+//! line naming the subject and the outcome, and replaces the Title with what
+//! comes back.
 //!
 //! Which Provider is the `session.title.errand` Setting's answer, read when the
 //! derivation begins. Left alone it is the Session's own, at that Provider's
@@ -35,17 +35,7 @@ use crate::{
     provider::ProviderErrand,
 };
 
-use super::{SessionStore, emoji::single_emoji};
-
-/// What one derivation yields: the Title Suru will store, and the Emoji that
-/// stands beside it when the reply carried a usable one. They travel together
-/// everywhere because they are derived together, in one Errand, and land
-/// together in one change.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DerivedTitle {
-    title: String,
-    emoji: Option<String>,
-}
+use super::SessionStore;
 
 /// The most of a first Prompt an Errand carries. The opening is taken rather
 /// than the ending because a first Prompt states its intent up front and trails
@@ -75,10 +65,7 @@ const QUOTE_PAIRS: [(char, char); 6] = [
     ('\u{00AB}', '\u{00BB}'),
 ];
 
-/// What Suru asks an Errand to answer with. One object carrying both the Title
-/// and the Emoji, because a Model choosing them together picks a better Emoji
-/// than one retrofitting it onto a Title it had no say in — and because two
-/// calls would cost twice as much to answer the same question.
+/// What Suru asks an Errand to answer with: an object carrying the Title.
 ///
 /// Suru's own validation tolerates extra properties: a Model that volunteers a
 /// field Suru did not ask for has still answered the question, and throwing a
@@ -90,8 +77,6 @@ const QUOTE_PAIRS: [(char, char); 6] = [
 #[derive(Debug, Deserialize)]
 struct DerivedTitleReply {
     title: String,
-    #[serde(default)]
-    emoji: Option<String>,
 }
 
 /// Derives Sessions' Titles. Cloned into the server's shared state, which is
@@ -185,14 +170,14 @@ impl TitleDerivation {
                     return;
                 }
             };
-            let Some(derived) = derived_title(&answer) else {
+            let Some(title) = derived_title(&answer) else {
                 tracing::info!(
                     %session_id,
                     "Title Errand answered outside its schema, so the Prompt-derived Title stands"
                 );
                 return;
             };
-            if !sessions.replace_derived_title(session_id, &derived_from, derived) {
+            if !sessions.replace_derived_title(session_id, &derived_from, title) {
                 tracing::debug!(
                     %session_id,
                     "a derived Title was discarded because the Title it was derived from has since changed"
@@ -246,8 +231,8 @@ impl SessionStore {
             .map(|record| record.summary.title.clone())
     }
 
-    /// Replaces a Session's Title and Emoji with a derived pair, but only when
-    /// the Title still reads as the one the derivation was derived from.
+    /// Replaces a Session's Title with a derived one, but only when the Title
+    /// still reads as the one the derivation was derived from.
     ///
     /// The guard is what makes a derivation that is still in flight safe, and
     /// what lets a rename command land later without a schema change: a Title
@@ -260,9 +245,8 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         derived_from: &str,
-        derived: DerivedTitle,
+        title: String,
     ) -> bool {
-        let DerivedTitle { title, emoji } = derived;
         let mut state = self
             .state
             .lock()
@@ -279,18 +263,13 @@ impl SessionStore {
                 session_id,
                 vec![SessionChange::TitleChanged {
                     title: title.clone(),
-                    emoji: emoji.clone(),
                 }],
             ) {
                 tracing::warn!(%session_id, %error, "Could not commit derived Title");
                 return false;
             }
         }
-        state.publish_catalog_change(SessionCatalogChange::TitleChanged {
-            session_id,
-            title,
-            emoji,
-        });
+        state.publish_catalog_change(SessionCatalogChange::TitleChanged { session_id, title });
         true
     }
 }
@@ -322,9 +301,7 @@ fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation]) -> String 
         "Name the piece of work the request below begins.\n\n\
          Answer with a title of 3 to 8 words, under 50 characters, naming the subject of \
          the work and what it is meant to achieve. Do not echo the wording of the request, \
-         do not address the reader, and do not end with a full stop. Answer also with a \
-         single emoji standing for the work, chosen alongside the title rather than fitted \
-         to it afterwards.\n\n\
+         do not address the reader, and do not end with a full stop.\n\n\
          The request:\n{opening}"
     )
 }
@@ -340,25 +317,18 @@ fn reply_schema() -> Value {
                 "type": "string",
                 "description": "3 to 8 words under 50 characters naming the subject of the work and what it is meant to achieve",
             },
-            "emoji": {
-                "type": "string",
-                "description": "a single emoji standing for the work",
-            },
         },
-        "required": ["title", "emoji"],
+        "required": ["title"],
         "additionalProperties": false,
     })
 }
 
-/// The Title and Emoji an Errand's reply yields, or `None` when it yields
-/// neither. Sanitizing runs on every path, whether or not the harness was able
-/// to enforce the schema, because no Provider can be relied on to have done it.
-fn derived_title(answer: &Value) -> Option<DerivedTitle> {
+/// The Title an Errand's reply yields, or `None` when it yields none.
+/// Sanitizing runs on every path, whether or not the harness was able to
+/// enforce the schema, because no Provider can be relied on to have done it.
+fn derived_title(answer: &Value) -> Option<String> {
     let reply: DerivedTitleReply = serde_json::from_value(answer.clone()).ok()?;
-    Some(DerivedTitle {
-        title: sanitized_title(&reply.title)?,
-        emoji: reply.emoji.as_deref().and_then(single_emoji),
-    })
+    sanitized_title(&reply.title)
 }
 
 /// A Model-authored Title as Suru stores it: its first non-empty line, unwrapped
@@ -452,20 +422,9 @@ mod tests {
 
     #[test]
     fn a_reply_without_a_title_yields_nothing_at_all() {
-        assert!(derived_title(&json!({ "emoji": "\u{1F680}" })).is_none());
+        assert!(derived_title(&json!({})).is_none());
         assert!(derived_title(&json!("Fix the flicker")).is_none());
         assert!(derived_title(&json!({ "title": "   " })).is_none());
-    }
-
-    #[test]
-    fn a_reply_with_an_unusable_emoji_still_yields_its_title() {
-        assert_eq!(
-            derived_title(&json!({ "title": "Fix the flicker", "emoji": "not an emoji" })),
-            Some(DerivedTitle {
-                title: "Fix the flicker".to_owned(),
-                emoji: None,
-            })
-        );
     }
 
     #[test]
@@ -473,13 +432,9 @@ mod tests {
         assert_eq!(
             derived_title(&json!({
                 "title": "Fix the flicker",
-                "emoji": "\u{1F680}",
                 "confidence": 0.9,
             })),
-            Some(DerivedTitle {
-                title: "Fix the flicker".to_owned(),
-                emoji: Some("\u{1F680}".to_owned()),
-            })
+            Some("Fix the flicker".to_owned())
         );
     }
 
@@ -530,10 +485,7 @@ mod tests {
             !store.replace_derived_title(
                 session_id,
                 "a Title this Session never had",
-                DerivedTitle {
-                    title: "Derived from something else".to_owned(),
-                    emoji: None,
-                },
+                "Derived from something else".to_owned(),
             ),
             "a derivation cannot replace a Title it was not derived from"
         );
@@ -542,10 +494,7 @@ mod tests {
         assert!(store.replace_derived_title(
             session_id,
             "Explain the seam",
-            DerivedTitle {
-                title: "Explain the Provider seam".to_owned(),
-                emoji: Some("\u{1F9F5}".to_owned()),
-            },
+            "Explain the Provider seam".to_owned(),
         ));
         assert_eq!(
             store.title(session_id).as_deref(),

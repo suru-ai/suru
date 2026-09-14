@@ -20,9 +20,9 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, AppearanceMode, AppearanceSettings, AutoReclaim, AutoSettle, CodexSettings,
-        CopilotSettings, EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability,
-        ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
-        ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+        CopilotSettings, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
@@ -618,14 +618,14 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_experimental_tab(&mut application);
 
-    let emojis = row(&application, "Session name Emojis");
+    let serving = row(&application, "Serving");
     assert!(
-        emojis.contains("hidden [default]"),
-        "a Session's name carries no Emoji until the reader asks for one: {emojis:?}"
+        serving.contains("false [default]"),
+        "Serving is off until the reader turns it on: {serving:?}"
     );
     assert_eq!(
         focused_key(&application),
-        "session.title.emoji",
+        "serving.enabled",
         "the focused Setting names the key a Config Document would spell"
     );
     assert!(
@@ -649,15 +649,13 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleEmoji {
-            value: Some(EmojiVisibility::Shown),
-        }),
+        ApplicationTransition::MutateSetting(SettingMutation::ServingEnabled { value: Some(true) }),
         "and Space cycles it on, as it cycles any other Setting"
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     assert!(
-        !has_row(&application, "Session name Emojis"),
+        !has_row(&application, "Serving"),
         "an experimental Setting is not also a General one"
     );
     assert!(

@@ -25,7 +25,6 @@ use crate::storage::{
 mod catalog;
 mod checkouts;
 pub(crate) use checkouts::CheckoutActivity;
-mod emoji;
 mod hydration;
 mod output;
 mod posture;

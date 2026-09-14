@@ -1922,17 +1922,8 @@ fn session_picker_row_text(
         .chain(status)
         .chain([age])
         .collect::<Vec<_>>();
-    // The Emoji's own columns, and the space parting it from the Title, come
-    // out of what the Title has to spend. A Session with no Emoji holds no cell
-    // open in front of its Title and spends the lot.
-    let emoji = row
-        .emoji
-        .map(|emoji| format!("{emoji} "))
-        .unwrap_or_default();
     let marker_width = marker.width();
-    let available = width
-        .saturating_sub(marker_width)
-        .saturating_sub(emoji.width());
+    let available = width.saturating_sub(marker_width);
     if row.pending_questionnaires > 0 {
         metadata.push(format!("{} pending questions", row.pending_questionnaires));
     }
@@ -1961,11 +1952,8 @@ fn session_picker_row_text(
     let title = truncate_to_width(row.title, title_width);
     let tag_start = remote_tag
         .as_ref()
-        .map(|_| marker.len() + emoji.len() + title.len() + separator.len());
-    let content = truncate_to_width(
-        &format!("{marker}{emoji}{title}{separator}{metadata}"),
-        width,
-    );
+        .map(|_| marker.len() + title.len() + separator.len());
+    let content = truncate_to_width(&format!("{marker}{title}{separator}{metadata}"), width);
     let tag_range = tag_start.and_then(|start| {
         let end = start + remote_tag.as_ref()?.len();
         (content.get(start..end) == remote_tag.as_deref()).then_some((start, end))
@@ -3226,16 +3214,13 @@ fn selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style
 /// What a row says after the Title of a Session the client could not read.
 const UNREADABLE_MARKER: &str = "[unreadable]";
 
-/// What a Session is called in the Sidebar: its Emoji, where it has one, and
-/// then its Title — followed, where the client could not read the Session, by
-/// the marker saying so. The marker's columns are held back before the Title
-/// is cut, so however long the Title the reason the row cannot be opened stays
-/// on show. `width` is the columns the whole name has to spend.
+/// What a Session is called in the Sidebar: its Title, followed, where the
+/// client could not read the Session, by the marker saying so. The marker's
+/// columns are held back before the Title is cut, so however long the Title
+/// the reason the row cannot be opened stays on show. `width` is the columns
+/// the whole name has to spend.
 fn sidebar_title_parts(row: SidebarRow<'_>, width: usize) -> (String, Vec<String>) {
-    let title = match row.emoji {
-        Some(emoji) => format!("{emoji} {}", row.title),
-        None => row.title.to_owned(),
-    };
+    let title = row.title.to_owned();
     let mut tags = row
         .remote
         .map(|remote| format!("[{remote}]"))
@@ -4413,16 +4398,6 @@ fn render_session_header(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let title = match state
-        .settings()
-        .session
-        .title
-        .emoji
-        .drawn_emoji(snapshot.emoji.as_deref())
-    {
-        Some(emoji) if !title.is_empty() => format!("{emoji} {title}"),
-        _ => title,
-    };
     let title = truncate_to_width(&title, title_width);
     let spacing =
         " ".repeat(usize::from(area.width).saturating_sub(orientation.width() + connection_width));
@@ -4985,7 +4960,6 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let snapshot = SessionSnapshot {
                 title: String::new(),
-                emoji: None,
                 session: Session {
                     checkout: None,
                     context_fill: Some(ContextFill {
@@ -5247,7 +5221,6 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     title: String::new(),
-                    emoji: None,
                     session: Session {
                         checkout: None,
                         context_fill: None,
@@ -5324,7 +5297,6 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     title: String::new(),
-                    emoji: None,
                     session: Session {
                         checkout: None,
                         context_fill: None,

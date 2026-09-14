@@ -24,15 +24,14 @@ use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
         Activity, ActivityId, ActivityStatus, ApprovalId, AutoSettle, EffectiveSettings,
-        EmojiVisibility, LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus,
-        ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session,
-        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
-        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
-        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
-        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
-        SidebarSettings, SidebarVisibility, SubagentInterventions, TextSelectionCopy,
-        TitleSettings, TurnStatus, UnreadableSessionSummary, Workspace,
+        LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session, SessionCatalogRevision,
+        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
+        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
+        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
+        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
+        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
+        SubagentInterventions, TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -86,13 +85,12 @@ fn the_sidebar_stands_beside_an_open_session_too() {
 }
 
 #[test]
-fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
+fn an_active_row_is_three_lines_of_workspace_time_and_title() {
     let workspace = workspace_dir();
-    let application = sidebar_showing_emojis(
+    let application = sidebar_showing(
         workspace.path(),
         vec![listed(
             "Sidebar shell",
-            Some("🧪"),
             &workspace.path().join("suru"),
             1,
             minutes_ago(5),
@@ -111,109 +109,14 @@ fn an_active_row_is_three_lines_of_workspace_time_emoji_and_title() {
         "the right slot carries the compact time since the Session moved: {workspace_line:?}"
     );
     let title_line = sidebar_column(&rows[first + 1]);
-    assert!(
-        title_line.starts_with('🧪') && title_line.ends_with("Sidebar shell"),
-        "the second line carries the Emoji and then the Title: {title_line:?}"
+    assert_eq!(
+        title_line, "Sidebar shell",
+        "the second line carries the Title: {title_line:?}"
     );
     assert_eq!(
         sidebar_column(&rows[first + 2]),
         "",
         "the third line is held blank for git awareness"
-    );
-}
-
-/// A snapshot lands while the column is on screen, so the Setting moves the
-/// rows the reader is already reading rather than waiting for a listing to
-/// come round again — and it moves them without asking for one.
-#[test]
-fn showing_emojis_moves_the_rows_a_reader_is_already_looking_at() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed(
-            "Sidebar shell",
-            Some("🧪"),
-            &workspace.path().join("suru"),
-            1,
-            minutes_ago(5),
-        )],
-    );
-    let drawn = |application: &Application| {
-        let rows = rendered_application_rows_at(application, WIDE, 20);
-        sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")])
-    };
-    assert_eq!(drawn(&application), "Sidebar shell");
-
-    assert_eq!(
-        deliver_settings(
-            &mut application,
-            EffectiveSettings {
-                sidebar: shown(AutoSettle::default()),
-                session: SessionSettings {
-                    title: TitleSettings {
-                        emoji: EmojiVisibility::Shown,
-                        ..TitleSettings::default()
-                    },
-                    ..SessionSettings::default()
-                },
-                ..EffectiveSettings::default()
-            },
-        ),
-        ApplicationTransition::Continue,
-        "a Sidebar already holding its Sessions asks for nothing to draw them anew"
-    );
-    let title_line = drawn(&application);
-    assert!(
-        title_line.starts_with('🧪') && title_line.ends_with("Sidebar shell"),
-        "the Emoji reaches the row without the listing coming round again: {title_line:?}"
-    );
-}
-
-/// The Emoji a derivation left beside a Session's Title is drawn only where the
-/// reader asked for one. Nothing asks by default, so the column reads as it did
-/// before Emojis existed until the Setting says otherwise — and a Session with
-/// no Emoji reads that way however the Setting stands.
-#[test]
-fn a_sidebar_row_draws_its_emoji_only_where_the_setting_shows_them() {
-    let workspace = workspace_dir();
-    let sessions = || {
-        vec![
-            listed(
-                "Sidebar shell",
-                Some("🧪"),
-                &workspace.path().join("suru"),
-                2,
-                minutes_ago(5),
-            ),
-            listed(
-                "No Emoji of its own",
-                None,
-                &workspace.path().join("suru"),
-                1,
-                minutes_ago(6),
-            ),
-        ]
-    };
-
-    let hidden = sidebar_showing(workspace.path(), sessions());
-    let rows = rendered_application_rows_at(&hidden, WIDE, 20);
-    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
-    assert_eq!(
-        title_line, "Sidebar shell",
-        "a Session's name carries no Emoji until the reader asks for one: {title_line:?}"
-    );
-
-    let shown = sidebar_showing_emojis(workspace.path(), sessions());
-    let rows = rendered_application_rows_at(&shown, WIDE, 20);
-    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
-    assert!(
-        title_line.starts_with('🧪') && title_line.ends_with("Sidebar shell"),
-        "and the Emoji leads the name once they have: {title_line:?}"
-    );
-    let bare = sidebar_column(&rows[rendered_row(&rows, "No Emoji of its own")]);
-    assert_eq!(
-        bare, "No Emoji of its own",
-        "a Session a derivation left no Emoji holds no cell open for one: {bare:?}"
     );
 }
 
@@ -226,16 +129,10 @@ fn the_compact_time_reads_now_minutes_hours_and_days() {
         workspace.path(),
         AutoSettle::Off,
         vec![
-            listed("Just now", None, &workspace.path().join("a"), 4, now()),
-            listed(
-                "Minutes",
-                None,
-                &workspace.path().join("b"),
-                3,
-                minutes_ago(5),
-            ),
-            listed("Hours", None, &workspace.path().join("c"), 2, hours_ago(3)),
-            listed("Days", None, &workspace.path().join("d"), 1, days_ago(2)),
+            listed("Just now", &workspace.path().join("a"), 4, now()),
+            listed("Minutes", &workspace.path().join("b"), 3, minutes_ago(5)),
+            listed("Hours", &workspace.path().join("c"), 2, hours_ago(3)),
+            listed("Days", &workspace.path().join("d"), 1, days_ago(2)),
         ],
     );
 
@@ -261,13 +158,7 @@ fn the_right_slot_says_working_and_how_long_while_the_latest_turn_is_unsettled()
     let application = sidebar_showing(
         workspace.path(),
         vec![working(
-            listed(
-                "Running a build",
-                None,
-                &workspace.path().join("suru"),
-                1,
-                now(),
-            ),
+            listed("Running a build", &workspace.path().join("suru"), 1, now()),
             seconds_ago(90),
         )],
     );
@@ -288,10 +179,10 @@ fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
         workspace.path(),
         vec![
             working(
-                listed("Running a build", None, workspace.path(), 2, now()),
+                listed("Running a build", workspace.path(), 2, now()),
                 seconds_ago(90),
             ),
-            listed("Waiting quietly", None, workspace.path(), 1, now()),
+            listed("Waiting quietly", workspace.path(), 1, now()),
         ],
     );
 
@@ -312,17 +203,17 @@ fn latest_turn_outcomes_draw_failed_and_done_but_leave_interrupted_quiet() {
         workspace.path(),
         vec![
             latest_turn(
-                listed("Failed work", None, workspace.path(), 3, now()),
+                listed("Failed work", workspace.path(), 3, now()),
                 TurnStatus::Failed,
                 now(),
             ),
             latest_turn(
-                listed("Completed work", None, workspace.path(), 2, now()),
+                listed("Completed work", workspace.path(), 2, now()),
                 TurnStatus::Completed,
                 now(),
             ),
             latest_turn(
-                listed("Stopped work", None, workspace.path(), 1, now()),
+                listed("Stopped work", workspace.path(), 1, now()),
                 TurnStatus::Interrupted,
                 now(),
             ),
@@ -355,7 +246,7 @@ fn failed_and_done_draw_only_when_the_latest_turn_settled_after_viewed() {
         vec![
             viewed(
                 latest_turn(
-                    listed("Already viewed", None, workspace.path(), 2, now()),
+                    listed("Already viewed", workspace.path(), 2, now()),
                     TurnStatus::Failed,
                     100,
                 ),
@@ -363,7 +254,7 @@ fn failed_and_done_draw_only_when_the_latest_turn_settled_after_viewed() {
             ),
             viewed(
                 latest_turn(
-                    listed("New since viewed", None, workspace.path(), 1, now()),
+                    listed("New since viewed", workspace.path(), 1, now()),
                     TurnStatus::Completed,
                     100,
                 ),
@@ -501,12 +392,12 @@ fn a_catalog_viewed_change_clears_another_clients_outcome_in_place() {
 fn search_keeps_an_active_working_rail_but_never_gives_one_to_a_settled_row() {
     let workspace = workspace_dir();
     let running = working(
-        listed("Running work", None, workspace.path(), 2, now()),
+        listed("Running work", workspace.path(), 2, now()),
         seconds_ago(90),
     );
     let history = set_aside(
         working(
-            listed("Settled work", None, workspace.path(), 1, now()),
+            listed("Settled work", workspace.path(), 1, now()),
             seconds_ago(90),
         ),
         now(),
@@ -539,7 +430,6 @@ fn the_right_slot_falls_back_to_the_compact_time_once_the_turn_settles() {
     // running, one with nothing running and five minutes since it last moved.
     let running = listed(
         "Running a build",
-        None,
         &workspace.path().join("suru"),
         1,
         minutes_ago(5),
@@ -569,19 +459,19 @@ fn the_working_duration_reads_seconds_minutes_and_hours() {
         workspace.path(),
         vec![
             working(
-                listed("Seconds", None, &workspace.path().join("a"), 4, now()),
+                listed("Seconds", &workspace.path().join("a"), 4, now()),
                 seconds_ago(12),
             ),
             working(
-                listed("Minutes", None, &workspace.path().join("b"), 3, now()),
+                listed("Minutes", &workspace.path().join("b"), 3, now()),
                 minutes_ago(5),
             ),
             working(
-                listed("Hours", None, &workspace.path().join("c"), 2, now()),
+                listed("Hours", &workspace.path().join("c"), 2, now()),
                 seconds_ago(2 * 60 * 60 + 3 * 60),
             ),
             working(
-                listed("Barely", None, &workspace.path().join("d"), 1, now()),
+                listed("Barely", &workspace.path().join("d"), 1, now()),
                 seconds_ago(0),
             ),
         ],
@@ -658,9 +548,9 @@ fn the_list_is_ordered_by_creation_and_activity_never_reorders_it() {
         workspace.path(),
         AutoSettle::Off,
         vec![
-            listed("Oldest", None, workspace.path(), 1, now()),
-            listed("Newest", None, workspace.path(), 3, days_ago(2)),
-            listed("Middle", None, workspace.path(), 2, hours_ago(3)),
+            listed("Oldest", workspace.path(), 1, now()),
+            listed("Newest", workspace.path(), 3, days_ago(2)),
+            listed("Middle", workspace.path(), 2, hours_ago(3)),
         ],
     );
 
@@ -674,7 +564,7 @@ fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     assert_eq!(
@@ -696,7 +586,7 @@ fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
-            sessions: vec![listed("Listed work", None, workspace.path(), 1, now())],
+            sessions: vec![listed("Listed work", workspace.path(), 1, now())],
         })
         .expect("hydrate the reopened Sidebar");
     assert!(
@@ -712,7 +602,7 @@ fn the_slash_command_toggles_the_same_sidebar_the_keybinding_does() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
     type_terminal_text(&mut application, "/sidebar");
 
@@ -772,7 +662,7 @@ fn a_terminal_too_narrow_for_both_keeps_the_main_view_and_forgets_nothing() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     let squeezed = rendered_application_rows_at(&application, 77, 20);
@@ -1085,7 +975,7 @@ fn an_overlay_opens_over_the_main_view_and_never_over_the_sidebar() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     application
@@ -1117,13 +1007,7 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
     for column in 30..=32 {
         let mut application = sidebar_showing(
             workspace.path(),
-            vec![listed(
-                "Work behind the grab",
-                None,
-                workspace.path(),
-                1,
-                now(),
-            )],
+            vec![listed("Work behind the grab", workspace.path(), 1, now())],
         );
         let row = drawn_at(&application, "Work behind the grab");
         let before = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
@@ -1574,8 +1458,8 @@ fn edge_double_click_while_the_sidebar_owns_keys_preserves_row_focus() {
 
     let workspace = workspace_dir();
     let sessions = vec![
-        listed("Nearest work", None, workspace.path(), 2, now()),
-        listed("Older work", None, workspace.path(), 1, now()),
+        listed("Nearest work", workspace.path(), 2, now()),
+        listed("Older work", workspace.path(), 1, now()),
     ];
     let (application, now) = opening_clock(sidebar_focused(workspace.path(), sessions));
     let mut application = application.with_click_interval(Duration::from_millis(300));
@@ -1620,8 +1504,8 @@ fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus()
 
     let workspace = workspace_dir();
     let sessions = vec![
-        listed("Nearest work", None, workspace.path(), 2, now()),
-        listed("Older work", None, workspace.path(), 1, now()),
+        listed("Nearest work", workspace.path(), 2, now()),
+        listed("Older work", workspace.path(), 1, now()),
     ];
     let mut composing = sidebar_showing(workspace.path(), sessions.clone());
     rendered_application_buffer(&composing, WIDE, PRESS_HEIGHT);
@@ -1766,7 +1650,7 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
 
     let mut menu = sidebar_showing(
         workspace.path(),
-        vec![listed("Menu subject", None, workspace.path(), 1, now())],
+        vec![listed("Menu subject", workspace.path(), 1, now())],
     );
     open_menu_on(&mut menu, "Menu subject");
     rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT);
@@ -1899,27 +1783,6 @@ fn sidebar_settling(
         workspace,
         EffectiveSettings {
             sidebar: shown(auto_settle),
-            ..EffectiveSettings::default()
-        },
-        sessions,
-    )
-}
-
-/// The Sidebar shown with Session name Emojis turned on, which is what every
-/// test about a row that draws one asks for: nothing draws an Emoji until the
-/// reader says so.
-fn sidebar_showing_emojis(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
-    sidebar_hydrated(
-        workspace,
-        EffectiveSettings {
-            sidebar: shown(AutoSettle::default()),
-            session: SessionSettings {
-                title: TitleSettings {
-                    emoji: EmojiVisibility::Shown,
-                    ..TitleSettings::default()
-                },
-                ..SessionSettings::default()
-            },
             ..EffectiveSettings::default()
         },
         sessions,
@@ -2112,8 +1975,7 @@ fn listed_with_id_and_updated_at(
     created_at: u64,
     updated_at: u64,
 ) -> SessionListItem {
-    let SessionListItem::Readable(mut summary) =
-        listed(title, None, workspace, created_at, updated_at)
+    let SessionListItem::Readable(mut summary) = listed(title, workspace, created_at, updated_at)
     else {
         unreachable!("the fixture builds a readable Session");
     };
@@ -2121,13 +1983,7 @@ fn listed_with_id_and_updated_at(
     SessionListItem::Readable(summary)
 }
 
-fn listed(
-    title: &str,
-    emoji: Option<&str>,
-    workspace: &Path,
-    created_at: u64,
-    updated_at: u64,
-) -> SessionListItem {
+fn listed(title: &str, workspace: &Path, created_at: u64, updated_at: u64) -> SessionListItem {
     SessionListItem::Readable(Box::new(SessionSummary {
         checkout_state: None,
         session: Session {
@@ -2146,7 +2002,6 @@ fn listed(
             parent: None,
         },
         title: title.to_owned(),
-        emoji: emoji.map(str::to_owned),
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
@@ -2188,7 +2043,6 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
         vec![
             listed(
                 "A Title long enough to run past the Sidebar's own columns",
-                Some("🧪"),
                 &workspace.path().join("suru"),
                 3,
                 days_ago(400),
@@ -2198,7 +2052,6 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
             working(
                 listed(
                     "A working Title long enough to run past them as well",
-                    Some("🧪"),
                     &workspace.path().join("a-workspace-named-at-length"),
                     2,
                     now(),
@@ -2207,7 +2060,6 @@ fn the_sidebar_survives_every_terminal_the_frame_will_draw() {
             ),
             settled(
                 "A settled Title long enough to run past them too",
-                Some("🧪"),
                 &workspace.path().join("suru"),
                 1,
                 days_ago(400),
@@ -2233,7 +2085,7 @@ fn the_initial_visibility_setting_shows_the_sidebar_without_taking_the_keys() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     type_terminal_text(&mut application, "hello");
@@ -2251,7 +2103,7 @@ fn opening_the_sidebar_takes_the_keys_from_the_composer() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     type_terminal_text(&mut application, "listed");
@@ -2277,9 +2129,9 @@ fn the_arrows_move_the_selection_and_wrap_past_the_ends() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Newest", None, workspace.path(), 3, now()),
-            listed("Middle", None, workspace.path(), 2, now()),
-            listed("Oldest", None, workspace.path(), 1, now()),
+            listed("Newest", workspace.path(), 3, now()),
+            listed("Middle", workspace.path(), 2, now()),
+            listed("Oldest", workspace.path(), 1, now()),
         ],
     );
 
@@ -2319,7 +2171,6 @@ fn the_column_windows_onto_the_selection_for_a_list_longer_than_it() {
         .map(|index| {
             listed(
                 &format!("Row {}", 7 - index),
-                None,
                 workspace.path(),
                 index,
                 now(),
@@ -2490,7 +2341,7 @@ fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     assert_eq!(
@@ -2524,7 +2375,7 @@ fn the_toggle_closes_the_sidebar_from_inside_it() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     press_toggle(&mut application);
@@ -2549,8 +2400,8 @@ fn an_open_overlay_hides_the_sidebars_row_focus_and_giving_the_keys_back_restore
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Nearest work", None, workspace.path(), 2, now()),
-            listed("Older work", None, workspace.path(), 1, now()),
+            listed("Nearest work", workspace.path(), 2, now()),
+            listed("Older work", workspace.path(), 1, now()),
         ],
     );
     step_onto_the_list(&mut application);
@@ -2567,7 +2418,7 @@ fn an_open_overlay_hides_the_sidebars_row_focus_and_giving_the_keys_back_restore
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
-            sessions: vec![listed("Nearest work", None, workspace.path(), 2, now())],
+            sessions: vec![listed("Nearest work", workspace.path(), 2, now())],
         })
         .expect("hydrate the picker");
 
@@ -2635,9 +2486,9 @@ fn the_arrows_pass_over_a_row_suru_cannot_read() {
         workspace.path(),
         vec![
             unreadable_from("Broken work", workspace.path(), 4),
-            listed("Newest", None, workspace.path(), 3, now()),
+            listed("Newest", workspace.path(), 3, now()),
             unreadable_from("Also broken", workspace.path(), 2),
-            listed("Oldest", None, workspace.path(), 1, now()),
+            listed("Oldest", workspace.path(), 1, now()),
         ],
     );
 
@@ -2682,7 +2533,7 @@ fn an_unreadable_row_is_marked_and_subdued() {
     let application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Readable work", None, workspace.path(), 2, now()),
+            listed("Readable work", workspace.path(), 2, now()),
             unreadable("Unreadable work", workspace.path()),
         ],
     );
@@ -2727,7 +2578,7 @@ fn seeding_passes_over_an_open_session_that_arrives_unreadable() {
             request,
             sessions: vec![
                 unreadable_as(open_session, "Broken work", workspace.path(), 2),
-                listed("Readable work", None, workspace.path(), 1, now()),
+                listed("Readable work", workspace.path(), 1, now()),
             ],
         })
         .expect("hydrate the Sidebar beside the open Session");
@@ -2801,7 +2652,7 @@ fn a_terminal_too_narrow_to_draw_the_sidebar_leaves_the_keys_with_the_composer()
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     rendered_application_rows_at(&application, 77, 20);
@@ -2824,8 +2675,8 @@ fn a_paste_goes_to_the_search_box_rather_than_the_composer() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Listed work", None, workspace.path(), 2, now()),
-            listed("Other work", None, workspace.path(), 1, now()),
+            listed("Listed work", workspace.path(), 2, now()),
+            listed("Other work", workspace.path(), 1, now()),
         ],
     );
 
@@ -2860,8 +2711,8 @@ fn the_keys_after_the_toggle_reach_the_sidebar_before_the_next_frame() {
         .handle_event(ApplicationEvent::SessionsListed {
             request,
             sessions: vec![
-                listed("Newest", None, workspace.path(), 2, now()),
-                listed("Older", None, workspace.path(), 1, now()),
+                listed("Newest", workspace.path(), 2, now()),
+                listed("Older", workspace.path(), 1, now()),
             ],
         })
         .expect("hydrate the Sidebar");
@@ -2883,7 +2734,6 @@ fn the_window_holds_still_while_the_selection_moves_inside_it() {
         .map(|index| {
             listed(
                 &format!("Row {}", 7 - index),
-                None,
                 workspace.path(),
                 index,
                 now(),
@@ -3066,7 +2916,7 @@ fn the_landing_highlights_no_session_row() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     assert!(
@@ -3436,13 +3286,12 @@ fn a_listing_that_drops_the_focused_row_moves_the_keys_to_the_nearest_survivor()
 #[test]
 fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
     let workspace = workspace_dir();
-    let application = sidebar_showing_emojis(
+    let application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Active work", None, workspace.path(), 2, now()),
+            listed("Active work", workspace.path(), 2, now()),
             settled(
                 "Wrapped up",
-                Some("🧪"),
                 workspace.path(),
                 1,
                 hours_ago(3),
@@ -3450,7 +3299,6 @@ fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
             ),
             settled(
                 "Wrapped up earlier",
-                None,
                 workspace.path(),
                 3,
                 hours_ago(9),
@@ -3473,8 +3321,8 @@ fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
     );
     let row = sidebar_column(&rows[shelf]);
     assert!(
-        row.starts_with('🧪') && row.contains("Wrapped up"),
-        "a settled row leads with the Emoji and the Title: {row:?}"
+        row.starts_with("Wrapped up"),
+        "a settled row leads with the Title: {row:?}"
     );
     assert!(
         row.ends_with("5m"),
@@ -3497,7 +3345,6 @@ fn the_settled_shelf_orders_by_when_the_work_ended() {
         vec![
             settled(
                 "Ended first",
-                None,
                 workspace.path(),
                 3,
                 minutes_ago(1),
@@ -3505,7 +3352,6 @@ fn the_settled_shelf_orders_by_when_the_work_ended() {
             ),
             settled(
                 "Ended last",
-                None,
                 workspace.path(),
                 1,
                 hours_ago(20),
@@ -3513,7 +3359,6 @@ fn the_settled_shelf_orders_by_when_the_work_ended() {
             ),
             settled(
                 "Ended in between",
-                None,
                 workspace.path(),
                 2,
                 hours_ago(10),
@@ -3636,14 +3481,7 @@ fn a_never_prompted_session_lists_as_active() {
         workspace.path(),
         vec![
             never_prompted("Never prompted", workspace.path(), days_ago(30)),
-            settled(
-                "Set aside",
-                None,
-                workspace.path(),
-                2,
-                hours_ago(2),
-                hours_ago(1),
-            ),
+            settled("Set aside", workspace.path(), 2, hours_ago(2), hours_ago(1)),
         ],
     );
 
@@ -3662,8 +3500,8 @@ fn a_session_left_alone_past_the_threshold_settles_itself() {
     let application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Still warm", None, workspace.path(), 2, hours_ago(1)),
-            listed("Left alone", None, workspace.path(), 1, days_ago(5)),
+            listed("Still warm", workspace.path(), 2, hours_ago(1)),
+            listed("Left alone", workspace.path(), 1, days_ago(5)),
         ],
     );
 
@@ -3686,15 +3524,8 @@ fn the_idle_setting_says_how_long_being_left_alone_has_to_be() {
         workspace.path(),
         AutoSettle::Idle(7),
         vec![
-            listed("Left alone", None, workspace.path(), 2, days_ago(3)),
-            settled(
-                "Set aside",
-                None,
-                workspace.path(),
-                1,
-                hours_ago(2),
-                hours_ago(1),
-            ),
+            listed("Left alone", workspace.path(), 2, days_ago(3)),
+            settled("Set aside", workspace.path(), 1, hours_ago(2), hours_ago(1)),
         ],
     );
 
@@ -3712,8 +3543,8 @@ fn turning_auto_settle_off_leaves_only_what_the_reader_settled_on_the_shelf() {
         workspace.path(),
         AutoSettle::Off,
         vec![
-            listed("Left alone", None, workspace.path(), 2, days_ago(30)),
-            settled("Set aside", None, workspace.path(), 1, hours_ago(2), now()),
+            listed("Left alone", workspace.path(), 2, days_ago(30)),
+            settled("Set aside", workspace.path(), 1, hours_ago(2), now()),
         ],
     );
 
@@ -3734,14 +3565,7 @@ fn a_session_the_reader_settled_stays_settled_however_recently_it_moved() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![settled(
-            "Set aside",
-            None,
-            workspace.path(),
-            1,
-            now(),
-            now(),
-        )],
+        vec![settled("Set aside", workspace.path(), 1, now(), now())],
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -3760,15 +3584,8 @@ fn a_session_that_settled_itself_stands_and_reads_by_its_last_activity() {
     let application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Left alone", None, workspace.path(), 2, days_ago(5)),
-            settled(
-                "Set aside",
-                None,
-                workspace.path(),
-                1,
-                days_ago(9),
-                hours_ago(1),
-            ),
+            listed("Left alone", workspace.path(), 2, days_ago(5)),
+            settled("Set aside", workspace.path(), 1, days_ago(9), hours_ago(1)),
         ],
     );
 
@@ -3792,7 +3609,7 @@ fn moving_the_auto_settle_settings_reclassifies_the_sidebar_in_place() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Left alone", None, workspace.path(), 1, days_ago(5))],
+        vec![listed("Left alone", workspace.path(), 1, days_ago(5))],
     );
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
@@ -3880,7 +3697,7 @@ fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
                 updated_at: SessionTimestamp(days_ago(60)),
                 workspace: Some(Workspace::directory(workspace.path().to_owned())),
             }),
-            listed("Left alone", None, workspace.path(), 1, days_ago(5)),
+            listed("Left alone", workspace.path(), 1, days_ago(5)),
         ],
     );
 
@@ -3897,15 +3714,8 @@ fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Still going", None, workspace.path(), 1, now()),
-            settled(
-                "Set aside",
-                None,
-                workspace.path(),
-                2,
-                hours_ago(2),
-                hours_ago(1),
-            ),
+            listed("Still going", workspace.path(), 1, now()),
+            settled("Set aside", workspace.path(), 2, hours_ago(2), hours_ago(1)),
         ],
     );
 
@@ -4066,7 +3876,6 @@ fn set_aside_shelf(workspace: &Path, count: u64) -> Vec<SessionListItem> {
         .map(|ordinal| {
             settled(
                 &format!("Ended {ordinal:02}"),
-                None,
                 workspace,
                 ordinal + 1,
                 minutes_ago(ordinal + 1),
@@ -4161,8 +3970,7 @@ fn listed_at(
     workspace: &Path,
     updated_at: u64,
 ) -> SessionListItem {
-    let SessionListItem::Readable(mut summary) = listed(title, None, workspace, 1, updated_at)
-    else {
+    let SessionListItem::Readable(mut summary) = listed(title, workspace, 1, updated_at) else {
         unreachable!("the fixture builds a readable Session");
     };
     summary.session.id = session_id;
@@ -4172,22 +3980,18 @@ fn listed_at(
 /// A Session made and never prompted since, which is a Session whose last
 /// activity is the moment it was made.
 fn never_prompted(title: &str, workspace: &Path, made_at: u64) -> SessionListItem {
-    listed(title, None, workspace, made_at, made_at)
+    listed(title, workspace, made_at, made_at)
 }
 
 /// A Session the reader has set aside as done for now.
 fn settled(
     title: &str,
-    emoji: Option<&str>,
     workspace: &Path,
     created_at: u64,
     updated_at: u64,
     settled_at: u64,
 ) -> SessionListItem {
-    set_aside(
-        listed(title, emoji, workspace, created_at, updated_at),
-        settled_at,
-    )
+    set_aside(listed(title, workspace, created_at, updated_at), settled_at)
 }
 
 /// A listed Session whose latest Turn began at `working_since` and has not
@@ -4246,7 +4050,7 @@ fn the_search_box_stands_at_the_top_of_the_sidebar() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -4265,8 +4069,8 @@ fn typing_narrows_the_sidebar_by_title_whatever_case_either_is_in() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Sidebar shell", None, workspace.path(), 2, now()),
-            listed("Codex runtime", None, workspace.path(), 1, now()),
+            listed("Sidebar shell", workspace.path(), 2, now()),
+            listed("Codex runtime", workspace.path(), 1, now()),
         ],
     );
 
@@ -4295,7 +4099,7 @@ fn the_query_has_to_run_whole_through_the_title() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
+        vec![listed("Sidebar shell", workspace.path(), 1, now())],
     );
 
     type_terminal_text(&mut application, "sdbr");
@@ -4315,11 +4119,10 @@ fn a_query_replaces_both_shelves_with_one_flat_list_in_shelf_order() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Live match", None, workspace.path(), 3, now()),
-            listed("Other work", None, workspace.path(), 2, now()),
+            listed("Live match", workspace.path(), 3, now()),
+            listed("Other work", workspace.path(), 2, now()),
             settled(
                 "Shelved match",
-                None,
                 workspace.path(),
                 1,
                 hours_ago(2),
@@ -4370,7 +4173,7 @@ fn a_query_nothing_carries_says_so_rather_than_drawing_an_empty_column() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Sidebar shell", None, workspace.path(), 1, now())],
+        vec![listed("Sidebar shell", workspace.path(), 1, now())],
     );
 
     type_terminal_text(&mut application, "nothing");
@@ -4392,8 +4195,8 @@ fn backspace_takes_the_query_back_a_letter_and_widens_the_results() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Sidebar shell", None, workspace.path(), 2, now()),
-            listed("Shelf paging", None, workspace.path(), 1, now()),
+            listed("Sidebar shell", workspace.path(), 2, now()),
+            listed("Shelf paging", workspace.path(), 1, now()),
         ],
     );
 
@@ -4426,8 +4229,8 @@ fn esc_clears_the_query_and_keeps_the_keys_in_the_sidebar() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Sidebar shell", None, workspace.path(), 2, now()),
-            listed("Codex runtime", None, workspace.path(), 1, now()),
+            listed("Sidebar shell", workspace.path(), 2, now()),
+            listed("Codex runtime", workspace.path(), 1, now()),
         ],
     );
     type_terminal_text(&mut application, "shell");
@@ -4499,9 +4302,9 @@ fn the_arrows_walk_the_results_and_wrap_within_them() {
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Match first", None, workspace.path(), 3, now()),
-            listed("Passed over", None, workspace.path(), 2, now()),
-            listed("Match second", None, workspace.path(), 1, now()),
+            listed("Match first", workspace.path(), 3, now()),
+            listed("Passed over", workspace.path(), 2, now()),
+            listed("Match second", workspace.path(), 1, now()),
         ],
     );
 
@@ -4534,8 +4337,8 @@ fn the_arrows_walk_the_results_and_wrap_within_them() {
 fn a_sidebar_coming_back_into_view_opens_on_the_whole_list_again() {
     let workspace = workspace_dir();
     let sessions = vec![
-        listed("Sidebar shell", None, workspace.path(), 2, now()),
-        listed("Codex runtime", None, workspace.path(), 1, now()),
+        listed("Sidebar shell", workspace.path(), 2, now()),
+        listed("Codex runtime", workspace.path(), 1, now()),
     ];
     let mut application = sidebar_focused(workspace.path(), sessions.clone());
     type_terminal_text(&mut application, "shell");
@@ -4584,7 +4387,6 @@ fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
             ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: moved,
                 title: "Renamed away".to_owned(),
-                emoji: None,
             }),
         ))
         .expect("take the retitle another client made");
@@ -4607,7 +4409,7 @@ fn a_long_query_keeps_its_end_in_the_box() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     type_terminal_text(&mut application, "a query longer than the box is wide");
@@ -4767,7 +4569,7 @@ fn a_left_press_on_a_row_suru_cannot_read_does_nothing() {
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Readable work", None, workspace.path(), 3, now()),
+            listed("Readable work", workspace.path(), 3, now()),
             unreadable_from("Broken work", workspace.path(), 2),
         ],
     );
@@ -4821,7 +4623,6 @@ fn a_left_press_off_the_rows_attaches_nothing() {
             listed_as(wanted, "Active work", workspace.path(), 2),
             settled(
                 "Wrapped up",
-                None,
                 workspace.path(),
                 1,
                 hours_ago(3),
@@ -4893,10 +4694,9 @@ fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Active work", None, workspace.path(), 2, now()),
+            listed("Active work", workspace.path(), 2, now()),
             settled(
                 "Wrapped up",
-                None,
                 workspace.path(),
                 1,
                 hours_ago(3),
@@ -4924,7 +4724,7 @@ fn a_right_press_on_a_row_suru_cannot_read_offers_only_delete() {
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Readable work", None, workspace.path(), 3, now()),
+            listed("Readable work", workspace.path(), 3, now()),
             unreadable_from("Broken work", workspace.path(), 2),
         ],
     );
@@ -4952,7 +4752,7 @@ fn the_menu_deletes_a_row_suru_cannot_read_after_asking_again() {
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Readable work", None, workspace.path(), 3, now()),
+            listed("Readable work", workspace.path(), 3, now()),
             unreadable_as(wanted, "Broken work", workspace.path(), 2),
         ],
     );
@@ -5008,7 +4808,7 @@ fn the_menu_takes_a_settled_row_back_off_the_shelf() {
     let mut application = sidebar_showing(
         workspace.path(),
         vec![
-            listed("Active work", None, workspace.path(), 2, now()),
+            listed("Active work", workspace.path(), 2, now()),
             set_aside(
                 listed_as(brought_back, "Wrapped up", workspace.path(), 1),
                 minutes_ago(5),
@@ -5263,7 +5063,7 @@ fn the_selector_stands_under_the_search_box_and_says_what_is_in_scope() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -5284,8 +5084,8 @@ fn the_selector_lists_everywhere_then_all_workspaces_then_the_outlooks_workspace
     let mut application = sidebar_focused(
         workspace.path(),
         vec![
-            listed("Notes", None, &workspace.path().join("notes"), 2, now()),
-            listed("Suru", None, &workspace.path().join("suru"), 1, now()),
+            listed("Notes", &workspace.path().join("notes"), 2, now()),
+            listed("Suru", &workspace.path().join("suru"), 1, now()),
         ],
     );
 
@@ -5309,13 +5109,7 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed(
-            "Previous local work",
-            None,
-            workspace.path(),
-            1,
-            now(),
-        )],
+        vec![listed("Previous local work", workspace.path(), 1, now())],
     );
 
     let EverywhereListing {
@@ -5359,10 +5153,9 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
     for request in requests {
         let sessions = match request.outlook() {
             Outlook::Local => vec![
-                listed("Local newest", None, workspace.path(), 40, minutes_ago(1)),
+                listed("Local newest", workspace.path(), 40, minutes_ago(1)),
                 settled(
                     "Local history",
-                    None,
                     workspace.path(),
                     10,
                     hours_ago(4),
@@ -5372,14 +5165,12 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
             Outlook::Remote(name) if name == "studio" => vec![
                 listed(
                     "Studio older",
-                    None,
                     &workspace.path().join("foreign-studio"),
                     30,
                     minutes_ago(2),
                 ),
                 settled(
                     "Studio history",
-                    None,
                     &workspace.path().join("foreign-history"),
                     20,
                     hours_ago(2),
@@ -5413,10 +5204,9 @@ fn everywhere_prefixes_foreign_workspaces_independently_of_title_truncation() {
     );
     for request in requests {
         let sessions = match request.outlook() {
-            Outlook::Local => vec![listed("Local work", None, workspace.path(), 2, now())],
+            Outlook::Local => vec![listed("Local work", workspace.path(), 2, now())],
             Outlook::Remote(_) => vec![listed(
                 "A foreign Title long enough that the Sidebar must truncate it",
-                None,
                 &workspace.path().join("remote"),
                 1,
                 now(),
@@ -5693,25 +5483,17 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
         let sessions = match request.outlook() {
             Outlook::Local => vec![settled(
                 "Local history",
-                None,
                 workspace.path(),
                 1,
                 minutes_ago(2),
                 minutes_ago(1),
             )],
             Outlook::Remote(name) if name == "studio" => vec![working(
-                listed(
-                    "Studio work",
-                    None,
-                    &workspace.path().join("studio"),
-                    3,
-                    now(),
-                ),
+                listed("Studio work", &workspace.path().join("studio"), 3, now()),
                 seconds_ago(90),
             )],
             Outlook::Remote(name) if name == "laptop" => vec![listed(
                 "Laptop work",
-                None,
                 &workspace.path().join("laptop"),
                 2,
                 now(),
@@ -5772,7 +5554,6 @@ fn enter_on_an_unreachable_remote_restarts_its_stream_and_listing_now() {
             Outlook::Local => Vec::new(),
             Outlook::Remote(_) => vec![listed(
                 "Studio work",
-                None,
                 &workspace.path().join("studio"),
                 1,
                 now(),
@@ -6039,17 +5820,15 @@ fn a_terminal_background_remote_failure_removes_only_that_origin() {
     );
     for request in requests {
         let sessions = match request.outlook() {
-            Outlook::Local => vec![listed("Local work", None, workspace.path(), 3, now())],
+            Outlook::Local => vec![listed("Local work", workspace.path(), 3, now())],
             Outlook::Remote(name) if name == "studio" => vec![listed(
                 "Studio work",
-                None,
                 &workspace.path().join("studio"),
                 2,
                 now(),
             )],
             Outlook::Remote(name) if name == "laptop" => vec![listed(
                 "Laptop work",
-                None,
                 &workspace.path().join("laptop"),
                 1,
                 now(),
@@ -6113,20 +5892,18 @@ fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outl
     for request in requests {
         let sessions = match request.outlook() {
             Outlook::Local => vec![
-                listed("Matching local", None, workspace.path(), 4, now()),
-                listed("Other local", None, workspace.path(), 2, now()),
+                listed("Matching local", workspace.path(), 4, now()),
+                listed("Other local", workspace.path(), 2, now()),
             ],
             Outlook::Remote(_) => vec![
                 listed(
                     "Matching foreign",
-                    None,
                     &workspace.path().join("foreign-only"),
                     3,
                     now(),
                 ),
                 listed(
                     "Other foreign",
-                    None,
                     &workspace.path().join("foreign-apart"),
                     1,
                     now(),
@@ -6332,7 +6109,6 @@ fn a_remote_catalog_change_updates_only_that_origins_rows() {
             event: ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: shared_id,
                 title: "Retitled remotely".to_owned(),
-                emoji: None,
             }),
         })
         .expect("take the Remote retitle");
@@ -6452,7 +6228,7 @@ fn the_selector_lists_one_entry_for_the_launch_workspace_however_it_was_spelled(
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         &noncanonical_spelling(&workspace),
-        vec![listed("Rooted here", None, workspace.path(), 1, now())],
+        vec![listed("Rooted here", workspace.path(), 1, now())],
     );
 
     open_selector(&mut application);
@@ -6486,7 +6262,7 @@ fn a_client_launched_through_a_symlink_narrows_to_the_workspace_the_server_repor
     let application = sidebar_scoped(
         &link,
         SidebarScope::CurrentWorkspace,
-        vec![listed("Rooted here", None, &canonical, 1, now())],
+        vec![listed("Rooted here", &canonical, 1, now())],
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -6614,10 +6390,9 @@ fn an_everywhere_initial_scope_launches_into_the_merged_listing() {
 
     for request in requests {
         let sessions = match request.outlook() {
-            Outlook::Local => vec![listed("Local work", None, workspace.path(), 2, now())],
+            Outlook::Local => vec![listed("Local work", workspace.path(), 2, now())],
             Outlook::Remote(name) if name == "studio" => vec![listed(
                 "Studio work",
-                None,
                 &workspace.path().join("studio"),
                 1,
                 minutes_ago(1),
@@ -6734,7 +6509,7 @@ fn the_arrows_reach_the_selector_above_the_list() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     step_onto_the_list(&mut application);
@@ -6808,11 +6583,10 @@ fn sidebar_scoped(
 /// runs in, which is what a narrowing is read against.
 fn two_workspaces(root: &Path) -> Vec<SessionListItem> {
     vec![
-        listed("Notes work", None, &root.join("notes"), 4, now()),
-        listed("Suru work", None, &root.join("suru"), 3, now()),
+        listed("Notes work", &root.join("notes"), 4, now()),
+        listed("Suru work", &root.join("suru"), 3, now()),
         settled(
             "Notes history",
-            None,
             &root.join("notes"),
             2,
             hours_ago(3),
@@ -6820,7 +6594,6 @@ fn two_workspaces(root: &Path) -> Vec<SessionListItem> {
         ),
         settled(
             "Suru history",
-            None,
             &root.join("suru"),
             1,
             hours_ago(4),
@@ -6882,7 +6655,7 @@ fn the_add_workspace_affordance_stands_beside_the_selector() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -6906,7 +6679,7 @@ fn the_affordance_opens_a_path_entry_in_place_of_the_list() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     assert_eq!(
@@ -6959,7 +6732,7 @@ fn a_directory_the_reader_names_becomes_the_workspace_the_selector_narrows_to() 
     std::fs::create_dir(&added).expect("create the directory the reader adds");
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     add_workspace(&mut application, &added.to_string_lossy());
@@ -7022,7 +6795,6 @@ fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
         workspace.path(),
         vec![listed(
             "Suru work",
-            None,
             &workspace.path().join("suru"),
             1,
             now(),
@@ -7052,7 +6824,7 @@ fn a_path_naming_no_directory_is_refused_inline_and_moves_nothing() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     let transition = add_workspace(
@@ -7142,7 +6914,7 @@ fn esc_gives_up_the_path_entry_and_leaves_the_workspace_where_it_was() {
     std::fs::create_dir(&added).expect("create a directory the reader does not take");
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
     press_add_workspace(&mut application);
     type_terminal_text(&mut application, &added.to_string_lossy());
@@ -7167,7 +6939,7 @@ fn esc_cancels_a_workspace_resolution_still_in_flight() {
     std::fs::create_dir(&added).expect("create a directory the reader does not take");
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
     press_add_workspace(&mut application);
     type_terminal_text(&mut application, &added.to_string_lossy());
@@ -7294,7 +7066,7 @@ fn the_arrows_reach_the_affordance_beside_the_selector() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
 
     step_onto_the_list(&mut application);
@@ -7398,7 +7170,7 @@ fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request: listing,
-            sessions: vec![listed("Rooted work", None, &canonical, 1, now())],
+            sessions: vec![listed("Rooted work", &canonical, 1, now())],
         })
         .expect("hydrate the Sidebar");
 
@@ -7416,7 +7188,7 @@ fn a_press_on_the_line_that_opened_the_entry_gives_it_up() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(
         workspace.path(),
-        vec![listed("Listed work", None, workspace.path(), 1, now())],
+        vec![listed("Listed work", workspace.path(), 1, now())],
     );
     press_add_workspace(&mut application);
 
@@ -7495,7 +7267,6 @@ fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
             ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: listed_session,
                 title: "Retitled work".to_owned(),
-                emoji: None,
             }),
         ),
         (
@@ -9363,7 +9134,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
     ] {
         let has_branch = matches!(&revision, Some(CheckoutRevision::Branch { .. }));
         let SessionListItem::Readable(mut summary) =
-            listed("Checkout work", None, workspace.path(), now(), now())
+            listed("Checkout work", workspace.path(), now(), now())
         else {
             unreachable!()
         };
@@ -9386,7 +9157,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
         assert!(!rows.iter().any(|row| row.contains("stale-recovery")));
     }
     let SessionListItem::Readable(mut summary) =
-        listed("Checkout work", None, workspace.path(), now(), now())
+        listed("Checkout work", workspace.path(), now(), now())
     else {
         unreachable!()
     };
@@ -9407,7 +9178,7 @@ fn remote_checkout_line_keeps_its_origin_label_without_a_main_indicator() {
     };
     let workspace = workspace_dir();
     let SessionListItem::Readable(mut summary) =
-        listed("Remote work", None, workspace.path(), now(), now())
+        listed("Remote work", workspace.path(), now(), now())
     else {
         unreachable!()
     };
@@ -9505,7 +9276,7 @@ fn active_sidebar_icons_follow_the_setting_and_checkout_state() {
             recovery_revision: None,
             reclaim: None,
         };
-        let SessionListItem::Readable(mut summary) = listed("Icon work", None, &path, now(), now())
+        let SessionListItem::Readable(mut summary) = listed("Icon work", &path, now(), now())
         else {
             unreachable!()
         };
@@ -9546,7 +9317,7 @@ fn active_remote_location_keeps_its_name_with_icons_off_and_in_workspace_scope()
     let (mut application, _) = everywhere_with_studio(
         workspace.path(),
         vec![],
-        vec![listed("Remote icons", None, &path, now(), now())],
+        vec![listed("Remote icons", &path, now(), now())],
     );
     for workspace_scope in [false, true] {
         if workspace_scope {

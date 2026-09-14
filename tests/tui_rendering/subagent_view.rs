@@ -97,7 +97,6 @@ fn child_session_snapshot(
     let message_id = MessageId::new();
     SessionSnapshot {
         title: String::new(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,

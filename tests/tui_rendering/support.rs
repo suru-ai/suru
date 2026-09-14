@@ -483,7 +483,6 @@ pub fn failed_session_snapshot(
     let transcript = delivered.transcript();
     SessionSnapshot {
         title: String::new(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,
@@ -539,7 +538,6 @@ pub fn selected_session_snapshot(
 ) -> SessionSnapshot {
     SessionSnapshot {
         title: String::new(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,
@@ -577,7 +575,6 @@ pub fn navigable_session_snapshot(
 ) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot {
         title: String::new(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,

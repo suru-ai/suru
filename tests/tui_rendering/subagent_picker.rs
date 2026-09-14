@@ -120,7 +120,6 @@ fn child_with_working_subagent(
     let activity_id = ActivityId::new();
     let snapshot = SessionSnapshot {
         title: String::new(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,

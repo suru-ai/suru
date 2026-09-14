@@ -7,17 +7,16 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutStateChanged,
-        CheckoutSummary, EffectiveSettings, EmojiVisibility, RepositoryId, SessionChange,
-        SessionRevision, SessionSnapshot, SessionUpdate, SettingsSnapshot, SidebarVisibility,
+        CheckoutSummary, EffectiveSettings, RepositoryId, SessionChange, SessionRevision,
+        SessionSnapshot, SessionUpdate, SettingsSnapshot, SidebarVisibility,
         SourceControlAvailability,
     },
     tui::{Application, ApplicationEvent},
 };
 
-fn settings(application: &mut Application, emoji: EmojiVisibility) {
+fn settings(application: &mut Application) {
     let mut settings = EffectiveSettings::default();
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
-    settings.session.title.emoji = emoji;
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {
@@ -66,7 +65,7 @@ fn application_with_checkout_branch(
     child: bool,
 ) -> Application {
     let mut application = connected_application(workspace);
-    settings(&mut application, EmojiVisibility::Hidden);
+    settings(&mut application);
     let (parent, mut snapshot) = enter_session(&mut application, workspace);
     let repository = RepositoryId::from_metadata("git", workspace);
     let association = CheckoutAssociation {
@@ -160,7 +159,7 @@ fn icons_identify_the_workspace_and_worktree_in_the_session_header() {
             "icons disappear with their labels at narrow widths: {narrow}"
         );
 
-        settings(&mut application, EmojiVisibility::Hidden);
+        settings(&mut application);
         let plain = header(&application, 240);
         assert!(
             plain.contains(&format!(" · feature/icons{legacy_suffix}")),
@@ -267,7 +266,7 @@ fn viewed_child_uses_the_branch_state_shared_by_its_worktree() {
 fn title_is_centered_in_the_view_and_updates_with_the_session() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
-    settings(&mut application, EmojiVisibility::Hidden);
+    settings(&mut application);
     let (_, mut snapshot) = enter_session(&mut application, workspace.path());
     snapshot.title = "Alpha".into();
     show(&mut application, &snapshot);
@@ -299,25 +298,19 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
                 revision: SessionRevision(snapshot.revision.0 + 1),
                 changes: vec![SessionChange::TitleChanged {
                     title: "Bravo".into(),
-                    emoji: Some("🐛".into()),
                 }],
             },
         )))
         .unwrap();
     let row = header(&application, 160);
-    assert!(
-        row.contains("Bravo") && !row.contains("Alpha") && !row.contains("🐛"),
-        "{row}"
-    );
-    settings(&mut application, EmojiVisibility::Shown);
-    assert!(header(&application, 160).contains("🐛"));
+    assert!(row.contains("Bravo") && !row.contains("Alpha"), "{row}");
 }
 
 #[test]
 fn long_multiline_titles_shrink_without_overwriting_indicators() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
-    settings(&mut application, EmojiVisibility::Hidden);
+    settings(&mut application);
     let (_, mut snapshot) = enter_session(&mut application, workspace.path());
     snapshot.title = "Alpha\n\tBeta".into();
     show(&mut application, &snapshot);
@@ -352,7 +345,7 @@ fn long_multiline_titles_shrink_without_overwriting_indicators() {
 fn viewed_child_uses_its_own_title_and_empty_title_leaves_the_center_blank() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
-    settings(&mut application, EmojiVisibility::Shown);
+    settings(&mut application);
     let (parent, mut snapshot) = enter_session(&mut application, workspace.path());
     snapshot.session.id = suru::protocol::SessionId::new();
     snapshot.session.parent = Some(parent);
@@ -362,8 +355,7 @@ fn viewed_child_uses_its_own_title_and_empty_title_leaves_the_center_blank() {
         .unwrap();
     assert!(header(&application, 200).contains("Child work"));
     snapshot.title.clear();
-    snapshot.emoji = Some("🐛".into());
     show(&mut application, &snapshot);
     let row = header(&application, 200);
-    assert!(!row.contains("Child work") && !row.contains("🐛"), "{row}");
+    assert!(!row.contains("Child work"), "{row}");
 }

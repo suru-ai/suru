@@ -36,14 +36,13 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260909000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260914000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
     sessions (id) {
         id -> Text,
         title -> Text,
-        emoji -> Nullable<Text>,
         settled_at -> Nullable<BigInt>,
         viewed_at -> Nullable<BigInt>,
         created_at -> BigInt,
@@ -493,7 +492,6 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 crate::protocol::SessionStandingInputs::from_turns(&turns).latest_turn;
             let snapshot = SessionSnapshot {
                 title: summary.title.clone(),
-                emoji: summary.emoji.clone(),
                 session: summary.session.clone(),
                 revision,
                 turns,
@@ -613,7 +611,6 @@ fn load_session(
     transcript.sort_unstable_by_key(|(order, _)| *order);
     let snapshot = SessionSnapshot {
         title: summary.title.clone(),
-        emoji: summary.emoji.clone(),
         session: summary.session.clone(),
         revision,
         prompts,

@@ -25,7 +25,6 @@ pub fn created_session_snapshot(
 ) -> SessionSnapshot {
     SessionSnapshot {
         title: prompt.text.trim().to_owned(),
-        emoji: None,
         session: Session {
             checkout: None,
             context_fill: None,

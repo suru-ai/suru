@@ -33,10 +33,10 @@ use serde_json::Value;
 use crate::protocol::{
     AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
     CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
-    EffectiveSettings, EmojiVisibility, FoldPosture, LandingPage, ProviderId,
-    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
-    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-    SidebarVisibility, TextSelectionCopy, TitleErrand,
+    EffectiveSettings, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
+    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
+    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
+    TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -59,7 +59,6 @@ const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // later gets its own key and turning Titles off can never silently disable
 // work that has nothing to do with them.
 const SESSION_TITLE_ERRAND: &str = "session.title.errand";
-const SESSION_TITLE_EMOJI: &str = "session.title.emoji";
 const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_WIDTH: &str = "sidebar.initialWidth";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
@@ -529,9 +528,6 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SessionTitleErrand { value } => {
             value.as_ref() == Some(&settings.session.title.errand)
-        }
-        SettingMutation::SessionTitleEmoji { value } => {
-            *value == Some(settings.session.title.emoji)
         }
         SettingMutation::SidebarInitialVisibility { value } => {
             *value == Some(settings.sidebar.initial_visibility)
@@ -1283,33 +1279,6 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     },
     // The experimental Settings stand last, as the tab presenting them does.
     SettingDescriptor {
-        key: SESSION_TITLE_EMOJI,
-        label: "Session name Emojis",
-        description: "Whether the Emoji derived for a Session is drawn wherever it is named",
-        group: SettingGroup::Experimental,
-        scope: SettingScope::Client,
-        values: SettingValues::Fixed(&[
-            SettingChoice {
-                value: "hidden",
-                build_mutation: || SettingMutation::SessionTitleEmoji {
-                    value: Some(EmojiVisibility::Hidden),
-                },
-            },
-            SettingChoice {
-                value: "shown",
-                build_mutation: || SettingMutation::SessionTitleEmoji {
-                    value: Some(EmojiVisibility::Shown),
-                },
-            },
-        ]),
-        reset: SettingMutation::SessionTitleEmoji { value: None },
-        apply: |settings, value| {
-            apply_value(value, |visibility| {
-                settings.session.title.emoji = visibility;
-            })
-        },
-    },
-    SettingDescriptor {
         key: SERVING_ENABLED,
         label: "Serving",
         description: "Whether this Server accepts paired Servers on its second listener",
@@ -1561,7 +1530,6 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
-        SettingMutation::SessionTitleEmoji { value } => (SESSION_TITLE_EMOJI, pinned(value)),
         SettingMutation::SidebarInitialVisibility { value } => {
             (SIDEBAR_INITIAL_VISIBILITY, pinned(value))
         }
@@ -2118,7 +2086,6 @@ mod tests {
                 "one of \"ask\" or \"allowAll\"".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"default\", \"acceptEdits\", \"dontAsk\", \"bypassPermissions\", or \"auto\"".to_owned(),
-                "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or true".to_owned(),
                 "a port from 0 to 65535".to_owned(),
                 "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),

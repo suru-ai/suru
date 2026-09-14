@@ -7,8 +7,7 @@ use std::{
 };
 
 use crate::protocol::{
-    EffectiveSettings, EmojiVisibility, Outlook, Remote, SessionId, SessionListItem,
-    SessionReference, SessionStatus, SessionTimestamp,
+    Outlook, Remote, SessionId, SessionListItem, SessionReference, SessionStatus, SessionTimestamp,
 };
 
 use super::{
@@ -65,9 +64,6 @@ pub(super) struct SessionPicker {
     everywhere_remote_sequence: u64,
     pending_everywhere_remotes: Option<u64>,
     awaiting_dispatch: Vec<SessionListRequest>,
-    /// Whether a row draws the Emoji derived beside its Session's Title, which
-    /// governs every frame from the moment the Setting lands.
-    emoji: EmojiVisibility,
     query: String,
     selected: Option<SessionReference>,
     attaching: Option<SessionReference>,
@@ -79,12 +75,6 @@ pub(super) struct SessionPicker {
 pub(super) struct SessionPickerRow<'a> {
     pub(super) origin: &'a Outlook,
     pub(super) title: &'a str,
-    /// The Emoji this row draws for its Session, carried beside the Title
-    /// rather than within it so the query never meets it. A Session whose
-    /// derivation was skipped, failed, or abandoned has none, and so has every
-    /// Session while the reader keeps Emojis hidden; a row is drawn as readily
-    /// without one either way.
-    pub(super) emoji: Option<&'a str>,
     pub(super) selected: bool,
     pub(super) current: bool,
     pub(super) active: bool,
@@ -107,7 +97,6 @@ impl SessionPicker {
             everywhere_remote_sequence: 0,
             pending_everywhere_remotes: None,
             awaiting_dispatch: Vec::new(),
-            emoji: EmojiVisibility::default(),
             query: String::new(),
             selected: None,
             attaching: None,
@@ -121,12 +110,6 @@ impl SessionPicker {
         self.query.clear();
         self.listing.clear_error();
         self.begin_listing()
-    }
-
-    /// Takes the Settings the picker draws under, which is how a Session is
-    /// named: everything else about a row is the listing's own.
-    pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
-        self.emoji = settings.session.title.emoji;
     }
 
     /// Takes the Workspace this client has moved to, so the picker's own
@@ -215,8 +198,8 @@ impl SessionPicker {
             .set_standing_inputs_origin(origin, session_id, inputs);
     }
 
-    pub(super) fn retitle(&mut self, session_id: SessionId, title: String, emoji: Option<String>) {
-        self.listing.retitle(session_id, title, emoji);
+    pub(super) fn retitle(&mut self, session_id: SessionId, title: String) {
+        self.listing.retitle(session_id, title);
     }
 
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
@@ -471,10 +454,8 @@ impl SessionPicker {
         outlook: Outlook,
         session_id: SessionId,
         title: String,
-        emoji: Option<String>,
     ) {
-        self.listing
-            .retitle_origin(outlook, session_id, title, emoji);
+        self.listing.retitle_origin(outlook, session_id, title);
     }
 
     pub(super) fn settle_origin(
@@ -518,7 +499,6 @@ impl SessionPicker {
                         summary.standing_inputs.pending_approval_count()
                     }),
                     title: summary.title(),
-                    emoji: self.emoji.drawn_emoji(summary.emoji()),
                     selected: self.selected.as_ref() == Some(summary.reference()),
                     current: readable.is_some() && current == Some(summary.reference()),
                     active: readable

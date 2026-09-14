@@ -886,39 +886,11 @@ impl<'de> Deserialize<'de> for SessionContentWidth {
     }
 }
 
-/// Whether the Emoji a derivation left beside a Session's Title is drawn
-/// wherever that Session is named.
-///
-/// Display and nothing else: an Emoji hidden is still derived, still stored,
-/// and still carried to every client, so turning them back on costs no
-/// derivation and reveals the Emojis Suru already holds.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmojiVisibility {
-    #[default]
-    Hidden,
-    Shown,
-}
-
-impl EmojiVisibility {
-    /// The Emoji a Session's name is drawn with: the one derived for it where
-    /// the reader has Emojis on, and none where they have not. Written down
-    /// once, so no two surfaces naming Sessions can disagree about what the
-    /// Setting means.
-    pub fn drawn_emoji(self, emoji: Option<&str>) -> Option<&str> {
-        match self {
-            Self::Shown => emoji,
-            Self::Hidden => None,
-        }
-    }
-}
-
-/// How Suru derives a Session's Title, and how what it derived is drawn.
+/// How Suru derives a Session's Title.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleSettings {
     pub errand: TitleErrand,
-    pub emoji: EmojiVisibility,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1617,9 +1589,6 @@ pub enum SettingMutation {
     SessionTitleErrand {
         value: Option<TitleErrand>,
     },
-    SessionTitleEmoji {
-        value: Option<EmojiVisibility>,
-    },
     SidebarInitialVisibility {
         value: Option<SidebarVisibility>,
     },
@@ -2093,13 +2062,6 @@ pub struct SessionSummary {
     #[serde(flatten)]
     pub session: Session,
     pub title: String,
-    /// The single emoji standing for this Session beside its Title, derived
-    /// with that Title and carried apart from it so a reader searching a
-    /// listing matches the words rather than the character in front of them.
-    /// Absent for every Session whose derivation was skipped, failed, or
-    /// predates the feature.
-    #[serde(default)]
-    pub emoji: Option<String>,
     /// When the user set this Session aside as done for now, and `None` while
     /// it is active. The marker and the moment are one field because a Session
     /// is settled exactly when there is a moment it was settled at — and a
@@ -2153,16 +2115,6 @@ impl SessionListItem {
         match self {
             Self::Readable(summary) => &summary.title,
             Self::Unreadable(summary) => &summary.title,
-        }
-    }
-
-    /// The Emoji standing for this Session, when it has one. A Session Suru
-    /// could not read carries none, because an Emoji is stored beside a Title
-    /// that only a readable Session has.
-    pub fn emoji(&self) -> Option<&str> {
-        match self {
-            Self::Readable(summary) => summary.emoji.as_deref(),
-            Self::Unreadable(_) => None,
         }
     }
 
@@ -2258,14 +2210,13 @@ pub enum SessionCatalogChange {
     Deleted {
         session_id: SessionId,
     },
-    /// A Session's Title — and the Emoji standing beside it — was replaced by
-    /// a derivation. It rides the catalog stream rather than the Session's own,
-    /// because a client subscribes only to the Sessions it has open while the
-    /// Title it draws is for every Session it lists.
+    /// A Session's Title was replaced by a derivation. It rides the catalog
+    /// stream rather than the Session's own, because a client subscribes only
+    /// to the Sessions it has open while the Title it draws is for every
+    /// Session it lists.
     TitleChanged {
         session_id: SessionId,
         title: String,
-        emoji: Option<String>,
     },
     /// A Session was set aside as done for now, or brought back. It rides the
     /// catalog stream for the same reason a Title does: every client lists the
@@ -2781,7 +2732,6 @@ pub struct SubagentInterventions {
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub title: String,
-    pub emoji: Option<String>,
     pub session: Session,
     pub revision: SessionRevision,
     pub prompts: Vec<Prompt>,
@@ -2888,7 +2838,6 @@ pub enum SessionChange {
     },
     TitleChanged {
         title: String,
-        emoji: Option<String>,
     },
     ContextFillChanged {
         context_fill: Option<ContextFill>,
@@ -3417,12 +3366,11 @@ pub struct SessionUsageChanged {
     pub total_usage: Option<UsageTotal>,
 }
 
-/// A Session's Title — and the Emoji beside it — as a derivation left them,
-/// carried to a client that may be listing that Session without having it open.
+/// A Session's Title as a derivation left it, carried to a client that may be
+/// listing that Session without having it open.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTitleChanged {
     pub session_id: SessionId,
     pub title: String,
-    pub emoji: Option<String>,
 }

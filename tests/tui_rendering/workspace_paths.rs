@@ -281,7 +281,6 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         checkout_state: None,
                         session: snapshot.session,
                         title: "Remote work".into(),
-                        emoji: None,
                         settled_at: None,
                         standing_inputs: Default::default(),
                         total_usage: None,

@@ -11,8 +11,8 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, EffectiveSettings, EmojiVisibility, Outlook, Remote, ResolveWorkspaceRequest,
-    SessionId, SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
+    AutoSettle, EffectiveSettings, Outlook, Remote, ResolveWorkspaceRequest, SessionId,
+    SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
     SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility,
 };
 
@@ -189,9 +189,6 @@ pub(super) struct Sidebar {
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
     /// open: editing it reclassifies every listed Session on the next frame.
     auto_settle: AutoSettle,
-    /// Whether a row draws the Emoji derived beside its Session's Title, which
-    /// governs every frame from the moment the Setting lands.
-    emoji: EmojiVisibility,
     /// The Session population the Sidebar draws, seeded once from the
     /// initial-scope Setting and moved by the selector afterwards.
     scope: SidebarListingScope,
@@ -335,9 +332,6 @@ pub(super) struct SidebarRow<'a> {
     /// the screen rows it draws so a press lands on the work rather than on
     /// the position.
     pub(super) reference: &'a SessionReference,
-    /// The Emoji this row draws for its Session: none where the derivation
-    /// left it none, and none while the reader keeps Emojis hidden.
-    pub(super) emoji: Option<&'a str>,
     pub(super) title: &'a str,
     /// The dim Origin tag following a foreign row's Title. Local rows carry
     /// none so the ordinary one-machine reading stays quiet.
@@ -837,7 +831,6 @@ impl Sidebar {
             drawn_width_limit: Cell::new(None),
             edge_held: false,
             auto_settle: AutoSettle::default(),
-            emoji: EmojiVisibility::default(),
             scope: SidebarListingScope::AllWorkspaces,
             selector_open: false,
             workspace_entry: None,
@@ -868,13 +861,12 @@ impl Sidebar {
     }
 
     /// Takes the Settings the Sidebar draws under, each on its own schedule:
-    /// auto-settle and how a Session is named govern every frame from here on,
-    /// while the three initial Settings have their say once and are then the
-    /// reader's to overrule. Returns nothing: a Sidebar that wants its Sessions
-    /// leaves the requests in [`Self::take_listing_requests`].
+    /// auto-settle governs every frame from here on, while the three initial
+    /// Settings have their say once and are then the reader's to overrule.
+    /// Returns nothing: a Sidebar that wants its Sessions leaves the requests
+    /// in [`Self::take_listing_requests`].
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
         self.auto_settle = settings.sidebar.auto_settle;
-        self.emoji = settings.session.title.emoji;
         if self.seeded {
             return;
         }
@@ -1739,11 +1731,9 @@ impl Sidebar {
         outlook: Outlook,
         session_id: SessionId,
         title: String,
-        emoji: Option<String>,
     ) {
         let before = self.focus_order_before_change();
-        self.listing
-            .retitle_origin(outlook, session_id, title, emoji);
+        self.listing.retitle_origin(outlook, session_id, title);
         // A Title is what a query is read against, so another client's retitle
         // can carry the row the keys are on out of the results under them.
         self.keep_focus_drawn(&before);
@@ -2493,7 +2483,6 @@ impl Sidebar {
         };
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
-            emoji: self.emoji.drawn_emoji(session.emoji()),
             title: session.title(),
             remote: if self.scope == SidebarListingScope::Everywhere {
                 session.reference().origin.remote_name()
@@ -3851,7 +3840,6 @@ mod tests {
                 parent: None,
             },
             title: title.to_owned(),
-            emoji: None,
             settled_at: None,
             standing_inputs: Default::default(),
             total_usage: None,

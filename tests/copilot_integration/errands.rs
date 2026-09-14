@@ -61,13 +61,10 @@ const TURN_TIMELINE: &str = r#"        event t1 assistant.message '{"messageId":
         event t2 session.idle '{}'
 "#;
 
-/// The Emoji the Errand answers with, beside the Title it chose.
-const DERIVED_EMOJI: &str = "\u{1F9F5}";
-
 /// An Errand answered exactly as it asked to be: one JSON object and nothing else.
 fn answered_errand() -> String {
     format!(
-        r#"        event e1 assistant.message '{{"messageId":"e1","content":"{{\"title\":\"{DERIVED_TITLE}\",\"emoji\":\"{DERIVED_EMOJI}\"}}"}}'
+        r#"        event e1 assistant.message '{{"messageId":"e1","content":"{{\"title\":\"{DERIVED_TITLE}\"}}"}}'
         event e2 session.idle '{{}}'
 "#
     )
@@ -222,8 +219,8 @@ async fn discarded_session(copilot: &ScriptedCopilot) -> String {
     deleted
 }
 
-/// The Title a Session carries in a listing, alongside the Emoji beside it.
-async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String, Option<String>) {
+/// The Title a Session carries in a listing.
+async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
     let listed = client
         .list_sessions(None)
         .await
@@ -231,10 +228,7 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String,
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed");
-    (
-        listed.title().to_owned(),
-        listed.emoji().map(ToOwned::to_owned),
-    )
+    listed.title().to_owned()
 }
 
 #[tokio::test]
@@ -269,7 +263,7 @@ async fn a_session_started_on_copilot_is_titled_by_an_errand_that_leaves_no_sess
     );
     assert_eq!(
         listed_title(&client, session_id).await,
-        (DERIVED_TITLE.to_owned(), Some(DERIVED_EMOJI.to_owned()))
+        DERIVED_TITLE.to_owned()
     );
     let listed = client.list_sessions(None).await.expect("list Sessions");
     assert_eq!(listed.len(), 1, "the Errand left no Session behind");
@@ -343,7 +337,7 @@ async fn an_errand_runs_at_copilots_declared_selection_carrying_no_tools_and_sto
         "the Errand carries the first Prompt: {prompt}"
     );
     assert!(
-        prompt.contains("\"emoji\"") && prompt.contains("\"title\""),
+        prompt.contains("\"title\""),
         "a harness that cannot be handed a schema is told it in the Prompt: {prompt}"
     );
 
@@ -420,7 +414,7 @@ async fn an_errand_that_runs_out_of_time_still_discards_the_session_it_opened() 
     );
     assert_eq!(
         listed_title(&client, created.session.id).await,
-        (FIRST_PROMPT.to_owned(), None),
+        FIRST_PROMPT.to_owned(),
         "the Prompt-derived Title stands"
     );
 

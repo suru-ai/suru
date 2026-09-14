@@ -1515,11 +1515,8 @@ impl TuiState {
                 self.remove_deleted_session(deleted.session_id);
             }
             ManagedEvent::SessionTitleChanged(retitled) => {
-                self.session_picker.retitle(
-                    retitled.session_id,
-                    retitled.title.clone(),
-                    retitled.emoji.clone(),
-                );
+                self.session_picker
+                    .retitle(retitled.session_id, retitled.title.clone());
             }
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.session_picker
@@ -1574,7 +1571,6 @@ impl TuiState {
                 outlook.clone(),
                 retitled.session_id,
                 retitled.title.clone(),
-                retitled.emoji.clone(),
             ),
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.sidebar
@@ -1635,7 +1631,6 @@ impl TuiState {
                 outlook.clone(),
                 retitled.session_id,
                 retitled.title.clone(),
-                retitled.emoji.clone(),
             ),
             ManagedEvent::SessionSettlementChanged(settled) => self.session_picker.settle_origin(
                 outlook.clone(),
@@ -1679,11 +1674,10 @@ impl TuiState {
                 interaction.folds.borrow_mut().clear_automatic_promotions();
             }
         }
-        // The Settings the Sidebar and the session picker draw under are the
-        // ones that act on arrival rather than on the next view opened,
-        // because the frames they govern may be on screen already.
+        // The Settings the Sidebar draws under are the ones that act on
+        // arrival rather than on the next view opened, because the frames it
+        // governs may be on screen already.
         self.sidebar.adopt_settings(&self.settings);
-        self.session_picker.adopt_settings(&self.settings);
         self.application_notice.receive(&snapshot.diagnostics);
     }
 
@@ -2933,7 +2927,6 @@ impl TuiState {
         let provisional = self.provisional.as_ref()?;
         Some(SessionSnapshot {
             title: provisional.prompt.text.trim().to_owned(),
-            emoji: None,
             session: crate::protocol::Session {
                 context_fill: None,
                 id: provisional.session_id,

@@ -363,18 +363,13 @@ fn apply_update(
             }
             Ok(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
         }
-        SessionCatalogChange::TitleChanged {
-            session_id,
-            title,
-            emoji,
-        } => {
+        SessionCatalogChange::TitleChanged { session_id, title } => {
             if !known.contains(&session_id) {
                 bail!("Session catalog retitled an unknown Session");
             }
             Ok(ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id,
                 title,
-                emoji,
             }))
         }
         SessionCatalogChange::SettlementChanged {

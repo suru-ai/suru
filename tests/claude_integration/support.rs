@@ -585,16 +585,15 @@ pub fn errand_preamble(envelope: &str) -> String {
     errand_arm(&format!(r#"printf '%s\n' '{envelope}'"#))
 }
 
-/// A print-mode envelope answering an Errand with `title` and `emoji`, in the shape the CLI shapes
-/// a schema-validated answer into: the prose in `result`, and the parsed answer beside it.
-pub fn derived_title_envelope(title: &str, emoji: &str) -> String {
+/// A print-mode envelope answering an Errand with `title`, in the shape the CLI shapes a
+/// schema-validated answer into: the prose in `result`, and the parsed answer beside it.
+pub fn derived_title_envelope(title: &str) -> String {
     format!(
         concat!(
             r#"{{"type":"result","subtype":"success","is_error":false,"#,
-            r#""result":"a title","structured_output":{{"title":"{title}","emoji":"{emoji}"}}}}"#,
+            r#""result":"a title","structured_output":{{"title":"{title}"}}}}"#,
         ),
         title = title,
-        emoji = emoji,
     )
 }
 

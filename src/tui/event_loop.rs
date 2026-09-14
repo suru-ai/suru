@@ -4324,7 +4324,6 @@ mod tests {
             application
                 .handle_event(ApplicationEvent::SessionAttached(SessionSnapshot {
                     title: String::new(),
-                    emoji: None,
                     session: Session {
                         checkout: None,
                         context_fill: None,
