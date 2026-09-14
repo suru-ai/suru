@@ -37,6 +37,11 @@ pub trait PreparationObserver: Send + Sync {
 
 #[async_trait]
 pub trait SourceControl: Send + Sync {
+    /// Observation point after a Reclaim candidate is selected and before its
+    /// Repository mutation guard is acquired. Adapters ordinarily do nothing;
+    /// deterministic Server tests use it to admit work in that race window.
+    async fn reclaim_candidate_observed(&self, _target: &crate::protocol::CheckoutRemovalTarget) {}
+
     async fn checkpoint(
         &self,
         _at: PreparationCheckpoint,
@@ -181,6 +186,12 @@ pub(crate) struct SourceControlService {
 }
 
 impl SourceControlService {
+    pub(crate) async fn reclaim_candidate_observed(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+    ) {
+        self.adapter.reclaim_candidate_observed(target).await;
+    }
     pub(crate) fn new(adapter: Arc<dyn SourceControl>) -> Self {
         Self {
             adapter,
@@ -641,6 +652,7 @@ impl SourceControlService {
                 resolved.checkouts.push(crate::protocol::CheckoutSummary {
                     association: crate::protocol::CheckoutAssociation {
                         recovery_revision: None,
+                        reclaim: None,
                         id: crate::protocol::CheckoutId::from_root(&id, &root),
                         repository: id,
                         root,

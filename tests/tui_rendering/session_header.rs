@@ -71,6 +71,7 @@ fn application_with_checkout_branch(
     let repository = RepositoryId::from_metadata("git", workspace);
     let association = CheckoutAssociation {
         recovery_revision: None,
+        reclaim: None,
         id: CheckoutId::from_root(&repository, workspace),
         repository,
         root: workspace.to_owned(),

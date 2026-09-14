@@ -49,6 +49,7 @@ impl Layout {
             .map(|(root, kind)| CheckoutSummary {
                 association: CheckoutAssociation {
                     recovery_revision: None,
+                    reclaim: None,
                     id: CheckoutId::from_root(&id, root),
                     repository: id.clone(),
                     root: root.clone(),
@@ -510,6 +511,7 @@ fn managed_worktrees_are_offered_by_their_leaf_name() {
         context.checkouts.push(CheckoutSummary {
             association: CheckoutAssociation {
                 recovery_revision: None,
+                reclaim: None,
                 id: CheckoutId::from_root(&repository.id, &managed),
                 repository: repository.id.clone(),
                 root: managed,
@@ -948,6 +950,7 @@ fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckou
     let repository = location.workspace.repository.clone().unwrap();
     location.checkout = Some(CheckoutAssociation {
         recovery_revision: None,
+        reclaim: None,
         id: CheckoutId::from_root(&repository.id, &destination),
         repository: repository.id.clone(),
         root: destination.clone(),

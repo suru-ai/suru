@@ -1,4 +1,5 @@
 use super::*;
+use diesel::{Connection, RunQueryDsl, sqlite::SqliteConnection};
 
 #[derive(Clone)]
 struct ReclaimLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -175,6 +176,590 @@ async fn wait_for_branch(root: &Path, branch: &str, exists: bool) {
     })
     .await
     .unwrap_or_else(|_| panic!("{branch} existence never became {exists}"));
+}
+
+fn set_session_updated_at(config: &ServerConfig, session_ids: &[SessionId], updated_at: u64) {
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("database path is UTF-8"),
+    )
+    .expect("open the Session database");
+    for session_id in session_ids {
+        diesel::sql_query("UPDATE sessions SET updated_at = ? WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(updated_at).unwrap())
+            .bind::<diesel::sql_types::Text, _>(session_id.to_string())
+            .execute(&mut database)
+            .expect("backdate the Session");
+    }
+}
+
+async fn listed_session(descriptor: &RuntimeDescriptor, session_id: SessionId) -> SessionListItem {
+    reqwest::Client::new()
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<SessionListItem>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id() == session_id)
+        .expect("Session remains listed")
+}
+
+async fn wait_for_unavailable_reclaim_reason(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> String {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let listed = listed_session(descriptor, session_id).await;
+            if let SessionListItem::Readable(summary) = listed
+                && let Some(CheckoutSummary {
+                    availability: SourceControlAvailability::Unavailable { reason },
+                    ..
+                }) = summary.checkout_state
+                && reason.contains("Reclaim")
+            {
+                return reason;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("catalog reports the durable Reclaim reason")
+}
+
+async fn wait_for_reclaim_phase(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    phase: CheckoutReclaimPhase,
+) -> SessionSnapshot {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let snapshot = support::read_session(descriptor, session_id).await;
+            if snapshot
+                .session
+                .checkout
+                .as_ref()
+                .and_then(|checkout| checkout.reclaim.as_ref())
+                .is_some_and(|reclaim| reclaim.phase == phase)
+            {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Session persists the expected Reclaim phase")
+}
+
+struct DelayedAvailableObservation {
+    git: GitSourceControl,
+    delayed: AtomicBool,
+    captured: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for DelayedAvailableObservation {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+        let reading = self.git.observe(checkout).await;
+        if reading.availability == SourceControlAvailability::Available
+            && !self.delayed.swap(true, Ordering::SeqCst)
+        {
+            self.captured.notify_one();
+            self.release.notified().await;
+        }
+        reading
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
+struct ObservationDuringRemoval {
+    git: GitSourceControl,
+    captured: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    delivered: AtomicBool,
+    processed: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for ObservationDuringRemoval {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+        let reading = self.git.observe(checkout).await;
+        if checkout
+            .reclaim
+            .as_ref()
+            .is_some_and(|reclaim| reclaim.phase == CheckoutReclaimPhase::Removing)
+            && reading.availability == SourceControlAvailability::Available
+            && !self.delivered.swap(true, Ordering::SeqCst)
+        {
+            self.captured.notify_one();
+            self.release.notified().await;
+        } else if checkout
+            .reclaim
+            .as_ref()
+            .is_some_and(|reclaim| reclaim.phase == CheckoutReclaimPhase::Removed)
+            && self.delivered.load(Ordering::SeqCst)
+        {
+            // Reaching the next tick proves the delayed result was handed to
+            // the Session store before this fresh missing-path observation.
+            self.processed.notify_one();
+        }
+        reading
+    }
+
+    async fn recover_checkout(
+        &self,
+        repository: &Repository,
+        checkout: &CheckoutAssociation,
+    ) -> Result<CheckoutRecovery, String> {
+        self.git.recover_checkout(repository, checkout).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.captured.notified().await;
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn an_unsettled_session_idle_past_the_threshold_is_reclaimed() {
+    let layout = ReclaimLayout::new("idle-unsettled");
+    layout.pin("1");
+    let config = layout.server_config("reclaim-idle-unsettled");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    assert_eq!(
+        listed_session(server.descriptor(), session.session.id)
+            .await
+            .settled_at(),
+        None
+    );
+    server.shutdown().await.unwrap();
+    set_session_updated_at(&config, &[session.session.id], 0);
+
+    let stale = Arc::new(DelayedAvailableObservation {
+        git: GitSourceControl::default(),
+        delayed: AtomicBool::new(false),
+        captured: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let (runtime, _provider) = ControlledProvider::new();
+    let first_restart = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime],
+        timings().with_checkout_observation_interval(Duration::from_millis(5)),
+        stale.clone(),
+    )
+    .await
+    .unwrap();
+    let (_ids, _catalog) =
+        support::open_catalog_stream_with_snapshot(first_restart.descriptor()).await;
+    timeout(PROGRESS_DEADLINE, stale.captured.notified())
+        .await
+        .expect("capture an Available observation before Reclaim");
+    first_restart.workspace_discovery_settled().await;
+    wait_for_path(&layout.managed, false).await;
+    stale.release.notify_one();
+    let retained = listed_session(first_restart.descriptor(), session.session.id).await;
+    assert_eq!(
+        retained.settled_at(),
+        None,
+        "Reclaim does not settle a Session"
+    );
+    assert_eq!(
+        retained.updated_at(),
+        SessionTimestamp(0),
+        "Reclaim does not count as Session activity"
+    );
+    let reason =
+        wait_for_unavailable_reclaim_reason(first_restart.descriptor(), session.session.id).await;
+    assert!(reason.contains("1 day"), "threshold is named: {reason}");
+    first_restart.shutdown().await.unwrap();
+
+    let (runtime, mut provider) = ControlledProvider::new();
+    let recovered = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    let (_ids, _catalog) = support::open_catalog_stream_with_snapshot(recovered.descriptor()).await;
+    assert!(
+        wait_for_unavailable_reclaim_reason(recovered.descriptor(), session.session.id)
+            .await
+            .contains("1 day"),
+        "the Reclaim cause survives restart and fresh observation"
+    );
+    assert_success(
+        admit(
+            recovered.descriptor(),
+            session.session.id,
+            prompt("Resume from the retained branch tip"),
+        )
+        .await,
+    )
+    .await;
+    let _resumed = restarted(&mut provider, &layout.managed).await;
+    assert_eq!(
+        read_git(&layout.managed, &["branch", "--show-current"]),
+        "suru/idle-unsettled"
+    );
+    let history = support::read_session_until(
+        &reqwest::Client::new(),
+        recovered.descriptor(),
+        session.session.id,
+        "recovered Turn completes",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(history.prompts[0].text, "Original history");
+    recovered.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn latest_session_activity_and_a_live_numeric_threshold_govern_shared_idle_reclaim() {
+    let layout = ReclaimLayout::new("latest-session");
+    layout.pin("2");
+    let config = layout.server_config("reclaim-latest-session");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (old, _old_connection) = open(&server, &mut provider, &layout.managed).await;
+    let (recent, _recent_connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    set_session_updated_at(&config, &[old.session.id], 0);
+    set_session_updated_at(
+        &config,
+        &[recent.session.id],
+        now.saturating_sub(36 * 60 * 60 * 1_000),
+    );
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    restarted.workspace_discovery_settled().await;
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 2).await;
+    assert!(
+        layout.managed.is_dir(),
+        "the latest sibling is inside the two-day threshold"
+    );
+    reqwest::Client::new()
+        .post(format!("{}/v1/settings", restarted.descriptor().base_url))
+        .bearer_auth(&restarted.descriptor().token)
+        .json(&SettingMutation::WorktreeAutoReclaim {
+            value: Some(AutoReclaim::AfterDays(1)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    wait_for_path(&layout.managed, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_observation_started_during_idle_reclaim_cannot_replace_detached_recovery() {
+    let layout = ReclaimLayout::new("idle-merged");
+    layout.pin("1");
+    let base = read_git(&layout.main, &["rev-parse", "main"]);
+    git(
+        &layout.main,
+        &["config", "branch.suru/idle-merged.suru-base", &base],
+    );
+    git(
+        &layout.main,
+        &["config", "branch.suru/idle-merged.suru-base-branch", "main"],
+    );
+    std::fs::write(layout.managed.join("tracked"), "merged managed work").unwrap();
+    git(&layout.managed, &["add", "."]);
+    commit(&layout.managed, "managed work merged into base");
+    let merged_commit = read_git(&layout.managed, &["rev-parse", "HEAD"]);
+    git(&layout.main, &["merge", "--ff-only", "suru/idle-merged"]);
+    let config = layout.server_config("reclaim-idle-merged");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    set_session_updated_at(&config, &[session.session.id], 0);
+
+    let source_control = Arc::new(ObservationDuringRemoval {
+        git: GitSourceControl::default(),
+        captured: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        delivered: AtomicBool::new(false),
+        processed: tokio::sync::Notify::new(),
+    });
+    let (runtime, mut provider) = ControlledProvider::new();
+    let running = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings().with_checkout_observation_interval(Duration::from_millis(5)),
+        source_control.clone(),
+    )
+    .await
+    .unwrap();
+    let (_ids, _catalog) = support::open_catalog_stream_with_snapshot(running.descriptor()).await;
+    wait_for_path(&layout.managed, false).await;
+    wait_for_branch(&layout.main, "refs/heads/suru/idle-merged", false).await;
+    wait_for_reclaim_phase(
+        running.descriptor(),
+        session.session.id,
+        CheckoutReclaimPhase::Removed,
+    )
+    .await;
+    source_control.release.notify_one();
+    timeout(PROGRESS_DEADLINE, source_control.processed.notified())
+        .await
+        .expect("the stale Available reading is recorded before another observation tick");
+    let retained = support::read_session(running.descriptor(), session.session.id).await;
+    let reclaim = retained
+        .session
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.reclaim.as_ref())
+        .expect("the completed Reclaim cause survives the stale Available reading");
+    assert_eq!(reclaim.phase, CheckoutReclaimPhase::Removed);
+    assert!(reclaim.reason.contains("1 day"));
+    assert!(matches!(
+        retained
+            .session
+            .checkout
+            .and_then(|checkout| checkout.recovery_revision),
+        Some(CheckoutRevision::Detached { ref commit }) if commit == &merged_commit
+    ));
+    assert_success(
+        admit(
+            running.descriptor(),
+            session.session.id,
+            prompt("Recover the merged Reclaimed worktree"),
+        )
+        .await,
+    )
+    .await;
+    let _resumed = restarted(&mut provider, &layout.managed).await;
+    assert_eq!(read_git(&layout.managed, &["branch", "--show-current"]), "");
+    assert_eq!(
+        read_git(&layout.managed, &["rev-parse", "HEAD"]),
+        merged_commit
+    );
+    let history = support::read_session_until(
+        &reqwest::Client::new(),
+        running.descriptor(),
+        session.session.id,
+        "detached recovery Turn completes",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(history.prompts[0].text, "Original history");
+    running.shutdown().await.unwrap();
+}
+
+struct PauseAfterCandidateObservation {
+    git: GitSourceControl,
+    paused: AtomicBool,
+    inspected: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for PauseAfterCandidateObservation {
+    async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
+        if !self.paused.swap(true, Ordering::SeqCst) {
+            self.inspected.notify_one();
+            self.resume.notified().await;
+        }
+    }
+
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn candidate_admission_leaving_a_surviving_subagent_is_rechecked_before_removal() {
+    let layout = ReclaimLayout::new("working-race");
+    layout.pin("1");
+    let config = layout.server_config("reclaim-working-race");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    set_session_updated_at(&config, &[session.session.id], 0);
+
+    let adapter = Arc::new(PauseAfterCandidateObservation {
+        git: GitSourceControl::default(),
+        paused: AtomicBool::new(false),
+        inspected: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let (runtime, mut provider) = ControlledProvider::new();
+    let running =
+        server::spawn_with_source_control(config, vec![runtime], timings(), adapter.clone())
+            .await
+            .unwrap();
+    timeout(PROGRESS_DEADLINE, adapter.inspected.notified())
+        .await
+        .expect("Reclaim observes the idle candidate");
+    assert_success(
+        admit(
+            running.descriptor(),
+            session.session.id,
+            prompt("Become Working before guarded removal"),
+        )
+        .await,
+    )
+    .await;
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("admitted Prompt starts its Provider");
+    let mut connection = start.succeed(identity());
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
+        .await
+        .expect("admitted Prompt reaches the Provider")
+        .succeed();
+    let child = suru::provider::ProviderSubagentId::new("reclaim-race-child");
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: child,
+            name: "Protect checkout".into(),
+            description: "Survive the parent Turn".into(),
+        })
+        .await;
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    support::read_session_until(
+        &reqwest::Client::new(),
+        running.descriptor(),
+        session.session.id,
+        "parent Turn settles while its Subagent survives",
+        |snapshot| {
+            snapshot
+                .turns
+                .last()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+                && snapshot.session.working_since.is_some()
+        },
+    )
+    .await;
+    assert!(
+        listed_session(running.descriptor(), session.session.id)
+            .await
+            .working_since()
+            .is_some(),
+        "the surviving Subagent keeps its parent Working before guarded removal"
+    );
+    adapter.resume.notify_one();
+    tokio::time::sleep(RECLAIM_INTERVAL * 3).await;
+    assert!(
+        layout.managed.is_dir(),
+        "the last-moment Working check protects the checkout"
+    );
+    running.shutdown().await.unwrap();
 }
 
 #[tokio::test]

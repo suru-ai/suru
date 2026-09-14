@@ -22,6 +22,7 @@ use crate::storage::{DeferredSessions, RestoredSessions, StorageSink, StoredResu
 
 mod catalog;
 mod checkouts;
+pub(crate) use checkouts::CheckoutActivity;
 mod emoji;
 mod hydration;
 mod output;

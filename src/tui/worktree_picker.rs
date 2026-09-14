@@ -116,6 +116,7 @@ mod tests {
             .map(|name| CheckoutSummary {
                 association: CheckoutAssociation {
                     recovery_revision: None,
+                    reclaim: None,
                     id: CheckoutId::from_root(&repository, &root(name)),
                     repository: repository.clone(),
                     root: root(name),

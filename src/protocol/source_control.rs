@@ -115,12 +115,41 @@ pub enum CheckoutKind {
     Linked,
 }
 
+/// Identity of one unattended Worktree removal attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ReclaimOperationId(pub uuid::Uuid);
+impl Default for ReclaimOperationId {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+/// The durable boundary an observation must have begun after to clear Reclaim.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutReclaimPhase {
+    Removing,
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckoutReclaim {
+    pub operation_id: ReclaimOperationId,
+    pub phase: CheckoutReclaimPhase,
+    pub reason: String,
+}
+
 /// Durable association, not a Session-owned working copy or historical branch.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckoutAssociation {
     /// Latest successful reading for recovery; never a live display value.
     #[serde(default)]
     pub recovery_revision: Option<CheckoutRevision>,
+    /// Durable unattended-removal state. Only an Available observation begun
+    /// after `Removed` may clear it.
+    #[serde(default)]
+    pub reclaim: Option<CheckoutReclaim>,
     pub id: CheckoutId,
     pub repository: RepositoryId,
     pub root: PathBuf,

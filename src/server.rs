@@ -2356,7 +2356,7 @@ async fn admit_prompt(
                 }
             };
             if let Some(reading) = lease.reading.clone()
-                && let Err(error) = state.sessions.record_checkout(reading)
+                && let Err(error) = state.sessions.record_execution_checkout(reading)
             {
                 return preparation_error(format!(
                     "Cannot persist current checkout recovery facts: {error}"

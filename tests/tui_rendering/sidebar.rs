@@ -9318,6 +9318,7 @@ fn active_checkout_line_uses_live_branch_detachment_and_explicit_unavailability(
             name: "stale-recovery".into(),
             commit: None,
         }),
+        reclaim: None,
     };
     for (revision, availability, expected) in [
         (
@@ -9417,6 +9418,7 @@ fn remote_checkout_line_keeps_its_origin_label_without_a_main_indicator() {
             root: workspace.path().to_owned(),
             kind: CheckoutKind::Main,
             recovery_revision: None,
+            reclaim: None,
         },
         revision: Some(CheckoutRevision::Branch {
             name: "remote-branch".into(),

@@ -971,6 +971,7 @@ impl SourceControl for GitSourceControl {
                 .map(|checkout| checkout.association.clone())
                 .unwrap_or_else(|| CheckoutAssociation {
                     recovery_revision: None,
+                    reclaim: None,
                     id: CheckoutId::from_root(&id, &top),
                     repository: id.clone(),
                     root: top,
@@ -1052,6 +1053,7 @@ fn listed_checkouts(
             };
             let association = CheckoutAssociation {
                 recovery_revision: None,
+                reclaim: None,
                 id: CheckoutId::from_root(repository, &root),
                 repository: repository.clone(),
                 root,

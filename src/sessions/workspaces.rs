@@ -125,11 +125,15 @@ impl SessionStore {
             return Ok(());
         };
         if let Some(checkout) = &mut checkout
-            && checkout.recovery_revision.is_none()
             && let Some(previous) = &record.snapshot.session.checkout
             && previous.id == checkout.id
         {
-            checkout.recovery_revision = previous.recovery_revision.clone();
+            if checkout.recovery_revision.is_none() {
+                checkout.recovery_revision = previous.recovery_revision.clone();
+            }
+            if checkout.reclaim.is_none() {
+                checkout.reclaim = previous.reclaim.clone();
+            }
         }
         if record.snapshot.session.workspace == workspace
             && record.snapshot.session.checkout == checkout

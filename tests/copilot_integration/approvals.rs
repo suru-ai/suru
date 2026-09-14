@@ -303,7 +303,8 @@ async fn native_permission_families_keep_their_typed_detail_and_all_decisions() 
 #[tokio::test]
 async fn a_child_approval_outlives_parent_idle_and_child_completion_cannot_erase_its_decision() {
     let copilot = fixture(
-        r#"      agent_event s agent-1 subagent.started '{"toolCallId":"spawn","agentName":"worker","agentDisplayName":"Worker","agentDescription":"Do child work"}'
+        r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      agent_event s agent-1 subagent.started '{"toolCallId":"spawn","agentName":"worker","agentDisplayName":"Worker","agentDescription":"Do child work"}'
       agent_event p agent-1 permission.requested '{"requestId":"child","permissionRequest":{"kind":"read","toolCallId":"child-tool","path":"child.txt","intention":"Child read"}}'
       event idle session.idle '{}'
 "#,
@@ -317,6 +318,7 @@ async fn a_child_approval_outlives_parent_idle_and_child_completion_cannot_erase
         "Delegate",
     )
     .await;
+    copilot.release();
     let parent = live
         .wait_for("parent settles while child remains", |snapshot| {
             snapshot.turns[0].status == TurnStatus::Completed
