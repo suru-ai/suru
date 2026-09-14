@@ -1,0 +1,18 @@
+# Reclaim idle Managed Worktrees automatically
+
+The Git Worktree lifecycle spec (#302) made Worktree removal an explicit, user-confirmed act and put automatic deletion out of scope, on the grounds that a background task deleting directories is how work gets lost. In practice Managed Worktrees accumulate faster than anyone removes them, and a Repository's observation loop keeps reading every one of them each tick. We decided the Server may Reclaim a Managed Worktree unattended, provided the rule is narrow enough that a Reclaim can never destroy anything that is not reproducible: it removes only what `git worktree remove` would remove without force, plus ignored files, and it refuses a Worktree that is Working, holds tracked changes, untracked files, or initialized submodules, or carries a Git lock Suru did not place. Reclaim is governed by one Server Setting, `worktree.autoReclaim`, a scalar holding `off` or a day count, in the Source Control group, defaulting to 14 days with a minimum of 1; `off` disables every kind of Reclaim.
+
+## Considered Options
+
+- **Keep removal explicit and only surface Reclaimable Worktrees for the user to confirm**: rejected because it relieves none of the accumulation for a user who never opens the list, which is the user the feature exists for.
+- **An on-demand command that lists and removes candidates**: rejected for the same reason; the problem is forgetting, and a command must be remembered.
+- **Reclaim orphans only, leaving Worktrees with living Sessions alone**: rejected because the felt mess is Worktrees whose Sessions still exist and were simply abandoned. Those Sessions keep their histories and recover the Worktree on their next Prompt, so the cost of a wrong guess is a recovery, not a loss.
+- **Force-remove like the reference implementation**: rejected outright. t3-code's only removal path runs `git worktree remove --force` and never checks for unpushed commits; the narrow rule above is the price of doing this without a confirmation.
+
+## Consequences
+
+Three populations are Reclaimable, each on its own clock. A Managed Worktree no Session references any longer is Reclaimed on first observation with no age, and eagerly when the last Session in it is deleted, since a Repository with no Sessions left is one the Server no longer visits. A Worktree whose every Session is idle is Reclaimed once the latest `updated_at` across those Sessions is older than the threshold; `settled_at` alone would never expire a forgotten, unsettled Session. A Worktree left by a failed preparation is Reclaimed once its intent is older than the threshold, retiring the intent and any withheld Prompt, whose first line the log quotes.
+
+The branch is retained unless fully merged into its base, which is why the source commit is now recorded as `branch.<name>.suru-base` in Git config at claim time; the preparation intent that held it does not outlive the Worktree, and the branch does. Managed Worktrees created before that record exists keep their branch. Explicit removal adopts the same merged-branch rule and previews it, so the two removal paths agree.
+
+A dedicated sweep runs once after startup discovery completes and then hourly, with both timings injectable through `ServerTimings`, rather than on the one-second checkout observation loop, which bails without a catalog subscriber and would leave an unattended Server never reclaiming. Removal failures log and retry on the next sweep. Affected Sessions are left unsettled with the checkout marked Unavailable and a reason naming the Reclaim; there is no notice beyond the log line and the Sidebar's checkout state. `git worktree lock` is the documented way to keep a Managed Worktree indefinitely.

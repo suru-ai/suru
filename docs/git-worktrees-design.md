@@ -11,7 +11,7 @@ Confirmed design expanding [#169](https://github.com/jake-tucker/suru/issues/169
 - Git is the only source control implementation in scope. Keep integration boundaries open to future systems such as Mercurial and Jujutsu, with operations represented as optional capabilities where appropriate.
 - Worktrees are shared places, not owned by individual Sessions. A new Session may use the current Worktree, another existing one, or a newly created one; isolation is explicit.
 - A Session's Execution Directory is fixed after its first Turn. Working in another directory starts another Session; external branch changes within the same directory remain possible.
-- Settling or deleting a Session never removes a Worktree. Removal is a separate explicit action.
+- Settling or deleting a Session never removes a Worktree. Removal is a separate explicit action, or a Reclaim the Server performs on its own terms under ADR 0027.
 - Sidebar rows show live Checkout State, so Sessions sharing a Worktree show the same current branch, with a main/linked Worktree indicator. Detached Worktrees show a short commit ID and unavailable Worktrees are marked explicitly. Historical branch tracking is outside this scope.
 - Directories outside supported source control leave the Sidebar's checkout line blank. A known Repository whose state cannot be read is shown as unavailable rather than mistaken for a directory without source control.
 - Workspace selection restores the last Execution Directory per Client, Server, and Workspace, defaulting to the main Worktree when none is remembered. Launching Suru preserves the launch directory. A separate Worktree Selector on the Landing chooses another checkout at its root; subdirectory selection remains explicit.
