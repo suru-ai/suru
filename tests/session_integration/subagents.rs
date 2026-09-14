@@ -1014,7 +1014,7 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
     fixture
         .provider_session
         .emit_attributed_and_wait_until_observed(
-            ProviderEventAttribution::Subagent(subagent),
+            ProviderEventAttribution::Subagent(subagent.clone()),
             ProviderEvent::SubagentStarted {
                 subagent_id: ProviderSubagentId::new("task-2"),
                 name: "Plan".to_owned(),
@@ -1053,7 +1053,7 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
     };
     let grandchild_id = *grandchild_id;
 
-    let deleted = fixture
+    let refused = fixture
         .client
         .delete(format!(
             "{}/v1/sessions/{}",
@@ -1064,6 +1064,67 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
         .send()
         .await
         .expect("delete parent Session");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let error = refused
+        .json::<SessionError>()
+        .await
+        .expect("decode Working deletion refusal");
+    assert_eq!(error.code, SessionErrorCode::WorkingSession);
+    for surviving in [fixture.session_id, child_id, grandchild_id] {
+        let read = fixture
+            .client
+            .get(format!(
+                "{}/v1/sessions/{surviving}",
+                fixture.server.descriptor().base_url
+            ))
+            .bearer_auth(&fixture.server.descriptor().token)
+            .send()
+            .await
+            .expect("read Session after refused deletion");
+        assert_eq!(read.status(), StatusCode::OK);
+    }
+
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(subagent.clone()),
+            ProviderEvent::SubagentCompleted {
+                subagent_id: ProviderSubagentId::new("task-2"),
+                status: ProviderSubagentStatus::Completed,
+            },
+        )
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the whole subtree stops Working",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+
+    let deleted = fixture
+        .client
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            fixture.server.descriptor().base_url,
+            fixture.session_id,
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("delete idle parent Session");
     assert!(
         deleted.status().is_success(),
         "deletion succeeds: {}",

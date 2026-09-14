@@ -28,9 +28,10 @@ use tokio::time::{Duration, timeout};
 /// would be the wrong Title.
 const FIRST_PROMPT: &str = "the reasoning group flickers when a block settles mid-run";
 
-/// What the Session's own Turn plays: nothing. These tests are about the Errand beside the Turn,
-/// not the Turn.
-const SILENT_TIMELINE: &str = "      :\n";
+/// What the Session's own Turn plays: a terminal result with no visible content. These tests are
+/// about the Errand beside the Turn, but their cleanup still waits for Working to finish.
+const SILENT_TIMELINE: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"result":"","terminal_reason":"completed","session_id":"prov-session"}'
+"#;
 
 /// The Agent Selection the Session converses under, chosen outright so the Model an Errand runs at
 /// is legibly not the Model the Session itself uses.
@@ -106,6 +107,23 @@ async fn errand_reaches_the_cli(claude: &ScriptedClaude) {
     })
     .await
     .expect("the Errand reaches the CLI");
+}
+
+async fn session_finishes_working(client: &ManagedClient, session_id: SessionId) {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let session = client
+                .read_session(session_id)
+                .await
+                .expect("read the Session while its silent Turn finishes");
+            if session.session.working_since.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the silent Session Turn finishes");
 }
 
 /// A Session opened on Claude is retitled by an Errand Claude ran through its own print mode: the
@@ -234,6 +252,7 @@ async fn a_failed_claude_errand_leaves_the_prompt_derived_title_standing() {
     // The Errand reaches the CLI and is refused there, so the failure is one Suru met rather than
     // one it never asked for.
     errand_reaches_the_cli(&claude).await;
+    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -265,6 +284,7 @@ async fn a_claude_errand_that_is_never_answered_leaves_the_prompt_derived_title_
     .await;
 
     errand_reaches_the_cli(&claude).await;
+    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -294,6 +314,7 @@ async fn a_claude_errand_whose_cli_dies_leaves_the_prompt_derived_title_standing
     .await;
 
     errand_reaches_the_cli(&claude).await;
+    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,

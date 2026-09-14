@@ -137,6 +137,23 @@ async fn connected_client(state_dir: &std::path::Path, channel: &str) -> Managed
     client
 }
 
+async fn finish_initial_turn(provider: &mut ControlledProvider) {
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("the Session reaches its Provider");
+    let mut session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: hosted_selection(PROVIDER, MODEL),
+    });
+    timeout(PROGRESS_DEADLINE, session.next_turn())
+        .await
+        .expect("the initial Turn reaches its Provider")
+        .succeed();
+    session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+}
+
 #[tokio::test]
 async fn an_answered_errand_updates_the_open_session_title_and_emoji() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -431,6 +448,7 @@ async fn a_failed_errand_leaves_the_prompt_derived_title_standing() {
         ("Explain the seam".to_owned(), None),
         "the Prompt-derived Title stands and no Emoji is invented"
     );
+    finish_initial_turn(&mut provider).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -471,6 +489,7 @@ async fn an_errand_that_never_answers_leaves_the_prompt_derived_title_standing()
         listed_title(&client, session_id).await,
         ("Explain the seam".to_owned(), None)
     );
+    finish_initial_turn(&mut provider).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -510,6 +529,7 @@ async fn an_errand_answering_outside_its_schema_yields_no_partial_title() {
         ("Explain the seam".to_owned(), None),
         "a reply Suru cannot read is discarded whole rather than half-applied"
     );
+    finish_initial_turn(&mut provider).await;
     assert_no_title_reaches(
         &mut client,
         session_id,

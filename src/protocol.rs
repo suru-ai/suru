@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 57;
+pub const PROTOCOL_VERSION: u32 = 58;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -3124,6 +3124,9 @@ pub enum SessionErrorCode {
     InvalidWorkspace,
     SessionNotFound,
     SubagentSession,
+    /// Deletion was refused because this Session or a Subagent below it is
+    /// still Working.
+    WorkingSession,
     PromptConflict,
     PromptNotFound,
     PromptNotPending,

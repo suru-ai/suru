@@ -1032,7 +1032,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
 }
 
 #[tokio::test]
-async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
+async fn a_provider_actor_ending_settles_the_command_it_left_in_flight() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = ControlledProvider::new();
@@ -1112,10 +1112,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
     .await
     .expect("command output reaches the Session");
 
-    client
-        .delete_session(session_id)
-        .await
-        .expect("delete the Session its Provider actor still owns");
+    drop(provider_session);
 
     let settle_changes = timeout(PROGRESS_DEADLINE, async {
         let mut changes = Vec::new();
@@ -1146,7 +1143,7 @@ async fn stopping_a_provider_actor_settles_the_command_it_left_in_flight() {
                     content: "progress 90%".to_owned(),
                 }
         })
-        .expect("the pending output line is stored before the Session goes away");
+        .expect("the pending output line is stored before the Provider actor ends");
     let settled_index = settle_changes
         .iter()
         .position(|change| {

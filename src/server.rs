@@ -2881,9 +2881,21 @@ async fn delete_session(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    state.providers.close_session(session_id).await;
     match state.sessions.delete(session_id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(deleted) => {
+            if let Some(repository) = deleted.repository {
+                reclaim::spawn_orphans(
+                    repository,
+                    state.sessions.clone(),
+                    state.source_control.clone(),
+                    state.preparations.clone(),
+                    state.settings.subscribe(),
+                    state.shutdown.provider_shutdown.subscribe(),
+                );
+            }
+            state.providers.close_session(session_id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(DeleteSessionError::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
@@ -2893,6 +2905,11 @@ async fn delete_session(
             StatusCode::CONFLICT,
             SessionErrorCode::SubagentSession,
             "A Subagent's Session is deleted with its parent",
+        ),
+        Err(DeleteSessionError::WorkingSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::WorkingSession,
+            "A Working Session or Subagent cannot be deleted",
         ),
         Err(DeleteSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

@@ -136,7 +136,17 @@ pub(crate) enum DeleteSessionError {
     /// deleting it directly would leave the parent's Transcript row naming a
     /// Session that no longer exists.
     SubagentSession,
+    /// Work is still running in the Session or one of its Subagents. The
+    /// whole subtree must survive together until that work finishes.
+    WorkingSession,
     Storage(String),
+}
+
+pub(crate) struct DeletedSession {
+    /// The Repository whose orphaned Managed Worktrees may now be Reclaimed.
+    /// A Session outside supported source control has no Repository pass to
+    /// run after deletion.
+    pub(crate) repository: Option<crate::protocol::Repository>,
 }
 
 impl SessionStore {
@@ -355,7 +365,10 @@ impl SessionStore {
         Ok(())
     }
 
-    pub(crate) fn delete(&self, session_id: SessionId) -> Result<(), DeleteSessionError> {
+    pub(crate) fn delete(
+        &self,
+        session_id: SessionId,
+    ) -> Result<DeletedSession, DeleteSessionError> {
         let mut state = self
             .state
             .lock()
@@ -372,6 +385,17 @@ impl SessionStore {
             }
             _ => {}
         }
+        let repository = state
+            .sessions
+            .get(&session_id)
+            .and_then(|record| record.summary.session.workspace.repository.clone())
+            .or_else(|| {
+                state
+                    .unreadable_sessions
+                    .get(&session_id)
+                    .and_then(|summary| summary.workspace.as_ref())
+                    .and_then(|workspace| workspace.repository.clone())
+            });
         // A Session's Subagent subtree shares its deletion, walked deepest
         // first so a failure partway leaves no child severed from the parent
         // that is its only way in. Only the named Session is announced,
@@ -401,6 +425,14 @@ impl SessionStore {
             }
             walk += 1;
         }
+        if doomed.iter().any(|doomed_id| {
+            state
+                .sessions
+                .get(doomed_id)
+                .is_some_and(|record| record.summary.session.working_since.is_some())
+        }) {
+            return Err(DeleteSessionError::WorkingSession);
+        }
         for doomed_id in doomed.iter().rev() {
             self.storage
                 .deleted(*doomed_id)
@@ -418,7 +450,7 @@ impl SessionStore {
             .prompts
             .retain(|_, owner| !doomed.contains(&owner.session_id));
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
-        Ok(())
+        Ok(DeletedSession { repository })
     }
 
     pub(crate) fn list(

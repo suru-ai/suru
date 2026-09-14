@@ -49,6 +49,7 @@ async fn wait_for_log(expectation: &str, matches: impl Fn(&str) -> bool) -> Stri
 
 const STARTUP_DELAY: Duration = Duration::from_millis(120);
 const RECLAIM_INTERVAL: Duration = Duration::from_millis(35);
+const EAGER_ONLY_DELAY: Duration = Duration::from_secs(60);
 
 struct ReclaimLayout {
     _temp: tempfile::TempDir,
@@ -112,6 +113,12 @@ fn timings() -> server::ServerTimings {
     server::ServerTimings::default()
         .with_worktree_reclaim_startup_delay(STARTUP_DELAY)
         .with_worktree_reclaim_interval(RECLAIM_INTERVAL)
+}
+
+fn eager_only_timings() -> server::ServerTimings {
+    server::ServerTimings::default()
+        .with_worktree_reclaim_startup_delay(EAGER_ONLY_DELAY)
+        .with_worktree_reclaim_interval(EAGER_ONLY_DELAY)
 }
 
 async fn spawn(layout: &ReclaimLayout, channel: &str) -> server::RunningServer {
@@ -679,6 +686,91 @@ struct PauseAfterCandidateObservation {
     resume: tokio::sync::Notify,
 }
 
+struct PauseEagerRemoval {
+    git: GitSourceControl,
+    reached_removal: tokio::sync::Notify,
+    release_removal: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for PauseEagerRemoval {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.reached_removal.notify_one();
+        self.release_removal.notified().await;
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
+struct CountReclaimCandidates {
+    git: GitSourceControl,
+    candidates: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for CountReclaimCandidates {
+    async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
+        self.candidates.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl SourceControl for PauseAfterCandidateObservation {
     async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
@@ -803,6 +895,323 @@ async fn candidate_admission_leaving_a_surviving_subagent_is_rechecked_before_re
         "the last-moment Working check protects the checkout"
     );
     running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_the_last_session_starts_reclaim_without_delaying_the_response() {
+    let layout = ReclaimLayout::new("eager-last-session");
+    let adapter = Arc::new(PauseEagerRemoval {
+        git: GitSourceControl::default(),
+        reached_removal: tokio::sync::Notify::new(),
+        release_removal: tokio::sync::Notify::new(),
+    });
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        layout.server_config("reclaim-eager-last-session"),
+        vec![runtime],
+        eager_only_timings(),
+        adapter.clone(),
+    )
+    .await
+    .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    let (_listed, mut catalog) =
+        support::open_catalog_stream_with_snapshot(server.descriptor()).await;
+
+    let deleted = timeout(
+        PROGRESS_DEADLINE,
+        reqwest::Client::new()
+            .delete(format!(
+                "{}/v1/sessions/{}",
+                server.descriptor().base_url,
+                session.session.id
+            ))
+            .bearer_auth(&server.descriptor().token)
+            .send(),
+    )
+    .await
+    .expect("DELETE response is independent of Reclaim")
+    .expect("delete the last Session");
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    timeout(PROGRESS_DEADLINE, adapter.reached_removal.notified())
+        .await
+        .expect("eager Reclaim reaches Git before the scheduled pass");
+    assert!(matches!(
+        crate::server_support::next_catalog_change_matching(&mut catalog, |change| {
+            matches!(
+                change,
+                SessionCatalogChange::Deleted { session_id }
+                    if *session_id == session.session.id
+            )
+        })
+        .await,
+        SessionCatalogChange::Deleted { session_id } if session_id == session.session.id
+    ));
+    assert!(
+        layout.managed.is_dir(),
+        "the response and published deletion arrived while Reclaim was still blocked"
+    );
+
+    adapter.release_removal.notify_one();
+    wait_for_path(&layout.managed, false).await;
+    assert!(
+        !read_git(
+            &layout.main,
+            &["rev-parse", "refs/heads/suru/eager-last-session"]
+        )
+        .is_empty(),
+        "the eager path applies the ordinary branch-retention rule"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_one_of_two_sessions_does_not_reclaim_their_worktree() {
+    let layout = ReclaimLayout::new("eager-siblings");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(
+        layout.server_config("reclaim-eager-siblings"),
+        runtime,
+        eager_only_timings(),
+    )
+    .await
+    .unwrap();
+    let (first, _first_connection) = open(&server, &mut provider, &layout.managed).await;
+    let (second, _second_connection) = open(&server, &mut provider, &layout.managed).await;
+
+    let first_deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            first.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        layout.managed.is_dir(),
+        "the surviving Session still references the Worktree"
+    );
+
+    let second_deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            second.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    wait_for_path(&layout.managed, false).await;
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn off_disables_eager_reclaim_after_the_last_session_is_deleted() {
+    let layout = ReclaimLayout::new("eager-off");
+    layout.pin(r#""off""#);
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(
+        layout.server_config("reclaim-eager-off"),
+        runtime,
+        eager_only_timings(),
+    )
+    .await
+    .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(layout.managed.is_dir(), "off disables the eager pass");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_eager_exclusion_is_retried_by_a_later_sweep() {
+    let layout = ReclaimLayout::new("eager-lock-retry");
+    git(
+        &layout.main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "reader pin",
+            layout.managed.to_str().unwrap(),
+        ],
+    );
+    let config = layout.server_config("reclaim-eager-lock-retry");
+    let adapter = Arc::new(CountReclaimCandidates {
+        git: GitSourceControl::default(),
+        candidates: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime],
+        eager_only_timings(),
+        adapter.clone(),
+    )
+    .await
+    .unwrap();
+    let (_main, _main_connection) = open(&server, &mut provider, &layout.main).await;
+    let (managed, _managed_connection) = open(&server, &mut provider, &layout.managed).await;
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            managed.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    timeout(PROGRESS_DEADLINE, async {
+        while adapter.candidates.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the eager pass observes the locked candidate");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        layout.managed.is_dir(),
+        "the external lock excludes Reclaim"
+    );
+    server.shutdown().await.unwrap();
+
+    git(
+        &layout.main,
+        &["worktree", "unlock", layout.managed.to_str().unwrap()],
+    );
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&layout.managed, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_working_subagent_refuses_delete_before_eager_reclaim_or_provider_shutdown() {
+    let layout = ReclaimLayout::new("eager-working-child");
+    let adapter = Arc::new(CountReclaimCandidates {
+        git: GitSourceControl::default(),
+        candidates: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        layout.server_config("reclaim-eager-working-child"),
+        vec![runtime],
+        eager_only_timings(),
+        adapter.clone(),
+    )
+    .await
+    .unwrap();
+    let session = support::create_session(
+        server.descriptor(),
+        &CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: ExecutionDirectory {
+                path: layout.managed.clone(),
+            },
+            prompt: prompt("Keep the child alive"),
+        },
+    )
+    .await;
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .unwrap();
+    let mut connection = start.succeed(identity());
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
+        .await
+        .unwrap()
+        .succeed();
+    let child = suru::provider::ProviderSubagentId::new("eager-working-child");
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: child.clone(),
+            name: "Protect checkout".into(),
+            description: "Survive the parent Turn".into(),
+        })
+        .await;
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    support::read_session_until(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session.session.id,
+        "the child keeps its parent Working",
+        |snapshot| snapshot.working_since().is_some(),
+    )
+    .await;
+
+    let refused = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<SessionError>().await.unwrap().code,
+        SessionErrorCode::WorkingSession
+    );
+    assert_eq!(adapter.candidates.load(Ordering::SeqCst), 0);
+    assert!(layout.managed.is_dir());
+
+    // The rejected delete did not close the Provider: its child can finish,
+    // clearing Working so the same Session can then be deleted.
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: child,
+            status: suru::provider::ProviderSubagentStatus::Completed,
+        })
+        .await;
+    support::read_session_until(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session.session.id,
+        "the child finishes",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            server.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    wait_for_path(&layout.managed, false).await;
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

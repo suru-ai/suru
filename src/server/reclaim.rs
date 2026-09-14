@@ -67,6 +67,36 @@ pub(super) fn spawn(
     });
 }
 
+/// Run the orphan population for the one Repository a successful Session
+/// deletion named. This task is deliberately detached from the DELETE
+/// response: Git refusal, a busy guard, and shutdown all leave a later sweep
+/// to retry without changing the completed Session operation.
+pub(super) fn spawn_orphans(
+    repository: Repository,
+    sessions: SessionStore,
+    source_control: SourceControlService,
+    preparations: PreparationStore,
+    settings: watch::Receiver<crate::protocol::SettingsSnapshot>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        if *shutdown.borrow() {
+            return;
+        }
+        let reclaimer = Reclaimer {
+            sessions,
+            source_control,
+            preparations,
+            settings,
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {}
+            _ = reclaimer.orphans(&repository) => {}
+        }
+    });
+}
+
 async fn run_pass_or_shutdown(reclaimer: &Reclaimer, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         biased;
@@ -128,17 +158,48 @@ impl Reclaimer {
                 .filter(|preparation| preparation.repository.id == repository.id)
                 .cloned()
                 .collect::<Vec<_>>();
-            self.reclaim_repository(repository, days, &repository_preparations)
-                .await;
+            self.reclaim_repository(
+                repository,
+                days,
+                &repository_preparations,
+                ReclaimPopulation::All,
+            )
+            .await;
         }
     }
 
-    /// One Repository pass, reusable by the later eager-on-delete rule.
+    async fn orphans(&self, repository: &Repository) {
+        let AutoReclaim::AfterDays(days) = self.settings.borrow().settings.worktree.auto_reclaim
+        else {
+            return;
+        };
+        let preparations = match self.preparations.all() {
+            Ok(preparations) => preparations
+                .into_iter()
+                .filter(|preparation| preparation.repository.id == repository.id)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(
+                    repository = %repository.presentation_path().display(),
+                    rule = "orphaned",
+                    "Managed Worktree Reclaim could not read preparation intents; will retry: {error}"
+                );
+                return;
+            }
+        };
+        self.reclaim_repository(repository, days, &preparations, ReclaimPopulation::Orphans)
+            .await;
+    }
+
+    /// One Repository pass shared by the scheduled and eager paths. The eager
+    /// path selects only orphans, so deleting a Session never accelerates an
+    /// idle or failed-preparation threshold.
     async fn reclaim_repository(
         &self,
         repository: &Repository,
         days: u64,
         preparations: &[crate::protocol::PreparedCheckout],
+        population: ReclaimPopulation,
     ) {
         let checkouts = match self.source_control.list_checkouts(repository).await {
             Ok(checkouts) => checkouts,
@@ -167,19 +228,24 @@ impl Reclaimer {
                 .collect::<Vec<_>>();
             let activity = self.sessions.checkout_activity(&checkout.id);
             let rule = if !unfinished.is_empty() {
-                if unfinished.iter().all(|plan| old(plan, days)) {
+                if population == ReclaimPopulation::All
+                    && unfinished.iter().all(|plan| old(plan, days))
+                {
                     ReclaimRule::FailedPreparation { days }
                 } else {
                     continue;
                 }
             } else if activity.affected == 0 {
                 ReclaimRule::Orphaned
-            } else if idle(activity, days) {
+            } else if population == ReclaimPopulation::All && idle(activity, days) {
                 ReclaimRule::Idle { days }
             } else {
                 continue;
             };
             self.reclaim(repository, checkout, rule).await;
+        }
+        if population == ReclaimPopulation::Orphans {
+            return;
         }
         for preparation in preparations.iter().filter(|plan| {
             plan.admitted_session.is_none()
@@ -531,6 +597,12 @@ impl Reclaimer {
             "Managed Worktree Reclaim failed; will retry: {error}"
         );
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReclaimPopulation {
+    All,
+    Orphans,
 }
 
 #[derive(Clone, Copy)]
