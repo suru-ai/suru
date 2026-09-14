@@ -23,6 +23,7 @@ pub enum PreparationCheckpoint {
     CheckoutCreated,
     SessionPersisted,
     Admitted,
+    IntentRetired,
 }
 
 #[async_trait]

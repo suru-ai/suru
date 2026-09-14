@@ -1,6 +1,12 @@
 use super::*;
 use crate::server_support::PROGRESS_DEADLINE;
-use suru::source_control::{GitSourceControl, SourceControl};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use suru::source_control::{
+    GitSourceControl, PreparationCheckpoint, PreparationObserver, SourceControl,
+};
 async fn target(path: &Path) -> CheckoutRemovalTarget {
     let resolved = GitSourceControl::default().discover(path).await;
     CheckoutRemovalTarget {
@@ -328,16 +334,27 @@ async fn removal_initialized_submodules_require_force_and_session_settlement_del
     server.shutdown().await.unwrap();
 }
 
-struct FailAfterCreation;
+struct FailOnceAt {
+    at: PreparationCheckpoint,
+    fired: AtomicBool,
+}
+impl FailOnceAt {
+    fn new(at: PreparationCheckpoint) -> Arc<Self> {
+        Arc::new(Self {
+            at,
+            fired: AtomicBool::new(false),
+        })
+    }
+}
 #[async_trait::async_trait]
-impl suru::source_control::PreparationObserver for FailAfterCreation {
+impl PreparationObserver for FailOnceAt {
     async fn checkpoint(
         &self,
-        at: suru::source_control::PreparationCheckpoint,
+        at: PreparationCheckpoint,
         _: &PreparedCheckout,
     ) -> Result<(), String> {
-        if at == suru::source_control::PreparationCheckpoint::CheckoutCreated {
-            Err("Destination preparation interrupted after checkout creation".into())
+        if self.at == at && !self.fired.swap(true, Ordering::SeqCst) {
+            Err(format!("Interrupted at {at:?}"))
         } else {
             Ok(())
         }
@@ -354,7 +371,7 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
         Default::default(),
         std::sync::Arc::new(
             GitSourceControl::default()
-                .with_preparation_observer(std::sync::Arc::new(FailAfterCreation)),
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::CheckoutCreated)),
         ),
     )
     .await
@@ -435,5 +452,127 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
     );
     assert!(relocated.join("nested/tracked").exists());
     assert!(!read_git(&layout.main, &["rev-parse", "refs/heads/topic"]).is_empty());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removal_retires_an_interrupted_admission_and_restart_keeps_its_prompt_cancelled() {
+    let layout = Layout::new();
+    let config = layout.config("removed-interrupted-admission");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        Default::default(),
+        Arc::new(
+            GitSourceControl::default().with_preparation_observer(FailOnceAt::new(
+                PreparationCheckpoint::SessionPersisted,
+            )),
+        ),
+    )
+    .await
+    .unwrap();
+    let prepared = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&PrepareCheckoutRequest {
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: layout.main.clone(),
+            },
+            description: "Remove interrupted admission".into(),
+            provider: ProviderId::new("controlled"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(prepared.error, None);
+    let initial_prompt = prompt("Withdraw before removing its Worktree");
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", server.descriptor().base_url))
+        .bearer_auth(&server.descriptor().token)
+        .json(&CreateSessionRequest {
+            preparation_id: Some(prepared.preparation.id),
+            agent_selection: None,
+            execution_directory: prepared.preparation.destination.clone(),
+            prompt: initial_prompt.clone(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(response.text().await.unwrap().contains("SessionPersisted"));
+    assert!(provider.try_next_start().is_none());
+    server.shutdown().await.unwrap();
+
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        Default::default(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::IntentRetired)),
+        ),
+    )
+    .await
+    .unwrap();
+    let restored =
+        support::read_session(server.descriptor(), prepared.preparation.intended_session).await;
+    assert_eq!(restored.prompts[0].id, initial_prompt.id);
+    assert_eq!(restored.prompts[0].status, PromptStatus::Pending);
+    assert!(provider.try_next_start().is_none());
+
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", prepared.preparation.id.0));
+    let retirement = config
+        .data_dir()
+        .join("retired-checkout-preparations")
+        .join(format!("{}.retired", prepared.preparation.id.0));
+    let prepared_target = target(&prepared.preparation.destination.path).await;
+    let facts = preview(&server, &prepared_target).await;
+    assert_eq!(facts.affected_sessions, 1);
+    assert!(remove(&server, facts, false).await.removed);
+    assert!(
+        intent.is_file(),
+        "the injected cleanup interruption preserves the source file"
+    );
+    assert!(
+        retirement.is_file(),
+        "the durable retirement marker makes the preserved source inert"
+    );
+    assert!(provider.try_next_start().is_none());
+    server.shutdown().await.unwrap();
+
+    let server = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        Default::default(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    let restored =
+        support::read_session(server.descriptor(), prepared.preparation.intended_session).await;
+    assert_eq!(restored.prompts[0].id, initial_prompt.id);
+    assert_eq!(restored.prompts[0].status, PromptStatus::Cancelled);
+    assert!(
+        !intent.exists(),
+        "restart reconciles retired intent metadata"
+    );
+    assert!(
+        !retirement.exists(),
+        "reconciliation also removes the retirement marker"
+    );
+    assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
 }

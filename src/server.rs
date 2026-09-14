@@ -1761,19 +1761,44 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
         if preview.working_sessions != 0 { return Err("A Session associated with this Worktree is Working on this Server; force cannot override it".to_owned()); }
         if preview != request.preview { return Err("Worktree conditions or affected Sessions changed; review the updated preview and confirm again".to_owned()); }
         if preview.inspection.requires_force() && !request.force { return Err("Git requires explicit force removal for these conditions; review and choose Force remove".to_owned()); }
+        let preparations = state.preparations.for_destination(&preview.target.checkout.root)?;
         state.sessions.record_checkout(preview.inspection.checkout.clone()).map_err(|e| format!("Cannot persist recovery facts before removal: {e}"))?;
         if state.sessions.checkout_references(&preview.target.checkout.id).1 != 0 {
             return Err("A Session became Working; Worktree removal is blocked".into());
         }
         state.source_control.remove_checkout(&preview.target, &preview.inspection, request.force).await?;
-        if let Err(error) = state
-            .preparations
-            .delete_for_destination(&preview.target.checkout.root)
-        {
-            tracing::warn!(
-                checkout = %preview.target.checkout.root.display(),
-                "Removed Worktree preparation intent could not be deleted: {error}"
-            );
+        for preparation in preparations {
+            if let Err(retire) = state.preparations.retire(preparation.id) {
+                let deleted = state.preparations.finish_retirement(preparation.id);
+                if let Err(delete) = deleted {
+                    tracing::warn!(
+                        checkout = %preview.target.checkout.root.display(),
+                        preparation = %preparation.id.0,
+                        "Removed Worktree preparation could not be retired: {retire}; {delete}"
+                    );
+                }
+                continue;
+            }
+            if let Err(error) = state
+                .source_control
+                .checkpoint(
+                    crate::source_control::PreparationCheckpoint::IntentRetired,
+                    &preparation,
+                )
+                .await
+            {
+                tracing::warn!(
+                    preparation = %preparation.id.0,
+                    "Retired Worktree preparation cleanup interrupted: {error}"
+                );
+                continue;
+            }
+            if let Err(error) = state.preparations.finish_retirement(preparation.id) {
+                tracing::warn!(
+                    preparation = %preparation.id.0,
+                    "Retired Worktree preparation cleanup will retry after restart: {error}"
+                );
+            }
         }
         state.sessions.record_checkout(crate::protocol::CheckoutSummary { association: preview.target.checkout.clone(), revision: None, availability: crate::protocol::SourceControlAvailability::Unavailable { reason: "Worktree was explicitly removed; prompt a retained Session to recover it".into() } }).map_err(|e| e.to_string())?;
         Ok::<_, String>(())

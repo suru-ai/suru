@@ -103,6 +103,12 @@ pub(super) enum PromptOrigin {
     Admission(PromptDelivery),
 }
 
+#[derive(Clone, Copy)]
+enum CreationRetry {
+    Ordinary,
+    Prepared,
+}
+
 /// The delivery a Prompt admitted right now would actually receive.
 ///
 /// A Steer joins the active Turn, but a Session running no Turn has nothing
@@ -219,35 +225,7 @@ impl SessionStore {
         &self,
         request: &CreateSessionRequest,
     ) -> Result<Option<SessionSnapshot>, CreateSessionError> {
-        let retry_execution_directory = {
-            let state = self
-                .state
-                .lock()
-                .expect("Session store lock is not poisoned");
-            let Some(owner) = state.prompts.get(&request.prompt.id) else {
-                return Ok(None);
-            };
-            if owner.matches_requested_creation(request) {
-                return Ok(Some(snapshot_for_owner(&state, owner)));
-            }
-            owner
-                .canonical_creation_directory(request)
-                .ok_or(CreateSessionError::PromptConflict)?
-        };
-        let execution_path = crate::paths::canonical(&request.execution_directory.path)
-            .map_err(|_| CreateSessionError::PromptConflict)?;
-        if execution_path != retry_execution_directory {
-            return Err(CreateSessionError::PromptConflict);
-        }
-        let state = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned");
-        let owner = state
-            .prompts
-            .get(&request.prompt.id)
-            .expect("Prompt owner remains indexed for the server lifetime");
-        Ok(Some(snapshot_for_owner(&state, owner)))
+        self.existing_creation_with(request, CreationRetry::Ordinary)
     }
 
     /// Finds an admitted Session after its Worktree preparation intent has
@@ -257,6 +235,14 @@ impl SessionStore {
     pub(crate) fn existing_prepared_creation(
         &self,
         request: &CreateSessionRequest,
+    ) -> Result<Option<SessionSnapshot>, CreateSessionError> {
+        self.existing_creation_with(request, CreationRetry::Prepared)
+    }
+
+    fn existing_creation_with(
+        &self,
+        request: &CreateSessionRequest,
+        retry: CreationRetry,
     ) -> Result<Option<SessionSnapshot>, CreateSessionError> {
         let canonical = {
             let state = self
@@ -268,13 +254,11 @@ impl SessionStore {
             };
             if owner.text != request.prompt.text
                 || owner.skill_invocations != request.prompt.skill_invocations
+                || matches!(retry, CreationRetry::Ordinary)
+                    && owner.agent_selection != request.agent_selection
             {
                 return Err(CreateSessionError::PromptConflict);
             }
-            let record = state
-                .sessions
-                .get(&owner.session_id)
-                .expect("Prompt owner always references its Session");
             match &owner.origin {
                 PromptOrigin::SessionCreation {
                     requested_execution_directory,
@@ -286,13 +270,19 @@ impl SessionStore {
                     canonical_execution_directory,
                     ..
                 } => canonical_execution_directory.clone(),
-                PromptOrigin::Admission(_)
-                    if record.snapshot.session.parent.is_none()
+                PromptOrigin::Admission(_) if matches!(retry, CreationRetry::Prepared) => {
+                    let record = state
+                        .sessions
+                        .get(&owner.session_id)
+                        .expect("Prompt owner always references its Session");
+                    if !(record.snapshot.session.parent.is_none()
                         && record.snapshot.prompts.iter().any(|prompt| {
                             prompt.id == request.prompt.id
                                 && prompt.admission_order == PromptOrder::INITIAL
-                        }) =>
-                {
+                        }))
+                    {
+                        return Err(CreateSessionError::PromptConflict);
+                    }
                     record.snapshot.session.execution_directory.path.clone()
                 }
                 PromptOrigin::Admission(_) => return Err(CreateSessionError::PromptConflict),
@@ -1107,19 +1097,6 @@ fn snapshot_for_owner(state: &SessionStoreState, owner: &PromptOwner) -> Session
 }
 
 impl PromptOwner {
-    fn matches_requested_creation(&self, request: &CreateSessionRequest) -> bool {
-        self.text == request.prompt.text
-            && self.skill_invocations == request.prompt.skill_invocations
-            && self.agent_selection == request.agent_selection
-            && matches!(
-                &self.origin,
-                PromptOrigin::SessionCreation {
-                    requested_execution_directory,
-                    ..
-                } if requested_execution_directory == &request.execution_directory.path
-            )
-    }
-
     fn canonical_creation_directory(&self, request: &CreateSessionRequest) -> Option<PathBuf> {
         if self.text != request.prompt.text
             || self.skill_invocations != request.prompt.skill_invocations
