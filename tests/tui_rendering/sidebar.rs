@@ -5399,11 +5399,12 @@ fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_
     let divider = sidebar_divider(&rows);
     assert!(rendered_row(&rows, "Studio older") < divider);
     assert!(divider < rendered_row(&rows, "Studio history"));
+    assert!(drawn_in_sidebar(&rows, "Studio history [studio]"));
     assert!(rendered_row(&rows, "Studio history") < rendered_row(&rows, "Local history"));
 }
 
 #[test]
-fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
+fn everywhere_prefixes_foreign_workspaces_independently_of_title_truncation() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
     let EverywhereListing { requests, .. } = choose_everywhere(
@@ -5430,16 +5431,16 @@ fn everywhere_tags_only_foreign_rows_and_keeps_the_tag_when_the_title_is_cut() {
     let rows = crate::support::buffer_rows(&buffer);
     let local = sidebar_column(&rows[rendered_row(&rows, "Local work")]);
     assert_eq!(local, "Local work", "local rows carry no Origin tag");
-    let foreign = sidebar_column(&rows[rendered_row(&rows, "[studio]")]);
-    assert!(
-        foreign.ends_with("[studio]") && !foreign.contains("truncate it"),
-        "the Title gives way before the Remote tag: {foreign:?}"
-    );
-    let (column, row) = text_position(&buffer, "[studio]");
+    let title_row = rendered_row(&rows, "A foreign Title");
+    let foreign = sidebar_column(&rows[title_row]);
+    assert!(!foreign.contains("[studio]") && !foreign.contains("truncate it"));
+    let location = sidebar_column(&rows[title_row - 1]);
+    assert!(location.starts_with("studio · remote"), "{location:?}");
+    let (column, row) = text_position(&buffer, "studio · remote");
     assert_eq!(
-        buffer.cell((column, row)).expect("the tag is drawn").fg,
+        buffer.cell((column, row)).expect("the Remote is drawn").fg,
         Color::DarkGray,
-        "the Remote's name is a dim tag"
+        "the Remote shares the Workspace's subdued style"
     );
 }
 
@@ -5565,7 +5566,7 @@ fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert_eq!(selector_label(&rows), format!("▸ {EVERYWHERE}"));
     assert!(drawn_in_sidebar(&rows, "Local work"));
-    assert!(drawn_in_sidebar(&rows, "Studio work [studio]"));
+    assert!(drawn_in_sidebar(&rows, "Studio work"));
     assert!(
         open_sidebar_text(&application).contains("Studio work"),
         "the open Title accent lands on the foreign row without repainting its Origin tag"
@@ -6140,7 +6141,7 @@ fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outl
     type_terminal_text(&mut application, "matching");
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(drawn_in_sidebar(&rows, "Matching local"));
-    assert!(drawn_in_sidebar(&rows, "Matching foreign [studio]"));
+    assert!(drawn_in_sidebar(&rows, "Matching foreign"));
     assert!(!drawn_in_sidebar(&rows, "Other local"));
     assert!(!drawn_in_sidebar(&rows, "Other foreign"));
     assert!(
@@ -6339,7 +6340,7 @@ fn a_remote_catalog_change_updates_only_that_origins_rows() {
     assert!(matches!(transition, ApplicationTransition::ListSessions(_)));
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(drawn_in_sidebar(&rows, "Local title"));
-    assert!(drawn_in_sidebar(&rows, "Retitled remotely [studio]"));
+    assert!(drawn_in_sidebar(&rows, "Retitled remotely"));
     assert!(!drawn_in_sidebar(&rows, "Remote title"));
 }
 
@@ -6631,7 +6632,7 @@ fn an_everywhere_initial_scope_launches_into_the_merged_listing() {
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert_eq!(selector_label(&rows), format!("▸ {EVERYWHERE}"));
     assert!(drawn_in_sidebar(&rows, "Local work"));
-    assert!(drawn_in_sidebar(&rows, "Studio work [studio]"));
+    assert!(drawn_in_sidebar(&rows, "Studio work"));
 }
 
 /// The reader's own choice is view state: it is not written back, and a later
@@ -9438,4 +9439,136 @@ fn remote_checkout_line_keeps_its_origin_label_without_a_main_indicator() {
     );
     assert!(!rows.iter().any(|row| row.contains(" · main")), "{rows:?}");
     assert!(rows.iter().any(|row| row.contains("studio")), "{rows:?}");
+}
+
+#[test]
+fn active_sidebar_icons_follow_the_setting_and_checkout_state() {
+    use suru::protocol::{
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
+        RepositoryId, SourceControlAvailability,
+    };
+    let workspace = workspace_dir();
+    let path = workspace.path().join("suru");
+    for (kind, revision, availability, plain, decorated) in [
+        (
+            CheckoutKind::Main,
+            Some(CheckoutRevision::Branch {
+                name: "main".into(),
+                commit: None,
+            }),
+            SourceControlAvailability::Available,
+            "main",
+            "\u{ec6f} main",
+        ),
+        (
+            CheckoutKind::Linked,
+            Some(CheckoutRevision::Branch {
+                name: "feature".into(),
+                commit: None,
+            }),
+            SourceControlAvailability::Available,
+            "feature (worktree)",
+            "\u{ec7e} feature",
+        ),
+        (
+            CheckoutKind::Linked,
+            Some(CheckoutRevision::Detached {
+                commit: "0123456789abcdef".into(),
+            }),
+            SourceControlAvailability::Available,
+            "0123456",
+            "\u{eafc} 0123456",
+        ),
+        (
+            CheckoutKind::Main,
+            None,
+            SourceControlAvailability::Unavailable {
+                reason: "missing".into(),
+            },
+            "[unavailable]",
+            "[unavailable]",
+        ),
+        (
+            CheckoutKind::Main,
+            None,
+            SourceControlAvailability::NotDetected,
+            "",
+            "",
+        ),
+    ] {
+        let repository = RepositoryId::from_metadata("git", &path);
+        let association = CheckoutAssociation {
+            id: CheckoutId::from_root(&repository, &path),
+            repository,
+            root: path.clone(),
+            kind,
+            recovery_revision: None,
+        };
+        let SessionListItem::Readable(mut summary) = listed("Icon work", None, &path, now(), now())
+        else {
+            unreachable!()
+        };
+        summary.session.checkout = Some(association.clone());
+        summary.checkout_state = Some(CheckoutSummary {
+            association,
+            revision,
+            availability,
+        });
+        let mut application = sidebar_showing(&path, vec![SessionListItem::Readable(summary)]);
+        for show_icons in [false, true, false] {
+            let mut settings = EffectiveSettings::default();
+            settings.appearance.show_icons = show_icons;
+            deliver_settings(&mut application, settings);
+            let rows = rendered_application_rows_at(&application, WIDE, 20);
+            let title = rendered_row(&rows, "Icon work");
+            assert!(
+                sidebar_column(&rows[title - 1]).starts_with(if show_icons {
+                    "\u{ea83} suru"
+                } else {
+                    "suru"
+                }),
+                "{rows:?}"
+            );
+            assert_eq!(sidebar_column(&rows[title]), "Icon work");
+            assert_eq!(
+                sidebar_column(&rows[title + 1]),
+                if show_icons { decorated } else { plain }
+            );
+        }
+    }
+}
+
+#[test]
+fn active_remote_location_keeps_its_name_with_icons_off_and_in_workspace_scope() {
+    let workspace = workspace_dir();
+    let path = workspace.path().join("suru");
+    let (mut application, _) = everywhere_with_studio(
+        workspace.path(),
+        vec![],
+        vec![listed("Remote icons", None, &path, now(), now())],
+    );
+    for workspace_scope in [false, true] {
+        if workspace_scope {
+            step_onto_the_list(&mut application);
+            press_sidebar_key(&mut application, KeyCode::Enter);
+            choose_workspace(&mut application, "suru");
+        }
+        for show_icons in [false, true, false] {
+            let mut settings = EffectiveSettings::default();
+            settings.appearance.show_icons = show_icons;
+            deliver_settings(&mut application, settings);
+            let rows = rendered_application_rows_at(&application, WIDE, 20);
+            let title = rendered_row(&rows, "Remote icons");
+            assert_eq!(sidebar_column(&rows[title]), "Remote icons");
+            let expected = if show_icons {
+                "\u{f0379} studio · \u{ea83} suru"
+            } else {
+                "studio · suru"
+            };
+            assert!(
+                sidebar_column(&rows[title - 1]).starts_with(expected),
+                "{rows:?}"
+            );
+        }
+    }
 }

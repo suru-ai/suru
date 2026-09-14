@@ -2774,6 +2774,7 @@ fn sidebar_entry_lines(
                 width,
                 driving,
                 theme,
+                state.settings().appearance.show_icons,
             )
             .to_vec(),
             SidebarShelf::Settled { ended_at } => {
@@ -2944,14 +2945,37 @@ fn sidebar_active_row_lines(
     width: usize,
     driving: bool,
     theme: &Theme,
+    show_icons: bool,
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
     let highlight = sidebar_row_style(row, driving, theme);
     let label_style = highlight.unwrap_or(theme.text.subdued);
+    let workspace = if workspace.is_empty() {
+        workspace
+    } else {
+        icon_label(show_icons, NF_COD_FOLDER, &workspace)
+    };
+    let location = row
+        .reference
+        .origin
+        .remote_name()
+        .map(|remote| icon_label(show_icons, NF_MD_MONITOR, remote))
+        .into_iter()
+        .chain((!workspace.is_empty()).then_some(workspace))
+        .collect::<Vec<_>>()
+        .join(" · ");
     [
-        sidebar_slotted_line(&workspace, label_style, &slot, width, highlight, theme),
-        sidebar_title_line(row, width, highlight, theme),
+        sidebar_slotted_line(&location, label_style, &slot, width, highlight, theme),
+        sidebar_title_line(
+            SidebarRow {
+                remote: None,
+                ..row
+            },
+            width,
+            highlight,
+            theme,
+        ),
         sidebar_plain_line(
-            &sidebar_checkout_label(row.shelf, width),
+            &sidebar_checkout_label(row.shelf, width, show_icons),
             width,
             highlight,
             theme.text.subdued,
@@ -2959,7 +2983,7 @@ fn sidebar_active_row_lines(
     ]
 }
 
-fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
+fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize, show_icons: bool) -> String {
     let SidebarShelf::Active {
         checkout_state: Some(reading),
         ..
@@ -2967,6 +2991,9 @@ fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize) -> String {
     else {
         return String::new();
     };
+    if show_icons {
+        return checkout_state_context(reading, true).unwrap_or_default();
+    }
     CheckoutStateLabel::read(reading)
         .map(|label| label.truncated(width))
         .unwrap_or_default()

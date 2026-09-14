@@ -28,3 +28,14 @@ This feature uses existing domain terms and the existing Setting model. No new g
 ## Validation
 
 The confirmed test boundaries are the existing settings/config integration tests and rendered TUI tests. They cover the Appearance panel, Config Document persistence and settings delivery, and the Landing and Session header presentations. Run focused tests during implementation and the full suite at completion.
+
+## Active Sidebar rows
+
+- The first line presents the Remote name, when present, followed by ` · ` and the Workspace name. Show the Remote in every scope, including a single Workspace, and retain these names and their placement when icons are disabled.
+- With **Show icons** enabled, prefix the Remote with the monitor icon and the Workspace with the folder icon, using the same spacing and colors as the Landing.
+- Remove the active row's Remote tag from its Title line. Settled rows retain their existing presentation.
+- The checkout line follows the Landing's icon rules: branch for a main Worktree, worktree for a linked branch, commit for detached state, and no icon for unavailable state. A worktree icon replaces `(worktree)`; with icons disabled, retain the suffix and its existing truncation behavior.
+- Keep status and age in the right slot, truncating the location from the right as needed. Icon widths count toward the available space.
+- Validate icons enabled and disabled, Remote placement across scopes, local rows, checkout states, and Title truncation with rendered Sidebar tests.
+
+These additions reuse existing domain terms and need no new ADR.
