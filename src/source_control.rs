@@ -88,6 +88,15 @@ pub trait SourceControl: Send + Sync {
         self.remove_checkout(target, inspection, false, branch_outcome)
             .await
     }
+    /// Retire adapter-owned evidence for a failed preparation after its
+    /// Worktree has been removed. Implementations must use exact ownership
+    /// proof and compare-and-swap deletion.
+    async fn retire_preparation(
+        &self,
+        _preparation: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        Err("Preparation ownership retirement is unsupported".into())
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
     async fn plan_checkout(
         &self,
@@ -236,6 +245,12 @@ impl SourceControlService {
         self.adapter
             .reclaim_checkout(target, inspection, branch_outcome, preparations)
             .await
+    }
+    pub(crate) async fn retire_preparation(
+        &self,
+        preparation: &crate::protocol::PreparedCheckout,
+    ) -> Result<(), String> {
+        self.adapter.retire_preparation(preparation).await
     }
     pub(crate) async fn mutation_guard(
         &self,

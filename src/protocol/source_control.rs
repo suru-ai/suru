@@ -226,6 +226,10 @@ pub struct PrepareCheckoutRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedCheckout {
     pub id: PreparationId,
+    /// When this durable preparation intent was first persisted. Legacy
+    /// intents have no timestamp and are treated as already old by Reclaim.
+    #[serde(default)]
+    pub persisted_at: Option<super::SessionTimestamp>,
     pub source: ExecutionDirectory,
     pub repository: Repository,
     pub destination: ExecutionDirectory,

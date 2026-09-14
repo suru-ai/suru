@@ -168,6 +168,29 @@ impl PreparationStore {
         Ok(preparations)
     }
 
+    /// Every readable, live preparation intent. Persisted Repository facts in
+    /// these records let startup Reclaim find failed preparations even when no
+    /// admitted Session remains to seed Workspace discovery.
+    pub(crate) fn all(&self) -> Result<Vec<PreparedCheckout>, String> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Cannot read Worktree preparations: {e}")),
+        };
+        let mut preparations = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Cannot read Worktree preparations: {e}"))?;
+            let bytes = std::fs::read(entry.path())
+                .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
+            let preparation: PreparedCheckout = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
+            if !self.is_retired(preparation.id) {
+                preparations.push(preparation);
+            }
+        }
+        Ok(preparations)
+    }
+
     /// The Sessions a stored preparation can still bring to their first Turn:
     /// an intention that never recorded an admitted Session is one whose
     /// creation did not finish, and rejoining it is how its Prompt reaches the

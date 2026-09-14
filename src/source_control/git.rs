@@ -484,6 +484,7 @@ impl SourceControl for GitSourceControl {
             }
             return Ok(PreparedCheckout {
                 id,
+                persisted_at: Some(SessionTimestamp::now()),
                 source: ExecutionDirectory {
                     path: source_path.to_owned(),
                 },
@@ -685,6 +686,49 @@ impl SourceControl for GitSourceControl {
         }
         self.remove_checkout(target, inspection, false, branch_outcome)
             .await
+    }
+    async fn retire_preparation(&self, plan: &PreparedCheckout) -> Result<(), String> {
+        let CheckoutPreparationPlan::Git { source_commit, .. } = &plan.plan;
+        let reference = format!("refs/suru/preparations/{}", plan.id.0.simple());
+        let repository = &plan.repository.metadata_directory;
+        let status = self
+            .command(repository, &["show-ref", "--verify", "--quiet", &reference])
+            .await?
+            .status;
+        if status.code() == Some(1) {
+            return Ok(());
+        }
+        if !status.success() {
+            return Err("Preparation ownership ref could not be inspected".into());
+        }
+        let commit = self
+            .text(repository, &["rev-parse", "--verify", &reference])
+            .await
+            .ok_or("Preparation ownership ref could not be read")?;
+        let provenance = self
+            .text(
+                repository,
+                &["reflog", "show", "--format=%gs", "-1", &reference],
+            )
+            .await;
+        if &commit != source_commit
+            || provenance.as_deref() != Some(preparation::token(plan).as_str())
+        {
+            return Err("Preparation ownership ref no longer matches its persisted intent".into());
+        }
+        self.mutate(repository, &["update-ref", "-d", &reference, source_commit])
+            .await?;
+        let absent = self
+            .command(repository, &["show-ref", "--verify", "--quiet", &reference])
+            .await?
+            .status
+            .code()
+            == Some(1);
+        if absent {
+            Ok(())
+        } else {
+            Err("Preparation ownership ref remains after retirement".into())
+        }
     }
     async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
         let root = match &plan.repository.location {

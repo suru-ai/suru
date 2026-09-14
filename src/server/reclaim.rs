@@ -11,6 +11,7 @@ use crate::{
     source_control::{PreparationStore, SourceControlService},
 };
 use std::{
+    collections::{HashMap, HashSet},
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -101,13 +102,44 @@ impl Reclaimer {
         else {
             return;
         };
-        for repository in self.source_control.repositories() {
-            self.reclaim_repository(&repository, days).await;
+        let preparations = match self.preparations.all() {
+            Ok(preparations) => preparations,
+            Err(error) => {
+                tracing::warn!(
+                    "Managed Worktree Reclaim could not read preparation intents; will retry: {error}"
+                );
+                return;
+            }
+        };
+        let mut repositories = self
+            .source_control
+            .repositories()
+            .into_iter()
+            .map(|repository| (repository.id.clone(), repository))
+            .collect::<HashMap<_, _>>();
+        for preparation in &preparations {
+            repositories
+                .entry(preparation.repository.id.clone())
+                .or_insert_with(|| preparation.repository.clone());
+        }
+        for repository in repositories.values() {
+            let repository_preparations = preparations
+                .iter()
+                .filter(|preparation| preparation.repository.id == repository.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            self.reclaim_repository(repository, days, &repository_preparations)
+                .await;
         }
     }
 
     /// One Repository pass, reusable by the later eager-on-delete rule.
-    async fn reclaim_repository(&self, repository: &Repository, days: u64) {
+    async fn reclaim_repository(
+        &self,
+        repository: &Repository,
+        days: u64,
+        preparations: &[crate::protocol::PreparedCheckout],
+    ) {
         let checkouts = match self.source_control.list_checkouts(repository).await {
             Ok(checkouts) => checkouts,
             Err(error) => {
@@ -119,28 +151,44 @@ impl Reclaimer {
                 return;
             }
         };
+        let listed = checkouts
+            .iter()
+            .map(|checkout| checkout.root.clone())
+            .collect::<HashSet<_>>();
         for checkout in checkouts {
             if !is_managed(repository, &checkout) {
                 continue;
             }
+            let unfinished = preparations
+                .iter()
+                .filter(|plan| {
+                    plan.destination.path == checkout.root && plan.admitted_session.is_none()
+                })
+                .collect::<Vec<_>>();
             let activity = self.sessions.checkout_activity(&checkout.id);
-            let rule = if activity.affected == 0 {
+            let rule = if !unfinished.is_empty() {
+                if unfinished.iter().all(|plan| old(plan, days)) {
+                    ReclaimRule::FailedPreparation { days }
+                } else {
+                    continue;
+                }
+            } else if activity.affected == 0 {
                 ReclaimRule::Orphaned
             } else if idle(activity, days) {
                 ReclaimRule::Idle { days }
             } else {
                 continue;
             };
-            if self
-                .preparations
-                .for_destination(&checkout.root)
-                .is_ok_and(|plans| plans.iter().any(|plan| plan.admitted_session.is_none()))
-            {
-                // Failed preparations have their own age rule in #352. Their
-                // stored intent must keep them out of the immediate orphan rule.
-                continue;
-            }
             self.reclaim(repository, checkout, rule).await;
+        }
+        for preparation in preparations.iter().filter(|plan| {
+            plan.admitted_session.is_none()
+                && old(plan, days)
+                && !listed.contains(&plan.destination.path)
+                && !plan.destination.path.exists()
+        }) {
+            self.finish_failed_preparation_remainder(repository, preparation, days)
+                .await;
         }
     }
 
@@ -176,7 +224,15 @@ impl Reclaimer {
                 return;
             }
         };
-        if preparations
+        if rule.is_failed_preparation() {
+            if preparations.is_empty()
+                || preparations
+                    .iter()
+                    .any(|plan| plan.admitted_session.is_some() || !old(plan, rule.days()))
+            {
+                return;
+            }
+        } else if preparations
             .iter()
             .any(|plan| plan.admitted_session.is_none())
         {
@@ -185,20 +241,27 @@ impl Reclaimer {
         // Admission should already have retired these intents (#348). Finish
         // any durable remainder while both race gates are held, before letting
         // a retry load it as though the deleted Session could still rejoin.
-        for preparation in &preparations {
-            if let Err(error) = self.preparations.retire(preparation.id) {
-                self.failed(&checkout, rule, &error);
-                return;
-            }
-            if let Err(error) = self.preparations.finish_retirement(preparation.id) {
-                tracing::warn!(
-                    checkout = %checkout.root.display(),
-                    preparation = %preparation.id.0,
-                    "Retired Worktree preparation cleanup will retry after restart: {error}"
-                );
+        if !rule.is_failed_preparation() {
+            for preparation in &preparations {
+                if let Err(error) = self.preparations.retire(preparation.id) {
+                    self.failed(&checkout, rule, &error);
+                    return;
+                }
+                if let Err(error) = self.preparations.finish_retirement(preparation.id) {
+                    tracing::warn!(
+                        checkout = %checkout.root.display(),
+                        preparation = %preparation.id.0,
+                        "Retired Worktree preparation cleanup will retry after restart: {error}"
+                    );
+                }
             }
         }
-        drop(preparation_serial);
+        let preparation_serial = if rule.is_failed_preparation() {
+            Some(preparation_serial)
+        } else {
+            drop(preparation_serial);
+            None
+        };
         let inspection = match self.source_control.inspect_removal(&target).await {
             Ok(inspection) => inspection,
             Err(error) => {
@@ -314,6 +377,18 @@ impl Reclaimer {
                     branch_outcome = branch_outcome(actual_outcome),
                     "Managed Worktree Reclaimed"
                 );
+                if rule.is_failed_preparation() {
+                    for preparation in &preparations {
+                        if let Err(error) = self
+                            .finish_failed_preparation(preparation, &checkout, rule)
+                            .await
+                        {
+                            self.failed(&checkout, rule, &error);
+                            break;
+                        }
+                    }
+                }
+                drop(preparation_serial);
             }
             Err(error) => {
                 let _ = self
@@ -321,6 +396,106 @@ impl Reclaimer {
                     .record_execution_checkout(inspection.checkout.clone());
                 self.failed(&checkout, rule, &error)
             }
+        }
+    }
+
+    async fn finish_failed_preparation(
+        &self,
+        preparation: &crate::protocol::PreparedCheckout,
+        checkout: &CheckoutAssociation,
+        rule: ReclaimRule,
+    ) -> Result<(), String> {
+        self.source_control.retire_preparation(preparation).await?;
+        let withheld_prompt = self
+            .sessions
+            .preparation_prompt_first_line(preparation.intended_session)
+            .await?;
+        if let Some(first_line) = &withheld_prompt {
+            tracing::info!(
+                checkout = %checkout.root.display(),
+                preparation = %preparation.id.0,
+                rule = rule.log_name(),
+                prompt_first_line = first_line,
+                "Failed Worktree preparation Prompt withheld by Reclaim"
+            );
+        }
+        self.sessions
+            .retire_preparation_prompt(preparation.intended_session)
+            .await?;
+        self.preparations.retire(preparation.id)?;
+        self.preparations.finish_retirement(preparation.id)?;
+        tracing::info!(
+            checkout = %checkout.root.display(),
+            preparation = %preparation.id.0,
+            rule = rule.log_name(),
+            "Failed Worktree preparation intent retired"
+        );
+        Ok(())
+    }
+
+    async fn finish_failed_preparation_remainder(
+        &self,
+        repository: &Repository,
+        preparation: &crate::protocol::PreparedCheckout,
+        days: u64,
+    ) {
+        let Ok(_serial) = self.preparations.serial.try_lock() else {
+            return;
+        };
+        let Some(_guard) = self.source_control.try_mutation_guard(&repository.id) else {
+            return;
+        };
+        let current = match self.preparations.load(preparation.id) {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(preparation = %preparation.id.0, "Failed Worktree preparation Reclaim could not reload intent; will retry: {error}");
+                return;
+            }
+        };
+        if current.admitted_session.is_some()
+            || !old(&current, days)
+            || current.destination.path.exists()
+            || current.repository.id != repository.id
+        {
+            return;
+        }
+        let checkout_id =
+            crate::protocol::CheckoutId::from_root(&repository.id, &current.destination.path);
+        if self.sessions.checkout_activity(&checkout_id).working != 0 {
+            return;
+        }
+        let listed = match self.source_control.list_checkouts(repository).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::warn!(
+                    checkout = %current.destination.path.display(),
+                    rule = "failed preparation",
+                    "Managed Worktree Reclaim could not confirm removed preparation; will retry: {error}"
+                );
+                return;
+            }
+        };
+        if listed
+            .iter()
+            .any(|checkout| checkout.root == current.destination.path)
+        {
+            return;
+        }
+        let checkout = CheckoutAssociation {
+            id: checkout_id,
+            repository: repository.id.clone(),
+            root: current.destination.path.clone(),
+            kind: CheckoutKind::Linked,
+            recovery_revision: None,
+            reclaim: None,
+        };
+        let rule = ReclaimRule::FailedPreparation { days };
+        if let Err(error) = self
+            .finish_failed_preparation(&current, &checkout, rule)
+            .await
+        {
+            self.failed(&checkout, rule, &error);
         }
     }
 
@@ -337,6 +512,7 @@ impl Reclaimer {
 enum ReclaimRule {
     Orphaned,
     Idle { days: u64 },
+    FailedPreparation { days: u64 },
 }
 
 impl ReclaimRule {
@@ -344,6 +520,7 @@ impl ReclaimRule {
         match self {
             Self::Orphaned => activity.affected == 0,
             Self::Idle { days } => idle(activity, days),
+            Self::FailedPreparation { .. } => activity.working == 0,
         }
     }
 
@@ -351,6 +528,7 @@ impl ReclaimRule {
         match self {
             Self::Orphaned => "orphaned",
             Self::Idle { .. } => "idle",
+            Self::FailedPreparation { .. } => "failed preparation",
         }
     }
 
@@ -359,8 +537,32 @@ impl ReclaimRule {
             Self::Orphaned => "Worktree was Reclaimed after its last Session was deleted; prompt a retained Session to recover it".into(),
             Self::Idle { days: 1 } => "Worktree was Reclaimed after 1 day of inactivity; prompt this Session to recover it".into(),
             Self::Idle { days } => format!("Worktree was Reclaimed after {days} days of inactivity; prompt this Session to recover it"),
+            Self::FailedPreparation { days: 1 } => "Worktree was Reclaimed after its preparation failed 1 day ago".into(),
+            Self::FailedPreparation { days } => format!("Worktree was Reclaimed after its preparation failed {days} days ago"),
         }
     }
+
+    fn is_failed_preparation(self) -> bool {
+        matches!(self, Self::FailedPreparation { .. })
+    }
+
+    fn days(self) -> u64 {
+        match self {
+            Self::Idle { days } | Self::FailedPreparation { days } => days,
+            Self::Orphaned => 0,
+        }
+    }
+}
+
+fn old(preparation: &crate::protocol::PreparedCheckout, days: u64) -> bool {
+    let Some(persisted_at) = preparation.persisted_at else {
+        return true;
+    };
+    let threshold = days.saturating_mul(24 * 60 * 60 * 1_000);
+    persisted_at.0
+        < crate::protocol::SessionTimestamp::now()
+            .0
+            .saturating_sub(threshold)
 }
 
 fn idle(activity: crate::sessions::CheckoutActivity, days: u64) -> bool {

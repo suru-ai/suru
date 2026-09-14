@@ -148,6 +148,49 @@ async fn remember_repository(server: &server::RunningServer, root: &Path) -> Res
         .unwrap()
 }
 
+async fn fail_preparation(
+    server: &server::RunningServer,
+    main: &Path,
+    description: &str,
+) -> PreparedCheckout {
+    let result = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&PrepareCheckoutRequest {
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: main.to_owned(),
+            },
+            description: description.into(),
+            provider: ProviderId::new("controlled"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert!(result.error.is_some());
+    result.preparation
+}
+
+fn age_preparation(config: &ServerConfig, preparation: &PreparedCheckout) -> PathBuf {
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", preparation.id.0));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
+    document["persisted_at"] = serde_json::json!(0);
+    std::fs::write(&intent, serde_json::to_vec(&document).unwrap()).unwrap();
+    intent
+}
+
 async fn wait_for_path(path: &Path, exists: bool) {
     timeout(PROGRESS_DEADLINE, async {
         while path.exists() != exists {
@@ -1104,6 +1147,56 @@ struct FailFirstReclaim {
     failed: AtomicBool,
 }
 
+struct FailFirstPreparationRetirement {
+    git: GitSourceControl,
+    failed: AtomicBool,
+    reached_retry: tokio::sync::Notify,
+    release_retry: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for FailFirstPreparationRetirement {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+
+    async fn retire_preparation(&self, preparation: &PreparedCheckout) -> Result<(), String> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            return Err("simulated ownership-ref retirement failure".into());
+        }
+        self.reached_retry.notify_one();
+        self.release_retry.acquire().await.unwrap().forget();
+        self.git.retire_preparation(preparation).await
+    }
+}
+
 #[async_trait::async_trait]
 impl SourceControl for FailFirstReclaim {
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
@@ -1196,12 +1289,109 @@ async fn a_failed_removal_is_retried_on_a_later_interval() {
 }
 
 #[tokio::test]
+async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_intent() {
+    let layout = ReclaimLayout::new("failed-retirement-retry");
+    let config = layout.server_config("reclaim-failed-retirement-retry");
+    let (runtime, _) = ControlledProvider::new();
+    let preparing = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default().with_preparation_observer(FailOnceAt::new(
+                PreparationCheckpoint::SessionPersisted,
+            )),
+        ),
+    )
+    .await
+    .unwrap();
+    let prepared = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            preparing.descriptor().base_url
+        ))
+        .bearer_auth(&preparing.descriptor().token)
+        .json(&PrepareCheckoutRequest {
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: layout.main.clone(),
+            },
+            description: "retry metadata retirement".into(),
+            provider: ProviderId::new("controlled"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(prepared.error, None);
+    let withheld = prompt("Retry this withheld Prompt");
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", preparing.descriptor().base_url))
+        .bearer_auth(&preparing.descriptor().token)
+        .json(&CreateSessionRequest {
+            preparation_id: Some(prepared.preparation.id),
+            agent_selection: None,
+            execution_directory: prepared.preparation.destination.clone(),
+            prompt: withheld.clone(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(response.text().await.unwrap().contains("SessionPersisted"));
+    let preparation = prepared.preparation;
+    let intent = age_preparation(&config, &preparation);
+    let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
+    preparing.shutdown().await.unwrap();
+
+    let adapter = Arc::new(FailFirstPreparationRetirement {
+        git: GitSourceControl::default(),
+        failed: AtomicBool::new(false),
+        reached_retry: Default::default(),
+        release_retry: tokio::sync::Semaphore::new(0),
+    });
+    let server =
+        server::spawn_with_source_control(config, vec![runtime], timings(), adapter.clone())
+            .await
+            .unwrap();
+    server.workspace_discovery_settled().await;
+    timeout(PROGRESS_DEADLINE, adapter.reached_retry.notified())
+        .await
+        .expect("a later pass reaches metadata retirement again");
+    assert!(!preparation.destination.path.exists());
+    assert!(intent.is_file());
+    assert!(!read_git(&layout.main, &["rev-parse", &ownership]).is_empty());
+    let removed = support::read_session(server.descriptor(), preparation.intended_session).await;
+    let reclaim = removed
+        .session
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.reclaim.as_ref())
+        .expect("the public Session records its durable Reclaim reason");
+    assert_eq!(reclaim.phase, CheckoutReclaimPhase::Removed);
+    assert!(reclaim.reason.contains("preparation failed 14 days ago"));
+    assert_eq!(removed.prompts[0].status, PromptStatus::Pending);
+    adapter.release_retry.add_permits(1);
+    wait_for_path(&intent, false).await;
+    wait_for_branch(&layout.main, &ownership, false).await;
+    let retired = support::read_session(server.descriptor(), preparation.intended_session).await;
+    assert_eq!(retired.prompts[0].id, withheld.id);
+    assert_eq!(retired.prompts[0].status, PromptStatus::Cancelled);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
     let layout = ReclaimLayout::new("unrelated-orphan");
+    let config = layout.server_config("reclaim-unfinished-preparation");
     let (runtime, _) = ControlledProvider::new();
     let server = server::spawn_with_source_control(
-        layout.server_config("reclaim-unfinished-preparation"),
-        vec![runtime],
+        config.clone(),
+        vec![runtime.clone()],
         timings(),
         Arc::new(
             GitSourceControl::default()
@@ -1211,6 +1401,89 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
     .await
     .unwrap();
     remember_repository(&server, &layout.main).await;
+    let request = PrepareCheckoutRequest {
+        id: Default::default(),
+        source: ExecutionDirectory {
+            path: layout.main.clone(),
+        },
+        description: "unfinished preparation".into(),
+        provider: ProviderId::new("controlled"),
+    };
+    let prepared = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert!(prepared.error.is_some());
+    assert!(prepared.preparation.persisted_at.is_some());
+    let unfinished = prepared.preparation.destination.path.clone();
+    assert!(unfinished.is_dir());
+
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 3).await;
+    assert!(
+        unfinished.is_dir(),
+        "a young failed preparation is preserved"
+    );
+    server.shutdown().await.unwrap();
+
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 2).await;
+    assert!(unfinished.is_dir());
+    let retried = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            restarted.descriptor().base_url
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(retried.error, None);
+    assert_eq!(retried.preparation.id, prepared.preparation.id);
+    assert_eq!(retried.preparation.destination.path, unfinished);
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repository() {
+    let layout = ReclaimLayout::new("failed-preparation-discovery");
+    let config = layout.server_config("reclaim-failed-preparation-discovery");
+    let (runtime, _) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::CheckoutCreated)),
+        ),
+    )
+    .await
+    .unwrap();
     let prepared = reqwest::Client::new()
         .post(format!(
             "{}/v1/checkouts/prepare",
@@ -1222,7 +1495,7 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "unfinished preparation".into(),
+            description: "old failed preparation".into(),
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -1234,13 +1507,247 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
         .await
         .unwrap();
     assert!(prepared.error.is_some());
-    let unfinished = prepared.preparation.destination.path;
-    assert!(unfinished.is_dir());
+    let destination = prepared.preparation.destination.path.clone();
+    let CheckoutPreparationPlan::Git { branch, .. } = &prepared.preparation.plan;
+    let branch = format!("refs/heads/{branch}");
+    let ownership = format!(
+        "refs/suru/preparations/{}",
+        prepared.preparation.id.0.simple()
+    );
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", prepared.preparation.id.0));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
+    document.as_object_mut().unwrap().remove("persisted_at");
+    std::fs::write(&intent, serde_json::to_vec(&document).unwrap()).unwrap();
+    assert!(destination.is_dir());
+    assert!(!read_git(&layout.main, &["rev-parse", &ownership]).is_empty());
+    server.shutdown().await.unwrap();
+
+    // No Workspace resolve or catalog subscription follows restart. The
+    // intent is the only durable Repository discovery fact left to the pass.
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&destination, false).await;
+    wait_for_branch(&layout.main, &branch, false).await;
+    wait_for_branch(&layout.main, &ownership, false).await;
+    wait_for_path(&intent, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its_prompt() {
+    let layout = ReclaimLayout::new("failed-session-shell");
+    let config = layout.server_config("reclaim-failed-session-shell");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default().with_preparation_observer(FailOnceAt::new(
+                PreparationCheckpoint::SessionPersisted,
+            )),
+        ),
+    )
+    .await
+    .unwrap();
+    let request = PrepareCheckoutRequest {
+        id: Default::default(),
+        source: ExecutionDirectory {
+            path: layout.main.clone(),
+        },
+        description: "failed Session shell".into(),
+        provider: ProviderId::new("controlled"),
+    };
+    let prepared = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(prepared.error, None);
+    let withheld = prompt("Keep this exact first line\nDo not quote this second line");
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", server.descriptor().base_url))
+        .bearer_auth(&server.descriptor().token)
+        .json(&CreateSessionRequest {
+            preparation_id: Some(prepared.preparation.id),
+            agent_selection: None,
+            execution_directory: prepared.preparation.destination.clone(),
+            prompt: withheld.clone(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(response.text().await.unwrap().contains("SessionPersisted"));
+    assert!(provider.try_next_start().is_none());
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", prepared.preparation.id.0));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
+    document["persisted_at"] = serde_json::json!(0);
+    std::fs::write(&intent, serde_json::to_vec(&document).unwrap()).unwrap();
+    server.shutdown().await.unwrap();
+    reclaim_log().lock().unwrap().clear();
+
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&prepared.preparation.destination.path, false).await;
+    wait_for_path(&intent, false).await;
+    let restored = support::read_session(
+        restarted.descriptor(),
+        prepared.preparation.intended_session,
+    )
+    .await;
+    assert_eq!(restored.prompts.len(), 1);
+    assert_eq!(restored.prompts[0].id, withheld.id);
+    assert_eq!(restored.prompts[0].text, withheld.text);
+    assert_eq!(restored.prompts[0].status, PromptStatus::Cancelled);
+    assert!(restored.turns.is_empty());
+    assert!(provider.try_next_start().is_none());
+    let log = wait_for_log("the withheld Prompt's first line", |log| {
+        log.contains("Failed Worktree preparation intent retired")
+            && log.contains("Keep this exact first line")
+    })
+    .await;
+    assert!(!log.contains("Do not quote this second line"));
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn off_preserves_an_old_failed_preparation() {
+    let layout = ReclaimLayout::new("failed-preparation-off");
+    layout.pin(r#""off""#);
+    let config = layout.server_config("reclaim-failed-preparation-off");
+    let (runtime, _) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::CheckoutCreated)),
+        ),
+    )
+    .await
+    .unwrap();
+    let preparation = fail_preparation(&server, &layout.main, "off keeps this intent").await;
+    let intent = age_preparation(&config, &preparation);
+    let CheckoutPreparationPlan::Git { branch, .. } = &preparation.plan;
+    let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
 
     tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 3).await;
+    assert!(preparation.destination.path.is_dir());
+    assert!(intent.is_file());
     assert!(
-        unfinished.is_dir(),
-        "the failed-preparation age rule belongs to #352"
+        !read_git(
+            &layout.main,
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        )
+        .is_empty()
     );
+    assert!(!read_git(&layout.main, &["rev-parse", &ownership]).is_empty());
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_external_lock_preserves_an_old_failed_preparation_but_its_exact_suru_lock_does_not() {
+    let layout = ReclaimLayout::new("failed-preparation-locks");
+    let config = layout.server_config("reclaim-failed-preparation-locks");
+    let (runtime, _) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::CheckoutCreated)),
+        ),
+    )
+    .await
+    .unwrap();
+    let preparation = fail_preparation(&server, &layout.main, "locked failed intent").await;
+    let intent = age_preparation(&config, &preparation);
+    git(
+        &layout.main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "reader pin",
+            preparation.destination.path.to_str().unwrap(),
+        ],
+    );
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 3).await;
+    assert!(preparation.destination.path.is_dir());
+    assert!(intent.is_file());
+    server.shutdown().await.unwrap();
+
+    let pointer = std::fs::read_to_string(preparation.destination.path.join(".git")).unwrap();
+    let metadata = PathBuf::from(
+        pointer
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("gitdir: ")
+            .unwrap(),
+    );
+    let own_reason = std::fs::read_to_string(metadata.join("suru-preparation")).unwrap();
+    git(
+        &layout.main,
+        &[
+            "worktree",
+            "unlock",
+            preparation.destination.path.to_str().unwrap(),
+        ],
+    );
+    git(
+        &layout.main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &own_reason,
+            preparation.destination.path.to_str().unwrap(),
+        ],
+    );
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&preparation.destination.path, false).await;
+    wait_for_path(&intent, false).await;
+    restarted.shutdown().await.unwrap();
 }

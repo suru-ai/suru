@@ -200,6 +200,73 @@ impl SessionStoreState {
 }
 
 impl SessionStore {
+    /// Reads the first line of the one durable delivery promise carried by an
+    /// unadmitted Worktree preparation for the Reclaim audit log.
+    pub(crate) async fn preparation_prompt_first_line(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, String> {
+        self.hydrate(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(self.snapshot(session_id).and_then(|snapshot| {
+            snapshot.turns.is_empty().then(|| {
+                snapshot
+                    .prompts
+                    .iter()
+                    .find(|prompt| {
+                        prompt.status == PromptStatus::Pending
+                            && prompt.delivery == PromptDelivery::Steer
+                    })
+                    .map(|prompt| prompt.text.lines().next().unwrap_or_default().to_owned())
+            })?
+        }))
+    }
+
+    /// Ends that delivery promise while preserving the Session and its Prompt
+    /// history. Retirement is durable because cancellation is committed before
+    /// the preparation intent is deleted.
+    pub(crate) async fn retire_preparation_prompt(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), String> {
+        self.hydrate(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let prompt = state.sessions.get(&session_id).and_then(|record| {
+            record
+                .snapshot
+                .turns
+                .is_empty()
+                .then(|| {
+                    record.snapshot.prompts.iter().find(|prompt| {
+                        prompt.status == PromptStatus::Pending
+                            && prompt.delivery == PromptDelivery::Steer
+                    })
+                })
+                .flatten()
+                .cloned()
+        });
+        if let Some(prompt) = &prompt {
+            state
+                .commit(
+                    &self.storage,
+                    session_id,
+                    vec![SessionChange::PromptStatusChanged {
+                        prompt_id: prompt.id,
+                        status: PromptStatus::Cancelled,
+                    }],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        state.resumable_preparations.remove(&session_id);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn create(
         &self,
