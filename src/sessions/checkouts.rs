@@ -11,15 +11,19 @@ pub(crate) struct CheckoutActivity {
     pub(crate) affected: usize,
     pub(crate) working: usize,
     pub(crate) latest_updated_at: Option<SessionTimestamp>,
+    /// A Session whose history cannot be read still owns its possible
+    /// checkout. Automatic removal cannot safely rewrite its recovery facts,
+    /// so it protects that checkout until explicitly deleted.
+    pub(crate) unreadable: usize,
 }
 
 impl SessionStore {
-    pub(crate) fn checkout_references(&self, id: &CheckoutId) -> (usize, usize) {
-        let activity = self.checkout_activity(id);
+    pub(crate) fn checkout_references(&self, checkout: &CheckoutAssociation) -> (usize, usize) {
+        let activity = self.checkout_activity(checkout);
         (activity.affected, activity.working)
     }
 
-    pub(crate) fn checkout_activity(&self, id: &CheckoutId) -> CheckoutActivity {
+    pub(crate) fn checkout_activity(&self, checkout: &CheckoutAssociation) -> CheckoutActivity {
         let state = self.state.lock().unwrap();
         let mut affected = 0;
         let mut working = 0;
@@ -29,7 +33,7 @@ impl SessionStore {
             if session
                 .checkout
                 .as_ref()
-                .is_some_and(|checkout| &checkout.id == id)
+                .is_some_and(|association| association.id == checkout.id)
             {
                 affected += 1;
                 working += usize::from(session.working_since.is_some());
@@ -41,10 +45,35 @@ impl SessionStore {
                 );
             }
         }
+        let mut unreadable = 0;
+        for record in state.unreadable_sessions.values() {
+            let possibly_references = match &record.checkout {
+                Some(association) => association.id == checkout.id,
+                None => match &record.execution_directory {
+                    Some(directory) => directory.path.starts_with(&checkout.root),
+                    None => record
+                        .summary
+                        .workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.repository.as_ref())
+                        .is_none_or(|repository| repository.id == checkout.repository),
+                },
+            };
+            if possibly_references {
+                affected += 1;
+                unreadable += 1;
+                latest_updated_at = Some(
+                    latest_updated_at.map_or(record.summary.updated_at, |latest| {
+                        latest.max(record.summary.updated_at)
+                    }),
+                );
+            }
+        }
         CheckoutActivity {
             affected,
             working,
             latest_updated_at,
+            unreadable,
         }
     }
 

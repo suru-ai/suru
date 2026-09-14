@@ -15,10 +15,12 @@ use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, TurnId,
-    UnreadableSessionSummary, ViewSessionOperationId,
+    ViewSessionOperationId,
 };
 use crate::provider::ProviderResumeState;
-use crate::storage::{DeferredSessions, RestoredSessions, StorageSink, StoredResumeState};
+use crate::storage::{
+    DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, UnreadableStoredSession,
+};
 
 mod catalog;
 mod checkouts;
@@ -76,7 +78,7 @@ pub(crate) enum StoreOutcome<T> {
 
 struct SessionStoreState {
     sessions: HashMap<SessionId, SessionRecord>,
-    unreadable_sessions: HashMap<SessionId, UnreadableSessionSummary>,
+    unreadable_sessions: HashMap<SessionId, UnreadableStoredSession>,
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
     catalog: SessionCatalogPublisher,
@@ -178,7 +180,11 @@ impl SessionStore {
                 ]
             })
             .flatten()
-            .chain(unreadable.iter().map(|summary| summary.updated_at))
+            .chain(
+                unreadable
+                    .iter()
+                    .map(|unreadable| unreadable.summary.updated_at),
+            )
             .max();
         let catalog = SessionCatalogPublisher::new();
         let mut sessions = HashMap::new();
@@ -191,7 +197,7 @@ impl SessionStore {
         }
         let unreadable_sessions = unreadable
             .into_iter()
-            .map(|summary| (summary.id, summary))
+            .map(|unreadable| (unreadable.summary.id, unreadable))
             .collect();
         let mut state = SessionStoreState {
             sessions,
@@ -393,7 +399,7 @@ impl SessionStore {
                 state
                     .unreadable_sessions
                     .get(&session_id)
-                    .and_then(|summary| summary.workspace.as_ref())
+                    .and_then(|unreadable| unreadable.summary.workspace.as_ref())
                     .and_then(|workspace| workspace.repository.clone())
             });
         // A Session's Subagent subtree shares its deletion, walked deepest
@@ -478,16 +484,17 @@ impl SessionStore {
                 state
                     .unreadable_sessions
                     .values()
-                    .filter(|summary| !state.is_stored_child(summary.id))
-                    .filter(|summary| {
+                    .filter(|unreadable| !state.is_stored_child(unreadable.summary.id))
+                    .filter(|unreadable| {
                         workspace.as_ref().is_none_or(|path| {
-                            summary
+                            unreadable
+                                .summary
                                 .workspace
                                 .as_ref()
                                 .is_none_or(|workspace| workspace.id == **path)
                         })
                     })
-                    .cloned()
+                    .map(|unreadable| unreadable.summary.clone())
                     .map(SessionListItem::Unreadable),
             )
             .collect::<Vec<_>>();

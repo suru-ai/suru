@@ -18,8 +18,8 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, PromptId, ProviderId, SessionId, SessionSnapshot, SessionSummary,
-        TranscriptItem, UnreadableSessionSummary,
+        AgentSelection, CheckoutAssociation, ExecutionDirectory, PromptId, ProviderId, SessionId,
+        SessionSnapshot, SessionSummary, TranscriptItem, UnreadableSessionSummary,
     },
     provider::ProviderResumeState,
     runtime::protect_current_user_file,
@@ -144,8 +144,17 @@ pub(crate) struct StoredResumeState {
 #[derive(Default)]
 pub(crate) struct RestoredSessions {
     pub(crate) readable: Vec<PersistedSession>,
-    pub(crate) unreadable: Vec<UnreadableSessionSummary>,
+    pub(crate) unreadable: Vec<UnreadableStoredSession>,
     pub(crate) deferred: Option<DeferredSessions>,
+}
+
+/// Catalog facts that remain trustworthy when a Session's full stored shape
+/// cannot be decoded. Location facts let automatic Worktree removal preserve
+/// a possible reference until the unreadable Session is explicitly deleted.
+pub(crate) struct UnreadableStoredSession {
+    pub(crate) summary: UnreadableSessionSummary,
+    pub(crate) checkout: Option<CheckoutAssociation>,
+    pub(crate) execution_directory: Option<ExecutionDirectory>,
 }
 
 pub(crate) struct DeferredSessions {
@@ -465,14 +474,14 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
         child_ids: HashSet::new(),
     };
     for row in rows {
-        let unreadable = row.unreadable_summary()?;
+        let unreadable = row.unreadable_session()?;
         if row.is_child() {
-            deferred.child_ids.insert(unreadable.id);
+            deferred.child_ids.insert(unreadable.summary.id);
         }
         // Keep malformed parent metadata inside the per-Session decode
         // boundary below; an invalid link must never fail server startup.
         let parent = row.parent_id().ok().flatten();
-        deferred.parents.insert(unreadable.id, parent);
+        deferred.parents.insert(unreadable.summary.id, parent);
         let turns = by_session.remove(&row.id).unwrap_or_default();
         let result = (|| {
             let (mut summary, revision) = row.into_summary_and_revision()?;
@@ -508,7 +517,9 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
         })();
         match result {
             Ok(session) => {
-                deferred.summaries.insert(unreadable.id, unreadable);
+                deferred
+                    .summaries
+                    .insert(unreadable.summary.id, unreadable.summary);
                 restored.readable.push(session);
             }
             Err(StorageError::InvalidSession { .. }) => restored.unreadable.push(unreadable),

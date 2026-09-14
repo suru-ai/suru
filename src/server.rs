@@ -1736,7 +1736,7 @@ async fn removal_preview(
         .removal_branch_outcome(&target, &inspection)
         .await?;
     let (affected_sessions, working_sessions) =
-        state.sessions.checkout_references(&target.checkout.id);
+        state.sessions.checkout_references(&target.checkout);
     Ok(crate::protocol::CheckoutRemovalPreview {
         target,
         inspection,
@@ -1792,20 +1792,17 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
         if preview != request.preview { return Err("Worktree conditions or affected Sessions changed; review the updated preview and confirm again".to_owned()); }
         if preview.inspection.requires_force() && !request.force { return Err("Git requires explicit force removal for these conditions; review and choose Force remove".to_owned()); }
         let preparations = state.preparations.for_destination(&preview.target.checkout.root)?;
-        let mut recovery = preview.inspection.checkout.clone();
-        if preview.branch_outcome == crate::protocol::CheckoutBranchOutcome::Deleted {
-            recovery.revision = match &recovery.revision {
-                Some(crate::protocol::CheckoutRevision::Branch {
-                    commit: Some(commit),
-                    ..
-                }) => Some(crate::protocol::CheckoutRevision::Detached {
-                    commit: commit.clone(),
-                }),
-                _ => return Err("A branch without a retained commit cannot be deleted safely".into()),
-            };
-        }
+        let recovery = crate::source_control::recovery_for_branch_outcome(
+            &preview.inspection.checkout,
+            preview.branch_outcome,
+        )?;
         state.sessions.record_checkout(recovery.clone()).map_err(|e| format!("Cannot persist recovery facts before removal: {e}"))?;
-        if state.sessions.checkout_references(&preview.target.checkout.id).1 != 0 {
+        if state
+            .sessions
+            .checkout_references(&preview.target.checkout)
+            .1
+            != 0
+        {
             return Err("A Session became Working; Worktree removal is blocked".into());
         }
         let branch_outcome = match state.source_control.remove_checkout(&preview.target, &preview.inspection, request.force, preview.branch_outcome).await {
@@ -1820,11 +1817,10 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
         // Checkout observation does not take the mutation guard and may have
         // published a branch reading while removal was in flight. Reassert the
         // recovery shape matching the actual branch outcome before Unavailable.
-        let final_recovery = if branch_outcome == crate::protocol::CheckoutBranchOutcome::Deleted {
-            recovery
-        } else {
-            preview.inspection.checkout.clone()
-        };
+        let final_recovery = crate::source_control::recovery_for_branch_outcome(
+            &preview.inspection.checkout,
+            branch_outcome,
+        )?;
         state.sessions.record_checkout(final_recovery).map_err(|e| format!("Cannot persist final recovery facts after removal: {e}"))?;
         for preparation in preparations {
             if let Err(retire) = state.preparations.retire(preparation.id) {

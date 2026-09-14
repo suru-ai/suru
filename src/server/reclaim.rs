@@ -8,7 +8,7 @@ use crate::{
         RepositoryLocation,
     },
     sessions::SessionStore,
-    source_control::{PreparationStore, SourceControlService},
+    source_control::{PreparationStore, SourceControlService, recovery_for_branch_outcome},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -226,7 +226,7 @@ impl Reclaimer {
                     plan.destination.path == checkout.root && plan.admitted_session.is_none()
                 })
                 .collect::<Vec<_>>();
-            let activity = self.sessions.checkout_activity(&checkout.id);
+            let activity = self.sessions.checkout_activity(&checkout);
             let rule = if !unfinished.is_empty() {
                 if population == ReclaimPopulation::All
                     && unfinished.iter().all(|plan| old(plan, days))
@@ -280,7 +280,7 @@ impl Reclaimer {
         let Some(_guard) = self.source_control.try_mutation_guard(&repository.id) else {
             return;
         };
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout.id)) {
+        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
             return;
         }
         let mut preparations = match self.preparations.for_destination(&checkout.root) {
@@ -367,28 +367,16 @@ impl Reclaimer {
         };
         // Last possible catalog check: inspection and branch analysis may have
         // taken time, and even an idle newly admitted Session blocks orphaning.
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout.id)) {
+        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
             return;
         }
-        let mut recovery = inspection.checkout.clone();
-        if intended_outcome == CheckoutBranchOutcome::Deleted {
-            recovery.revision = match &recovery.revision {
-                Some(crate::protocol::CheckoutRevision::Branch {
-                    commit: Some(commit),
-                    ..
-                }) => Some(crate::protocol::CheckoutRevision::Detached {
-                    commit: commit.clone(),
-                }),
-                _ => {
-                    self.failed(
-                        &checkout,
-                        rule,
-                        "A branch without a retained commit cannot be deleted safely",
-                    );
-                    return;
-                }
-            };
-        }
+        let recovery = match recovery_for_branch_outcome(&inspection.checkout, intended_outcome) {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                self.failed(&checkout, rule, error);
+                return;
+            }
+        };
         if let Err(error) = self.sessions.record_checkout(recovery.clone()) {
             self.failed(
                 &checkout,
@@ -397,7 +385,7 @@ impl Reclaimer {
             );
             return;
         }
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout.id)) {
+        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
             return;
         }
         let removing = CheckoutReclaim {
@@ -416,7 +404,7 @@ impl Reclaimer {
             );
             return;
         }
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout.id)) {
+        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
             let _ = self
                 .sessions
                 .record_execution_checkout(inspection.checkout.clone());
@@ -428,11 +416,14 @@ impl Reclaimer {
             .await
         {
             Ok(actual_outcome) => {
-                let final_recovery = if actual_outcome == CheckoutBranchOutcome::Deleted {
-                    recovery
-                } else {
-                    inspection.checkout.clone()
-                };
+                let final_recovery =
+                    match recovery_for_branch_outcome(&inspection.checkout, actual_outcome) {
+                        Ok(recovery) => recovery,
+                        Err(error) => {
+                            self.failed(&checkout, rule, error);
+                            return;
+                        }
+                    };
                 let removed = CheckoutReclaim {
                     phase: CheckoutReclaimPhase::Removed,
                     ..removing
@@ -545,9 +536,6 @@ impl Reclaimer {
         }
         let checkout_id =
             crate::protocol::CheckoutId::from_root(&repository.id, &current.destination.path);
-        if self.sessions.checkout_activity(&checkout_id).working != 0 {
-            return;
-        }
         let listed = match self.source_control.list_checkouts(repository).await {
             Ok(listed) => listed,
             Err(error) => {
@@ -573,6 +561,10 @@ impl Reclaimer {
             recovery_revision: None,
             reclaim: None,
         };
+        let activity = self.sessions.checkout_activity(&checkout);
+        if activity.working != 0 || activity.unreadable != 0 {
+            return;
+        }
         let rule = ReclaimRule::FailedPreparation { days };
         let retire_branch = !current.checkout_created;
         match self
@@ -614,6 +606,9 @@ enum ReclaimRule {
 
 impl ReclaimRule {
     fn qualifies(self, activity: crate::sessions::CheckoutActivity) -> bool {
+        if activity.unreadable != 0 {
+            return false;
+        }
         match self {
             Self::Orphaned => activity.affected == 0,
             Self::Idle { days } => idle(activity, days),

@@ -246,6 +246,36 @@ fn set_session_updated_at(config: &ServerConfig, session_ids: &[SessionId], upda
     }
 }
 
+fn corrupt_session_history(config: &ServerConfig, session_id: SessionId) {
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("database path is UTF-8"),
+    )
+    .expect("open the Session database");
+    diesel::sql_query("UPDATE prompts SET payload = '{' WHERE session_id = ?")
+        .bind::<diesel::sql_types::Text, _>(session_id.to_string())
+        .execute(&mut database)
+        .expect("corrupt the Session history");
+}
+
+fn corrupt_session_location(config: &ServerConfig, session_id: SessionId) {
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("database path is UTF-8"),
+    )
+    .expect("open the Session database");
+    diesel::sql_query("UPDATE sessions SET workspace = '{' WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(session_id.to_string())
+        .execute(&mut database)
+        .expect("corrupt the Session location metadata");
+}
+
 async fn listed_session(descriptor: &RuntimeDescriptor, session_id: SessionId) -> SessionListItem {
     reqwest::Client::new()
         .get(format!("{}/v1/sessions", descriptor.base_url))
@@ -576,6 +606,158 @@ async fn latest_session_activity_and_a_live_numeric_threshold_govern_shared_idle
         .unwrap()
         .error_for_status()
         .unwrap();
+    wait_for_path(&layout.managed, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_recent_session_that_becomes_unreadable_before_the_startup_pass_is_not_orphaned() {
+    let layout = ReclaimLayout::new("recent-unreadable");
+    layout.pin("1");
+    let config = layout.server_config("reclaim-recent-unreadable");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    corrupt_session_history(&config, session.session.id);
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    let unreadable = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unreadable.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(matches!(
+        listed_session(restarted.descriptor(), session.session.id).await,
+        SessionListItem::Unreadable(_)
+    ));
+
+    restarted.workspace_discovery_settled().await;
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 2).await;
+    assert!(
+        layout.managed.is_dir(),
+        "an unreadable Session still protects the Managed Worktree it references"
+    );
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    wait_for_path(&layout.managed, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_recent_unreadable_sibling_keeps_an_old_session_from_idle_reclaim() {
+    let layout = ReclaimLayout::new("recent-unreadable-sibling");
+    layout.pin("1");
+    let config = layout.server_config("reclaim-recent-unreadable-sibling");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (old, _old_connection) = open(&server, &mut provider, &layout.managed).await;
+    let (recent, _recent_connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    set_session_updated_at(&config, &[old.session.id], 0);
+    corrupt_session_history(&config, recent.session.id);
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    let unreadable = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            recent.session.id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unreadable.status(), reqwest::StatusCode::NOT_FOUND);
+
+    restarted.workspace_discovery_settled().await;
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 2).await;
+    assert!(
+        layout.managed.is_dir(),
+        "the unreadable sibling's recent activity still protects the shared checkout"
+    );
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            recent.session.id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    wait_for_path(&layout.managed, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unreadable_session_without_location_facts_protects_reclaim_until_deleted() {
+    let layout = ReclaimLayout::new("unknown-unreadable-location");
+    layout.pin("1");
+    let config = layout.server_config("reclaim-unknown-unreadable-location");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    server.shutdown().await.unwrap();
+    corrupt_session_location(&config, session.session.id);
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider_and_timings(config, runtime, timings())
+        .await
+        .unwrap();
+    assert!(matches!(
+        listed_session(restarted.descriptor(), session.session.id).await,
+        SessionListItem::Unreadable(_)
+    ));
+    remember_repository(&restarted, &layout.main).await;
+    restarted.workspace_discovery_settled().await;
+    tokio::time::sleep(STARTUP_DELAY + RECLAIM_INTERVAL * 2).await;
+    assert!(
+        layout.managed.is_dir(),
+        "missing location facts conservatively protect every possible checkout reference"
+    );
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            restarted.descriptor().base_url,
+            session.session.id
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
     wait_for_path(&layout.managed, false).await;
     restarted.shutdown().await.unwrap();
 }

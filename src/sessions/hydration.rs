@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     protocol::{PromptId, PromptOrder, SessionCatalogChange, SessionId},
-    storage::{PersistedSession, StorageError},
+    storage::{PersistedSession, StorageError, UnreadableStoredSession},
 };
 
 impl SessionStore {
@@ -118,15 +118,25 @@ impl SessionStore {
                         .remove(&id);
                 }
                 Ok(None) | Err(StorageError::InvalidSession { .. }) => {
-                    let unreadable = state
+                    let mut unreadable = state
                         .deferred
                         .as_mut()
                         .expect("deferred repository exists")
                         .summaries
                         .remove(&id)
                         .expect("deferred Session exists");
-                    state.sessions.remove(&id);
-                    state.unreadable_sessions.insert(id, unreadable);
+                    let record = state.sessions.remove(&id).expect("deferred record exists");
+                    unreadable.workspace = Some(record.summary.session.workspace.clone());
+                    state.unreadable_sessions.insert(
+                        id,
+                        UnreadableStoredSession {
+                            summary: unreadable,
+                            checkout: record.summary.session.checkout.clone(),
+                            execution_directory: Some(
+                                record.summary.session.execution_directory.clone(),
+                            ),
+                        },
+                    );
                     invalidated = true;
                 }
                 Err(error) => return Err(error),

@@ -14,6 +14,28 @@ mod preparation;
 pub use git::GitSourceControl;
 pub(crate) use preparation::PreparationStore;
 
+/// Shape the durable recovery reading for the branch fate Git actually uses.
+/// A deleted branch must leave its last commit reachable through detached
+/// recovery; a retained branch keeps the inspected reading unchanged.
+pub(crate) fn recovery_for_branch_outcome(
+    inspection: &crate::protocol::CheckoutSummary,
+    outcome: crate::protocol::CheckoutBranchOutcome,
+) -> Result<crate::protocol::CheckoutSummary, &'static str> {
+    let mut recovery = inspection.clone();
+    if outcome == crate::protocol::CheckoutBranchOutcome::Deleted {
+        recovery.revision = match &inspection.revision {
+            Some(crate::protocol::CheckoutRevision::Branch {
+                commit: Some(commit),
+                ..
+            }) => Some(crate::protocol::CheckoutRevision::Detached {
+                commit: commit.clone(),
+            }),
+            _ => return Err("A branch without a retained commit cannot be deleted safely"),
+        };
+    }
+    Ok(recovery)
+}
+
 /// Observable preparation boundaries, injectable for interruption testing and hosts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparationCheckpoint {

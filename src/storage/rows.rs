@@ -26,8 +26,9 @@ use crate::{
 };
 
 use super::{
-    PersistedSession, StorageError, StoredResumeState, activities, landing_agent_selection,
-    messages, model_catalog, prompts, provider_resume_states, sessions, turns,
+    PersistedSession, StorageError, StoredResumeState, UnreadableStoredSession, activities,
+    landing_agent_selection, messages, model_catalog, prompts, provider_resume_states, sessions,
+    turns,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -439,16 +440,33 @@ impl SessionRow {
             .transpose()
     }
 
-    pub(super) fn unreadable_summary(&self) -> Result<UnreadableSessionSummary, StorageError> {
+    pub(super) fn unreadable_session(&self) -> Result<UnreadableStoredSession, StorageError> {
         let session_id = self.id.clone();
-        Ok(UnreadableSessionSummary {
-            id: parse_id(&session_id, "Session ID", SessionId::from_uuid)?,
-            title: self.title.clone(),
-            created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
-            updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
-            workspace: serde_json::from_str::<StoredSessionMetadata>(&self.workspace)
-                .ok()
-                .map(Workspace::from),
+        let metadata = serde_json::from_str::<StoredSessionMetadata>(&self.workspace).ok();
+        let checkout = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.checkout.clone());
+        let execution_directory = metadata
+            .as_ref()
+            .map(StoredSessionMetadata::execution_directory);
+        Ok(UnreadableStoredSession {
+            summary: UnreadableSessionSummary {
+                id: parse_id(&session_id, "Session ID", SessionId::from_uuid)?,
+                title: self.title.clone(),
+                created_at: SessionTimestamp(i64_to_u64(
+                    &session_id,
+                    "created_at",
+                    self.created_at,
+                )?),
+                updated_at: SessionTimestamp(i64_to_u64(
+                    &session_id,
+                    "updated_at",
+                    self.updated_at,
+                )?),
+                workspace: metadata.map(Workspace::from),
+            },
+            checkout,
+            execution_directory,
         })
     }
 }
