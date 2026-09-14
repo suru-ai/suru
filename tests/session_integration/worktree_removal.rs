@@ -779,3 +779,6 @@ async fn removal_retires_an_interrupted_admission_and_restart_keeps_its_prompt_c
     assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
 }
+
+#[path = "worktree_reclaim.rs"]
+mod reclaim;

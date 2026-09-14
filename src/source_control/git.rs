@@ -632,6 +632,60 @@ impl SourceControl for GitSourceControl {
             Ok(CheckoutBranchOutcome::Retained)
         }
     }
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        // Branch analysis occurs between the Server's inspection and this
+        // mutation. Re-read before releasing any lock so a user's newer pin is
+        // never removed as though it were the older Suru-owned one.
+        let current = self.inspect_linked_removal(target).await?;
+        if &current != inspection {
+            return Err("Worktree conditions changed before Reclaim".into());
+        }
+        if !current.tracked.is_empty()
+            || !current.untracked.is_empty()
+            || !current.initialized_submodules.is_empty()
+        {
+            return Err("Worktree requires force and is not eligible for Reclaim".into());
+        }
+        if let Some(lock) = &current.lock {
+            let recovery = format!("suru-recovery:{}", target.checkout.id.0);
+            let preparation = preparations.iter().any(|plan| {
+                plan.destination.path == target.checkout.root
+                    && preparation::token(plan) == *lock
+                    && self
+                        .owned_registration(plan)
+                        .is_ok_and(|owned| owned.is_some())
+            }) || self.owns_preparation_lock(target, lock).await?;
+            if lock != &recovery && !preparation {
+                return Err("External Worktree lock excludes Reclaim".into());
+            }
+            let root: PathBuf = target.checkout.root.components().collect();
+            let root = root
+                .to_str()
+                .ok_or("Worktree path cannot be passed to Git")?;
+            self.mutate(
+                &target.repository.metadata_directory,
+                &["worktree", "unlock", "--", root],
+            )
+            .await?;
+            let unlocked = self.inspect_linked_removal(target).await?;
+            let mut expected = current;
+            expected.lock = None;
+            if unlocked != expected {
+                return Err("Worktree conditions changed while its Suru lock was released".into());
+            }
+            return self
+                .remove_checkout(target, &unlocked, false, branch_outcome)
+                .await;
+        }
+        self.remove_checkout(target, inspection, false, branch_outcome)
+            .await
+    }
     async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
         let root = match &plan.repository.location {
             RepositoryLocation::Main { root } | RepositoryLocation::Bare { root } => root,

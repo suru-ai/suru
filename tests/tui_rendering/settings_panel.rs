@@ -19,7 +19,7 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AppearanceMode, AppearanceSettings, AutoSettle, CodexSettings,
+        AgentSelection, AppearanceMode, AppearanceSettings, AutoReclaim, AutoSettle, CodexSettings,
         CopilotSettings, EffectiveSettings, EmojiVisibility, FoldPosture, ModelAvailability,
         ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
         ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
@@ -419,6 +419,14 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let source_control = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&source_control, "Source Control"),
+        active,
+        "Source Control follows Appearance"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     let last = rendered_application_buffer(&application, 80, 15);
     assert_eq!(
         styling(&last, "Experimental"),
@@ -441,6 +449,39 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
         active,
         "Left before the first tab wraps to the last"
     );
+}
+
+#[test]
+fn source_control_tab_presents_the_server_reclaim_setting_between_providers_and_experimental() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+
+    let reclaim_row = row(&application, "Reclaim Managed Worktrees");
+    assert!(
+        reclaim_row.contains("14 days [default]"),
+        "default threshold is visible: {reclaim_row}"
+    );
+    assert_eq!(focused_key(&application), "worktree.autoReclaim");
+    let descriptor = suru::settings::SCHEMA
+        .iter()
+        .find(|descriptor| descriptor.key == "worktree.autoReclaim")
+        .expect("schema declares Reclaim");
+    assert_eq!(descriptor.group, SettingGroup::SourceControl);
+    assert_eq!(descriptor.scope, SettingScope::Server);
+
+    deliver_snapshot(
+        &mut application,
+        EffectiveSettings {
+            worktree: suru::protocol::WorktreeSettings {
+                auto_reclaim: AutoReclaim::Off,
+            },
+            ..EffectiveSettings::default()
+        },
+        &["worktree.autoReclaim"],
+    );
+    assert!(row(&application, "Reclaim Managed Worktrees").contains("off [pinned]"));
 }
 
 #[test]
@@ -1011,6 +1052,13 @@ fn entering_the_providers_tab_reads_availability_every_time() {
         press(&mut application, KeyCode::Left, KeyModifiers::NONE),
         ApplicationTransition::Continue,
         "wrapping backwards off the first tab lands on one presenting no Provider"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+            ApplicationTransition::Continue
+        ),
+        "crossing Source Control reads no Provider"
     );
     assert!(
         matches!(

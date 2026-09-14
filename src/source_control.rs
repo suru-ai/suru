@@ -67,6 +67,22 @@ pub trait SourceControl: Send + Sync {
     ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
         Err("Working-copy removal is unsupported".into())
     }
+    /// Remove one freshly inspected Reclaim candidate without force. Adapters
+    /// may release only their own verified operation locks before delegating
+    /// to the same native removal used by the explicit path.
+    async fn reclaim_checkout(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+        inspection: &crate::protocol::CheckoutRemovalInspection,
+        branch_outcome: crate::protocol::CheckoutBranchOutcome,
+        _preparations: &[crate::protocol::PreparedCheckout],
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
+        if inspection.requires_force() {
+            return Err("Worktree requires force and is not eligible for Reclaim".to_owned());
+        }
+        self.remove_checkout(target, inspection, false, branch_outcome)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
     async fn plan_checkout(
         &self,
@@ -199,6 +215,17 @@ impl SourceControlService {
             .remove_checkout(target, inspection, force, branch_outcome)
             .await
     }
+    pub(crate) async fn reclaim_checkout(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+        inspection: &crate::protocol::CheckoutRemovalInspection,
+        branch_outcome: crate::protocol::CheckoutBranchOutcome,
+        preparations: &[crate::protocol::PreparedCheckout],
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
+        self.adapter
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
     pub(crate) async fn mutation_guard(
         &self,
         id: &RepositoryId,
@@ -211,6 +238,19 @@ impl SourceControlService {
             .or_default()
             .clone();
         lock.lock_owned().await
+    }
+    pub(crate) fn try_mutation_guard(
+        &self,
+        id: &RepositoryId,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self
+            .mutations
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        lock.try_lock_owned().ok()
     }
     pub(crate) async fn prepare_execution(
         &self,

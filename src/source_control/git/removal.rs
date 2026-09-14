@@ -134,7 +134,11 @@ impl GitSourceControl {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.to_string()),
         };
-        let reading = self.observe(checkout).await;
+        // Removal already holds the Repository mutation guard. Read through a
+        // verified Suru recovery marker here so Reclaim can inspect and finish
+        // that abandoned operation; an external or mismatched lock remains in
+        // the inspection and still blocks unattended removal.
+        let reading = self.observe_checkout(checkout, true).await;
         if reading.availability != SourceControlAvailability::Available {
             return Err("The selected Worktree cannot be read safely for removal".into());
         }

@@ -4,7 +4,7 @@
 use super::*;
 use std::io::Write;
 
-fn token(plan: &PreparedCheckout) -> String {
+pub(super) fn token(plan: &PreparedCheckout) -> String {
     let identity = serde_json::to_vec(&(
         &plan.id,
         &plan.repository.id,
@@ -16,6 +16,52 @@ fn token(plan: &PreparedCheckout) -> String {
     format!("suru-preparation:{}", blake3::hash(&identity).to_hex())
 }
 impl GitSourceControl {
+    /// Whether a lock is backed by both pieces of Git-owned evidence Suru
+    /// writes during preparation. This remains verifiable after the intent is
+    /// retired: the registration marker and ownership-ref reflog carry the
+    /// same opaque token. A raw `suru-preparation:` prefix proves nothing.
+    pub(super) async fn owns_preparation_lock(
+        &self,
+        target: &CheckoutRemovalTarget,
+        lock: &str,
+    ) -> Result<bool, String> {
+        let Some(metadata) = self.recovery_registration(&target.repository, &target.checkout)?
+        else {
+            return Ok(false);
+        };
+        let marker = match std::fs::read_to_string(metadata.join("suru-preparation")) {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        if marker != lock {
+            return Ok(false);
+        }
+        let references = self
+            .text(
+                &target.repository.metadata_directory,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/suru/preparations",
+                ],
+            )
+            .await
+            .unwrap_or_default();
+        for reference in references.lines() {
+            let message = self
+                .text(
+                    &target.repository.metadata_directory,
+                    &["reflog", "show", "--format=%gs", "-1", reference],
+                )
+                .await;
+            if message.as_deref() == Some(lock) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn record_branch_base(&self, plan: &PreparedCheckout) -> Result<(), String> {
         let CheckoutPreparationPlan::Git {
             branch,

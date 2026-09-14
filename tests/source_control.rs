@@ -55,6 +55,52 @@ fn linked(main: &Path, path: &Path, branch: &str) {
     );
 }
 
+#[tokio::test]
+async fn reclaim_accepts_a_preparation_lock_only_with_git_owned_marker_and_ref_evidence() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let adapter = GitSourceControl::default();
+    let source = adapter.discover(&main).await;
+    let plan = adapter
+        .plan_checkout(Default::default(), &source, "owned lock")
+        .await
+        .unwrap();
+    adapter.prepare_checkout(&plan).await.unwrap();
+    let target = removal_target(&adapter, &plan.destination.path).await;
+    let pointer = std::fs::read_to_string(plan.destination.path.join(".git")).unwrap();
+    let metadata = PathBuf::from(
+        pointer
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("gitdir: ")
+            .unwrap(),
+    );
+    let reason = std::fs::read_to_string(metadata.join("suru-preparation")).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &reason,
+            plan.destination.path.to_str().unwrap(),
+        ],
+    );
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+    assert_eq!(inspection.lock.as_deref(), Some(reason.as_str()));
+
+    assert_eq!(
+        adapter
+            .reclaim_checkout(&target, &inspection, CheckoutBranchOutcome::Retained, &[],)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained,
+        "retired intents need not survive when Git's two ownership records agree"
+    );
+    assert!(!plan.destination.path.exists());
+}
+
 fn read_git(directory: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

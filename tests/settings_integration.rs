@@ -11,11 +11,11 @@ use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
-        CodexSandboxMode, CommandAutoExpand, CopilotPermissions, EmojiVisibility, FoldPosture,
-        ModelId, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-        SidebarVisibility, TitleErrand,
+        AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
+        CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
+        EmojiVisibility, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
+        ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
+        SettingsSnapshot, SidebarScope, SidebarVisibility, TitleErrand,
     },
     server::{self, ServerConfig},
 };
@@ -751,6 +751,87 @@ async fn the_auto_settle_setting_pins_from_a_document_and_resets_to_its_default(
     assert_eq!(answered.pinned, [] as [String; 0]);
 
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_auto_reclaim_setting_round_trips_both_scalar_forms_and_defaults_to_fourteen_days() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "worktree": { "autoReclaim": 7 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-auto-reclaim")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-auto-reclaim").await;
+    assert_eq!(
+        opening.settings.worktree.auto_reclaim,
+        AutoReclaim::AfterDays(7)
+    );
+    assert_eq!(opening.pinned, ["worktree.autoReclaim"]);
+
+    let off = client
+        .mutate_setting(SettingMutation::WorktreeAutoReclaim {
+            value: Some(AutoReclaim::Off),
+        })
+        .await
+        .expect("turn Reclaim off");
+    assert_eq!(off.settings.worktree.auto_reclaim, AutoReclaim::Off);
+
+    let reset = client
+        .mutate_setting(SettingMutation::WorktreeAutoReclaim { value: None })
+        .await
+        .expect("reset Reclaim");
+    assert_eq!(
+        reset.settings.worktree.auto_reclaim,
+        AutoReclaim::AfterDays(14)
+    );
+    assert!(reset.pinned.is_empty());
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn auto_reclaim_rejects_values_below_one_with_the_usual_diagnostic() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "worktree": { "autoReclaim": 0 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-auto-reclaim-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-auto-reclaim-invalid")
+        .await
+        .1;
+    assert_eq!(
+        snapshot.settings.worktree.auto_reclaim,
+        AutoReclaim::AfterDays(14)
+    );
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.key.as_deref(), Some("worktree.autoReclaim"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not one of \"off\" or a whole number of days, at least 1"
+    );
+
     server.shutdown().await.expect("shut down server");
 }
 

@@ -31,12 +31,12 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AppearanceMode, AutoSettle, ClaudePermissionMode, CodexApprovalPolicy,
-    CodexSandboxMode, CommandAutoExpand, CopilotPermissions, EffectiveSettings, EmojiVisibility,
-    FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail, ReasoningVisibility,
-    SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
-    TextSelectionCopy, TitleErrand,
+    AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
+    CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
+    EffectiveSettings, EmojiVisibility, FoldPosture, LandingPage, ProviderId,
+    ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+    SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
+    SidebarVisibility, TextSelectionCopy, TitleErrand,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -64,6 +64,7 @@ const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_WIDTH: &str = "sidebar.initialWidth";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
+const WORKTREE_AUTO_RECLAIM: &str = "worktree.autoReclaim";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_CODEX_APPROVAL_POLICY: &str = "provider.codex.approvalPolicy";
@@ -92,6 +93,8 @@ pub enum SettingGroup {
     /// Settings scoped to one Provider, which the panel presents beside the
     /// Provider they configure rather than in a flat list.
     Providers,
+    /// Settings governing source-control behavior owned by the Server.
+    SourceControl,
     /// Settings still finding their shape, kept apart so a reader meets them
     /// knowing as much. Nothing else follows from the group: an experimental
     /// Setting is loaded, pinned, and edited exactly like any other, and
@@ -302,6 +305,25 @@ const SIDEBAR_AUTO_SETTLE_NUMERIC: NumericSettingChoice = NumericSettingChoice::
     spell_auto_settle_idle_days,
     |days| SettingMutation::SidebarAutoSettle {
         value: Some(AutoSettle::Idle(days)),
+    },
+);
+
+const WORKTREE_AUTO_RECLAIM_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Days before Reclaim",
+    |settings| match settings.worktree.auto_reclaim {
+        AutoReclaim::Off => 14,
+        AutoReclaim::AfterDays(days) => days,
+    },
+    |value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|days| *days >= AutoReclaim::MINIMUM_DAYS)
+            .ok_or("minimum: 1")
+    },
+    spell_auto_settle_idle_days,
+    |days| SettingMutation::WorktreeAutoReclaim {
+        value: Some(AutoReclaim::AfterDays(days)),
     },
 );
 
@@ -522,6 +544,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SidebarAutoSettle { value } => {
             *value == Some(settings.sidebar.auto_settle)
+        }
+        SettingMutation::WorktreeAutoReclaim { value } => {
+            *value == Some(settings.worktree.auto_reclaim)
         }
         SettingMutation::ProviderCodexEnabled { value } => {
             *value == Some(settings.provider.codex.enabled)
@@ -980,6 +1005,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         ]),
         reset: SettingMutation::TextSelectionCopy { value: None },
         apply: |settings, value| apply_value(value, |copy| settings.text_selection.copy = copy),
+    },
+    SettingDescriptor {
+        key: WORKTREE_AUTO_RECLAIM,
+        label: "Reclaim Managed Worktrees",
+        description: "Reclaim unused Managed Worktrees automatically",
+        group: SettingGroup::SourceControl,
+        scope: SettingScope::Server,
+        values: SettingValues::Open {
+            named: &[SettingChoice {
+                value: "off",
+                build_mutation: || SettingMutation::WorktreeAutoReclaim {
+                    value: Some(AutoReclaim::Off),
+                },
+            }],
+            accepts: "a whole number of days, at least 1",
+            spell: |settings| match settings.worktree.auto_reclaim {
+                AutoReclaim::Off => "off".to_owned(),
+                AutoReclaim::AfterDays(days) => WORKTREE_AUTO_RECLAIM_NUMERIC.spell(days),
+            },
+            chosen_at: Some(SettingChoiceSurface::Numeric(WORKTREE_AUTO_RECLAIM_NUMERIC)),
+        },
+        reset: SettingMutation::WorktreeAutoReclaim { value: None },
+        apply: |settings, value| {
+            apply_value(value, |auto_reclaim| {
+                settings.worktree.auto_reclaim = auto_reclaim;
+            })
+        },
     },
     SettingDescriptor {
         key: PROVIDER_CODEX_ENABLED,
@@ -1516,6 +1568,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::SidebarInitialWidth { value } => (SIDEBAR_INITIAL_WIDTH, pinned(value)),
         SettingMutation::SidebarInitialScope { value } => (SIDEBAR_INITIAL_SCOPE, pinned(value)),
         SettingMutation::SidebarAutoSettle { value } => (SIDEBAR_AUTO_SETTLE, pinned(value)),
+        SettingMutation::WorktreeAutoReclaim { value } => (WORKTREE_AUTO_RECLAIM, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
@@ -2056,6 +2109,7 @@ mod tests {
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
                 "one of \"release\" or \"manual\"".to_owned(),
+                "one of \"off\" or a whole number of days, at least 1".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
                 "one of \"untrusted\", \"on-request\", or \"never\"".to_owned(),

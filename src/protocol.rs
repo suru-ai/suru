@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 54;
+pub const PROTOCOL_VERSION: u32 = 55;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -973,6 +973,64 @@ pub enum AutoSettle {
     Idle(u64),
 }
 
+/// Whether the Server Reclaims Managed Worktrees, and the age threshold used
+/// by age-based rules. Orphaned Worktrees use the same switch but no age.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoReclaim {
+    Off,
+    AfterDays(u64),
+}
+
+impl AutoReclaim {
+    pub const MINIMUM_DAYS: u64 = 1;
+}
+
+impl Default for AutoReclaim {
+    fn default() -> Self {
+        Self::AfterDays(14)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum AutoReclaimDocument {
+    Named(String),
+    Days(u64),
+}
+
+impl Serialize for AutoReclaim {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => AutoReclaimDocument::Named("off".to_owned()),
+            Self::AfterDays(days) => AutoReclaimDocument::Days(*days),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoReclaim {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match AutoReclaimDocument::deserialize(deserializer)? {
+            AutoReclaimDocument::Named(word) if word == "off" => Ok(Self::Off),
+            AutoReclaimDocument::Named(word) => Err(serde::de::Error::custom(format!(
+                "{word:?} is not a Managed Worktree reclaim threshold"
+            ))),
+            AutoReclaimDocument::Days(days) if days >= Self::MINIMUM_DAYS => {
+                Ok(Self::AfterDays(days))
+            }
+            AutoReclaimDocument::Days(days) => Err(serde::de::Error::custom(format!(
+                "{days} is below the one-day minimum"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeSettings {
+    pub auto_reclaim: AutoReclaim,
+}
+
 impl AutoSettle {
     pub const MINIMUM_IDLE_DAYS: u64 = 1;
 
@@ -1366,6 +1424,7 @@ pub struct EffectiveSettings {
     pub transcript: TranscriptSettings,
     pub session: SessionSettings,
     pub sidebar: SidebarSettings,
+    pub worktree: WorktreeSettings,
     pub provider: ProviderSettings,
     pub serving: ServingSettings,
 }
@@ -1572,6 +1631,9 @@ pub enum SettingMutation {
     },
     SidebarAutoSettle {
         value: Option<AutoSettle>,
+    },
+    WorktreeAutoReclaim {
+        value: Option<AutoReclaim>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,

@@ -6,7 +6,7 @@
 //! the server is what moves a row — the panel never shows a value the Config
 //! Document does not yet carry.
 //!
-//! Four tabs split the listing. Appearance, General and Experimental are the
+//! Five tabs split the listing. Appearance, General, Source Control and Experimental are the
 //! schema filtered to their own group, so a Setting added to any appears with
 //! no work. Providers is hand-built from the built-in Provider list rather than
 //! from the schema: one row per Provider, always and in the built-in order,
@@ -70,6 +70,7 @@ pub(super) enum SettingsTab {
     General,
     Appearance,
     Providers,
+    SourceControl,
     Experimental,
 }
 
@@ -80,6 +81,7 @@ impl SettingsTab {
         Self::General,
         Self::Providers,
         Self::Appearance,
+        Self::SourceControl,
         Self::Experimental,
     ];
 
@@ -88,6 +90,7 @@ impl SettingsTab {
             Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Providers => "Providers",
+            Self::SourceControl => "Source Control",
             Self::Experimental => "Experimental",
         }
     }
@@ -98,6 +101,7 @@ impl SettingsTab {
             Self::General => SettingGroup::General,
             Self::Appearance => SettingGroup::Appearance,
             Self::Providers => SettingGroup::Providers,
+            Self::SourceControl => SettingGroup::SourceControl,
             Self::Experimental => SettingGroup::Experimental,
         }
     }
@@ -771,7 +775,10 @@ impl SettingsPanel {
     fn entries(&self) -> Vec<PanelEntry> {
         let tab = self.tab;
         match tab {
-            SettingsTab::General | SettingsTab::Appearance | SettingsTab::Experimental => SCHEMA
+            SettingsTab::General
+            | SettingsTab::Appearance
+            | SettingsTab::SourceControl
+            | SettingsTab::Experimental => SCHEMA
                 .iter()
                 .filter(|descriptor| descriptor.group == tab.group())
                 .map(|descriptor| PanelEntry {
