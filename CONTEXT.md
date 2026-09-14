@@ -65,15 +65,18 @@ The local source-controlled body of work a Workspace belongs to, including its r
 _Avoid_: Remote, origin, project
 
 **Worktree**:
-A Git Repository's working copy, either its main working copy or a linked one elsewhere on the same Server, shared by any Sessions that work within it. Every Worktree belongs to its Repository's Workspace, including those created outside Suru. Settling or deleting Sessions never removes one: a Worktree leaves only through explicit removal or, for a Managed Worktree, a Reclaim.
+A Git Repository's working copy, either its main working copy or a linked one elsewhere on the same Server, shared by any Sessions that work within it. Every Worktree belongs to its Repository's Workspace, including those created outside Suru; settling a Session leaves it in place, while deleting the last Session that references a Managed Worktree can make it Reclaimable.
 _Avoid_: Workspace (for an individual linked working copy)
 
 **Managed Worktree**:
 A linked Worktree that Suru created for a Session, living under the Repository's managed container on a branch Suru named and started from the commit the Session was created against. Only Managed Worktrees are ever Reclaimed; a linked Worktree the user created elsewhere is theirs to remove.
 _Avoid_: temporary worktree, auto worktree, sandbox
 
+**Reclaimable**:
+A Managed Worktree eligible for Reclaim because no Session or unfinished preparation references it, every Session that references it has been inactive past the configured threshold, or its failed preparation is older than that threshold. Working Sessions, changes Git would need force to discard, initialized submodules, and Git locks Suru did not place make it ineligible.
+
 **Reclaim**:
-The Server's unattended removal of a **Reclaimable** Managed Worktree: one no Session references any longer, one whose every Session has gone quiet past the reclaim threshold, or one left behind by a failed preparation past that same threshold. A Reclaim never touches a Worktree that is Working, that holds anything Git would need force to discard, meaning tracked changes, untracked files, or initialized submodules, or that is locked in Git by anyone but Suru, which is also how a user keeps one indefinitely; it retains the branch unless the branch is fully merged into its base; and the Sessions it leaves behind keep their histories and recover the Worktree on their next Prompt. Distinct from explicit removal, which the user asks for and confirms.
+The Server's unattended removal of a Reclaimable Managed Worktree, distinct from explicit removal that the user asks for and confirms. It retains the branch unless fully merged into its recorded base, and leaves affected Sessions' histories and settlement unchanged so their next Prompt can recover the Worktree.
 _Avoid_: cleanup, prune, sweep, garbage collection, expire, retire
 
 **Execution Directory**:
