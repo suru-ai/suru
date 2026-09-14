@@ -61,7 +61,7 @@ as other Settings.
 Successful Reclaims are recorded only in the Server log, with the qualifying rule and actual branch outcome; Suru
 does not show a notice or dialog. A failed Reclaim is logged and retried on a later pass. For a failed preparation,
 Suru also removes its stored intent and ownership ref, applies the same branch rule, and logs the first line of any
-withheld Prompt before discarding it.
+withheld Prompt before cancelling its pending delivery; the Prompt remains in its Session history.
 
 The running Server remembers Repositories it has discovered and can retry a failed Reclaim on a later pass. Suru
 does not persist a Repository registry, so after a restart it cannot rediscover a Repository with no Sessions and no
