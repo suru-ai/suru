@@ -115,6 +115,42 @@ async fn managed_branch_records_the_planned_source_commit_and_branch_when_claime
     );
 }
 
+#[tokio::test]
+async fn same_named_tag_cannot_hide_an_unmerged_local_source_branch() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    git(&main, &["tag", "main"]);
+    let adapter = GitSourceControl::default();
+    let source = adapter.discover(&main).await;
+    let plan = adapter
+        .plan_checkout(Default::default(), &source, "ambiguous short ref")
+        .await
+        .unwrap();
+    let CheckoutPreparationPlan::Git { source_branch, .. } = &plan.plan;
+    assert_eq!(source_branch.as_deref(), Some("main"));
+    let prepared = adapter.prepare_checkout(&plan).await.unwrap();
+    let checkout = prepared.checkout.unwrap();
+    commit(&checkout.root);
+    let tip = read_git(&checkout.root, &["rev-parse", "HEAD"]);
+    git(
+        &main,
+        &["update-ref", "refs/remotes/upstream/integration", &tip],
+    );
+    let target = removal_target(&adapter, &checkout.root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained,
+        "the existing, unmerged local source branch prevents remote fallback"
+    );
+}
+
 async fn removal_target(adapter: &GitSourceControl, path: &Path) -> CheckoutRemovalTarget {
     let resolved = adapter.discover(path).await;
     CheckoutRemovalTarget {
@@ -209,6 +245,41 @@ async fn remote_tracking_refs_are_considered_only_after_the_source_branch_is_del
             .unwrap(),
         CheckoutBranchOutcome::Deleted,
         "any local remote-tracking ref is a fallback, regardless of its branch name"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_ref_store_does_not_authorize_remote_fallback() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    commit(&linked_root);
+    let base = read_git(&main, &["rev-parse", "main"]);
+    let managed = read_git(&main, &["rev-parse", "managed"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    git(
+        &main,
+        &["update-ref", "refs/remotes/upstream/integration", &managed],
+    );
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+    std::fs::write(main.join(".git/packed-refs"), "invalid packed ref\n").unwrap();
+
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained,
+        "a fatal source-ref lookup is ambiguous, not proof that the branch is absent"
     );
 }
 

@@ -443,20 +443,24 @@ impl SourceControl for GitSourceControl {
         // Capture the commit and exact symbolic source together. In particular,
         // never rediscover a branch by looking for another ref at the same commit:
         // several branches may legitimately share it.
-        let source_branch = self
-            .text(source_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        let source_reference = self
+            .text(source_path, &["symbolic-ref", "--quiet", "HEAD"])
             .await;
+        let source_branch = source_reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("refs/heads/"))
+            .map(str::to_owned);
         let commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await
             .ok_or("A usable local source commit is required; this Repository may be unborn")?;
-        let confirmed_branch = self
-            .text(source_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        let confirmed_reference = self
+            .text(source_path, &["symbolic-ref", "--quiet", "HEAD"])
             .await;
         let confirmed_commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await;
-        if confirmed_branch != source_branch || confirmed_commit.as_deref() != Some(&commit) {
+        if confirmed_reference != source_reference || confirmed_commit.as_deref() != Some(&commit) {
             return Err("The source checkout changed while its Worktree was being planned; retry preparation".into());
         }
         let description = portable_description(description);

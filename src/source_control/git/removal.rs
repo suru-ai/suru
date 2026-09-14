@@ -66,17 +66,16 @@ impl GitSourceControl {
             return Ok(CheckoutBranchOutcome::Retained);
         }
         let local_source = format!("refs/heads/{source_branch}");
-        let local_exists = self
+        let local_status = self
             .command(
                 repository,
                 &["show-ref", "--verify", "--quiet", &local_source],
             )
             .await?
-            .status
-            .success();
-        let merged = if local_exists {
+            .status;
+        let merged = if local_status.success() {
             self.is_ancestor(repository, tip, &local_source).await?
-        } else {
+        } else if local_status.code() == Some(1) {
             // Once the exact local source branch is gone, any locally known
             // remote-tracking ref may prove the work merged. No fetch is made.
             let refs = self
@@ -94,6 +93,10 @@ impl GitSourceControl {
                 }
             }
             merged
+        } else {
+            // Only show-ref's documented "not found" status proves absence.
+            // Invalid provenance and repository read failures retain the branch.
+            return Ok(CheckoutBranchOutcome::Retained);
         };
         Ok(if merged {
             CheckoutBranchOutcome::Deleted
