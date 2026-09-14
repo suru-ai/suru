@@ -210,16 +210,8 @@ impl SessionStore {
             .await
             .map_err(|error| error.to_string())?;
         Ok(self.snapshot(session_id).and_then(|snapshot| {
-            snapshot.turns.is_empty().then(|| {
-                snapshot
-                    .prompts
-                    .iter()
-                    .find(|prompt| {
-                        prompt.status == PromptStatus::Pending
-                            && prompt.delivery == PromptDelivery::Steer
-                    })
-                    .map(|prompt| prompt.text.lines().next().unwrap_or_default().to_owned())
-            })?
+            withheld_preparation_prompt(&snapshot)
+                .map(|prompt| prompt.text.lines().next().unwrap_or_default().to_owned())
         }))
     }
 
@@ -237,20 +229,11 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let prompt = state.sessions.get(&session_id).and_then(|record| {
-            record
-                .snapshot
-                .turns
-                .is_empty()
-                .then(|| {
-                    record.snapshot.prompts.iter().find(|prompt| {
-                        prompt.status == PromptStatus::Pending
-                            && prompt.delivery == PromptDelivery::Steer
-                    })
-                })
-                .flatten()
-                .cloned()
-        });
+        let prompt = state
+            .sessions
+            .get(&session_id)
+            .and_then(|record| withheld_preparation_prompt(&record.snapshot))
+            .cloned();
         if let Some(prompt) = &prompt {
             state
                 .commit(
@@ -1031,6 +1014,15 @@ impl SessionStore {
         prompt.status = PromptStatus::Cancelled;
         Ok(prompt)
     }
+}
+
+fn withheld_preparation_prompt(snapshot: &SessionSnapshot) -> Option<&Prompt> {
+    if !snapshot.turns.is_empty() {
+        return None;
+    }
+    snapshot.prompts.iter().find(|prompt| {
+        prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
+    })
 }
 
 impl SessionRecord {

@@ -553,85 +553,8 @@ impl SourceControl for GitSourceControl {
         else {
             return Ok(CheckoutBranchOutcome::Retained);
         };
-        let reference = format!("refs/heads/{name}");
-        let listing = self
-            .command(
-                &target.repository.metadata_directory,
-                &["worktree", "list", "--porcelain", "-z"],
-            )
-            .await?;
-        if !listing.status.success() {
-            tracing::warn!(
-                branch = name,
-                "Worktree was removed but branch use could not be rechecked"
-            );
-            return Ok(CheckoutBranchOutcome::Retained);
-        }
-        if parse_worktrees(&listing.stdout).iter().any(|entry| {
-            matches!(
-                &entry.revision,
-                Some(CheckoutRevision::Branch { name: used, .. }) if used == name
-            )
-        }) {
-            tracing::warn!(
-                branch = name,
-                "Worktree was removed but its branch is used by another Worktree"
-            );
-            return Ok(CheckoutBranchOutcome::Retained);
-        }
-        if let Err(error) = self
-            .mutate(
-                &target.repository.metadata_directory,
-                &["update-ref", "-d", &reference, tip],
-            )
+        self.delete_branch_if_unused(&target.repository.metadata_directory, name, tip)
             .await
-        {
-            let branch_is_definitely_absent = self
-                .command(
-                    &target.repository.metadata_directory,
-                    &["show-ref", "--verify", "--quiet", &reference],
-                )
-                .await
-                .is_ok_and(|output| output.status.code() == Some(1));
-            if !branch_is_definitely_absent {
-                tracing::warn!(
-                    branch = name,
-                    "Worktree was removed but its merged branch was retained: {error}"
-                );
-                return Ok(CheckoutBranchOutcome::Retained);
-            }
-        }
-        // update-ref intentionally uses an expected old value for race safety;
-        // remove the now-unused branch section separately after the ref is gone.
-        let section = format!("branch.{name}");
-        if let Err(error) = self
-            .mutate(
-                &target.repository.metadata_directory,
-                &["config", "--local", "--remove-section", &section],
-            )
-            .await
-        {
-            tracing::warn!(
-                branch = name,
-                "Deleted branch configuration could not be removed: {error}"
-            );
-        }
-        let branch_is_absent = self
-            .command(
-                &target.repository.metadata_directory,
-                &["show-ref", "--verify", "--quiet", &reference],
-            )
-            .await
-            .is_ok_and(|output| output.status.code() == Some(1));
-        if branch_is_absent {
-            Ok(CheckoutBranchOutcome::Deleted)
-        } else {
-            tracing::warn!(
-                branch = name,
-                "Worktree was removed but its branch still exists after deletion"
-            );
-            Ok(CheckoutBranchOutcome::Retained)
-        }
     }
     async fn reclaim_checkout(
         &self,
@@ -687,8 +610,16 @@ impl SourceControl for GitSourceControl {
         self.remove_checkout(target, inspection, false, branch_outcome)
             .await
     }
-    async fn retire_preparation(&self, plan: &PreparedCheckout) -> Result<(), String> {
-        let CheckoutPreparationPlan::Git { source_commit, .. } = &plan.plan;
+    async fn retire_preparation(
+        &self,
+        plan: &PreparedCheckout,
+        retire_branch: bool,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        let CheckoutPreparationPlan::Git {
+            branch,
+            source_commit,
+            ..
+        } = &plan.plan;
         let reference = format!("refs/suru/preparations/{}", plan.id.0.simple());
         let repository = &plan.repository.metadata_directory;
         let status = self
@@ -696,7 +627,7 @@ impl SourceControl for GitSourceControl {
             .await?
             .status;
         if status.code() == Some(1) {
-            return Ok(());
+            return Ok(CheckoutBranchOutcome::Retained);
         }
         if !status.success() {
             return Err("Preparation ownership ref could not be inspected".into());
@@ -716,6 +647,32 @@ impl SourceControl for GitSourceControl {
         {
             return Err("Preparation ownership ref no longer matches its persisted intent".into());
         }
+        let branch_ref = format!("refs/heads/{branch}");
+        let branch_status = self
+            .command(
+                repository,
+                &["show-ref", "--verify", "--quiet", &branch_ref],
+            )
+            .await?
+            .status;
+        let branch_outcome = if branch_status.code() == Some(1) {
+            CheckoutBranchOutcome::Deleted
+        } else if branch_status.success() && retire_branch {
+            let tip = self
+                .text(repository, &["rev-parse", "--verify", &branch_ref])
+                .await
+                .ok_or("Prepared branch could not be read")?;
+            if self.branch_outcome(repository, branch, &tip).await?
+                == CheckoutBranchOutcome::Deleted
+            {
+                self.delete_branch_if_unused(repository, branch, &tip)
+                    .await?
+            } else {
+                CheckoutBranchOutcome::Retained
+            }
+        } else {
+            CheckoutBranchOutcome::Retained
+        };
         self.mutate(repository, &["update-ref", "-d", &reference, source_commit])
             .await?;
         let absent = self
@@ -725,7 +682,7 @@ impl SourceControl for GitSourceControl {
             .code()
             == Some(1);
         if absent {
-            Ok(())
+            Ok(branch_outcome)
         } else {
             Err("Preparation ownership ref remains after retirement".into())
         }

@@ -217,7 +217,7 @@ impl Reclaimer {
         if !rule.qualifies(self.sessions.checkout_activity(&checkout.id)) {
             return;
         }
-        let preparations = match self.preparations.for_destination(&checkout.root) {
+        let mut preparations = match self.preparations.for_destination(&checkout.root) {
             Ok(preparations) => preparations,
             Err(error) => {
                 self.failed(&checkout, rule, &error);
@@ -231,6 +231,19 @@ impl Reclaimer {
                     .any(|plan| plan.admitted_session.is_some() || !old(plan, rule.days()))
             {
                 return;
+            }
+            // The CheckoutCreated observer may fail before the request handler
+            // records this fact. Persist it once Git lists the Worktree so a
+            // post-removal retry never mistakes the remainder for branch-only
+            // preparation and broadens the branch fate already decided here.
+            for preparation in &mut preparations {
+                if !preparation.checkout_created {
+                    preparation.checkout_created = true;
+                    if let Err(error) = self.preparations.save(preparation) {
+                        self.failed(&checkout, rule, &error);
+                        return;
+                    }
+                }
             }
         } else if preparations
             .iter()
@@ -380,7 +393,7 @@ impl Reclaimer {
                 if rule.is_failed_preparation() {
                     for preparation in &preparations {
                         if let Err(error) = self
-                            .finish_failed_preparation(preparation, &checkout, rule)
+                            .finish_failed_preparation(preparation, &checkout, rule, false)
                             .await
                         {
                             self.failed(&checkout, rule, &error);
@@ -404,8 +417,12 @@ impl Reclaimer {
         preparation: &crate::protocol::PreparedCheckout,
         checkout: &CheckoutAssociation,
         rule: ReclaimRule,
-    ) -> Result<(), String> {
-        self.source_control.retire_preparation(preparation).await?;
+        retire_branch: bool,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        let branch_outcome = self
+            .source_control
+            .retire_preparation(preparation, retire_branch)
+            .await?;
         let withheld_prompt = self
             .sessions
             .preparation_prompt_first_line(preparation.intended_session)
@@ -430,7 +447,7 @@ impl Reclaimer {
             rule = rule.log_name(),
             "Failed Worktree preparation intent retired"
         );
-        Ok(())
+        Ok(branch_outcome)
     }
 
     async fn finish_failed_preparation_remainder(
@@ -491,11 +508,17 @@ impl Reclaimer {
             reclaim: None,
         };
         let rule = ReclaimRule::FailedPreparation { days };
-        if let Err(error) = self
-            .finish_failed_preparation(&current, &checkout, rule)
+        match self
+            .finish_failed_preparation(&current, &checkout, rule, !current.checkout_created)
             .await
         {
-            self.failed(&checkout, rule, &error);
+            Ok(outcome) => tracing::info!(
+                checkout = %checkout.root.display(),
+                rule = rule.log_name(),
+                branch_outcome = branch_outcome(outcome),
+                "Managed Worktree Reclaimed"
+            ),
+            Err(error) => self.failed(&checkout, rule, &error),
         }
     }
 

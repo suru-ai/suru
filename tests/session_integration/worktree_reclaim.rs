@@ -1187,13 +1187,19 @@ impl SourceControl for FailFirstPreparationRetirement {
             .await
     }
 
-    async fn retire_preparation(&self, preparation: &PreparedCheckout) -> Result<(), String> {
+    async fn retire_preparation(
+        &self,
+        preparation: &PreparedCheckout,
+        retire_branch: bool,
+    ) -> Result<CheckoutBranchOutcome, String> {
         if !self.failed.swap(true, Ordering::SeqCst) {
             return Err("simulated ownership-ref retirement failure".into());
         }
         self.reached_retry.notify_one();
         self.release_retry.acquire().await.unwrap().forget();
-        self.git.retire_preparation(preparation).await
+        self.git
+            .retire_preparation(preparation, retire_branch)
+            .await
     }
 }
 
@@ -1541,6 +1547,101 @@ async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repos
     wait_for_branch(&layout.main, &branch, false).await;
     wait_for_branch(&layout.main, &ownership, false).await;
     wait_for_path(&intent, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_reclaims_an_old_branch_only_preparation_and_its_merged_branch() {
+    let layout = ReclaimLayout::new("failed-branch-only");
+    let config = layout.server_config("reclaim-failed-branch-only");
+    let (runtime, _) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::BranchCreated)),
+        ),
+    )
+    .await
+    .unwrap();
+    let preparation = fail_preparation(&server, &layout.main, "branch-only failure").await;
+    let intent = age_preparation(&config, &preparation);
+    let CheckoutPreparationPlan::Git { branch, .. } = &preparation.plan;
+    let branch = format!("refs/heads/{branch}");
+    let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
+    assert!(!preparation.destination.path.exists());
+    assert!(!read_git(&layout.main, &["rev-parse", &branch]).is_empty());
+    assert!(!read_git(&layout.main, &["rev-parse", &ownership]).is_empty());
+    server.shutdown().await.unwrap();
+
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&intent, false).await;
+    wait_for_branch(&layout.main, &branch, false).await;
+    wait_for_branch(&layout.main, &ownership, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn branch_only_reclaim_retires_metadata_but_preserves_unmerged_commits() {
+    let layout = ReclaimLayout::new("failed-branch-only-unmerged");
+    let config = layout.server_config("reclaim-failed-branch-only-unmerged");
+    let (runtime, _) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        config.clone(),
+        vec![runtime.clone()],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(FailOnceAt::new(PreparationCheckpoint::BranchCreated)),
+        ),
+    )
+    .await
+    .unwrap();
+    let preparation = fail_preparation(&server, &layout.main, "unmerged branch-only failure").await;
+    let intent = age_preparation(&config, &preparation);
+    let CheckoutPreparationPlan::Git { branch, .. } = &preparation.plan;
+    let branch_ref = format!("refs/heads/{branch}");
+    let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
+    let authoring = layout.root.join("author-unmerged");
+    git(
+        &layout.main,
+        &["worktree", "add", authoring.to_str().unwrap(), branch],
+    );
+    std::fs::write(authoring.join("tracked"), "user commit").unwrap();
+    git(&authoring, &["add", "."]);
+    commit(&authoring, "unmerged user work");
+    let unmerged_tip = read_git(&authoring, &["rev-parse", "HEAD"]);
+    git(
+        &layout.main,
+        &["worktree", "remove", authoring.to_str().unwrap()],
+    );
+    server.shutdown().await.unwrap();
+
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings(),
+        Arc::new(GitSourceControl::default()),
+    )
+    .await
+    .unwrap();
+    restarted.workspace_discovery_settled().await;
+    wait_for_path(&intent, false).await;
+    wait_for_branch(&layout.main, &ownership, false).await;
+    assert_eq!(
+        read_git(&layout.main, &["rev-parse", &branch_ref]),
+        unmerged_tip
+    );
     restarted.shutdown().await.unwrap();
 }
 

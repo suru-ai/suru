@@ -94,7 +94,8 @@ pub trait SourceControl: Send + Sync {
     async fn retire_preparation(
         &self,
         _preparation: &crate::protocol::PreparedCheckout,
-    ) -> Result<(), String> {
+        _retire_branch: bool,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
         Err("Preparation ownership retirement is unsupported".into())
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
@@ -249,8 +250,11 @@ impl SourceControlService {
     pub(crate) async fn retire_preparation(
         &self,
         preparation: &crate::protocol::PreparedCheckout,
-    ) -> Result<(), String> {
-        self.adapter.retire_preparation(preparation).await
+        retire_branch: bool,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
+        self.adapter
+            .retire_preparation(preparation, retire_branch)
+            .await
     }
     pub(crate) async fn mutation_guard(
         &self,

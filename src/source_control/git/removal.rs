@@ -36,7 +36,16 @@ impl GitSourceControl {
         if inspection.checkout.association.id != target.checkout.id {
             return Err("Removal inspection no longer identifies the selected Worktree".into());
         }
-        let repository = &target.repository.metadata_directory;
+        self.branch_outcome(&target.repository.metadata_directory, name, tip)
+            .await
+    }
+
+    pub(super) async fn branch_outcome(
+        &self,
+        repository: &Path,
+        name: &str,
+        tip: &str,
+    ) -> Result<CheckoutBranchOutcome, String> {
         let base = match self
             .text(
                 repository,
@@ -103,6 +112,79 @@ impl GitSourceControl {
         } else {
             CheckoutBranchOutcome::Retained
         })
+    }
+
+    pub(super) async fn delete_branch_if_unused(
+        &self,
+        repository: &Path,
+        name: &str,
+        expected_tip: &str,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        let reference = format!("refs/heads/{name}");
+        let listing = self
+            .command(repository, &["worktree", "list", "--porcelain", "-z"])
+            .await?;
+        if !listing.status.success() {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but branch use could not be rechecked"
+            );
+            return Ok(CheckoutBranchOutcome::Retained);
+        }
+        if parse_worktrees(&listing.stdout).iter().any(|entry| {
+            matches!(
+                &entry.revision,
+                Some(CheckoutRevision::Branch { name: used, .. }) if used == name
+            )
+        }) {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but its branch is used by another Worktree"
+            );
+            return Ok(CheckoutBranchOutcome::Retained);
+        }
+        if let Err(error) = self
+            .mutate(repository, &["update-ref", "-d", &reference, expected_tip])
+            .await
+        {
+            let branch_is_definitely_absent = self
+                .command(repository, &["show-ref", "--verify", "--quiet", &reference])
+                .await
+                .is_ok_and(|output| output.status.code() == Some(1));
+            if !branch_is_definitely_absent {
+                tracing::warn!(
+                    branch = name,
+                    "Worktree was removed but its merged branch was retained: {error}"
+                );
+                return Ok(CheckoutBranchOutcome::Retained);
+            }
+        }
+        let section = format!("branch.{name}");
+        if let Err(error) = self
+            .mutate(
+                repository,
+                &["config", "--local", "--remove-section", &section],
+            )
+            .await
+        {
+            tracing::warn!(
+                branch = name,
+                "Deleted branch configuration could not be removed: {error}"
+            );
+        }
+        let branch_is_absent = self
+            .command(repository, &["show-ref", "--verify", "--quiet", &reference])
+            .await
+            .is_ok_and(|output| output.status.code() == Some(1));
+        if branch_is_absent {
+            Ok(CheckoutBranchOutcome::Deleted)
+        } else {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but its branch still exists after deletion"
+            );
+            Ok(CheckoutBranchOutcome::Retained)
+        }
     }
 
     pub(super) async fn inspect_linked_removal(

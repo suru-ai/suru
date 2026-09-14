@@ -12,6 +12,19 @@ pub(crate) struct PreparationStore {
     retired: PathBuf,
     pub(crate) serial: Arc<tokio::sync::Mutex<()>>,
 }
+
+#[derive(Clone, Copy)]
+enum UnreadableIntent {
+    Skip,
+    Reject,
+}
+
+#[derive(Clone, Copy)]
+enum RetiredIntent {
+    Include,
+    Exclude,
+}
+
 impl PreparationStore {
     pub(crate) fn new(data: &Path) -> Self {
         let store = Self {
@@ -147,21 +160,38 @@ impl PreparationStore {
         &self,
         destination: &Path,
     ) -> Result<Vec<PreparedCheckout>, String> {
+        Ok(self
+            .intentions(UnreadableIntent::Skip, RetiredIntent::Include)?
+            .into_iter()
+            .filter(|preparation| preparation.destination.path == destination)
+            .collect())
+    }
+
+    fn intentions(
+        &self,
+        unreadable: UnreadableIntent,
+        retired: RetiredIntent,
+    ) -> Result<Vec<PreparedCheckout>, String> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("Cannot read Worktree preparations: {e}")),
         };
         let mut preparations = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+        for entry in entries {
+            let preparation = (|| {
+                let entry = entry.map_err(|e| format!("Cannot read Worktree preparations: {e}"))?;
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
+                serde_json::from_slice::<PreparedCheckout>(&bytes)
+                    .map_err(|e| format!("Cannot read Worktree preparation: {e}"))
+            })();
+            let preparation = match preparation {
+                Ok(preparation) => preparation,
+                Err(_) if matches!(unreadable, UnreadableIntent::Skip) => continue,
+                Err(error) => return Err(error),
             };
-            let Ok(preparation) = serde_json::from_slice::<PreparedCheckout>(&bytes) else {
-                continue;
-            };
-            if preparation.destination.path == destination {
+            if matches!(retired, RetiredIntent::Include) || !self.is_retired(preparation.id) {
                 preparations.push(preparation);
             }
         }
@@ -172,23 +202,7 @@ impl PreparationStore {
     /// these records let startup Reclaim find failed preparations even when no
     /// admitted Session remains to seed Workspace discovery.
     pub(crate) fn all(&self) -> Result<Vec<PreparedCheckout>, String> {
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("Cannot read Worktree preparations: {e}")),
-        };
-        let mut preparations = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Cannot read Worktree preparations: {e}"))?;
-            let bytes = std::fs::read(entry.path())
-                .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
-            let preparation: PreparedCheckout = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("Cannot read Worktree preparation: {e}"))?;
-            if !self.is_retired(preparation.id) {
-                preparations.push(preparation);
-            }
-        }
-        Ok(preparations)
+        self.intentions(UnreadableIntent::Reject, RetiredIntent::Exclude)
     }
 
     /// The Sessions a stored preparation can still bring to their first Turn:
@@ -199,16 +213,10 @@ impl PreparationStore {
     /// restoration from withdrawing it (ADR 0024). An unreadable intention
     /// names no Session and holds nothing back.
     pub(crate) fn resumable_sessions(&self) -> Vec<crate::protocol::SessionId> {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(|entry| {
-                let bytes = std::fs::read(entry.ok()?.path()).ok()?;
-                let preparation: PreparedCheckout = serde_json::from_slice(&bytes).ok()?;
-                if self.is_retired(preparation.id) {
-                    return None;
-                }
+        self.intentions(UnreadableIntent::Skip, RetiredIntent::Exclude)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|preparation| {
                 preparation
                     .admitted_session
                     .is_none()
