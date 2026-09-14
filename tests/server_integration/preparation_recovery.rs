@@ -93,19 +93,19 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
     assert_eq!(b.error, None);
     assert_eq!(a.preparation.destination, failed.preparation.destination);
     assert_eq!(a.preparation.plan, failed.preparation.plan);
-    let create = |text: &str| CreateSessionRequest {
+    let create = CreateSessionRequest {
         preparation_id: Some(a.preparation.id),
         agent_selection: None,
         execution_directory: a.preparation.destination.clone(),
         prompt: InitialPrompt {
             id: PromptId::new(),
-            text: text.into(),
+            text: "First request".into(),
             skill_invocations: vec![],
         },
     };
     let (one, two) = tokio::join!(
-        remote.create_session(create("First request")),
-        remote.create_session(create("Duplicate request"))
+        remote.create_session(create.clone()),
+        remote.create_session(create)
     );
     assert_eq!(one.unwrap().session.id, two.unwrap().session.id);
     let start = timeout(PROGRESS_DEADLINE, provider.next_start())

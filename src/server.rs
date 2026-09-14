@@ -1697,7 +1697,7 @@ async fn rejoin_preparation(
         );
     }
     plan.admitted_session = Some(snapshot.session.id);
-    state.preparations.save(plan)?;
+    state.preparations.delete_after_admission(plan)?;
     Ok(Some(snapshot))
 }
 
@@ -1746,6 +1746,9 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
         Ok(request) => request,
         Err(response) => return response,
     };
+    // Preparation and admission take these locks in this order. Removal joins
+    // that order so no intent can be recreated while its Worktree disappears.
+    let _preparation_serial = state.preparations.serial.lock().await;
     let _guard = state
         .source_control
         .mutation_guard(&request.preview.target.repository.id)
@@ -1763,6 +1766,15 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
             return Err("A Session became Working; Worktree removal is blocked".into());
         }
         state.source_control.remove_checkout(&preview.target, &preview.inspection, request.force).await?;
+        if let Err(error) = state
+            .preparations
+            .delete_for_destination(&preview.target.checkout.root)
+        {
+            tracing::warn!(
+                checkout = %preview.target.checkout.root.display(),
+                "Removed Worktree preparation intent could not be deleted: {error}"
+            );
+        }
         state.sessions.record_checkout(crate::protocol::CheckoutSummary { association: preview.target.checkout.clone(), revision: None, availability: crate::protocol::SourceControlAvailability::Unavailable { reason: "Worktree was explicitly removed; prompt a retained Session to recover it".into() } }).map_err(|e| e.to_string())?;
         Ok::<_, String>(())
     }.await;
@@ -1788,13 +1800,19 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     } else {
         None
     };
+    if request.preparation_id.is_some()
+        && let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await
+    {
+        tracing::warn!("Prompt owner hydration failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let mut missing_preparation = false;
     let mut preparation = match request.preparation_id {
         Some(id) => match state.preparations.load(id) {
             Ok(Some(plan)) => Some(plan),
             Ok(None) => {
-                return preparation_error(
-                    "Worktree preparation is unknown; prepare it before admission",
-                );
+                missing_preparation = true;
+                None
             }
             Err(e) => return preparation_error(e),
         },
@@ -1860,6 +1878,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         .resolve(&request.execution_directory.path, None)
         .await;
     if mutation.is_none()
+        && !missing_preparation
         && let Some(repository) = &location.workspace.repository
     {
         mutation = Some(state.source_control.mutation_guard(&repository.id).await);
@@ -1898,7 +1917,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         .as_ref()
         .map(|selection| selection.provider.clone())
         .or_else(|| state.hosted_providers.first().cloned());
-    if preparation.is_some()
+    if request.preparation_id.is_some()
         && !request.prompt.skill_invocations.is_empty()
         && let Some(provider) = provider.clone()
     {
@@ -1927,6 +1946,17 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     .await
     {
         return response;
+    }
+
+    if missing_preparation {
+        return match state.sessions.existing_prepared_creation(&request) {
+            Ok(Some(snapshot)) => Json(snapshot).into_response(),
+            Ok(None) => {
+                preparation_error("Worktree preparation is unknown; prepare it before admission")
+            }
+            Err(CreateSessionError::PromptConflict) => prompt_conflict_response(),
+            Err(_) => unreachable!("existing creation only reports Prompt conflicts"),
+        };
     }
 
     let admission = if let Some(plan) = &preparation {
@@ -1960,8 +1990,10 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                     return preparation_error(error);
                 }
                 plan.admitted_session = Some(snapshot.session.id);
-                if let Err(e) = state.preparations.save(plan) {
-                    tracing::warn!("Admitted preparation marker will require reconciliation: {e}");
+                if let Err(e) = state.preparations.delete_after_admission(plan) {
+                    tracing::warn!(
+                        "Admitted Worktree preparation intent could not be deleted: {e}"
+                    );
                 }
             }
 

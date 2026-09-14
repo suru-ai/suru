@@ -173,7 +173,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
             "committed\n"
         );
         let a = creation(&one.preparation, "Admitted once");
-        let b = creation(&two.preparation, "Another Prompt id");
+        let b = a.clone();
         let (a, b) = tokio::join!(
             create_response(server.descriptor(), &a),
             create_response(server.descriptor(), &b)
@@ -371,23 +371,13 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
         "a fresh catalog missing the admitted Skill cannot start the Provider"
     );
     runtime.offer_skills(original_catalog);
-    let mut edited = request.clone();
-    edited.description = "Edited after admission".into();
-    let (one, two) = tokio::join!(
-        prepare(server.descriptor(), &edited),
-        prepare(server.descriptor(), &edited)
-    );
+    let one = prepare(server.descriptor(), &request).await;
     assert_eq!(one.error, None);
-    assert_eq!(two.error, None);
     assert_eq!(
         one.preparation.admitted_session,
         Some(prepared.preparation.intended_session)
     );
-    let rejoined = support::create_session(
-        server.descriptor(),
-        &creation(&one.preparation, "Never admit this edit"),
-    )
-    .await;
+    let rejoined = support::create_session(server.descriptor(), &original).await;
     let listed = reqwest::Client::new()
         .get(format!("{}/v1/sessions", server.descriptor().base_url))
         .bearer_auth(&server.descriptor().token)
@@ -432,8 +422,8 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
     )
     .await
     .unwrap();
-    let rejoined = prepare(server.descriptor(), &edited).await;
-    assert_eq!(rejoined.error, None);
+    let rejoined = support::create_session(server.descriptor(), &original).await;
+    assert_eq!(rejoined.session.id, settled.session.id);
     assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
 }
@@ -696,11 +686,7 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
     )
     .await;
     assert_eq!(settled.prompts.len(), 1);
-    let duplicate = support::create_session(
-        server.descriptor(),
-        &creation(&ready.preparation, "Edited after response loss"),
-    )
-    .await;
+    let duplicate = support::create_session(server.descriptor(), &initial).await;
     assert_eq!(duplicate.session.id, settled.session.id);
     assert_eq!(duplicate.prompts.len(), 1);
     assert!(
@@ -718,9 +704,8 @@ async fn lost_admission_response_rejoins_delivered_work_without_another_provider
     )
     .await
     .unwrap();
-    let retry = prepare(server.descriptor(), &request).await;
-    assert_eq!(retry.error, None);
-    assert_eq!(retry.preparation.admitted_session, Some(settled.session.id));
+    let retry = support::create_session(server.descriptor(), &initial).await;
+    assert_eq!(retry.session.id, settled.session.id);
     assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
 }

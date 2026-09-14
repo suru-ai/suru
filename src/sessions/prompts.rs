@@ -212,6 +212,108 @@ impl SessionStore {
         self.create_in_with_identity(request, location, None)
     }
 
+    /// Finds the Session an already admitted creation request made. This is
+    /// the idempotency record once a completed Worktree preparation no longer
+    /// needs its durable intent.
+    pub(crate) fn existing_creation(
+        &self,
+        request: &CreateSessionRequest,
+    ) -> Result<Option<SessionSnapshot>, CreateSessionError> {
+        let retry_execution_directory = {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            let Some(owner) = state.prompts.get(&request.prompt.id) else {
+                return Ok(None);
+            };
+            if owner.matches_requested_creation(request) {
+                return Ok(Some(snapshot_for_owner(&state, owner)));
+            }
+            owner
+                .canonical_creation_directory(request)
+                .ok_or(CreateSessionError::PromptConflict)?
+        };
+        let execution_path = crate::paths::canonical(&request.execution_directory.path)
+            .map_err(|_| CreateSessionError::PromptConflict)?;
+        if execution_path != retry_execution_directory {
+            return Err(CreateSessionError::PromptConflict);
+        }
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let owner = state
+            .prompts
+            .get(&request.prompt.id)
+            .expect("Prompt owner remains indexed for the server lifetime");
+        Ok(Some(snapshot_for_owner(&state, owner)))
+    }
+
+    /// Finds an admitted Session after its Worktree preparation intent has
+    /// been deleted. Provider discovery may have resolved an implicit Agent
+    /// Selection differently since admission, so the original Prompt content
+    /// and execution location remain the durable idempotency facts here.
+    pub(crate) fn existing_prepared_creation(
+        &self,
+        request: &CreateSessionRequest,
+    ) -> Result<Option<SessionSnapshot>, CreateSessionError> {
+        let canonical = {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            let Some(owner) = state.prompts.get(&request.prompt.id) else {
+                return Ok(None);
+            };
+            if owner.text != request.prompt.text
+                || owner.skill_invocations != request.prompt.skill_invocations
+            {
+                return Err(CreateSessionError::PromptConflict);
+            }
+            let record = state
+                .sessions
+                .get(&owner.session_id)
+                .expect("Prompt owner always references its Session");
+            match &owner.origin {
+                PromptOrigin::SessionCreation {
+                    requested_execution_directory,
+                    ..
+                } if requested_execution_directory == &request.execution_directory.path => {
+                    return Ok(Some(snapshot_for_owner(&state, owner)));
+                }
+                PromptOrigin::SessionCreation {
+                    canonical_execution_directory,
+                    ..
+                } => canonical_execution_directory.clone(),
+                PromptOrigin::Admission(_)
+                    if record.snapshot.session.parent.is_none()
+                        && record.snapshot.prompts.iter().any(|prompt| {
+                            prompt.id == request.prompt.id
+                                && prompt.admission_order == PromptOrder::INITIAL
+                        }) =>
+                {
+                    record.snapshot.session.execution_directory.path.clone()
+                }
+                PromptOrigin::Admission(_) => return Err(CreateSessionError::PromptConflict),
+            }
+        };
+        let execution_path = crate::paths::canonical(&request.execution_directory.path)
+            .map_err(|_| CreateSessionError::PromptConflict)?;
+        if execution_path != canonical {
+            return Err(CreateSessionError::PromptConflict);
+        }
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let owner = state
+            .prompts
+            .get(&request.prompt.id)
+            .expect("Prompt owner remains indexed for the server lifetime");
+        Ok(Some(snapshot_for_owner(&state, owner)))
+    }
+
     pub(crate) fn persist_prepared_session(&self, id: SessionId) -> anyhow::Result<()> {
         let state = self.state.lock().unwrap();
         let record = state
@@ -242,47 +344,12 @@ impl SessionStore {
         // or starting the withdrawn work again. Asking for that work again is
         // a new Prompt, which is what a client's retry after a withdrawal
         // submits (ADR 0024).
-        let retry_execution_directory = {
-            let state = self
-                .state
-                .lock()
-                .expect("Session store lock is not poisoned");
-            if let Some(owner) = state.prompts.get(&request.prompt.id) {
-                if owner.matches_requested_creation(&request) {
-                    return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
-                }
-                Some(
-                    owner
-                        .canonical_creation_directory(&request)
-                        .ok_or(CreateSessionError::PromptConflict)?,
-                )
-            } else {
-                None
-            }
-        };
-
-        let execution_path =
-            crate::paths::canonical(&request.execution_directory.path).map_err(|_| {
-                if retry_execution_directory.is_some() {
-                    CreateSessionError::PromptConflict
-                } else {
-                    CreateSessionError::InvalidWorkspace
-                }
-            })?;
-        if let Some(expected) = retry_execution_directory {
-            if execution_path != expected {
-                return Err(CreateSessionError::PromptConflict);
-            }
-            let state = self
-                .state
-                .lock()
-                .expect("Session store lock is not poisoned");
-            let owner = state
-                .prompts
-                .get(&request.prompt.id)
-                .expect("Prompt owner remains indexed for the server lifetime");
-            return Ok(StoreOutcome::Existing(snapshot_for_owner(&state, owner)));
+        if let Some(snapshot) = self.existing_creation(&request)? {
+            return Ok(StoreOutcome::Existing(snapshot));
         }
+
+        let execution_path = crate::paths::canonical(&request.execution_directory.path)
+            .map_err(|_| CreateSessionError::InvalidWorkspace)?;
         if !execution_path.is_dir() {
             return Err(CreateSessionError::InvalidWorkspace);
         }

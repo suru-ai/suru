@@ -82,7 +82,7 @@ fn creation(preparation: &PreparedCheckout, text: &str) -> CreateSessionRequest 
 }
 
 #[tokio::test]
-async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_admitted_session() {
+async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_creation() {
     let temp = tempfile::tempdir().unwrap();
     let root = suru::paths::canonical(temp.path()).unwrap();
     let main = root.join("repo");
@@ -157,26 +157,13 @@ async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_
     assert_eq!(one.preparation.destination, result.preparation.destination);
     assert_eq!(two.preparation.plan, result.preparation.plan);
     assert_eq!(read_git(&destination, &["rev-parse", "HEAD"]), source);
-    let created = support::create_session(
-        server.descriptor(),
-        &creation(&one.preparation, "corrected work"),
-    )
-    .await;
+    let creation = creation(&one.preparation, "corrected work");
+    let created = support::create_session(server.descriptor(), &creation).await;
     let startup = provider.next_start().await;
     assert_eq!(startup.execution_directory(), destination);
     drop(startup);
-    let duplicate = support::create_session(
-        server.descriptor(),
-        &creation(&two.preparation, "different Prompt ID"),
-    )
-    .await;
+    let duplicate = support::create_session(server.descriptor(), &creation).await;
     assert_eq!(created.session.id, duplicate.session.id);
-    let acknowledged = prepare(server.descriptor(), &request).await;
-    assert_eq!(acknowledged.error, None);
-    assert_eq!(
-        acknowledged.preparation.admitted_session,
-        Some(created.session.id)
-    );
     assert!(provider.try_next_start().is_none());
     let failed = support::read_session_until(
         &reqwest::Client::new(),
@@ -193,6 +180,59 @@ async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_
     .await;
     assert_eq!(failed.session.id, created.session.id);
     assert!(destination.is_dir());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_deletes_the_intent_and_restart_withdraws_its_undelivered_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("repo");
+    committed(&main);
+    let config = ServerConfig::new(root.join("state"), "retired-admission").unwrap();
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(config.clone(), runtime)
+        .await
+        .unwrap();
+    let preparation_request = request(&main, "Retire after admission");
+    let prepared = prepare(server.descriptor(), &preparation_request).await;
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", prepared.preparation.id.0));
+    assert!(intent.is_file());
+
+    let creation = creation(&prepared.preparation, "Leave this Prompt undelivered");
+    let admitted = support::create_session(server.descriptor(), &creation).await;
+    let startup = provider.next_start().await;
+    assert!(
+        !intent.exists(),
+        "an admitted preparation no longer remains resumable"
+    );
+    server.shutdown().await.unwrap();
+    drop(startup);
+
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(config, runtime).await.unwrap();
+    let restored = support::read_session(server.descriptor(), admitted.session.id).await;
+    assert_eq!(restored.prompts[0].status, PromptStatus::Cancelled);
+    assert_eq!(restored.session.status, SessionStatus::Idle);
+    assert!(provider.try_next_start().is_none());
+    let repeated_preparation = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&preparation_request)
+        .send()
+        .await
+        .unwrap();
+    assert!(!repeated_preparation.status().is_success());
+    assert!(
+        !intent.exists(),
+        "repeating a completed preparation cannot recreate its intent"
+    );
     server.shutdown().await.unwrap();
 }
 

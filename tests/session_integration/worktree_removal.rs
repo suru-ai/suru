@@ -347,8 +347,9 @@ impl suru::source_control::PreparationObserver for FailAfterCreation {
 async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replacement_contents() {
     let layout = Layout::new();
     let (runtime, _) = ControlledProvider::new();
+    let config = layout.config("failed-preparation");
     let server = server::spawn_with_source_control(
-        layout.config("failed-preparation"),
+        config.clone(),
         vec![runtime],
         Default::default(),
         std::sync::Arc::new(
@@ -380,12 +381,21 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
         .unwrap();
     assert!(prepared.error.as_ref().unwrap().contains("interrupted"));
     let root = &prepared.preparation.destination.path;
+    let intent = config
+        .data_dir()
+        .join("checkout-preparations")
+        .join(format!("{}.json", prepared.preparation.id.0));
+    assert!(intent.is_file());
     assert!(root.exists());
     let prepared_target = target(root).await;
     let facts = preview(&server, &prepared_target).await;
     assert_eq!(facts.affected_sessions, 0);
     assert!(remove(&server, facts, false).await.removed);
     assert!(!root.exists());
+    assert!(
+        !intent.exists(),
+        "explicit removal deletes the preparation that named the Worktree"
+    );
     let CheckoutPreparationPlan::Git { branch, .. } = &prepared.preparation.plan;
     assert!(
         !read_git(

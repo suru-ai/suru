@@ -426,6 +426,20 @@ impl SourceControl for GitSourceControl {
         if self.common(source_path).await.as_ref() != Some(&repository.metadata_directory) {
             return Err("The source checkout no longer belongs to this Repository".to_owned());
         }
+        let ownership_ref = format!("refs/suru/preparations/{}", id.0.simple());
+        if self
+            .text(
+                &repository.metadata_directory,
+                &["rev-parse", "--verify", &ownership_ref],
+            )
+            .await
+            .is_some()
+        {
+            return Err(
+                "Worktree preparation identity was already used; retry Session creation with the original Prompt"
+                    .to_owned(),
+            );
+        }
         let commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await

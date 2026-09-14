@@ -47,6 +47,52 @@ impl PreparationStore {
         .map_err(|e| format!("Cannot persist Worktree preparation: {e}"))
     }
 
+    pub(crate) fn delete(&self, id: PreparationId) -> Result<(), String> {
+        match std::fs::remove_file(self.root.join(format!("{}.json", id.0))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Cannot delete Worktree preparation: {e}")),
+        }
+    }
+
+    /// Records that admission completed before deleting the intent. If the
+    /// marker write fails, still attempt deletion so an old unadmitted record
+    /// cannot keep the Prompt resumable across restart.
+    pub(crate) fn delete_after_admission(
+        &self,
+        preparation: &PreparedCheckout,
+    ) -> Result<(), String> {
+        let saved = self.save(preparation);
+        let deleted = self.delete(preparation.id);
+        match (saved, deleted) {
+            (_, Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(save), Err(delete)) => Err(format!("{save}; {delete}")),
+        }
+    }
+
+    pub(crate) fn delete_for_destination(&self, destination: &Path) -> Result<(), String> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("Cannot read Worktree preparations: {e}")),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(preparation) = serde_json::from_slice::<PreparedCheckout>(&bytes) else {
+                continue;
+            };
+            if preparation.destination.path == destination {
+                std::fs::remove_file(path)
+                    .map_err(|e| format!("Cannot delete Worktree preparation: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The Sessions a stored preparation can still bring to their first Turn:
     /// an intention that never recorded an admitted Session is one whose
     /// creation did not finish, and rejoining it is how its Prompt reaches the
