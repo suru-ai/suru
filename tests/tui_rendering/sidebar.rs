@@ -9503,6 +9503,7 @@ fn active_sidebar_icons_follow_the_setting_and_checkout_state() {
             root: path.clone(),
             kind,
             recovery_revision: None,
+            reclaim: None,
         };
         let SessionListItem::Readable(mut summary) = listed("Icon work", None, &path, now(), now())
         else {
