@@ -2,6 +2,7 @@ mod ansi;
 pub mod approval;
 pub mod build_identity;
 mod errands;
+mod icon_catalog;
 pub mod logging;
 pub mod managed_client;
 mod model_catalog;
