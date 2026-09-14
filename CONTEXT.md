@@ -44,9 +44,13 @@ _Avoid_: Chat, thread, conversation
 The short line by which a Session is known both while viewing it and wherever Sessions are listed, and the text a reader searches those listings by. A Title begins as the Session's first Prompt trimmed of the space around it — a real Title rather than a placeholder — and Suru replaces it once it has derived a better one through an Errand. Derivation is attempted once, when the first Prompt is admitted, and never again: a Session whose derivation was skipped, failed, or abandoned keeps the Title its Prompt gave it for good. A derived Title only replaces the Title it was derived from, so a Title since set by other means stands. A Setting decides whether Suru derives Titles at all, and which Agent Selection does the deriving.
 _Avoid_: Name, subject, summary
 
-**Emoji**:
-A single emoji standing for a Session beside its Title, derived with that Title in the same Errand and carried as a typed property rather than written into the Title's own text, so searching a listing of Sessions matches the words a reader remembers rather than the character in front of them. A Session may have none, which every surface presenting Sessions draws as readily as it draws one. Whether the ones a Session does carry are drawn at all is a Setting, off until the reader turns it on: hiding them is presentation and nothing else, so an Emoji goes on being derived, stored, and carried to every client, and turning them back on reveals what Suru already holds.
-_Avoid_: Icon, glyph — which a Marker and a Spinner already claim — avatar
+**Icon**:
+One Nerd Font glyph standing for a Session beside its Title, or for a Workspace wherever it is named, chosen from the Icon Catalog and carried as a typed property rather than written into any text, so searching a listing matches the words a reader remembers rather than the glyph in front of them. A Session's Icon is derived with its Title in the same Errand; a Workspace's is derived from its name and README once it has a Session to lend the Errand a Provider, and attempted again with each new Session until one lands. Either may also be chosen by the user, and a chosen Icon stands: derivation only ever fills an absence. Either may have none, which every surface draws as readily as it draws one; a Workspace without one is named beside the plain folder glyph instead. Whether Icons are drawn at all is the one Setting governing every Nerd Font glyph Suru shows, so hiding them is presentation and nothing else: an Icon goes on being derived, stored, and carried to every client. The fixed glyphs beside a Provider, a branch, or a folder are not Icons in this sense.
+_Avoid_: Emoji, glyph — which a Marker and a Spinner already claim — avatar, badge
+
+**Icon Catalog**:
+The set of Nerd Font glyphs Suru itself knows by name, from which every Icon is chosen, whether by an Errand or by the user. An Icon is remembered by its Catalog name rather than its codepoint, so a glyph the Catalog no longer carries is drawn as no Icon at all.
+_Avoid_: Glyph table, icon list, nerd font names
 
 **Landing**:
 The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names the Workspace by its presented root, followed by the selected Worktree's Checkout State as a Sidebar row draws it and, when working in a subdirectory, the path relative to that Worktree's root; the user may choose an existing Worktree or ask Suru to create one on submit, with that pending intent shown here and its branch, starting commit, and location managed by Suru.
@@ -234,6 +238,10 @@ _Avoid_: Agent panel, roster, subagent list
 **Workspace Picker**:
 The centered, searchable list a Client opens to switch among the Workspaces its Sessions belong to and its current Workspace. Choosing one opens the Landing with that Client's last Execution Directory for the Workspace on its Server, defaulting to the main Worktree when none is remembered or requiring a Worktree choice for a bare Repository; the open Session keeps its own work and the Sidebar keeps its chosen scope.
 _Avoid_: Project picker, project list, workspace switcher
+
+**Icon Picker**:
+The centered, searchable grid a Client opens to choose an Icon for one Session or one Workspace, reached from that Session's or Workspace's row or from the open Session's header, always replacing whatever Icon stood there and never clearing it. Its search narrows the Icon Catalog by name and keyword, its cells show glyphs alone with the focused glyph named beneath the grid, and it stays inert, its ways in withheld, while Icons are not drawn — a glyph one cannot see is not one to choose.
+_Avoid_: Emoji picker, glyph chooser, icon menu
 
 **Worktree Selector**:
 The Landing control that chooses an existing Worktree for the next Session or asks Suru to create a new one on first Prompt submission. It names the current location above its list without offering it as a choice, then offers creating a new Worktree first and selected, then every Worktree of the Repository with its Checkout State and its location: the leaf name alone for a Worktree Suru manages, the path beneath the Workspace's main root for one within it, and the whole path otherwise. The Worktree the reader is already in is marked among them, and choosing it keeps the location as it stands. Choosing another existing Worktree or creating a new one starts at its root; a subdirectory is reached through the Sidebar's path entry instead.
