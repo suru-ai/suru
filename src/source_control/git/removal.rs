@@ -1,6 +1,107 @@
 //! Exact, read-only inspection followed only by Git's linked Worktree removal.
 use super::*;
 impl GitSourceControl {
+    async fn is_ancestor(
+        &self,
+        repository: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .command(
+                repository,
+                &["merge-base", "--is-ancestor", ancestor, descendant],
+            )
+            .await?
+            .status
+            .success())
+    }
+
+    pub(super) async fn linked_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        let CheckoutRevision::Branch {
+            name,
+            commit: Some(tip),
+        } = inspection
+            .checkout
+            .revision
+            .as_ref()
+            .ok_or("The selected Worktree has no readable revision for branch retention")?
+        else {
+            return Ok(CheckoutBranchOutcome::Retained);
+        };
+        if inspection.checkout.association.id != target.checkout.id {
+            return Err("Removal inspection no longer identifies the selected Worktree".into());
+        }
+        let repository = &target.repository.metadata_directory;
+        let base = match self
+            .text(
+                repository,
+                &["config", "--get", &format!("branch.{name}.suru-base")],
+            )
+            .await
+        {
+            Some(base) => base,
+            None => return Ok(CheckoutBranchOutcome::Retained),
+        };
+        let source_branch = match self
+            .text(
+                repository,
+                &[
+                    "config",
+                    "--get",
+                    &format!("branch.{name}.suru-base-branch"),
+                ],
+            )
+            .await
+        {
+            Some(branch) => branch,
+            None => return Ok(CheckoutBranchOutcome::Retained),
+        };
+        // Invalid or edited provenance is never grounds to remove a branch.
+        if !self.is_ancestor(repository, &base, tip).await? {
+            return Ok(CheckoutBranchOutcome::Retained);
+        }
+        let local_source = format!("refs/heads/{source_branch}");
+        let local_exists = self
+            .command(
+                repository,
+                &["show-ref", "--verify", "--quiet", &local_source],
+            )
+            .await?
+            .status
+            .success();
+        let merged = if local_exists {
+            self.is_ancestor(repository, tip, &local_source).await?
+        } else {
+            // Once the exact local source branch is gone, any locally known
+            // remote-tracking ref may prove the work merged. No fetch is made.
+            let refs = self
+                .text(
+                    repository,
+                    &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+                )
+                .await
+                .unwrap_or_default();
+            let mut merged = false;
+            for reference in refs.lines() {
+                if self.is_ancestor(repository, tip, reference).await? {
+                    merged = true;
+                    break;
+                }
+            }
+            merged
+        };
+        Ok(if merged {
+            CheckoutBranchOutcome::Deleted
+        } else {
+            CheckoutBranchOutcome::Retained
+        })
+    }
+
     pub(super) async fn inspect_linked_removal(
         &self,
         target: &CheckoutRemovalTarget,

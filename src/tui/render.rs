@@ -886,9 +886,13 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         if !facts.initialized_submodules.is_empty() {
             lines.push(Line::raw("Initialized submodules will be removed"));
         }
-        lines.push(Line::raw(
-            "Branch and Session histories retained; uncommitted files cannot be recovered",
-        ));
+        lines.push(Line::raw(format!(
+            "{}; Session histories retained; uncommitted files cannot be recovered",
+            match preview.branch_outcome {
+                crate::protocol::CheckoutBranchOutcome::Deleted => "Branch will be deleted",
+                crate::protocol::CheckoutBranchOutcome::Retained => "Branch retained",
+            }
+        )));
         lines.push(Line::raw(if picker.loading {
             "Removing…"
         } else if preview.working_sessions != 0 {

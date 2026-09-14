@@ -16,6 +16,29 @@ fn token(plan: &PreparedCheckout) -> String {
     format!("suru-preparation:{}", blake3::hash(&identity).to_hex())
 }
 impl GitSourceControl {
+    async fn record_branch_base(&self, plan: &PreparedCheckout) -> Result<(), String> {
+        let CheckoutPreparationPlan::Git {
+            branch,
+            source_commit,
+            source_branch,
+        } = &plan.plan;
+        let base_key = format!("branch.{branch}.suru-base");
+        self.mutate(
+            &plan.repository.metadata_directory,
+            &["config", "--local", &base_key, source_commit],
+        )
+        .await?;
+        if let Some(source_branch) = source_branch {
+            let branch_key = format!("branch.{branch}.suru-base-branch");
+            self.mutate(
+                &plan.repository.metadata_directory,
+                &["config", "--local", &branch_key, source_branch],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn populate_unfinished_checkout(
         &self,
         destination: &Path,
@@ -43,6 +66,7 @@ impl GitSourceControl {
         let CheckoutPreparationPlan::Git {
             branch,
             source_commit,
+            ..
         } = &plan.plan;
         let root = &plan.repository.metadata_directory;
         let claim = format!("refs/suru/preparations/{}", plan.id.0.simple());
@@ -79,6 +103,7 @@ impl GitSourceControl {
                     if !output.status.success() {
                         return Err("Missing prepared branch could not be recreated without overwriting conflicting state".into());
                     }
+                    self.record_branch_base(plan).await?;
                     return Ok(());
                 }
                 let creation = self
@@ -90,6 +115,7 @@ impl GitSourceControl {
                     return Err("Prepared branch is missing or has been replaced or changed; unrelated work was not reset".into());
                 }
             }
+            self.record_branch_base(plan).await?;
             return Ok(());
         }
         if plan.checkout_created {
@@ -116,6 +142,7 @@ impl GitSourceControl {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        self.record_branch_base(plan).await?;
         self.checkpoint(super::super::PreparationCheckpoint::BranchCreated, plan)
             .await
     }

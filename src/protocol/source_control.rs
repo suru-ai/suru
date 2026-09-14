@@ -222,6 +222,10 @@ pub enum CheckoutPreparationPlan {
     Git {
         branch: String,
         source_commit: String,
+        /// Exact local branch the source checkout named while this plan was made.
+        /// Detached and legacy plans have no branch provenance and are retained.
+        #[serde(default)]
+        source_branch: Option<String>,
     },
 }
 
@@ -255,10 +259,19 @@ pub struct CheckoutRemovalTarget {
     pub repository: Repository,
     pub checkout: CheckoutAssociation,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutBranchOutcome {
+    Deleted,
+    Retained,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckoutRemovalPreview {
     pub target: CheckoutRemovalTarget,
     pub inspection: CheckoutRemovalInspection,
+    pub branch_outcome: CheckoutBranchOutcome,
     pub affected_sessions: usize,
     pub working_sessions: usize,
 }

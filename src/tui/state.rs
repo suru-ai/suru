@@ -4336,7 +4336,15 @@ impl Application {
                             }
                             picker.removal = None;
                             picker.error = Some(
-                                "Worktree removed. Branch and Session histories retained".into(),
+                                match result.preview.branch_outcome {
+                                    crate::protocol::CheckoutBranchOutcome::Deleted => {
+                                        "Worktree removed. Branch deleted; Session histories retained"
+                                    }
+                                    crate::protocol::CheckoutBranchOutcome::Retained => {
+                                        "Worktree removed. Branch retained; Session histories retained"
+                                    }
+                                }
+                                .into(),
                             );
                         }
                         Ok(result) => {

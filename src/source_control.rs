@@ -51,12 +51,20 @@ pub trait SourceControl: Send + Sync {
     ) -> Result<crate::protocol::CheckoutRemovalInspection, String> {
         Err("Working-copy removal is unsupported".into())
     }
+    async fn removal_branch_outcome(
+        &self,
+        _target: &crate::protocol::CheckoutRemovalTarget,
+        _inspection: &crate::protocol::CheckoutRemovalInspection,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
+        Ok(crate::protocol::CheckoutBranchOutcome::Retained)
+    }
     async fn remove_checkout(
         &self,
         _target: &crate::protocol::CheckoutRemovalTarget,
         _inspection: &crate::protocol::CheckoutRemovalInspection,
         _force: bool,
-    ) -> Result<(), String> {
+        _branch_outcome: crate::protocol::CheckoutBranchOutcome,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
         Err("Working-copy removal is unsupported".into())
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
@@ -171,14 +179,24 @@ impl SourceControlService {
     ) -> Result<crate::protocol::CheckoutRemovalInspection, String> {
         self.adapter.inspect_removal(target).await
     }
+    pub(crate) async fn removal_branch_outcome(
+        &self,
+        target: &crate::protocol::CheckoutRemovalTarget,
+        inspection: &crate::protocol::CheckoutRemovalInspection,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
+        self.adapter
+            .removal_branch_outcome(target, inspection)
+            .await
+    }
     pub(crate) async fn remove_checkout(
         &self,
         target: &crate::protocol::CheckoutRemovalTarget,
         inspection: &crate::protocol::CheckoutRemovalInspection,
         force: bool,
-    ) -> Result<(), String> {
+        branch_outcome: crate::protocol::CheckoutBranchOutcome,
+    ) -> Result<crate::protocol::CheckoutBranchOutcome, String> {
         self.adapter
-            .remove_checkout(target, inspection, force)
+            .remove_checkout(target, inspection, force, branch_outcome)
             .await
     }
     pub(crate) async fn mutation_guard(

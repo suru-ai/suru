@@ -505,6 +505,7 @@ async fn matching_branch_commit_and_destination_do_not_prove_external_checkout_o
     let CheckoutPreparationPlan::Git {
         branch,
         source_commit,
+        ..
     } = &ready.preparation.plan;
     git(
         &main,

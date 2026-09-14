@@ -87,6 +87,7 @@ async fn removal_previews_all_content_conditions_force_retains_branch_and_main_i
         let target = target(&layout.linked).await;
         let facts = preview(&server, &target).await;
         assert_eq!(facts.affected_sessions, 0);
+        assert_eq!(facts.branch_outcome, CheckoutBranchOutcome::Retained);
         assert_eq!(!facts.inspection.tracked.is_empty(), condition == "tracked");
         assert_eq!(
             !facts.inspection.untracked.is_empty(),
@@ -120,6 +121,124 @@ async fn removal_previews_all_content_conditions_force_retains_branch_and_main_i
         assert!(layout.main.exists());
         server.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn merged_managed_branch_is_previewed_deleted_and_recovers_its_session_detached() {
+    let layout = Layout::new();
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(layout.config("merged-managed"), runtime)
+        .await
+        .unwrap();
+    let prepared = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&PrepareCheckoutRequest {
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: layout.main.clone(),
+            },
+            description: "Merged recovery".into(),
+            provider: ProviderId::new("controlled"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(prepared.error, None);
+    let CheckoutPreparationPlan::Git { branch, .. } = &prepared.preparation.plan;
+    let snapshot = support::create_session(
+        server.descriptor(),
+        &CreateSessionRequest {
+            preparation_id: Some(prepared.preparation.id),
+            agent_selection: None,
+            execution_directory: prepared.preparation.destination.clone(),
+            prompt: prompt("Keep this history after merged removal"),
+        },
+    )
+    .await;
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .unwrap();
+    let mut connection = start.succeed_with_resume(identity(), Some(resume()));
+    timeout(PROGRESS_DEADLINE, connection.next_turn())
+        .await
+        .unwrap()
+        .succeed();
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let target = target(&prepared.preparation.destination.path).await;
+    commit(&prepared.preparation.destination.path, "managed work");
+    let removed_commit = read_git(
+        &prepared.preparation.destination.path,
+        &["rev-parse", "HEAD"],
+    );
+    let unmerged = preview(&server, &target).await;
+    assert_eq!(unmerged.branch_outcome, CheckoutBranchOutcome::Retained);
+    git(&layout.main, &["merge", "--ff-only", branch]);
+    let facts = preview(&server, &target).await;
+    assert_eq!(facts.branch_outcome, CheckoutBranchOutcome::Deleted);
+    let result = remove(&server, facts, false).await;
+    assert!(result.removed, "{:?}", result.error);
+    assert_eq!(
+        result.preview.branch_outcome,
+        CheckoutBranchOutcome::Deleted
+    );
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&layout.main)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .status()
+            .unwrap()
+            .code()
+            == Some(1)
+    );
+    let retained = support::read_session(server.descriptor(), snapshot.session.id).await;
+    assert!(matches!(
+        retained.session.checkout.and_then(|checkout| checkout.recovery_revision),
+        Some(CheckoutRevision::Detached { ref commit }) if commit == &removed_commit
+    ));
+
+    assert_success(
+        admit(
+            server.descriptor(),
+            snapshot.session.id,
+            prompt("Recover without the deleted branch"),
+        )
+        .await,
+    )
+    .await;
+    let _recovered = restarted(&mut provider, &prepared.preparation.destination.path).await;
+    assert_eq!(
+        read_git(
+            &prepared.preparation.destination.path,
+            &["branch", "--show-current"]
+        ),
+        ""
+    );
+    assert_eq!(
+        read_git(
+            &prepared.preparation.destination.path,
+            &["rev-parse", "HEAD"]
+        ),
+        removed_commit
+    );
+    server.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn removal_reconfirms_new_ignored_contents_and_retains_fresh_revision_history_for_recovery() {
@@ -334,6 +453,82 @@ async fn removal_initialized_submodules_require_force_and_session_settlement_del
     server.shutdown().await.unwrap();
 }
 
+struct RefusingRemoval {
+    git: GitSourceControl,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for RefusingRemoval {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn remove_checkout(
+        &self,
+        _: &CheckoutRemovalTarget,
+        _: &CheckoutRemovalInspection,
+        _: bool,
+        _: CheckoutBranchOutcome,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        Err("simulated Git removal refusal".into())
+    }
+}
+
+#[tokio::test]
+async fn failed_removal_restores_branch_recovery_facts() {
+    let layout = Layout::new();
+    let base = read_git(&layout.main, &["rev-parse", "main"]);
+    git(&layout.main, &["config", "branch.topic.suru-base", &base]);
+    git(
+        &layout.main,
+        &["config", "branch.topic.suru-base-branch", "main"],
+    );
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        layout.config("failed-removal-recovery"),
+        vec![runtime],
+        Default::default(),
+        Arc::new(RefusingRemoval {
+            git: GitSourceControl::default(),
+        }),
+    )
+    .await
+    .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.linked).await;
+    let target = target(&layout.linked).await;
+    let facts = preview(&server, &target).await;
+    assert_eq!(facts.branch_outcome, CheckoutBranchOutcome::Deleted);
+
+    let result = remove(&server, facts, false).await;
+    assert!(!result.removed);
+    assert!(result.error.unwrap().contains("simulated"));
+    assert!(layout.linked.exists());
+    let retained = support::read_session(server.descriptor(), session.session.id).await;
+    assert!(matches!(
+        retained
+            .session
+            .checkout
+            .and_then(|checkout| checkout.recovery_revision),
+        Some(CheckoutRevision::Branch { ref name, .. }) if name == "topic"
+    ));
+    server.shutdown().await.unwrap();
+}
+
 struct FailOnceAt {
     at: PreparationCheckpoint,
     fired: AtomicBool,
@@ -415,11 +610,19 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
     );
     let CheckoutPreparationPlan::Git { branch, .. } = &prepared.preparation.plan;
     assert!(
-        !read_git(
-            &layout.main,
-            &["rev-parse", &format!("refs/heads/{branch}")]
-        )
-        .is_empty()
+        !std::process::Command::new("git")
+            .arg("-C")
+            .arg(&layout.main)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "a fully merged failed-preparation branch follows the same explicit-removal rule"
     );
 
     let original_target = target(&layout.linked).await;

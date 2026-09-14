@@ -55,6 +55,269 @@ fn linked(main: &Path, path: &Path, branch: &str) {
     );
 }
 
+fn read_git(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[tokio::test]
+async fn managed_branch_records_the_planned_source_commit_and_branch_when_claimed() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let adapter = GitSourceControl::default();
+    let source = adapter.discover(&main).await;
+    let plan = adapter
+        .plan_checkout(Default::default(), &source, "remember provenance")
+        .await
+        .unwrap();
+    let CheckoutPreparationPlan::Git {
+        branch,
+        source_commit,
+        source_branch,
+    } = &plan.plan;
+    assert_eq!(source_branch.as_deref(), Some("main"));
+
+    // Claim uses the source identity captured by planning even if that checkout
+    // has since moved to another branch at the same commit.
+    git(&main, &["checkout", "-b", "other"]);
+    adapter.prepare_checkout(&plan).await.unwrap();
+
+    assert_eq!(
+        read_git(
+            &main,
+            &["config", "--get", &format!("branch.{branch}.suru-base")],
+        ),
+        *source_commit
+    );
+    assert_eq!(
+        read_git(
+            &main,
+            &[
+                "config",
+                "--get",
+                &format!("branch.{branch}.suru-base-branch"),
+            ],
+        ),
+        "main"
+    );
+}
+
+async fn removal_target(adapter: &GitSourceControl, path: &Path) -> CheckoutRemovalTarget {
+    let resolved = adapter.discover(path).await;
+    CheckoutRemovalTarget {
+        repository: resolved.workspace.repository.unwrap(),
+        checkout: resolved.checkout.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn branch_outcome_is_deleted_only_when_the_managed_tip_is_in_its_local_source_branch() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained,
+        "a branch without recorded provenance is always retained"
+    );
+
+    let base = read_git(&main, &["rev-parse", "main"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Deleted
+    );
+
+    commit(&linked_root);
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained
+    );
+}
+
+#[tokio::test]
+async fn remote_tracking_refs_are_considered_only_after_the_source_branch_is_deleted() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    commit(&linked_root);
+    let base = read_git(&main, &["rev-parse", "main"]);
+    let managed = read_git(&main, &["rev-parse", "managed"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    git(
+        &main,
+        &["update-ref", "refs/remotes/upstream/integration", &managed],
+    );
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained,
+        "an existing local source branch is authoritative"
+    );
+
+    git(&main, &["checkout", "--detach"]);
+    git(&main, &["branch", "-D", "main"]);
+    assert_eq!(
+        adapter
+            .removal_branch_outcome(&target, &inspection)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Deleted,
+        "any local remote-tracking ref is a fallback, regardless of its branch name"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_fully_merged_worktree_deletes_its_branch() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    let base = read_git(&main, &["rev-parse", "main"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+
+    assert_eq!(
+        adapter
+            .remove_checkout(&target, &inspection, false, CheckoutBranchOutcome::Deleted,)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Deleted
+    );
+    assert!(!linked_root.exists());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/managed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn removal_never_broadens_a_confirmed_retained_branch_outcome() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    let base = read_git(&main, &["rev-parse", "main"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+
+    assert_eq!(
+        adapter
+            .remove_checkout(&target, &inspection, false, CheckoutBranchOutcome::Retained,)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained
+    );
+    assert_eq!(read_git(&main, &["rev-parse", "managed"]), base);
+}
+
+#[tokio::test]
+async fn branch_checked_out_elsewhere_is_retained_after_its_selected_worktree_is_removed() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "managed");
+    let second = root.join("second");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            second.to_str().unwrap(),
+            "managed",
+        ],
+    );
+    let base = read_git(&main, &["rev-parse", "main"]);
+    git(&main, &["config", "branch.managed.suru-base", &base]);
+    git(
+        &main,
+        &["config", "branch.managed.suru-base-branch", "main"],
+    );
+    let adapter = GitSourceControl::default();
+    let target = removal_target(&adapter, &linked_root).await;
+    let inspection = adapter.inspect_removal(&target).await.unwrap();
+
+    assert_eq!(
+        adapter
+            .remove_checkout(&target, &inspection, false, CheckoutBranchOutcome::Deleted,)
+            .await
+            .unwrap(),
+        CheckoutBranchOutcome::Retained
+    );
+    assert!(!linked_root.exists());
+    assert_eq!(read_git(&second, &["branch", "--show-current"]), "managed");
+    assert_eq!(read_git(&main, &["rev-parse", "managed"]), base);
+}
+
 #[tokio::test]
 async fn shared_metadata_groups_external_worktrees_and_subdirs_but_not_clones_or_nested_repositories()
  {

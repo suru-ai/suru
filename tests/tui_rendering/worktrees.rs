@@ -970,6 +970,7 @@ fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckou
             plan: CheckoutPreparationPlan::Git {
                 branch: "suru/prepared".to_owned(),
                 source_commit: "abc".to_owned(),
+                source_branch: Some("main".to_owned()),
             },
             checkout_created: true,
             ready: true,
@@ -1576,6 +1577,7 @@ fn linked_removal_confirmation_warns_counts_cancel_is_read_only_and_force_is_dis
             lock: Some("owner lock".into()),
             initialized_submodules: vec!["module".into()],
         },
+        branch_outcome: CheckoutBranchOutcome::Retained,
         affected_sessions: 3,
         working_sessions: 0,
     };
@@ -1590,6 +1592,7 @@ fn linked_removal_confirmation_warns_counts_cancel_is_read_only_and_force_is_dis
     .unwrap();
     let rendered = text(&app);
     assert!(rendered.contains("3 affected Sessions"));
+    assert!(rendered.contains("Branch retained"), "{rendered}");
     assert!(rendered.contains("Ignored contents"));
     assert!(rendered.contains("owner lock"));
     assert!(rendered.contains("Initialized submodules"));
@@ -1651,6 +1654,7 @@ fn main_removal_unavailable_and_canceled_preview_response_is_ignored() {
             lock: None,
             initialized_submodules: vec![],
         },
+        branch_outcome: CheckoutBranchOutcome::Deleted,
         affected_sessions: 0,
         working_sessions: 0,
     };
@@ -1689,6 +1693,7 @@ fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_se
             lock: None,
             initialized_submodules: vec![],
         },
+        branch_outcome: CheckoutBranchOutcome::Deleted,
         affected_sessions: 2,
         working_sessions: 0,
     };
@@ -1701,6 +1706,11 @@ fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_se
         }),
     })
     .unwrap();
+    assert!(
+        text(&app).contains("Branch will be deleted"),
+        "{}",
+        text(&app)
+    );
     let ApplicationTransition::RemoveCheckout {
         request_id,
         request,
@@ -1719,6 +1729,7 @@ fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_se
     })
     .unwrap();
     let rendered = text(&app);
+    assert!(rendered.contains("Branch deleted"), "{rendered}");
     assert!(rendered.contains("unavailable"));
     assert!(rendered.contains("nested"));
     key(&mut app, KeyCode::Esc);

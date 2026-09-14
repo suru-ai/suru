@@ -643,6 +643,7 @@ async fn branch_collision_does_not_reset_or_duplicate_intention_and_unknown_main
     let CheckoutPreparationPlan::Git {
         branch,
         source_commit,
+        ..
     } = &failed.preparation.plan;
     assert_eq!(read_git(&main, &["rev-parse", branch]), *source_commit);
     assert!(provider.try_next_start().is_none());

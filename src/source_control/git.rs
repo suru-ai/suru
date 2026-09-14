@@ -440,10 +440,25 @@ impl SourceControl for GitSourceControl {
                     .to_owned(),
             );
         }
+        // Capture the commit and exact symbolic source together. In particular,
+        // never rediscover a branch by looking for another ref at the same commit:
+        // several branches may legitimately share it.
+        let source_branch = self
+            .text(source_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await;
         let commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await
             .ok_or("A usable local source commit is required; this Repository may be unborn")?;
+        let confirmed_branch = self
+            .text(source_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await;
+        let confirmed_commit = self
+            .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await;
+        if confirmed_branch != source_branch || confirmed_commit.as_deref() != Some(&commit) {
+            return Err("The source checkout changed while its Worktree was being planned; retry preparation".into());
+        }
         let description = portable_description(description);
         for _ in 0..32 {
             let name = format!(
@@ -473,6 +488,7 @@ impl SourceControl for GitSourceControl {
                 plan: CheckoutPreparationPlan::Git {
                     branch,
                     source_commit: commit,
+                    source_branch,
                 },
                 checkout_created: false,
                 ready: false,
@@ -488,12 +504,20 @@ impl SourceControl for GitSourceControl {
     ) -> Result<CheckoutRemovalInspection, String> {
         self.inspect_linked_removal(target).await
     }
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.linked_branch_outcome(target, inspection).await
+    }
     async fn remove_checkout(
         &self,
         target: &CheckoutRemovalTarget,
         inspection: &CheckoutRemovalInspection,
         force: bool,
-    ) -> Result<(), String> {
+        branch_outcome: CheckoutBranchOutcome,
+    ) -> Result<CheckoutBranchOutcome, String> {
         // The Server just validated these facts under its mutation guard and
         // checked Working after inspection. No newer reading may silently
         // broaden the user's confirmation here.
@@ -513,7 +537,96 @@ impl SourceControl for GitSourceControl {
         }
         args.extend(["--", root]);
         self.mutate(&target.repository.metadata_directory, &args)
+            .await?;
+        if branch_outcome == CheckoutBranchOutcome::Retained {
+            return Ok(branch_outcome);
+        }
+        let Some(CheckoutRevision::Branch {
+            name,
+            commit: Some(tip),
+        }) = &inspection.checkout.revision
+        else {
+            return Ok(CheckoutBranchOutcome::Retained);
+        };
+        let reference = format!("refs/heads/{name}");
+        let listing = self
+            .command(
+                &target.repository.metadata_directory,
+                &["worktree", "list", "--porcelain", "-z"],
+            )
+            .await?;
+        if !listing.status.success() {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but branch use could not be rechecked"
+            );
+            return Ok(CheckoutBranchOutcome::Retained);
+        }
+        if parse_worktrees(&listing.stdout).iter().any(|entry| {
+            matches!(
+                &entry.revision,
+                Some(CheckoutRevision::Branch { name: used, .. }) if used == name
+            )
+        }) {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but its branch is used by another Worktree"
+            );
+            return Ok(CheckoutBranchOutcome::Retained);
+        }
+        if let Err(error) = self
+            .mutate(
+                &target.repository.metadata_directory,
+                &["update-ref", "-d", &reference, tip],
+            )
             .await
+        {
+            let branch_is_definitely_absent = self
+                .command(
+                    &target.repository.metadata_directory,
+                    &["show-ref", "--verify", "--quiet", &reference],
+                )
+                .await
+                .is_ok_and(|output| output.status.code() == Some(1));
+            if !branch_is_definitely_absent {
+                tracing::warn!(
+                    branch = name,
+                    "Worktree was removed but its merged branch was retained: {error}"
+                );
+                return Ok(CheckoutBranchOutcome::Retained);
+            }
+        }
+        // update-ref intentionally uses an expected old value for race safety;
+        // remove the now-unused branch section separately after the ref is gone.
+        let section = format!("branch.{name}");
+        if let Err(error) = self
+            .mutate(
+                &target.repository.metadata_directory,
+                &["config", "--local", "--remove-section", &section],
+            )
+            .await
+        {
+            tracing::warn!(
+                branch = name,
+                "Deleted branch configuration could not be removed: {error}"
+            );
+        }
+        let branch_is_absent = self
+            .command(
+                &target.repository.metadata_directory,
+                &["show-ref", "--verify", "--quiet", &reference],
+            )
+            .await
+            .is_ok_and(|output| output.status.code() == Some(1));
+        if branch_is_absent {
+            Ok(CheckoutBranchOutcome::Deleted)
+        } else {
+            tracing::warn!(
+                branch = name,
+                "Worktree was removed but its branch still exists after deletion"
+            );
+            Ok(CheckoutBranchOutcome::Retained)
+        }
     }
     async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
         let root = match &plan.repository.location {
