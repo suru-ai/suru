@@ -4198,15 +4198,11 @@ fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option
             .cost
             .filter(|cost| !cost.is_zero() || total.cost_is_partial)
             .map(|cost| {
-                let mut rendered = if cost.is_zero() {
+                if cost.is_zero() {
                     "$0.00".to_owned()
                 } else {
                     compact_cost(cost)
-                };
-                if total.cost_is_partial {
-                    rendered.push_str(" · partial");
                 }
-                rendered
             })
     });
     let (full, minimal) = match snapshot.session.context_fill {
@@ -5026,7 +5022,7 @@ mod tests {
             });
             assert_eq!(
                 session_footer_metrics_text(&partial_zero, 30).as_deref(),
-                Some("$0.00 · partial"),
+                Some("$0.00"),
                 "a known-zero partial total remains visible"
             );
             let mut application = Application::default();
