@@ -12,10 +12,10 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
-        CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions, FoldPosture,
-        ModelId, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SettingMutation, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope,
-        SidebarVisibility, TitleErrand,
+        CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
+        DerivationErrand, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
+        ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
+        SettingsSnapshot, SidebarScope, SidebarVisibility,
     },
     server::{self, ServerConfig},
 };
@@ -2124,53 +2124,51 @@ fn pinned_title_selection() -> AgentSelection {
     }
 }
 
-/// Title derivation is the first Setting whose values the schema cannot
-/// enumerate, so these hold the line on a value richer than a word: pinned from
-/// a document, pinned by an edit, and diagnosed by naming the values that do
-/// have words alongside a description of the one that does not.
+/// Title and Icon derivation is the first Setting whose values the schema
+/// cannot enumerate, so these hold the line on a value richer than a word:
+/// pinned from a document, pinned by an edit, and diagnosed by naming the
+/// values that do have words alongside a description of the one that does not.
 #[tokio::test]
-async fn a_pinned_title_errand_selection_round_trips_through_a_config_document() {
+async fn a_pinned_derivation_errand_selection_round_trips_through_a_config_document() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
-            // Every Title written by the cheap Model, whatever the Session uses.
-            "session": {
-                "title": {
-                    "errand": {
-                        "provider": "codex",
-                        "model": "gpt-5-mini",
-                        "options": [],
-                    },
+            // Every Title and Icon written by the cheap Model, whatever the Session uses.
+            "derivation": {
+                "errand": {
+                    "provider": "codex",
+                    "model": "gpt-5-mini",
+                    "options": [],
                 },
             },
         }"#,
     )
     .expect("write Config Document");
     let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "settings-title-pin")
+        ServerConfig::new(state_dir.path(), "settings-derivation-pin")
             .expect("configure server")
             .with_config_dir(config_dir.path()),
     )
     .await
     .expect("spawn server");
 
-    let (client, opening) = attach(state_dir.path(), "settings-title-pin").await;
+    let (client, opening) = attach(state_dir.path(), "settings-derivation-pin").await;
     assert_eq!(
-        opening.settings.session.title.errand,
-        TitleErrand::Pinned(pinned_title_selection())
+        opening.settings.derivation.errand,
+        DerivationErrand::Pinned(pinned_title_selection())
     );
-    assert_eq!(opening.pinned, ["session.title.errand"]);
+    assert_eq!(opening.pinned, ["derivation.errand"]);
     assert_eq!(opening.diagnostics, []);
 
     let off = client
-        .mutate_setting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::Off),
+        .mutate_setting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::Off),
         })
         .await
-        .expect("turn Title derivation off");
-    assert_eq!(off.settings.session.title.errand, TitleErrand::Off);
+        .expect("turn Title and Icon derivation off");
+    assert_eq!(off.settings.derivation.errand, DerivationErrand::Off);
     let document = config_document(config_dir.path());
     assert!(
         document.contains("\"errand\": \"off\""),
@@ -2178,34 +2176,34 @@ async fn a_pinned_title_errand_selection_round_trips_through_a_config_document()
     );
 
     let repinned = client
-        .mutate_setting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::Pinned(pinned_title_selection())),
+        .mutate_setting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::Pinned(pinned_title_selection())),
         })
         .await
         .expect("pin an Agent Selection again");
     assert_eq!(
-        repinned.settings.session.title.errand,
-        TitleErrand::Pinned(pinned_title_selection()),
+        repinned.settings.derivation.errand,
+        DerivationErrand::Pinned(pinned_title_selection()),
         "an Agent Selection survives the round trip through the document"
     );
 
     let reset = client
-        .mutate_setting(SettingMutation::SessionTitleErrand { value: None })
+        .mutate_setting(SettingMutation::DerivationErrand { value: None })
         .await
         .expect("remove the pin");
     assert_eq!(
-        reset.settings.session.title.errand,
-        TitleErrand::FollowSession,
+        reset.settings.derivation.errand,
+        DerivationErrand::FollowSession,
         "the built-in default follows the Session's own Provider"
     );
     assert_eq!(reset.pinned, [] as [String; 0]);
     let emptied = config_document(config_dir.path());
     assert!(
-        !emptied.contains("session") && !emptied.contains("title"),
-        "the pin takes the objects that existed only to hold it with it: {emptied:?}"
+        !emptied.contains("derivation"),
+        "the pin takes the object that existed only to hold it with it: {emptied:?}"
     );
     assert!(
-        emptied.contains("// Every Title written by the cheap Model"),
+        emptied.contains("// Every Title and Icon written by the cheap Model"),
         "the author's comment about the removed pin is theirs to delete: {emptied:?}"
     );
 
@@ -2214,29 +2212,31 @@ async fn a_pinned_title_errand_selection_round_trips_through_a_config_document()
 }
 
 #[tokio::test]
-async fn a_mistyped_title_errand_is_ignored_alone_and_says_what_it_accepts() {
+async fn a_mistyped_derivation_errand_is_ignored_alone_and_says_what_it_accepts() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
-            "session": { "title": { "errand": "sometimes" } },
+            "derivation": { "errand": "sometimes" },
             "transcript": { "reasoningVisibility": "shown" }
         }"#,
     )
     .expect("write Config Document");
     let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "settings-title-mistyped")
+        ServerConfig::new(state_dir.path(), "settings-derivation-mistyped")
             .expect("configure server")
             .with_config_dir(config_dir.path()),
     )
     .await
     .expect("spawn server");
 
-    let snapshot = attach(state_dir.path(), "settings-title-mistyped").await.1;
+    let snapshot = attach(state_dir.path(), "settings-derivation-mistyped")
+        .await
+        .1;
     assert_eq!(
-        snapshot.settings.session.title.errand,
-        TitleErrand::FollowSession,
+        snapshot.settings.derivation.errand,
+        DerivationErrand::FollowSession,
         "the mistyped Setting keeps its built-in default"
     );
     assert_eq!(
@@ -2251,12 +2251,56 @@ async fn a_mistyped_title_errand_is_ignored_alone_and_says_what_it_accepts() {
     };
     assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
     assert_eq!(diagnostic.file, config_dir.path().join("suru.jsonc"));
-    assert_eq!(diagnostic.key.as_deref(), Some("session.title.errand"));
+    assert_eq!(diagnostic.key.as_deref(), Some("derivation.errand"));
     assert!(
         diagnostic
             .message
             .contains("one of \"session\", \"off\", or an Agent Selection"),
         "a Setting the schema cannot enumerate names what it can and describes the rest: {:?}",
+        diagnostic.message
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The retired `session` › `title` › `errand` key names no Setting any more:
+/// renaming it to `derivation.errand` (so it plainly covers the Icon it now
+/// also governs) leaves the old path recognized only as far as `session`
+/// itself, a group other Settings still live under.
+#[tokio::test]
+async fn the_retired_title_derivation_key_is_no_longer_a_known_setting() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "session": { "title": { "errand": "off" } } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-derivation-retired-key")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-derivation-retired-key")
+        .await
+        .1;
+    assert_eq!(
+        snapshot.settings.derivation.errand,
+        DerivationErrand::FollowSession,
+        "the retired key pins nothing, so the built-in default stands"
+    );
+    assert_eq!(snapshot.pinned, [] as [String; 0]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+    assert_eq!(diagnostic.key.as_deref(), Some("session.title"));
+    assert!(
+        diagnostic.message.contains("not a known Setting"),
+        "the retired path is diagnosed exactly like any other unknown key: {:?}",
         diagnostic.message
     );
 

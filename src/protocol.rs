@@ -761,31 +761,37 @@ pub struct TranscriptSettings {
     pub command_auto_expand: CommandAutoExpand,
 }
 
-/// Which Agent Selection derives a Session's Title, which is also whether Suru
-/// derives one at all.
+/// Which Agent Selection derives a Session's Title and a Workspace's Icon,
+/// which is also whether Suru derives either at all.
 ///
 /// One Setting rather than two, because two would admit a state that
-/// contradicts itself — titling turned off while a Model stands pinned for it —
-/// and would give the settings panel two rows for one intent.
+/// contradicts itself — deriving turned off while a Model stands pinned for it
+/// — and would give the settings panel two rows for one intent. Titles and
+/// Icons share this one Setting rather than each having their own: both are
+/// Provider-authored small talk asked of the same Errand Selection at the
+/// same moment (Session creation), and a user who wants neither, or wants a
+/// cheap Model to write both, is expressing one preference.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum TitleErrand {
-    /// The built-in default: each Session's Title is derived by the Provider
-    /// that Session already uses, at that Provider's Errand Selection. A
-    /// Session that has selected no Provider is left alone, because Suru will
-    /// not pick one the user did not choose.
+pub enum DerivationErrand {
+    /// The built-in default: each Session's Title, and its Workspace's Icon
+    /// where it has none, are derived by the Provider that Session already
+    /// uses, at that Provider's Errand Selection. A Session that has selected
+    /// no Provider is left alone, because Suru will not pick one the user did
+    /// not choose.
     #[default]
     FollowSession,
-    /// Suru derives no Titles and makes no Provider call on its own behalf.
+    /// Suru derives no Titles and no Icons, and makes no Provider call on its
+    /// own behalf for either.
     Off,
-    /// Every Session's Title is derived by this Provider and Model, whatever
-    /// the Session itself uses — including a Session that uses nothing. The
-    /// Selection is resolved against the live Model catalog like any other
-    /// Errand Selection, so a Model that has gone gives way to that Provider's
-    /// default rather than failing the Errand.
+    /// Every Session's Title, and every Workspace's Icon, is derived by this
+    /// Provider and Model, whatever the Session itself uses — including a
+    /// Session that uses nothing. The Selection is resolved against the live
+    /// Model catalog like any other Errand Selection, so a Model that has gone
+    /// gives way to that Provider's default rather than failing the Errand.
     Pinned(AgentSelection),
 }
 
-impl TitleErrand {
+impl DerivationErrand {
     /// The word a Config Document spells this value with, and `None` for the
     /// one value no word can spell. This is the only place those words are
     /// written down: serializing reads them off here, deserializing matches
@@ -800,39 +806,41 @@ impl TitleErrand {
     }
 }
 
-/// How a Config Document spells a [`TitleErrand`]: one of the two words for the
-/// values the schema names, or the Agent Selection itself for the one it
-/// cannot. The Selection is written plainly rather than under a tag, because a
-/// Config Document is written by hand and an Agent Selection is already an
-/// object no word could be mistaken for.
+/// How a Config Document spells a [`DerivationErrand`]: one of the two words
+/// for the values the schema names, or the Agent Selection itself for the one
+/// it cannot. The Selection is written plainly rather than under a tag,
+/// because a Config Document is written by hand and an Agent Selection is
+/// already an object no word could be mistaken for.
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-enum TitleErrandDocument {
+enum DerivationErrandDocument {
     Named(String),
     Pinned(AgentSelection),
 }
 
-impl Serialize for TitleErrand {
+impl Serialize for DerivationErrand {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match (self.named(), self) {
-            (Some(word), _) => TitleErrandDocument::Named(word.to_owned()),
-            (None, Self::Pinned(selection)) => TitleErrandDocument::Pinned(selection.clone()),
+            (Some(word), _) => DerivationErrandDocument::Named(word.to_owned()),
+            (None, Self::Pinned(selection)) => DerivationErrandDocument::Pinned(selection.clone()),
             (None, _) => unreachable!("every value but a pinned Selection has a word"),
         }
         .serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for TitleErrand {
+impl<'de> Deserialize<'de> for DerivationErrand {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match TitleErrandDocument::deserialize(deserializer)? {
-            TitleErrandDocument::Named(word) => [Self::FollowSession, Self::Off]
+        match DerivationErrandDocument::deserialize(deserializer)? {
+            DerivationErrandDocument::Named(word) => [Self::FollowSession, Self::Off]
                 .into_iter()
                 .find(|value| value.named() == Some(word.as_str()))
                 .ok_or_else(|| {
-                    serde::de::Error::custom(format!("{word:?} is not a way of deriving a Title"))
+                    serde::de::Error::custom(format!(
+                        "{word:?} is not a way of deriving a Title or an Icon"
+                    ))
                 }),
-            TitleErrandDocument::Pinned(selection) => Ok(Self::Pinned(selection)),
+            DerivationErrandDocument::Pinned(selection) => Ok(Self::Pinned(selection)),
         }
     }
 }
@@ -886,18 +894,17 @@ impl<'de> Deserialize<'de> for SessionContentWidth {
     }
 }
 
-/// How Suru derives a Session's Title.
+/// How Suru derives a Session's Title and a Workspace's Icon.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TitleSettings {
-    pub errand: TitleErrand,
+pub struct DerivationSettings {
+    pub errand: DerivationErrand,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSettings {
     pub content_width: SessionContentWidth,
-    pub title: TitleSettings,
 }
 
 /// Whether a TUI's Sidebar is on screen.
@@ -1395,6 +1402,10 @@ pub struct EffectiveSettings {
     pub appearance: AppearanceSettings,
     pub transcript: TranscriptSettings,
     pub session: SessionSettings,
+    /// How Suru derives a Session's Title and a Workspace's Icon. A top-level
+    /// Setting rather than one scoped under `session`, because a Workspace
+    /// outlives any one Session and the Errand this governs derives both.
+    pub derivation: DerivationSettings,
     pub sidebar: SidebarSettings,
     pub worktree: WorktreeSettings,
     pub provider: ProviderSettings,
@@ -1586,8 +1597,8 @@ pub enum SettingMutation {
     SessionContentWidth {
         value: Option<SessionContentWidth>,
     },
-    SessionTitleErrand {
-        value: Option<TitleErrand>,
+    DerivationErrand {
+        value: Option<DerivationErrand>,
     },
     SidebarInitialVisibility {
         value: Option<SidebarVisibility>,

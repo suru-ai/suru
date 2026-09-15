@@ -10,9 +10,8 @@ use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
-        CreateSessionRequest, InitialPrompt, Message, MessageRole, ModelCatalog, PromptId,
-        ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TitleErrand, TurnId,
-        TurnStatus,
+        CreateSessionRequest, DerivationErrand, InitialPrompt, Message, MessageRole, ModelCatalog,
+        PromptId, ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -757,5 +756,5 @@ pub async fn session_where(
 /// Selection — which is what makes it a Session worth deriving a Title for — would otherwise have
 /// the Errand's own Copilot Session interleaving with its own.
 pub fn titling_turned_off() -> tempfile::TempDir {
-    config_root_pinning(&TitleErrand::Off)
+    config_root_pinning(&DerivationErrand::Off)
 }

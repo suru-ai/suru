@@ -13,11 +13,11 @@ use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, InitialPrompt,
-        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ModelOptionSelection, ModelOptionValue, PromptId, ProviderId, SessionCatalogChange,
-        SessionId, SessionListItem, SessionTitleChanged, TitleErrand,
+        AgentId, AgentIdentity, AgentSelection, CreateSessionRequest, DerivationErrand,
+        InitialPrompt, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionRole, ModelOptionSelection, ModelOptionValue, PromptId, ProviderId,
+        SessionCatalogChange, SessionId, SessionListItem, SessionTitleChanged,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -947,7 +947,7 @@ async fn work_the_first_turn(provider: &mut ControlledProvider) {
 async fn title_derivation_turned_off_asks_for_no_errand_at_all() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let config_dir = config_root_pinning(&TitleErrand::Off);
+    let config_dir = config_root_pinning(&DerivationErrand::Off);
     let (runtime, mut provider) = titling_provider();
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), "title-off-test")
@@ -990,7 +990,7 @@ async fn a_pinned_selection_titles_a_session_whatever_that_session_converses_at(
         model: ModelId::new(ERRAND_MODEL),
         options: Vec::new(),
     };
-    let config_dir = config_root_pinning(&TitleErrand::Pinned(pinned));
+    let config_dir = config_root_pinning(&DerivationErrand::Pinned(pinned));
     let (runtime, mut provider) = errand_titling_provider();
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), "title-pinned-test")
@@ -1054,7 +1054,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
         model: ModelId::new(ERRAND_MODEL),
         options: Vec::new(),
     };
-    let config_dir = config_root_pinning(&TitleErrand::Pinned(pinned.clone()));
+    let config_dir = config_root_pinning(&DerivationErrand::Pinned(pinned.clone()));
     let (runtime, mut provider) =
         ControlledProvider::with_provider(ProviderId::new(PROVIDER), vec![only_model]);
     let server = server::spawn_with_provider(
@@ -1100,7 +1100,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
 async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let config_dir = config_root_pinning(&TitleErrand::Pinned(AgentSelection {
+    let config_dir = config_root_pinning(&DerivationErrand::Pinned(AgentSelection {
         provider: ProviderId::new(PROVIDER),
         model: ModelId::new(ERRAND_MODEL),
         options: Vec::new(),

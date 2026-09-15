@@ -20,13 +20,14 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, AppearanceMode, AppearanceSettings, AutoReclaim, AutoSettle, CodexSettings,
-        CopilotSettings, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
-        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
-        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
-        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
-        SidebarSettings, SidebarVisibility, TitleErrand, TitleSettings, TranscriptSettings,
+        CopilotSettings, DerivationErrand, DerivationSettings, EffectiveSettings, FoldPosture,
+        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail,
+        ReasoningVisibility, SessionContentWidth, SessionId, SessionSettings, SettingMutation,
+        SettingScope, SettingsSnapshot, SidebarScope, SidebarSettings, SidebarVisibility,
+        TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -2528,14 +2529,11 @@ fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
 
 /// Effective settings whose only departure from the built-in defaults is which
 /// Agent Selection derives a Session's Title.
-fn deriving_titles_with(errand: TitleErrand) -> EffectiveSettings {
+fn deriving_titles_with(errand: DerivationErrand) -> EffectiveSettings {
     EffectiveSettings {
-        session: SessionSettings {
-            title: TitleSettings {
-                errand,
-                ..TitleSettings::default()
-            },
-            ..SessionSettings::default()
+        derivation: DerivationSettings {
+            errand,
+            ..DerivationSettings::default()
         },
         ..EffectiveSettings::default()
     }
@@ -2616,12 +2614,12 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    focus_setting(&mut application, "session.title.errand");
+    focus_setting(&mut application, "derivation.errand");
 
     assert!(
-        row(&application, "Title derivation").contains("· session"),
+        row(&application, "Title and Icon derivation").contains("· session"),
         "the built-in default follows the Session's own Provider: {:?}",
-        row(&application, "Title derivation")
+        row(&application, "Title and Icon derivation")
     );
     assert!(
         rendered_application_rows(&application)
@@ -2632,26 +2630,26 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::Off),
+        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::Off),
         }),
         "Space walks the values the schema does name"
     );
 
     deliver_snapshot(
         &mut application,
-        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
-        &["session.title.errand"],
+        deriving_titles_with(DerivationErrand::Pinned(pinned_selection())),
+        &["derivation.errand"],
     );
-    let pinned_row = row(&application, "Title derivation");
+    let pinned_row = row(&application, "Title and Icon derivation");
     assert!(
         pinned_row.contains("codex · gpt-5-mini") && pinned_row.contains("[pinned]"),
         "a value the schema never named is spelled by the Setting itself: {pinned_row:?}"
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::FollowSession),
+        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::FollowSession),
         }),
         "and cycling off it returns to the first value that has a word"
     );
@@ -2662,7 +2660,7 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    focus_setting(&mut application, "session.title.errand");
+    focus_setting(&mut application, "derivation.errand");
 
     let ApplicationTransition::ListModels(request) =
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
@@ -2677,7 +2675,7 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
         .expect("receive the catalog the picker asked for");
     let showing = rendered_application_rows(&application).join("\n");
     assert!(
-        showing.contains("GPT-5 Mini") && !showing.contains("Title derivation"),
+        showing.contains("GPT-5 Mini") && !showing.contains("Title and Icon derivation"),
         "the picker is drawn over the panel that opened it, and answers the keys: {showing}"
     );
     assert!(
@@ -2702,8 +2700,8 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::Pinned(pinned_selection())),
+        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::Pinned(pinned_selection())),
         }),
         "the Model the reader chose is pinned as this Setting's value, not as the Agent, \
          and the pin claims the Model alone rather than freezing today's Model Options"
@@ -2719,8 +2717,8 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
     // the reader made rather than back on the Provider's default.
     deliver_snapshot(
         &mut application,
-        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
-        &["session.title.errand"],
+        deriving_titles_with(DerivationErrand::Pinned(pinned_selection())),
+        &["derivation.errand"],
     );
     let ApplicationTransition::ListModels(reopened) =
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
@@ -2749,8 +2747,8 @@ fn a_catalog_landing_leaves_the_pinned_model_focused_rather_than_the_sessions() 
     let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
-        deriving_titles_with(TitleErrand::Pinned(pinned_selection())),
-        &["session.title.errand"],
+        deriving_titles_with(DerivationErrand::Pinned(pinned_selection())),
+        &["derivation.errand"],
     );
     // A Session conversing at the Provider's default Model, which is the Model
     // this picker must not be dragged onto.
@@ -2768,7 +2766,7 @@ fn a_catalog_landing_leaves_the_pinned_model_focused_rather_than_the_sessions() 
         ))
         .expect("attach a Session conversing at another Model");
     open_panel(&mut application);
-    focus_setting(&mut application, "session.title.errand");
+    focus_setting(&mut application, "derivation.errand");
 
     let ApplicationTransition::ListModels(request) =
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE)
@@ -2796,25 +2794,25 @@ fn cancelling_the_picker_leaves_the_settings_panel_where_it_was() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    focus_setting(&mut application, "session.title.errand");
+    focus_setting(&mut application, "derivation.errand");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
 
     assert!(
-        has_row(&application, "Title derivation"),
+        has_row(&application, "Title and Icon derivation"),
         "Esc closes the picker alone"
     );
     assert_eq!(
         focused_key(&application),
-        "session.title.errand",
+        "derivation.errand",
         "and the panel is still focused on the row that opened it"
     );
 }
 
 fn open_title_options(application: &mut Application, catalog: ModelCatalog) {
     open_panel(application);
-    focus_setting(application, "session.title.errand");
+    focus_setting(application, "derivation.errand");
     let ApplicationTransition::ListModels(request) =
         press(application, KeyCode::Enter, KeyModifiers::NONE)
     else {
@@ -2874,8 +2872,8 @@ fn title_options_pin_explicit_choices_even_equal_to_defaults_across_providers() 
         });
         assert_eq!(
             press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-            ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-                value: Some(TitleErrand::Pinned(expected)),
+            ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+                value: Some(DerivationErrand::Pinned(expected)),
             }),
             "explicit Low is pinned while untouched Speed follows defaults for {provider}"
         );
@@ -2892,8 +2890,8 @@ fn title_options_reopen_own_overrides_and_can_restore_provider_defaults() {
     });
     let mut application = client_showing(
         workspace.path(),
-        deriving_titles_with(TitleErrand::Pinned(selection)),
-        &["session.title.errand"],
+        deriving_titles_with(DerivationErrand::Pinned(selection)),
+        &["derivation.errand"],
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(
@@ -2922,8 +2920,8 @@ fn title_options_reopen_own_overrides_and_can_restore_provider_defaults() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-            value: Some(TitleErrand::Pinned(pinned_selection())),
+        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            value: Some(DerivationErrand::Pinned(pinned_selection())),
         })
     );
 }
@@ -2946,8 +2944,8 @@ fn cancelling_title_options_discards_staged_changes_and_preserves_the_setting() 
         press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
         ApplicationTransition::Continue
     );
-    assert_eq!(focused_key(&application), "session.title.errand");
-    assert!(row(&application, "Title derivation").contains("· session"));
+    assert_eq!(focused_key(&application), "derivation.errand");
+    assert!(row(&application, "Title and Icon derivation").contains("· session"));
 }
 
 #[test]
@@ -2961,8 +2959,8 @@ fn choosing_another_title_model_or_provider_starts_with_inherited_options() {
         });
         let mut application = client_showing(
             workspace.path(),
-            deriving_titles_with(TitleErrand::Pinned(original)),
-            &["session.title.errand"],
+            deriving_titles_with(DerivationErrand::Pinned(original)),
+            &["derivation.errand"],
         );
         let mut catalog = configurable_title_catalog(provider);
         catalog.providers[0].models[0].id = ModelId::new(model);
@@ -2974,8 +2972,8 @@ fn choosing_another_title_model_or_provider_starts_with_inherited_options() {
         );
         assert_eq!(
             press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-            ApplicationTransition::MutateSetting(SettingMutation::SessionTitleErrand {
-                value: Some(TitleErrand::Pinned(AgentSelection {
+            ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+                value: Some(DerivationErrand::Pinned(AgentSelection {
                     provider: ProviderId::new(provider),
                     model: ModelId::new(model),
                     options: Vec::new(),

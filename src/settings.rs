@@ -32,11 +32,11 @@ use serde_json::Value;
 
 use crate::protocol::{
     AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
-    CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
+    CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions, DerivationErrand,
     EffectiveSettings, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
-    TextSelectionCopy, TitleErrand,
+    TextSelectionCopy,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -55,10 +55,10 @@ const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
 const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
-// Keyed per purpose rather than Errand-wide, so a compaction Errand arriving
-// later gets its own key and turning Titles off can never silently disable
-// work that has nothing to do with them.
-const SESSION_TITLE_ERRAND: &str = "session.title.errand";
+// Scoped to Titles and Icons alone rather than Errand-wide, so a compaction
+// Errand arriving later gets its own key and turning these off can never
+// silently disable work that has nothing to do with them.
+const DERIVATION_ERRAND: &str = "derivation.errand";
 const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_WIDTH: &str = "sidebar.initialWidth";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
@@ -526,8 +526,8 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::SessionContentWidth { value } => {
             *value == Some(settings.session.content_width)
         }
-        SettingMutation::SessionTitleErrand { value } => {
-            value.as_ref() == Some(&settings.session.title.errand)
+        SettingMutation::DerivationErrand { value } => {
+            value.as_ref() == Some(&settings.derivation.errand)
         }
         SettingMutation::SidebarInitialVisibility { value } => {
             *value == Some(settings.sidebar.initial_visibility)
@@ -808,59 +808,59 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
-        key: SESSION_TITLE_ERRAND,
-        label: "Title derivation",
-        description: "Which Agent Selection derives a Session's Title, if any",
+        key: DERIVATION_ERRAND,
+        label: "Title and Icon derivation",
+        description: "Which Agent Selection derives a Session's Title and a Workspace's Icon, if any",
         group: SettingGroup::General,
         scope: SettingScope::Server,
         values: SettingValues::Open {
             named: &[
                 SettingChoice {
                     value: "session",
-                    build_mutation: || SettingMutation::SessionTitleErrand {
-                        value: Some(TitleErrand::FollowSession),
+                    build_mutation: || SettingMutation::DerivationErrand {
+                        value: Some(DerivationErrand::FollowSession),
                     },
                 },
                 SettingChoice {
                     value: "off",
-                    build_mutation: || SettingMutation::SessionTitleErrand {
-                        value: Some(TitleErrand::Off),
+                    build_mutation: || SettingMutation::DerivationErrand {
+                        value: Some(DerivationErrand::Off),
                     },
                 },
             ],
             accepts: "an Agent Selection",
             spell: |settings| {
-                let errand = &settings.session.title.errand;
+                let errand = &settings.derivation.errand;
                 match errand {
                     // The pin's own Model, not the one an Errand would resolve
                     // to: a row reports the choice the reader made, and what a
                     // live catalog makes of it is the Errand's business.
-                    TitleErrand::Pinned(selection) => {
+                    DerivationErrand::Pinned(selection) => {
                         format!("{} · {}", selection.provider, selection.model)
                     }
                     // Every other value spells itself the way a reader would
                     // have typed it, read off the one place those words are
                     // written down rather than repeated here.
-                    TitleErrand::FollowSession | TitleErrand::Off => errand
+                    DerivationErrand::FollowSession | DerivationErrand::Off => errand
                         .named()
                         .expect("every value but a pinned Selection has a word")
                         .to_owned(),
                 }
             },
             chosen_at: Some(SettingChoiceSurface::AgentSelection {
-                current: |settings| match &settings.session.title.errand {
-                    TitleErrand::Pinned(selection) => Some(selection.clone()),
-                    TitleErrand::FollowSession | TitleErrand::Off => None,
+                current: |settings| match &settings.derivation.errand {
+                    DerivationErrand::Pinned(selection) => Some(selection.clone()),
+                    DerivationErrand::FollowSession | DerivationErrand::Off => None,
                 },
-                pin: |selection| SettingMutation::SessionTitleErrand {
-                    value: Some(TitleErrand::Pinned(selection)),
+                pin: |selection| SettingMutation::DerivationErrand {
+                    value: Some(DerivationErrand::Pinned(selection)),
                 },
             }),
         },
-        reset: SettingMutation::SessionTitleErrand { value: None },
+        reset: SettingMutation::DerivationErrand { value: None },
         apply: |settings, value| {
             apply_value(value, |errand| {
-                settings.session.title.errand = errand;
+                settings.derivation.errand = errand;
             })
         },
     },
@@ -1529,7 +1529,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             (TRANSCRIPT_COMMAND_AUTO_EXPAND, pinned(value))
         }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
-        SettingMutation::SessionTitleErrand { value } => (SESSION_TITLE_ERRAND, pinned(value)),
+        SettingMutation::DerivationErrand { value } => (DERIVATION_ERRAND, pinned(value)),
         SettingMutation::SidebarInitialVisibility { value } => {
             (SIDEBAR_INITIAL_VISIBILITY, pinned(value))
         }
@@ -2190,8 +2190,8 @@ mod tests {
     fn a_pinned_agent_selection_reads_back_as_the_selection_the_reader_chose() {
         let descriptor = SCHEMA
             .iter()
-            .find(|descriptor| descriptor.key == SESSION_TITLE_ERRAND)
-            .expect("the Title derivation Setting is defined");
+            .find(|descriptor| descriptor.key == DERIVATION_ERRAND)
+            .expect("the Title and Icon derivation Setting is defined");
         let chosen = AgentSelection {
             provider: crate::protocol::ProviderId::new("codex"),
             model: crate::protocol::ModelId::new("gpt-5-mini"),
@@ -2214,8 +2214,8 @@ mod tests {
         ));
 
         assert_eq!(
-            settings.session.title.errand,
-            TitleErrand::Pinned(chosen.clone()),
+            settings.derivation.errand,
+            DerivationErrand::Pinned(chosen.clone()),
             "the pin puts the reader's own Selection in force"
         );
         assert_eq!(
