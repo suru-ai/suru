@@ -2062,6 +2062,14 @@ pub struct SessionSummary {
     #[serde(flatten)]
     pub session: Session,
     pub title: String,
+    /// The Icon Catalog name standing beside this Session's Title, derived
+    /// with that Title and carried apart from it so a reader searching a
+    /// listing matches the words rather than the glyph in front of them.
+    /// Absent for every Session whose derivation was skipped, failed, or
+    /// predates the feature. Resolved to a glyph only at draw time, and
+    /// drawn nowhere at all where the Catalog no longer carries the name.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// When the user set this Session aside as done for now, and `None` while
     /// it is active. The marker and the moment are one field because a Session
     /// is settled exactly when there is a moment it was settled at — and a
@@ -2115,6 +2123,16 @@ impl SessionListItem {
         match self {
             Self::Readable(summary) => &summary.title,
             Self::Unreadable(summary) => &summary.title,
+        }
+    }
+
+    /// The Icon Catalog name standing for this Session, when it has one. A
+    /// Session Suru could not read carries none, because an Icon is stored
+    /// beside a Title that only a readable Session has.
+    pub fn icon(&self) -> Option<&str> {
+        match self {
+            Self::Readable(summary) => summary.icon.as_deref(),
+            Self::Unreadable(_) => None,
         }
     }
 
@@ -2210,13 +2228,14 @@ pub enum SessionCatalogChange {
     Deleted {
         session_id: SessionId,
     },
-    /// A Session's Title was replaced by a derivation. It rides the catalog
-    /// stream rather than the Session's own, because a client subscribes only
-    /// to the Sessions it has open while the Title it draws is for every
-    /// Session it lists.
+    /// A Session's Title — and the Icon standing beside it — was replaced by
+    /// a derivation. It rides the catalog stream rather than the Session's own,
+    /// because a client subscribes only to the Sessions it has open while the
+    /// Title it draws is for every Session it lists.
     TitleChanged {
         session_id: SessionId,
         title: String,
+        icon: Option<String>,
     },
     /// A Session was set aside as done for now, or brought back. It rides the
     /// catalog stream for the same reason a Title does: every client lists the
@@ -2732,6 +2751,10 @@ pub struct SubagentInterventions {
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub title: String,
+    /// The Icon Catalog name standing beside this Session's Title. See
+    /// [`SessionSummary::icon`].
+    #[serde(default)]
+    pub icon: Option<String>,
     pub session: Session,
     pub revision: SessionRevision,
     pub prompts: Vec<Prompt>,
@@ -2838,6 +2861,7 @@ pub enum SessionChange {
     },
     TitleChanged {
         title: String,
+        icon: Option<String>,
     },
     ContextFillChanged {
         context_fill: Option<ContextFill>,
@@ -3366,11 +3390,12 @@ pub struct SessionUsageChanged {
     pub total_usage: Option<UsageTotal>,
 }
 
-/// A Session's Title as a derivation left it, carried to a client that may be
-/// listing that Session without having it open.
+/// A Session's Title — and the Icon beside it — as a derivation left them,
+/// carried to a client that may be listing that Session without having it open.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTitleChanged {
     pub session_id: SessionId,
     pub title: String,
+    pub icon: Option<String>,
 }

@@ -185,12 +185,12 @@ mod tests {
             "subtype": "success",
             "is_error": false,
             "result": "{\"title\":\"Fix the flicker\"}",
-            "structured_output": { "title": "Fix the flicker" },
+            "structured_output": { "title": "Fix the flicker", "icon": "md-bug" },
         })
         .to_string();
         assert_eq!(
             errand_answer(&printed).expect("a schema-shaped answer is an answer"),
-            json!({ "title": "Fix the flicker" })
+            json!({ "title": "Fix the flicker", "icon": "md-bug" })
         );
     }
 

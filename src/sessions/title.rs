@@ -1,10 +1,18 @@
-//! Deriving a Session's Title from its first Prompt.
+//! Deriving a Session's Title and Icon from its first Prompt.
 //!
 //! A Session is titled with the verbatim text of its first Prompt, which is a
 //! real Title rather than a placeholder but rarely a good one. The moment that
 //! Prompt is admitted, Suru asks a Provider — through an Errand — for a short
-//! line naming the subject and the outcome, and replaces the Title with what
-//! comes back.
+//! line naming the subject and the outcome, with an Icon standing for the
+//! work chosen alongside it, and replaces the Title with what comes back.
+//!
+//! The Icon travels with the Title but keeps its own rule: a derived Icon
+//! lands only where the Session still carries none, so an Icon derived
+//! earlier — or chosen by the user, once that lands — is never overwritten by
+//! a later derivation. The Title keeps its own, separate rule of replacing
+//! only the Title it was derived from. See the **Icon** and **Icon Catalog**
+//! glossary entries and ADR 0028 for why an Icon is carried as a Catalog name
+//! rather than a codepoint.
 //!
 //! Which Provider is the `session.title.errand` Setting's answer, read when the
 //! derivation begins. Left alone it is the Session's own, at that Provider's
@@ -27,6 +35,7 @@ use tokio::sync::watch;
 
 use crate::{
     errands::ErrandRunner,
+    icon_catalog,
     model_catalog::ModelCatalogService,
     protocol::{
         AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionChange, SessionId,
@@ -65,22 +74,43 @@ const QUOTE_PAIRS: [(char, char); 6] = [
     ('\u{00AB}', '\u{00BB}'),
 ];
 
-/// What Suru asks an Errand to answer with: an object carrying the Title.
+/// What Suru asks an Errand to answer with. One object carrying both the
+/// Title and the Icon Catalog name, because a Model choosing them together
+/// picks a better Icon than one retrofitting it onto a Title it had no say
+/// in — and because two calls would cost twice as much to answer the same
+/// question.
 ///
-/// Suru's own validation tolerates extra properties: a Model that volunteers a
-/// field Suru did not ask for has still answered the question, and throwing a
-/// good Title away over it costs the user more than ignoring it does. The
-/// requested schema still rejects them because Codex sends output schemas in
-/// strict mode, where every object must do so. Providers that cannot enforce the
-/// schema may return them anyway, and Suru will keep ignoring them. A reply
-/// missing the Title is what does not deserialize, and it is discarded whole.
+/// Suru's own validation tolerates extra properties and a missing or unusable
+/// Icon: a Model that volunteers a field Suru did not ask for, or names an
+/// Icon Suru's Catalog does not carry, has still answered the Title question,
+/// and throwing a good Title away over it costs the user more than ignoring
+/// it does. The requested schema still marks both properties required and
+/// rejects unasked ones because Codex sends output schemas in strict mode,
+/// where every property must be required and no others allowed. Providers
+/// that cannot enforce the schema may return outside it anyway, and Suru will
+/// keep validating regardless. A reply missing the Title is what does not
+/// deserialize at all, and it is discarded whole.
 #[derive(Debug, Deserialize)]
 struct DerivedTitleReply {
     title: String,
+    #[serde(default)]
+    icon: Option<String>,
 }
 
-/// Derives Sessions' Titles. Cloned into the server's shared state, which is
-/// what lets Session creation fork a derivation and return without waiting.
+/// What one derivation yields: the Title Suru will store, and the Icon
+/// Catalog name that stands beside it when the reply named a usable one.
+/// They travel together everywhere because they are derived together, in one
+/// Errand, and land together in one change — though the Icon lands only
+/// where the Session still has none.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DerivedTitle {
+    title: String,
+    icon: Option<String>,
+}
+
+/// Derives Sessions' Titles and Icons. Cloned into the server's shared state,
+/// which is what lets Session creation fork a derivation and return without
+/// waiting.
 #[derive(Clone)]
 pub(crate) struct TitleDerivation {
     errands: ErrandRunner,
@@ -170,14 +200,14 @@ impl TitleDerivation {
                     return;
                 }
             };
-            let Some(title) = derived_title(&answer) else {
+            let Some(derived) = derived_title(&answer) else {
                 tracing::info!(
                     %session_id,
                     "Title Errand answered outside its schema, so the Prompt-derived Title stands"
                 );
                 return;
             };
-            if !sessions.replace_derived_title(session_id, &derived_from, title) {
+            if !sessions.replace_derived_title(session_id, &derived_from, derived) {
                 tracing::debug!(
                     %session_id,
                     "a derived Title was discarded because the Title it was derived from has since changed"
@@ -231,45 +261,65 @@ impl SessionStore {
             .map(|record| record.summary.title.clone())
     }
 
-    /// Replaces a Session's Title with a derived one, but only when the Title
-    /// still reads as the one the derivation was derived from.
+    /// Replaces a Session's Title and Icon with a derived pair, but only
+    /// where each of their own guards allows it: the Title only when it
+    /// still reads as the one the derivation was derived from, and the Icon
+    /// only where the Session still carries none.
     ///
-    /// The guard is what makes a derivation that is still in flight safe, and
-    /// what lets a rename command land later without a schema change: a Title
-    /// set by other means while an Errand was outstanding is never overwritten
-    /// by the answer to that Errand. Answers `true` when the Title changed.
+    /// The Title guard is what makes a derivation that is still in flight
+    /// safe, and what lets a rename command land later without a schema
+    /// change: a Title set by other means while an Errand was outstanding is
+    /// never overwritten by the answer to that Errand. The Icon guard is the
+    /// same idea applied to derivation filling an absence rather than
+    /// replacing a value: an Icon this Session already carries — derived
+    /// earlier, or chosen by the user once that lands — stands regardless of
+    /// what a later derivation offers. Answers `true` when the Title changed;
+    /// a Title that changes without an Icon to fill is still a change.
     ///
     /// The change reaches both the open Session stream and the catalog, so
-    /// attached clients see the same Title as readers of Session listings.
+    /// attached clients see the same Title and Icon as readers of Session
+    /// listings. A future "set this Session's Icon by user choice" write
+    /// (issue #360) is expected to share this same commit-then-publish shape
+    /// rather than replace it, differing only in that it writes the Icon
+    /// unconditionally instead of filling an absence.
     pub(crate) fn replace_derived_title(
         &self,
         session_id: SessionId,
         derived_from: &str,
-        title: String,
+        derived: DerivedTitle,
     ) -> bool {
+        let DerivedTitle { title, icon } = derived;
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        {
+        let icon = {
             let Some(record) = state.sessions.get_mut(&session_id) else {
                 return false;
             };
             if record.summary.title != derived_from {
                 return false;
             }
+            // A derived Icon only ever fills an absence.
+            let icon = record.summary.icon.clone().or(icon);
             if let Err(error) = record.commit_derived(
                 &self.storage,
                 session_id,
                 vec![SessionChange::TitleChanged {
                     title: title.clone(),
+                    icon: icon.clone(),
                 }],
             ) {
                 tracing::warn!(%session_id, %error, "Could not commit derived Title");
                 return false;
             }
-        }
-        state.publish_catalog_change(SessionCatalogChange::TitleChanged { session_id, title });
+            icon
+        };
+        state.publish_catalog_change(SessionCatalogChange::TitleChanged {
+            session_id,
+            title,
+            icon,
+        });
         true
     }
 }
@@ -301,7 +351,9 @@ fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation]) -> String 
         "Name the piece of work the request below begins.\n\n\
          Answer with a title of 3 to 8 words, under 50 characters, naming the subject of \
          the work and what it is meant to achieve. Do not echo the wording of the request, \
-         do not address the reader, and do not end with a full stop.\n\n\
+         do not address the reader, and do not end with a full stop. Answer also with an \
+         Icon standing for the work, chosen from the offered names alongside the title \
+         rather than fitted to it afterwards.\n\n\
          The request:\n{opening}"
     )
 }
@@ -317,18 +369,29 @@ fn reply_schema() -> Value {
                 "type": "string",
                 "description": "3 to 8 words under 50 characters naming the subject of the work and what it is meant to achieve",
             },
+            "icon": {
+                "type": "string",
+                "description": "the Icon Catalog name standing for the work",
+                "enum": icon_catalog::names(),
+            },
         },
-        "required": ["title"],
+        "required": ["title", "icon"],
         "additionalProperties": false,
     })
 }
 
-/// The Title an Errand's reply yields, or `None` when it yields none.
-/// Sanitizing runs on every path, whether or not the harness was able to
-/// enforce the schema, because no Provider can be relied on to have done it.
-fn derived_title(answer: &Value) -> Option<String> {
+/// The Title and Icon an Errand's reply yields, or `None` when it yields
+/// neither. Sanitizing runs on every path, whether or not the harness was
+/// able to enforce the schema, because no Provider can be relied on to have
+/// done it.
+fn derived_title(answer: &Value) -> Option<DerivedTitle> {
     let reply: DerivedTitleReply = serde_json::from_value(answer.clone()).ok()?;
-    sanitized_title(&reply.title)
+    Some(DerivedTitle {
+        title: sanitized_title(&reply.title)?,
+        icon: reply
+            .icon
+            .filter(|name| icon_catalog::glyph(name).is_some()),
+    })
 }
 
 /// A Model-authored Title as Suru stores it: its first non-empty line, unwrapped
@@ -422,9 +485,31 @@ mod tests {
 
     #[test]
     fn a_reply_without_a_title_yields_nothing_at_all() {
-        assert!(derived_title(&json!({})).is_none());
+        assert!(derived_title(&json!({ "icon": "md-bug" })).is_none());
         assert!(derived_title(&json!("Fix the flicker")).is_none());
         assert!(derived_title(&json!({ "title": "   " })).is_none());
+    }
+
+    #[test]
+    fn a_reply_with_an_unknown_icon_still_yields_its_title() {
+        assert_eq!(
+            derived_title(&json!({ "title": "Fix the flicker", "icon": "not-a-catalog-name" })),
+            Some(DerivedTitle {
+                title: "Fix the flicker".to_owned(),
+                icon: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reply_missing_an_icon_still_yields_its_title() {
+        assert_eq!(
+            derived_title(&json!({ "title": "Fix the flicker" })),
+            Some(DerivedTitle {
+                title: "Fix the flicker".to_owned(),
+                icon: None,
+            })
+        );
     }
 
     #[test]
@@ -432,9 +517,13 @@ mod tests {
         assert_eq!(
             derived_title(&json!({
                 "title": "Fix the flicker",
+                "icon": "md-bug",
                 "confidence": 0.9,
             })),
-            Some("Fix the flicker".to_owned())
+            Some(DerivedTitle {
+                title: "Fix the flicker".to_owned(),
+                icon: Some("md-bug".to_owned()),
+            })
         );
     }
 
@@ -443,11 +532,22 @@ mod tests {
         assert_eq!(reply_schema()["additionalProperties"], json!(false));
     }
 
-    /// The guard is exercised here rather than at the server seam because
-    /// nothing else in Suru writes a Title yet — a rename command is the caller
-    /// this exists for, and it does not exist. The guard is built now anyway,
-    /// because it is what lets that command land later without a schema change
-    /// and what makes a derivation still in flight safe.
+    #[test]
+    fn a_title_errand_schema_enumerates_the_icon_catalog() {
+        let schema = reply_schema();
+        assert_eq!(
+            schema["properties"]["icon"]["enum"],
+            json!(icon_catalog::names()),
+            "a Model can only choose an Icon Suru's Catalog can resolve"
+        );
+        assert_eq!(schema["required"], json!(["title", "icon"]));
+    }
+
+    /// The Title guard is exercised here rather than at the server seam
+    /// because nothing else in Suru writes a Title yet — a rename command is
+    /// the caller this exists for, and it does not exist. The guard is built
+    /// now anyway, because it is what lets that command land later without a
+    /// schema change and what makes a derivation still in flight safe.
     #[tokio::test]
     async fn a_derived_title_replaces_only_the_title_it_was_derived_from() {
         use crate::{
@@ -485,7 +585,10 @@ mod tests {
             !store.replace_derived_title(
                 session_id,
                 "a Title this Session never had",
-                "Derived from something else".to_owned(),
+                DerivedTitle {
+                    title: "Derived from something else".to_owned(),
+                    icon: None,
+                },
             ),
             "a derivation cannot replace a Title it was not derived from"
         );
@@ -494,11 +597,98 @@ mod tests {
         assert!(store.replace_derived_title(
             session_id,
             "Explain the seam",
-            "Explain the Provider seam".to_owned(),
+            DerivedTitle {
+                title: "Explain the Provider seam".to_owned(),
+                icon: Some("md-bug".to_owned()),
+            },
         ));
         assert_eq!(
             store.title(session_id).as_deref(),
             Some("Explain the Provider seam")
+        );
+    }
+
+    /// The Icon's own guard: derivation fills an absence and never overwrites
+    /// an Icon the Session already carries, exactly as a chosen Icon will
+    /// stand against a later derivation once issue #360 lands a way to
+    /// choose one.
+    #[tokio::test]
+    async fn a_derived_icon_fills_an_absence_but_never_overwrites_one() {
+        use crate::{
+            protocol::{CreateSessionRequest, InitialPrompt, PromptId},
+            storage::{StorageRepository, StorageWriter},
+        };
+
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new());
+        let created = store
+            .create(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Explain the seam".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .expect("create Session");
+        let crate::sessions::StoreOutcome::Created(snapshot) = created else {
+            panic!("a fresh Prompt creates a Session");
+        };
+        let session_id = snapshot.session.id;
+
+        assert!(store.replace_derived_title(
+            session_id,
+            "Explain the seam",
+            DerivedTitle {
+                title: "Explain the Provider seam".to_owned(),
+                icon: Some("md-bug".to_owned()),
+            },
+        ));
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned")
+                .sessions
+                .get(&session_id)
+                .expect("the created Session is held")
+                .summary
+                .icon
+                .as_deref(),
+            Some("md-bug"),
+            "a first derivation fills the Session's absent Icon"
+        );
+
+        assert!(store.replace_derived_title(
+            session_id,
+            "Explain the Provider seam",
+            DerivedTitle {
+                title: "Explain the Provider seam once more".to_owned(),
+                icon: Some("dev-rust".to_owned()),
+            },
+        ));
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned")
+                .sessions
+                .get(&session_id)
+                .expect("the created Session is held")
+                .summary
+                .icon
+                .as_deref(),
+            Some("md-bug"),
+            "a second derivation never overwrites the Icon the Session already carries"
         );
     }
 

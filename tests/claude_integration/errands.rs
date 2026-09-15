@@ -132,7 +132,10 @@ async fn session_finishes_working(client: &ManagedClient, session_id: SessionId)
 #[tokio::test]
 async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
     let claude = ScriptedClaude::with_preamble(
-        &errand_preamble(&derived_title_envelope("Fix reasoning group flicker")),
+        &errand_preamble(&derived_title_envelope(
+            "Fix reasoning group flicker",
+            "md-bug",
+        )),
         &conversation_arms(SILENT_TIMELINE),
     );
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -150,8 +153,9 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
         SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
+            icon: Some("md-bug".to_owned()),
         },
-        "the Errand's answer becomes the Session's Title"
+        "the Errand's answer becomes the Session's Title and the Icon beside it"
     );
 
     let errand = claude.launch_carrying("--json-schema");
@@ -208,7 +212,7 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
     let schema: serde_json::Value =
         serde_json::from_str(errand.value("--json-schema")).expect("the schema is JSON");
     assert!(
-        schema["properties"]["title"].is_object(),
+        schema["properties"]["title"].is_object() && schema["properties"]["icon"].is_object(),
         "the schema reaches the CLI natively rather than as prose: {schema}"
     );
     let prompt = claude.errand_prompts();
@@ -327,7 +331,7 @@ async fn a_claude_errand_whose_cli_dies_leaves_the_prompt_derived_title_standing
 async fn an_errand_falls_back_to_claudes_default_model_once_the_cheap_row_is_withdrawn() {
     let withdrawn = models_without(CLAUDE_MODELS, "haiku");
     let claude = ScriptedClaude::with_preamble(
-        &errand_preamble(&derived_title_envelope("Fix the flicker")),
+        &errand_preamble(&derived_title_envelope("Fix the flicker", "md-bug")),
         &conversation_arms_over(&withdrawn),
     );
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

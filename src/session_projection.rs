@@ -23,8 +23,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     let next = snapshot;
     for change in &update.changes {
         match change {
-            SessionChange::TitleChanged { title } => {
+            SessionChange::TitleChanged { title, icon } => {
                 next.title.clone_from(title);
+                next.icon.clone_from(icon);
             }
             SessionChange::AgentSelectionChanged { selection } => {
                 next.session.agent_selection = Some(selection.clone());
@@ -853,6 +854,7 @@ mod tests {
         let turn_id = TurnId::new();
         let mut snapshot = SessionSnapshot {
             title: String::new(),
+            icon: None,
             session: Session {
                 checkout: None,
                 context_fill: None,

@@ -112,8 +112,9 @@ fn declared_errand_selection() -> AgentSelection {
     }
 }
 
-/// The Title one Session in a listing carries.
-async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
+/// The Title one Session in a listing carries, alongside the Icon Catalog
+/// name beside it.
+async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String, Option<String>) {
     let listed = client
         .list_sessions(None)
         .await
@@ -121,7 +122,10 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed");
-    listed.title().to_owned()
+    (
+        listed.title().to_owned(),
+        listed.icon().map(ToOwned::to_owned),
+    )
 }
 
 async fn connected_client(state_dir: &std::path::Path, channel: &str) -> ManagedClient {
@@ -152,7 +156,7 @@ async fn finish_initial_turn(provider: &mut ControlledProvider) {
 }
 
 #[tokio::test]
-async fn an_answered_errand_updates_the_open_session_title() {
+async fn an_answered_errand_updates_the_open_session_title_and_icon() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = titling_provider();
@@ -214,11 +218,17 @@ async fn an_answered_errand_updates_the_open_session_title() {
     );
     let schema = errand.schema();
     assert!(
-        schema["properties"]["title"].is_object(),
-        "the Errand asks for the Title: {schema}"
+        schema["properties"]["title"].is_object() && schema["properties"]["icon"].is_object(),
+        "one Errand asks for both the Title and the Icon: {schema}"
+    );
+    assert_eq!(
+        schema["properties"]["icon"]["enum"],
+        json!(suru::icon_catalog_names()),
+        "the reply schema carries the Icon Catalog as a strict enum: {schema}"
     );
     errand.succeed(json!({
         "title": "Fix reasoning group flicker",
+        "icon": "md-bug",
     }));
 
     assert_eq!(
@@ -226,17 +236,22 @@ async fn an_answered_errand_updates_the_open_session_title() {
         SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
+            icon: Some("md-bug".to_owned()),
         }
     );
     assert_eq!(
         listed_title(&client, session_id).await,
-        "Fix reasoning group flicker".to_owned()
+        (
+            "Fix reasoning group flicker".to_owned(),
+            Some("md-bug".to_owned())
+        )
     );
     let titled = client
         .read_session(session_id)
         .await
         .expect("read the Session");
     assert_eq!(titled.title, "Fix reasoning group flicker");
+    assert_eq!(titled.icon.as_deref(), Some("md-bug"));
     assert!(titled.revision.0 > created.revision.0);
     timeout(PROGRESS_DEADLINE, async {
         loop {
@@ -248,8 +263,9 @@ async fn an_answered_errand_updates_the_open_session_title() {
             if let suru::managed_client::SessionEvent::Updated(update) = event
                 && update.changes.iter().any(|change| {
                     matches!(change,
-                        suru::protocol::SessionChange::TitleChanged { title }
+                        suru::protocol::SessionChange::TitleChanged { title, icon }
                             if title == "Fix reasoning group flicker"
+                                && icon.as_deref() == Some("md-bug")
                     )
                 })
             {
@@ -373,7 +389,7 @@ async fn a_provider_with_no_model_to_run_an_errand_at_is_asked_for_none() {
     );
     assert_eq!(
         listed_title(&client, created.session.id).await,
-        "Explain the seam".to_owned(),
+        ("Explain the seam".to_owned(), None),
         "the Prompt-derived Title stands"
     );
 
@@ -439,8 +455,8 @@ async fn a_failed_errand_leaves_the_prompt_derived_title_standing() {
 
     assert_eq!(
         listed_title(&client, session_id).await,
-        "Explain the seam".to_owned(),
-        "the Prompt-derived Title stands"
+        ("Explain the seam".to_owned(), None),
+        "the Prompt-derived Title stands and no Icon is invented"
     );
     finish_initial_turn(&mut provider).await;
     assert_no_title_reaches(
@@ -481,7 +497,7 @@ async fn an_errand_that_never_answers_leaves_the_prompt_derived_title_standing()
 
     assert_eq!(
         listed_title(&client, session_id).await,
-        "Explain the seam".to_owned()
+        ("Explain the seam".to_owned(), None)
     );
     finish_initial_turn(&mut provider).await;
     assert_no_title_reaches(
@@ -520,7 +536,7 @@ async fn an_errand_answering_outside_its_schema_yields_no_partial_title() {
 
     assert_eq!(
         listed_title(&client, session_id).await,
-        "Explain the seam".to_owned(),
+        ("Explain the seam".to_owned(), None),
         "a reply Suru cannot read is discarded whole rather than half-applied"
     );
     finish_initial_turn(&mut provider).await;
@@ -530,6 +546,53 @@ async fn an_errand_answering_outside_its_schema_yields_no_partial_title() {
         "no Title reached the client ahead of the deletion",
     )
     .await;
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// An Icon Suru's Catalog does not carry is not a reason to throw the Title
+/// away: validation looks the name up, finds nothing, and lands the Title
+/// alone — exactly as a reply naming no Icon at all does.
+#[tokio::test]
+async fn an_invalid_icon_name_lands_the_title_alone() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = titling_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "title-invalid-icon-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = connected_client(state_dir.path(), "title-invalid-icon-test").await;
+
+    let created = client
+        .create_session(create_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("an Errand reaches the Provider")
+        .succeed(json!({
+            "title": "Explain the Provider seam",
+            "icon": "md-not-a-glyph",
+        }));
+
+    assert_eq!(
+        next_derived_title(&mut client).await,
+        SessionTitleChanged {
+            session_id,
+            title: "Explain the Provider seam".to_owned(),
+            icon: None,
+        },
+        "an unknown Icon name lands no Icon while the Title still lands"
+    );
+    assert_eq!(
+        listed_title(&client, session_id).await,
+        ("Explain the Provider seam".to_owned(), None)
+    );
 
     server.shutdown().await.expect("shut down server");
 }
@@ -557,12 +620,13 @@ async fn a_badly_behaved_title_is_cleaned_up_before_it_is_stored() {
         .expect("an Errand reaches the Provider")
         .succeed(json!({
             "title": format!("\n  \"Fix   the {} flicker\"  \nand a second line", "very ".repeat(40)),
+            "icon": "md-not-a-glyph",
         }));
 
-    let title = timeout(PROGRESS_DEADLINE, async {
+    let (title, icon) = timeout(PROGRESS_DEADLINE, async {
         loop {
             let listed = listed_title(&client, created.session.id).await;
-            if listed != "Explain the seam" {
+            if listed.0 != "Explain the seam" {
                 return listed;
             }
             tokio::task::yield_now().await;
@@ -587,6 +651,10 @@ async fn a_badly_behaved_title_is_cleaned_up_before_it_is_stored() {
         "the Title is capped at 80 characters, ellipsis included: {title:?}"
     );
     assert!(title.ends_with('\u{2026}'));
+    assert_eq!(
+        icon, None,
+        "an Icon the Catalog does not carry is discarded"
+    );
 
     server.shutdown().await.expect("shut down server");
 }
@@ -685,13 +753,14 @@ async fn interrupting_the_first_turn_still_yields_a_derived_title() {
     timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("an Errand reaches the Provider")
-        .succeed(json!({ "title": "Explain the Provider seam" }));
+        .succeed(json!({ "title": "Explain the Provider seam", "icon": "dev-rust" }));
 
     assert_eq!(
         next_derived_title(&mut client).await,
         SessionTitleChanged {
             session_id,
             title: "Explain the Provider seam".to_owned(),
+            icon: Some("dev-rust".to_owned()),
         }
     );
 
@@ -739,7 +808,7 @@ async fn an_errand_run_through_a_provider_side_session_creates_no_suru_session()
     assert!(delivered.prompt().contains("Explain the seam"));
     delivered.succeed();
     errand_session.emit(ProviderEvent::AgentMessageDelta {
-        content: json!({ "title": "Explain the Provider seam" }).to_string(),
+        content: json!({ "title": "Explain the Provider seam", "icon": "dev-rust" }).to_string(),
     });
     errand_session.emit(ProviderEvent::TurnCompleted);
 
@@ -754,7 +823,10 @@ async fn an_errand_run_through_a_provider_side_session_creates_no_suru_session()
     );
     assert_eq!(
         listed_title(&client, session_id).await,
-        "Explain the Provider seam".to_owned()
+        (
+            "Explain the Provider seam".to_owned(),
+            Some("dev-rust".to_owned())
+        )
     );
     let listed = client.list_sessions(None).await.expect("list Sessions");
     assert_eq!(listed.len(), 1, "the Errand left no Session behind");
@@ -801,7 +873,7 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
             .await
             .expect("an Errand reaches the Provider");
         if errand.prompt().contains("Explain the seam") {
-            errand.succeed(json!({ "title": "Explain the Provider seam" }));
+            errand.succeed(json!({ "title": "Explain the Provider seam", "icon": "dev-rust" }));
         } else {
             errand.fail("the Provider went away mid-derivation");
         }
@@ -811,6 +883,7 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
         SessionTitleChanged {
             session_id: derived.session.id,
             title: "Explain the Provider seam".to_owned(),
+            icon: Some("dev-rust".to_owned()),
         }
     );
     drop(client);
@@ -827,17 +900,21 @@ async fn a_derived_title_outlives_a_restart_and_is_never_derived_again() {
 
     assert_eq!(
         listed_title(&client, derived.session.id).await,
-        "Explain the Provider seam".to_owned(),
-        "a derived Title survives a restart"
+        (
+            "Explain the Provider seam".to_owned(),
+            Some("dev-rust".to_owned())
+        ),
+        "a derived Title and Icon survive a restart"
     );
     let reopened = client
         .read_session(derived.session.id)
         .await
         .expect("reopen titled Session");
     assert_eq!(reopened.title, "Explain the Provider seam");
+    assert_eq!(reopened.icon.as_deref(), Some("dev-rust"));
     assert_eq!(
         listed_title(&client, undecided.session.id).await,
-        "Ship the picker".to_owned(),
+        ("Ship the picker".to_owned(), None),
         "a Session whose derivation failed keeps its Prompt-derived Title for good"
     );
     assert!(
@@ -895,7 +972,7 @@ async fn title_derivation_turned_off_asks_for_no_errand_at_all() {
     );
     assert_eq!(
         listed_title(&client, created.session.id).await,
-        "Explain the seam".to_owned(),
+        ("Explain the seam".to_owned(), None),
         "the Prompt-derived Title stands"
     );
 
@@ -949,13 +1026,14 @@ async fn a_pinned_selection_titles_a_session_whatever_that_session_converses_at(
         },
         "the pinned Provider and Model derive the Title, not the Session's own"
     );
-    errand.succeed(json!({ "title": "Explain the Provider seam" }));
+    errand.succeed(json!({ "title": "Explain the Provider seam", "icon": "dev-rust" }));
 
     assert_eq!(
         next_derived_title(&mut client).await,
         SessionTitleChanged {
             session_id: created.session.id,
             title: "Explain the Provider seam".to_owned(),
+            icon: Some("dev-rust".to_owned()),
         }
     );
 

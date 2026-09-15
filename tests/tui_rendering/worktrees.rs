@@ -191,6 +191,7 @@ fn summary(context: &ResolvedWorkspace, title: &str) -> SessionListItem {
             parent: None,
         },
         title: title.to_owned(),
+        icon: None,
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,

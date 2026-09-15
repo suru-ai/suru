@@ -280,6 +280,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             parent: None,
         },
         title: "Explain this workspace".to_owned(),
+        icon: Some("md-bug".to_owned()),
         settled_at: Some(SessionTimestamp(1_755_497_600_999)),
         standing_inputs: Default::default(),
         total_usage: Some(UsageTotal {
@@ -298,6 +299,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
         "checkout_state": null,
         "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
         "title": "Explain this workspace",
+        "icon": "md-bug",
         "settled_at": 1_755_497_600_999_u64,
         "standing_inputs": {
             "subagent_interventions": [],
@@ -344,21 +346,25 @@ fn session_summary_round_trips_with_discovery_metadata() {
         summary
     );
 
-    // A Session nobody set aside carries no settle moment, which is every
-    // Session that predates the marker. A Session with nothing running
-    // carries no working moment, which is every Session that is not working
-    // right now. A Session whose Turns reported nothing carries no total,
-    // which is every Session stored before Usage was recorded at all.
+    // A Session whose Title was never derived carries no Icon at all, which is
+    // every Session that predates Title derivation. A Session nobody set aside
+    // carries no settle moment either, which is every Session that predates the
+    // marker. A Session with nothing running carries no working moment, which
+    // is every Session that is not working right now. A Session whose Turns
+    // reported nothing carries no total, which is every Session stored before
+    // Usage was recorded at all.
     let mut without_optionals = expected;
     let fields = without_optionals
         .as_object_mut()
         .expect("the encoded summary is an object");
+    fields.remove("icon");
     fields.remove("settled_at");
     fields.remove("working_since");
     fields.remove("total_usage");
     fields.remove("approval_posture");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
         .expect("decode a Session summary carrying none of them");
+    assert_eq!(decoded.icon, None);
     assert_eq!(decoded.settled_at, None);
     assert_eq!(decoded.session.working_since, None);
     assert_eq!(decoded.total_usage, None);
@@ -368,6 +374,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
 fn provider_neutral_session_snapshot_round_trips_through_json() {
     let snapshot = SessionSnapshot {
         title: String::new(),
+        icon: None,
         session: Session {
             checkout: None,
             context_fill: Some(suru::protocol::ContextFill {
@@ -479,6 +486,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
     };
     let expected = json!({
         "title": "",
+        "icon": null,
         "session": {
             "id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
             "workspace": Workspace::directory(std::path::PathBuf::from("/work/suru")),

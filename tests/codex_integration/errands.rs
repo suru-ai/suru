@@ -199,7 +199,7 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
 async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     let codex = scripted_codex(
         CATALOG_WITH_ERRAND_MODEL,
-        r#"  printf '%s' '{"title":"Fix reasoning group flicker"}' > "$answer"
+        r#"  printf '%s' '{"title":"Fix reasoning group flicker","icon":"md-bug"}' > "$answer"
   exit 0"#,
     );
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -250,7 +250,9 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
     );
     let schema = codex.errand_schema();
     assert!(
-        schema["properties"]["title"].is_object() && schema["additionalProperties"] == false,
+        schema["properties"]["title"].is_object()
+            && schema["properties"]["icon"].is_object()
+            && schema["additionalProperties"] == false,
         "the schema Suru asked for is handed to Codex natively: {schema}"
     );
 
@@ -259,6 +261,7 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
         SessionTitleChanged {
             session_id,
             title: "Fix reasoning group flicker".to_owned(),
+            icon: Some("md-bug".to_owned()),
         }
     );
     assert_eq!(
@@ -290,7 +293,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
     );
     let codex = scripted_codex_with_app_server_arms(
         CATALOG_WITH_ERRAND_MODEL,
-        r#"  printf '%s' '{"title":"Fix automatic titles"}' > "$answer"
+        r#"  printf '%s' '{"title":"Fix automatic titles","icon":"md-bug"}' > "$answer"
   exit 0"#,
         &skill_arm,
     );
@@ -347,6 +350,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
         SessionTitleChanged {
             session_id: created.session.id,
             title: "Fix automatic titles".to_owned(),
+            icon: Some("md-bug".to_owned()),
         }
     );
 

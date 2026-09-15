@@ -23,15 +23,16 @@ use ratatui::{buffer::Buffer, style::Color};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
     protocol::{
-        Activity, ActivityId, ActivityStatus, ApprovalId, AutoSettle, EffectiveSettings,
-        LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session, SessionCatalogRevision,
-        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
-        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
-        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
-        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
-        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
-        SubagentInterventions, TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
+        Activity, ActivityId, ActivityStatus, AppearanceSettings, ApprovalId, AutoSettle,
+        EffectiveSettings, LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus,
+        ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
+        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
+        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
+        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
+        SidebarSettings, SidebarVisibility, SubagentInterventions, TextSelectionCopy, TurnStatus,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -43,6 +44,11 @@ use suru::{
 /// and three three-line rows fill the column, so the rest is read through the
 /// window.
 const WINDOWED: u16 = 13;
+
+/// The glyph `md-bug` resolves to, pinned here rather than read through
+/// `icon_catalog` because integration tests are a separate crate and cannot
+/// reach it; see the Icon Catalog API notes for why literal names are used.
+const MD_BUG: char = '\u{f00e4}';
 
 #[test]
 fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() {
@@ -117,6 +123,163 @@ fn an_active_row_is_three_lines_of_workspace_time_and_title() {
         sidebar_column(&rows[first + 2]),
         "",
         "the third line is held blank for git awareness"
+    );
+}
+
+/// The Icon a derivation left beside a Session's Title is drawn only where the
+/// reader asked for one. Nothing asks by default, so the column reads as it
+/// did before Icons existed until the Setting says otherwise — and a Session
+/// with no Icon, or an Icon Catalog no longer carries, reads that way however
+/// the Setting stands.
+#[test]
+fn active_sidebar_rows_draw_their_icon_only_where_the_setting_shows_them_and_when_resolvable() {
+    let workspace = workspace_dir();
+    let sessions = || {
+        vec![
+            icon_listed(
+                "Sidebar shell",
+                "md-bug",
+                &workspace.path().join("suru"),
+                2,
+                minutes_ago(5),
+            ),
+            listed(
+                "No Icon of its own",
+                &workspace.path().join("suru"),
+                1,
+                minutes_ago(6),
+            ),
+        ]
+    };
+
+    let hidden = sidebar_showing(workspace.path(), sessions());
+    let rows = rendered_application_rows_at(&hidden, WIDE, 20);
+    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
+    assert_eq!(
+        title_line, "Sidebar shell",
+        "a Session's name carries no Icon until the reader asks for one: {title_line:?}"
+    );
+
+    let shown = sidebar_showing_icons(workspace.path(), sessions());
+    let rows = rendered_application_rows_at(&shown, WIDE, 20);
+    let title_line = sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")]);
+    assert_eq!(
+        title_line,
+        format!("{MD_BUG} Sidebar shell"),
+        "and the Icon leads the name once they have: {title_line:?}"
+    );
+    let bare = sidebar_column(&rows[rendered_row(&rows, "No Icon of its own")]);
+    assert_eq!(
+        bare, "No Icon of its own",
+        "a Session a derivation left no Icon holds no cell open for one: {bare:?}"
+    );
+
+    let unresolved = sidebar_showing_icons(
+        workspace.path(),
+        vec![icon_listed(
+            "Unresolved icon session",
+            "md-not-a-glyph",
+            &workspace.path().join("suru"),
+            1,
+            minutes_ago(5),
+        )],
+    );
+    let rows = rendered_application_rows_at(&unresolved, WIDE, 20);
+    let title_line = sidebar_column(&rows[rendered_row(&rows, "Unresolved icon session")]);
+    assert_eq!(
+        title_line, "Unresolved icon session",
+        "an Icon Catalog name the Catalog no longer carries draws as no Icon at all: {title_line:?}"
+    );
+}
+
+/// A snapshot lands while the column is on screen, so the Setting moves the
+/// rows the reader is already reading rather than waiting for a listing to
+/// come round again — and it moves them without asking for one.
+#[test]
+fn showing_icons_moves_the_rows_a_reader_is_already_looking_at() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![icon_listed(
+            "Sidebar shell",
+            "md-bug",
+            &workspace.path().join("suru"),
+            1,
+            minutes_ago(5),
+        )],
+    );
+    let drawn = |application: &Application| {
+        let rows = rendered_application_rows_at(application, WIDE, 20);
+        sidebar_column(&rows[rendered_row(&rows, "Sidebar shell")])
+    };
+    assert_eq!(drawn(&application), "Sidebar shell");
+
+    assert_eq!(
+        deliver_settings(
+            &mut application,
+            EffectiveSettings {
+                sidebar: shown(AutoSettle::default()),
+                appearance: AppearanceSettings {
+                    show_icons: true,
+                    ..AppearanceSettings::default()
+                },
+                ..EffectiveSettings::default()
+            },
+        ),
+        ApplicationTransition::Continue,
+        "a Sidebar already holding its Sessions asks for nothing to draw them anew"
+    );
+    let title_line = drawn(&application);
+    assert_eq!(
+        title_line,
+        format!("{MD_BUG} Sidebar shell"),
+        "the Icon reaches the row without the listing coming round again: {title_line:?}"
+    );
+}
+
+/// A query narrows the Sidebar by the words of a Title, and never by the Icon
+/// Catalog name standing beside it.
+#[test]
+fn sidebar_search_matches_the_words_of_a_title_and_never_the_icon_beside_it() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            icon_listed(
+                "Rocket telemetry parsed",
+                "md-bug",
+                workspace.path(),
+                2,
+                now(),
+            ),
+            icon_listed(
+                "Ledger reconciliation",
+                "dev-rust",
+                workspace.path(),
+                1,
+                now(),
+            ),
+        ],
+    );
+
+    type_terminal_text(&mut application, "rocket");
+    let by_word = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert!(by_word.contains("Rocket telemetry parsed"));
+    assert!(!by_word.contains("Ledger reconciliation"));
+
+    for _ in 0.."rocket".len() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .expect("clear the Sidebar search");
+    }
+    type_terminal_text(&mut application, "md-bug");
+    let by_icon_name = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert!(
+        !by_icon_name.contains("Rocket telemetry parsed"),
+        "an Icon Catalog name is carried beside a Title and is never matched against: {by_icon_name}"
     );
 }
 
@@ -1773,6 +1936,43 @@ fn sidebar_showing(workspace: &Path, sessions: Vec<SessionListItem>) -> Applicat
     sidebar_settling(workspace, AutoSettle::default(), sessions)
 }
 
+/// The Sidebar shown with Icons turned on, which is what every test about a
+/// row that draws one asks for: nothing draws an Icon until the reader says
+/// so.
+fn sidebar_showing_icons(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
+    sidebar_hydrated(
+        workspace,
+        EffectiveSettings {
+            sidebar: shown(AutoSettle::default()),
+            appearance: AppearanceSettings {
+                show_icons: true,
+                ..AppearanceSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        sessions,
+    )
+}
+
+/// A listed Session whose derivation already landed, so it carries an Icon
+/// Catalog name beside its Title.
+fn icon_listed(
+    title: &str,
+    icon: &str,
+    workspace: &Path,
+    created_at: u64,
+    updated_at: u64,
+) -> SessionListItem {
+    let SessionListItem::Readable(summary) = listed(title, workspace, created_at, updated_at)
+    else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    SessionListItem::Readable(Box::new(SessionSummary {
+        icon: Some(icon.to_owned()),
+        ..*summary
+    }))
+}
+
 /// The same, under the auto-settle Setting the reader has chosen.
 fn sidebar_settling(
     workspace: &Path,
@@ -2002,6 +2202,7 @@ fn listed(title: &str, workspace: &Path, created_at: u64, updated_at: u64) -> Se
             parent: None,
         },
         title: title.to_owned(),
+        icon: None,
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
@@ -3335,6 +3536,43 @@ fn a_settled_session_stands_below_the_divider_as_one_slim_line() {
     );
 }
 
+/// The settled shelf draws a Session's Icon exactly as an active row does:
+/// leading the Title, gated by the same Setting, and absent for a Catalog
+/// name that no longer resolves.
+#[test]
+fn a_settled_row_draws_its_icon_leading_the_title() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing_icons(
+        workspace.path(),
+        vec![set_aside(
+            icon_listed("Wrapped up", "md-bug", workspace.path(), 1, hours_ago(3)),
+            minutes_ago(5),
+        )],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let shelf = rendered_row(&rows, "Wrapped up");
+    let row = sidebar_column(&rows[shelf]);
+    assert!(
+        row.starts_with(&format!("{MD_BUG} Wrapped up")),
+        "a settled row leads with the Icon and then the Title: {row:?}"
+    );
+
+    let hidden = sidebar_showing(
+        workspace.path(),
+        vec![set_aside(
+            icon_listed("Wrapped up", "md-bug", workspace.path(), 1, hours_ago(3)),
+            minutes_ago(5),
+        )],
+    );
+    let rows = rendered_application_rows_at(&hidden, WIDE, 20);
+    let row = sidebar_column(&rows[rendered_row(&rows, "Wrapped up")]);
+    assert!(
+        row.starts_with("Wrapped up") && !row.contains(MD_BUG),
+        "a settled row carries no Icon until the reader asks for one: {row:?}"
+    );
+}
+
 #[test]
 fn the_settled_shelf_orders_by_when_the_work_ended() {
     let workspace = workspace_dir();
@@ -4387,6 +4625,7 @@ fn a_result_retitled_elsewhere_out_of_the_query_takes_the_reader_with_it() {
             ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: moved,
                 title: "Renamed away".to_owned(),
+                icon: None,
             }),
         ))
         .expect("take the retitle another client made");
@@ -6109,6 +6348,7 @@ fn a_remote_catalog_change_updates_only_that_origins_rows() {
             event: ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: shared_id,
                 title: "Retitled remotely".to_owned(),
+                icon: None,
             }),
         })
         .expect("take the Remote retitle");
@@ -7267,6 +7507,7 @@ fn every_catalog_change_asks_the_sidebar_for_the_listing_again() {
             ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: listed_session,
                 title: "Retitled work".to_owned(),
+                icon: None,
             }),
         ),
         (

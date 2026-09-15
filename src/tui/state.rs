@@ -1515,8 +1515,11 @@ impl TuiState {
                 self.remove_deleted_session(deleted.session_id);
             }
             ManagedEvent::SessionTitleChanged(retitled) => {
-                self.session_picker
-                    .retitle(retitled.session_id, retitled.title.clone());
+                self.session_picker.retitle(
+                    retitled.session_id,
+                    retitled.title.clone(),
+                    retitled.icon.clone(),
+                );
             }
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.session_picker
@@ -1571,6 +1574,7 @@ impl TuiState {
                 outlook.clone(),
                 retitled.session_id,
                 retitled.title.clone(),
+                retitled.icon.clone(),
             ),
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.sidebar
@@ -1631,6 +1635,7 @@ impl TuiState {
                 outlook.clone(),
                 retitled.session_id,
                 retitled.title.clone(),
+                retitled.icon.clone(),
             ),
             ManagedEvent::SessionSettlementChanged(settled) => self.session_picker.settle_origin(
                 outlook.clone(),
@@ -2927,6 +2932,7 @@ impl TuiState {
         let provisional = self.provisional.as_ref()?;
         Some(SessionSnapshot {
             title: provisional.prompt.text.trim().to_owned(),
+            icon: None,
             session: crate::protocol::Session {
                 context_fill: None,
                 id: provisional.session_id,

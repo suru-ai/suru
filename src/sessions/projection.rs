@@ -948,6 +948,7 @@ impl SessionRecord {
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
         self.summary.title.clone_from(&self.snapshot.title);
+        self.summary.icon.clone_from(&self.snapshot.icon);
         self.summary
             .standing_inputs
             .subagent_interventions

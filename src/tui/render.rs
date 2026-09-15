@@ -1922,8 +1922,20 @@ fn session_picker_row_text(
         .chain(status)
         .chain([age])
         .collect::<Vec<_>>();
+    // The Icon's own columns, and the space parting it from the Title, come
+    // out of what the Title has to spend. A Session with no Icon — or an
+    // unresolved one, or a reader who has Icons hidden — holds no cell open
+    // in front of its Title and spends the lot.
+    let icon = row
+        .icon
+        .filter(|_| state.settings().appearance.show_icons)
+        .and_then(crate::icon_catalog::glyph)
+        .map(|icon| format!("{icon} "))
+        .unwrap_or_default();
     let marker_width = marker.width();
-    let available = width.saturating_sub(marker_width);
+    let available = width
+        .saturating_sub(marker_width)
+        .saturating_sub(icon.width());
     if row.pending_questionnaires > 0 {
         metadata.push(format!("{} pending questions", row.pending_questionnaires));
     }
@@ -1952,8 +1964,11 @@ fn session_picker_row_text(
     let title = truncate_to_width(row.title, title_width);
     let tag_start = remote_tag
         .as_ref()
-        .map(|_| marker.len() + title.len() + separator.len());
-    let content = truncate_to_width(&format!("{marker}{title}{separator}{metadata}"), width);
+        .map(|_| marker.len() + icon.len() + title.len() + separator.len());
+    let content = truncate_to_width(
+        &format!("{marker}{icon}{title}{separator}{metadata}"),
+        width,
+    );
     let tag_range = tag_start.and_then(|start| {
         let end = start + remote_tag.as_ref()?.len();
         (content.get(start..end) == remote_tag.as_deref()).then_some((start, end))
@@ -3214,13 +3229,16 @@ fn selection_style(selected: bool, focused: bool, theme: &Theme) -> Option<Style
 /// What a row says after the Title of a Session the client could not read.
 const UNREADABLE_MARKER: &str = "[unreadable]";
 
-/// What a Session is called in the Sidebar: its Title, followed, where the
-/// client could not read the Session, by the marker saying so. The marker's
-/// columns are held back before the Title is cut, so however long the Title
-/// the reason the row cannot be opened stays on show. `width` is the columns
-/// the whole name has to spend.
+/// What a Session is called in the Sidebar: its Icon, where it has one, and
+/// then its Title — followed, where the client could not read the Session, by
+/// the marker saying so. The marker's columns are held back before the Title
+/// is cut, so however long the Title the reason the row cannot be opened stays
+/// on show. `width` is the columns the whole name has to spend.
 fn sidebar_title_parts(row: SidebarRow<'_>, width: usize) -> (String, Vec<String>) {
-    let title = row.title.to_owned();
+    let title = match row.icon {
+        Some(icon) => format!("{icon} {}", row.title),
+        None => row.title.to_owned(),
+    };
     let mut tags = row
         .remote
         .map(|remote| format!("[{remote}]"))
@@ -4398,7 +4416,18 @@ fn render_session_header(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let title = truncate_to_width(&title, title_width);
+    // The Icon leads the Title as a span of its own, apart from the Title
+    // text, so a pointer press can later target it on its own (issue #360).
+    // It draws only beside a Title that has something to stand beside: an
+    // empty Title leaves the center blank, Icon included.
+    let icon_prefix = (!title.is_empty())
+        .then(|| snapshot.icon.as_deref())
+        .flatten()
+        .filter(|_| show_icons)
+        .and_then(crate::icon_catalog::glyph)
+        .map(|icon| format!("{icon} "));
+    let icon_width = icon_prefix.as_deref().map(str::width).unwrap_or(0);
+    let title = truncate_to_width(&title, title_width.saturating_sub(icon_width));
     let spacing =
         " ".repeat(usize::from(area.width).saturating_sub(orientation.width() + connection_width));
     frame.render_widget(
@@ -4410,14 +4439,19 @@ fn render_session_header(
         area,
     );
     if !title.is_empty() {
-        let width = title.width() as u16;
+        let width = (icon_width + title.width()) as u16;
         let title_area = Rect::new(
             area.x + (area.width - width) / 2,
             area.y,
             width,
             area.height,
         );
-        frame.render_widget(Paragraph::new(title).style(theme.text.primary), title_area);
+        let mut spans = Vec::new();
+        if let Some(icon_prefix) = icon_prefix {
+            spans.push(Span::styled(icon_prefix, theme.text.primary));
+        }
+        spans.push(Span::styled(title, theme.text.primary));
+        frame.render_widget(Paragraph::new(Line::from(spans)), title_area);
     }
 }
 
@@ -4960,6 +4994,7 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let snapshot = SessionSnapshot {
                 title: String::new(),
+                icon: None,
                 session: Session {
                     checkout: None,
                     context_fill: Some(ContextFill {
@@ -5221,6 +5256,7 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     title: String::new(),
+                    icon: None,
                     session: Session {
                         checkout: None,
                         context_fill: None,
@@ -5297,6 +5333,7 @@ mod tests {
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {
                     title: String::new(),
+                    icon: None,
                     session: Session {
                         checkout: None,
                         context_fill: None,

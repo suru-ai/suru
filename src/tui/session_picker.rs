@@ -75,6 +75,11 @@ pub(super) struct SessionPicker {
 pub(super) struct SessionPickerRow<'a> {
     pub(super) origin: &'a Outlook,
     pub(super) title: &'a str,
+    /// The Icon Catalog name standing beside this row's Title, carried raw
+    /// rather than resolved so drawing it stays gated in one place — the
+    /// renderer, which is what already resolves every other Icon in the TUI.
+    /// A Session whose derivation was skipped, failed, or abandoned has none.
+    pub(super) icon: Option<&'a str>,
     pub(super) selected: bool,
     pub(super) current: bool,
     pub(super) active: bool,
@@ -198,8 +203,8 @@ impl SessionPicker {
             .set_standing_inputs_origin(origin, session_id, inputs);
     }
 
-    pub(super) fn retitle(&mut self, session_id: SessionId, title: String) {
-        self.listing.retitle(session_id, title);
+    pub(super) fn retitle(&mut self, session_id: SessionId, title: String, icon: Option<String>) {
+        self.listing.retitle(session_id, title, icon);
     }
 
     pub(super) fn settle(&mut self, session_id: SessionId, settled_at: Option<SessionTimestamp>) {
@@ -454,8 +459,10 @@ impl SessionPicker {
         outlook: Outlook,
         session_id: SessionId,
         title: String,
+        icon: Option<String>,
     ) {
-        self.listing.retitle_origin(outlook, session_id, title);
+        self.listing
+            .retitle_origin(outlook, session_id, title, icon);
     }
 
     pub(super) fn settle_origin(
@@ -499,6 +506,7 @@ impl SessionPicker {
                         summary.standing_inputs.pending_approval_count()
                     }),
                     title: summary.title(),
+                    icon: summary.icon(),
                     selected: self.selected.as_ref() == Some(summary.reference()),
                     current: readable.is_some() && current == Some(summary.reference()),
                     active: readable

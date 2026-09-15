@@ -26,3 +26,12 @@ pub mod tui;
 pub use runtime::RuntimeConfig;
 
 pub mod questionnaire;
+
+/// The Icon Catalog's names, in listing order — the same list the Title
+/// Errand's reply schema enumerates an Icon over. The Catalog itself stays
+/// crate-private; this is a deliberate, narrow seam so integration tests (a
+/// separate crate) can assert a schema's `icon` enum matches it without
+/// reaching into `icon_catalog` itself.
+pub fn icon_catalog_names() -> &'static [&'static str] {
+    icon_catalog::names()
+}

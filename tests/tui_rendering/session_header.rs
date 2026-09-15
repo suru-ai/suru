@@ -298,12 +298,93 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
                 revision: SessionRevision(snapshot.revision.0 + 1),
                 changes: vec![SessionChange::TitleChanged {
                     title: "Bravo".into(),
+                    icon: None,
                 }],
             },
         )))
         .unwrap();
     let row = header(&application, 160);
     assert!(row.contains("Bravo") && !row.contains("Alpha"), "{row}");
+}
+
+/// The Session Icon leads the Title as its own glyph and a single space,
+/// gated by `appearance.showIcons` exactly like every other Icon in the TUI,
+/// and drawn as absent where the Catalog no longer carries the stored name.
+#[test]
+fn session_icon_follows_the_setting_and_unknown_names_draw_nothing() {
+    const MD_BUG: char = '\u{f00e4}';
+
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    settings(&mut application);
+    let (_, mut snapshot) = enter_session(&mut application, workspace.path());
+    snapshot.title = "Alpha".into();
+    snapshot.icon = Some("md-bug".to_owned());
+    show(&mut application, &snapshot);
+
+    let hidden = header(&application, 200);
+    assert!(
+        !hidden.contains(MD_BUG) && hidden.contains("Alpha"),
+        "an Icon is drawn only once the reader asks for one: {hidden}"
+    );
+
+    enable_icons(&mut application);
+    let shown = header(&application, 200);
+    assert!(
+        shown.contains(&format!("{MD_BUG} Alpha")),
+        "the Icon leads the Title by one space: {shown}"
+    );
+
+    // An Icon Catalog name no longer carried draws as no Icon at all, while
+    // the Title still lands.
+    snapshot.icon = Some("md-not-a-glyph".to_owned());
+    show(&mut application, &snapshot);
+    let unknown = header(&application, 200);
+    assert!(
+        !unknown.contains(MD_BUG) && unknown.contains("Alpha"),
+        "an unresolved Icon name draws nothing: {unknown}"
+    );
+
+    // A Title with no Icon at all reads exactly as before Icons existed.
+    snapshot.icon = None;
+    show(&mut application, &snapshot);
+    let none = header(&application, 200);
+    assert!(
+        !none.contains(MD_BUG) && none.contains("Alpha"),
+        "a Session with no Icon draws none: {none}"
+    );
+}
+
+/// The Icon's own column and separating space come out of what the Title has
+/// to spend, so a long Title truncates around it rather than pushing it off
+/// the header.
+#[test]
+fn the_session_icon_counts_in_the_titles_width_budget() {
+    const MD_BUG: char = '\u{f00e4}';
+
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    enable_icons(&mut application);
+    let (_, mut snapshot) = enter_session(&mut application, workspace.path());
+    snapshot.title = "w".repeat(60);
+    snapshot.icon = Some("md-bug".to_owned());
+    show(&mut application, &snapshot);
+
+    let with_icon = header(&application, 40);
+    assert!(with_icon.contains(MD_BUG), "{with_icon}");
+
+    snapshot.icon = None;
+    show(&mut application, &snapshot);
+    let without_icon = header(&application, 40);
+    assert!(!without_icon.contains(MD_BUG), "{without_icon}");
+
+    // With the Icon absent the Title has one more column and space to spend,
+    // so it draws at least as many Title characters as it does beside an Icon.
+    let title_run = |row: &str| row.chars().filter(|character| *character == 'w').count();
+    assert!(
+        title_run(&without_icon) >= title_run(&with_icon),
+        "with: {with_icon:?}, without: {without_icon:?}"
+    );
 }
 
 #[test]

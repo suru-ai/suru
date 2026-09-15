@@ -221,14 +221,14 @@ mod tests {
     #[test]
     fn a_json_object_is_read_out_of_whatever_a_model_wrapped_it_in() {
         for wrapped in [
-            r#"{"title":"Explain the seam"}"#,
-            "  {\"title\":\"Explain the seam\"}\n",
-            "```json\n{\"title\":\"Explain the seam\"}\n```",
-            "Sure! {\"title\":\"Explain the seam\"} — hope that helps.",
+            r#"{"title":"Explain the seam","icon":"md-bug"}"#,
+            "  {\"title\":\"Explain the seam\",\"icon\":\"md-bug\"}\n",
+            "```json\n{\"title\":\"Explain the seam\",\"icon\":\"md-bug\"}\n```",
+            "Sure! {\"title\":\"Explain the seam\",\"icon\":\"md-bug\"} — hope that helps.",
         ] {
             assert_eq!(
                 replied_json(wrapped),
-                Some(json!({ "title": "Explain the seam" })),
+                Some(json!({ "title": "Explain the seam", "icon": "md-bug" })),
                 "{wrapped} carries an answer"
             );
         }

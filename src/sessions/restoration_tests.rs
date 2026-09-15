@@ -521,6 +521,7 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
             checkout_state: None,
             session: session.clone(),
             title: "restoration fixture".into(),
+            icon: None,
             settled_at: None,
             standing_inputs: SessionStandingInputs::default(),
             total_usage: None,
@@ -529,6 +530,7 @@ fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
         },
         snapshot: SessionSnapshot {
             title: "restoration fixture".into(),
+            icon: None,
             session,
             revision: SessionRevision(7),
             prompts: vec![],

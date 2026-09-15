@@ -4,7 +4,7 @@ use crate::support::{
     connected_application, connected_application_homed, enter_active_session,
     failed_session_snapshot, named_workspace_path, navigable_session_snapshot,
     noncanonical_spelling, rendered_application_buffer, rendered_application_rows,
-    rendered_application_rows_at, rendered_row, type_terminal_text, workspace_dir,
+    rendered_application_rows_at, rendered_row, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
@@ -1446,9 +1446,10 @@ fn a_title_arriving_while_the_picker_is_open_lands_on_its_row() {
             ManagedEvent::SessionTitleChanged(SessionTitleChanged {
                 session_id: derived_id,
                 title: "Reasoning group flicker fixed".to_owned(),
+                icon: Some("md-bug".to_owned()),
             }),
         ))
-        .expect("apply a derived Title");
+        .expect("apply a derived Title and Icon");
 
     let retitled = rendered_application_rows(&application);
     let derived_row = retitled
@@ -1467,6 +1468,206 @@ fn a_title_arriving_while_the_picker_is_open_lands_on_its_row() {
             .join("\n")
             .contains("the reasoning group keeps flickering when")
     );
+}
+
+/// Every Session picker row spends its first two columns on the marker naming
+/// the selected row, so what a row draws of its own begins just past them.
+const SESSION_ROW_MARKER_WIDTH: u16 = 2;
+
+/// The glyph `md-bug` resolves to, pinned here rather than read through
+/// `icon_catalog` because integration tests are a separate crate and cannot
+/// reach it; see the Icon Catalog API notes for why literal names are used.
+const MD_BUG: char = '\u{f00e4}';
+
+#[test]
+fn session_picker_draws_an_icon_beside_its_title_and_leaves_a_session_without_one_where_it_was() {
+    let workspace = workspace_dir();
+    let derived_id = SessionId::new();
+    let underived_id = SessionId::new();
+    let mut mixed = client_showing_icons(workspace.path());
+    open_session_picker_with(
+        &mut mixed,
+        vec![
+            icon_session_summary(
+                derived_id,
+                workspace.path(),
+                "Reasoning group flicker fixed",
+                "md-bug",
+                20,
+            ),
+            session_summary(
+                underived_id,
+                workspace.path(),
+                "look at this stack trace",
+                SessionStatus::Idle,
+                10,
+            ),
+        ],
+    );
+
+    let rows = rendered_application_rows(&mixed);
+    assert!(
+        rows.iter()
+            .find(|row| row.contains("Reasoning group flicker fixed"))
+            .expect("render the Session with an Icon")
+            .contains(MD_BUG),
+        "a Session with an Icon draws it on its Title's row"
+    );
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.contains("look at this stack trace"))
+            .expect("render the Session without an Icon")
+            .contains(MD_BUG),
+        "an Icon belongs to one Session's row and no other"
+    );
+    // Both rows begin at the same place: the box's own left edge, which the
+    // search line above them starts at, plus the two columns every row spends
+    // on its selection marker. An Icon takes the front of the row it belongs
+    // to, and the row without one holds no cell open where an Icon would have
+    // gone — it is drawn exactly as it was before Icons existed.
+    let mixed_buffer = rendered_application_buffer(&mixed, 80, 15);
+    let first_column = text_position(&mixed_buffer, "Search:").0 + SESSION_ROW_MARKER_WIDTH;
+    assert_eq!(
+        text_position(&mixed_buffer, &MD_BUG.to_string()).0,
+        first_column,
+        "an Icon draws at the front of its own row"
+    );
+    assert!(
+        text_position(&mixed_buffer, "Reasoning group flicker fixed").0 > first_column,
+        "the Title it stands for follows it"
+    );
+    assert_eq!(
+        text_position(&mixed_buffer, "look at this").0,
+        first_column,
+        "a Session without an Icon draws where it always did"
+    );
+
+    // The Icon costs its own columns and no more, so a Title still reads at
+    // the narrowest terminal the picker supports.
+    let narrow = rendered_application_rows_at(&mixed, 28, 8);
+    assert!(
+        narrow
+            .iter()
+            .find(|row| row.contains("Reasoning"))
+            .expect("render the Session with an Icon on a narrow terminal")
+            .contains(MD_BUG)
+    );
+    assert!(narrow.join("\n").contains("look at this"));
+}
+
+/// The Icon beside a Session's Title is drawn in the picker only where the
+/// reader asked for one, and a row left without it reads exactly as the row
+/// of a Session that never had one. An Icon Catalog name the Catalog no
+/// longer carries draws exactly as no Icon at all.
+#[test]
+fn a_session_picker_row_draws_its_icon_only_where_the_setting_shows_them() {
+    let workspace = workspace_dir();
+    let sessions = || {
+        vec![icon_session_summary(
+            SessionId::new(),
+            workspace.path(),
+            "Reasoning group flicker fixed",
+            "md-bug",
+            20,
+        )]
+    };
+
+    let mut hidden = Application::new(workspace.path(), Default::default());
+    open_session_picker_with(&mut hidden, sessions());
+    let drawn = rendered_application_rows(&hidden);
+    let row = drawn
+        .iter()
+        .find(|row| row.contains("Reasoning group flicker fixed"))
+        .expect("render the Session")
+        .clone();
+    assert!(
+        !row.contains(MD_BUG),
+        "a Session's name carries no Icon until the reader asks for one: {row:?}"
+    );
+    let buffer = rendered_application_buffer(&hidden, 80, 15);
+    assert_eq!(
+        text_position(&buffer, "Reasoning group flicker fixed").0,
+        text_position(&buffer, "Search:").0 + SESSION_ROW_MARKER_WIDTH,
+        "and its Title holds no cell open where an Icon would have gone"
+    );
+
+    let mut shown = client_showing_icons(workspace.path());
+    open_session_picker_with(&mut shown, sessions());
+    assert!(
+        rendered_application_rows(&shown)
+            .iter()
+            .find(|row| row.contains("Reasoning group flicker fixed"))
+            .expect("render the Session")
+            .contains(MD_BUG),
+        "and the Icon leads the row once they have"
+    );
+
+    let mut unknown = client_showing_icons(workspace.path());
+    open_session_picker_with(
+        &mut unknown,
+        vec![icon_session_summary(
+            SessionId::new(),
+            workspace.path(),
+            "Unresolved icon session",
+            "md-not-a-glyph",
+            20,
+        )],
+    );
+    let row = rendered_application_rows(&unknown)
+        .into_iter()
+        .find(|row| row.contains("Unresolved icon session"))
+        .expect("render the Session");
+    assert!(
+        !row.contains(MD_BUG),
+        "an Icon Catalog name the Catalog no longer carries draws as no Icon at all: {row:?}"
+    );
+}
+
+#[test]
+fn session_picker_search_matches_the_words_of_a_title_and_never_the_icon_beside_it() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    open_session_picker_with(
+        &mut application,
+        vec![
+            icon_session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Rocket telemetry parsed",
+                "md-bug",
+                20,
+            ),
+            icon_session_summary(
+                SessionId::new(),
+                workspace.path(),
+                "Ledger reconciliation",
+                "dev-rust",
+                10,
+            ),
+        ],
+    );
+
+    type_terminal_text(&mut application, "rocket");
+    let by_word = rendered_application_rows(&application).join("\n");
+    assert!(by_word.contains("Rocket telemetry parsed"));
+    assert!(!by_word.contains("Ledger reconciliation"));
+
+    for _ in 0.."rocket".len() {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .expect("clear the Session picker search");
+    }
+    type_terminal_text(&mut application, "md-bug");
+    let by_icon_name = rendered_application_rows(&application).join("\n");
+    assert!(
+        by_icon_name.contains("No Sessions found"),
+        "an Icon Catalog name is carried beside a Title and is never matched against"
+    );
+    assert!(!by_icon_name.contains("Rocket telemetry parsed"));
 }
 
 fn session_summary(
@@ -1494,12 +1695,65 @@ fn session_summary(
             parent: None,
         },
         title: title.to_owned(),
+        icon: None,
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     }))
+}
+
+/// A Session listing entry whose derivation already landed, so it carries an
+/// Icon Catalog name beside its Title.
+fn icon_session_summary(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+    title: &str,
+    icon: &str,
+    updated_at: u64,
+) -> SessionListItem {
+    match session_summary(
+        session_id,
+        workspace,
+        title,
+        SessionStatus::Idle,
+        updated_at,
+    ) {
+        SessionListItem::Readable(summary) => SessionListItem::Readable(Box::new(SessionSummary {
+            icon: Some(icon.to_owned()),
+            ..*summary
+        })),
+        unreadable => unreadable,
+    }
+}
+
+/// A client whose reader has turned Icons on, which is what a test about a
+/// row that draws one asks for: a Session's name carries no Icon until the
+/// Setting says it does. The Sidebar is left down, so the picker is the only
+/// thing on screen listing Sessions.
+fn client_showing_icons(workspace: &std::path::Path) -> Application {
+    let mut application = Application::new(workspace, Default::default());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings {
+                    appearance: suru::protocol::AppearanceSettings {
+                        show_icons: true,
+                        ..EffectiveSettings::default().appearance
+                    },
+                    sidebar: SidebarSettings {
+                        initial_visibility: SidebarVisibility::Hidden,
+                        ..SidebarSettings::default()
+                    },
+                    ..EffectiveSettings::default()
+                },
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("receive the effective-settings snapshot");
+    application
 }
 
 fn remote(name: &str, status: RemoteStatus) -> Remote {

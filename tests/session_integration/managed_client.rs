@@ -894,6 +894,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
     let activity_id = ActivityId::new();
     SessionSnapshot {
         title: String::new(),
+        icon: None,
         session: Session {
             checkout: None,
             context_fill: None,

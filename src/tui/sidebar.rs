@@ -189,6 +189,9 @@ pub(super) struct Sidebar {
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
     /// open: editing it reclassifies every listed Session on the next frame.
     auto_settle: AutoSettle,
+    /// Whether a row draws the Icon derived beside its Session's Title, which
+    /// governs every frame from the moment the Setting lands.
+    show_icons: bool,
     /// The Session population the Sidebar draws, seeded once from the
     /// initial-scope Setting and moved by the selector afterwards.
     scope: SidebarListingScope,
@@ -332,6 +335,11 @@ pub(super) struct SidebarRow<'a> {
     /// the screen rows it draws so a press lands on the work rather than on
     /// the position.
     pub(super) reference: &'a SessionReference,
+    /// The Icon this row draws for its Session: none where the derivation
+    /// left it none, and none while the reader keeps Icons hidden. Resolved
+    /// to a glyph already, and already gated by `appearance.showIcons`, so
+    /// every reader of this row draws it exactly as offered.
+    pub(super) icon: Option<char>,
     pub(super) title: &'a str,
     /// The dim Origin tag following a foreign row's Title. Local rows carry
     /// none so the ordinary one-machine reading stays quiet.
@@ -831,6 +839,7 @@ impl Sidebar {
             drawn_width_limit: Cell::new(None),
             edge_held: false,
             auto_settle: AutoSettle::default(),
+            show_icons: false,
             scope: SidebarListingScope::AllWorkspaces,
             selector_open: false,
             workspace_entry: None,
@@ -861,12 +870,14 @@ impl Sidebar {
     }
 
     /// Takes the Settings the Sidebar draws under, each on its own schedule:
-    /// auto-settle governs every frame from here on, while the three initial
-    /// Settings have their say once and are then the reader's to overrule.
-    /// Returns nothing: a Sidebar that wants its Sessions leaves the requests
-    /// in [`Self::take_listing_requests`].
+    /// auto-settle and whether a row draws its Session's Icon govern every
+    /// frame from here on, while the three initial Settings have their say
+    /// once and are then the reader's to overrule. Returns nothing: a Sidebar
+    /// that wants its Sessions leaves the requests in
+    /// [`Self::take_listing_requests`].
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
         self.auto_settle = settings.sidebar.auto_settle;
+        self.show_icons = settings.appearance.show_icons;
         if self.seeded {
             return;
         }
@@ -1731,9 +1742,11 @@ impl Sidebar {
         outlook: Outlook,
         session_id: SessionId,
         title: String,
+        icon: Option<String>,
     ) {
         let before = self.focus_order_before_change();
-        self.listing.retitle_origin(outlook, session_id, title);
+        self.listing
+            .retitle_origin(outlook, session_id, title, icon);
         // A Title is what a query is read against, so another client's retitle
         // can carry the row the keys are on out of the results under them.
         self.keep_focus_drawn(&before);
@@ -2483,6 +2496,11 @@ impl Sidebar {
         };
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
+            icon: self
+                .show_icons
+                .then(|| session.icon())
+                .flatten()
+                .and_then(crate::icon_catalog::glyph),
             title: session.title(),
             remote: if self.scope == SidebarListingScope::Everywhere {
                 session.reference().origin.remote_name()
@@ -3840,6 +3858,7 @@ mod tests {
                 parent: None,
             },
             title: title.to_owned(),
+            icon: None,
             settled_at: None,
             standing_inputs: Default::default(),
             total_usage: None,

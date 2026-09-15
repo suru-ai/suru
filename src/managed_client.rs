@@ -193,8 +193,8 @@ pub enum ManagedEvent {
     },
     CheckoutStateChanged(CheckoutStateChanged),
     SessionDeleted(SessionDeleted),
-    /// A Session's derived Title landed. It arrives for every Session the
-    /// server holds, open or not, because the picker lists Sessions this
+    /// A Session's derived Title and Icon landed. It arrives for every Session
+    /// the server holds, open or not, because the picker lists Sessions this
     /// client has never opened.
     SessionTitleChanged(SessionTitleChanged),
     /// A Session was set aside as done for now, or brought back. It arrives on

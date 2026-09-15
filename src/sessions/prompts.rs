@@ -434,6 +434,10 @@ impl SessionStore {
         let prompt_id = prompt.id;
         let snapshot = SessionSnapshot {
             title: title.clone(),
+            // A Session begins with none: the Icon beside its Title arrives
+            // only once an Errand has derived one, and a Session that never
+            // gets one draws just as cleanly.
+            icon: None,
             session: Session {
                 checkout: location.checkout,
                 context_fill: None,
@@ -469,6 +473,7 @@ impl SessionStore {
             checkout_state: None,
             session: snapshot.session.clone(),
             title,
+            icon: None,
             // And it begins active: a Session created by a Prompt is work
             // beginning, which is the opposite of work set aside.
             settled_at: None,

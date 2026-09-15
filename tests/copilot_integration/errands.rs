@@ -51,6 +51,8 @@ const ERRAND_MODELS: &str = concat!(
 /// deliberately not each other's words, so a Title that arrives is one Copilot wrote.
 const FIRST_PROMPT: &str = "Work out why the Copilot harness drops its second Turn";
 const DERIVED_TITLE: &str = "Explain the Copilot seam";
+/// The Icon Catalog name the Errand answers with, beside the Title it chose.
+const DERIVED_ICON: &str = "md-bug";
 
 /// What the Errand's Prompt says whatever else it carries, which is how the fixture tells an Errand
 /// apart from the Turn the user started.
@@ -64,7 +66,7 @@ const TURN_TIMELINE: &str = r#"        event t1 assistant.message '{"messageId":
 /// An Errand answered exactly as it asked to be: one JSON object and nothing else.
 fn answered_errand() -> String {
     format!(
-        r#"        event e1 assistant.message '{{"messageId":"e1","content":"{{\"title\":\"{DERIVED_TITLE}\"}}"}}'
+        r#"        event e1 assistant.message '{{"messageId":"e1","content":"{{\"title\":\"{DERIVED_TITLE}\",\"icon\":\"{DERIVED_ICON}\"}}"}}'
         event e2 session.idle '{{}}'
 "#
     )
@@ -219,8 +221,8 @@ async fn discarded_session(copilot: &ScriptedCopilot) -> String {
     deleted
 }
 
-/// The Title a Session carries in a listing.
-async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
+/// The Title a Session carries in a listing, alongside the Icon Catalog name beside it.
+async fn listed_title(client: &ManagedClient, session_id: SessionId) -> (String, Option<String>) {
     let listed = client
         .list_sessions(None)
         .await
@@ -228,7 +230,10 @@ async fn listed_title(client: &ManagedClient, session_id: SessionId) -> String {
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("the Session remains listed");
-    listed.title().to_owned()
+    (
+        listed.title().to_owned(),
+        listed.icon().map(ToOwned::to_owned),
+    )
 }
 
 #[tokio::test]
@@ -263,7 +268,7 @@ async fn a_session_started_on_copilot_is_titled_by_an_errand_that_leaves_no_sess
     );
     assert_eq!(
         listed_title(&client, session_id).await,
-        DERIVED_TITLE.to_owned()
+        (DERIVED_TITLE.to_owned(), Some(DERIVED_ICON.to_owned()))
     );
     let listed = client.list_sessions(None).await.expect("list Sessions");
     assert_eq!(listed.len(), 1, "the Errand left no Session behind");
@@ -337,7 +342,7 @@ async fn an_errand_runs_at_copilots_declared_selection_carrying_no_tools_and_sto
         "the Errand carries the first Prompt: {prompt}"
     );
     assert!(
-        prompt.contains("\"title\""),
+        prompt.contains("\"title\"") && prompt.contains("\"icon\""),
         "a harness that cannot be handed a schema is told it in the Prompt: {prompt}"
     );
 
@@ -414,7 +419,7 @@ async fn an_errand_that_runs_out_of_time_still_discards_the_session_it_opened() 
     );
     assert_eq!(
         listed_title(&client, created.session.id).await,
-        FIRST_PROMPT.to_owned(),
+        (FIRST_PROMPT.to_owned(), None),
         "the Prompt-derived Title stands"
     );
 

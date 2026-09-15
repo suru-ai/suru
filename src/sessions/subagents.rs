@@ -54,6 +54,7 @@ impl SessionStore {
         };
         let snapshot = SessionSnapshot {
             title: title.clone(),
+            icon: None,
             session: Session {
                 checkout: parent_session.checkout.clone(),
                 context_fill: None,
@@ -98,6 +99,9 @@ impl SessionStore {
             checkout_state: None,
             session: snapshot.session.clone(),
             title,
+            // A child is titled from its spawn description alone: no Errand
+            // derives it a Title, so no Icon ever arrives beside one.
+            icon: None,
             settled_at: None,
             standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
             total_usage: snapshot.total_usage(),
