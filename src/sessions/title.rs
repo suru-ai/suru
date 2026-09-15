@@ -39,7 +39,7 @@ use crate::{
     model_catalog::ModelCatalogService,
     protocol::{
         AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionChange, SessionId,
-        SettingsSnapshot, SkillInvocation, TitleErrand,
+        SessionSummary, SettingsSnapshot, SkillInvocation, TitleErrand,
     },
     provider::ProviderErrand,
 };
@@ -278,10 +278,10 @@ impl SessionStore {
     ///
     /// The change reaches both the open Session stream and the catalog, so
     /// attached clients see the same Title and Icon as readers of Session
-    /// listings. A future "set this Session's Icon by user choice" write
-    /// (issue #360) is expected to share this same commit-then-publish shape
-    /// rather than replace it, differing only in that it writes the Icon
-    /// unconditionally instead of filling an absence.
+    /// listings. [`SessionStore::set_icon`] shares this same
+    /// commit-then-publish shape rather than duplicating it, differing only
+    /// in that it writes the Icon unconditionally instead of filling an
+    /// absence.
     pub(crate) fn replace_derived_title(
         &self,
         session_id: SessionId,
@@ -322,6 +322,64 @@ impl SessionStore {
         });
         true
     }
+
+    /// Sets a Session's Icon to the user's own choice from the Icon Catalog,
+    /// replacing whatever it already carried — derived earlier, chosen
+    /// before, or absent — because a user's choice always stands rather than
+    /// only ever filling an absence the way derivation does. Refuses a name
+    /// the Icon Catalog does not carry, so a Session never stores an Icon
+    /// that would only ever draw as no Icon at all.
+    ///
+    /// Shares `replace_derived_title`'s commit-then-publish shape and its
+    /// `TitleChanged` change, carrying the Session's current Title unchanged
+    /// alongside the new Icon: every client's existing apply path already
+    /// repaints from that one change kind, so a chosen Icon reaches it the
+    /// same way a derived one does.
+    pub(crate) fn set_icon(
+        &self,
+        session_id: SessionId,
+        icon: &str,
+    ) -> Result<SessionSummary, SetIconError> {
+        if icon_catalog::glyph(icon).is_none() {
+            return Err(SetIconError::UnknownIcon);
+        }
+        let icon = icon.to_owned();
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let (title, summary) = {
+            let Some(record) = state.sessions.get_mut(&session_id) else {
+                return Err(SetIconError::SessionNotFound);
+            };
+            let title = record.summary.title.clone();
+            record
+                .commit_derived(
+                    &self.storage,
+                    session_id,
+                    vec![SessionChange::TitleChanged {
+                        title: title.clone(),
+                        icon: Some(icon.clone()),
+                    }],
+                )
+                .map_err(|_| SetIconError::Storage)?;
+            (title, record.summary.clone())
+        };
+        state.publish_catalog_change(SessionCatalogChange::TitleChanged {
+            session_id,
+            title,
+            icon: Some(icon),
+        });
+        Ok(summary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetIconError {
+    SessionNotFound,
+    /// The named Icon does not resolve in the Icon Catalog.
+    UnknownIcon,
+    Storage,
 }
 
 /// The Prompt one Title Errand carries: what to write, and the first Prompt to

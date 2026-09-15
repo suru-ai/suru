@@ -27,6 +27,7 @@ use super::{
     approval_posture_picker::ApprovalPostureChoice,
     completion::CompletionRow,
     composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
+    icon_picker,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
@@ -148,6 +149,12 @@ pub(super) fn render_with_slots(
     // The Subagent Picker's rows are pointable, so its record of where they
     // were drawn starts over with the frame as well.
     state.subagent_picker.forget_frame();
+    // The Icon Picker's cells are pointable on the same terms, and the header
+    // Icon's own span is pointable whether or not the picker is even open —
+    // both start over with the frame, so a stale record from a frame that
+    // drew neither can never answer a press.
+    state.icon_picker.forget_frame();
+    *state.header_icon_area.borrow_mut() = None;
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
     state.session_animation_on_screen.set(false);
@@ -296,6 +303,12 @@ pub(super) fn render_with_slots(
     if state.connect_overlay.is_open() && !state.reconnect_overlay_visible {
         render_connect_overlay(frame, state, main, theme);
     }
+    // Drawn last among the overlays, so it stands over every one of them —
+    // matching how [`TuiState::top_selection_overlay`] and `handle_click`
+    // already answer for it first.
+    if state.icon_picker.is_open() && !state.reconnect_overlay_visible {
+        render_icon_picker(frame, state, main, theme);
+    }
     if state.reconnect_overlay_visible {
         state.selection_frames.borrow_mut().clear();
         render_reconnect_overlay(frame, theme);
@@ -310,6 +323,7 @@ pub(super) fn render_with_slots(
         && !state.connect_overlay.is_open()
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
+        && !state.icon_picker.is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
         // The frame may have drawn no composer at all — a Subagent's Session
@@ -1104,6 +1118,85 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &Tui
         ));
     }
     truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
+}
+
+/// The Icon Picker: a Workspace-Picker-style overlay whose rows are a grid of
+/// glyph-only cells rather than a column of text, so a reader chooses by
+/// shape rather than by name. Cells are recorded at draw time the way the
+/// Subagent Picker records its rows, which is what lets a pointer press
+/// resolve to a Catalog name later.
+fn render_icon_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(48),
+        main.height.saturating_sub(2).min(14),
+    );
+    let content_width = area.width.saturating_sub(2);
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let content_x = area.x.saturating_add(1);
+    let content_y = area.y.saturating_add(1);
+    let mut lines = Vec::with_capacity(content_height);
+    let shows_search = content_height >= 3;
+    let shows_footer = content_height >= 2;
+    if shows_search {
+        lines.push(Line::styled(
+            picker_search_line(state.icon_picker.query(), usize::from(content_width)),
+            theme.text.subdued,
+        ));
+    }
+    let footer_rows = usize::from(shows_footer);
+    let grid_capacity = content_height.saturating_sub(lines.len() + footer_rows);
+    let columns = icon_picker::columns_for_width(content_width);
+    let grid_rows = state.icon_picker.visible_rows(columns, grid_capacity);
+    if grid_rows.is_empty() {
+        if lines.len() < content_height {
+            lines.push(Line::styled("No Icons found", theme.text.subdued));
+        }
+    } else {
+        for row in &grid_rows {
+            let row_y = content_y.saturating_add(lines.len() as u16);
+            let mut spans = Vec::with_capacity(row.len().saturating_mul(2));
+            let mut column_x = content_x;
+            for (index, cell) in row.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                    column_x = column_x.saturating_add(icon_picker::CELL_GUTTER);
+                }
+                let style = if cell.selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                };
+                spans.push(Span::styled(format!(" {} ", cell.entry.glyph), style));
+                state.icon_picker.record_cell(
+                    row_y,
+                    column_x..column_x.saturating_add(icon_picker::CELL_WIDTH),
+                    cell.entry.name,
+                );
+                column_x = column_x.saturating_add(icon_picker::CELL_WIDTH);
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    if shows_footer && lines.len() < content_height {
+        let footer = state
+            .icon_picker
+            .focused_entry()
+            .map_or("No Icons found", |entry| entry.name);
+        lines.push(Line::styled(
+            truncate_to_width(footer, usize::from(content_width)),
+            theme.text.subdued,
+        ));
+    }
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Icons,
+        area,
+        lines,
+        " Choose Icon ",
+        theme,
+    );
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -4448,6 +4541,13 @@ fn render_session_header(
         );
         let mut spans = Vec::new();
         if let Some(icon_prefix) = icon_prefix {
+            // Recorded here rather than resolved from the Title's own
+            // geometry, because the Icon is the target: a press meant for
+            // the Title text beside it opens nothing (issue #360).
+            *state.header_icon_area.borrow_mut() = Some((
+                title_area.y,
+                title_area.x..title_area.x.saturating_add(icon_width as u16),
+            ));
             spans.push(Span::styled(icon_prefix, theme.text.primary));
         }
         spans.push(Span::styled(title, theme.text.primary));

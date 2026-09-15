@@ -18,9 +18,7 @@ use std::sync::LazyLock;
 /// Which half of the Icon Catalog one [`IconEntry`] belongs to. Read by the
 /// Icon Picker's grid, which groups by this before anything else so a glyph
 /// standing for what a Session's work is about never sits beside one standing
-/// for what it is written in. Unused until the Icon Picker (issues #360 and
-/// #361) reads it.
-#[allow(dead_code)]
+/// for what it is written in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IconGroup {
     /// What a Session's or Workspace's work is about: a bug, a feature, a
@@ -43,10 +41,8 @@ pub(crate) struct IconEntry {
     /// [`tests::every_codepoint_is_pinned_to_the_nerd_fonts_fixture`] against
     /// the fixture in `tests/fixtures/glyphnames.json`.
     pub(crate) glyph: char,
-    /// Which half of the Catalog this entry belongs to. Unused outside this
-    /// module's own tests until the Icon Picker (issues #360 and #361) groups
-    /// its grid by it.
-    #[allow(dead_code)]
+    /// Which half of the Catalog this entry belongs to. The Icon Picker's
+    /// grid groups by it.
     pub(crate) group: IconGroup,
     /// Lowercase words [`search`] matches against, in addition to `name`
     /// itself.
@@ -1429,9 +1425,7 @@ pub(crate) fn glyph(name: &str) -> Option<char> {
 }
 
 /// The Icon Catalog's whole listing, in the order the Icon Picker's grid
-/// presents it. Unused until the Icon Picker (issues #360 and #361) opens a
-/// grid to read it into.
-#[allow(dead_code)]
+/// presents it.
 pub(crate) fn entries() -> &'static [IconEntry] {
     CATALOG
 }
@@ -1445,9 +1439,7 @@ pub(crate) fn names() -> &'static [&'static str] {
 /// The entries whose name or keywords contain `query`, case-insensitively, in
 /// listing order — what the Icon Picker narrows its grid to as the user
 /// types. An empty or all-whitespace `query` matches everything, which is
-/// what the Picker opens showing. Unused until the Icon Picker (issues #360
-/// and #361) narrows its grid with it.
-#[allow(dead_code)]
+/// what the Picker opens showing.
 pub(crate) fn search(query: &str) -> Vec<&'static IconEntry> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {

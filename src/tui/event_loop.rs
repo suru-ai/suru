@@ -848,6 +848,13 @@ impl RunLoop {
                     },
                 );
             }
+            ApplicationTransition::SetSessionIcon { session, icon } => {
+                let session_id = session.session_id;
+                self.spawn_operation(
+                    session,
+                    SessionOperation::SetSessionIcon { session_id, icon },
+                );
+            }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
@@ -1168,6 +1175,7 @@ impl RunLoop {
             | ApplicationTransition::DetachSession
             | ApplicationTransition::DeleteSession(_)
             | ApplicationTransition::SettleSession { .. }
+            | ApplicationTransition::SetSessionIcon { .. }
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
@@ -2554,6 +2562,10 @@ enum SessionOperation {
         session_id: SessionId,
         settled: bool,
     },
+    SetSessionIcon {
+        session_id: SessionId,
+        icon: String,
+    },
     PromotePrompt {
         session_id: SessionId,
         prompt_id: PromptId,
@@ -2638,6 +2650,16 @@ impl SessionOperation {
                 Ok(_) if settled => SubmissionResult::SessionSettled(session),
                 result => operation_result(session, result.map(|_| ())),
             },
+            // The catalog carries the resulting `TitleChanged` change to
+            // every client, this one included, so nothing further is done
+            // with the answered summary beyond reporting failure.
+            Self::SetSessionIcon { session_id, icon } => operation_result(
+                session,
+                commands
+                    .set_session_icon(session_id, &icon)
+                    .await
+                    .map(|_| ()),
+            ),
             Self::PromotePrompt {
                 session_id,
                 prompt_id,

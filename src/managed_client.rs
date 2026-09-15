@@ -22,9 +22,9 @@ use crate::{
         SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
         SessionError, SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot,
         SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
-        UpdateApprovalPostureRequest, ViewSessionRequest,
+        SessionWorkingChanged, SetSessionIconRequest, SettingMutation, SettingsSnapshot,
+        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
     },
 };
 
@@ -534,6 +534,18 @@ impl ManagedClient {
             .await
     }
 
+    /// Sets a Session's Icon to a user's choice from the Icon Catalog by
+    /// name, refused where the Catalog does not carry it.
+    pub async fn set_session_icon(
+        &self,
+        session_id: SessionId,
+        icon: &str,
+    ) -> Result<SessionSummary> {
+        self.session_commands()
+            .set_session_icon(session_id, icon)
+            .await
+    }
+
     pub async fn view_session(
         &self,
         session_id: SessionId,
@@ -722,6 +734,16 @@ impl OutlookClient {
         settled: bool,
     ) -> Result<SessionSummary> {
         self.commands.settle_session(session_id, settled).await
+    }
+
+    /// Sets a Session's Icon to a user's choice from the Icon Catalog by
+    /// name, refused where the Catalog does not carry it.
+    pub async fn set_session_icon(
+        &self,
+        session_id: SessionId,
+        icon: &str,
+    ) -> Result<SessionSummary> {
+        self.commands.set_session_icon(session_id, icon).await
     }
 
     pub async fn view_session(
@@ -1245,6 +1267,25 @@ impl SessionCommandClient {
         .await
     }
 
+    /// Sets a Session's Icon to a user's own choice from the Icon Catalog by
+    /// name. Routed like every other Session command: against this Client's
+    /// own Outlook, which is the Session's Origin wherever a caller reached
+    /// this through [`ManagedClient::session_commands_for`].
+    pub(crate) async fn set_session_icon(
+        &self,
+        session_id: SessionId,
+        icon: &str,
+    ) -> Result<SessionSummary> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/icon"),
+            &SetSessionIconRequest {
+                icon: icon.to_owned(),
+            },
+            "Session Icon",
+        )
+        .await
+    }
+
     /// Reports that this Client has the Session open in its main view.
     pub(crate) async fn view_session(
         &self,
@@ -1453,6 +1494,26 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/remotes/workstation/v1/sessions/session-id/approvals/approval-id/decision"
+        );
+    }
+
+    /// A chosen Icon routes to a remote Session's own Origin exactly like
+    /// every other Session command: `session_commands_for(reference.origin)`
+    /// carries this Outlook into every request it sends, `set_session_icon`
+    /// included, and `server_url` is where that carrying becomes the request
+    /// a remote Server actually receives.
+    #[test]
+    fn set_session_icon_uses_the_remote_session_command_route() {
+        let url = server_url(
+            "http://127.0.0.1:7777",
+            &Outlook::Remote("workstation".into()),
+            "/v1/sessions/session-id/icon",
+        )
+        .expect("build remote Icon URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/remotes/workstation/v1/sessions/session-id/icon"
         );
     }
 }

@@ -37,9 +37,10 @@ use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
     SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity,
     ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionUpdate, SettingMutation, SettingsSnapshot,
-    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery,
-    TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+    SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest, SettingMutation,
+    SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+    SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
+    ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -49,8 +50,8 @@ use crate::serving::ServingController;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
     CreateSessionError, DeleteSessionError, InterruptSessionError, PromptAdmissionDisposition,
-    PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore, SettleSessionError,
-    StoreOutcome, TitleDerivation,
+    PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore, SetIconError,
+    SettleSessionError, StoreOutcome, TitleDerivation,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -716,6 +717,7 @@ pub async fn spawn_with_source_control(
                     post(update_approval_posture),
                 )
                 .route("/v1/sessions/{session_id}/settlement", post(settle_session))
+                .route("/v1/sessions/{session_id}/icon", post(set_session_icon))
                 .route("/v1/sessions/{session_id}/viewed", post(view_session))
                 .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
                 .route(
@@ -2933,6 +2935,41 @@ async fn settle_session(
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
+    }
+}
+
+/// Sets a Session's Icon to the user's own choice from the Icon Catalog,
+/// refused where the Catalog does not carry the named entry. Answers with the
+/// same `TitleChanged` catalog change a derived Icon publishes, so every
+/// client's existing apply path repaints from it.
+async fn set_session_icon(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let request = match decode_session_command::<SetSessionIconRequest>(
+        &state,
+        request,
+        "Session Icon",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.sessions.set_icon(session_id, &request.icon) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(SetIconError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(SetIconError::UnknownIcon) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidIcon,
+            format!("`{}` is not an Icon Catalog name", request.icon),
+        ),
+        Err(SetIconError::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

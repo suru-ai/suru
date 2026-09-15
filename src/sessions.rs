@@ -54,7 +54,7 @@ pub(crate) use settled::SettleSessionError;
 pub(crate) use settlement::{
     InterruptSessionError, InterruptTarget, ProviderTurnOutcome, TrailingCommandOutput,
 };
-pub(crate) use title::TitleDerivation;
+pub(crate) use title::{SetIconError, TitleDerivation};
 pub(crate) use viewed::ViewSessionError;
 
 use catalog::SessionCatalogPublisher;

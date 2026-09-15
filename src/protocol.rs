@@ -3066,6 +3066,17 @@ pub struct SettleSessionRequest {
     pub settled: bool,
 }
 
+/// The user's own choice of a Session's Icon, by Icon Catalog name. Refused
+/// where the Catalog does not carry that name, so a Session never stores an
+/// Icon that would only ever draw as absent. Unlike a derived Icon, which only
+/// ever fills an absence, a chosen Icon replaces whatever the Session already
+/// carried — a user's choice always stands.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionIconRequest {
+    pub icon: String,
+}
+
 /// One report that a Client has a root Session open in its main view. The
 /// identity makes transport retries one operation rather than later Views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3095,6 +3106,8 @@ pub enum SessionErrorCode {
     InvalidCommand,
     EmptyPrompt,
     InvalidWorkspace,
+    /// A chosen Icon named a Catalog entry the Icon Catalog does not carry.
+    InvalidIcon,
     SessionNotFound,
     SubagentSession,
     /// Deletion was refused because this Session or a Subagent below it is

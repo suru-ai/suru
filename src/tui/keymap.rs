@@ -98,6 +98,62 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
     }
 }
 
+/// The Icon Picker is the newest thing on screen while it is up, so it has
+/// the keys: the arrows walk its grid in two dimensions, Enter chooses the
+/// focused glyph, and Esc puts the picker away leaving its target's Icon
+/// unchanged. Anything else typed narrows the grid by name and keyword, as
+/// the Workspace Picker's own search does, and the pointer answers as it does
+/// everywhere else — a press outside the grid is handled the way a press
+/// outside the Subagent Picker is.
+pub(super) fn command_for_icon_picker_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::IconPickerSearchInsert,
+                text,
+            ));
+        }
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Left, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::IconPickerLeft))
+        }
+        (KeyCode::Right, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::IconPickerRight,
+        )),
+        (KeyCode::Up, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::IconPickerUp))
+        }
+        (KeyCode::Down, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::IconPickerDown))
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::IconPickerChoose,
+        )),
+        (KeyCode::Esc, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::IconPickerClose,
+        )),
+        (KeyCode::Backspace, KeyModifiers::NONE) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::IconPickerSearchDelete,
+        )),
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::IconPickerSearchInsert,
+                character.to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The Subagent Picker is the newest thing on screen while it is up, so it
 /// has the keys: the arrows walk its entries, Enter opens the Session of the
 /// one the reader is on, `x` stops it where the Provider allows — at once,

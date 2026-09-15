@@ -39,10 +39,12 @@ use super::{
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::ConnectOverlay,
+    icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
         command_for_approval_posture_picker_event, command_for_completion_event,
-        command_for_connect_overlay_event, command_for_interrupt_confirmation_event,
-        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
+        command_for_connect_overlay_event, command_for_icon_picker_event,
+        command_for_interrupt_confirmation_event, command_for_leader_event,
+        command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_serve_overlay_event, command_for_session_picker_event,
         command_for_settings_panel_event, command_for_sidebar_event,
@@ -511,6 +513,12 @@ pub struct TuiState {
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
     pub(super) subagent_picker: SubagentPicker,
+    pub(super) icon_picker: IconPicker,
+    /// Where the last frame drew the Session header's Icon span, so a press
+    /// there can be resolved without the header re-deriving it: `None`
+    /// whenever nothing was drawn there, including with Icons turned off, so
+    /// a press over that blank space reaches nothing (issue #360).
+    pub(super) header_icon_area: RefCell<Option<(u16, std::ops::Range<u16>)>>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) sidebar: Sidebar,
@@ -768,6 +776,8 @@ impl TuiState {
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
             subagent_picker: SubagentPicker::default(),
+            icon_picker: IconPicker::default(),
+            header_icon_area: RefCell::new(None),
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             sidebar: Sidebar::new(workspace),
@@ -2530,7 +2540,9 @@ impl TuiState {
 
     /// The top painted overlay owns selection and pointer/key dispatch alike.
     fn top_selection_overlay(&self) -> Option<SelectionSurface> {
-        if self.connect_overlay.is_open() {
+        if self.icon_picker.is_open() {
+            Some(SelectionSurface::Icons)
+        } else if self.connect_overlay.is_open() {
             Some(SelectionSurface::Connect)
         } else if self.serve_overlay.is_open() {
             Some(SelectionSurface::Serve)
@@ -2582,7 +2594,8 @@ impl TuiState {
     /// opened over it, and the row it stands on goes on saying which row it
     /// acts upon.
     pub(super) fn overlay_owns_input(&self) -> bool {
-        self.theme_picker.is_open()
+        self.icon_picker.is_open()
+            || self.theme_picker.is_open()
             || self.model_picker.is_open()
             || self.connect_overlay.is_open()
             || self.serve_overlay.is_open()
@@ -3614,6 +3627,12 @@ pub enum CommandId {
         screen_row: u16,
     },
     InvokeSemantic(SemanticCommandId),
+    /// A semantic command that carries typed text as its own payload rather
+    /// than acting on a target already in view state — the Icon Picker's
+    /// search insert is the first of these, so it still reaches
+    /// [`Application::invoke_semantic`] like every other semantic command
+    /// rather than mutating picker state directly from the keymap.
+    InvokeSemanticText(SemanticCommandId, String),
     InsertText(String),
     PasteText(String),
     InsertConnectText(String),
@@ -3644,6 +3663,13 @@ pub enum ApplicationTransition {
     SettleSession {
         session: SessionReference,
         settled: bool,
+    },
+    /// A user's own choice of a Session's Icon by Icon Catalog name, made
+    /// through the Icon Picker. Routed to the Session's own Origin like every
+    /// other Session act.
+    SetSessionIcon {
+        session: SessionReference,
+        icon: String,
     },
     PreviewCheckoutRemoval {
         request_id: uuid::Uuid,
@@ -4584,6 +4610,9 @@ impl Application {
             CommandId::SubmitSteer => Ok(self.submit_prompt(PromptDelivery::Steer)),
             CommandId::SubmitQueue => Ok(self.submit_prompt(PromptDelivery::Queue)),
             CommandId::InvokeSemantic(command) => self.invoke_semantic(command),
+            CommandId::InvokeSemanticText(command, text) => {
+                self.invoke_semantic(command.on_text(text))
+            }
             CommandId::InsertConnectText(text) => {
                 self.state.connect_overlay.insert(&text);
                 Ok(ApplicationTransition::Continue)
@@ -4983,6 +5012,23 @@ impl Application {
     /// order they were drawn: the Sidebar owns the columns it drew, and a
     /// click it does not claim reaches the composer or Transcript beside it.
     fn handle_click(&mut self, position: Position) -> Result<ApplicationTransition> {
+        // The Icon Picker stands over everything below while it is up, so it
+        // answers first, ahead of even the Subagent Picker: a press on one of
+        // its cells chooses the glyph it names — the same command Enter
+        // invokes — and a press anywhere else puts the picker away without
+        // choosing, since it has no clear action to fall back on.
+        if self.state.icon_picker.is_open() {
+            return Ok(match self.state.icon_picker.hit(position) {
+                Some(name) => {
+                    self.state.icon_picker.focus(name);
+                    self.choose_icon()
+                }
+                None => {
+                    self.state.icon_picker.close();
+                    ApplicationTransition::Continue
+                }
+            });
+        }
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
         // row names — the same command Enter invokes — and a press anywhere
@@ -5003,6 +5049,18 @@ impl Application {
         let press = self.state.sidebar.press_at(position);
         if press != SidebarPress::Elsewhere {
             return self.answer_sidebar_press(press);
+        }
+        // The header draws the open Session's Icon as its own leading span
+        // only while Icons are shown and the Session has one to draw, so a
+        // press over that blank space when either is untrue hits nothing
+        // recorded here and falls through like any other press.
+        let header_icon = self.state.header_icon_area.borrow().clone();
+        if let Some((row, columns)) = header_icon
+            && row == position.y
+            && columns.contains(&position.x)
+            && let Some(session) = self.state.session_reference.clone()
+        {
+            return self.invoke_semantic(SemanticCommandId::SessionIconChoose.on_session(session));
         }
         if let Some(target) = self
             .state
@@ -7149,7 +7207,8 @@ impl Application {
                 | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
-                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
@@ -7164,7 +7223,8 @@ impl Application {
                 | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
-                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
             // Session has a parent to return to, so anywhere else the command
@@ -7203,11 +7263,39 @@ impl Application {
                     | SemanticSubject::Approval(_)
                     | SemanticSubject::Questionnaire(_)
                     | SemanticSubject::Origin(_)
-                    | SemanticSubject::Hyperlink(_) => self.session_reference(),
+                    | SemanticSubject::Hyperlink(_)
+                    | SemanticSubject::Text(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
                     ApplicationTransition::SettleSession { session, settled }
                 }))
+            }
+            // The Session it names is the picker's target: the Sidebar row's
+            // context menu and the header Icon press both build the
+            // invocation with one, so the picker never has to guess which
+            // Session an unlabeled press meant. Inert while Icons are off,
+            // since no Icon Suru derives, stores, or draws would ever show
+            // through a Catalog choice made while they are hidden.
+            SemanticCommandId::SessionIconChoose => {
+                self.state.command_mode = CommandMode::Composer;
+                if self.state.settings().appearance.show_icons
+                    && let SemanticSubject::Session(session) = invocation.subject
+                {
+                    self.state
+                        .icon_picker
+                        .open(IconPickerTarget::Session(session));
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            command @ (SemanticCommandId::IconPickerLeft
+            | SemanticCommandId::IconPickerRight
+            | SemanticCommandId::IconPickerUp
+            | SemanticCommandId::IconPickerDown
+            | SemanticCommandId::IconPickerChoose
+            | SemanticCommandId::IconPickerClose
+            | SemanticCommandId::IconPickerSearchInsert
+            | SemanticCommandId::IconPickerSearchDelete) => {
+                Ok(self.handle_icon_picker_command(command, invocation.subject))
             }
             command @ (SemanticCommandId::SidebarPrevious
             | SemanticCommandId::SidebarNext
@@ -7251,7 +7339,8 @@ impl Application {
                 | SemanticSubject::Session(_)
                 | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
-                | SemanticSubject::Hyperlink(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
@@ -7429,6 +7518,64 @@ impl Application {
                 ApplicationTransition::ListModels(request)
             }
             AvailabilityRead::None => ApplicationTransition::Continue,
+        }
+    }
+
+    /// Handles the Icon Picker commands routed here. Guarded by `is_open`
+    /// even though every route that reaches these commands already scopes
+    /// them to the picker being open — `command_for_icon_picker_event` binds
+    /// them nowhere else, and the Sidebar menu and header press only ever
+    /// invoke [`SemanticCommandId::SessionIconChoose`], which opens it —
+    /// because a handler answering for state it does not own is the kind of
+    /// bug that survives every one of today's callers and bites the first
+    /// one added tomorrow.
+    fn handle_icon_picker_command(
+        &mut self,
+        command: SemanticCommandId,
+        subject: SemanticSubject,
+    ) -> ApplicationTransition {
+        if !self.state.icon_picker.is_open() {
+            return ApplicationTransition::Continue;
+        }
+        match command {
+            SemanticCommandId::IconPickerLeft => self.state.icon_picker.move_left(),
+            SemanticCommandId::IconPickerRight => self.state.icon_picker.move_right(),
+            SemanticCommandId::IconPickerUp => self.state.icon_picker.move_up(),
+            SemanticCommandId::IconPickerDown => self.state.icon_picker.move_down(),
+            SemanticCommandId::IconPickerSearchInsert => {
+                if let SemanticSubject::Text(text) = subject {
+                    self.state.icon_picker.insert(&text);
+                }
+            }
+            SemanticCommandId::IconPickerSearchDelete => self.state.icon_picker.delete_backward(),
+            SemanticCommandId::IconPickerClose => self.state.icon_picker.close(),
+            SemanticCommandId::IconPickerChoose => return self.choose_icon(),
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Sets the Icon Picker's Icon to its focused glyph and closes it. There
+    /// is no clear action: a query that offers nothing leaves nothing
+    /// focused, and Enter there does nothing rather than emptying the
+    /// target's Icon.
+    fn choose_icon(&mut self) -> ApplicationTransition {
+        let Some(target) = self.state.icon_picker.target().cloned() else {
+            return ApplicationTransition::Continue;
+        };
+        let Some(icon) = self
+            .state
+            .icon_picker
+            .focused_entry()
+            .map(|entry| entry.name.to_owned())
+        else {
+            return ApplicationTransition::Continue;
+        };
+        self.state.icon_picker.close();
+        match target {
+            IconPickerTarget::Session(session) => {
+                ApplicationTransition::SetSessionIcon { session, icon }
+            }
         }
     }
 
@@ -7794,6 +7941,7 @@ impl Application {
             return command_for_approval_posture_picker_event(event);
         }
         match self.state.top_selection_overlay() {
+            Some(SelectionSurface::Icons) => return command_for_icon_picker_event(event),
             Some(SelectionSurface::Connect) => {
                 return command_for_connect_overlay_event(
                     event,

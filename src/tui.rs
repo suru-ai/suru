@@ -11,6 +11,7 @@ mod connect_overlay;
 mod event_loop;
 mod fuzzy;
 mod hyperlink;
+mod icon_picker;
 mod keymap;
 mod markdown;
 mod model_options;

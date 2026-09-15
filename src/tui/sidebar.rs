@@ -709,6 +709,11 @@ pub(super) enum SidebarMenuItem {
     TryAgain,
     Settle,
     Unsettle,
+    /// Opens the Icon Picker over this row's Session. Offered only while
+    /// `appearance.showIcons` is on and the row is readable — a Session
+    /// deletion cannot pick from, and no glyph the Icon Picker offered would
+    /// show through a Setting that hides every one already drawn.
+    ChooseIcon,
     Delete,
 }
 
@@ -747,6 +752,7 @@ impl SidebarMenuItem {
             Self::TryAgain => "Try again now",
             Self::Settle => "Settle",
             Self::Unsettle => "Unsettle",
+            Self::ChooseIcon => "Choose icon",
             Self::Delete if confirming_delete => "Delete — confirm",
             Self::Delete => "Delete",
         }
@@ -759,6 +765,7 @@ impl SidebarMenuItem {
             Self::TryAgain => SemanticCommandId::RemoteRetry,
             Self::Settle => SemanticCommandId::SessionSettle,
             Self::Unsettle => SemanticCommandId::SessionUnsettle,
+            Self::ChooseIcon => SemanticCommandId::SessionIconChoose,
             Self::Delete => SemanticCommandId::SessionDelete,
         }
     }
@@ -767,21 +774,26 @@ impl SidebarMenuItem {
 impl SidebarMenu {
     /// What the menu offers, top to bottom: what the row's shelf asks for —
     /// except on a row the client could not read, which no shelf operation can
-    /// act on — and Delete, which every row keeps.
-    fn items(&self) -> Vec<SidebarMenuItem> {
+    /// act on — choosing an Icon while Icons are shown, and Delete, which
+    /// every row keeps.
+    fn items(&self, show_icons: bool) -> Vec<SidebarMenuItem> {
         match &self.subject {
             SidebarMenuSubject::Unreachable(_) => vec![SidebarMenuItem::TryAgain],
             SidebarMenuSubject::Session {
                 unreadable: true, ..
             } => vec![SidebarMenuItem::Delete],
-            SidebarMenuSubject::Session { settled, .. } => vec![
-                if *settled {
+            SidebarMenuSubject::Session { settled, .. } => {
+                let mut items = vec![if *settled {
                     SidebarMenuItem::Unsettle
                 } else {
                     SidebarMenuItem::Settle
-                },
-                SidebarMenuItem::Delete,
-            ],
+                }];
+                if show_icons {
+                    items.push(SidebarMenuItem::ChooseIcon);
+                }
+                items.push(SidebarMenuItem::Delete);
+                items
+            }
         }
     }
 
@@ -1301,7 +1313,7 @@ impl Sidebar {
         Some(SidebarMenuView {
             anchor: menu.anchor,
             items: menu
-                .items()
+                .items(self.show_icons)
                 .into_iter()
                 .enumerate()
                 .map(|(index, item)| SidebarMenuEntry {
@@ -1322,10 +1334,11 @@ impl Sidebar {
     }
 
     fn move_menu_selection(&mut self, distance: isize) {
+        let show_icons = self.show_icons;
         let Some(menu) = &mut self.menu else {
             return;
         };
-        let length = menu.items().len() as isize;
+        let length = menu.items(show_icons).len() as isize;
         menu.selected = (menu.selected as isize + distance).rem_euclid(length) as usize;
     }
 
@@ -1349,10 +1362,11 @@ impl Sidebar {
     /// the menu is done; Delete asks again the first time and acts the second,
     /// so the menu stands until the reader has said it twice.
     fn act_on_menu_item(&mut self, index: usize) -> SidebarPress {
+        let show_icons = self.show_icons;
         let Some(menu) = &mut self.menu else {
             return SidebarPress::Answered;
         };
-        let Some(item) = menu.items().get(index).copied() else {
+        let Some(item) = menu.items(show_icons).get(index).copied() else {
             return SidebarPress::Answered;
         };
         menu.selected = index;

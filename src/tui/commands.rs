@@ -66,6 +66,18 @@ pub enum SemanticCommandId {
     SessionNew,
     SessionSettle,
     SessionUnsettle,
+    /// Opens the Icon Picker over a Session, which the picker only does while
+    /// `appearance.showIcons` is on: inert with it off, so a header press or a
+    /// menu item stays quiet rather than opening a picker no glyph could draw.
+    SessionIconChoose,
+    IconPickerLeft,
+    IconPickerRight,
+    IconPickerUp,
+    IconPickerDown,
+    IconPickerChoose,
+    IconPickerClose,
+    IconPickerSearchInsert,
+    IconPickerSearchDelete,
     ConnectOpen,
     ConnectConfirm,
     ConnectFocusNext,
@@ -87,7 +99,9 @@ pub enum SemanticCommandId {
     SidebarToggle,
     SidebarWiden,
     SidebarNarrow,
-    SidebarWidthSet { columns: u64 },
+    SidebarWidthSet {
+        columns: u64,
+    },
     SidebarWidthReset,
     SidebarPrevious,
     SidebarNext,
@@ -204,6 +218,10 @@ pub(super) enum SemanticSubject {
     ComposerCursor(CursorTarget),
     ScreenPosition(Position),
     Hyperlink(String),
+    /// Typed text a command carries as its own payload rather than acting
+    /// on anything already in view state — the Icon Picker's search insert is
+    /// the first of these.
+    Text(String),
     Turn(TurnId),
     Questionnaire(QuestionnaireId),
     Approval(ApprovalId),
@@ -280,6 +298,15 @@ impl SemanticCommandId {
         }
     }
 
+    /// This command invoked with typed text as its own payload, which is what
+    /// the Icon Picker's search insert carries in place of a target.
+    pub(super) fn on_text(self, text: String) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Text(text),
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ApprovalOpen => "approval.open",
@@ -335,6 +362,15 @@ impl SemanticCommandId {
             Self::SessionNew => "session.new",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
+            Self::SessionIconChoose => "session.icon.choose",
+            Self::IconPickerLeft => "icon-picker.left",
+            Self::IconPickerRight => "icon-picker.right",
+            Self::IconPickerUp => "icon-picker.up",
+            Self::IconPickerDown => "icon-picker.down",
+            Self::IconPickerChoose => "icon-picker.choose",
+            Self::IconPickerClose => "icon-picker.close",
+            Self::IconPickerSearchInsert => "icon-picker.search.insert",
+            Self::IconPickerSearchDelete => "icon-picker.search.delete-backward",
             Self::ConnectOpen => "connect.open",
             Self::ConnectConfirm => "connect.confirm",
             Self::ConnectFocusNext => "connect.focus.next",
@@ -967,6 +1003,73 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             name: "unsettle",
             aliases: &[],
         }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionIconChoose,
+        title: "Choose Session Icon",
+        // The command names the Session it acts on, so it is invoked from a
+        // Sidebar row's context menu or a press on that Session's header Icon
+        // rather than from a key or a slash that would have no way to say
+        // which Session it meant.
+        description: "Open the Icon Picker over a Session, while Icons are shown",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerLeft,
+        title: "Icon Picker Left",
+        description: "Move the Icon Picker's focus one cell left",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerRight,
+        title: "Icon Picker Right",
+        description: "Move the Icon Picker's focus one cell right",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerUp,
+        title: "Icon Picker Up",
+        description: "Move the Icon Picker's focus one row up",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerDown,
+        title: "Icon Picker Down",
+        description: "Move the Icon Picker's focus one row down",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerChoose,
+        title: "Choose Icon",
+        description: "Set the target's Icon to the Icon Picker's focused glyph and close it",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerClose,
+        title: "Close Icon Picker",
+        description: "Dismiss the Icon Picker without choosing",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerSearchInsert,
+        title: "Insert Icon Search Text",
+        description: "Narrow the Icon Picker's grid by typed text",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::IconPickerSearchDelete,
+        title: "Delete Icon Search Text",
+        description: "Widen the Icon Picker's grid by deleting the last typed character",
+        slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
