@@ -7,9 +7,9 @@ use futures_util::StreamExt;
 use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{
-        Health, ModelCatalog, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
-        SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged, ShutdownReason,
-        SkillCatalog, TitleErrand,
+        DerivationErrand, Health, ModelCatalog, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT,
+        ServerShutdown, SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged,
+        ShutdownReason, SkillCatalog, WorkspaceIconChanged,
     },
 };
 use tokio::time::timeout;
@@ -97,6 +97,20 @@ pub async fn next_derived_title(client: &mut ManagedClient) -> SessionTitleChang
     })
     .await
     .expect("a derived Title reaches the client")
+}
+
+/// The next derived Workspace Icon to reach this client, past whatever else
+/// the catalog announced first.
+pub async fn next_workspace_icon_changed(client: &mut ManagedClient) -> WorkspaceIconChanged {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(ManagedEvent::WorkspaceIconChanged(changed)) = client.next().await {
+                return changed;
+            }
+        }
+    })
+    .await
+    .expect("a derived Workspace Icon reaches the client")
 }
 
 /// Proves nothing retitled `session_id` without waiting out a deadline: the Session is deleted, and
@@ -230,11 +244,11 @@ pub async fn catalog_changes_through_title(
     .expect("the derived Title reaches the catalog stream")
 }
 
-/// A config root holding one Config Document that pins `session.title.errand` to `errand`, which is
+/// A config root holding one Config Document that pins `derivation.errand` to `errand`, which is
 /// how the Setting reaches a spawned server.
-pub fn config_root_pinning(errand: &TitleErrand) -> tempfile::TempDir {
+pub fn config_root_pinning(errand: &DerivationErrand) -> tempfile::TempDir {
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
-    let document = serde_json::json!({ "session": { "title": { "errand": errand } } });
+    let document = serde_json::json!({ "derivation": { "errand": errand } });
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         serde_json::to_string_pretty(&document).expect("serialize the Config Document"),

@@ -117,10 +117,16 @@ impl SessionStore {
     pub(crate) fn regroup(
         &self,
         id: SessionId,
-        workspace: Workspace,
+        mut workspace: Workspace,
         mut checkout: Option<crate::protocol::CheckoutAssociation>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
+        // The table is authoritative for a Workspace's Icon: whatever
+        // resolution or a caller handed in, the current durable reading wins,
+        // so every regrouped Session's own copy of its Workspace stays in
+        // step with it (see `SessionStore::commit_workspace_icon`, which
+        // reaches every Session sharing a Workspace through this same path).
+        workspace.icon = state.workspace_icons.get(&workspace.id).cloned();
         let Some(record) = state.sessions.get_mut(&id) else {
             return Ok(());
         };

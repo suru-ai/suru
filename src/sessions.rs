@@ -15,7 +15,7 @@ use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, TurnId,
-    ViewSessionOperationId,
+    ViewSessionOperationId, WorkspaceId,
 };
 use crate::provider::ProviderResumeState;
 use crate::storage::{
@@ -39,6 +39,7 @@ mod settlement;
 mod subagents;
 mod title;
 mod viewed;
+mod workspace_icon;
 mod workspaces;
 
 pub(crate) use output::{
@@ -54,7 +55,7 @@ pub(crate) use settled::SettleSessionError;
 pub(crate) use settlement::{
     InterruptSessionError, InterruptTarget, ProviderTurnOutcome, TrailingCommandOutput,
 };
-pub(crate) use title::{SetIconError, TitleDerivation};
+pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
 
 use catalog::SessionCatalogPublisher;
@@ -96,6 +97,15 @@ struct SessionStoreState {
     /// in the public snapshot. Provider actors do not survive restoration, so
     /// restored Sessions begin a fresh local generation sequence.
     posture_generations: HashMap<SessionId, u64>,
+    /// Every Workspace's Icon this server knows of, seeded from the durable
+    /// `workspaces` table at startup and kept current by
+    /// [`SessionStore::commit_workspace_icon`]. This is the table's whole
+    /// in-memory reading — deliberately not a broader Workspace registry (ADR
+    /// 0027) — and it is what every `Workspace` copy this store hands out is
+    /// authoritatively read against, whether resolved fresh at Session
+    /// creation, regrouped by discovery, or restored from a Session's own
+    /// stored metadata.
+    workspace_icons: HashMap<WorkspaceId, String>,
 }
 
 struct SessionRecord {
@@ -154,10 +164,21 @@ impl SessionStore {
     /// `resumable_preparations` names the Sessions a stored Worktree
     /// preparation can still bring to their first Turn; their Prompts are the
     /// one kind restoration leaves standing (ADR 0024).
+    ///
+    /// `workspace_icons` is the `workspaces` table's whole reading at startup.
+    /// It is applied over every restored Session's own copy of its Workspace
+    /// here, once, rather than trusted from `StoredSessionMetadata`: that copy
+    /// is exactly as stale as whatever the Session last committed, while the
+    /// table is authoritative, so it must win regardless of which is newer.
+    /// Later, on-demand history hydration ([`SessionStore::hydrate`]) already
+    /// preserves grouping learned without opening that history over whatever a
+    /// freshly decoded row says, which is what carries this correction
+    /// forward.
     pub(crate) fn new(
         restored: RestoredSessions,
         storage: StorageSink,
         resumable_preparations: Vec<SessionId>,
+        workspace_icons: HashMap<WorkspaceId, String>,
     ) -> Self {
         let started = std::time::Instant::now();
         let RestoredSessions {
@@ -188,7 +209,12 @@ impl SessionStore {
         let catalog = SessionCatalogPublisher::new();
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
-        for persisted in persisted_sessions {
+        for mut persisted in persisted_sessions {
+            let icon = workspace_icons
+                .get(&persisted.snapshot.session.workspace.id)
+                .cloned();
+            persisted.snapshot.session.workspace.icon = icon.clone();
+            persisted.summary.session.workspace.icon = icon;
             sessions.insert(
                 persisted.snapshot.session.id,
                 hydration::restored_record(persisted, &mut prompts),
@@ -196,7 +222,12 @@ impl SessionStore {
         }
         let unreadable_sessions = unreadable
             .into_iter()
-            .map(|unreadable| (unreadable.summary.id, unreadable))
+            .map(|mut unreadable| {
+                if let Some(workspace) = &mut unreadable.summary.workspace {
+                    workspace.icon = workspace_icons.get(&workspace.id).cloned();
+                }
+                (unreadable.summary.id, unreadable)
+            })
             .collect();
         let mut state = SessionStoreState {
             sessions,
@@ -208,6 +239,7 @@ impl SessionStore {
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
             posture_generations: HashMap::new(),
+            workspace_icons,
         };
         // Durable Turns reconstruct Working and Usage before any Session can
         // be listed or opened, without committing synthetic changes.

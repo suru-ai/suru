@@ -149,6 +149,50 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     );
 }
 
+/// A Workspace carries its Icon on the wire, and tolerates its absence: a
+/// server predating issue #359 sends `Workspace` objects without an `icon`
+/// field at all, and a client built against this schema must still decode
+/// them rather than refuse the whole Session.
+#[test]
+fn workspace_round_trips_its_icon_and_tolerates_its_absence() {
+    let iconed = Workspace {
+        id: suru::protocol::WorkspaceId("directory:/work/suru".to_owned()),
+        path: PathBuf::from("/work/suru"),
+        repository: None,
+        source_control: suru::protocol::SourceControlAvailability::NotDetected,
+        icon: Some("dev-rust".to_owned()),
+    };
+    let expected = json!({
+        "id": "directory:/work/suru",
+        "path": "/work/suru",
+        "repository": null,
+        "source_control": { "status": "not_detected" },
+        "icon": "dev-rust",
+    });
+    assert_eq!(
+        serde_json::to_value(&iconed).expect("encode Workspace"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<Workspace>(expected).expect("decode Workspace"),
+        iconed
+    );
+
+    let without_icon = json!({
+        "id": "directory:/work/suru",
+        "path": "/work/suru",
+        "repository": null,
+        "source_control": { "status": "not_detected" },
+    });
+    assert_eq!(
+        serde_json::from_value::<Workspace>(without_icon)
+            .expect("decode a Workspace with no icon field at all")
+            .icon,
+        None,
+        "a Workspace predating the Icon field decodes with none rather than refusing"
+    );
+}
+
 #[test]
 fn skill_catalog_request_round_trips_provider_and_workspace_context() {
     let request = SkillCatalogRequest {

@@ -71,6 +71,14 @@ pub(super) const fn width_limit(frame_width: u16) -> Option<u16> {
 const ALL_WORKSPACES: &str = "All Workspaces";
 const EVERYWHERE: &str = "Everywhere";
 
+/// The plain folder glyph a scope entry narrowed to one Workspace draws in
+/// place of its own derived Icon. Kept in step with
+/// `crate::tui::render::NF_COD_FOLDER` by hand: the two live in different
+/// modules for the same reason a scope entry resolves its own Icon here
+/// rather than in `render` — this module already owns every other fact a
+/// scope entry draws.
+const SCOPE_ENTRY_FOLDER_GLYPH: char = '\u{ea83}';
+
 /// The affordance beside the selector, opening the path entry a reader names a
 /// Workspace in. It shares the selector's line, so it is drawn — and pressed —
 /// within its own columns of it.
@@ -384,6 +392,10 @@ pub(super) enum SidebarShelf<'a> {
         /// component. A Session Suru could not read may not know its Workspace
         /// at all.
         workspace: Option<&'a Path>,
+        /// The Workspace's Icon, resolved to a glyph already and gated by
+        /// `appearance.showIcons` exactly like [`SidebarRow::icon`], drawn in
+        /// place of the folder glyph beside `workspace` where present.
+        workspace_icon: Option<char>,
         /// How long ago this Session was last active, which is what the
         /// row's right slot reads when nothing else claims it.
         updated_at: SessionTimestamp,
@@ -475,6 +487,11 @@ pub(super) struct SidebarScopeEntry {
     /// it is where the reader already is.
     pub(super) chosen: bool,
     pub(super) focused: bool,
+    /// The glyph this entry draws ahead of its label: a Workspace's own
+    /// derived Icon, the plain folder glyph where it is narrowed to one with
+    /// none, and nothing at all for `Everywhere` or `AllWorkspaces`, or while
+    /// the reader keeps Icons off.
+    pub(super) icon: Option<char>,
     /// The scope pressing this entry asks for.
     scope: SidebarListingScope,
 }
@@ -1766,6 +1783,19 @@ impl Sidebar {
         self.keep_focus_drawn(&before);
     }
 
+    /// Takes a Workspace's newly derived Icon into every active row rooted
+    /// there. Unlike a retitle, this moves no row's Title, so the reader's
+    /// query results and row focus are untouched.
+    pub(super) fn set_workspace_icon_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        icon: Option<String>,
+    ) {
+        self.listing
+            .set_workspace_icon_origin(outlook, workspace_id, icon);
+    }
+
     pub(super) fn settle_origin(
         &mut self,
         outlook: Outlook,
@@ -2300,6 +2330,20 @@ impl Sidebar {
                     label: scope.label(name),
                     chosen: scope == self.scope,
                     focused: self.focus == Some(SidebarFocus::Scope(scope.clone())),
+                    icon: self
+                        .show_icons
+                        .then(|| match &scope {
+                            SidebarListingScope::Workspace(workspace) => Some(
+                                workspace
+                                    .icon
+                                    .as_deref()
+                                    .and_then(crate::icon_catalog::glyph)
+                                    .unwrap_or(SCOPE_ENTRY_FOLDER_GLYPH),
+                            ),
+                            SidebarListingScope::Everywhere
+                            | SidebarListingScope::AllWorkspaces => None,
+                        })
+                        .flatten(),
                     scope,
                 }),
                 BodyEntry::ShowMore(count) => SidebarEntry::ShowMore(SidebarShowMore {
@@ -2333,6 +2377,12 @@ impl Sidebar {
                         workspace: session
                             .workspace()
                             .map(|workspace| workspace.path.as_path()),
+                        workspace_icon: self
+                            .show_icons
+                            .then(|| session.workspace())
+                            .flatten()
+                            .and_then(|workspace| workspace.icon.as_deref())
+                            .and_then(crate::icon_catalog::glyph),
                         updated_at: session.updated_at(),
                         working_since: session.working_since(),
                     },

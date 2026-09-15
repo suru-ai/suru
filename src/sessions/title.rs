@@ -1,33 +1,48 @@
-//! Deriving a Session's Title and Icon from its first Prompt.
+//! Deriving a Session's Title, and its Workspace's Icon, from its first
+//! Prompt.
 //!
 //! A Session is titled with the verbatim text of its first Prompt, which is a
 //! real Title rather than a placeholder but rarely a good one. The moment that
 //! Prompt is admitted, Suru asks a Provider — through an Errand — for a short
 //! line naming the subject and the outcome, with an Icon standing for the
-//! work chosen alongside it, and replaces the Title with what comes back.
+//! work chosen alongside it, and replaces the Title with what comes back. On
+//! the same task, right after, a second Errand asks for an Icon standing for
+//! the Workspace itself where it still has none — see
+//! [`super::workspace_icon`] for what that Errand asks and how its answer
+//! commits.
 //!
-//! The Icon travels with the Title but keeps its own rule: a derived Icon
-//! lands only where the Session still carries none, so an Icon derived
-//! earlier — or chosen by the user, once that lands — is never overwritten by
-//! a later derivation. The Title keeps its own, separate rule of replacing
-//! only the Title it was derived from. See the **Icon** and **Icon Catalog**
-//! glossary entries and ADR 0028 for why an Icon is carried as a Catalog name
-//! rather than a codepoint.
+//! The Session's own Icon travels with its Title but keeps its own rule: a
+//! derived Icon lands only where the Session still carries none, so an Icon
+//! derived earlier — or chosen by the user, once that lands — is never
+//! overwritten by a later derivation. The Title keeps its own, separate rule
+//! of replacing only the Title it was derived from. See the **Icon** and
+//! **Icon Catalog** glossary entries and ADR 0028 for why an Icon is carried
+//! as a Catalog name rather than a codepoint.
 //!
-//! Which Provider is the `session.title.errand` Setting's answer, read when the
-//! derivation begins. Left alone it is the Session's own, at that Provider's
-//! declared Errand Selection resolved when the Errand runs, so titling is paid
-//! for at the rate that Provider keeps for its own work rather than at the rate
-//! of conversing. Turned off, no Errand is asked for at all. Pinned to an Agent
-//! Selection, that Provider and Model derive every Session's Title whatever the
-//! Session itself uses — including a Session using nothing.
+//! Which Provider runs both Errands is the `derivation.errand` Setting's
+//! answer, read once when derivation begins and shared by the Title and the
+//! Workspace Icon alike. Left alone it is the Session's own, at that
+//! Provider's declared Errand Selection resolved when each Errand runs, so
+//! deriving either is paid for at the rate that Provider keeps for its own
+//! work rather than at the rate of conversing. Turned off, neither Errand is
+//! asked for. Pinned to an Agent Selection, that Provider and Model derive
+//! every Session's Title and every Workspace's Icon, whatever the Session
+//! itself uses — including a Session using nothing.
 //!
-//! Everything here is best-effort by construction. The derivation runs in the
-//! background alongside the real first Turn and never blocks or gates it; it is
-//! attempted once per Session and never again; and a failure of any kind — a
-//! Provider that cannot be reached, a reply that arrives too late, a reply that
-//! is not the shape Suru asked for — leaves the Prompt-derived Title standing
-//! and reaches the Log and nowhere else.
+//! The two Errands run in a fixed order on the one spawned task: the Title
+//! Errand first, all the way to its own commit or failure, and only then the
+//! Workspace Errand — never concurrently, and never Workspace-first. A harness
+//! answering Errands in the order it receives them can therefore always tell
+//! the two apart by position, which is what keeps this ordering a documented
+//! guarantee rather than an accident of scheduling.
+//!
+//! Everything here is best-effort by construction. Derivation runs in the
+//! background alongside the real first Turn and never blocks or gates it; the
+//! Title is attempted once per Session and never again; and a failure of any
+//! kind — a Provider that cannot be reached, a reply that arrives too late, a
+//! reply that is not the shape Suru asked for — leaves the Prompt-derived
+//! Title standing, or the Workspace without an Icon, and reaches the Log and
+//! nowhere else.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,13 +53,13 @@ use crate::{
     icon_catalog,
     model_catalog::ModelCatalogService,
     protocol::{
-        AgentSelection, Prompt, ProviderId, SessionCatalogChange, SessionChange, SessionId,
-        SessionSummary, SettingsSnapshot, SkillInvocation, TitleErrand,
+        AgentSelection, DerivationErrand, Prompt, ProviderId, SessionCatalogChange, SessionChange,
+        SessionId, SessionSummary, SettingsSnapshot, SkillInvocation, Workspace,
     },
     provider::ProviderErrand,
 };
 
-use super::SessionStore;
+use super::{SessionStore, workspace_icon};
 
 /// The most of a first Prompt an Errand carries. The opening is taken rather
 /// than the ending because a first Prompt states its intent up front and trails
@@ -108,11 +123,11 @@ pub(crate) struct DerivedTitle {
     icon: Option<String>,
 }
 
-/// Derives Sessions' Titles and Icons. Cloned into the server's shared state,
-/// which is what lets Session creation fork a derivation and return without
-/// waiting.
+/// Derives Sessions' Titles and Icons, and Workspaces' Icons. Cloned into the
+/// server's shared state, which is what lets Session creation fork a
+/// derivation and return without waiting.
 #[derive(Clone)]
-pub(crate) struct TitleDerivation {
+pub(crate) struct Derivation {
     errands: ErrandRunner,
     /// The live Model catalog, which is what an Errand Selection is resolved
     /// against — every time one runs, rather than once when the server started.
@@ -124,7 +139,7 @@ pub(crate) struct TitleDerivation {
     settings: watch::Receiver<SettingsSnapshot>,
 }
 
-impl TitleDerivation {
+impl Derivation {
     pub(crate) fn new(
         errands: ErrandRunner,
         models: ModelCatalogService,
@@ -149,19 +164,30 @@ impl TitleDerivation {
     /// skipped, permanently: Suru will not pick a Provider the user did not
     /// choose, and deferring the attempt would give derivation a second trigger
     /// point and pending state to carry. A pinned Selection is the user
-    /// choosing one up front, so it titles that Session like any other.
+    /// choosing one up front, so it titles that Session like any other. The
+    /// same gate governs the Workspace Errand below: a Setting or a Session
+    /// that skips the Title skips the Workspace Icon too, since both are one
+    /// Provider call asked at one moment.
     ///
     /// Where the Session's own Provider runs the Errand, its Agent Selection
     /// decides the Provider and nothing else. The Model is the Provider's own
     /// business — its declared Errand Selection, resolved when the Errand runs
     /// — because the Model a user converses with is not the one that should be
     /// paid to write six words.
+    ///
+    /// `workspace` is read once, here, for whether it already carries an Icon:
+    /// a Workspace that does skips the second Errand for good, and one that
+    /// does not gets exactly one attempt from this Session — a race with
+    /// another Session created in the same Workspace before either commits is
+    /// possible and harmless, because [`SessionStore::commit_workspace_icon`]
+    /// only ever fills an absence.
     pub(crate) fn derive(
         &self,
         session_id: SessionId,
         execution_directory: std::path::PathBuf,
         provider: Option<ProviderId>,
         prompt: &Prompt,
+        workspace: &Workspace,
     ) {
         let Some(errand_at) = self.errand_at(session_id, provider) else {
             return;
@@ -171,7 +197,13 @@ impl TitleDerivation {
         let Some(derived_from) = self.sessions.title(session_id) else {
             return;
         };
-        let prompt = errand_prompt(&prompt.text, &prompt.skill_invocations);
+        let title_prompt = errand_prompt(&prompt.text, &prompt.skill_invocations);
+        let workspace_errand = workspace.icon.is_none().then(|| {
+            (
+                workspace.id.clone(),
+                workspace_icon::errand_prompt(workspace),
+            )
+        });
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
@@ -183,55 +215,90 @@ impl TitleDerivation {
             let Some(selection) = models.resolved_errand_selection(provider, pinned).await else {
                 tracing::info!(
                     %session_id,
-                    "no Title Errand: `{provider}` offers no Model to run one at"
+                    "no Errand: `{provider}` offers no Model to run one at"
                 );
+                return;
+            };
+            // The Title Errand runs first, to completion, before the
+            // Workspace Errand is even built — see the module doc for why the
+            // order is a guarantee rather than a scheduling accident.
+            let title_errand = ProviderErrand {
+                prompt: title_prompt,
+                schema: reply_schema(),
+                selection: selection.clone(),
+                execution_directory: execution_directory.clone(),
+            };
+            match errands.run(title_errand).await {
+                Ok(answer) => match derived_title(&answer) {
+                    Some(derived) => {
+                        if !sessions.replace_derived_title(session_id, &derived_from, derived) {
+                            tracing::debug!(
+                                %session_id,
+                                "a derived Title was discarded because the Title it was derived from has since changed"
+                            );
+                        }
+                    }
+                    None => tracing::info!(
+                        %session_id,
+                        "Title Errand answered outside its schema, so the Prompt-derived Title stands"
+                    ),
+                },
+                Err(failure) => {
+                    tracing::info!(%session_id, "Title Errand produced no Title: {failure}")
+                }
+            }
+
+            let Some((workspace_id, prompt)) = workspace_errand else {
                 return;
             };
             let errand = ProviderErrand {
                 prompt,
-                schema: reply_schema(),
+                schema: workspace_icon::reply_schema(),
                 selection,
-                execution_directory: execution_directory,
+                execution_directory,
             };
             let answer = match errands.run(errand).await {
                 Ok(answer) => answer,
                 Err(failure) => {
-                    tracing::info!(%session_id, "Title Errand produced no Title: {failure}");
+                    tracing::info!(
+                        ?workspace_id,
+                        "Workspace Icon Errand produced no Icon: {failure}"
+                    );
                     return;
                 }
             };
-            let Some(derived) = derived_title(&answer) else {
+            let Some(icon) = workspace_icon::derived_icon(&answer) else {
                 tracing::info!(
-                    %session_id,
-                    "Title Errand answered outside its schema, so the Prompt-derived Title stands"
+                    ?workspace_id,
+                    "Workspace Icon Errand answered outside its schema"
                 );
                 return;
             };
-            if !sessions.replace_derived_title(session_id, &derived_from, derived) {
+            if !sessions.commit_workspace_icon(&workspace_id, icon) {
                 tracing::debug!(
-                    %session_id,
-                    "a derived Title was discarded because the Title it was derived from has since changed"
+                    ?workspace_id,
+                    "a derived Workspace Icon was discarded because the Workspace already carries one"
                 );
             }
         });
     }
 
-    /// Where this Session's Title Errand goes, as the Setting in force decides,
-    /// and `None` where it goes nowhere. Read before anything is spawned, so a
+    /// Where this derivation's Errands go, as the Setting in force decides,
+    /// and `None` where they go nowhere. Read before anything is spawned, so a
     /// Setting turning derivation off costs no task and no Provider call.
     fn errand_at(&self, session_id: SessionId, provider: Option<ProviderId>) -> Option<ErrandAt> {
-        match &self.settings.borrow().settings.session.title.errand {
-            TitleErrand::Off => {
-                tracing::debug!(%session_id, "no Title Errand: Title derivation is turned off");
+        match &self.settings.borrow().settings.derivation.errand {
+            DerivationErrand::Off => {
+                tracing::debug!(%session_id, "no Errand: derivation is turned off");
                 None
             }
-            TitleErrand::Pinned(selection) => Some(ErrandAt::Selection(selection.clone())),
-            TitleErrand::FollowSession => match provider {
+            DerivationErrand::Pinned(selection) => Some(ErrandAt::Selection(selection.clone())),
+            DerivationErrand::FollowSession => match provider {
                 Some(provider) => Some(ErrandAt::Provider(provider)),
                 None => {
                     tracing::debug!(
                         %session_id,
-                        "no Title Errand: the Session has selected no Provider"
+                        "no Errand: the Session has selected no Provider"
                     );
                     None
                 }
@@ -619,7 +686,7 @@ mod tests {
             .await
             .expect("open Session repository");
         let (_writer, storage) = StorageWriter::spawn(repository, &[]);
-        let store = SessionStore::new(Default::default(), storage, Vec::new());
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let created = store
             .create(CreateSessionRequest {
                 preparation_id: None,
@@ -683,7 +750,7 @@ mod tests {
             .await
             .expect("open Session repository");
         let (_writer, storage) = StorageWriter::spawn(repository, &[]);
-        let store = SessionStore::new(Default::default(), storage, Vec::new());
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let created = store
             .create(CreateSessionRequest {
                 preparation_id: None,

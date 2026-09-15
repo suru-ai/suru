@@ -172,6 +172,45 @@ fn icons_identify_the_workspace_and_worktree_in_the_session_header() {
     }
 }
 
+/// The Session header draws a Workspace's own Icon in place of the plain
+/// folder glyph once one has been derived, falls back to the folder glyph
+/// while it has none, and draws neither once the reader turns Icons off.
+#[test]
+fn the_session_header_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    settings(&mut application);
+    let (_, mut snapshot) = enter_session(&mut application, workspace.path());
+
+    let plain_row = header(&application, 240);
+    assert!(
+        !plain_row.contains('\u{ea83}') && !plain_row.contains('\u{e7a8}'),
+        "no Icon is drawn while the reader keeps Icons off: {plain_row}"
+    );
+
+    enable_icons(&mut application);
+    let folder_row = header(&application, 240);
+    assert!(
+        folder_row.contains('\u{ea83}'),
+        "the folder glyph stands while the Workspace has no derived Icon: {folder_row}"
+    );
+
+    snapshot.session.workspace.icon = Some("dev-rust".to_owned());
+    show(&mut application, &snapshot);
+    let iconed_row = header(&application, 240);
+    assert!(
+        iconed_row.contains('\u{e7a8}') && !iconed_row.contains('\u{ea83}'),
+        "the Workspace's own Icon replaces the folder glyph: {iconed_row}"
+    );
+
+    settings(&mut application);
+    let off_row = header(&application, 240);
+    assert!(
+        !off_row.contains('\u{e7a8}') && !off_row.contains('\u{ea83}'),
+        "turning Icons off draws neither the derived Icon nor the folder glyph: {off_row}"
+    );
+}
+
 #[test]
 fn remote_header_icons_preserve_the_centered_title_and_compact_remote_label() {
     let workspace = workspace_dir();

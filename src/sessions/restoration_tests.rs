@@ -141,6 +141,7 @@ async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
 
     let aggregate_total = store
@@ -204,6 +205,7 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
     for (index, (since, output)) in [
         (Some(10), Some(8)),
@@ -277,6 +279,7 @@ async fn restore_tree(wide: bool) {
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
     let work = WORK.get();
     assert!(
@@ -357,6 +360,7 @@ async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
     let work = WORK.get();
     assert!(
@@ -457,6 +461,7 @@ async fn restored_balanced_tree_matches_the_durable_interval_union() {
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
     assert!(
         WORK.get() <= 127 * 64,
@@ -489,6 +494,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
         },
         sink,
         Vec::new(),
+        Default::default(),
     );
     store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
@@ -561,7 +567,7 @@ async fn restoring_independent_roots_does_linear_relationship_work() {
         ..Default::default()
     };
     WORK.set(0);
-    let store = SessionStore::new(restored, sink, Vec::new());
+    let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
     let work = WORK.get();
     assert_eq!(store.list(None).len(), 128);
     assert!(

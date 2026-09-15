@@ -200,6 +200,63 @@ fn a_row_names_the_workspace_and_spells_its_path_beside_it() {
     );
 }
 
+/// A Workspace Picker row draws the Workspace's own Icon in place of the
+/// folder glyph where one has been derived, the folder glyph while it has
+/// none, and neither with Icons off.
+#[test]
+fn a_row_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
+    let here = workspace(&["work", "here"]);
+    let iconed = workspace(&["group", "iconed-ws"]);
+    let plain = workspace(&["group", "plain-ws"]);
+    let mut application = connected_application(&here);
+
+    let mut iconed_session = rooted("Newer", &iconed, 30);
+    let SessionListItem::Readable(summary) = &mut iconed_session else {
+        unreachable!()
+    };
+    summary.session.workspace.icon = Some("dev-rust".to_owned());
+
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = false;
+    deliver_settings(&mut application, settings);
+    open_picker_with(
+        &mut application,
+        vec![iconed_session.clone(), rooted("Older", &plain, 20)],
+    );
+    let rows = picker_rows(&application);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains('\u{ea83}') || row.contains('\u{e7a8}')),
+        "no Icon is drawn while the reader keeps Icons off: {rows:?}"
+    );
+
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+    open_picker_with(
+        &mut application,
+        vec![iconed_session, rooted("Older", &plain, 20)],
+    );
+    let rows = picker_rows(&application);
+    let iconed_row = rows
+        .iter()
+        .find(|row| row.contains("iconed-ws"))
+        .expect("the iconed row is offered");
+    assert!(
+        iconed_row.contains('\u{e7a8}'),
+        "the Workspace's own derived Icon replaces the folder glyph: {rows:?}"
+    );
+    let plain_row = rows
+        .iter()
+        .find(|row| row.contains("plain-ws"))
+        .expect("the plain row is offered");
+    assert!(
+        plain_row.contains('\u{ea83}'),
+        "the folder glyph stands in for a Workspace with no derived Icon: {rows:?}"
+    );
+}
+
 /// The server canonicalizes the Workspace it roots a Session at, and the
 /// client reads its own launch directory the same way, so a launch spelling
 /// that differs from the canonical one never stands the same directory twice.
@@ -1441,6 +1498,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
         path: metadata,
         repository: Some(repository.clone()),
         source_control: SourceControlAvailability::Available,
+        icon: None,
     };
     let mut known = unknown.clone();
     known.path = main.clone();
@@ -1543,6 +1601,7 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
         path: root.clone(),
         repository: Some(repository),
         source_control: SourceControlAvailability::Available,
+        icon: None,
     };
     let mut application = Application::new(&root, Default::default());
     let ApplicationTransition::ResolveWorkspace {

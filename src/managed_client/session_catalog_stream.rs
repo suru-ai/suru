@@ -423,6 +423,15 @@ fn apply_update(
                 total_usage,
             }))
         }
+        // Unlike every other change here, this names no Session at all: a
+        // Workspace may hold none this client currently lists, and it is
+        // still worth telling every surface that lists one — the Landing
+        // draws its current Workspace whether or not it has ever held work.
+        SessionCatalogChange::WorkspaceIconChanged { workspace_id, icon } => {
+            Ok(ManagedEvent::WorkspaceIconChanged(
+                crate::protocol::WorkspaceIconChanged { workspace_id, icon },
+            ))
+        }
     }
 }
 

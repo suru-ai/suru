@@ -45,6 +45,10 @@ pub(super) struct WorkspacePickerRow {
     /// Whether this is the Workspace the client is working in, which is the
     /// one the picker stands first.
     pub(super) current: bool,
+    /// The Workspace's Icon, resolved to a glyph already, where the listing
+    /// carries one and the reader keeps Icons on. `None` draws the plain
+    /// folder glyph in its place.
+    pub(super) icon: Option<char>,
 }
 
 impl WorkspacePicker {
@@ -157,6 +161,16 @@ impl WorkspacePicker {
         self.listing.fail(request, error);
     }
 
+    pub(super) fn set_workspace_icon_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        icon: Option<String>,
+    ) {
+        self.listing
+            .set_workspace_icon_origin(outlook, workspace_id, icon);
+    }
+
     /// Whether a listing the server answered with would move anything the
     /// picker draws.
     ///
@@ -220,6 +234,10 @@ impl WorkspacePicker {
                 },
                 current: workspace.id == current.id,
                 selected: self.selected.as_ref() == Some(&workspace.id),
+                icon: workspace
+                    .icon
+                    .as_deref()
+                    .and_then(crate::icon_catalog::glyph),
                 path: workspace.path,
             })
             .collect()

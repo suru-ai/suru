@@ -1103,7 +1103,9 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &Tui
     let marker = if row.selected { "› " } else { "  " };
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let separator = if compact { " " } else { " · " };
-    let mut fields = vec![row.name.clone()];
+    let show_icons = state.settings().appearance.show_icons;
+    let name = icon_label(show_icons, row.icon.unwrap_or(NF_COD_FOLDER), &row.name);
+    let mut fields = vec![name];
     if row.current {
         fields.push((if compact { "C" } else { "[current]" }).to_owned());
     }
@@ -2858,6 +2860,7 @@ fn sidebar_entry_lines(
         SidebarEntry::Row(row) => match row.shelf {
             SidebarShelf::Active {
                 workspace,
+                workspace_icon,
                 updated_at,
                 working_since,
                 ..
@@ -2866,6 +2869,7 @@ fn sidebar_entry_lines(
                 workspace
                     .map(|path| state.workspace_name(&row.reference.origin, path))
                     .unwrap_or_default(),
+                workspace_icon,
                 sidebar_active_slot(row.standing, working_since, updated_at, now),
                 width,
                 driving,
@@ -2964,8 +2968,12 @@ fn sidebar_scope_line(
     driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
+    let label = match scope.icon {
+        Some(icon) => format!("{icon} {}", scope.label),
+        None => scope.label.clone(),
+    };
     sidebar_plain_line(
-        &format!("  {}", scope.label),
+        &format!("  {label}"),
         width,
         sidebar_focus_style(scope.focused, driving, theme),
         if scope.chosen {
@@ -3037,6 +3045,7 @@ fn sidebar_plain_line(
 fn sidebar_active_row_lines(
     row: SidebarRow<'_>,
     workspace: String,
+    workspace_icon: Option<char>,
     slot: String,
     width: usize,
     driving: bool,
@@ -3048,7 +3057,11 @@ fn sidebar_active_row_lines(
     let workspace = if workspace.is_empty() {
         workspace
     } else {
-        icon_label(show_icons, NF_COD_FOLDER, &workspace)
+        icon_label(
+            show_icons,
+            workspace_icon.unwrap_or(NF_COD_FOLDER),
+            &workspace,
+        )
     };
     let location = row
         .reference
@@ -3445,7 +3458,7 @@ fn pad_to_width(text: &str, width: usize) -> String {
 fn execution_context(state: &TuiState, show_icons: bool) -> String {
     match state.execution_directory.as_deref() {
         Some(_) => {
-            let label = workspace_context(state, &state.workspace.path, true);
+            let label = workspace_context(state, &state.workspace, true);
             let status = if matches!(
                 state.execution_status,
                 crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
@@ -3491,7 +3504,7 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
             };
             format!(
                 "{} · {intent}",
-                workspace_context(state, &state.workspace.path, true)
+                workspace_context(state, &state.workspace, true)
             )
         }
     }
@@ -4468,9 +4481,16 @@ fn render_session_header(
     let connection_width = connection.width().min(usize::from(area.width));
     let left_width = usize::from(area.width).saturating_sub(connection_width.saturating_add(2));
     let mut orientation = if detail.shows_secondary() {
+        let workspace_icon = snapshot
+            .session
+            .workspace
+            .icon
+            .as_deref()
+            .and_then(crate::icon_catalog::glyph)
+            .unwrap_or(NF_COD_FOLDER);
         icon_label(
             show_icons,
-            NF_COD_FOLDER,
+            workspace_icon,
             &state.workspace_name(&state.outlook, &snapshot.session.workspace.path),
         )
     } else {
@@ -4973,17 +4993,26 @@ fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String 
     }
 }
 
-fn workspace_context(state: &TuiState, path: &std::path::Path, show_path: bool) -> String {
+fn workspace_context(
+    state: &TuiState,
+    workspace: &crate::protocol::Workspace,
+    show_path: bool,
+) -> String {
     let show_icons = state.settings().appearance.show_icons;
     let remote = state
         .outlook
         .remote_name()
         .map(|remote| icon_label(show_icons, NF_MD_MONITOR, remote));
+    let workspace_icon = workspace
+        .icon
+        .as_deref()
+        .and_then(crate::icon_catalog::glyph)
+        .unwrap_or(NF_COD_FOLDER);
     let path = show_path.then(|| {
         icon_label(
             show_icons,
-            NF_COD_FOLDER,
-            &state.workspace_label(&state.outlook, path),
+            workspace_icon,
+            &state.workspace_label(&state.outlook, &workspace.path),
         )
     });
     remote

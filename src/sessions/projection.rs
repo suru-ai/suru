@@ -1175,7 +1175,7 @@ mod tests {
             .await
             .expect("open Session repository");
         let (_writer, storage) = StorageWriter::spawn(repository, &[]);
-        let store = SessionStore::new(Default::default(), storage, Vec::new());
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let first = PromptId::new();
         let StoreOutcome::Created(snapshot) = store
             .create(CreateSessionRequest {

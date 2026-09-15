@@ -15,7 +15,7 @@ use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-        SessionUpdate,
+        SessionUpdate, WorkspaceId,
     },
     session_projection::apply_update,
 };
@@ -56,6 +56,10 @@ enum WriterCommand {
     },
     SaveLandingAgentSelection(AgentSelection),
     SaveModelCatalog(RememberedProviderCatalog),
+    SaveWorkspaceIcon {
+        workspace_id: WorkspaceId,
+        icon: String,
+    },
     SaveResumeState {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
@@ -185,6 +189,15 @@ impl StorageWriter {
                     Ok(WriterCommand::SaveModelCatalog(remembered)) => {
                         if let Err(error) = repository.save_model_catalog(remembered) {
                             tracing::warn!("could not remember the Model Catalog: {error}");
+                        }
+                    }
+                    // Best-effort on the same terms as a remembered Model
+                    // Catalog: a Workspace Icon that fails to persist costs
+                    // nothing beyond the next Session in that Workspace
+                    // deriving one again.
+                    Ok(WriterCommand::SaveWorkspaceIcon { workspace_id, icon }) => {
+                        if let Err(error) = repository.save_workspace_icon(workspace_id, icon) {
+                            tracing::warn!("could not save a Workspace Icon: {error}");
                         }
                     }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
@@ -323,6 +336,15 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::SaveModelCatalog(remembered));
+    }
+
+    /// Records a Workspace's Icon, off the Session store's own commit path:
+    /// the in-memory guard against overwriting one is already applied by the
+    /// time this fires, so this is purely the durable half landing behind it.
+    pub(crate) fn save_workspace_icon(&self, workspace_id: WorkspaceId, icon: String) {
+        let _ = self
+            .commands
+            .send(WriterCommand::SaveWorkspaceIcon { workspace_id, icon });
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

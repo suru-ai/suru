@@ -19,7 +19,8 @@ use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, CheckoutAssociation, ExecutionDirectory, PromptId, ProviderId, SessionId,
-        SessionSnapshot, SessionSummary, TranscriptItem, UnreadableSessionSummary,
+        SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
+        UnreadableSessionSummary, WorkspaceId,
     },
     provider::ProviderResumeState,
     runtime::protect_current_user_file,
@@ -32,11 +33,11 @@ pub(crate) use writer::{StorageSink, StorageWriter};
 
 use rows::{
     ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
-    ProviderResumeStateRow, SessionRow, StoredRows, TurnRow,
+    ProviderResumeStateRow, SessionRow, StoredRows, TurnRow, WorkspaceRow,
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260914010000";
+const CURRENT_SCHEMA_VERSION: &str = "20260914020000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -70,6 +71,15 @@ diesel::table! {
         provider -> Text,
         payload -> Text,
         discovered_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    workspaces (id) {
+        id -> Text,
+        icon -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
     }
 }
 
@@ -187,6 +197,7 @@ pub(crate) enum StorageError {
     },
     WriteLandingAgentSelection(String),
     WriteModelCatalog(String),
+    WriteWorkspaceIcon(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -230,6 +241,9 @@ impl fmt::Display for StorageError {
             }
             Self::WriteModelCatalog(message) => {
                 write!(formatter, "save remembered Model Catalog: {message}")
+            }
+            Self::WriteWorkspaceIcon(message) => {
+                write!(formatter, "save a Workspace Icon: {message}")
             }
             Self::BlockingTask { operation, message } => write!(
                 formatter,
@@ -344,6 +358,29 @@ impl StorageRepository {
         .await
     }
 
+    /// Every Workspace's Icon this server has ever derived, as the `workspaces`
+    /// table holds it — its whole reading, since the table carries nothing
+    /// else (ADR 0027). A row that no longer decodes is left out rather than
+    /// failing startup: the next Session created in that Workspace derives
+    /// one again, exactly as if none had ever landed.
+    pub(crate) async fn workspace_icons(
+        &self,
+    ) -> Result<HashMap<WorkspaceId, String>, StorageError> {
+        let database_path = self.database_path.as_ref().clone();
+        on_blocking_task("reading Workspace Icons", move || {
+            let mut connection = connect(&database_path)?;
+            let rows = workspaces::table
+                .select(WorkspaceRow::as_select())
+                .load::<WorkspaceRow>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .filter_map(WorkspaceRow::into_icon)
+                .collect())
+        })
+        .await
+    }
+
     fn save_model_catalog(
         &self,
         remembered: RememberedProviderCatalog,
@@ -357,6 +394,28 @@ impl StorageRepository {
             .set(&row)
             .execute(&mut connection)
             .map_err(|error| StorageError::WriteModelCatalog(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Records a Workspace's Icon for good. `on_conflict` guards the same
+    /// invariant the caller already checked in memory — a Workspace's Icon,
+    /// once landed, is never replaced — against two Sessions in the same
+    /// Workspace racing derivations that both succeed: whichever write lands
+    /// first in the database wins, and the second's is silently a no-op
+    /// rather than a later derivation overwriting an earlier one.
+    fn save_workspace_icon(
+        &self,
+        workspace_id: WorkspaceId,
+        icon: String,
+    ) -> Result<(), StorageError> {
+        let row = WorkspaceRow::from_icon(workspace_id, icon, SessionTimestamp::now());
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(workspaces::table)
+            .values(&row)
+            .on_conflict(workspaces::id)
+            .do_nothing()
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
         Ok(())
     }
 

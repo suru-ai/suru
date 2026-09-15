@@ -43,6 +43,7 @@ impl Layout {
             path: main.clone(),
             repository: Some(repository),
             source_control: SourceControlAvailability::Available,
+            icon: None,
         };
         let checkouts = [(&main, CheckoutKind::Main), (&linked, CheckoutKind::Linked)]
             .into_iter()
@@ -399,6 +400,38 @@ fn landing_icons_decorate_the_location_checkout_and_pending_worktree() {
     choose_new(&mut app, &layout);
     let pending = text(&app);
     assert!(pending.contains(" New Worktree on submit"), "{pending}");
+}
+
+/// The Landing draws the current Workspace's own derived Icon in place of the
+/// plain folder glyph, falls back to the folder glyph while it has none, and
+/// draws neither with Icons off.
+#[test]
+fn the_landing_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
+    let mut layout = Layout::new();
+
+    let plain = layout.app();
+    let plain_text = text(&plain);
+    assert!(
+        !plain_text.contains('\u{ea83}') && !plain_text.contains('\u{e7a8}'),
+        "no Icon is drawn while the reader keeps Icons off: {plain_text}"
+    );
+
+    let mut folder_app = layout.app();
+    show_icons(&mut folder_app);
+    let folder_text = text(&folder_app);
+    assert!(
+        folder_text.contains('\u{ea83}'),
+        "the folder glyph stands while the Workspace has no derived Icon: {folder_text}"
+    );
+
+    layout.context.workspace.icon = Some("dev-rust".to_owned());
+    let mut iconed_app = layout.app();
+    show_icons(&mut iconed_app);
+    let iconed_text = text(&iconed_app);
+    assert!(
+        iconed_text.contains('\u{e7a8}') && !iconed_text.contains('\u{ea83}'),
+        "the Workspace's own derived Icon replaces the folder glyph: {iconed_text}"
+    );
 }
 
 #[test]

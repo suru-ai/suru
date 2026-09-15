@@ -3365,7 +3365,8 @@ mod tests {
             .await
             .expect("open Session repository");
         let (writer, storage) = StorageWriter::spawn(repository, &[]);
-        let sessions = SessionStore::new(Default::default(), storage, Vec::new());
+        let sessions =
+            SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let owning = create_session(
             &sessions,
             execution_directory.path(),

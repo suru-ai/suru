@@ -49,9 +49,9 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
-    CreateSessionError, DeleteSessionError, InterruptSessionError, PromptAdmissionDisposition,
-    PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore, SetIconError,
-    SettleSessionError, StoreOutcome, TitleDerivation,
+    CreateSessionError, DeleteSessionError, Derivation, InterruptSessionError,
+    PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore,
+    SetIconError, SettleSessionError, StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -378,9 +378,10 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
-    /// Derives a Session's Title from its first Prompt, in the background and
-    /// beside the first Turn rather than in front of it.
-    title_derivation: TitleDerivation,
+    /// Derives a Session's Title, and its Workspace's Icon where it has none,
+    /// from its first Prompt, in the background and beside the first Turn
+    /// rather than in front of it.
+    derivation: Derivation,
     model_catalog: ModelCatalogService,
     skill_catalog: SkillCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
@@ -520,6 +521,10 @@ pub async fn spawn_with_source_control(
         .model_catalog()
         .await
         .context("load remembered Model Catalog")?;
+    let workspace_icons = repository
+        .workspace_icons()
+        .await
+        .context("load Workspace Icons")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -570,6 +575,7 @@ pub async fn spawn_with_source_control(
         persisted_sessions,
         storage.clone(),
         preparations.resumable_sessions(),
+        workspace_icons,
     );
     for update in sessions.reconcile_approval_postures(&opening_settings.settings) {
         sessions.mark_approval_posture_application(
@@ -641,7 +647,7 @@ pub async fn spawn_with_source_control(
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
-    let title_derivation = TitleDerivation::new(
+    let derivation = Derivation::new(
         ErrandRunner::new(runtimes.clone(), provider_shutdown_rx, settings.subscribe())
             .with_timeout(timings.errand_timeout),
         model_catalog.clone(),
@@ -655,7 +661,7 @@ pub async fn spawn_with_source_control(
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),
-        title_derivation,
+        derivation,
         model_catalog,
         skill_catalog,
         landing_agent_selection,
@@ -2115,7 +2121,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             // freshly created Session reaches here, which is what makes the
             // derivation once-per-Session — a retried creation answers with the
             // Session it already made and asks for nothing.
-            state.title_derivation.derive(
+            state.derivation.derive(
                 snapshot.session.id,
                 snapshot.session.execution_directory.path.clone(),
                 snapshot
@@ -2124,6 +2130,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                     .as_ref()
                     .map(|selection| selection.provider.clone()),
                 &snapshot.prompts[0],
+                &snapshot.session.workspace,
             );
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }

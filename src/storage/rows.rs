@@ -20,7 +20,7 @@ use crate::{
         Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
         SessionId, SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp,
         SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
-        Workspace,
+        Workspace, WorkspaceId,
     },
     provider::ProviderResumeState,
 };
@@ -28,7 +28,7 @@ use crate::{
 use super::{
     PersistedSession, StorageError, StoredResumeState, UnreadableStoredSession, activities,
     landing_agent_selection, messages, model_catalog, prompts, provider_resume_states, sessions,
-    turns,
+    turns, workspaces,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -93,6 +93,39 @@ impl LandingAgentSelectionRow {
 
     pub(super) fn into_selection(self) -> Option<AgentSelection> {
         serde_json::from_str(&self.selection).ok()
+    }
+}
+
+/// A Workspace's one piece of durable, Workspace-owned state: its Icon (see
+/// ADR 0027 for why nothing broader lives here). `created_at` and
+/// `updated_at` are both stamped once, at the single insert this row is ever
+/// written by — a derivation only ever fills an absence, so there is nothing
+/// later to update.
+#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+#[diesel(table_name = workspaces)]
+pub(super) struct WorkspaceRow {
+    id: String,
+    icon: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl WorkspaceRow {
+    pub(super) fn from_icon(workspace_id: WorkspaceId, icon: String, at: SessionTimestamp) -> Self {
+        let stamp = i64::try_from(at.0).unwrap_or(i64::MAX);
+        Self {
+            id: workspace_id.0,
+            icon: Some(icon),
+            created_at: stamp,
+            updated_at: stamp,
+        }
+    }
+
+    /// Nothing for a row this binary cannot read as a Workspace id and an
+    /// Icon: like a remembered Model Catalog, this is best-effort state a
+    /// missing or damaged row simply leaves the next derivation to fill.
+    pub(super) fn into_icon(self) -> Option<(WorkspaceId, String)> {
+        Some((WorkspaceId(self.id), self.icon?))
     }
 }
 

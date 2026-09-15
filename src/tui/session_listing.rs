@@ -332,6 +332,31 @@ impl SessionListing {
         }
     }
 
+    /// Takes a Workspace's newly derived Icon into every listed Session
+    /// rooted there, and into the client's own current Workspace where this
+    /// is it — which is what lets the Landing draw an Icon beside a Workspace
+    /// that has no Session of its own yet. Unlike a Session's own retitle,
+    /// this names no Session id: a Workspace's Icon is one fact shared by
+    /// every row rooted under it, so one change moves as many rows as are
+    /// listed for it.
+    pub(super) fn set_workspace_icon_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        icon: Option<String>,
+    ) {
+        if &self.current_workspace.id == workspace_id {
+            self.current_workspace.icon = icon.clone();
+        }
+        for session in &mut self.origin_mut(outlook).sessions {
+            if let SessionListItem::Readable(summary) = &mut session.item
+                && &summary.session.workspace.id == workspace_id
+            {
+                summary.session.workspace.icon = icon.clone();
+            }
+        }
+    }
+
     /// Records a Session the server reports set aside as done for now, or
     /// brought back. The order this listing keeps is by when a Session was last
     /// updated, which settling does not touch, so nothing moves.

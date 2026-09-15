@@ -465,6 +465,16 @@ impl SessionPicker {
             .retitle_origin(outlook, session_id, title, icon);
     }
 
+    pub(super) fn set_workspace_icon_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        icon: Option<String>,
+    ) {
+        self.listing
+            .set_workspace_icon_origin(outlook, workspace_id, icon);
+    }
+
     pub(super) fn settle_origin(
         &mut self,
         outlook: Outlook,

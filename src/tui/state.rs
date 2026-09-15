@@ -1549,6 +1549,24 @@ impl TuiState {
             // footer of the Session in view reads its own — so the roll-up
             // the catalog announces moves nothing this client draws.
             ManagedEvent::SessionUsageChanged(_) => {}
+            ManagedEvent::WorkspaceIconChanged(changed) => {
+                // The Sidebar already took this in `apply_sidebar_catalog_event`,
+                // called ahead of this match. What is left is the Landing's own
+                // current Workspace and the two pickers.
+                if self.workspace.id == changed.workspace_id {
+                    self.workspace.icon = changed.icon.clone();
+                }
+                self.session_picker.set_workspace_icon_origin(
+                    self.outlook.clone(),
+                    &changed.workspace_id,
+                    changed.icon.clone(),
+                );
+                self.workspace_picker.set_workspace_icon_origin(
+                    self.outlook.clone(),
+                    &changed.workspace_id,
+                    changed.icon,
+                );
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
@@ -1605,6 +1623,11 @@ impl TuiState {
             ManagedEvent::SessionCatalogReconciled(snapshot) => self
                 .sidebar
                 .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
+            ManagedEvent::WorkspaceIconChanged(changed) => self.sidebar.set_workspace_icon_origin(
+                outlook.clone(),
+                &changed.workspace_id,
+                changed.icon.clone(),
+            ),
             ManagedEvent::Connecting
             | ManagedEvent::Connected(_)
             | ManagedEvent::SettingsSnapshot(_)
@@ -1655,6 +1678,18 @@ impl TuiState {
             ManagedEvent::SessionCatalogReconciled(snapshot) => self
                 .session_picker
                 .retain_origin_catalog(outlook.clone(), &snapshot.session_ids),
+            ManagedEvent::WorkspaceIconChanged(changed) => {
+                self.session_picker.set_workspace_icon_origin(
+                    outlook.clone(),
+                    &changed.workspace_id,
+                    changed.icon.clone(),
+                );
+                self.workspace_picker.set_workspace_icon_origin(
+                    outlook.clone(),
+                    &changed.workspace_id,
+                    changed.icon.clone(),
+                );
+            }
             ManagedEvent::Connecting
             | ManagedEvent::Connected(_)
             | ManagedEvent::SettingsSnapshot(_)

@@ -5343,6 +5343,45 @@ fn the_selector_lists_everywhere_then_all_workspaces_then_the_outlooks_workspace
     );
 }
 
+/// A selector entry narrowed to one Workspace draws that Workspace's own
+/// derived Icon, the plain folder glyph where it has none, and — for
+/// `Everywhere` and `AllWorkspaces`, which name no single Workspace — neither.
+#[test]
+fn selector_entries_draw_their_workspaces_own_icon_or_the_folder_glyph() {
+    let workspace = workspace_dir();
+    let SessionListItem::Readable(mut suru_session) =
+        listed("Suru", &workspace.path().join("suru"), 1, now())
+    else {
+        unreachable!()
+    };
+    suru_session.session.workspace.icon = Some("dev-rust".to_owned());
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![
+            listed("Notes", &workspace.path().join("notes"), 2, now()),
+            SessionListItem::Readable(suru_session),
+        ],
+    );
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+
+    open_selector(&mut application);
+
+    assert_eq!(
+        selector_entries(&application),
+        vec![
+            EVERYWHERE.to_owned(),
+            ALL_WORKSPACES.to_owned(),
+            format!("\u{ea83} {}", workspace_name(workspace.path())),
+            "\u{ea83} notes".to_owned(),
+            "\u{e7a8} suru".to_owned(),
+        ],
+        "Everywhere and AllWorkspaces draw no Icon; a Workspace scope draws its \
+         own Icon or falls back to the folder glyph"
+    );
+}
+
 #[test]
 fn everywhere_asks_each_non_terminal_origin_and_merges_both_shelves_by_reported_recency() {
     let workspace = workspace_dir();
@@ -9549,6 +9588,86 @@ fn active_sidebar_icons_follow_the_setting_and_checkout_state() {
             );
         }
     }
+}
+
+/// An active row draws its Workspace's own Icon where one has been derived,
+/// the plain folder glyph while it has none, and neither once the reader
+/// turns Icons off.
+#[test]
+fn an_active_row_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
+    let workspace = workspace_dir();
+    let path = workspace.path().join("suru");
+    let SessionListItem::Readable(mut summary) = listed("Iconed work", &path, now(), now()) else {
+        unreachable!()
+    };
+    summary.session.workspace.icon = Some("dev-rust".to_owned());
+    let mut application = sidebar_showing(&path, vec![SessionListItem::Readable(summary)]);
+
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = false;
+    deliver_settings(&mut application, settings);
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = rendered_row(&rows, "Iconed work");
+    assert!(
+        !sidebar_column(&rows[title - 1]).contains('\u{ea83}')
+            && !sidebar_column(&rows[title - 1]).contains('\u{e7a8}'),
+        "no Icon is drawn while the reader keeps Icons off: {rows:?}"
+    );
+
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = rendered_row(&rows, "Iconed work");
+    assert!(
+        sidebar_column(&rows[title - 1]).starts_with("\u{e7a8} suru"),
+        "the Workspace's own derived Icon replaces the folder glyph: {rows:?}"
+    );
+
+    let SessionListItem::Readable(mut summary) = listed("Unknown work", &path, now(), now()) else {
+        unreachable!()
+    };
+    summary.session.workspace.icon = None;
+    let mut application = sidebar_showing(&path, vec![SessionListItem::Readable(summary)]);
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = rendered_row(&rows, "Unknown work");
+    assert!(
+        sidebar_column(&rows[title - 1]).starts_with("\u{ea83} suru"),
+        "the folder glyph stands in for a Workspace with no derived Icon: {rows:?}"
+    );
+}
+
+/// A Remote's own Server derives its Workspaces' Icons independently, and a
+/// Remote's listing carries them exactly as a local one does: nothing in the
+/// managed client or the merged Sidebar strips an Icon a foreign Origin
+/// reports.
+#[test]
+fn a_remote_workspaces_own_icon_survives_its_listing_into_the_sidebar() {
+    let workspace = workspace_dir();
+    let path = workspace.path().join("suru");
+    let SessionListItem::Readable(mut summary) = listed("Remote work", &path, now(), now()) else {
+        unreachable!()
+    };
+    summary.session.workspace.icon = Some("dev-rust".to_owned());
+    let (mut application, _) = everywhere_with_studio(
+        workspace.path(),
+        vec![],
+        vec![SessionListItem::Readable(summary)],
+    );
+
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = rendered_row(&rows, "Remote work");
+    assert!(
+        sidebar_column(&rows[title - 1]).contains("\u{e7a8} suru"),
+        "a Remote's own derived Workspace Icon reaches the merged Sidebar unstripped: {rows:?}"
+    );
 }
 
 #[test]

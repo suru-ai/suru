@@ -337,6 +337,14 @@ async fn a_withdrawn_errand_model_falls_back_to_the_providers_default_model() {
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "title": "Explain the Provider seam" }));
+    // The first Session's own Workspace Icon Errand follows the Title Errand
+    // on the same task, since its Workspace still carries no Icon; drained
+    // here so it cannot be mistaken for the second Session's own Title Errand
+    // below.
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Workspace Icon Errand also reaches the Provider")
+        .succeed(json!({ "icon": "dev-rust" }));
 
     // The Provider drops the declared Model from its catalog, as a Provider
     // changing its catalog under a running server does.
@@ -1125,6 +1133,14 @@ async fn a_pinned_model_that_has_gone_falls_back_to_its_providers_default_model(
         .await
         .expect("an Errand reaches the Provider")
         .succeed(json!({ "title": "Explain the Provider seam" }));
+    // The first Session's own Workspace Icon Errand follows the Title Errand
+    // on the same task, since its Workspace still carries no Icon; drained
+    // here so it cannot be mistaken for the second Session's own Title Errand
+    // below.
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Workspace Icon Errand also reaches the Provider")
+        .succeed(json!({ "icon": "dev-rust" }));
 
     catalog.withdraw_model(&ModelId::new(ERRAND_MODEL));
     client.refresh_models().await.expect("refresh the catalog");

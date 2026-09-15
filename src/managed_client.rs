@@ -25,6 +25,7 @@ use crate::{
         SessionWorkingChanged, SetSessionIconRequest, SettingMutation, SettingsSnapshot,
         SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+        WorkspaceIconChanged,
     },
 };
 
@@ -214,6 +215,12 @@ pub enum ManagedEvent {
     /// a client listing Sessions it has never opened can state what each of
     /// them has consumed.
     SessionUsageChanged(SessionUsageChanged),
+    /// A Workspace's Icon landed, or — once issue #360 lands a way to choose
+    /// one — changed. It names no Session, unlike every other catalog event
+    /// here: a Workspace may hold no Session this client currently lists, and
+    /// the Landing draws its current Workspace's Icon whether or not it ever
+    /// has.
+    WorkspaceIconChanged(WorkspaceIconChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -253,6 +260,7 @@ impl ManagedEvent {
                 | Self::SessionSettlementChanged(_)
                 | Self::SessionWorkingChanged(_)
                 | Self::SessionStandingInputsChanged(_)
+                | Self::WorkspaceIconChanged(_)
                 | Self::SessionCatalogReconciled(_)
         )
     }

@@ -446,6 +446,13 @@ pub struct Workspace {
     pub path: PathBuf,
     pub repository: Option<Repository>,
     pub source_control: SourceControlAvailability,
+    /// The Workspace's Icon, as the `workspaces` table holds it: absent until
+    /// a derivation lands one for good. It rides every copy of a Workspace —
+    /// discovery, a listed Session, an open Session's own — because the table
+    /// is its one source of truth (see the **Icon** glossary entry and ADR
+    /// 0027 for why there is no broader Workspace registry beside it).
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 impl Workspace {
@@ -455,6 +462,7 @@ impl Workspace {
             path,
             repository: None,
             source_control: SourceControlAvailability::NotDetected,
+            icon: None,
         }
     }
     pub fn main_unknown(&self) -> bool {
@@ -2282,6 +2290,15 @@ pub enum SessionCatalogChange {
         session_id: SessionId,
         total_usage: Option<UsageTotal>,
     },
+    /// A Workspace's Icon was derived, or — once issue #360 lands a way to
+    /// choose one — set. It rides the catalog stream because every client
+    /// listing a Session rooted in that Workspace draws the same Icon beside
+    /// it, whether or not that Session is open, and the Landing draws it
+    /// beside the Workspace the client currently works in.
+    WorkspaceIconChanged {
+        workspace_id: WorkspaceId,
+        icon: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3421,5 +3438,15 @@ pub struct SessionUsageChanged {
 pub struct SessionTitleChanged {
     pub session_id: SessionId,
     pub title: String,
+    pub icon: Option<String>,
+}
+
+/// A Workspace's Icon as a derivation — or, later, a choice — left it, carried
+/// to every client that may list a Session rooted there without having any of
+/// them open.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceIconChanged {
+    pub workspace_id: WorkspaceId,
     pub icon: Option<String>,
 }
