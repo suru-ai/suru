@@ -5,7 +5,9 @@ use ratatui::layout::Position;
 
 use super::text_layout::CursorTarget;
 
-use crate::protocol::{ApprovalId, Outlook, QuestionnaireId, SessionReference, TurnId};
+use crate::protocol::{
+    ApprovalId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
+};
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
 
@@ -70,6 +72,10 @@ pub enum SemanticCommandId {
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
     SessionIconChoose,
+    /// Opens the Icon Picker over a Workspace, on the same terms
+    /// [`Self::SessionIconChoose`] opens it over a Session: inert while
+    /// `appearance.showIcons` is off.
+    WorkspaceIconChoose,
     IconPickerLeft,
     IconPickerRight,
     IconPickerUp,
@@ -78,6 +84,11 @@ pub enum SemanticCommandId {
     IconPickerClose,
     IconPickerSearchInsert,
     IconPickerSearchDelete,
+    /// Invokes the Workspace Picker row menu's one item — Choose icon — the
+    /// way Enter acts on the Sidebar's own row menu.
+    WorkspacePickerMenuSelect,
+    /// Dismisses the Workspace Picker row menu, leaving its row alone.
+    WorkspacePickerMenuClose,
     ConnectOpen,
     ConnectConfirm,
     ConnectFocusNext,
@@ -229,6 +240,13 @@ pub(super) enum SemanticSubject {
     /// One Session, which is what a reader names by acting on its row rather
     /// than on the Session they have open.
     Session(SessionReference),
+    /// One Workspace, named by the Origin it stands on and its own identity —
+    /// what a Sidebar selector entry or a Workspace Picker row names it by,
+    /// since neither carries a Session to name it through.
+    Workspace {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    },
 }
 
 /// One invocation of a semantic command: which command, and what it acts on.
@@ -279,6 +297,23 @@ impl SemanticCommandId {
         SemanticInvocation {
             id: self,
             subject: SemanticSubject::Session(session),
+        }
+    }
+
+    /// This command invoked against one Workspace, which is what a Sidebar
+    /// selector entry's or a Workspace Picker row's own context menu names it
+    /// by.
+    pub(super) fn on_workspace(
+        self,
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    ) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Workspace {
+                origin,
+                workspace_id,
+            },
         }
     }
 
@@ -363,6 +398,7 @@ impl SemanticCommandId {
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
             Self::SessionIconChoose => "session.icon.choose",
+            Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::IconPickerLeft => "icon-picker.left",
             Self::IconPickerRight => "icon-picker.right",
             Self::IconPickerUp => "icon-picker.up",
@@ -371,6 +407,8 @@ impl SemanticCommandId {
             Self::IconPickerClose => "icon-picker.close",
             Self::IconPickerSearchInsert => "icon-picker.search.insert",
             Self::IconPickerSearchDelete => "icon-picker.search.delete-backward",
+            Self::WorkspacePickerMenuSelect => "workspace-picker.menu.select",
+            Self::WorkspacePickerMenuClose => "workspace-picker.menu.close",
             Self::ConnectOpen => "connect.open",
             Self::ConnectConfirm => "connect.confirm",
             Self::ConnectFocusNext => "connect.focus.next",
@@ -1017,6 +1055,17 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceIconChoose,
+        title: "Choose Workspace Icon",
+        // The command names the Workspace it acts on by Origin and identity,
+        // so it is invoked from a Sidebar selector entry's context menu or a
+        // Workspace Picker row's context menu rather than from a key or a
+        // slash that would have no way to say which Workspace it meant.
+        description: "Open the Icon Picker over a Workspace, while Icons are shown",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerLeft,
         title: "Icon Picker Left",
         description: "Move the Icon Picker's focus one cell left",
@@ -1069,6 +1118,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::IconPickerSearchDelete,
         title: "Delete Icon Search Text",
         description: "Widen the Icon Picker's grid by deleting the last typed character",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspacePickerMenuSelect,
+        title: "Invoke Workspace Picker Menu Item",
+        description: "Act on the Workspace Picker row menu's selected item",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspacePickerMenuClose,
+        title: "Close Workspace Picker Menu",
+        description: "Dismiss the Workspace Picker's row menu, leaving its row alone",
         slash: None,
         keybinding: None,
     },

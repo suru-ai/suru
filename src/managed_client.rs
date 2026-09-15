@@ -22,10 +22,10 @@ use crate::{
         SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
         SessionError, SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot,
         SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SetSessionIconRequest, SettingMutation, SettingsSnapshot,
-        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation,
+        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
-        WorkspaceIconChanged,
+        WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -554,6 +554,17 @@ impl ManagedClient {
             .await
     }
 
+    /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by
+    /// name, refused where the Catalog does not carry it or where this Client's
+    /// own local server does not know the Workspace. A Remote Workspace's own
+    /// choice reaches it through [`Self::outlook`] instead, the way every
+    /// other Remote-addressed command does.
+    pub async fn set_workspace_icon(&self, workspace_id: &WorkspaceId, icon: &str) -> Result<()> {
+        self.session_commands()
+            .set_workspace_icon(workspace_id, icon)
+            .await
+    }
+
     pub async fn view_session(
         &self,
         session_id: SessionId,
@@ -752,6 +763,13 @@ impl OutlookClient {
         icon: &str,
     ) -> Result<SessionSummary> {
         self.commands.set_session_icon(session_id, icon).await
+    }
+
+    /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by
+    /// name, refused where the Catalog does not carry it or where this
+    /// Outlook's own server does not know the Workspace.
+    pub async fn set_workspace_icon(&self, workspace_id: &WorkspaceId, icon: &str) -> Result<()> {
+        self.commands.set_workspace_icon(workspace_id, icon).await
     }
 
     pub async fn view_session(
@@ -1294,6 +1312,37 @@ impl SessionCommandClient {
         .await
     }
 
+    /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by
+    /// name. Routed like every other Session-adjacent command: against this
+    /// Client's own Outlook, which is the Workspace's Origin wherever a
+    /// caller reached this through [`ManagedClient::session_commands_for`].
+    /// The Workspace's identity travels in the request body rather than a URL
+    /// path segment, since a `WorkspaceId`'s inner string may itself contain
+    /// path characters.
+    pub(crate) async fn set_workspace_icon(
+        &self,
+        workspace_id: &WorkspaceId,
+        icon: &str,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/workspaces/icon",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&SetWorkspaceIconRequest {
+                workspace_id: workspace_id.clone(),
+                icon: icon.to_owned(),
+            })
+            .send()
+            .await
+            .context("send Workspace Icon command")?;
+        decode_empty_api_response(response, "Workspace Icon").await
+    }
+
     /// Reports that this Client has the Session open in its main view.
     pub(crate) async fn view_session(
         &self,
@@ -1522,6 +1571,28 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/remotes/workstation/v1/sessions/session-id/icon"
+        );
+    }
+
+    /// A chosen Workspace Icon routes to that Workspace's own Origin exactly
+    /// like a chosen Session Icon does: `session_commands_for(reference.origin)`
+    /// carries this Outlook into every request it sends, `set_workspace_icon`
+    /// included, and `server_url` is where that carrying becomes the request a
+    /// remote Server actually receives. The Workspace's identity is not part of
+    /// this path at all — it travels in the body instead, so this only proves
+    /// the route reaches the right Server.
+    #[test]
+    fn set_workspace_icon_uses_the_remote_session_command_route() {
+        let url = server_url(
+            "http://127.0.0.1:7777",
+            &Outlook::Remote("workstation".into()),
+            "/v1/workspaces/icon",
+        )
+        .expect("build remote Workspace Icon URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/remotes/workstation/v1/workspaces/icon"
         );
     }
 }

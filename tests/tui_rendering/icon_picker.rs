@@ -1,6 +1,7 @@
 //! The Icon Picker: a grid overlay a reader opens from a Sidebar row's
-//! context menu or from a press on the open Session's header Icon, narrows by
-//! typing, and chooses from with the arrows and Enter or a pointer press.
+//! context menu, a Sidebar selector entry's context menu, a Workspace Picker
+//! row's context menu, or a press on the open Session's header Icon, narrows
+//! by typing, and chooses from with the arrows and Enter or a pointer press.
 
 use crate::support::{
     click_mouse, connected_application, deliver_settings, enter_session,
@@ -13,11 +14,14 @@ use std::path::Path;
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        AppearanceSettings, EffectiveSettings, Session, SessionId, SessionListItem,
+        AppearanceSettings, EffectiveSettings, Outlook, Session, SessionId, SessionListItem,
         SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings,
-        SidebarVisibility, Workspace,
+        SidebarVisibility, Workspace, WorkspaceId,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
+        SessionListRequest, SessionListScope, SessionListSurface,
+    },
 };
 
 fn shown_with_icons(show_icons: bool) -> EffectiveSettings {
@@ -407,5 +411,323 @@ fn a_press_outside_the_grid_closes_without_choosing() {
     // The far corner of a wide, tall frame stands well outside the centered
     // overlay's own box.
     press(&mut application, MouseButton::Left, WIDE - 1, TALL - 1);
+    assert!(!picker_is_drawn(&application));
+}
+
+// A Workspace target: opened from a Sidebar selector entry's own context
+// menu, or from a Workspace Picker row's own context menu, both carrying the
+// Workspace by Origin and identity the way a Session's own row carries it.
+
+/// Settings showing Icons without forcing the Sidebar open — the Workspace
+/// Picker fixtures below draw their own overlay and have no use for it.
+fn icons_shown(show_icons: bool) -> EffectiveSettings {
+    EffectiveSettings {
+        appearance: AppearanceSettings {
+            show_icons,
+            ..AppearanceSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+/// A Sidebar showing two Sessions rooted in two different Workspaces, with
+/// the selector opened on the entries beneath it — what a reader right-clicks
+/// to act on a Workspace rather than a Session. Answers with the Application
+/// and the "acorn" Workspace's own identity, computed the same way the
+/// client does.
+fn sidebar_with_selector_open(root: &Path, show_icons: bool) -> (Application, WorkspaceId) {
+    let acorn = root.join("acorn");
+    let birch = root.join("birch");
+    let mut application = connected_application(root);
+    let ApplicationTransition::ListSessions(request) =
+        deliver_settings(&mut application, shown_with_icons(show_icons))
+    else {
+        panic!("a Sidebar coming into view asks for its Sessions");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed_as(SessionId::new(), "Acorn work", &acorn),
+                listed_as(SessionId::new(), "Birch work", &birch),
+            ],
+        })
+        .expect("hydrate the Sidebar");
+    // The selector's own line stands closed, marked "▸", above the entries a
+    // press on it opens.
+    let selector_row = drawn_at(&application, "\u{25b8} ");
+    press(
+        &mut application,
+        MouseButton::Left,
+        SIDEBAR_CELL,
+        selector_row,
+    );
+    (application, WorkspaceId::directory(&acorn))
+}
+
+/// Opens the Icon Picker on the "acorn" Workspace's selector entry, through
+/// its own context menu. Answers with the Application, still with the
+/// picker's frame drawn, and the Workspace's own identity.
+fn open_picker_from_selector_menu(root: &Path) -> (Application, WorkspaceId) {
+    let (mut application, workspace_id) = sidebar_with_selector_open(root, true);
+    let anchor = drawn_at(&application, "acorn");
+    press(&mut application, MouseButton::Right, SIDEBAR_CELL, anchor);
+    let items = menu_item_labels(&application, anchor);
+    let index = items
+        .iter()
+        .position(|label| label.contains("Choose icon"))
+        .expect("the selector entry's menu offers Choose icon while Icons are shown");
+    press(
+        &mut application,
+        MouseButton::Left,
+        SIDEBAR_CELL + 1,
+        anchor + 1 + u16::try_from(index).expect("small menu index"),
+    );
+    assert!(
+        picker_is_drawn(&application),
+        "choosing the menu item opens the Icon Picker"
+    );
+    (application, workspace_id)
+}
+
+#[test]
+fn the_selector_entry_menu_offers_choose_icon_only_while_icons_are_shown() {
+    let workspace = workspace_dir();
+
+    let (mut with_icons, _) = sidebar_with_selector_open(workspace.path(), true);
+    let anchor = drawn_at(&with_icons, "acorn");
+    press(&mut with_icons, MouseButton::Right, SIDEBAR_CELL, anchor);
+    let items = menu_item_labels(&with_icons, anchor);
+    assert!(
+        items.iter().any(|label| label.contains("Choose icon")),
+        "the entry's menu offers Choose icon while Icons are shown: {items:?}"
+    );
+
+    let (mut without_icons, _) = sidebar_with_selector_open(workspace.path(), false);
+    let anchor = drawn_at(&without_icons, "acorn");
+    let before = rendered_application_rows_at(&without_icons, WIDE, TALL);
+    press(&mut without_icons, MouseButton::Right, SIDEBAR_CELL, anchor);
+    let after = rendered_application_rows_at(&without_icons, WIDE, TALL);
+    assert_eq!(
+        before, after,
+        "a right press draws no menu at all while Icons are hidden"
+    );
+}
+
+#[test]
+fn choosing_the_selector_menu_item_opens_the_icon_picker_over_the_workspace() {
+    let workspace = workspace_dir();
+    let (application, _) = open_picker_from_selector_menu(workspace.path());
+    assert!(picker_is_drawn(&application));
+}
+
+#[test]
+fn keyboard_choice_over_a_selector_entry_emits_set_workspace_icon_and_closes() {
+    let workspace = workspace_dir();
+    let (mut application, workspace_id) = open_picker_from_selector_menu(workspace.path());
+
+    type_text(&mut application, "rust");
+    let transition = press_key(&mut application, KeyCode::Enter);
+    let ApplicationTransition::SetWorkspaceIcon {
+        origin,
+        workspace_id: chosen,
+        icon,
+    } = transition
+    else {
+        panic!("Enter chooses the focused glyph, got {transition:?}");
+    };
+    assert_eq!(origin, Outlook::Local);
+    assert_eq!(chosen, workspace_id);
+    assert_eq!(icon, "dev-rust");
+    assert!(
+        !picker_is_drawn(&application),
+        "choosing closes the Icon Picker"
+    );
+}
+
+#[test]
+fn pointer_choice_over_a_selector_entry_does_the_same() {
+    let workspace = workspace_dir();
+    let (mut application, workspace_id) = open_picker_from_selector_menu(workspace.path());
+
+    type_text(&mut application, "rust");
+    let buffer = rendered_application_buffer(&application, WIDE, TALL);
+    // `dev-rust`'s own glyph, the query's only remaining cell.
+    let (column, row) = text_position(&buffer, "\u{e7a8}");
+    let transition = click_mouse(
+        &mut application,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .expect("press the cell");
+    let ApplicationTransition::SetWorkspaceIcon {
+        origin,
+        workspace_id: chosen,
+        icon,
+    } = transition
+    else {
+        panic!("a press on a cell chooses it, got {transition:?}");
+    };
+    assert_eq!(origin, Outlook::Local);
+    assert_eq!(chosen, workspace_id);
+    assert_eq!(icon, "dev-rust");
+    assert!(!picker_is_drawn(&application));
+}
+
+fn expect_workspace_listing(transition: ApplicationTransition) -> SessionListRequest {
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("opening the Workspace Picker asks for its Sessions, not {transition:?}");
+    };
+    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
+    assert_eq!(request.scope(), &SessionListScope::AllWorkspaces);
+    request
+}
+
+/// The Workspace Picker showing two Workspaces' rows, `show_icons` as given.
+/// Answers with the Application and the "acorn" Workspace's own identity.
+fn workspace_picker_with_two_workspaces(
+    root: &Path,
+    show_icons: bool,
+) -> (Application, WorkspaceId) {
+    let acorn = root.join("acorn");
+    let birch = root.join("birch");
+    let mut application = connected_application(root);
+    deliver_settings(&mut application, icons_shown(show_icons));
+    let request = expect_workspace_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                listed_as(SessionId::new(), "Acorn work", &acorn),
+                listed_as(SessionId::new(), "Birch work", &birch),
+            ],
+        })
+        .expect("hydrate the Workspace Picker");
+    (application, WorkspaceId::directory(&acorn))
+}
+
+/// Opens the Icon Picker on the "acorn" Workspace Picker row, through its own
+/// context menu.
+fn open_picker_from_workspace_picker_row_menu(root: &Path) -> (Application, WorkspaceId) {
+    let (mut application, workspace_id) = workspace_picker_with_two_workspaces(root, true);
+    let buffer = rendered_application_buffer(&application, WIDE, TALL);
+    let (column, row) = text_position(&buffer, "acorn");
+    press(&mut application, MouseButton::Right, column, row);
+    let items = menu_item_labels(&application, row);
+    let index = items
+        .iter()
+        .position(|label| label.contains("Choose icon"))
+        .expect("the row's menu offers Choose icon while Icons are shown");
+    press(
+        &mut application,
+        MouseButton::Left,
+        column + 1,
+        row + 1 + u16::try_from(index).expect("small menu index"),
+    );
+    assert!(
+        picker_is_drawn(&application),
+        "choosing the menu item opens the Icon Picker"
+    );
+    (application, workspace_id)
+}
+
+#[test]
+fn the_workspace_picker_row_menu_offers_choose_icon_only_while_icons_are_shown() {
+    let workspace = workspace_dir();
+
+    let (mut with_icons, _) = workspace_picker_with_two_workspaces(workspace.path(), true);
+    let buffer = rendered_application_buffer(&with_icons, WIDE, TALL);
+    let (column, row) = text_position(&buffer, "acorn");
+    press(&mut with_icons, MouseButton::Right, column, row);
+    let items = menu_item_labels(&with_icons, row);
+    assert!(
+        items.iter().any(|label| label.contains("Choose icon")),
+        "the row's menu offers Choose icon while Icons are shown: {items:?}"
+    );
+
+    let (mut without_icons, _) = workspace_picker_with_two_workspaces(workspace.path(), false);
+    let buffer = rendered_application_buffer(&without_icons, WIDE, TALL);
+    let (column, row) = text_position(&buffer, "acorn");
+    let before = rendered_application_rows_at(&without_icons, WIDE, TALL);
+    press(&mut without_icons, MouseButton::Right, column, row);
+    let after = rendered_application_rows_at(&without_icons, WIDE, TALL);
+    assert_eq!(
+        before, after,
+        "a right press draws no menu at all while Icons are hidden"
+    );
+}
+
+#[test]
+fn choosing_the_workspace_picker_row_menu_item_opens_the_icon_picker() {
+    let workspace = workspace_dir();
+    let (application, _) = open_picker_from_workspace_picker_row_menu(workspace.path());
+    assert!(picker_is_drawn(&application));
+}
+
+#[test]
+fn keyboard_choice_over_a_workspace_picker_row_emits_set_workspace_icon_and_closes() {
+    let workspace = workspace_dir();
+    let (mut application, workspace_id) =
+        open_picker_from_workspace_picker_row_menu(workspace.path());
+
+    type_text(&mut application, "rust");
+    let transition = press_key(&mut application, KeyCode::Enter);
+    let ApplicationTransition::SetWorkspaceIcon {
+        origin,
+        workspace_id: chosen,
+        icon,
+    } = transition
+    else {
+        panic!("Enter chooses the focused glyph, got {transition:?}");
+    };
+    assert_eq!(origin, Outlook::Local);
+    assert_eq!(chosen, workspace_id);
+    assert_eq!(icon, "dev-rust");
+    assert!(
+        !picker_is_drawn(&application),
+        "choosing closes the Icon Picker"
+    );
+}
+
+#[test]
+fn pointer_choice_over_a_workspace_picker_row_does_the_same() {
+    let workspace = workspace_dir();
+    let (mut application, workspace_id) =
+        open_picker_from_workspace_picker_row_menu(workspace.path());
+
+    type_text(&mut application, "rust");
+    let buffer = rendered_application_buffer(&application, WIDE, TALL);
+    let (column, row) = text_position(&buffer, "\u{e7a8}");
+    let transition = click_mouse(
+        &mut application,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .expect("press the cell");
+    let ApplicationTransition::SetWorkspaceIcon {
+        origin,
+        workspace_id: chosen,
+        icon,
+    } = transition
+    else {
+        panic!("a press on a cell chooses it, got {transition:?}");
+    };
+    assert_eq!(origin, Outlook::Local);
+    assert_eq!(chosen, workspace_id);
+    assert_eq!(icon, "dev-rust");
     assert!(!picker_is_drawn(&application));
 }

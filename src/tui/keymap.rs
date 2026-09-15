@@ -372,8 +372,39 @@ pub(super) fn command_for_theme_picker_event(event: InputEvent) -> Option<Comman
     command_for_picker_event(event, &THEME_PICKER_COMMANDS)
 }
 
+/// A mouse event answers through the terminal's own table rather than the
+/// picker's keyboard bindings, which is what turns a right press into
+/// [`CommandId::OpenContextMenuAt`] — nothing else here has ever needed the
+/// pointer before, since the picker's rows are chosen by the keyboard alone.
 pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<CommandId> {
-    command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS)
+    match event {
+        event @ InputEvent::Mouse(_) => command_for_terminal_event(event),
+        event => command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS),
+    }
+}
+
+/// The Workspace Picker row menu is the newest thing on screen while it
+/// stands open, on the same terms the Sidebar's own row menu is: Enter acts
+/// on its one item, Esc puts it away leaving the row alone, and the pointer
+/// answers as it does everywhere else — a press inside the menu's own box
+/// reaches the click handler as an ordinary click, and one outside it is
+/// already an Escape by the time it gets here (see
+/// `SemanticCommandId::PointerClick`'s own outside-overlay handling).
+pub(super) fn command_for_workspace_picker_menu_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuSelect,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
 }
 
 /// The Sidebar has the keyboard and not the mouse. Up and Down move through

@@ -3105,6 +3105,20 @@ pub struct SetSessionIconRequest {
     pub icon: String,
 }
 
+/// The user's own choice of a Workspace's Icon, by Icon Catalog name and the
+/// Workspace's identity — carried in the body rather than a URL path segment,
+/// since a [`WorkspaceId`]'s inner string may itself contain path characters.
+/// Refused where the Catalog does not carry the named Icon, or where this
+/// server knows no such Workspace at all. Unlike a derived Icon, which only
+/// ever fills an absence, a chosen Icon replaces whatever the Workspace
+/// already carried — a user's choice always stands.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetWorkspaceIconRequest {
+    pub workspace_id: WorkspaceId,
+    pub icon: String,
+}
+
 /// One report that a Client has a root Session open in its main view. The
 /// identity makes transport retries one operation rather than later Views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

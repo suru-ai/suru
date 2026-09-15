@@ -167,6 +167,7 @@ pub(super) enum SelectionSurface {
     Subagents,
     SidebarMenu,
     Icons,
+    WorkspacePickerMenu,
 }
 
 /// A prose surface recorded by the draw, before selection highlighting.

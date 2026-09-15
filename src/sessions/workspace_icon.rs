@@ -19,6 +19,15 @@
 //! first, and the other's reply lands on an absence that is no longer there
 //! and is discarded. Failure records nothing at all, so the next Session
 //! created in that Workspace tries again; success ends attempts for good.
+//!
+//! A user may also choose a Workspace's Icon from the Icon Picker, through
+//! [`SessionStore::set_workspace_icon`]. Unlike a derivation, a choice always
+//! stands: it replaces whatever the Workspace already carried, and once
+//! landed it stands against every later derivation the same way a chosen
+//! Session Icon stands against one (see [`super::title::SessionStore::set_icon`]).
+//! Both ways an Icon can land share the write, regroup, and publish this
+//! module does once, in [`SessionStore::land_workspace_icon`]; only the guard
+//! at the top differs.
 
 use std::path::{Path, PathBuf};
 
@@ -153,6 +162,30 @@ fn find_readme(root: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+/// How a Workspace's Icon lands: filling an absence only, the way a
+/// derivation's does, or replacing whatever stood there, the way a user's own
+/// choice does. The two calls into [`SessionStore::land_workspace_icon`]
+/// differ only in this — everything else about landing an Icon is shared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IconLanding {
+    /// [`SessionStore::commit_workspace_icon`]'s rule: a Workspace that
+    /// already carries an Icon keeps it.
+    FillAbsence,
+    /// [`SessionStore::set_workspace_icon`]'s rule: a user's choice always
+    /// stands, whatever the Workspace carried before.
+    Replace,
+}
+
+/// Why [`SessionStore::set_workspace_icon`] refused a user's chosen Icon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetWorkspaceIconError {
+    /// This server groups no Session under the named Workspace and holds no
+    /// durable row for it either — there is nothing here to set an Icon on.
+    WorkspaceNotFound,
+    /// The named Icon does not resolve in the Icon Catalog.
+    UnknownIcon,
+}
+
 impl SessionStore {
     /// The Icon a Workspace carries, or `None` for one with no Icon yet — read
     /// off the same in-memory record [`Self::commit_workspace_icon`] writes.
@@ -175,23 +208,69 @@ impl SessionStore {
     /// ([`super::title::SessionStore::replace_derived_title`]), applied here
     /// to the one piece of state a Workspace owns for itself (see ADR 0027 for
     /// why nothing broader exists). Answers `true` where the Icon lands.
-    ///
-    /// Every Session presently grouped under this Workspace is regrouped with
-    /// the Icon in hand — through [`super::SessionStore::regroup`], which
-    /// reads it back out of the same durable record this just wrote — so an
-    /// open Session's own header repaints through the ordinary
-    /// `SessionChange::WorkspaceChanged` path rather than a bespoke one, and
-    /// every listed Session catches up the same way it does for any other
-    /// Workspace change. A single, separate
-    /// [`SessionCatalogChange::WorkspaceIconChanged`] follows for the Sessions
-    /// a listing may hold without any of them open.
     pub(crate) fn commit_workspace_icon(&self, workspace_id: &WorkspaceId, icon: String) -> bool {
+        self.land_workspace_icon(workspace_id, icon, IconLanding::FillAbsence)
+    }
+
+    /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog,
+    /// replacing whatever it already carried — derived earlier, chosen
+    /// before, or absent — because a user's choice always stands rather than
+    /// only ever filling an absence the way derivation does. Refuses a name
+    /// the Icon Catalog does not carry, and refuses a Workspace this server
+    /// does not know at all: one with no Session presently grouped under it
+    /// and no durable row of its own, which is the only way this server could
+    /// ever have heard of it.
+    pub(crate) fn set_workspace_icon(
+        &self,
+        workspace_id: &WorkspaceId,
+        icon: &str,
+    ) -> Result<(), SetWorkspaceIconError> {
+        if icon_catalog::glyph(icon).is_none() {
+            return Err(SetWorkspaceIconError::UnknownIcon);
+        }
+        let known = {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            state.workspace_icons.contains_key(workspace_id)
+                || state
+                    .sessions
+                    .values()
+                    .any(|record| &record.snapshot.session.workspace.id == workspace_id)
+        };
+        if !known {
+            return Err(SetWorkspaceIconError::WorkspaceNotFound);
+        }
+        self.land_workspace_icon(workspace_id, icon.to_owned(), IconLanding::Replace);
+        Ok(())
+    }
+
+    /// Writes a Workspace's Icon into the in-memory cache under `landing`'s
+    /// rule, persists it, regroups every Session presently held under that
+    /// Workspace — through [`super::SessionStore::regroup`], which reads the
+    /// Icon back out of the same durable record this just wrote — so an open
+    /// Session's own header repaints through the ordinary
+    /// `SessionChange::WorkspaceChanged` path rather than a bespoke one, and
+    /// publishes a single, separate
+    /// [`SessionCatalogChange::WorkspaceIconChanged`] for the Sessions a
+    /// listing may hold without any of them open. Answers whether the write
+    /// landed: [`IconLanding::FillAbsence`] answers `false`, and does nothing
+    /// else at all, where the Workspace already carried one.
+    fn land_workspace_icon(
+        &self,
+        workspace_id: &WorkspaceId,
+        icon: String,
+        landing: IconLanding,
+    ) -> bool {
         let grouped = {
             let mut state = self
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
-            if state.workspace_icons.contains_key(workspace_id) {
+            if landing == IconLanding::FillAbsence
+                && state.workspace_icons.contains_key(workspace_id)
+            {
                 return false;
             }
             state
@@ -210,14 +289,20 @@ impl SessionStore {
                 })
                 .collect::<Vec<_>>()
         };
-        self.storage
-            .save_workspace_icon(workspace_id.clone(), icon.clone());
+        match landing {
+            IconLanding::FillAbsence => self
+                .storage
+                .save_workspace_icon(workspace_id.clone(), icon.clone()),
+            IconLanding::Replace => self
+                .storage
+                .replace_workspace_icon(workspace_id.clone(), icon.clone()),
+        }
         for (session_id, workspace, checkout) in grouped {
             if let Err(error) = self.regroup(session_id, workspace, checkout) {
                 tracing::warn!(
                     %session_id,
                     %error,
-                    "could not regroup a Session after its Workspace's Icon was derived"
+                    "could not regroup a Session after its Workspace's Icon changed"
                 );
             }
         }
@@ -413,6 +498,83 @@ mod tests {
             regrouped.session.workspace.icon.as_deref(),
             Some("md-bug"),
             "the Session sharing this Workspace was regrouped with the committed Icon"
+        );
+    }
+
+    /// A user's own choice replaces whatever a Workspace already carried —
+    /// the opposite rule from [`Self::commit_workspace_icon`]'s own guard
+    /// test above — and is refused for a Catalog name the Icon Catalog does
+    /// not carry, or a Workspace this store has never heard of at all.
+    #[tokio::test]
+    async fn a_chosen_workspace_icon_replaces_whatever_stood_there_and_refuses_the_unknown() {
+        use crate::{
+            protocol::{CreateSessionRequest, InitialPrompt, PromptId},
+            storage::{StorageRepository, StorageWriter},
+        };
+
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let created = store
+            .create(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Explain the seam".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .expect("create Session");
+        let crate::sessions::StoreOutcome::Created(snapshot) = created else {
+            panic!("a fresh Prompt creates a Session");
+        };
+        let workspace_id = snapshot.session.workspace.id.clone();
+
+        assert_eq!(
+            store.set_workspace_icon(&workspace_id, "not-a-catalog-name"),
+            Err(SetWorkspaceIconError::UnknownIcon)
+        );
+        assert_eq!(
+            store.set_workspace_icon(
+                &WorkspaceId("no-session-or-row-names-this-one".to_owned()),
+                "md-bug"
+            ),
+            Err(SetWorkspaceIconError::WorkspaceNotFound)
+        );
+        assert_eq!(store.workspace_icon(&workspace_id), None);
+
+        assert_eq!(store.set_workspace_icon(&workspace_id, "md-bug"), Ok(()));
+        assert_eq!(
+            store.workspace_icon(&workspace_id),
+            Some("md-bug".to_owned())
+        );
+
+        assert_eq!(
+            store.set_workspace_icon(&workspace_id, "dev-rust"),
+            Ok(()),
+            "a later choice replaces the one before it, unlike a derivation's own guard"
+        );
+        assert_eq!(
+            store.workspace_icon(&workspace_id),
+            Some("dev-rust".to_owned())
+        );
+
+        let regrouped = store
+            .subscribe(snapshot.session.id)
+            .expect("the Session remains held")
+            .snapshot;
+        assert_eq!(
+            regrouped.session.workspace.icon.as_deref(),
+            Some("dev-rust"),
+            "the Session sharing this Workspace was regrouped with the chosen Icon"
         );
     }
 }

@@ -98,9 +98,11 @@ impl LandingAgentSelectionRow {
 
 /// A Workspace's one piece of durable, Workspace-owned state: its Icon (see
 /// ADR 0027 for why nothing broader lives here). `created_at` and
-/// `updated_at` are both stamped once, at the single insert this row is ever
-/// written by — a derivation only ever fills an absence, so there is nothing
-/// later to update.
+/// `updated_at` both stamp the row's first write; a derivation only ever
+/// fills an absence, so its own write is the only one this row ever sees
+/// unless a user's later choice replaces the Icon — the one write that moves
+/// `updated_at` again, through `StorageRepository::replace_workspace_icon`
+/// rather than through this row's own `Insertable` derive.
 #[derive(AsChangeset, Insertable, Queryable, Selectable)]
 #[diesel(table_name = workspaces)]
 pub(super) struct WorkspaceRow {

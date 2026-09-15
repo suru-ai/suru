@@ -419,6 +419,37 @@ impl StorageRepository {
         Ok(())
     }
 
+    /// Records a Workspace's Icon for good, replacing whatever the table
+    /// already held for it. Where [`Self::save_workspace_icon`]'s
+    /// `on_conflict` guards a derivation's write-once rule, this is the other
+    /// half of that same rule: a user's choice always stands, so it must land
+    /// whether the table already carries a derived Icon, an earlier choice, or
+    /// nothing at all — an upsert rather than an insert-if-absent. Only the
+    /// Icon and `updated_at` move on conflict; `created_at` stays whatever the
+    /// row's first write stamped it, exactly as an ordinary update would leave
+    /// it.
+    fn replace_workspace_icon(
+        &self,
+        workspace_id: WorkspaceId,
+        icon: String,
+    ) -> Result<(), StorageError> {
+        let stamp = SessionTimestamp::now();
+        let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), stamp);
+        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(workspaces::table)
+            .values(&row)
+            .on_conflict(workspaces::id)
+            .do_update()
+            .set((
+                workspaces::icon.eq(Some(icon)),
+                workspaces::updated_at.eq(updated_at),
+            ))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
+        Ok(())
+    }
+
     fn save_sessions(&self, persisted: Vec<PersistedSession>) -> Result<(), StorageError> {
         if persisted.is_empty() {
             return Ok(());

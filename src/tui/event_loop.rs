@@ -855,6 +855,19 @@ impl RunLoop {
                     SessionOperation::SetSessionIcon { session_id, icon },
                 );
             }
+            ApplicationTransition::SetWorkspaceIcon {
+                origin,
+                workspace_id,
+                icon,
+            } => {
+                spawn_workspace_icon_set(
+                    self.client.session_commands_for(origin.clone()),
+                    origin,
+                    workspace_id,
+                    icon,
+                    self.channels.submissions.clone(),
+                );
+            }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
@@ -1176,6 +1189,7 @@ impl RunLoop {
             | ApplicationTransition::DeleteSession(_)
             | ApplicationTransition::SettleSession { .. }
             | ApplicationTransition::SetSessionIcon { .. }
+            | ApplicationTransition::SetWorkspaceIcon { .. }
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
@@ -1575,6 +1589,13 @@ impl RunLoop {
             SubmissionResult::SettingMutationFailed(error) => {
                 self.application
                     .handle_event(ApplicationEvent::SettingMutationFailed(error))?;
+            }
+            SubmissionResult::WorkspaceIconSetFailed { origin, error } => {
+                if self.application.outlook() != &origin {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                self.application
+                    .handle_event(ApplicationEvent::SessionOperationFailed(error))?;
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -2274,6 +2295,13 @@ enum SubmissionResult {
     },
     SettingMutated(Box<SettingsSnapshot>),
     SettingMutationFailed(String),
+    /// A user's chosen Workspace Icon was refused or could not be sent. A
+    /// success carries no result of its own: it reaches every client,
+    /// including this one, through the ordinary catalog stream instead.
+    WorkspaceIconSetFailed {
+        origin: Outlook,
+        error: String,
+    },
 }
 
 enum ModelPickerResult {
@@ -2744,6 +2772,29 @@ fn operation_result(session: SessionReference, result: anyhow::Result<()>) -> Su
             error: error.to_string(),
         },
     }
+}
+
+/// Sends a user's chosen Workspace Icon to its own Origin. The catalog
+/// carries the resulting `WorkspaceIconChanged` change to every client, this
+/// one included, through the ordinary catalog stream, so nothing further is
+/// done with a success beyond that; a failure is reported the same way a
+/// Session operation's is, gated on the same Outlook a Session operation's
+/// failure gates on.
+fn spawn_workspace_icon_set(
+    commands: SessionCommandClient,
+    origin: Outlook,
+    workspace_id: crate::protocol::WorkspaceId,
+    icon: String,
+    results: UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = commands.set_workspace_icon(&workspace_id, &icon).await {
+            let _ = results.send(SubmissionResult::WorkspaceIconSetFailed {
+                origin,
+                error: error.to_string(),
+            });
+        }
+    });
 }
 
 /// Sends one Setting's typed edit to the server, which owns the Config

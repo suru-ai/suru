@@ -1,13 +1,22 @@
 //! Workspace Picker state: the Workspaces a Session listing puts on offer,
 //! ordered for choosing and narrowed by what the reader types.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cell::RefCell,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
-use crate::protocol::{Outlook, SessionListItem, WorkspacePaths};
+use ratatui::layout::Position;
+
+use crate::protocol::{Outlook, SessionListItem, WorkspaceId, WorkspacePaths};
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface, fuzzy::fuzzy_matches,
-    session_listing::SessionListing, sidebar::workspace_name,
+    SessionListRequest, SessionListScope, SessionListSurface,
+    commands::{SemanticCommandId, SemanticInvocation},
+    fuzzy::fuzzy_matches,
+    session_listing::SessionListing,
+    sidebar::workspace_name,
 };
 
 #[derive(Clone, Debug)]
@@ -26,11 +35,24 @@ pub(super) struct WorkspacePicker {
     /// The Workspace the reader is on, held by identity rather than as a row
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
-    selected: Option<crate::protocol::WorkspaceId>,
+    selected: Option<WorkspaceId>,
     /// Why the selected Workspace could not be read when the reader chose it.
     /// It belongs to the picker rather than to the listing: the row is still
     /// true of past work even when its directory has since disappeared.
     refusal: Option<String>,
+    /// One row's own context menu, opened by a right press on it. Its only
+    /// item is choosing that Workspace's Icon, so it stands only while
+    /// `appearance.showIcons` is on (see [`Self::open_menu_at`]). Once open,
+    /// every press this picker receives (see [`Self::menu_is_open`]'s callers
+    /// in `state.rs`) acts on its one item — the whole box drawn for it is the
+    /// item, so there is no finer geometry to resolve a press against the way
+    /// the Sidebar's own multi-item menu needs; a press missing the box
+    /// entirely never reaches this far; see `SemanticCommandId::PointerClick`.
+    menu: Option<WorkspacePickerMenu>,
+    /// Where the last frame drew each row, recorded at draw time and resolved
+    /// against a right press the same way [`super::icon_picker::IconPicker`]
+    /// records its own cells.
+    row_geometry: RefCell<Vec<WorkspacePickerRowGeometry>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +71,45 @@ pub(super) struct WorkspacePickerRow {
     /// carries one and the reader keeps Icons on. `None` draws the plain
     /// folder glyph in its place.
     pub(super) icon: Option<char>,
+    /// The Workspace's own identity, carried so a context menu opened on this
+    /// row can name it precisely rather than re-deriving it from a name or
+    /// path a query may already have narrowed away.
+    pub(super) workspace_id: WorkspaceId,
+    /// The Origin this Workspace stands on, carried the same way a listed
+    /// Session's own reference carries it, so a chosen Icon for a Remote
+    /// Workspace routes to that Workspace's own Server rather than always
+    /// this Client's local one.
+    pub(super) origin: Outlook,
+}
+
+/// One Workspace Picker row's own context menu: the target it names, and
+/// where the reader opened it.
+#[derive(Clone, Debug)]
+struct WorkspacePickerMenu {
+    origin: Outlook,
+    workspace_id: WorkspaceId,
+    anchor: Position,
+}
+
+/// The Workspace Picker row menu as a frame draws it: an anchor and the one
+/// label it ever shows. Unlike the Sidebar's own row menu, this one never
+/// grows past a single item, so there is nothing here to select between.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WorkspacePickerMenuView {
+    pub(super) anchor: Position,
+    pub(super) label: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspacePickerRowGeometry {
+    row: u16,
+    columns: Range<u16>,
+    workspace_id: WorkspaceId,
+    /// The row's own Origin, carried from [`WorkspacePickerRow::origin`]
+    /// rather than re-read off the listing at hit-testing time, so a right
+    /// press always names the Origin the row it landed on was actually drawn
+    /// for.
+    origin: Outlook,
 }
 
 impl WorkspacePicker {
@@ -64,6 +125,8 @@ impl WorkspacePicker {
             query: String::new(),
             selected: None,
             refusal: None,
+            menu: None,
+            row_geometry: RefCell::new(Vec::new()),
         }
     }
 
@@ -72,6 +135,7 @@ impl WorkspacePicker {
         self.query.clear();
         self.selected = None;
         self.refusal = None;
+        self.menu = None;
         self.listing.clear_error();
         self.listing.refresh()
     }
@@ -81,6 +145,7 @@ impl WorkspacePicker {
         self.query.clear();
         self.selected = None;
         self.refusal = None;
+        self.menu = None;
         self.listing.clear();
     }
 
@@ -224,6 +289,7 @@ impl WorkspacePicker {
 
     fn rows(&self) -> Vec<WorkspacePickerRow> {
         let current = self.listing.current_workspace().to_owned();
+        let origin = self.listing.outlook().clone();
         self.offered()
             .into_iter()
             .map(|workspace| WorkspacePickerRow {
@@ -239,6 +305,8 @@ impl WorkspacePicker {
                     .as_deref()
                     .and_then(crate::icon_catalog::glyph),
                 path: workspace.path,
+                workspace_id: workspace.id,
+                origin: origin.clone(),
             })
             .collect()
     }
@@ -306,5 +374,86 @@ impl WorkspacePicker {
             return;
         }
         self.selected = offered.first().map(|workspace| workspace.id.clone());
+    }
+
+    /// Opens a row's own context menu at `position`, naming the Workspace the
+    /// row it landed on stands for — only while Icons are shown, since
+    /// choosing one is the only thing this menu ever offers. A press outside
+    /// every row, or with Icons hidden, opens nothing, leaving whatever menu
+    /// already stood there put away regardless.
+    pub(super) fn open_menu_at(&mut self, position: Position, show_icons: bool) {
+        self.menu = None;
+        if !show_icons {
+            return;
+        }
+        let Some((origin, workspace_id)) = self.hit_row(position) else {
+            return;
+        };
+        self.menu = Some(WorkspacePickerMenu {
+            origin,
+            workspace_id,
+            anchor: position,
+        });
+    }
+
+    pub(super) fn menu_is_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
+    /// Puts the row menu away, leaving the row it stood on alone.
+    pub(super) fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// The row menu as a frame draws it, and `None` while none stands open.
+    pub(super) fn menu(&self) -> Option<WorkspacePickerMenuView> {
+        self.menu.as_ref().map(|menu| WorkspacePickerMenuView {
+            anchor: menu.anchor,
+            label: "Choose icon",
+        })
+    }
+
+    /// The invocation the row menu's one item asks for, or `None` while no
+    /// menu stands open. Closing the menu is left to the caller, the same way
+    /// [`super::sidebar::Sidebar::activate_menu_item`] leaves it.
+    pub(super) fn activate_menu(&self) -> Option<SemanticInvocation> {
+        let menu = self.menu.as_ref()?;
+        Some(
+            SemanticCommandId::WorkspaceIconChoose
+                .on_workspace(menu.origin.clone(), menu.workspace_id.clone()),
+        )
+    }
+
+    /// Gives up the last frame's row geometry, called as every frame begins,
+    /// so a press resolves only against cells actually on screen.
+    pub(super) fn forget_frame(&self) {
+        self.row_geometry.borrow_mut().clear();
+    }
+
+    /// Records where the frame in force drew one row, so a right press over
+    /// it can open that row's own menu.
+    pub(super) fn record_row(
+        &self,
+        row: u16,
+        columns: Range<u16>,
+        workspace_id: WorkspaceId,
+        origin: Outlook,
+    ) {
+        self.row_geometry
+            .borrow_mut()
+            .push(WorkspacePickerRowGeometry {
+                row,
+                columns,
+                workspace_id,
+                origin,
+            });
+    }
+
+    fn hit_row(&self, position: Position) -> Option<(Outlook, WorkspaceId)> {
+        self.row_geometry
+            .borrow()
+            .iter()
+            .find(|cell| cell.row == position.y && cell.columns.contains(&position.x))
+            .map(|cell| (cell.origin.clone(), cell.workspace_id.clone()))
     }
 }

@@ -13,7 +13,7 @@ use ratatui::layout::Position;
 use crate::protocol::{
     AutoSettle, EffectiveSettings, Outlook, Remote, ResolveWorkspaceRequest, SessionId,
     SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
-    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility,
+    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility, WorkspaceId,
 };
 
 use super::{
@@ -720,7 +720,9 @@ pub(super) enum SidebarActivation {
 }
 
 /// The items a Sidebar row's context menu offers. A recovering Remote offers
-/// only a retry; a Session offers its shelf action and deletion.
+/// only a retry; a Session offers its shelf action and deletion; a Workspace
+/// entry offers nothing but choosing its Icon, and only while there is one to
+/// choose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SidebarMenuItem {
     TryAgain,
@@ -731,6 +733,11 @@ pub(super) enum SidebarMenuItem {
     /// deletion cannot pick from, and no glyph the Icon Picker offered would
     /// show through a Setting that hides every one already drawn.
     ChooseIcon,
+    /// Opens the Icon Picker over this selector entry's Workspace. The only
+    /// item a Workspace entry's menu ever offers, so the menu itself opens
+    /// only while `appearance.showIcons` is on — there is nothing else here
+    /// for the reader to press.
+    ChooseWorkspaceIcon,
     Delete,
 }
 
@@ -758,6 +765,15 @@ enum SidebarMenuSubject {
         unreadable: bool,
     },
     Unreachable(Outlook),
+    /// One Workspace the selector offers, named by the Origin it stands on
+    /// and its own identity — the same pair [`SemanticSubject::Workspace`]
+    /// carries, since a selector entry names no Session to carry it through.
+    ///
+    /// [`SemanticSubject::Workspace`]: super::commands::SemanticSubject::Workspace
+    Workspace {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    },
 }
 
 impl SidebarMenuItem {
@@ -769,7 +785,7 @@ impl SidebarMenuItem {
             Self::TryAgain => "Try again now",
             Self::Settle => "Settle",
             Self::Unsettle => "Unsettle",
-            Self::ChooseIcon => "Choose icon",
+            Self::ChooseIcon | Self::ChooseWorkspaceIcon => "Choose icon",
             Self::Delete if confirming_delete => "Delete — confirm",
             Self::Delete => "Delete",
         }
@@ -783,6 +799,7 @@ impl SidebarMenuItem {
             Self::Settle => SemanticCommandId::SessionSettle,
             Self::Unsettle => SemanticCommandId::SessionUnsettle,
             Self::ChooseIcon => SemanticCommandId::SessionIconChoose,
+            Self::ChooseWorkspaceIcon => SemanticCommandId::WorkspaceIconChoose,
             Self::Delete => SemanticCommandId::SessionDelete,
         }
     }
@@ -792,7 +809,10 @@ impl SidebarMenu {
     /// What the menu offers, top to bottom: what the row's shelf asks for —
     /// except on a row the client could not read, which no shelf operation can
     /// act on — choosing an Icon while Icons are shown, and Delete, which
-    /// every row keeps.
+    /// every row keeps. A Workspace entry offers only choosing its Icon, and
+    /// nothing at all where `show_icons` is off — [`Self::open_menu_at`]
+    /// never opens one there in the first place, but a Setting toggled while
+    /// this menu already stands must still leave it with nothing to press.
     fn items(&self, show_icons: bool) -> Vec<SidebarMenuItem> {
         match &self.subject {
             SidebarMenuSubject::Unreachable(_) => vec![SidebarMenuItem::TryAgain],
@@ -811,20 +831,27 @@ impl SidebarMenu {
                 items.push(SidebarMenuItem::Delete);
                 items
             }
+            SidebarMenuSubject::Workspace { .. } => {
+                if show_icons {
+                    vec![SidebarMenuItem::ChooseWorkspaceIcon]
+                } else {
+                    vec![]
+                }
+            }
         }
     }
 
     fn session(&self) -> Option<&SessionReference> {
         match &self.subject {
             SidebarMenuSubject::Session { reference, .. } => Some(reference),
-            SidebarMenuSubject::Unreachable(_) => None,
+            SidebarMenuSubject::Unreachable(_) | SidebarMenuSubject::Workspace { .. } => None,
         }
     }
 
     fn unreachable_origin(&self) -> Option<&Outlook> {
         match &self.subject {
             SidebarMenuSubject::Unreachable(outlook) => Some(outlook),
-            SidebarMenuSubject::Session { .. } => None,
+            SidebarMenuSubject::Session { .. } | SidebarMenuSubject::Workspace { .. } => None,
         }
     }
 }
@@ -1299,6 +1326,22 @@ impl Sidebar {
                 self.release_borrowed_focus();
                 SidebarMenuSubject::Unreachable(outlook)
             }
+            // A Workspace entry's only item is choosing its Icon, so a menu
+            // with Icons hidden would have nothing at all to offer — the same
+            // reasoning `SidebarMenuItem::ChooseIcon` already follows for a
+            // Session row, applied here to the entry's one and only item.
+            Some(SidebarTarget::Scope(SidebarListingScope::Workspace(workspace)))
+                if self.show_icons =>
+            {
+                self.focus_on(SidebarTarget::Scope(SidebarListingScope::Workspace(
+                    workspace.clone(),
+                )));
+                self.release_borrowed_focus();
+                SidebarMenuSubject::Workspace {
+                    origin: self.listing.outlook().clone(),
+                    workspace_id: workspace.id,
+                }
+            }
             _ => return,
         };
         self.menu = Some(SidebarMenu {
@@ -1356,6 +1399,13 @@ impl Sidebar {
             return;
         };
         let length = menu.items(show_icons).len() as isize;
+        // A Workspace entry's menu offers nothing at all once Icons are
+        // hidden — see `SidebarMenu::items` — so there is no item for the
+        // arrows to land on; leaving the selection at rest is what a menu
+        // with nothing to select does everywhere else in Suru.
+        if length == 0 {
+            return;
+        }
         menu.selected = (menu.selected as isize + distance).rem_euclid(length) as usize;
     }
 
@@ -1396,6 +1446,10 @@ impl Sidebar {
         SidebarPress::Invoke(match subject {
             SidebarMenuSubject::Session { reference, .. } => item.command().on_session(reference),
             SidebarMenuSubject::Unreachable(outlook) => item.command().on_origin(outlook),
+            SidebarMenuSubject::Workspace {
+                origin,
+                workspace_id,
+            } => item.command().on_workspace(origin, workspace_id),
         })
     }
 

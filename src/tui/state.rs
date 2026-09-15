@@ -25,7 +25,7 @@ use crate::{
         ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
         SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
         ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace,
+        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -51,6 +51,7 @@ use super::{
         command_for_sidebar_menu_event, command_for_subagent_picker_event,
         command_for_subagent_view_event, command_for_terminal_event,
         command_for_theme_picker_event, command_for_workspace_picker_event,
+        command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -2593,6 +2594,8 @@ impl TuiState {
             Some(SelectionSurface::Settings)
         } else if self.worktree_picker.open {
             Some(SelectionSurface::Worktrees)
+        } else if self.workspace_picker.menu_is_open() {
+            Some(SelectionSurface::WorkspacePickerMenu)
         } else if self.workspace_picker.is_open() {
             Some(SelectionSurface::Workspaces)
         } else if self.session_picker.is_open() {
@@ -3704,6 +3707,14 @@ pub enum ApplicationTransition {
     /// other Session act.
     SetSessionIcon {
         session: SessionReference,
+        icon: String,
+    },
+    /// A user's own choice of a Workspace's Icon by Icon Catalog name, made
+    /// through the Icon Picker. Routed to the Workspace's own Origin like
+    /// every other Workspace act.
+    SetWorkspaceIcon {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
         icon: String,
     },
     PreviewCheckoutRemoval {
@@ -4832,7 +4843,14 @@ impl Application {
             }
             CommandId::ClickAt { position } => self.handle_click(position),
             CommandId::OpenContextMenuAt { position } => {
-                self.state.sidebar.open_menu_at(position);
+                if self.state.workspace_picker.is_open() {
+                    let show_icons = self.state.settings().appearance.show_icons;
+                    self.state
+                        .workspace_picker
+                        .open_menu_at(position, show_icons);
+                } else {
+                    self.state.sidebar.open_menu_at(position);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             command @ (CommandId::SelectPreviousCompletion
@@ -5063,6 +5081,15 @@ impl Application {
                     ApplicationTransition::Continue
                 }
             });
+        }
+        // The Workspace Picker's own row menu stands over the picker while it
+        // is up, so it answers next: a press anywhere inside its one-item box
+        // acts on that item, the same command Enter invokes — a press outside
+        // the box never reaches here at all, since `PointerClick` already
+        // turned it into the Escape that closes the menu instead (see
+        // `active_selection_overlay_area`).
+        if self.state.workspace_picker.menu_is_open() {
+            return self.activate_workspace_picker_menu();
         }
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
@@ -5733,6 +5760,38 @@ impl Application {
             _ => {}
         }
         Ok(ApplicationTransition::Continue)
+    }
+
+    /// Handles the Workspace Picker row menu's own commands, routed here only
+    /// while it is open: the menu has exactly one item — Choose icon, the
+    /// only reason the menu ever opens at all — so Enter and a click both ask
+    /// for the very same invocation the menu already knows how to build.
+    fn handle_workspace_picker_menu_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> Result<ApplicationTransition> {
+        if !self.state.workspace_picker.menu_is_open() {
+            return Ok(ApplicationTransition::Continue);
+        }
+        match command {
+            SemanticCommandId::WorkspacePickerMenuClose => {
+                self.state.workspace_picker.close_menu();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::WorkspacePickerMenuSelect => self.activate_workspace_picker_menu(),
+            _ => Ok(ApplicationTransition::Continue),
+        }
+    }
+
+    /// Acts on the Workspace Picker row menu's one item and closes it,
+    /// whether asked for by Enter or by a press inside the menu's own box.
+    fn activate_workspace_picker_menu(&mut self) -> Result<ApplicationTransition> {
+        let invocation = self.state.workspace_picker.activate_menu();
+        self.state.workspace_picker.close_menu();
+        match invocation {
+            Some(invocation) => self.invoke_semantic(invocation),
+            None => Ok(ApplicationTransition::Continue),
+        }
     }
 
     /// Handles the Model picker commands routed here; any other command leaves
@@ -7243,6 +7302,7 @@ impl Application {
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // Stopping a Subagent is interrupting its child Session, on the
@@ -7259,6 +7319,7 @@ impl Application {
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
@@ -7299,6 +7360,7 @@ impl Application {
                     | SemanticSubject::Questionnaire(_)
                     | SemanticSubject::Origin(_)
                     | SemanticSubject::Hyperlink(_)
+                    | SemanticSubject::Workspace { .. }
                     | SemanticSubject::Text(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
@@ -7322,6 +7384,26 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            // The Workspace it names is the picker's target, the same way a
+            // Session names it for `SessionIconChoose`: a Sidebar selector
+            // entry's context menu and a Workspace Picker row's own menu both
+            // build the invocation with one. Inert while Icons are off, for
+            // the same reason choosing a Session's Icon is.
+            SemanticCommandId::WorkspaceIconChoose => {
+                self.state.command_mode = CommandMode::Composer;
+                if self.state.settings().appearance.show_icons
+                    && let SemanticSubject::Workspace {
+                        origin,
+                        workspace_id,
+                    } = invocation.subject
+                {
+                    self.state.icon_picker.open(IconPickerTarget::Workspace {
+                        origin,
+                        workspace_id,
+                    });
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             command @ (SemanticCommandId::IconPickerLeft
             | SemanticCommandId::IconPickerRight
             | SemanticCommandId::IconPickerUp
@@ -7331,6 +7413,10 @@ impl Application {
             | SemanticCommandId::IconPickerSearchInsert
             | SemanticCommandId::IconPickerSearchDelete) => {
                 Ok(self.handle_icon_picker_command(command, invocation.subject))
+            }
+            command @ (SemanticCommandId::WorkspacePickerMenuSelect
+            | SemanticCommandId::WorkspacePickerMenuClose) => {
+                self.handle_workspace_picker_menu_command(command)
             }
             command @ (SemanticCommandId::SidebarPrevious
             | SemanticCommandId::SidebarNext
@@ -7375,6 +7461,7 @@ impl Application {
                 | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
@@ -7611,6 +7698,14 @@ impl Application {
             IconPickerTarget::Session(session) => {
                 ApplicationTransition::SetSessionIcon { session, icon }
             }
+            IconPickerTarget::Workspace {
+                origin,
+                workspace_id,
+            } => ApplicationTransition::SetWorkspaceIcon {
+                origin,
+                workspace_id,
+                icon,
+            },
         }
     }
 
@@ -7993,6 +8088,9 @@ impl Application {
             Some(SelectionSurface::Settings) => return command_for_settings_panel_event(event),
             Some(SelectionSurface::Worktrees) => {
                 return super::keymap::command_for_worktree_picker_event(event);
+            }
+            Some(SelectionSurface::WorkspacePickerMenu) => {
+                return command_for_workspace_picker_menu_event(event);
             }
             Some(SelectionSurface::Workspaces) => return command_for_workspace_picker_event(event),
             Some(SelectionSurface::Sessions) => return command_for_session_picker_event(event),

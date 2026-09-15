@@ -60,6 +60,14 @@ enum WriterCommand {
         workspace_id: WorkspaceId,
         icon: String,
     },
+    /// A user's own choice replacing whatever a Workspace's Icon table row
+    /// already held — the durable half of the Session store's own
+    /// `set_workspace_icon`, off its commit path the same way
+    /// `SaveWorkspaceIcon` is for a derivation.
+    ReplaceWorkspaceIcon {
+        workspace_id: WorkspaceId,
+        icon: String,
+    },
     SaveResumeState {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
@@ -198,6 +206,15 @@ impl StorageWriter {
                     Ok(WriterCommand::SaveWorkspaceIcon { workspace_id, icon }) => {
                         if let Err(error) = repository.save_workspace_icon(workspace_id, icon) {
                             tracing::warn!("could not save a Workspace Icon: {error}");
+                        }
+                    }
+                    // Best-effort on the same terms as a derived Workspace
+                    // Icon: a choice that fails to persist here still stands
+                    // in memory for the rest of this process, and only a
+                    // restart would ever see the table's stale row again.
+                    Ok(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon }) => {
+                        if let Err(error) = repository.replace_workspace_icon(workspace_id, icon) {
+                            tracing::warn!("could not save a chosen Workspace Icon: {error}");
                         }
                     }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
@@ -345,6 +362,16 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::SaveWorkspaceIcon { workspace_id, icon });
+    }
+
+    /// Records a user's own choice of a Workspace's Icon, replacing whatever
+    /// the table already held for it — off the Session store's own commit
+    /// path the same way [`Self::save_workspace_icon`] is, but for the
+    /// unconditional half of that commit rather than the fill-an-absence one.
+    pub(crate) fn replace_workspace_icon(&self, workspace_id: WorkspaceId, icon: String) {
+        let _ = self
+            .commands
+            .send(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon });
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

@@ -1,6 +1,5 @@
 //! The Icon Picker: a Workspace-Picker-style overlay a reader opens over one
-//! Session (a Workspace target is issue #361's to add) to choose its Icon
-//! from the Icon Catalog by hand.
+//! Session or one Workspace to choose its Icon from the Icon Catalog by hand.
 //!
 //! Where the Workspace Picker narrows a single column of rows, this picker
 //! narrows a grid: the Catalog is around 150 to 250 glyphs, far more than a
@@ -21,7 +20,7 @@ use ratatui::layout::Position;
 
 use crate::{
     icon_catalog::{self, IconEntry},
-    protocol::SessionReference,
+    protocol::{Outlook, SessionReference, WorkspaceId},
 };
 
 /// Splits `offered` into rows up to `columns` cells wide, starting a fresh row
@@ -55,15 +54,16 @@ pub(super) const CELL_WIDTH: u16 = 3;
 /// Blank columns between adjacent cells.
 pub(super) const CELL_GUTTER: u16 = 1;
 
-/// What one Icon Picker is choosing an Icon for.
-///
-/// Only a Session names a target today. Issue #361 is expected to grow this
-/// enum with a `Workspace { origin, workspace_id }` variant naming its target
-/// the same way this one does — by Origin and identity — so a listing moving
+/// What one Icon Picker is choosing an Icon for: one Session, or one
+/// Workspace — either named by Origin and identity, so a listing moving
 /// behind the picker can never retarget a choice already in flight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IconPickerTarget {
     Session(SessionReference),
+    Workspace {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    },
 }
 
 /// One cell the grid draws: the Catalog entry it stands for, and whether it

@@ -154,6 +154,9 @@ pub(super) fn render_with_slots(
     // both start over with the frame, so a stale record from a frame that
     // drew neither can never answer a press.
     state.icon_picker.forget_frame();
+    // The Workspace Picker's own rows are pointable on the same terms, so its
+    // record of where they were drawn starts over with the frame too.
+    state.workspace_picker.forget_frame();
     *state.header_icon_area.borrow_mut() = None;
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
@@ -273,6 +276,13 @@ pub(super) fn render_with_slots(
     }
     if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
         render_workspace_picker(frame, state, main, theme);
+        // A row's own context menu stands in front of the picker it was
+        // opened on, the same way the Sidebar's own menu stands in front of
+        // its column — drawn after it so it wins the selection frame
+        // `top_selection_overlay` already expects while it is up.
+        if state.workspace_picker.menu_is_open() {
+            render_workspace_picker_menu(frame, state, theme);
+        }
     }
     if state.worktree_picker.open && !state.reconnect_overlay_visible {
         render_worktree_picker(frame, state, main, theme);
@@ -1046,17 +1056,29 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     } else {
         let footer_rows = usize::from(shows_footer);
         let capacity = content_height.saturating_sub(lines.len() + footer_rows);
-        let rows = state
-            .workspace_picker
-            .visible_rows(capacity)
-            .into_iter()
-            .map(|row| {
+        let visible_rows = state.workspace_picker.visible_rows(capacity);
+        let content_x = area.x.saturating_add(1);
+        let content_y = area.y.saturating_add(1);
+        let row_columns =
+            content_x..content_x.saturating_add(u16::try_from(content_width).unwrap_or(u16::MAX));
+        let rows = visible_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
                 let style = if row.selected {
                     theme.selection.focused
                 } else {
                     theme.text.primary
                 };
-                Line::styled(workspace_picker_row_text(&row, content_width, state), style)
+                let row_y =
+                    content_y.saturating_add(u16::try_from(lines.len() + index).unwrap_or(0));
+                state.workspace_picker.record_row(
+                    row_y,
+                    row_columns.clone(),
+                    row.workspace_id.clone(),
+                    row.origin.clone(),
+                );
+                Line::styled(workspace_picker_row_text(row, content_width, state), style)
             })
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < content_height.saturating_sub(footer_rows) {
@@ -1092,6 +1114,54 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         lines,
         " Workspaces ",
         theme,
+    );
+}
+
+/// A Workspace Picker row's own context menu: a small anchored box holding
+/// the one item it ever offers, in the Sidebar row menu's own style —
+/// [`render_sidebar_menu`] draws a taller version of the very same box.
+fn render_workspace_picker_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
+    let Some(menu) = state.workspace_picker.menu() else {
+        return;
+    };
+    let width = u16::try_from(menu.label.width().saturating_add(4)).unwrap_or(u16::MAX);
+    let height: u16 = 3;
+    let frame_area = frame.area();
+    if frame_area.width < width || frame_area.height < height {
+        return;
+    }
+    let area = Rect {
+        x: menu.anchor.x.min(frame_area.right().saturating_sub(width)),
+        y: menu
+            .anchor
+            .y
+            .min(frame_area.bottom().saturating_sub(height)),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            pad_to_width(
+                &format!(" {}", menu.label),
+                usize::from(width.saturating_sub(2)),
+            ),
+            theme.selection.focused,
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border.default)
+                .style(theme.surface.overlay),
+        ),
+        area,
+    );
+    record_overlay_selection(
+        frame,
+        state,
+        area,
+        SelectionSurface::WorkspacePickerMenu,
+        true,
     );
 }
 

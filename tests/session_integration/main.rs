@@ -35,6 +35,7 @@ mod turns;
 mod usage;
 mod viewed;
 mod working;
+mod workspace_icon_choice;
 mod workspace_icons;
 
 mod approval_posture;

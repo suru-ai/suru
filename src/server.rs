@@ -37,10 +37,10 @@ use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
     SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity,
     ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest, SettingMutation,
-    SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-    SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
-    ViewSessionRequest,
+    SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest, SetWorkspaceIconRequest,
+    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+    SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
+    UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -51,7 +51,7 @@ use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
     CreateSessionError, DeleteSessionError, Derivation, InterruptSessionError,
     PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore,
-    SetIconError, SettleSessionError, StoreOutcome,
+    SetIconError, SetWorkspaceIconError, SettleSessionError, StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -701,6 +701,7 @@ pub async fn spawn_with_source_control(
             put(confirm_landing_agent_selection),
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
+        .route("/v1/workspaces/icon", post(set_workspace_icon))
         .route("/v1/checkouts/prepare", post(prepare_checkout))
         .route(
             "/v1/checkouts/removal-preview",
@@ -2977,6 +2978,43 @@ async fn set_session_icon(
             format!("`{}` is not an Icon Catalog name", request.icon),
         ),
         Err(SetIconError::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Sets a Workspace's Icon to the user's own choice from the Icon Catalog,
+/// refused where the Catalog does not carry the named entry or where this
+/// server does not know the named Workspace at all. Routed to the
+/// Workspace's own Origin exactly like a Session's chosen Icon is routed to
+/// its Session's Origin (see `ManagedClient::set_workspace_icon` in
+/// `managed_client.rs`); answers with the same `WorkspaceIconChanged` catalog
+/// change [`SessionStore::commit_workspace_icon`] publishes for a derived
+/// one, so the choosing client and every other client repaint from it.
+async fn set_workspace_icon(State(state): State<AppState>, request: Request) -> Response {
+    let request =
+        match decode_session_command::<SetWorkspaceIconRequest>(&state, request, "Workspace Icon")
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    match state
+        .sessions
+        .set_workspace_icon(&request.workspace_id, &request.icon)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(SetWorkspaceIconError::WorkspaceNotFound) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            format!(
+                "`{}` is not a Workspace this server knows",
+                request.workspace_id.0
+            ),
+        ),
+        Err(SetWorkspaceIconError::UnknownIcon) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidIcon,
+            format!("`{}` is not an Icon Catalog name", request.icon),
+        ),
     }
 }
 

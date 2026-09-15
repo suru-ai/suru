@@ -57,6 +57,7 @@ pub(crate) use settlement::{
 };
 pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
+pub(crate) use workspace_icon::SetWorkspaceIconError;
 
 use catalog::SessionCatalogPublisher;
 use prompts::PromptOwner;
