@@ -24,6 +24,9 @@ enum ServeOverlayState {
         invite: IssuedInvite,
         peers: Vec<Peer>,
         selected: usize,
+        /// Whether the selected Peer's removal has been asked for once and
+        /// awaits the second press that performs it.
+        armed: bool,
         removing: Option<String>,
         error: Option<String>,
     },
@@ -199,6 +202,7 @@ impl ServeOverlay {
             invite,
             peers,
             selected: 0,
+            armed: false,
             removing: None,
             error: None,
         };
@@ -222,10 +226,13 @@ impl ServeOverlay {
         self.invite().map(|invite| invite.invite.clone())
     }
 
+    /// Ending a Pairing is asked for twice, as it is for a Remote: the first
+    /// press arms the selected Peer's removal and only the second performs it.
     pub(super) fn remove_selected(&mut self) -> Option<String> {
         let ServeOverlayState::Managing {
             peers,
             selected,
+            armed,
             removing,
             error,
             ..
@@ -237,9 +244,26 @@ impl ServeOverlay {
             return None;
         }
         let peer_id = peers.get(*selected)?.id.clone();
-        *removing = Some(peer_id.clone());
         *error = None;
+        if !*armed {
+            *armed = true;
+            return None;
+        }
+        *armed = false;
+        *removing = Some(peer_id.clone());
         Some(peer_id)
+    }
+
+    /// Puts down an armed removal, which every key but the one that arms it
+    /// does.
+    pub(super) fn disarm_removal(&mut self) {
+        if let ServeOverlayState::Managing { armed, .. } = &mut self.state {
+            *armed = false;
+        }
+    }
+
+    pub(super) fn removal_armed(&self) -> bool {
+        matches!(self.state, ServeOverlayState::Managing { armed: true, .. })
     }
 
     pub(super) fn peer_removed(&mut self, peer_id: &str) {
@@ -260,10 +284,12 @@ impl ServeOverlay {
     pub(super) fn fail_operation(&mut self, error: String) {
         match &mut self.state {
             ServeOverlayState::Managing {
+                armed,
                 removing,
                 error: message,
                 ..
             } => {
+                *armed = false;
                 *removing = None;
                 *message = Some(error);
             }

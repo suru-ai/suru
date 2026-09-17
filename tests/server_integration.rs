@@ -14,7 +14,7 @@ use suru::{
         AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, CodexApprovalPolicy,
         CodexSandboxMode, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
         LifecycleState, ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION,
-        PromptDelivery, PromptId, ProviderId, RedeemInviteRequest, RemoteStatus,
+        PromptDelivery, PromptId, ProviderId, RedeemInviteRequest, RemoteRemoval, RemoteStatus,
         ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason,
@@ -908,6 +908,8 @@ struct PairedServers {
     _serving_state: tempfile::TempDir,
     _serving_config_root: tempfile::TempDir,
     _connecting_state: tempfile::TempDir,
+    serving_data_dir: std::path::PathBuf,
+    connecting_data_dir: std::path::PathBuf,
     connecting_identity_path: std::path::PathBuf,
     serving: server::RunningServer,
     connecting: server::RunningServer,
@@ -934,6 +936,7 @@ struct ObservedTcpProxy {
     active_connections: tokio::sync::watch::Receiver<usize>,
     opened_connections: tokio::sync::watch::Receiver<usize>,
     online: tokio::sync::watch::Sender<bool>,
+    hold: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -946,13 +949,21 @@ impl ObservedTcpProxy {
         let (active, active_connections) = tokio::sync::watch::channel(0_usize);
         let (opened, opened_connections) = tokio::sync::watch::channel(0_usize);
         let (online, online_rx) = tokio::sync::watch::channel(true);
+        let (hold, hold_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
+            // A held connection is kept open and never forwarded, so a dialer
+            // waits on it exactly as it would on a machine that accepts and
+            // then says nothing.
+            let mut held = Vec::new();
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     break;
                 };
                 opened.send_modify(|count| *count += 1);
                 if !*online_rx.borrow() {
+                    if *hold_rx.borrow() {
+                        held.push(inbound);
+                    }
                     continue;
                 }
                 active.send_modify(|count| *count += 1);
@@ -982,8 +993,16 @@ impl ObservedTcpProxy {
             active_connections,
             opened_connections,
             online,
+            hold,
             task,
         }
+    }
+
+    /// Accepts connections and answers nothing, so a dialer's own budget is
+    /// the only thing that ends the attempt.
+    async fn swallow_connections(&mut self) {
+        self.hold.send_replace(true);
+        self.set_online(false).await;
     }
 
     async fn set_online(&mut self, online: bool) {
@@ -1058,7 +1077,13 @@ async fn paired_servers_with_runtime(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
 ) -> PairedServers {
-    paired_servers_with_source_control(name, alternate, runtime, None).await
+    paired_servers_with_source_control(name, alternate, runtime, None, None).await
+}
+
+/// Pairs two Servers whose redeeming side gives a Remote only `timeout` to
+/// acknowledge its own removal.
+async fn paired_servers_with_withdrawal_timeout(name: &str, timeout: Duration) -> PairedServers {
+    paired_servers_with_source_control(name, false, None, None, Some(timeout)).await
 }
 
 async fn paired_servers_with_source_control(
@@ -1066,6 +1091,7 @@ async fn paired_servers_with_source_control(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
     source_control: Option<std::sync::Arc<dyn suru::source_control::SourceControl>>,
+    withdrawal_timeout: Option<Duration>,
 ) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
@@ -1073,6 +1099,7 @@ async fn paired_servers_with_source_control(
     let config = ServerConfig::new(serving_state.path(), &serving_channel)
         .expect("configure Serving Server")
         .with_config_dir(serving_config_root.path());
+    let serving_data_dir = config.data_dir().to_path_buf();
     let timings = ServerTimings {
         shutdown_grace: Duration::from_millis(5),
         checkout_observation_interval: Duration::from_millis(15),
@@ -1124,7 +1151,8 @@ async fn paired_servers_with_source_control(
     let connecting_channel = format!("{name}-connecting");
     let connecting_config = ServerConfig::new(connecting_state.path(), &connecting_channel)
         .expect("configure connecting Server");
-    let connecting_identity_path = connecting_config.data_dir().join("server-identity.pk8");
+    let connecting_data_dir = connecting_config.data_dir().to_path_buf();
+    let connecting_identity_path = connecting_data_dir.join("server-identity.pk8");
     // A Provider double stands in for the built-in runtimes on this side too.
     // Those launch the developer's real harness CLIs, and a Codex Errand starts
     // `codex exec` in the Session's own Execution Directory. On Windows a
@@ -1138,6 +1166,8 @@ async fn paired_servers_with_source_control(
         std::sync::Arc::new(failing_provider_support::FailingProviderRuntime),
         ServerTimings {
             shutdown_grace: Duration::from_millis(5),
+            remote_withdrawal_timeout: withdrawal_timeout
+                .unwrap_or_else(|| ServerTimings::default().remote_withdrawal_timeout),
             ..ServerTimings::default()
         },
     )
@@ -1176,6 +1206,8 @@ async fn paired_servers_with_source_control(
         _serving_state: serving_state,
         _serving_config_root: serving_config_root,
         _connecting_state: connecting_state,
+        serving_data_dir,
+        connecting_data_dir,
         connecting_identity_path,
         serving,
         connecting,
@@ -2977,6 +3009,158 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
     drop(connecting_client);
     connecting.shutdown().await.unwrap();
     serving.shutdown().await.unwrap();
+}
+
+fn pairing_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).expect("Pairing records are a JSON array"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read Pairing records {path:?}: {error}"),
+    }
+}
+
+fn revoked_peer_ids(data_dir: &std::path::Path) -> Vec<String> {
+    pairing_records(&data_dir.join("revoked-peers.json"))
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .expect("revoked Peer tombstones are identifiers")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn removing_a_remote_withdraws_its_peer_record_without_revoking_it() {
+    let pair = paired_servers("remote-removal").await;
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+
+    let removal = pair
+        .connecting_client
+        .remove_remote("workstation")
+        .await
+        .expect("remove the Remote through the local Server");
+
+    assert_eq!(
+        removal,
+        RemoteRemoval {
+            name: "workstation".to_owned(),
+            acknowledged: true
+        },
+        "a Remote that answers ends the Pairing on its side too"
+    );
+    assert!(
+        pair.connecting_client
+            .list_remotes()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(pairing_records(&pair.connecting_data_dir.join("remotes.json")).is_empty());
+    assert!(pair.serving_client.list_peers().await.unwrap().is_empty());
+    assert!(pairing_records(&pair.serving_data_dir.join("peers.json")).is_empty());
+    assert!(
+        !revoked_peer_ids(&pair.serving_data_dir).contains(&peer.id),
+        "withdrawing is not revocation: pairing again takes only a new Invite"
+    );
+    let error = pair
+        .connecting_client
+        .probe_remote("workstation")
+        .await
+        .expect_err("a removed Remote is no longer known");
+    assert_eq!(pairing_error_code(&error), SessionErrorCode::RemoteNotFound);
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn removing_a_remote_that_never_answers_forgets_it_here_all_the_same() {
+    let mut pair = paired_servers_with_withdrawal_timeout(
+        "remote-removal-unanswered",
+        Duration::from_millis(50),
+    )
+    .await;
+    pair.wire.swallow_connections().await;
+
+    let removal = pair
+        .connecting_client
+        .remove_remote("workstation")
+        .await
+        .expect("an unreachable Remote is not an error to the caller");
+
+    assert!(
+        !removal.acknowledged,
+        "a Remote that says nothing within the budget goes unacknowledged"
+    );
+    assert!(
+        pair.connecting_client
+            .list_remotes()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(pairing_records(&pair.connecting_data_dir.join("remotes.json")).is_empty());
+    assert_eq!(
+        pair.serving_client.list_peers().await.unwrap().len(),
+        1,
+        "a Serving side that never heard the withdrawal keeps its Peer"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn removing_an_unknown_remote_is_a_not_found_error() {
+    let pair = paired_servers("remote-removal-unknown").await;
+
+    let error = pair
+        .connecting_client
+        .remove_remote("no-such-machine")
+        .await
+        .expect_err("an unknown name names no Pairing to end");
+
+    assert_eq!(pairing_error_code(&error), SessionErrorCode::RemoteNotFound);
+    assert_eq!(
+        pair.connecting_client.list_remotes().await.unwrap().len(),
+        1,
+        "a refused removal leaves every known Remote standing"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_revoked_peer_may_not_withdraw_and_leaves_its_revocation_standing() {
+    let pair = paired_servers("remote-removal-revoked").await;
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client
+        .remove_peer(&peer.id)
+        .await
+        .expect("remove the Peer from the Serving side");
+    assert_eq!(
+        revoked_peer_ids(&pair.serving_data_dir),
+        vec![peer.id.clone()]
+    );
+
+    let removal = pair
+        .connecting_client
+        .remove_remote("workstation")
+        .await
+        .expect("removal answers whether or not the Remote accepts the withdrawal");
+
+    assert!(
+        !removal.acknowledged,
+        "a Server that is no longer a Peer is refused like any other stranger"
+    );
+    assert_eq!(
+        revoked_peer_ids(&pair.serving_data_dir),
+        vec![peer.id],
+        "a refused withdrawal disturbs neither the Peer list nor its tombstones"
+    );
+    assert!(pairing_records(&pair.serving_data_dir.join("peers.json")).is_empty());
+    assert!(pairing_records(&pair.connecting_data_dir.join("remotes.json")).is_empty());
+
+    pair.shutdown().await;
 }
 
 #[tokio::test]

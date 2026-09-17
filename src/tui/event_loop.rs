@@ -968,6 +968,13 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
+            ApplicationTransition::RemoveRemote(name) => {
+                spawn_remote_removal(
+                    self.client.session_commands(),
+                    name,
+                    self.channels.pairing.clone(),
+                );
+            }
             ApplicationTransition::BeginConnecting => {
                 spawn_remote_listing(
                     self.client.session_commands(),
@@ -1211,6 +1218,7 @@ impl RunLoop {
             | ApplicationTransition::CopyToClipboard(_)
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
+            | ApplicationTransition::RemoveRemote(_)
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
@@ -1811,6 +1819,9 @@ impl RunLoop {
                 ApplicationEvent::InvitePreviewFailed { invite, error }
             }
             PairingResult::RemoteRedeemed(remote) => ApplicationEvent::RemoteRedeemed(remote),
+            PairingResult::RemoteRemoved { name, result } => {
+                ApplicationEvent::RemoteRemoved { name, result }
+            }
             PairingResult::InviteRedemptionFailed(error) => {
                 ApplicationEvent::InviteRedemptionFailed(error)
             }
@@ -1973,6 +1984,10 @@ enum PairingResult {
     },
     RemoteRedeemed(crate::protocol::Remote),
     InviteRedemptionFailed(String),
+    RemoteRemoved {
+        name: String,
+        result: Result<crate::protocol::RemoteRemoval, String>,
+    },
     RemoteProbed {
         name: String,
         result: Result<crate::protocol::RemoteHealth, String>,
@@ -2137,6 +2152,22 @@ fn spawn_invite_issuance(
         .await
         .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
         let _ = results.send(result);
+    });
+}
+
+/// Ends the Pairing with one Remote. The local Server forgets it either way;
+/// the answer says whether the Remote itself acknowledged in time.
+fn spawn_remote_removal(
+    commands: SessionCommandClient,
+    name: String,
+    results: UnboundedSender<PairingResult>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .remove_remote(&name)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = results.send(PairingResult::RemoteRemoved { name, result });
     });
 }
 

@@ -1398,6 +1398,28 @@ impl TuiState {
         }
     }
 
+    /// Drops one Origin's rows from the listings that range over Everywhere,
+    /// which both a Remote that stopped answering and one whose Pairing ended
+    /// leave behind.
+    fn drop_origin_rows(&mut self, outlook: &Outlook) {
+        self.sidebar.end_origin(outlook);
+        self.session_picker.end_origin(outlook);
+    }
+
+    /// Everything this Client held for a Remote it can no longer reach at all.
+    /// Reaching it again takes a new Invite, so nothing remembered per Outlook
+    /// survives its Pairing.
+    fn end_pairing_memories(&mut self, outlook: &Outlook) {
+        self.drop_origin_rows(outlook);
+        self.outlook_workspaces.remove(outlook);
+        self.outlook_execution_directories.remove(outlook);
+        self.outlook_execution_checkouts.remove(outlook);
+        self.outlook_landing_selections.remove(outlook);
+        self.workspace_paths.remove(outlook);
+        self.remembered_execution_directories
+            .retain(|(origin, _), _| origin != outlook);
+    }
+
     fn settle_remote_failure(&mut self, message: String) {
         self.recovery = None;
         self.reconnect_overlay_visible = false;
@@ -3542,6 +3564,12 @@ pub enum ApplicationEvent {
     },
     RemoteRedeemed(crate::protocol::Remote),
     InviteRedemptionFailed(String),
+    /// How a Remote's removal ended: the local Server forgot it either way,
+    /// and the removal says whether the Remote itself answered.
+    RemoteRemoved {
+        name: String,
+        result: std::result::Result<crate::protocol::RemoteRemoval, String>,
+    },
     RemoteProbed {
         name: String,
         result: Result<crate::protocol::RemoteHealth, String>,
@@ -3792,6 +3820,9 @@ pub enum ApplicationTransition {
     CopyToClipboard(super::ClipboardContent),
     OpenHyperlink(String),
     RemovePeer(String),
+    /// End the Pairing with the named Remote, which the reader confirmed by
+    /// pressing the removal key a second time.
+    RemoveRemote(String),
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
     /// the Connect overlay.
@@ -4237,6 +4268,19 @@ impl Application {
                 self.state.connect_overlay.redemption_failed(error);
                 Ok(ApplicationTransition::Continue)
             }
+            ApplicationEvent::RemoteRemoved { name, result } => match result {
+                Ok(removal) => {
+                    self.state
+                        .connect_overlay
+                        .remote_removed(&removal.name, removal.acknowledged);
+                    let message = format!("{name} was removed");
+                    Ok(self.end_pairing(&Outlook::Remote(name), &message))
+                }
+                Err(error) => {
+                    self.state.connect_overlay.removal_failed(error);
+                    Ok(ApplicationTransition::Continue)
+                }
+            },
             ApplicationEvent::RemoteProbed { name, result } => {
                 self.state.connect_overlay.remote_probed(&name, result);
                 Ok(ApplicationTransition::Continue)
@@ -6292,6 +6336,57 @@ impl Application {
         }
     }
 
+    /// The one path a Pairing's end takes, whether the Remote revoked it or
+    /// this user removed it: an Outlook turned toward it leaves first, so the
+    /// turn's own bookkeeping cannot re-remember what is about to go, then
+    /// its rows leave every listing and the memories held for that Outlook go
+    /// with them.
+    fn end_pairing(&mut self, outlook: &Outlook, message: &str) -> ApplicationTransition {
+        let was_current = *outlook == self.state.outlook;
+        if was_current {
+            self.leave_current_remote(outlook, message);
+        }
+        self.state.end_pairing_memories(outlook);
+        self.state.sync_composer_completion();
+        if was_current {
+            return ApplicationTransition::TurnOutlook {
+                outlook: Outlook::Local,
+                catalog_origins: self.state.catalog_origins(),
+            };
+        }
+        ApplicationTransition::ReconcileCatalogOrigins {
+            catalog_origins: self.state.catalog_origins(),
+            requests: Vec::new(),
+        }
+    }
+
+    /// Turns the Outlook back to this Client's own Server because the Remote
+    /// it was turned toward can no longer be worked in: whatever was about to
+    /// be submitted there fails with `message`, and an open Session's composer
+    /// and interaction state come home rather than stranding.
+    fn leave_current_remote(&mut self, outlook: &Outlook, message: &str) {
+        let pending_prompt = self
+            .state
+            .pending_submission
+            .as_ref()
+            .filter(|pending| match &pending.target {
+                SubmissionTarget::CreateSession => true,
+                SubmissionTarget::AdmitPrompt(session, _) => session.origin == *outlook,
+            })
+            .map(|pending| pending.prompt.id);
+        if let Some(prompt_id) = pending_prompt {
+            self.state
+                .fail_pending_submission(prompt_id, message.to_owned());
+        }
+        if let Some(reference) = self.state.session_reference.clone() {
+            self.state
+                .composers
+                .recover_session_to_landing(reference.clone());
+            self.state.session_interactions.remove(&reference);
+        }
+        self.state.turn_outlook(Outlook::Local);
+    }
+
     fn handle_origin_catalog(
         &mut self,
         outlook: Outlook,
@@ -6299,38 +6394,27 @@ impl Application {
     ) -> Result<ApplicationTransition> {
         if let ManagedEvent::RemoteFailed { status, message } = &event {
             let is_current = outlook == self.state.outlook;
-            self.state.sidebar.end_origin(&outlook);
-            self.state.session_picker.end_origin(&outlook);
+            let Some(name) = outlook.remote_name().map(str::to_owned) else {
+                return Ok(ApplicationTransition::Continue);
+            };
+            if is_current {
+                self.state.connect_overlay.remote_failed(&name, *status);
+            }
+            if *status == crate::protocol::RemoteStatus::Revoked {
+                let transition = self.end_pairing(&outlook, message);
+                if is_current {
+                    self.state.settle_remote_failure(message.clone());
+                }
+                return Ok(transition);
+            }
+            self.state.drop_origin_rows(&outlook);
             if !is_current {
                 return Ok(ApplicationTransition::ReconcileCatalogOrigins {
                     catalog_origins: self.state.catalog_origins(),
                     requests: Vec::new(),
                 });
             }
-            let Some(name) = outlook.remote_name().map(str::to_owned) else {
-                return Ok(ApplicationTransition::Continue);
-            };
-            let pending_prompt = self
-                .state
-                .pending_submission
-                .as_ref()
-                .filter(|pending| match &pending.target {
-                    SubmissionTarget::CreateSession => true,
-                    SubmissionTarget::AdmitPrompt(session, _) => session.origin == outlook,
-                })
-                .map(|pending| pending.prompt.id);
-            if let Some(prompt_id) = pending_prompt {
-                self.state
-                    .fail_pending_submission(prompt_id, message.clone());
-            }
-            if let Some(reference) = self.state.session_reference.clone() {
-                self.state
-                    .composers
-                    .recover_session_to_landing(reference.clone());
-                self.state.session_interactions.remove(&reference);
-            }
-            self.state.connect_overlay.remote_failed(&name, *status);
-            self.state.turn_outlook(Outlook::Local);
+            self.leave_current_remote(&outlook, message);
             self.state.settle_remote_failure(message.clone());
             self.state.sync_composer_completion();
             return Ok(ApplicationTransition::TurnOutlook {
@@ -6937,6 +7021,11 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::BeginConnecting)
             }
+            SemanticCommandId::PairOpen => {
+                self.state.connect_overlay.open_invite_entry();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::BeginConnecting)
+            }
             SemanticCommandId::ConnectConfirm => {
                 if self.state.connect_overlay.confirm() {
                     return Ok(ApplicationTransition::Continue);
@@ -6987,6 +7076,12 @@ impl Application {
             SemanticCommandId::ConnectPairAnother => {
                 self.state.connect_overlay.pair_another();
                 Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ConnectRemoveRemote => {
+                Ok(self.state.connect_overlay.remove_remote().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::RemoveRemote,
+                ))
             }
             SemanticCommandId::ConnectClose => {
                 self.state.connect_overlay.close();
@@ -7919,10 +8014,37 @@ impl Application {
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
         self.note_interaction(&event);
-        self.command_for_terminal_input(event)
-            .map_or(Ok(ApplicationTransition::Continue), |command| {
-                self.handle_event(ApplicationEvent::Command(command))
-            })
+        let interaction = is_reader_interaction(&event);
+        let command = self.command_for_terminal_input(event);
+        if interaction {
+            self.settle_armed_removals(command.as_ref());
+        }
+        command.map_or(Ok(ApplicationTransition::Continue), |command| {
+            self.handle_event(ApplicationEvent::Command(command))
+        })
+    }
+
+    /// Ending a Pairing is armed by one key and put down by every other, so an
+    /// overlay never removes anything on a key the reader did not aim at it.
+    /// The note a finished removal leaves goes the same way: the next key
+    /// clears it.
+    fn settle_armed_removals(&mut self, command: Option<&CommandId>) {
+        if !matches!(
+            command,
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::ConnectRemoveRemote
+            ))
+        ) {
+            self.state.connect_overlay.disarm_removal();
+        }
+        if !matches!(
+            command,
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::ServeRemovePeer
+            ))
+        ) {
+            self.state.serve_overlay.disarm_removal();
+        }
     }
 
     /// Records that the reader touched the terminal, whether or not the active

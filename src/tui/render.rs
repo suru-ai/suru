@@ -516,7 +516,8 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         "Paired Remotes",
         theme.text.primary.add_modifier(Modifier::BOLD),
     )];
-    let remote_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(2);
+    let note_rows = usize::from(overlay.picker_note().is_some());
+    let remote_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(2 + note_rows);
     let mut remote_rows = vec![Line::styled(
         if overlay.selected() == 0 {
             "› Local"
@@ -554,8 +555,24 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         overlay.selected(),
         remote_capacity,
     ));
+    if let Some((note, failed)) = overlay.picker_note() {
+        lines.push(Line::styled(
+            note.to_owned(),
+            if failed {
+                theme.feedback.error
+            } else {
+                theme.text.subdued
+            },
+        ));
+    }
+    // An armed removal says so where the keys are taught, so the second press
+    // is the reader's own and every other key is plainly the way out.
     lines.push(Line::styled(
-        "↑↓ choose · a pair another · Esc close",
+        if overlay.removal_armed() {
+            "x confirm removal · any other key cancels"
+        } else {
+            "↑↓ choose · a pair another · x remove · Esc close"
+        },
         theme.text.subdued,
     ));
     render_overlay_box(
@@ -630,7 +647,11 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
         }
         lines.push(Line::styled(
-            "Ctrl+C copy · ↑↓ choose Peer · x remove · Esc close",
+            if state.serve_overlay.removal_armed() {
+                "x confirm removal · any other key cancels"
+            } else {
+                "Ctrl+C copy · ↑↓ choose Peer · x remove · Esc close"
+            },
             theme.text.subdued,
         ));
         render_overlay_box(

@@ -31,6 +31,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
             GitSourceControl::default()
                 .with_preparation_observer(Arc::new(InterruptedCreation(AtomicBool::new(false)))),
         )),
+        None,
     )
     .await;
     let temp = tempfile::tempdir().unwrap();

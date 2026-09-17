@@ -60,7 +60,7 @@ use uuid::Uuid;
 use crate::{
     protocol::{
         InvitePreview, IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote,
-        RemoteHealth, RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
+        RemoteHealth, RemoteRemoval, RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -71,6 +71,9 @@ const REVOKED_PEERS_FILE: &str = "revoked-peers.json";
 const REMOTES_FILE: &str = "remotes.json";
 const PAIRING_PROTOCOL_HEADER: &str = "x-suru-protocol-version";
 const PEER_API_PREFIX: &str = "/v1/pairing/proxy";
+/// Where a Peer says it is withdrawing, so removing a Remote can end the
+/// Pairing on the Serving side as well as this one.
+const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
@@ -79,6 +82,7 @@ pub(crate) struct ServingController {
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
     invite_ttl: tokio::time::Duration,
+    withdrawal_timeout: tokio::time::Duration,
     invites: Arc<StdMutex<InviteLedger>>,
     protocol_version: u32,
     identity: Arc<StdMutex<Option<IdentityMaterial>>>,
@@ -293,6 +297,7 @@ impl ServingController {
             active: Arc::new(Mutex::new(None)),
             address,
             invite_ttl,
+            withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
             invites: Arc::new(StdMutex::new(InviteLedger::default())),
             protocol_version,
             identity: Arc::new(StdMutex::new(None)),
@@ -301,6 +306,13 @@ impl ServingController {
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
             revocations: Arc::new(RwLock::new(revocations)),
         })
+    }
+
+    /// Bounds how long removing a Remote waits for that Remote to drop its
+    /// Peer record; injectable so tests need not wait out the default.
+    pub(crate) fn with_withdrawal_timeout(mut self, timeout: tokio::time::Duration) -> Self {
+        self.withdrawal_timeout = timeout;
+        self
     }
 
     pub(crate) fn address(&self) -> Option<SocketAddr> {
@@ -551,6 +563,103 @@ impl ServingController {
         }
         self.persist_revoked_peer_ids()
             .map_err(internal_pairing_failure)?;
+        Ok(())
+    }
+
+    /// Ends a Pairing from the redeeming side. The Remote is asked to drop its
+    /// Peer record first, while the Pairing that authenticates the request is
+    /// still in place; the local record then goes whether or not that Remote
+    /// answered, because a Remote that cannot be reached is forgotten here all
+    /// the same and reaching it again takes a new Invite.
+    pub(crate) async fn remove_remote(
+        &self,
+        name: &str,
+    ) -> std::result::Result<RemoteRemoval, PairingFailure> {
+        let remote = self.stored_remote(name)?;
+        let acknowledged = self.ask_remote_to_withdraw(&remote).await;
+        self.delete_remote(name)?;
+        Ok(RemoteRemoval {
+            name: name.to_owned(),
+            acknowledged,
+        })
+    }
+
+    /// Drops the calling Peer's own record. Withdrawal is not revocation: the
+    /// Peer leaves no tombstone, so its user may pair again with a new Invite.
+    fn withdraw_peer(&self, public_key: &[u8]) -> std::result::Result<(), PairingFailure> {
+        let id = fingerprint(public_key);
+        let mut peers = self
+            .peers
+            .write()
+            .expect("Peer record lock is not poisoned");
+        let Some(index) = peers.iter().position(|peer| peer.id == id) else {
+            return Err(PairingFailure::new(
+                SessionErrorCode::PeerNotFound,
+                "Peer not found",
+            ));
+        };
+        let withdrawn = peers.remove(index);
+        if let Err(error) = write_private_json(&self.data_dir.join(PEERS_FILE), &*peers) {
+            peers.insert(index, withdrawn);
+            return Err(internal_pairing_failure(error));
+        }
+        Ok(())
+    }
+
+    /// Dials the Remote over the Pairing listener and asks it to withdraw this
+    /// Server's Peer record, within the withdrawal budget. Every dial,
+    /// authentication, protocol, and timeout failure alike simply leaves the
+    /// removal unacknowledged.
+    async fn ask_remote_to_withdraw(&self, remote: &StoredRemote) -> bool {
+        let Ok(client) = self.pairing_client(remote) else {
+            return false;
+        };
+        let attempt_client = client.clone();
+        let withdrawal = first_remote_answer(remote, &client, move |address| {
+            let client = attempt_client.clone();
+            async move {
+                match client
+                    .http
+                    .post(format!("https://{address}{PAIRING_WITHDRAWAL_PATH}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        RemoteAddressAttempt::Answered(())
+                    }
+                    Ok(_) | Err(_) => RemoteAddressAttempt::TryNext,
+                }
+            }
+        });
+        matches!(
+            tokio::time::timeout(self.withdrawal_timeout, withdrawal).await,
+            Ok(Ok(_))
+        )
+    }
+
+    fn delete_remote(&self, name: &str) -> std::result::Result<(), PairingFailure> {
+        let mut remotes = self
+            .remotes
+            .write()
+            .expect("Remote record lock is not poisoned");
+        let Some(index) = remotes.iter().position(|stored| stored.remote.name == name) else {
+            return Err(PairingFailure::new(
+                SessionErrorCode::RemoteNotFound,
+                "Remote not found",
+            ));
+        };
+        let removed = remotes.remove(index);
+        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
+            remotes.insert(index, removed);
+            return Err(internal_pairing_failure(error));
+        }
+        drop(remotes);
+        // A name freed here may be paired again to a different key, so its
+        // pinned client must not outlive the record it was built from.
+        self.remote_clients
+            .lock()
+            .expect("Remote client lock is not poisoned")
+            .remove(name);
         Ok(())
     }
 
@@ -1030,6 +1139,7 @@ async fn serve(
     let app = Router::new()
         .route("/health", get(serving_health))
         .route("/v1/pairing/enroll", post(enroll_peer))
+        .route(PAIRING_WITHDRAWAL_PATH, post(withdraw_peer))
         .route("/v1/pairing/proxy/{*path}", any(forward_peer_api))
         .with_state(state);
     let _ = axum::serve(
@@ -1249,6 +1359,25 @@ async fn enroll_peer(
             protocol_version: state.protocol_version,
         })
         .into_response(),
+        Err(error) => error.response(),
+    }
+}
+
+/// A Peer saying its user has removed this Server as their Remote. It is
+/// authenticated by the caller's own mutual-TLS key and ends only that Peer's
+/// own record, so no Peer can withdraw another.
+async fn withdraw_peer(
+    State(state): State<ServingState>,
+    ConnectInfo(connection): ConnectInfo<ServingConnectionInfo>,
+) -> Response {
+    let Some(public_key) = connection
+        .peer_key
+        .filter(|key| state.controller.is_enrolled_peer(key))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state.controller.withdraw_peer(&public_key) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.response(),
     }
 }

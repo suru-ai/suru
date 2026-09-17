@@ -80,6 +80,9 @@ pub struct ServerTimings {
     pub errand_timeout: Duration,
     /// How long a newly issued Invite remains redeemable.
     pub invite_ttl: Duration,
+    /// How long removing a Remote waits for that Remote to acknowledge the
+    /// withdrawal before forgetting it locally regardless.
+    pub remote_withdrawal_timeout: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
 }
@@ -95,12 +98,17 @@ impl Default for ServerTimings {
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
+            remote_withdrawal_timeout: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
         }
     }
 }
 
 impl ServerTimings {
+    pub fn with_remote_withdrawal_timeout(mut self, timeout: Duration) -> Self {
+        self.remote_withdrawal_timeout = timeout;
+        self
+    }
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
         self.checkout_skill_timeout = timeout;
         self
@@ -546,7 +554,8 @@ pub async fn spawn_with_source_control(
         timings.pairing_protocol_version,
         descriptor.base_url.clone(),
         descriptor.token.clone(),
-    )?;
+    )?
+    .with_withdrawal_timeout(timings.remote_withdrawal_timeout);
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     // After all fallible local-server setup, so an error returning from spawn
@@ -682,6 +691,10 @@ pub async fn spawn_with_source_control(
         .route("/v1/pairing/invites/preview", post(preview_invite))
         .route("/v1/pairing/remotes", get(list_remotes).post(redeem_invite))
         .route("/v1/pairing/remotes/{name}/health", post(probe_remote))
+        .route(
+            "/v1/pairing/remotes/{name}",
+            axum::routing::delete(remove_remote),
+        )
         .route(
             "/v1/remotes/{name}/{*path}",
             axum::routing::any(proxy_remote),
@@ -1169,6 +1182,20 @@ async fn proxy_remote(
     *request.uri_mut() = uri;
     match state.serving.proxy_remote(&name, request).await {
         Ok(response) => response,
+        Err(error) => pairing_error_response(error),
+    }
+}
+
+async fn remove_remote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.serving.remove_remote(&name).await {
+        Ok(removal) => Json(removal).into_response(),
         Err(error) => pairing_error_response(error),
     }
 }

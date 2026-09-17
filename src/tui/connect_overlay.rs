@@ -32,7 +32,22 @@ enum ConnectOverlayState {
     Redeeming(ConnectDraft),
     RemotePicker {
         selected: usize,
+        /// Whether the selected Remote's removal has been asked for once and
+        /// awaits the second press that performs it.
+        armed: bool,
+        note: Option<PickerNote>,
     },
+    Removing {
+        selected: usize,
+    },
+}
+
+/// The one line a finished removal leaves on the picker, standing until the
+/// next key the reader presses.
+#[derive(Clone, Debug)]
+struct PickerNote {
+    text: String,
+    failed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +153,16 @@ impl ConnectOverlay {
         self.state = ConnectOverlayState::Loading;
     }
 
+    /// Opens straight on Invite entry, as `/pair` asks. The Remote listing is
+    /// still asked for behind it, so a duplicate name is refused and a
+    /// successful redemption has a picker to land on.
+    pub(super) fn open_invite_entry(&mut self) {
+        self.state = ConnectOverlayState::InviteEntry {
+            invite: String::new(),
+            error: None,
+        };
+    }
+
     pub(super) fn close(&mut self) {
         self.state = ConnectOverlayState::Closed;
     }
@@ -147,10 +172,11 @@ impl ConnectOverlay {
     }
 
     pub(super) fn loading_label(&self) -> Option<&'static str> {
-        match self.state {
+        match &self.state {
             ConnectOverlayState::Loading => Some("Loading Remotes…"),
             ConnectOverlayState::Inspecting => Some("Inspecting Invite…"),
             ConnectOverlayState::Redeeming(_) => Some("Pairing Remote…"),
+            ConnectOverlayState::Removing { .. } => Some("Removing Remote…"),
             _ => None,
         }
     }
@@ -168,22 +194,22 @@ impl ConnectOverlay {
             })
             .collect();
         self.known_remotes = remotes;
-        self.state = if self.known_remotes.is_empty() && *outlook == Outlook::Local {
-            ConnectOverlayState::InviteEntry {
-                invite: String::new(),
-                error: None,
-            }
-        } else {
-            ConnectOverlayState::RemotePicker {
-                selected: outlook
-                    .remote_name()
-                    .and_then(|name| {
-                        self.known_remotes
-                            .iter()
-                            .position(|remote| remote.name == name)
-                    })
-                    .map_or(0, |index| index + 1),
-            }
+        // A listing that lands behind Invite entry is only what that screen
+        // needs to refuse a duplicate name; the reader stays where they are.
+        if !matches!(self.state, ConnectOverlayState::Loading) {
+            return;
+        }
+        self.state = ConnectOverlayState::RemotePicker {
+            selected: outlook
+                .remote_name()
+                .and_then(|name| {
+                    self.known_remotes
+                        .iter()
+                        .position(|remote| remote.name == name)
+                })
+                .map_or(0, |index| index + 1),
+            armed: false,
+            note: None,
         };
     }
 
@@ -199,7 +225,8 @@ impl ConnectOverlay {
             ConnectOverlayState::Closed
             | ConnectOverlayState::Loading
             | ConnectOverlayState::Inspecting
-            | ConnectOverlayState::Redeeming(_) => ConnectInputMode::Waiting,
+            | ConnectOverlayState::Redeeming(_)
+            | ConnectOverlayState::Removing { .. } => ConnectInputMode::Waiting,
         }
     }
 
@@ -300,7 +327,7 @@ impl ConnectOverlay {
     pub(super) fn select_previous(&mut self) {
         match &mut self.state {
             ConnectOverlayState::Details(draft) => draft.select_previous(),
-            ConnectOverlayState::RemotePicker { selected } => {
+            ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = selected.checked_sub(1).unwrap_or(self.known_remotes.len());
             }
             _ => {}
@@ -310,7 +337,7 @@ impl ConnectOverlay {
     pub(super) fn select_next(&mut self) {
         match &mut self.state {
             ConnectOverlayState::Details(draft) => draft.select_next(),
-            ConnectOverlayState::RemotePicker { selected } => {
+            ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = (*selected + 1) % (self.known_remotes.len() + 1);
             }
             _ => {}
@@ -376,7 +403,99 @@ impl ConnectOverlay {
         self.known_remotes.push(remote);
         self.state = ConnectOverlayState::RemotePicker {
             selected: self.known_remotes.len(),
+            armed: false,
+            note: None,
         };
+    }
+
+    /// Ending a Pairing is asked for twice: the first press arms the selected
+    /// Remote's removal and only the second performs it. Local is the one row
+    /// no press removes.
+    pub(super) fn remove_remote(&mut self) -> Option<String> {
+        let ConnectOverlayState::RemotePicker {
+            selected, armed, ..
+        } = &self.state
+        else {
+            return None;
+        };
+        let (selected, armed) = (*selected, *armed);
+        let name = selected
+            .checked_sub(1)
+            .and_then(|index| self.known_remotes.get(index))
+            .map(|remote| remote.name.clone());
+        let Some(name) = name else {
+            self.disarm_removal();
+            return None;
+        };
+        if !armed {
+            self.state = ConnectOverlayState::RemotePicker {
+                selected,
+                armed: true,
+                note: None,
+            };
+            return None;
+        }
+        self.state = ConnectOverlayState::Removing { selected };
+        Some(name)
+    }
+
+    /// Puts down an armed removal and clears the note a finished one left,
+    /// which every key but the one that arms removal does.
+    pub(super) fn disarm_removal(&mut self) {
+        if let ConnectOverlayState::RemotePicker { armed, note, .. } = &mut self.state {
+            *armed = false;
+            *note = None;
+        }
+    }
+
+    pub(super) fn remote_removed(&mut self, name: &str, acknowledged: bool) {
+        self.known_names.retain(|known| known != name);
+        self.known_remotes.retain(|remote| remote.name != name);
+        self.remote_statuses.remove(name);
+        self.settle_removal(PickerNote {
+            text: if acknowledged {
+                format!("Removed {name}")
+            } else {
+                format!("Removed {name} here; it did not answer")
+            },
+            failed: false,
+        });
+    }
+
+    pub(super) fn removal_failed(&mut self, error: String) {
+        self.settle_removal(PickerNote {
+            text: error,
+            failed: true,
+        });
+    }
+
+    fn settle_removal(&mut self, note: PickerNote) {
+        let selected = match &self.state {
+            ConnectOverlayState::Removing { selected, .. } => *selected,
+            _ => return,
+        };
+        self.state = ConnectOverlayState::RemotePicker {
+            selected: selected.min(self.known_remotes.len()),
+            armed: false,
+            note: Some(note),
+        };
+    }
+
+    pub(super) fn removal_armed(&self) -> bool {
+        matches!(
+            self.state,
+            ConnectOverlayState::RemotePicker { armed: true, .. }
+        )
+    }
+
+    /// The finished removal's one line, and whether it failed.
+    pub(super) fn picker_note(&self) -> Option<(&str, bool)> {
+        match &self.state {
+            ConnectOverlayState::RemotePicker {
+                note: Some(note), ..
+            } => Some((note.text.as_str(), note.failed)),
+            _ => None,
+        }
     }
 
     pub(super) fn remote_probed(&mut self, name: &str, result: Result<RemoteHealth, String>) {
@@ -449,7 +568,7 @@ impl ConnectOverlay {
     }
 
     pub(super) fn selected_outlook(&self) -> Option<Outlook> {
-        let ConnectOverlayState::RemotePicker { selected } = self.state else {
+        let ConnectOverlayState::RemotePicker { selected, .. } = self.state else {
             return None;
         };
         if selected == 0 {

@@ -13,8 +13,9 @@ use suru::{
     protocol::{
         AgentSelection, InvitePreview, ModelAvailability, ModelCatalog, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Remote,
-        RemoteHealth, RemoteStatus, Session, SessionCreated, SessionId, SessionListItem,
-        SessionReference, SessionStatus, SessionSummary, SessionTimestamp, Workspace,
+        RemoteHealth, RemoteRemoval, RemoteStatus, Session, SessionCreated, SessionId,
+        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp,
+        Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -946,13 +947,60 @@ fn press_with(
         .expect("handle Connect overlay key")
 }
 
+/// Invite entry as `/pair` opens it, with the Remote listing it asks for in
+/// the background already answered.
 fn invite_entry() -> Application {
     let mut application = Application::default();
-    type_terminal_text(&mut application, "/connect");
+    type_terminal_text(&mut application, "/pair");
     press(&mut application, KeyCode::Enter);
     application
         .handle_event(ApplicationEvent::RemotesListed(Vec::new()))
         .unwrap();
+    application
+}
+
+/// The paired-Remote picker `/connect` opens, holding `studio` alone and
+/// already probed.
+fn studio_picker() -> Application {
+    let mut application = Application::default();
+    open_connect(&mut application);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))
+        .unwrap();
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(RemoteHealth {
+                protocol_version: Some(28),
+                status: RemoteStatus::Available,
+            }),
+        })
+        .unwrap();
+    application
+}
+
+fn removal_in_flight() -> Application {
+    let mut application = studio_picker();
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue,
+        "the first press only arms the removal"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("x confirm removal · any other key cancels")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::RemoveRemote("studio".to_owned())
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Removing Remote…")
+    );
     application
 }
 
@@ -1081,12 +1129,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
 
 #[test]
 fn pasted_invite_shows_its_fingerprint_before_pairing_can_advance() {
-    let mut application = Application::default();
-    type_terminal_text(&mut application, "/connect");
-    press(&mut application, KeyCode::Enter);
-    application
-        .handle_event(ApplicationEvent::RemotesListed(Vec::new()))
-        .unwrap();
+    let mut application = invite_entry();
 
     assert_eq!(
         application
@@ -1175,13 +1218,13 @@ fn remote_name_is_editable_and_addresses_are_redeemed_in_the_visible_priority_or
 }
 
 #[test]
-fn connect_is_semantic_and_an_empty_remote_listing_opens_invite_entry() {
+fn connect_is_semantic_and_an_empty_remote_listing_still_opens_the_picker() {
     let mut application = Application::default();
 
     type_terminal_text(&mut application, "/connect");
     let completion = rendered_application_rows(&application).join("\n");
     assert!(completion.contains("/connect"));
-    assert!(completion.contains("Pair or choose a Remote"));
+    assert!(completion.contains("Choose a Remote"));
     assert_eq!(SemanticCommandId::ConnectOpen.as_str(), "connect.open");
     assert_eq!(
         press(&mut application, KeyCode::Enter),
@@ -1190,11 +1233,223 @@ fn connect_is_semantic_and_an_empty_remote_listing_opens_invite_entry() {
 
     application
         .handle_event(ApplicationEvent::RemotesListed(Vec::new()))
-        .expect("open Invite entry for an empty Remote listing");
+        .expect("open the Remote picker for an empty Remote listing");
+
+    let picker = rendered_application_rows(&application).join("\n");
+    assert!(picker.contains("Paired Remotes"), "{picker}");
+    assert!(picker.contains("Local"), "{picker}");
+    assert!(!picker.contains("Paste Invite"), "{picker}");
+    assert!(picker.contains("a pair another"), "{picker}");
+}
+
+#[test]
+fn an_empty_slash_lists_pairing_straight_after_choosing_a_remote() {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "/");
+
+    let palette = rendered_application_rows_at(&application, 100, 40);
+    let connect = palette
+        .iter()
+        .position(|row| row.contains("/connect"))
+        .unwrap_or_else(|| panic!("the empty palette offers /connect: {palette:#?}"));
+    assert!(
+        palette[connect + 1].contains("/pair"),
+        "/pair stands immediately after /connect: {palette:#?}"
+    );
+}
+
+#[test]
+fn pair_opens_invite_entry_without_waiting_for_the_remote_listing() {
+    let mut application = Application::default();
+
+    type_terminal_text(&mut application, "/pair");
+    let completion = rendered_application_rows(&application).join("\n");
+    assert!(completion.contains("/pair"), "{completion}");
+    assert!(completion.contains("Pair with a Remote"), "{completion}");
+    assert_eq!(SemanticCommandId::PairOpen.as_str(), "pair.open");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::BeginConnecting
+    );
 
     let entry = rendered_application_rows(&application).join("\n");
-    assert!(entry.contains("Paste Invite"));
-    assert!(entry.contains("Enter inspect"));
+    assert!(entry.contains("Paste Invite"), "{entry}");
+    assert!(entry.contains("Enter inspect"), "{entry}");
+
+    // The listing lands behind the Invite entry, for the duplicate-name
+    // refusal and so a successful redemption has a picker to land on.
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))
+        .expect("take the background Remote listing");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Paste Invite")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Paste Invite")
+    );
+}
+
+#[test]
+fn removing_a_remote_takes_two_presses_and_says_the_remote_answered() {
+    let mut application = removal_in_flight();
+    assert_eq!(
+        SemanticCommandId::ConnectRemoveRemote.as_str(),
+        "connect.remove"
+    );
+
+    application
+        .handle_event(ApplicationEvent::RemoteRemoved {
+            name: "studio".to_owned(),
+            result: Ok(RemoteRemoval {
+                name: "studio".to_owned(),
+                acknowledged: true,
+            }),
+        })
+        .expect("settle the removal");
+
+    let settled = rendered_application_rows(&application).join("\n");
+    assert!(settled.contains("Paired Remotes"), "{settled}");
+    assert!(!settled.contains("studio  Available"), "{settled}");
+    assert!(settled.contains("Removed studio"), "{settled}");
+
+    press(&mut application, KeyCode::Down);
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Removed studio")
+    );
+}
+
+#[test]
+fn a_remote_that_does_not_answer_its_removal_is_forgotten_here_all_the_same() {
+    let mut application = removal_in_flight();
+
+    application
+        .handle_event(ApplicationEvent::RemoteRemoved {
+            name: "studio".to_owned(),
+            result: Ok(RemoteRemoval {
+                name: "studio".to_owned(),
+                acknowledged: false,
+            }),
+        })
+        .expect("settle the unanswered removal");
+
+    let settled = rendered_application_rows(&application).join("\n");
+    assert!(!settled.contains("studio  Available"), "{settled}");
+    assert!(
+        settled.contains("Removed studio here; it did not answer"),
+        "{settled}"
+    );
+}
+
+#[test]
+fn a_refused_removal_keeps_the_remote_listed_with_its_error_on_show() {
+    let mut application = removal_in_flight();
+
+    application
+        .handle_event(ApplicationEvent::RemoteRemoved {
+            name: "studio".to_owned(),
+            result: Err("Server refused the removal".to_owned()),
+        })
+        .expect("settle the refused removal");
+
+    let settled = rendered_application_rows(&application).join("\n");
+    assert!(settled.contains("studio  Available"), "{settled}");
+    assert!(settled.contains("Server refused the removal"), "{settled}");
+}
+
+#[test]
+fn moving_the_selection_disarms_a_removal_and_local_can_never_be_removed() {
+    let mut application = studio_picker();
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Char('x'));
+    press(&mut application, KeyCode::Up);
+    let disarmed = rendered_application_rows(&application).join("\n");
+    assert!(
+        !disarmed.contains("x confirm removal"),
+        "moving the selection cancels the armed removal: {disarmed}"
+    );
+
+    // The keys are on Local now, which no press can remove.
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("x confirm removal")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("studio  Available")
+    );
+
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Char('x'));
+    assert_eq!(
+        press(&mut application, KeyCode::Char('z')),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("x confirm removal"),
+        "any other key cancels an armed removal"
+    );
+}
+
+#[test]
+fn removing_the_remote_the_outlook_is_turned_toward_turns_back_to_local() {
+    let mut application = application_looking_at_studio();
+    open_connect(&mut application);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![studio_remote()]))
+        .unwrap();
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::RemoveRemote("studio".to_owned())
+    );
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::RemoteRemoved {
+                name: "studio".to_owned(),
+                result: Ok(RemoteRemoval {
+                    name: "studio".to_owned(),
+                    acknowledged: true,
+                }),
+            })
+            .expect("settle the removal of the current Outlook"),
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Local,
+            catalog_origins: HashSet::new(),
+        }
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue
+    );
+    let landing = rendered_application_rows(&application).join("\n");
+    assert!(!landing.contains("studio ·"), "{landing}");
 }
 
 #[test]

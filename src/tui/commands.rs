@@ -90,6 +90,9 @@ pub enum SemanticCommandId {
     /// Dismisses the Workspace Picker row menu, leaving its row alone.
     WorkspacePickerMenuClose,
     ConnectOpen,
+    /// Opens the Connect overlay straight on Invite entry, where a Pairing is
+    /// formed, rather than on the picker that chooses among formed ones.
+    PairOpen,
     ConnectConfirm,
     ConnectFocusNext,
     ConnectPrevious,
@@ -98,6 +101,9 @@ pub enum SemanticCommandId {
     ConnectMoveAddressUp,
     ConnectMoveAddressDown,
     ConnectPairAnother,
+    /// Arms the selected Remote's removal, and removes it when it is already
+    /// armed: ending a Pairing is asked for twice.
+    ConnectRemoveRemote,
     ConnectClose,
     ServeOpen,
     ServePrevious,
@@ -410,6 +416,7 @@ impl SemanticCommandId {
             Self::WorkspacePickerMenuSelect => "workspace-picker.menu.select",
             Self::WorkspacePickerMenuClose => "workspace-picker.menu.close",
             Self::ConnectOpen => "connect.open",
+            Self::PairOpen => "pair.open",
             Self::ConnectConfirm => "connect.confirm",
             Self::ConnectFocusNext => "connect.focus.next",
             Self::ConnectPrevious => "connect.previous",
@@ -418,6 +425,7 @@ impl SemanticCommandId {
             Self::ConnectMoveAddressUp => "connect.address.move-up",
             Self::ConnectMoveAddressDown => "connect.address.move-down",
             Self::ConnectPairAnother => "connect.pair-another",
+            Self::ConnectRemoveRemote => "connect.remove",
             Self::ConnectClose => "connect.close",
             Self::ServeOpen => "serve.open",
             Self::ServePrevious => "serve.previous",
@@ -1137,10 +1145,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectOpen,
-        title: "Pair or choose a Remote",
-        description: "Redeem an Invite or browse paired Remotes",
+        title: "Choose a Remote",
+        description: "Turn the Outlook toward a paired Remote or Local",
         slash: Some(SlashCommand {
             name: "connect",
+            aliases: &[],
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::PairOpen,
+        title: "Pair with a Remote",
+        description: "Redeem an Invite from another machine",
+        slash: Some(SlashCommand {
+            name: "pair",
             aliases: &[],
         }),
         keybinding: None,
@@ -1191,6 +1209,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::ConnectMoveAddressDown,
         title: "Lower Address Priority",
         description: "Move the focused address later in the dialing order",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectRemoveRemote,
+        title: "Remove Remote",
+        description: "End the Pairing with the selected Remote",
         slash: None,
         keybinding: None,
     },
@@ -1648,18 +1673,23 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
     matches.sort_unstable_by_key(|(score, slash, id, _)| (*score, *slash, *id));
     // Keep the established short-terminal browse window stable when an empty
     // slash gives every command the same score. Pairing follows the existing
-    // Model Options action there; any typed part of `connect` ranks normally.
-    if query.is_empty()
-        && let Some(connect_index) = matches
-            .iter()
-            .position(|(_, _, _, id)| *id == SemanticCommandId::ConnectOpen)
-    {
-        let connect = matches.remove(connect_index);
-        let after_options = matches
-            .iter()
-            .position(|(_, _, _, id)| *id == SemanticCommandId::ModelOptions)
-            .map_or(matches.len(), |index| index + 1);
-        matches.insert(after_options, connect);
+    // Model Options action there, choosing a Remote before forming a Pairing
+    // with one; any typed part of `connect` or `pair` ranks normally.
+    if query.is_empty() {
+        for (index, id) in [SemanticCommandId::ConnectOpen, SemanticCommandId::PairOpen]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(position) = matches.iter().position(|(_, _, _, held)| *held == id) else {
+                continue;
+            };
+            let command = matches.remove(position);
+            let after_options = matches
+                .iter()
+                .position(|(_, _, _, held)| *held == SemanticCommandId::ModelOptions)
+                .map_or(matches.len(), |options| options + 1);
+            matches.insert((after_options + index).min(matches.len()), command);
+        }
     }
     matches
         .into_iter()

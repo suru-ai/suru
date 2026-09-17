@@ -77,6 +77,30 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
         press_with(&mut application, KeyCode::Char('c'), KeyModifiers::CONTROL,),
         ApplicationTransition::CopyToClipboard(invite.into())
     );
+    // Removing a Peer ends a Pairing, so it is asked for twice: the first
+    // press arms it and any other key puts it down again.
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("x confirm removal · any other key cancels")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Down),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("x confirm removal")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue
+    );
     assert_eq!(
         press(&mut application, KeyCode::Char('x')),
         ApplicationTransition::RemovePeer("peer-laptop".to_owned())

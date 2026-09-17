@@ -18,14 +18,14 @@ use crate::{
         AdmitPromptRequest, AgentSelection, CheckoutStateChanged, CreateSessionRequest, Health,
         InterruptOutcome, InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState,
         ModelCatalog, Outlook, Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest,
-        Remote, RemoteHealth, ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown,
-        SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
-        SessionError, SessionId, SessionListItem, SessionSettlementChanged, SessionSnapshot,
-        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation,
-        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
-        WorkspaceIconChanged, WorkspaceId,
+        Remote, RemoteHealth, RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor,
+        ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSettlementChanged,
+        SessionSnapshot, SessionStandingInputsChanged, SessionSummary, SessionTitleChanged,
+        SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest,
+        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+        SkillCatalogRequest, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
+        ViewSessionRequest, WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -458,6 +458,10 @@ impl ManagedClient {
 
     pub async fn remove_peer(&self, peer_id: &str) -> Result<()> {
         self.session_commands().remove_peer(peer_id).await
+    }
+
+    pub async fn remove_remote(&self, name: &str) -> Result<RemoteRemoval> {
+        self.session_commands().remove_remote(name).await
     }
 
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
@@ -1218,6 +1222,18 @@ impl SessionCommandClient {
         decode_empty_api_response(response, "Peer removal").await
     }
 
+    pub(crate) async fn remove_remote(&self, name: &str) -> Result<RemoteRemoval> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .delete(remote_removal_url(&descriptor.base_url, name)?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Remote removal")?;
+        decode_api_response(response, "Remote removal").await
+    }
+
     async fn get_pairing_resource<ResponseBody>(
         &self,
         path: &str,
@@ -1517,6 +1533,14 @@ fn remote_probe_url(base_url: &str, name: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+fn remote_removal_url(base_url: &str, name: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("parse server base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("server base URL cannot contain path segments"))?
+        .extend(["v1", "pairing", "remotes", name]);
+    Ok(url)
+}
+
 impl Drop for ManagedClient {
     fn drop(&mut self) {
         self.task.abort();
@@ -1525,7 +1549,7 @@ impl Drop for ManagedClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_probe_url, server_url};
+    use super::{remote_probe_url, remote_removal_url, server_url};
     use crate::protocol::Outlook;
 
     #[test]
@@ -1536,6 +1560,17 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/pairing/remotes/lab%2Feast%3F%23/health"
+        );
+    }
+
+    #[test]
+    fn remote_removal_url_encodes_a_freely_editable_name_as_one_path_segment() {
+        let url = remote_removal_url("http://127.0.0.1:7777", "lab/east?#")
+            .expect("build Remote removal URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/pairing/remotes/lab%2Feast%3F%23"
         );
     }
 

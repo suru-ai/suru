@@ -1363,6 +1363,16 @@ pub enum RemoteStatus {
     ProtocolMismatch,
 }
 
+/// The outcome of removing a Remote. Removal always ends the Pairing on this
+/// side; `acknowledged` says whether the Remote answered in time and dropped
+/// its Peer record for this Server as well.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteRemoval {
+    pub name: String,
+    pub acknowledged: bool,
+}
+
 /// The result of probing a Remote. The protocol version is known only after an
 /// authenticated health response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
