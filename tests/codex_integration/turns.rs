@@ -810,18 +810,36 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
         .await
         .expect("decode idle-flushed Session after abrupt restart");
     assert_eq!(final_boundary, boundary_snapshot);
-    // A restart rebuilds Working from the durable Turns alone, so a Session
-    // whose Working began at its Prompt's admission comes back Working from
-    // the Turn that Prompt began instead (ADR 0024); everything else about
-    // the Session survives the restart unchanged.
+    // The Turn the abrupt stop cut off was run by a process this history
+    // outlived, so the restart settles it as failed and reads no Working
+    // from it (ADR 0029); everything the Turn had produced survives.
+    assert_eq!(final_idle.session.working_since, None);
+    assert_eq!(final_idle.session.status, SessionStatus::Idle);
+    assert_eq!(final_idle.turns[0].id, idle_snapshot.turns[0].id);
+    assert_eq!(final_idle.turns[0].status, TurnStatus::Failed);
+    assert!(final_idle.turns[0].settled_at.is_some());
+    assert_eq!(final_idle.prompts, idle_snapshot.prompts);
+    // The settlement completes the tail that was still streaming; its content
+    // is exactly what the idle flush wrote.
     assert_eq!(
-        final_idle.session.working_since,
-        final_idle.turns[0].started_at
+        final_idle
+            .messages
+            .iter()
+            .map(|message| (message.id, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        idle_snapshot
+            .messages
+            .iter()
+            .map(|message| (message.id, message.content.as_str()))
+            .collect::<Vec<_>>()
     );
-    let mut idle_snapshot = idle_snapshot;
-    idle_snapshot.session.working_since = final_idle.session.working_since;
-    assert_eq!(final_idle, idle_snapshot);
-    assert_eq!(final_idle.turns[0].status, TurnStatus::Active);
+    assert!(
+        final_idle
+            .messages
+            .iter()
+            .all(|message| message.status == MessageStatus::Completed),
+        "a settled Turn leaves no Message streaming"
+    );
     assert_eq!(
         final_idle
             .messages

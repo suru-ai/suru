@@ -53,7 +53,8 @@ pub(crate) use prompts::{
 pub(crate) use selection::AgentSelectionMutationError;
 pub(crate) use settled::SettleSessionError;
 pub(crate) use settlement::{
-    InterruptSessionError, InterruptTarget, ProviderTurnOutcome, TrailingCommandOutput,
+    InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome,
+    TrailingCommandOutput,
 };
 pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
@@ -249,7 +250,10 @@ impl SessionStore {
         // A history read eagerly rather than on access is withdrawn here
         // instead; a deferred one waits for the hydration that reads it.
         let readable = state.sessions.keys().copied().collect::<Vec<_>>();
-        state.withdraw_stranded_prompts(&storage, readable);
+        state.withdraw_stranded_prompts(&storage, readable.clone());
+        // A Turn read still open was run by a process this history outlived;
+        // the same goes for one a deferred hydration reads later.
+        state.settle_stopped_turns(&storage, readable);
         tracing::debug!(
             sessions = state.sessions.len(),
             projection_ms = projection_started.elapsed().as_secs_f64() * 1000.0,

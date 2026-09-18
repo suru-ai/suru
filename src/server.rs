@@ -328,7 +328,6 @@ impl ShutdownController {
             return;
         };
         tracing::info!(reason = ?request.reason, "server shutdown accepted");
-        self.provider_updates.stop();
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
         self.provider_shutdown.send_replace(true);
@@ -342,8 +341,16 @@ impl ShutdownController {
     }
 
     fn stop_providers(&self) {
-        self.provider_updates.stop();
         self.provider_shutdown.send_replace(true);
+    }
+
+    /// Closes the gate Provider actors write Sessions through. Called only
+    /// once every Provider has shut down: a stopping actor settles the Turn
+    /// and Subagents it was running, and those settlements are the record the
+    /// next process reads, so the gate must stay open for them and close
+    /// before the storage writer does (ADR 0029).
+    fn stop_provider_updates(&self) {
+        self.provider_updates.stop();
     }
 }
 
@@ -792,6 +799,7 @@ pub async fn spawn_with_source_control(
         let provider_shutdown_result = provider_shutdown_task
             .await
             .context("Provider shutdown task panicked");
+        task_shutdown.stop_provider_updates();
         let storage_shutdown_result = storage_writer
             .shutdown()
             .await

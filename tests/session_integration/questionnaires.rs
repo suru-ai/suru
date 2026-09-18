@@ -115,12 +115,17 @@ async fn questionnaire_answer_crosses_the_public_client_and_is_readable_in_durab
     )
     .await
     .unwrap();
+    // The stop settled the Turn the Questionnaire belonged to, which adds the
+    // Turn's own failure to the history; the answer itself is exactly as it
+    // was written.
+    let restored = client.read_session(live.session_id).await.unwrap();
     assert_eq!(
-        client
-            .read_session(live.session_id)
-            .await
-            .unwrap()
-            .activities,
+        restored
+            .activities
+            .iter()
+            .filter(|activity| !matches!(activity, Activity::Error { .. }))
+            .cloned()
+            .collect::<Vec<_>>(),
         snapshot.activities
     );
     drop(client);
@@ -1459,7 +1464,16 @@ async fn secret_questionnaire_answer_is_private_in_client_updates_and_persisted_
             .await
             .unwrap();
     let restored = client.read_session(live.session_id).await.unwrap();
-    assert_eq!(restored.activities, snapshot.activities);
+    assert_eq!(
+        restored
+            .activities
+            .iter()
+            .filter(|activity| !matches!(activity, Activity::Error { .. }))
+            .cloned()
+            .collect::<Vec<_>>(),
+        snapshot.activities,
+        "the stop's own failure row aside, the history is exactly as written"
+    );
     assert!(!serde_json::to_string(&restored).unwrap().contains(SECRET));
     drop(client);
     server.shutdown().await.unwrap();

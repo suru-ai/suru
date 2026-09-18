@@ -6,9 +6,9 @@ use anyhow::anyhow;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, MessageRole, MessageStatus, Prompt,
-    PromptDelivery, PromptStatus, SessionChange, SessionId, SessionSnapshot, SessionUpdate, Turn,
-    TurnId, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, ApprovalOutcome, MessageRole,
+    MessageStatus, Prompt, PromptDelivery, PromptStatus, QuestionnaireOutcome, SessionChange,
+    SessionId, SessionSnapshot, SessionTimestamp, SessionUpdate, Turn, TurnId, TurnStatus,
 };
 
 use super::{
@@ -97,6 +97,64 @@ pub(crate) enum ProviderTurnOutcome {
 /// an empty one and still settles every stream the Turn left open.
 pub(crate) type TrailingCommandOutput = HashMap<ActivityId, NormalizedText>;
 
+/// What a settlement says of the Approvals and Questionnaires the Turn still
+/// had open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenInterventions {
+    /// The Turn ended while the Provider was still there to be answered: the
+    /// request simply outlived its Turn.
+    TurnEnded,
+    /// The process that could have answered is gone — Suru stopped, or is
+    /// starting again — so a request still waiting becomes Unavailable and a
+    /// decision in delivery becomes DeliveryUncertain, which no restart can
+    /// tell from delivered.
+    Abandoned,
+}
+
+impl OpenInterventions {
+    /// The outcome an Approval settles to under this reading, or its own if
+    /// it was not open.
+    pub(super) fn approval_outcome(self, outcome: ApprovalOutcome) -> ApprovalOutcome {
+        match (outcome, self) {
+            (
+                ApprovalOutcome::Submitting
+                | ApprovalOutcome::Pending
+                | ApprovalOutcome::SubmissionRejected,
+                Self::TurnEnded,
+            ) => ApprovalOutcome::TurnEnded,
+            (ApprovalOutcome::Submitting, Self::Abandoned) => ApprovalOutcome::DeliveryUncertain,
+            (ApprovalOutcome::Pending | ApprovalOutcome::SubmissionRejected, Self::Abandoned) => {
+                ApprovalOutcome::Unavailable
+            }
+            (other, _) => other,
+        }
+    }
+
+    /// The outcome a Questionnaire settles to under this reading, or its own
+    /// if it was not open.
+    pub(super) fn questionnaire_outcome(
+        self,
+        outcome: QuestionnaireOutcome,
+    ) -> QuestionnaireOutcome {
+        match (outcome, self) {
+            (
+                QuestionnaireOutcome::Submitting
+                | QuestionnaireOutcome::Pending
+                | QuestionnaireOutcome::SubmissionRejected,
+                Self::TurnEnded,
+            ) => QuestionnaireOutcome::TurnEnded,
+            (QuestionnaireOutcome::Submitting, Self::Abandoned) => {
+                QuestionnaireOutcome::DeliveryUncertain
+            }
+            (
+                QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected,
+                Self::Abandoned,
+            ) => QuestionnaireOutcome::Unavailable,
+            (other, _) => other,
+        }
+    }
+}
+
 impl SessionStore {
     pub(crate) fn fail_turn(
         &self,
@@ -104,6 +162,7 @@ impl SessionStore {
         turn_id: TurnId,
         trailing_output: TrailingCommandOutput,
         message: String,
+        interventions: OpenInterventions,
     ) -> anyhow::Result<SessionUpdate> {
         let mut state = self
             .state
@@ -113,21 +172,14 @@ impl SessionStore {
             .sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-        let mut changes = settle_in_flight_changes(&record.snapshot, turn_id, trailing_output);
-        changes.extend([
-            SessionChange::ActivityAdded {
-                activity: Activity::Error {
-                    id: ActivityId::new(),
-                    turn_id,
-                    text: message,
-                },
-            },
-            SessionChange::TurnStatusChanged {
-                turn_id,
-                status: TurnStatus::Failed,
-                settled_at: None,
-            },
-        ]);
+        let changes = fail_turn_changes(
+            &record.snapshot,
+            turn_id,
+            trailing_output,
+            message,
+            None,
+            interventions,
+        );
         state.commit(&self.storage, session_id, changes)
     }
 
@@ -216,7 +268,12 @@ impl SessionStore {
                 // was running, so the flushed output arriving here should find nothing
                 // left to land on. Store what it does still find rather than trusting
                 // that and discarding it unseen.
-                let salvaged = settle_in_flight_changes(&record.snapshot, turn_id, trailing_output);
+                let salvaged = settle_in_flight_changes(
+                    &record.snapshot,
+                    turn_id,
+                    trailing_output,
+                    OpenInterventions::TurnEnded,
+                );
                 if salvaged.is_empty() {
                     return Ok(());
                 }
@@ -245,7 +302,12 @@ impl SessionStore {
             pending_steers.sort_unstable_by_key(|prompt| prompt.admission_order);
             (
                 pending_steers,
-                settle_in_flight_changes(&record.snapshot, turn_id, trailing_output),
+                settle_in_flight_changes(
+                    &record.snapshot,
+                    turn_id,
+                    trailing_output,
+                    OpenInterventions::TurnEnded,
+                ),
             )
         };
 
@@ -414,6 +476,7 @@ pub(super) fn settle_in_flight_changes(
     snapshot: &SessionSnapshot,
     turn_id: TurnId,
     mut trailing_output: TrailingCommandOutput,
+    interventions: OpenInterventions,
 ) -> Vec<SessionChange> {
     let mut changes = Vec::new();
     changes.extend(
@@ -437,25 +500,25 @@ pub(super) fn settle_in_flight_changes(
             Activity::Approval {
                 id,
                 outcome:
-                    crate::protocol::ApprovalOutcome::Pending
-                    | crate::protocol::ApprovalOutcome::SubmissionRejected
-                    | crate::protocol::ApprovalOutcome::Submitting,
+                    outcome @ (ApprovalOutcome::Pending
+                    | ApprovalOutcome::SubmissionRejected
+                    | ApprovalOutcome::Submitting),
                 ..
             } => changes.push(SessionChange::ApprovalSettled {
                 activity_id: *id,
-                outcome: crate::protocol::ApprovalOutcome::TurnEnded,
+                outcome: interventions.approval_outcome(*outcome),
                 decision: None,
             }),
             Activity::Questionnaire {
                 id,
                 outcome:
-                    crate::protocol::QuestionnaireOutcome::Pending
-                    | crate::protocol::QuestionnaireOutcome::SubmissionRejected
-                    | crate::protocol::QuestionnaireOutcome::Submitting,
+                    outcome @ (QuestionnaireOutcome::Pending
+                    | QuestionnaireOutcome::SubmissionRejected
+                    | QuestionnaireOutcome::Submitting),
                 ..
             } => changes.push(SessionChange::QuestionnaireSettled {
                 activity_id: *id,
-                outcome: crate::protocol::QuestionnaireOutcome::TurnEnded,
+                outcome: interventions.questionnaire_outcome(*outcome),
                 answer: None,
             }),
             Activity::Command {
@@ -500,6 +563,37 @@ pub(super) fn settle_in_flight_changes(
             _ => {}
         }
     }
+    changes
+}
+
+/// The one record of a Turn that failed: every stream it left in flight
+/// settled, an Error Activity saying why, and the Turn itself Failed. A live
+/// failure leaves `settled_at` to the commit's clock; a Turn found still open
+/// at the next start carries the moment it last showed work, since the commit
+/// that settles it runs long after the work ended (ADR 0029).
+pub(super) fn fail_turn_changes(
+    snapshot: &SessionSnapshot,
+    turn_id: TurnId,
+    trailing_output: TrailingCommandOutput,
+    message: String,
+    settled_at: Option<SessionTimestamp>,
+    interventions: OpenInterventions,
+) -> Vec<SessionChange> {
+    let mut changes = settle_in_flight_changes(snapshot, turn_id, trailing_output, interventions);
+    changes.extend([
+        SessionChange::ActivityAdded {
+            activity: Activity::Error {
+                id: ActivityId::new(),
+                turn_id,
+                text: message,
+            },
+        },
+        SessionChange::TurnStatusChanged {
+            turn_id,
+            status: TurnStatus::Failed,
+            settled_at,
+        },
+    ]);
     changes
 }
 
@@ -610,7 +704,12 @@ mod tests {
             vec![streaming.clone()],
         );
 
-        let changes = settle_in_flight_changes(&snapshot, turn_id, TrailingCommandOutput::new());
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TrailingCommandOutput::new(),
+            OpenInterventions::TurnEnded,
+        );
 
         assert_eq!(
             changes,
@@ -647,6 +746,7 @@ mod tests {
                     truncated: false,
                 },
             )]),
+            OpenInterventions::TurnEnded,
         );
 
         assert_eq!(
@@ -681,6 +781,7 @@ mod tests {
                     truncated: true,
                 },
             )]),
+            OpenInterventions::TurnEnded,
         );
 
         assert_eq!(
@@ -716,7 +817,12 @@ mod tests {
         };
         let snapshot = settling_snapshot(turn_id, vec![reasoning.clone()], Vec::new());
 
-        let changes = settle_in_flight_changes(&snapshot, turn_id, TrailingCommandOutput::new());
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TrailingCommandOutput::new(),
+            OpenInterventions::TurnEnded,
+        );
 
         assert_eq!(
             changes,
@@ -768,6 +874,7 @@ mod tests {
                     truncated: false,
                 },
             )]),
+            OpenInterventions::TurnEnded,
         );
 
         assert!(

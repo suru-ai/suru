@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::protocol::{
-    Cost, CostCoverage, CostRecord, CostTotal, SessionId, SessionTimestamp, Turn, TurnId,
-    TurnStatus, UsageTotal,
+    Cost, CostCoverage, CostRecord, CostTotal, SessionId, SessionStatus, SessionTimestamp, Turn,
+    TurnId, TurnStatus, UsageTotal,
 };
 
 use super::{
@@ -87,13 +87,18 @@ impl SessionStoreState {
                 let Some(start) = turn.started_at else {
                     continue;
                 };
+                // A Turn read still open was run by a process this history
+                // outlived, and hydration will settle it at the last moment
+                // it showed work; the reading anticipates that settlement so
+                // no listing reports Working for work nothing is doing
+                // (ADR 0029).
                 let end = if turn.status.is_terminal() {
                     let Some(end) = turn.settled_at else { continue };
-                    Some(end)
+                    end
                 } else {
-                    None
+                    turn.last_output_at.unwrap_or(start)
                 };
-                working.insert(start, end);
+                working.insert(start, Some(end));
             }
             let reading = working.working_since();
             record.snapshot.session.working_since = reading;
@@ -104,8 +109,17 @@ impl SessionStoreState {
             // says so, and its status is derived the same way every other
             // commit derives it (ADR 0024). A history whose Turns break that
             // derivation keeps the status it was stored with.
-            let status = derived_session_status(&record.snapshot, &record.turn_start_admissions)
-                .unwrap_or(record.snapshot.session.status);
+            // A restored Session owes no Turn (admissions belonged to the
+            // process that made them) and an open Turn is read as ended above,
+            // so a history the derivation can read is Idle until hydration
+            // settles that Turn for real (ADR 0029).
+            let status = if derived_session_status(&record.snapshot, &record.turn_start_admissions)
+                .is_ok()
+            {
+                SessionStatus::Idle
+            } else {
+                record.snapshot.session.status
+            };
             record.snapshot.session.status = status;
             record.summary.session.status = status;
             record.snapshot.subagent_usage = delegated;

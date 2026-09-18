@@ -14,8 +14,8 @@ use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, ModelId,
         PromptDelivery, PromptId, SessionCatalogChange, SessionChange, SessionError,
-        SessionErrorCode, SessionListItem, SessionRevision, SessionSnapshot, TurnStatus,
-        ViewSessionOperationId, ViewSessionRequest,
+        SessionErrorCode, SessionListItem, SessionRevision, SessionSnapshot, SessionStatus,
+        TurnStatus, ViewSessionOperationId, ViewSessionRequest,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -594,9 +594,7 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
 #[tokio::test]
 async fn working_duration_stays_continuous_when_only_subagents_remain() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let instance = "subagent-working-duration-test";
-    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
-    let fixture = working_turn(state_dir.path(), instance).await;
+    let fixture = working_turn(state_dir.path(), "subagent-working-duration-test").await;
     let before_spawn = read_session_at_least_revision(
         &fixture.client,
         fixture.server.descriptor(),
@@ -680,61 +678,253 @@ async fn working_duration_stays_continuous_when_only_subagents_remain() {
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// A Subagent that outlives its Turn is still the Provider's work, and the
+/// Provider does not survive the server stopping. The stop settles it the way
+/// a lost Provider connection does — before the storage writer closes, so the
+/// settlement is what the next process reads rather than a Turn it must
+/// settle for itself — and the restarted server reports the parent idle
+/// instead of waiting on Subagents no process is running (ADR 0029).
+#[tokio::test]
+async fn a_stop_settles_the_subagents_no_process_will_finish() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let instance = "subagent-stop-settles-test";
+    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
+    let fixture = working_turn(state_dir.path(), instance).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let waiting = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the parent Turn settles while its Subagent keeps Working",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+    )
+    .await;
+    assert!(waiting.working_since().is_some());
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&waiting)
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+
+    // The Provider connection is alive when the server stops: the stop itself
+    // is what ends the Subagent's work.
+    fixture.server.shutdown().await.expect("shut down server");
+    drop(fixture.provider_session);
+
     let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
     let restarted = server::spawn_with_provider(config, replacement_runtime)
         .await
         .expect("respawn server");
-    let restored_parent = fixture
-        .client
-        .get(format!(
-            "{}/v1/sessions/{}",
-            restarted.descriptor().base_url,
-            fixture.session_id
-        ))
+    let listed = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", restarted.descriptor().base_url))
         .bearer_auth(&restarted.descriptor().token)
         .send()
         .await
-        .expect("read restored parent")
+        .expect("list Sessions")
         .error_for_status()
-        .expect("restored parent remains readable")
-        .json::<SessionSnapshot>()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionListItem>>()
         .await
-        .expect("decode restored parent");
+        .expect("decode Session listing");
+    let summary = listed
+        .iter()
+        .find_map(|item| {
+            item.readable()
+                .filter(|summary| summary.session.id == fixture.session_id)
+        })
+        .expect("the parent Session remains listed");
     assert_eq!(
-        restored_parent.working_since(),
-        Some(turn_started_at),
-        "restart reconstructs the parent's uninterrupted subtree clock from \
-         the durable Turns, the admission that preceded the first of them \
-         having belonged to the process that admitted it"
+        summary.session.working_since, None,
+        "the listing reads no Working from work no process is doing, before anyone opens it"
     );
+
+    let restored_child = read_session(restarted.descriptor(), child_id).await;
+    assert_eq!(restored_child.turns.len(), 1);
+    assert_eq!(restored_child.turns[0].status, TurnStatus::Failed);
+    assert!(
+        restored_child.turns[0].settled_at.is_some(),
+        "the settled Turn says when it settled"
+    );
+    assert_eq!(restored_child.session.status, SessionStatus::Idle);
+    assert_eq!(restored_child.working_since(), None);
+    let reasons = restored_child
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Error { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        vec![
+            "Provider execution failed: the Provider Session ended before the Subagent's work completed."
+        ],
+        "the stopping server settled the Subagent itself, so the next process had nothing to settle"
+    );
+
+    let restored_parent = read_session(restarted.descriptor(), fixture.session_id).await;
     let Activity::Subagent {
-        session_id: child_id,
+        status,
+        duration_ms,
         ..
     } = the_subagent_row(&restored_parent)
     else {
         unreachable!()
     };
-    let restored_child = fixture
-        .client
-        .get(format!(
-            "{}/v1/sessions/{child_id}",
-            restarted.descriptor().base_url
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(
+        *duration_ms, None,
+        "a Subagent the Provider never reported settling has no duration"
+    );
+    assert_eq!(restored_parent.working_since(), None);
+    assert_eq!(restored_parent.session.status, SessionStatus::Idle);
+    restarted.shutdown().await.expect("stop restarted server");
+}
+
+/// A history that reaches the next start with Turns still open — a crash, a
+/// kill, or a database written before stops settled their own work — is
+/// settled by that start: the listing reads nothing as Working or Active
+/// before any tree is opened, opening the tree settles the Turns durably at
+/// the moment they last showed work, and the parent's Subagent row settles
+/// with the child (ADR 0029).
+#[tokio::test]
+async fn a_restart_settles_the_turns_the_last_process_left_open() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let instance = "subagent-restart-repair-test";
+    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
+    let fixture = working_turn(state_dir.path(), instance).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    let spawned = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let Activity::Subagent {
+        id: row_id,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&spawned)
+    else {
+        unreachable!()
+    };
+    let (row_id, child_id) = (*row_id, *child_id);
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    // Put the history back the way a process that never settled its work
+    // would have left it: both Turns open, the Subagent row still live.
+    {
+        use diesel::{Connection, RunQueryDsl, SqliteConnection};
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        diesel::sql_query(
+            "UPDATE turns SET payload = json_set(payload, '$.status', 'active', '$.settled_at', json('null'))",
+        )
+        .execute(&mut database)
+        .unwrap();
+        diesel::sql_query(format!(
+            "UPDATE activities SET payload = json_set(payload, '$.status', 'active', '$.duration_ms', json('null')) WHERE id = '{row_id}'"
         ))
+        .execute(&mut database)
+        .unwrap();
+    }
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config.clone(), runtime)
+        .await
+        .expect("respawn server");
+    let listed = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", restarted.descriptor().base_url))
         .bearer_auth(&restarted.descriptor().token)
         .send()
         .await
-        .expect("read restored child")
+        .expect("list Sessions")
         .error_for_status()
-        .expect("restored child remains readable")
-        .json::<SessionSnapshot>()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionListItem>>()
         .await
-        .expect("decode restored child");
+        .expect("decode Session listing");
+    let summary = listed
+        .iter()
+        .find_map(|item| {
+            item.readable()
+                .filter(|summary| summary.session.id == fixture.session_id)
+        })
+        .expect("the parent Session remains listed");
     assert_eq!(
-        restored_child.working_since(),
-        restored_child.turns[0].started_at,
-        "a focused child reconstructs its own Working clock too"
+        summary.session.working_since, None,
+        "before any tree is opened, the listing reads no Working from Turns no process is running"
     );
+    assert_eq!(summary.session.status, SessionStatus::Idle);
+
+    let child = read_session(restarted.descriptor(), child_id).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Failed);
+    assert_eq!(
+        child.turns[0].settled_at, child.turns[0].started_at,
+        "a Turn that never showed output settles where it began"
+    );
+    assert_eq!(child.session.status, SessionStatus::Idle);
+    assert!(child.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text == "The server stopped before this Subagent finished."
+    )));
+    let parent = read_session(restarted.descriptor(), fixture.session_id).await;
+    assert_eq!(parent.turns[0].status, TurnStatus::Failed);
+    assert!(parent.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text == "The server stopped before this Turn finished."
+    )));
+    let Activity::Subagent {
+        status,
+        duration_ms,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!((*status, *duration_ms), (ActivityStatus::Failed, None));
+    assert_eq!(parent.working_since(), None);
+    assert_eq!(parent.session.status, SessionStatus::Idle);
     restarted.shutdown().await.expect("stop restarted server");
+
+    // The repair is durable: the next process reads it back rather than
+    // deciding it again.
+    let (runtime, _provider) = ControlledProvider::new();
+    let again = server::spawn_with_provider(config, runtime)
+        .await
+        .expect("respawn server once more");
+    assert_eq!(
+        read_session(again.descriptor(), child_id).await.revision,
+        child.revision
+    );
+    assert_eq!(
+        read_session(again.descriptor(), fixture.session_id)
+            .await
+            .revision,
+        parent.revision
+    );
+    again.shutdown().await.expect("stop final server");
 }
 
 #[tokio::test]

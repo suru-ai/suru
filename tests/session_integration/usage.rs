@@ -40,6 +40,15 @@ fn active_total(fresh_input: u64, output: u64, usd: f64) -> UsageTotal {
     }
 }
 
+/// The total a Session reports once every Turn under it has settled: nothing
+/// is Working, so nothing more can accrue against the cost it reported.
+fn settled_total(fresh_input: u64, output: u64, usd: f64) -> UsageTotal {
+    UsageTotal {
+        cost_is_partial: false,
+        ..active_total(fresh_input, output, usd)
+    }
+}
+
 /// Spawns one Subagent under `owner` — the owning Session's own Turn, or a
 /// Subagent of its own — and answers with the child Session it opened.
 async fn spawn_subagent(
@@ -362,7 +371,10 @@ async fn an_ancestor_report_suppresses_an_overlapping_nested_report() {
         .total_usage()
         .expect("restore ancestor aggregate");
     assert_eq!(restored_parent.cost, Cost::from_usd(0.10));
-    assert!(restored_parent.cost_is_partial);
+    assert!(
+        !restored_parent.cost_is_partial,
+        "the restart settled every Turn, so the reported aggregate covers all the work there was"
+    );
     assert_eq!(
         read_session(restarted.descriptor(), child_id)
             .await
@@ -804,13 +816,13 @@ async fn a_restarted_server_derives_the_roll_up_again_from_the_turns_it_stored()
     let parent = read_session(restarted.descriptor(), session_id).await;
     assert_eq!(
         parent.total_usage(),
-        Some(active_total(6_000, 1_500, 0.25)),
-        "the roll-up comes back from the child's own stored Turns"
+        Some(settled_total(6_000, 1_500, 0.25)),
+        "the roll-up comes back from the child's own stored Turns, settled by the restart"
     );
     let child = read_session(restarted.descriptor(), child_id).await;
     assert_eq!(
         child.total_usage(),
-        Some(active_total(2_000, 500, 0.05)),
+        Some(settled_total(2_000, 500, 0.05)),
         "a restored child still keeps its own"
     );
 

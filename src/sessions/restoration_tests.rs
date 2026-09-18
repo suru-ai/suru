@@ -5,9 +5,10 @@ use std::{cell::Cell, collections::HashMap, path::Path};
 use super::SessionStore;
 use crate::{
     protocol::{
-        Cost, CostBasis, CostCoverage, CostDetails, ModelAvailability, Session, SessionId,
-        SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus, SessionSummary,
-        SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
+        Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
+        ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot,
+        SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, TranscriptItem,
+        Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
 };
@@ -175,7 +176,7 @@ async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_
 }
 
 #[tokio::test]
-async fn restored_working_bridges_settled_ancestors_without_spending_revisions_or_writes() {
+async fn restored_usage_folds_descendants_without_spending_revisions_or_writes() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
@@ -184,11 +185,11 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
     let mut child = persisted(directory.path(), Some(root.snapshot.session.id));
     child.snapshot.turns = vec![turn(18, Some(42), Some(3))];
     let mut leaf = persisted(directory.path(), Some(child.snapshot.session.id));
-    leaf.snapshot.turns = vec![turn(49, None, Some(5))];
+    leaf.snapshot.turns = vec![turn(49, Some(60), Some(5))];
     let mut sibling = persisted(directory.path(), Some(root.snapshot.session.id));
     sibling.snapshot.turns = vec![turn(1, Some(5), None)];
     let mut unknown = persisted(directory.path(), None);
-    let mut untimed = turn(0, None, None);
+    let mut untimed = turn(0, Some(1), None);
     untimed.started_at = None;
     unknown.snapshot.turns = vec![untimed];
     let mut zero = persisted(directory.path(), None);
@@ -208,9 +209,9 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
         Default::default(),
     );
     for (index, (since, output)) in [
-        (Some(10), Some(8)),
-        (Some(49), Some(8)),
-        (Some(49), Some(5)),
+        (None, Some(8)),
+        (None, Some(8)),
+        (None, Some(5)),
         (None, None),
         (None, None),
         (None, Some(0)),
@@ -253,6 +254,249 @@ async fn restored_working_bridges_settled_ancestors_without_spending_revisions_o
     );
 }
 
+/// A parent's row for `child`, still open, as `fail_all` would have found it.
+fn subagent_row(parent: &mut PersistedSession, child: SessionId) -> ActivityId {
+    let id = ActivityId::new();
+    let turn_id = parent.snapshot.turns[0].id;
+    parent.snapshot.activities.push(Activity::Subagent {
+        id,
+        turn_id,
+        status: ActivityStatus::Active,
+        name: "explorer".into(),
+        description: "map the seams".into(),
+        model: None,
+        session_id: child,
+        duration_ms: None,
+    });
+    parent
+        .snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id: id });
+    id
+}
+
+fn subagent_status(snapshot: &SessionSnapshot, id: ActivityId) -> (ActivityStatus, Option<u64>) {
+    snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Subagent {
+                id: found,
+                status,
+                duration_ms,
+                ..
+            } if *found == id => Some((*status, *duration_ms)),
+            _ => None,
+        })
+        .expect("the Subagent row survives restoration")
+}
+
+fn error_texts(snapshot: &SessionSnapshot, turn_id: TurnId) -> Vec<String> {
+    snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Error {
+                turn_id: owner,
+                text,
+                ..
+            } if *owner == turn_id => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The Turn a child Session was running when the server stopped is settled at
+/// the next start, and its parent's row settles with it, because nothing
+/// survives a stop to finish either (ADR 0029).
+#[tokio::test]
+async fn a_subagent_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![turn(10, Some(32), None)];
+    let mut child = persisted(directory.path(), Some(root.snapshot.session.id));
+    let mut open = turn(30, None, Some(2));
+    open.last_output_at = Some(SessionTimestamp(50));
+    let open_id = open.id;
+    child.snapshot.turns = vec![open];
+    child.snapshot.session.status = SessionStatus::Active;
+    let child_id = child.snapshot.session.id;
+    let row = subagent_row(&mut root, child_id);
+    let root_id = root.snapshot.session.id;
+    let records = vec![root, child];
+    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: records,
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+        Default::default(),
+    );
+
+    let restored_child = store.subscribe(child_id).unwrap().snapshot;
+    let settled = restored_child
+        .turns
+        .iter()
+        .find(|turn| turn.id == open_id)
+        .unwrap();
+    assert_eq!(settled.status, TurnStatus::Failed);
+    assert_eq!(
+        settled.settled_at,
+        Some(SessionTimestamp(50)),
+        "the Turn settles at its last output, not at the restart"
+    );
+    assert_eq!(
+        error_texts(&restored_child, open_id),
+        vec![super::hydration::STOPPED_SUBAGENT_MESSAGE.to_owned()]
+    );
+    assert_eq!(restored_child.session.status, SessionStatus::Idle);
+    assert_eq!(restored_child.working_since(), None);
+    let restored_root = store.subscribe(root_id).unwrap().snapshot;
+    assert_eq!(
+        subagent_status(&restored_root, row),
+        (ActivityStatus::Failed, None)
+    );
+    assert_eq!(restored_root.working_since(), None);
+    assert_eq!(restored_root.session.status, SessionStatus::Idle);
+
+    // The repair is durable: the next process reads it back rather than
+    // deciding it again.
+    writer.shutdown().await.unwrap();
+    let reloaded_child = repository
+        .session(child_id)
+        .await
+        .unwrap()
+        .expect("the child was written");
+    assert_eq!(reloaded_child.snapshot, restored_child);
+    let reloaded_root = repository
+        .session(root_id)
+        .await
+        .unwrap()
+        .expect("the parent was written");
+    // Subagent Usage is derived at every start rather than stored, so the
+    // parent is compared on what the repair wrote.
+    assert_eq!(
+        subagent_status(&reloaded_root.snapshot, row),
+        (ActivityStatus::Failed, None)
+    );
+    assert_eq!(reloaded_root.snapshot.revision, restored_root.revision);
+    assert_eq!(reloaded_root.snapshot.session, restored_root.session);
+}
+
+/// A root's own open Turn is orphaned by a stop the same way: no Provider
+/// survives to finish it either, and nothing at restoration resumes it.
+#[tokio::test]
+async fn a_root_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let mut root = persisted(directory.path(), None);
+    let open = turn(40, None, Some(1));
+    let open_id = open.id;
+    root.snapshot.turns = vec![turn(10, Some(20), None), open];
+    root.snapshot.session.status = SessionStatus::Active;
+    let root_id = root.snapshot.session.id;
+    let records = vec![root];
+    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: records,
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+        Default::default(),
+    );
+
+    let restored = store.subscribe(root_id).unwrap().snapshot;
+    let settled = restored
+        .turns
+        .iter()
+        .find(|turn| turn.id == open_id)
+        .unwrap();
+    assert_eq!(settled.status, TurnStatus::Failed);
+    assert_eq!(
+        settled.settled_at,
+        Some(SessionTimestamp(40)),
+        "a Turn that never showed output settles where it began"
+    );
+    assert_eq!(
+        error_texts(&restored, open_id),
+        vec![super::hydration::STOPPED_TURN_MESSAGE.to_owned()]
+    );
+    assert_eq!(restored.session.status, SessionStatus::Idle);
+    assert_eq!(restored.working_since(), None);
+    let listed = store.list(None);
+    let crate::protocol::SessionListItem::Readable(summary) = &listed[0] else {
+        panic!("readable")
+    };
+    assert_eq!(summary.session.status, SessionStatus::Idle);
+    assert_eq!(summary.session.working_since, None);
+
+    writer.shutdown().await.unwrap();
+    let reloaded = repository
+        .session(root_id)
+        .await
+        .unwrap()
+        .expect("the root was written");
+    assert_eq!(reloaded.snapshot, restored);
+}
+
+/// A Subagent whose Turn already settled — completed, failed, or stopped —
+/// is exactly as the last process left it: the repair spends no revision and
+/// writes nothing.
+#[tokio::test]
+async fn a_subagent_already_settled_is_left_exactly_as_it_was() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![turn(10, Some(32), None)];
+    let mut child = persisted(directory.path(), Some(root.snapshot.session.id));
+    let mut interrupted = turn(30, Some(31), Some(2));
+    interrupted.status = TurnStatus::Interrupted;
+    child.snapshot.turns = vec![interrupted];
+    let child_id = child.snapshot.session.id;
+    let row = subagent_row(&mut root, child_id);
+    let root_id = root.snapshot.session.id;
+    let records = vec![root, child];
+    let expected = records
+        .iter()
+        .map(|persisted| persisted.snapshot.clone())
+        .collect::<Vec<_>>();
+    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: records,
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+        Default::default(),
+    );
+
+    let restored_child = store.subscribe(child_id).unwrap().snapshot;
+    assert_eq!(restored_child, expected[1]);
+    let restored_root = store.subscribe(root_id).unwrap().snapshot;
+    assert_eq!(restored_root.revision, SessionRevision(7));
+    assert_eq!(
+        subagent_status(&restored_root, row),
+        (ActivityStatus::Active, None),
+        "a row the last process left open over a settled Turn is not this repair's to close"
+    );
+    writer.shutdown().await.unwrap();
+    assert!(
+        repository
+            .load_sessions()
+            .await
+            .unwrap()
+            .readable
+            .is_empty(),
+        "restoration wrote synthetic state"
+    );
+}
+
 async fn restore_tree(wide: bool) {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
@@ -267,7 +511,7 @@ async fn restore_tree(wide: bool) {
     }
     for (index, record) in records.iter_mut().enumerate() {
         let start = if wide { 10 } else { 10 + index as u64 * 3 };
-        record.snapshot.turns = vec![turn(start, (index != 511).then_some(start + 1), Some(1))];
+        record.snapshot.turns = vec![turn(start, Some(start + 1), Some(1))];
     }
     let root = records[0].snapshot.session.id;
     let leaf = records[511].snapshot.session.id;
@@ -289,10 +533,7 @@ async fn restore_tree(wide: bool) {
     let snapshot = store.subscribe(root).unwrap().snapshot;
     assert_eq!(snapshot.total_usage().unwrap().output_tokens, Some(512));
     assert_eq!(snapshot.subagent_usage.unwrap().output_tokens, Some(511));
-    assert_eq!(
-        snapshot.working_since(),
-        Some(SessionTimestamp(if wide { 10 } else { 1543 }))
-    );
+    assert_eq!(snapshot.working_since(), None);
     assert_eq!(
         store
             .subscribe(leaf)
@@ -392,13 +633,13 @@ async fn restored_balanced_tree_matches_the_durable_interval_union() {
     }
     for (index, record) in records.iter_mut().enumerate() {
         // Repeated starts, touching ends, gaps, nested overlaps and old Turns
-        // without timing. Some branches have no live work at all.
+        // without timing.
         let start = (index as u64 * 17) % 83;
         record.snapshot.turns = vec![
             turn(start, Some(start + 5), Some(0)),
-            turn(start + 20, (index % 7 != 0).then_some(start + 23), Some(2)),
+            turn(start + 20, Some(start + 23), Some(2)),
         ];
-        let mut untimed = turn(0, None, None);
+        let mut untimed = turn(0, Some(1), None);
         untimed.started_at = None;
         record.snapshot.turns.push(untimed);
         let mut no_end = turn(0, Some(1000), None);

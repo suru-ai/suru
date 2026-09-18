@@ -1164,7 +1164,7 @@ async fn a_provider_actor_ending_settles_the_command_it_left_in_flight() {
 }
 
 #[tokio::test]
-async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_command() {
+async fn a_restart_settles_the_turn_it_cut_off_and_the_command_it_left_in_flight() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let config =
@@ -1252,13 +1252,22 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         .expect("decode restored Session");
     assert_eq!(
         restored.turns[0].status,
-        TurnStatus::Active,
-        "a restart leaves the Turn it cut off active and without a Provider actor"
+        TurnStatus::Failed,
+        "a restart settles the Turn it cut off, since no process is left to run it"
     );
-    let Activity::Command { status, .. } = &restored.activities[0] else {
+    assert_eq!(restored.session.status, SessionStatus::Idle);
+    let Some(Activity::Command { status, .. }) = restored
+        .activities
+        .iter()
+        .find(|activity| activity.id() == command_activity_id)
+    else {
         panic!("Provider command projects as command Activity");
     };
-    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "the settlement closes what the Turn left in flight"
+    );
 
     let refused = http
         .post(format!(
@@ -1269,14 +1278,15 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         .send()
         .await
         .expect("request interruption of the restored Turn");
-    assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
     assert_eq!(
         refused
             .json::<SessionError>()
             .await
-            .expect("decode interruption failure")
+            .expect("decode interruption refusal")
             .code,
-        SessionErrorCode::InterruptionFailed
+        SessionErrorCode::NothingToInterrupt,
+        "there is nothing left to interrupt once the restart has settled the Turn"
     );
 
     let interrupted = http
@@ -1293,19 +1303,9 @@ async fn interrupting_a_turn_without_a_provider_actor_settles_its_in_flight_comm
         .json::<SessionSnapshot>()
         .await
         .expect("decode the failed Session");
-    assert_eq!(interrupted.turns[0].status, TurnStatus::Failed);
-    assert_eq!(interrupted.session.status, SessionStatus::Idle);
-    let Some(Activity::Command { status, .. }) = interrupted
-        .activities
-        .iter()
-        .find(|activity| activity.id() == command_activity_id)
-    else {
-        panic!("the command Activity survives the failed interruption");
-    };
     assert_eq!(
-        *status,
-        ActivityStatus::Failed,
-        "an interruption that never reaches a Provider actor still settles what it left in flight"
+        interrupted.revision, restored.revision,
+        "a refused interrupt changes nothing"
     );
 
     replacement

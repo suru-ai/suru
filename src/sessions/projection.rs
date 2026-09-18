@@ -770,7 +770,13 @@ fn stamp_output_evidence(
                         .find(|message| message.id == *message_id)
                         .map(|message| message.turn_id)
                 }),
-            SessionChange::ActivityAdded { activity } => Some(activity.turn_id()),
+            // An Error is Suru's own account of a failure, not output the
+            // Turn produced, so it is no evidence the Turn was still at work.
+            SessionChange::ActivityAdded { activity }
+                if !matches!(activity, crate::protocol::Activity::Error { .. }) =>
+            {
+                Some(activity.turn_id())
+            }
             SessionChange::CommandOutputAppended {
                 activity_id,
                 content,
@@ -1058,9 +1064,14 @@ fn stamp_turn_timing(changes: &mut [SessionChange], committed_at: SessionTimesta
                     turn.settled_at = Some(committed_at);
                 }
             }
+            // A settlement that already carries its moment is a Turn found open
+            // at the next start, settled at the last time it showed work; every
+            // live settlement leaves it to the commit's clock (ADR 0029).
             SessionChange::TurnStatusChanged {
                 status, settled_at, ..
-            } if status.is_terminal() => *settled_at = Some(committed_at),
+            } if status.is_terminal() => {
+                settled_at.get_or_insert(committed_at);
+            }
             _ => {}
         }
     }

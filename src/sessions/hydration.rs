@@ -4,9 +4,20 @@ use super::{
     prompts::{PromptOrigin, PromptOwner},
 };
 use crate::{
-    protocol::{PromptId, PromptOrder, SessionCatalogChange, SessionId},
-    storage::{PersistedSession, StorageError, UnreadableStoredSession},
+    protocol::{
+        Activity, ActivityStatus, PromptId, PromptOrder, SessionCatalogChange, SessionChange,
+        SessionId,
+    },
+    storage::{PersistedSession, StorageError, StorageSink, UnreadableStoredSession},
 };
+
+use super::settlement::{OpenInterventions, TrailingCommandOutput, fail_turn_changes};
+
+/// Why a Subagent's Turn found open at start failed, as its Transcript says it.
+pub(super) const STOPPED_SUBAGENT_MESSAGE: &str =
+    "The server stopped before this Subagent finished.";
+/// Why any other Turn found open at start failed.
+pub(super) const STOPPED_TURN_MESSAGE: &str = "The server stopped before this Turn finished.";
 
 impl SessionStore {
     /// Restore the entire containing tree before exposing history or admitting
@@ -169,7 +180,8 @@ impl SessionStore {
         // is left to deliver, in the same lock that first made it readable, so
         // no reader ever sees it as a Message still waiting on an Agent
         // (ADR 0024).
-        state.withdraw_stranded_prompts(&self.storage, hydrated);
+        state.withdraw_stranded_prompts(&self.storage, hydrated.clone());
+        state.settle_stopped_turns(&self.storage, hydrated);
         Ok(())
     }
 
@@ -228,6 +240,114 @@ impl SessionStoreState {
             .as_ref()
             .is_some_and(|deferred| deferred.child_ids.contains(&id))
     }
+
+    /// Settles every Turn persisted still open. A Turn is run by the process
+    /// that began it, and this history has outlived that process: no Provider
+    /// survives a stop, so nothing is left to finish the Turn, and reading it
+    /// as live would keep its whole ancestry Working forever. It fails the way
+    /// a lost Provider connection fails it, at the moment it last showed work,
+    /// and a Subagent's row in its parent settles with it (ADR 0029).
+    ///
+    /// Deferred Sessions are passed over: hydrating one is what brings it
+    /// here. A parent still deferred keeps its row until its own hydration.
+    pub(super) fn settle_stopped_turns(
+        &mut self,
+        storage: &StorageSink,
+        sessions: impl IntoIterator<Item = SessionId>,
+    ) {
+        for session_id in sessions {
+            if self.is_deferred(session_id) {
+                continue;
+            }
+            let Some(record) = self.sessions.get(&session_id) else {
+                continue;
+            };
+            let subagent = record.snapshot.session.is_subagent();
+            let parent = record.snapshot.session.parent;
+            let open = record
+                .snapshot
+                .turns
+                .iter()
+                .filter(|turn| !turn.status.is_terminal())
+                .map(|turn| (turn.id, turn.last_output_at.or(turn.started_at)))
+                .collect::<Vec<_>>();
+            if open.is_empty() {
+                continue;
+            }
+            for (turn_id, settled_at) in open {
+                let Some(record) = self.sessions.get(&session_id) else {
+                    break;
+                };
+                let message = if subagent {
+                    STOPPED_SUBAGENT_MESSAGE
+                } else {
+                    STOPPED_TURN_MESSAGE
+                };
+                let changes = fail_turn_changes(
+                    &record.snapshot,
+                    turn_id,
+                    TrailingCommandOutput::new(),
+                    message.to_owned(),
+                    settled_at,
+                    OpenInterventions::Abandoned,
+                );
+                if let Err(error) = self.commit(storage, session_id, changes) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "Turn left open by a stop could not be settled: {error}"
+                    );
+                }
+            }
+            let Some(parent) = parent else {
+                continue;
+            };
+            self.settle_stopped_subagent_row(storage, parent, session_id);
+        }
+    }
+
+    /// Settles the row `parent` holds for `child`, if it still stands open,
+    /// the way a lost Provider connection would have: Failed, with no
+    /// duration, since the Provider never reported the Subagent settling.
+    fn settle_stopped_subagent_row(
+        &mut self,
+        storage: &StorageSink,
+        parent: SessionId,
+        child: SessionId,
+    ) {
+        if self.is_deferred(parent) {
+            return;
+        }
+        let Some(record) = self.sessions.get(&parent) else {
+            return;
+        };
+        let rows = record
+            .snapshot
+            .activities
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::Subagent {
+                    id,
+                    status: ActivityStatus::Active,
+                    session_id,
+                    ..
+                } if *session_id == child => Some(SessionChange::SubagentStatusChanged {
+                    activity_id: *id,
+                    status: ActivityStatus::Failed,
+                    duration_ms: None,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(error) = self.commit(storage, parent, rows) {
+            tracing::warn!(
+                session_id = %parent,
+                "Subagent row left open by a stop could not be settled: {error}"
+            );
+        }
+    }
 }
 
 /// Both eager in-memory fixtures and durable hydration use the same recovery
@@ -275,27 +395,17 @@ pub(super) fn restored_record(
     }
 }
 
+/// Reads every Approval and Questionnaire the last process left waiting as
+/// abandoned: the process that could have answered is gone. The same reading a
+/// stopping server writes for the Turn it settles ([`OpenInterventions`]).
 fn recover_interventions(persisted: &mut PersistedSession) {
-    use crate::protocol::{Activity, ApprovalOutcome, QuestionnaireOutcome};
     for activity in &mut persisted.snapshot.activities {
         match activity {
             Activity::Approval { outcome, .. } => {
-                *outcome = match *outcome {
-                    ApprovalOutcome::Submitting => ApprovalOutcome::DeliveryUncertain,
-                    ApprovalOutcome::Pending | ApprovalOutcome::SubmissionRejected => {
-                        ApprovalOutcome::Unavailable
-                    }
-                    other => other,
-                };
+                *outcome = OpenInterventions::Abandoned.approval_outcome(*outcome);
             }
             Activity::Questionnaire { outcome, .. } => {
-                *outcome = match *outcome {
-                    QuestionnaireOutcome::Submitting => QuestionnaireOutcome::DeliveryUncertain,
-                    QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected => {
-                        QuestionnaireOutcome::Unavailable
-                    }
-                    other => other,
-                };
+                *outcome = OpenInterventions::Abandoned.questionnaire_outcome(*outcome);
             }
             _ => {}
         }

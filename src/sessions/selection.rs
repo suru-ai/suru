@@ -12,7 +12,7 @@ use crate::protocol::{
 use super::{
     SessionRecord, SessionStore,
     prompts::{PromptOrigin, PromptOwner},
-    settlement::{TrailingCommandOutput, settle_in_flight_changes},
+    settlement::{OpenInterventions, TrailingCommandOutput, settle_in_flight_changes},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,7 +275,12 @@ impl SessionStore {
                 prompt.clone(),
                 mark_unavailable,
                 record.next_prompt_order,
-                settle_in_flight_changes(&record.snapshot, turn_id, trailing_output),
+                settle_in_flight_changes(
+                    &record.snapshot,
+                    turn_id,
+                    trailing_output,
+                    OpenInterventions::TurnEnded,
+                ),
             )
         };
         let restored = Prompt {

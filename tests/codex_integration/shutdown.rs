@@ -11,7 +11,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         CreateSessionRequest, InitialPrompt, MessageRole, PromptId, SessionId, SessionSnapshot,
-        ShutdownReason, TurnStatus,
+        SessionStatus, ShutdownReason, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -171,11 +171,19 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
         .json::<SessionSnapshot>()
         .await
         .expect("decode Session after Provider shutdown");
-    assert_eq!(
-        after_shutdown.revision, before_shutdown.revision,
-        "Provider output after shutdown begins must not change the Session"
+    // The stop settles the Turn it cut off before the storage writer closes,
+    // and the settlement is readable through the graceful HTTP window
+    // (ADR 0029).
+    assert!(
+        after_shutdown.revision > before_shutdown.revision,
+        "the stop's settlement is the one change after shutdown begins"
     );
-    assert_eq!(after_shutdown.turns[0].status, TurnStatus::Active);
+    assert!(
+        after_shutdown.turns[0].status.is_terminal(),
+        "the Turn Suru interrupted for shutdown is settled, not left running"
+    );
+    assert!(after_shutdown.turns[0].settled_at.is_some());
+    assert_eq!(after_shutdown.session.status, SessionStatus::Idle);
 
     let methods = fixture
         .requests()

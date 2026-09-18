@@ -1370,7 +1370,7 @@ async fn a_session_stored_before_turn_usage_stays_readable_through_the_server_ap
 }
 
 #[tokio::test]
-async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() {
+async fn a_restored_summary_reads_the_turn_it_cut_off_as_settled() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -1425,16 +1425,13 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         SessionRevision(3),
     )
     .await;
-    let started_at = running.turns[0]
-        .started_at
-        .expect("the delivery commit stamps when the Turn started");
     assert_eq!(running.turns[0].status, TurnStatus::Active);
     drop(provider_session);
     original.shutdown().await.expect("stop original server");
 
     // The Turn was still running when the server went down, so it is stored
-    // running: what a restored summary says about live work has to come back
-    // off that Turn, because no column of its own ever held it.
+    // running; nothing survives a stop to finish it, so the restart settles
+    // it and the listing reads no live work off it (ADR 0029).
     let (restart_runtime, _restart_provider) = ControlledProvider::new();
     let restarted = server::spawn_with_provider(config, restart_runtime)
         .await
@@ -1456,12 +1453,16 @@ async fn a_restored_summary_reads_live_work_back_off_the_turn_that_is_running() 
         .into_iter()
         .find(|summary| summary.session.id == created.session.id)
         .expect("the Session is listed after the restart");
-    assert_eq!(restored.session.status, SessionStatus::Active);
+    assert_eq!(restored.session.status, SessionStatus::Idle);
     assert_eq!(
-        restored.session.working_since,
-        Some(started_at),
-        "a restored listing says live work has been running since its Turn began"
+        restored.session.working_since, None,
+        "a restored listing reads no live work from a Turn no process is running"
     );
+    let latest = restored
+        .standing_inputs
+        .latest_turn
+        .expect("the settled Turn is the latest Turn");
+    assert_eq!(latest.status, TurnStatus::Failed);
     restarted.shutdown().await.expect("stop restarted server");
 }
 

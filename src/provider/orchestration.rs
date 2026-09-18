@@ -34,7 +34,7 @@ use crate::protocol::{
 };
 use crate::sessions::{
     ApprovalPostureUpdate, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
-    InterruptTarget, ProviderTurnOutcome, SessionStore, TrailingCommandOutput,
+    InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore, TrailingCommandOutput,
     command_output_changes, earliest_pending_prompt, message_content_changes,
     reasoning_content_changes,
 };
@@ -453,7 +453,13 @@ impl SubagentRoutes {
     /// is this actor's only handle on those streams, and no more of their
     /// events — the settles the rows were owed included — can arrive once the
     /// connection is gone.
-    fn fail_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate, message: &str) {
+    fn fail_all(
+        &mut self,
+        sessions: &SessionStore,
+        updates: &ProviderUpdateGate,
+        message: &str,
+        interventions: OpenInterventions,
+    ) {
         self.context_routes.clear();
         for (_, mut route) in self.routes.drain() {
             fail_active_turn(
@@ -462,6 +468,7 @@ impl SubagentRoutes {
                 route.session_id,
                 &mut route.turn,
                 message.to_owned(),
+                interventions,
             );
         }
         for (_, row) in self.rows.drain() {
@@ -1149,6 +1156,7 @@ impl ProviderOrchestrator {
                 turn_id,
                 TrailingCommandOutput::new(),
                 message.to_owned(),
+                OpenInterventions::TurnEnded,
             )
         });
         InterruptSessionError::ProviderFailure(message.to_owned())
@@ -2182,6 +2190,7 @@ async fn run_provider_session(
                                 session_id,
                                 current,
                                 message.clone(),
+                                OpenInterventions::TurnEnded,
                             );
                             active = None;
                             lose_provider_connection(
@@ -2228,7 +2237,14 @@ async fn run_provider_session(
                     }
                     Err(error) => {
                         let message = failure_message("Provider interruption failed", &error);
-                        fail_active_turn(&sessions, &updates, session_id, current, message.clone());
+                        fail_active_turn(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            current,
+                            message.clone(),
+                            OpenInterventions::TurnEnded,
+                        );
                         active = None;
                         lose_provider_connection(
                             &mut provider,
@@ -2320,6 +2336,7 @@ async fn run_provider_session(
                             session_id,
                             current,
                             failure_message("Provider execution failed", &error),
+                            OpenInterventions::TurnEnded,
                         );
                         active = None;
                         lose_provider_connection(
@@ -2338,6 +2355,7 @@ async fn run_provider_session(
                             current,
                             "Provider execution failed: the Provider Session ended before the Turn completed."
                                 .to_owned(),
+                            OpenInterventions::TurnEnded,
                         );
                         active = None;
                         lose_provider_connection(
@@ -2365,9 +2383,15 @@ async fn run_provider_session(
             &mut current,
             "Provider execution failed: Suru stopped the Provider Session before the Turn completed."
                 .to_owned(),
+            OpenInterventions::Abandoned,
         );
     }
-    subagents.fail_all(&sessions, &updates, SUBAGENT_CONNECTION_LOST_MESSAGE);
+    subagents.fail_all(
+        &sessions,
+        &updates,
+        SUBAGENT_CONNECTION_LOST_MESSAGE,
+        OpenInterventions::Abandoned,
+    );
     drop(questionnaire_deliveries);
     drop(decision_deliveries);
 
@@ -2439,7 +2463,12 @@ fn lose_provider_connection(
     updates: &ProviderUpdateGate,
 ) {
     *provider = None;
-    subagents.fail_all(sessions, updates, SUBAGENT_CONNECTION_LOST_MESSAGE);
+    subagents.fail_all(
+        sessions,
+        updates,
+        SUBAGENT_CONNECTION_LOST_MESSAGE,
+        OpenInterventions::TurnEnded,
+    );
 }
 
 /// Fails the Turn this actor was running, flushing the pending line each of its
@@ -2452,10 +2481,12 @@ fn fail_active_turn(
     session_id: SessionId,
     active: &mut ActiveProviderTurn,
     message: String,
+    interventions: OpenInterventions,
 ) {
     let turn_id = active.turn_id;
     let trailing_output = active.take_trailing_output();
-    let _ = updates.apply(|| sessions.fail_turn(session_id, turn_id, trailing_output, message));
+    let _ = updates
+        .apply(|| sessions.fail_turn(session_id, turn_id, trailing_output, message, interventions));
 }
 
 fn provider_turn_start(
@@ -2531,7 +2562,13 @@ fn project_turn_start_failure(
                 message,
             )
         } else {
-            sessions.fail_turn(session_id, turn_id, TrailingCommandOutput::new(), message)
+            sessions.fail_turn(
+                session_id,
+                turn_id,
+                TrailingCommandOutput::new(),
+                message,
+                OpenInterventions::TurnEnded,
+            )
         }
     });
 }
@@ -3696,6 +3733,7 @@ running 1 test",
             &fixture.sessions,
             &updates,
             SUBAGENT_CONNECTION_LOST_MESSAGE,
+            OpenInterventions::TurnEnded,
         );
 
         let routed = fixture
