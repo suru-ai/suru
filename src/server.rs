@@ -592,13 +592,8 @@ pub async fn spawn_with_source_control(
         storage.clone(),
         preparations.resumable_sessions(),
         workspace_icons,
-    );
-    for update in sessions.reconcile_approval_postures(&opening_settings.settings) {
-        sessions.mark_approval_posture_application(
-            update,
-            crate::protocol::ApprovalPostureApplication::Applied,
-        );
-    }
+    )
+    .with_settings(settings.subscribe());
     let source_control = crate::source_control::SourceControlService::new(source_control);
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
@@ -2099,9 +2094,13 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     };
     match admission {
         Ok(StoreOutcome::Created(mut snapshot)) => {
-            state
-                .sessions
-                .reconcile_approval_postures(&state.settings.borrow().settings);
+            settle_actorless_posture(
+                &state,
+                state.sessions.reconcile_tree_approval_posture(
+                    snapshot.session.id,
+                    &state.settings.borrow().settings,
+                ),
+            );
             snapshot = state
                 .sessions
                 .snapshot(snapshot.session.id)
@@ -2252,6 +2251,23 @@ async fn update_approval_posture(
     }
 }
 
+/// A posture owed to a Provider actor that does not exist is applied by
+/// nobody, so it is recorded as applied at once: the actor that starts next
+/// starts under it, and no reader waits on a delivery that will never come.
+fn settle_actorless_posture(
+    state: &AppState,
+    update: Option<crate::sessions::ApprovalPostureUpdate>,
+) {
+    if let Some(update) = update
+        && !state.providers.has_session_actor(update.session_id)
+    {
+        state.sessions.mark_approval_posture_application(
+            update,
+            crate::protocol::ApprovalPostureApplication::Applied,
+        );
+    }
+}
+
 async fn apply_live_posture_updates(
     state: &AppState,
     changed: Vec<crate::sessions::ApprovalPostureUpdate>,
@@ -2293,9 +2309,12 @@ async fn update_agent_selection(
         .apply_agent_selection_command(session_id, request)
     {
         Ok(mutation) => {
-            state
-                .sessions
-                .reconcile_approval_postures(&state.settings.borrow().settings);
+            settle_actorless_posture(
+                &state,
+                state
+                    .sessions
+                    .reconcile_tree_approval_posture(session_id, &state.settings.borrow().settings),
+            );
             if let Some(prompt_id) = mutation.retry_prompt_id {
                 state
                     .providers
@@ -2878,19 +2897,6 @@ async fn hydrate_session_request(
         {
             tracing::warn!("Session hydration failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        let changed = state
-            .sessions
-            .reconcile_approval_postures(&state.settings.borrow().settings);
-        for update in changed {
-            if Some(update.session_id) == session_id
-                && !state.providers.has_session_actor(update.session_id)
-            {
-                state.sessions.mark_approval_posture_application(
-                    update,
-                    crate::protocol::ApprovalPostureApplication::Applied,
-                );
-            }
         }
     }
     next.run(request).await

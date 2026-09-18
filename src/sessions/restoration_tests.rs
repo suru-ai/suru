@@ -747,7 +747,7 @@ pub(super) fn record_work(count: usize) {
     WORK.set(WORK.get() + count);
 }
 
-fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
+pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> PersistedSession {
     let session = Session {
         checkout: None,
         context_fill: None,

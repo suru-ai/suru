@@ -9,12 +9,12 @@ use std::{
 };
 
 use anyhow::anyhow;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
-    SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, TurnId,
+    SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, SettingsSnapshot, TurnId,
     ViewSessionOperationId, WorkspaceId,
 };
 use crate::provider::ProviderResumeState;
@@ -28,6 +28,8 @@ pub(crate) use checkouts::CheckoutActivity;
 mod hydration;
 mod output;
 mod posture;
+#[cfg(test)]
+mod posture_tests;
 mod projection;
 mod prompts;
 mod restoration;
@@ -70,6 +72,10 @@ pub(crate) struct SessionStore {
     state: Arc<Mutex<SessionStoreState>>,
     storage: StorageSink,
     hydration: Arc<tokio::sync::Mutex<()>>,
+    /// The Server Settings a history catches up with when it is hydrated: a
+    /// stored unpinned Approval Posture was shaped by the Settings of the
+    /// process that wrote it, and this process may have opened with others.
+    settings: watch::Receiver<SettingsSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,11 +266,22 @@ impl SessionStore {
             restoration_ms = started.elapsed().as_secs_f64() * 1000.0,
             "Session restoration completed"
         );
+        let (_detached, settings) = watch::channel(SettingsSnapshot::default());
         Self {
             state: Arc::new(Mutex::new(state)),
             storage,
             hydration: Arc::new(tokio::sync::Mutex::new(())),
+            settings,
         }
+    }
+
+    /// Follows the live Server Settings rather than the built-in defaults a
+    /// store starts with, so every history hydrated from here on reconciles
+    /// against what the server is actually running under. The server always
+    /// chains this; only tests, which run under the defaults, omit it.
+    pub(crate) fn with_settings(mut self, settings: watch::Receiver<SettingsSnapshot>) -> Self {
+        self.settings = settings;
+        self
     }
 
     pub(crate) fn subscribe(&self, session_id: SessionId) -> Option<SessionFeed> {

@@ -1753,11 +1753,12 @@ async fn run_provider_session(
                 // Provider discovery can supply the Session's first Agent Selection. Derive the
                 // corresponding unpinned posture immediately so snapshots do not remain empty
                 // until a later HTTP mutation happens to reconcile them.
-                let posture_updates =
-                    sessions.reconcile_approval_postures(&settings.borrow().settings);
-                if let Some(update) = posture_updates.into_iter().find(|update| {
-                    update.session_id == session_id && Some(update.value) == session_posture
-                }) {
+                let posture_update = sessions
+                    .reconcile_tree_approval_posture(session_id, &settings.borrow().settings)
+                    .filter(|update| {
+                        update.session_id == session_id && Some(update.value) == session_posture
+                    });
+                if let Some(update) = posture_update {
                     sessions.mark_approval_posture_application(
                         update,
                         crate::protocol::ApprovalPostureApplication::Applied,

@@ -23,6 +23,11 @@ impl SessionStore {
     /// Restore the entire containing tree before exposing history or admitting
     /// work: reconciliation can mutate any ancestor or descendant. Waiting for
     /// another reader never occupies a blocking thread or the store lock.
+    ///
+    /// A tree hydrates exactly once, and this is where its history catches up
+    /// with the process that loads it: stranded Prompts withdraw, stopped
+    /// Turns settle, and unpinned Approval Postures follow the current
+    /// Settings.
     pub(crate) async fn hydrate(&self, session_id: SessionId) -> Result<(), StorageError> {
         // Active trees need no admission gate and never wait behind another
         // tree's first read. Recheck after the gate to coalesce waiting readers.
@@ -181,11 +186,16 @@ impl SessionStore {
         // no reader ever sees it as a Message still waiting on an Agent
         // (ADR 0024).
         state.withdraw_stranded_prompts(&self.storage, hydrated.clone());
-        state.settle_stopped_turns(&self.storage, hydrated);
+        state.settle_stopped_turns(&self.storage, hydrated.clone());
+        // The Settings that shaped a stored unpinned posture may not be the
+        // ones this process opened with; the history catches up here, once,
+        // and nothing is owed to a Provider because a deferred Session never
+        // has one.
+        state.adopt_hydrated_postures(&self.storage, &hydrated, &self.settings.borrow().settings);
         Ok(())
     }
 
-    /// Prompt IDs are globally unique, including Prompts in unopened Sessions.
+    /// Prompt IDs are globally unique, including Prompts in deferred Sessions.
     /// Locate their owner without reading any Prompt content, then hydrate only
     /// that tree before the existing conflict/retry rules inspect the Prompt.
     pub(crate) async fn hydrate_prompt_owner(
