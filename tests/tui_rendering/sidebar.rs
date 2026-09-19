@@ -25,14 +25,13 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AppearanceSettings, ApprovalId, AutoSettle,
         EffectiveSettings, LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus,
-        ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, Session,
-        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
-        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
-        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
-        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
-        SidebarSettings, SidebarVisibility, SubagentInterventions, TextSelectionCopy, TurnStatus,
-        UnreadableSessionSummary, Workspace,
+        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, SessionCatalogRevision,
+        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
+        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
+        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
+        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
+        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
+        SubagentInterventions, TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -2175,40 +2174,11 @@ fn listed_with_id_and_updated_at(
     created_at: u64,
     updated_at: u64,
 ) -> SessionListItem {
-    let SessionListItem::Readable(mut summary) = listed(title, workspace, created_at, updated_at)
-    else {
-        unreachable!("the fixture builds a readable Session");
-    };
-    summary.session.id = session_id;
-    SessionListItem::Readable(summary)
+    crate::support::listed_session(session_id, title, workspace, created_at, updated_at)
 }
 
 fn listed(title: &str, workspace: &Path, created_at: u64, updated_at: u64) -> SessionListItem {
-    SessionListItem::Readable(Box::new(SessionSummary {
-        checkout_state: None,
-        session: Session {
-            checkout: None,
-            context_fill: None,
-            id: SessionId::new(),
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.to_owned(),
-            },
-            workspace: Workspace::directory(workspace.to_owned()),
-            agent_selection: None,
-            agent_selection_availability: ModelAvailability::Available,
-            approval_posture: None,
-            status: SessionStatus::Idle,
-            working_since: None,
-            parent: None,
-        },
-        title: title.to_owned(),
-        icon: None,
-        settled_at: None,
-        standing_inputs: Default::default(),
-        total_usage: None,
-        created_at: SessionTimestamp(created_at),
-        updated_at: SessionTimestamp(updated_at),
-    }))
+    crate::support::listed_session(SessionId::new(), title, workspace, created_at, updated_at)
 }
 
 fn now() -> u64 {

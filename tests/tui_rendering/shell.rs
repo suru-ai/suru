@@ -904,6 +904,16 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
         )))
         .expect("begin recovery");
 
+    // A loss inside its grace is held back from the frame everywhere, the
+    // status line included: a momentary drop must not flicker across it.
+    let inside_grace = rendered_state_rows(&state).join("\n");
+    assert!(!inside_grace.contains("Recovering"), "{inside_grace}");
+
+    state
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed(
+            suru::protocol::Outlook::Local,
+        ))
+        .expect("elapse the grace period");
     let screen = rendered_state_rows(&state).join("\n");
 
     assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
@@ -939,14 +949,19 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
         )))
         .expect("begin recovery");
     let brief = rendered_application_rows_at(&application, 80, 15).join("\n");
-    assert!(brief.contains("Recovering"));
+    assert!(
+        !brief.contains("Recovering"),
+        "the grace holds the loss back: {brief}"
+    );
     assert!(brief.contains("Keep the Session visible"));
     assert!(brief.contains("Preserve this draft"));
     assert!(!brief.contains("Reconnecting to Suru"));
     assert!(!brief.contains("Your Session will resume automatically"));
 
     application
-        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed(
+            suru::protocol::Outlook::Local,
+        ))
         .expect("show delayed reconnect overlay");
     let prolonged = rendered_application_rows_at(&application, 80, 15).join("\n");
     assert!(prolonged.contains("Reconnecting to Suru"));

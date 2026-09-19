@@ -40,7 +40,7 @@ fn choosing_a_remote_names_it_beside_the_workspace_on_landing_and_in_the_session
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -139,14 +139,16 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
         })
         .unwrap();
     application
-        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed(Outlook::Remote(
+            "studio".to_owned(),
+        )))
         .unwrap();
 
-    assert!(
-        rendered_application_rows(&application)
-            .join("\n")
-            .contains("Reconnecting to Suru…")
-    );
+    // The loss is the Remote's own: it is said above the composer and nowhere
+    // else, and the whole frame goes on being the reader's.
+    let dropped = rendered_application_rows(&application).join("\n");
+    assert!(!dropped.contains("Reconnecting to Suru…"), "{dropped}");
+    assert!(dropped.contains("studio is unreachable"), "{dropped}");
 
     application
         .handle_event(ApplicationEvent::OriginCatalog {
@@ -157,7 +159,7 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
     let recovered = rendered_application_rows(&application).join("\n");
     assert!(recovered.contains("unfinished thought"));
     assert!(recovered.contains("studio ·"));
-    assert!(!recovered.contains("Reconnecting to Suru…"));
+    assert!(!recovered.contains("is unreachable"));
 }
 
 #[test]
@@ -215,7 +217,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -237,7 +239,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -371,7 +373,7 @@ fn a_model_is_called_what_the_latest_catalog_calls_it_across_outlook_turns() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -608,7 +610,7 @@ fn a_remote_session_row_carries_its_origin_into_attachment() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -681,7 +683,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -764,7 +766,7 @@ fn application_looking_at_studio() -> Application {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -806,7 +808,7 @@ pub(super) fn turn_to_studio(application: &mut Application) {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -850,7 +852,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })
@@ -971,7 +973,7 @@ fn studio_picker() -> Application {
         .handle_event(ApplicationEvent::RemoteProbed {
             name: "studio".to_owned(),
             result: Ok(RemoteHealth {
-                protocol_version: Some(28),
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
             }),
         })

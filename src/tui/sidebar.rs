@@ -1734,13 +1734,15 @@ impl Sidebar {
 
     /// Begins one reader-requested retry while leaving the stale presentation
     /// in place until the replacement stream supplies a fresh snapshot.
-    pub(super) fn retry_origin(&mut self, outlook: Outlook) -> Option<SessionListRequest> {
-        if !self.recovering_origins.contains(&outlook) {
-            return None;
-        }
+    ///
+    /// Whether there is anything to retry is the Client's own reading, not
+    /// this column's: a Remote may have stopped answering while the Sidebar is
+    /// narrowed away from it, and the banner above the composer still offers
+    /// the retry. All that is asked here is the listing that goes with it.
+    pub(super) fn retry_origin(&mut self, outlook: Outlook) -> SessionListRequest {
         self.asked_afresh = false;
         self.listing.clear_error();
-        Some(self.listing.catch_up_origin(outlook))
+        self.listing.catch_up_origin(outlook)
     }
 
     /// Remote streams the run loop must own for the chosen scope. The local
@@ -1760,8 +1762,16 @@ impl Sidebar {
         }
     }
 
+    /// Whether this Origin's rows are part of the listing on show. Everywhere
+    /// ranges over every Server the Client can reach; every narrower scope
+    /// ranges over the Outlook's own — which is still an Origin that can stop
+    /// answering, and whose rows are dimmed and whose `[unreachable]` row
+    /// stands whichever scope the reader chose.
     pub(super) fn includes_origin(&self, outlook: &Outlook) -> bool {
-        self.scope == SidebarListingScope::Everywhere && self.everywhere_origins.contains(outlook)
+        if self.scope == SidebarListingScope::Everywhere {
+            return self.everywhere_origins.contains(outlook);
+        }
+        self.listing.outlook() == outlook
     }
 
     pub(super) fn fail_everywhere_remotes(
@@ -1947,10 +1957,7 @@ impl Sidebar {
         let wanted = match focus {
             SidebarFocus::Session(reference) => reference,
             SidebarFocus::Unreachable(outlook) => {
-                return self.retry_origin(outlook).map_or(
-                    SidebarActivation::Answered,
-                    SidebarActivation::RetryCatalogOrigin,
-                );
+                return SidebarActivation::RetryCatalogOrigin(self.retry_origin(outlook));
             }
             SidebarFocus::ShowMore => {
                 self.show_more();
@@ -2482,12 +2489,20 @@ impl Sidebar {
             return self.results(settlement);
         }
         let mut body = active_session_entries(self.active(settlement));
+        // A Remote that has stopped answering stands at the foot of the active
+        // list whichever scope is chosen: Everywhere has one such row per
+        // Remote it ranges over, and a narrower scope has the Outlook's own.
         if self.scope == SidebarListingScope::Everywhere {
             body.extend(self.everywhere_origins.iter().filter_map(|outlook| {
                 self.recovering_origins
                     .contains(outlook)
                     .then_some(BodyEntry::Unreachable(outlook))
             }));
+        } else {
+            let outlook = self.listing.outlook();
+            if self.recovering_origins.contains(outlook) {
+                body.push(BodyEntry::Unreachable(outlook));
+            }
         }
         let shelf = self.shelf(settlement);
         if shelf.on_show.is_empty() {

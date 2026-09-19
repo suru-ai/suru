@@ -49,7 +49,7 @@ use super::{
     },
     spinner,
     state::{
-        ClaimStanding, CommandId, CommandMode, QueuedPrompt, SessionInteraction,
+        ClaimStanding, CommandId, CommandMode, PointableSpan, QueuedPrompt, SessionInteraction,
         TranscriptViewport, TuiState,
     },
     subagent_picker::working_subagents,
@@ -158,6 +158,9 @@ pub(super) fn render_with_slots(
     // record of where they were drawn starts over with the frame too.
     state.workspace_picker.forget_frame();
     *state.header_icon_area.borrow_mut() = None;
+    // The Unreachable banner's "Try again" is pointable on the same terms, and
+    // is only there on a frame that drew it.
+    *state.unreachable_banner_area.borrow_mut() = None;
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
     state.session_animation_on_screen.set(false);
@@ -180,6 +183,14 @@ pub(super) fn render_with_slots(
     if let Some(surface) = state.composers.selection_frame() {
         state.selection_frames.borrow_mut().push(surface);
     }
+    // A Remote that has stopped answering says so on one line directly above
+    // the composer, so whatever else stands there stands above it.
+    let notice_floor = composer.area.y.saturating_sub(render_unreachable_banner(
+        frame,
+        state,
+        composer.area,
+        theme,
+    ));
     let pending_approvals: Vec<_> = state.pending_approvals().collect();
     let pending: Vec<_> = state.pending_questionnaires().collect();
     if let Some(approval) = state.open_approval() {
@@ -238,10 +249,10 @@ pub(super) fn render_with_slots(
                 pending.len()
             ));
         }
-        let available_rows = usize::from(composer.area.y.saturating_sub(frame.area().y));
+        let available_rows = usize::from(notice_floor.saturating_sub(frame.area().y));
         let first_visible = intervention_notices.len().saturating_sub(available_rows);
         let visible = &intervention_notices[first_visible..];
-        let first_y = composer.area.y.saturating_sub(visible.len() as u16);
+        let first_y = notice_floor.saturating_sub(visible.len() as u16);
         for (offset, notice) in visible.iter().enumerate() {
             frame.render_widget(
                 Paragraph::new(notice.as_str()).style(theme.feedback.warning),
@@ -254,27 +265,27 @@ pub(super) fn render_with_slots(
             );
         }
     }
-    if state.composer_completion.is_visible() && !state.reconnect_overlay_visible {
+    if state.composer_completion.is_visible() && !state.reconnect_overlay_visible() {
         render_composer_completion(frame, state, composer.area, theme);
     }
     // The Subagent Picker docks over the composer the way the completion list
     // does: it belongs to the composer's place on screen, not to the main
     // view's center.
-    if state.subagent_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.subagent_picker.is_open() && !state.reconnect_overlay_visible() {
         render_subagent_picker(frame, state, composer.area, theme);
     }
     // The Sidebar's own context menu, drawn over the column and whatever of
     // the main view it runs into, because it stands in front of the row it was
     // opened on.
-    if !state.reconnect_overlay_visible {
+    if !state.reconnect_overlay_visible() {
         render_sidebar_menu(frame, state, theme);
     }
     // Every overlay is centered on the main view rather than the whole frame:
     // the Sidebar sits beside them and is neither opened over nor obscured.
-    if state.session_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.session_picker.is_open() && !state.reconnect_overlay_visible() {
         render_session_picker(frame, state, main, theme);
     }
-    if state.workspace_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.workspace_picker.is_open() && !state.reconnect_overlay_visible() {
         render_workspace_picker(frame, state, main, theme);
         // A row's own context menu stands in front of the picker it was
         // opened on, the same way the Sidebar's own menu stands in front of
@@ -284,10 +295,10 @@ pub(super) fn render_with_slots(
             render_workspace_picker_menu(frame, state, theme);
         }
     }
-    if state.worktree_picker.open && !state.reconnect_overlay_visible {
+    if state.worktree_picker.open && !state.reconnect_overlay_visible() {
         render_worktree_picker(frame, state, main, theme);
     }
-    if state.settings_panel.is_open() && !state.reconnect_overlay_visible {
+    if state.settings_panel.is_open() && !state.reconnect_overlay_visible() {
         render_settings_panel(frame, state, main, theme);
         if state.settings_panel.numeric_editor().is_some() {
             render_numeric_editor(frame, state, main, theme);
@@ -295,31 +306,31 @@ pub(super) fn render_with_slots(
     }
     // Choice pickers can be opened by a settings row, so they are drawn over
     // the panel that asked and take the reader's answer first.
-    if state.model_options.is_open() && !state.reconnect_overlay_visible {
+    if state.model_options.is_open() && !state.reconnect_overlay_visible() {
         render_model_options(frame, state, main, theme);
     }
-    if state.model_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.model_picker.is_open() && !state.reconnect_overlay_visible() {
         render_model_picker(frame, state, main, theme);
     }
-    if state.approval_posture_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.approval_posture_picker.is_open() && !state.reconnect_overlay_visible() {
         render_approval_posture_picker(frame, state, main, theme);
     }
-    if state.theme_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.theme_picker.is_open() && !state.reconnect_overlay_visible() {
         render_theme_picker(frame, state, main, theme);
     }
-    if state.serve_overlay.is_open() && !state.reconnect_overlay_visible {
+    if state.serve_overlay.is_open() && !state.reconnect_overlay_visible() {
         render_serve_overlay(frame, state, main, theme);
     }
-    if state.connect_overlay.is_open() && !state.reconnect_overlay_visible {
+    if state.connect_overlay.is_open() && !state.reconnect_overlay_visible() {
         render_connect_overlay(frame, state, main, theme);
     }
     // Drawn last among the overlays, so it stands over every one of them —
     // matching how [`TuiState::top_selection_overlay`] and `handle_click`
     // already answer for it first.
-    if state.icon_picker.is_open() && !state.reconnect_overlay_visible {
+    if state.icon_picker.is_open() && !state.reconnect_overlay_visible() {
         render_icon_picker(frame, state, main, theme);
     }
-    if state.reconnect_overlay_visible {
+    if state.reconnect_overlay_visible() {
         state.selection_frames.borrow_mut().clear();
         render_reconnect_overlay(frame, theme);
     } else if !state.session_picker.is_open()
@@ -4655,7 +4666,7 @@ fn render_session_header(
             // Recorded here rather than resolved from the Title's own
             // geometry, because the Icon is the target: a press meant for
             // the Title text beside it opens nothing (issue #360).
-            *state.header_icon_area.borrow_mut() = Some((
+            *state.header_icon_area.borrow_mut() = Some(PointableSpan::new(
                 title_area.y,
                 title_area.x..title_area.x.saturating_add(icon_width as u16),
             ));
@@ -4883,6 +4894,58 @@ fn render_pending_prompts(
     );
 }
 
+/// What the banner's retry affordance reads, and the whole of what a press on
+/// it has to land within.
+const RETRY_AFFORDANCE: &str = "Try again";
+
+/// How long until the next attempt, in the whole seconds a reader counts down.
+fn retry_countdown(retry_in: std::time::Duration) -> String {
+    let seconds = retry_in.as_secs() + u64::from(retry_in.subsec_millis() > 0);
+    format!("{seconds}s")
+}
+
+/// The one line a Remote that has stopped answering is drawn on: directly
+/// above the composer, on the Session View and the Landing alike. It names the
+/// Remote — never "Suru", because the rest of the Client is working — the
+/// schedule its recovery is on, and the retry the reader may ask for
+/// themselves. Answers the rows it took, so whatever else stands above the
+/// composer stands above it in turn.
+fn render_unreachable_banner(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    composer: Rect,
+    theme: &Theme,
+) -> u16 {
+    let Some((remote, status)) = state.unreachable_remote() else {
+        return 0;
+    };
+    if composer.y <= frame.area().y || composer.width == 0 {
+        return 0;
+    }
+    let row = composer.y.saturating_sub(1);
+    let lead = format!(
+        "{remote} is unreachable · retrying in {} (attempt {}) · ",
+        retry_countdown(status.retry_in),
+        status.attempt
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(lead.clone(), theme.feedback.warning),
+            Span::styled(
+                RETRY_AFFORDANCE,
+                theme.accent.primary.add_modifier(Modifier::UNDERLINED),
+            ),
+        ])),
+        Rect::new(composer.x, row, composer.width, 1),
+    );
+    let start = composer.x.saturating_add(lead.width() as u16);
+    let end = start.saturating_add(RETRY_AFFORDANCE.width() as u16);
+    if end <= composer.x.saturating_add(composer.width) {
+        *state.unreachable_banner_area.borrow_mut() = Some(PointableSpan::new(row, start..end));
+    }
+    1
+}
+
 fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
     frame.render_widget(Block::default().style(theme.surface.overlay), frame.area());
     let area = centered_rect(frame.area(), 48, 5);
@@ -5075,7 +5138,9 @@ fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String 
         "Connection failed".to_owned()
     } else if state.manually_stopped {
         "Server stopped".to_owned()
-    } else if state.recovery.is_some() {
+    } else if state.unreachable_remote().is_some() {
+        "Unreachable".to_owned()
+    } else if state.presented_recovery(&state.outlook).is_some() {
         "Recovering".to_owned()
     } else if state.identity.is_some() {
         "Connected".to_owned()
@@ -5140,7 +5205,18 @@ fn status_text(state: &TuiState) -> String {
             },
         );
     }
-    if let Some(recovery) = state.recovery {
+    // Recovery is reported for the Server the Outlook is turned toward and no
+    // other: another Remote's loss is its Sidebar row's to say. A loss inside
+    // its grace period is reported nowhere at all, here least of all — the
+    // status line is what a reader watches.
+    if let Some(recovery) = state.presented_recovery(&state.outlook) {
+        if let Some(remote) = state.outlook.remote_name() {
+            return format!(
+                "{remote} is unreachable (attempt {}, retry in {})",
+                recovery.attempt,
+                retry_countdown(recovery.retry_in)
+            );
+        }
         let last_server = state.identity.as_ref().map_or_else(
             || "no previous server".to_owned(),
             |identity| format!("last server pid {}", identity.pid),
@@ -5167,7 +5243,10 @@ fn server_identity_text(identity: &ServerIdentity) -> String {
 fn status_style(state: &TuiState, theme: &Theme) -> Style {
     if state.fatal_error.is_some() {
         theme.feedback.error
-    } else if state.identity.is_some() && state.recovery.is_none() && !state.manually_stopped {
+    } else if state.identity.is_some()
+        && state.presented_recovery(&state.outlook).is_none()
+        && !state.manually_stopped
+    {
         theme.feedback.success
     } else {
         theme.feedback.warning

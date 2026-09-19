@@ -7599,7 +7599,9 @@ fn reconnecting_cancels_a_held_transcript_edge_drag() {
         )))
         .unwrap();
     application
-        .handle_event(ApplicationEvent::ReconnectGraceElapsed)
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed(
+            suru::protocol::Outlook::Local,
+        ))
         .unwrap();
     application
         .handle_terminal_event(selection_mouse(

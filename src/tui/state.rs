@@ -141,6 +141,47 @@ enum SurfaceAboveInterventions {
     ApprovalPosture,
     Selection(SelectionSurface),
     Sidebar,
+    /// Not a surface at all, but the same answer: the Session's own Origin has
+    /// stopped answering, so its Interventions wait out of sight — a Decision
+    /// taken now would go nowhere — and present themselves as soon as it
+    /// answers again.
+    UnreachableOrigin,
+}
+
+/// A run of cells on one row that a press can land on, as the frame that drew
+/// it recorded them. A frame that did not draw the affordance records nothing,
+/// so a stale reading can never answer a press.
+#[derive(Clone, Debug)]
+pub(super) struct PointableSpan {
+    row: u16,
+    columns: std::ops::Range<u16>,
+}
+
+impl PointableSpan {
+    pub(super) fn new(row: u16, columns: std::ops::Range<u16>) -> Self {
+        Self { row, columns }
+    }
+
+    fn contains(&self, position: Position) -> bool {
+        self.row == position.y && self.columns.contains(&position.x)
+    }
+}
+
+/// One Origin's Server recovering: the schedule its stream last reported, and
+/// whether that loss has outlived its grace period and so is the reader's to
+/// see. A loss inside the grace is held but never drawn, which is what keeps a
+/// momentary drop from flickering across the frame.
+#[derive(Clone, Copy, Debug)]
+struct OriginRecovery {
+    status: RecoveryStatus,
+    presented: bool,
+    /// Whether this loss has already had its grace period. One loss is served
+    /// once, however many attempts its recovery goes on to make: without this
+    /// every retry would ask for another wakeup, and a loss taken back off the
+    /// frame — as a Fatal error takes the modal down — would be put straight
+    /// back up by the next grace to come due. A fresh loss is a fresh entry,
+    /// and is served afresh.
+    served: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -421,7 +462,14 @@ pub struct TuiState {
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
     pub(super) identity: Option<ServerIdentity>,
-    pub(super) recovery: Option<RecoveryStatus>,
+    /// What each Origin's connection is presently recovering from, keyed by
+    /// the Origin whose Server stopped answering. `Outlook::Local` is this
+    /// machine's own Server, whose loss still stands the whole frame down
+    /// (ADR 0002). A Remote key is the narrower thing the glossary calls
+    /// Unreachable — see [`Self::is_unreachable`] — which blocks only what
+    /// goes to that Remote and leaves the rest of the Client as live as it
+    /// ever was.
+    recovering: HashMap<Outlook, OriginRecovery>,
     /// Manual stop preserves the last confirmed identity as useful final context.
     pub(super) manually_stopped: bool,
     pub(super) fatal_error: Option<String>,
@@ -536,7 +584,6 @@ pub struct TuiState {
     queued_agent_selection: Option<(SessionReference, AgentSelection)>,
     confirmed_agent_selection: Option<(SessionReference, AgentSelection)>,
     session_events_blocked: bool,
-    pub(super) reconnect_overlay_visible: bool,
     pending_submission: Option<PendingSubmission>,
     failed_submissions: HashMap<PromptId, FailedSubmission>,
     pending_steers: Vec<HeldPrompt>,
@@ -560,7 +607,10 @@ pub struct TuiState {
     /// there can be resolved without the header re-deriving it: `None`
     /// whenever nothing was drawn there, including with Icons turned off, so
     /// a press over that blank space reaches nothing (issue #360).
-    pub(super) header_icon_area: RefCell<Option<(u16, std::ops::Range<u16>)>>,
+    pub(super) header_icon_area: RefCell<Option<PointableSpan>>,
+    /// Where the Unreachable banner drew its "Try again", so a press lands on
+    /// the very command the Sidebar's `[unreachable]` row invokes.
+    pub(super) unreachable_banner_area: RefCell<Option<PointableSpan>>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) sidebar: Sidebar,
@@ -761,7 +811,7 @@ impl TuiState {
             workspace_resolution_sequence: 0,
             pending_workspace_resolutions: HashMap::new(),
             identity: None,
-            recovery: None,
+            recovering: HashMap::new(),
             manually_stopped: false,
             fatal_error: None,
             workspace: Workspace::directory(workspace.clone()),
@@ -805,7 +855,6 @@ impl TuiState {
             queued_agent_selection: None,
             confirmed_agent_selection: None,
             session_events_blocked: false,
-            reconnect_overlay_visible: false,
             pending_submission: None,
             failed_submissions: HashMap::new(),
             pending_steers: Vec::new(),
@@ -823,6 +872,7 @@ impl TuiState {
             subagent_picker: SubagentPicker::default(),
             icon_picker: IconPicker::default(),
             header_icon_area: RefCell::new(None),
+            unreachable_banner_area: RefCell::new(None),
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             sidebar: Sidebar::new(workspace),
@@ -1397,14 +1447,27 @@ impl TuiState {
         self.adopt_workspace_paths(outlook, &event);
         self.adopt_checkout_state(outlook, &event);
         self.reconcile_questionnaire_catalog(outlook, &event);
-        if self.sidebar.includes_origin(outlook) {
-            match &event {
-                ManagedEvent::Recovering(_) => self.sidebar.mark_origin_recovering(outlook.clone()),
-                ManagedEvent::RemoteRecovered | ManagedEvent::SessionCatalogReconciled(_) => {
-                    self.sidebar.mark_origin_catalog_current(outlook)
-                }
-                _ => {}
-            }
+        // Reachability is the Origin's own, whether or not the Outlook is
+        // turned toward it: a Remote that stops answering blocks what goes to
+        // that Remote and nothing else. The two events that say nothing but
+        // reachability are answered here in full, so the local Server's own
+        // recovery arm can never be reached by a Remote's loss.
+        if let ManagedEvent::Recovering(status) = &event {
+            self.begin_recovery(outlook.clone(), *status);
+            self.sidebar.mark_origin_recovering(outlook.clone());
+            return;
+        }
+        if matches!(
+            &event,
+            ManagedEvent::RemoteRecovered | ManagedEvent::SessionCatalogReconciled(_)
+        ) {
+            self.end_recovery(outlook);
+            self.sidebar.mark_origin_catalog_current(outlook);
+        }
+        // A bare recovery says nothing but reachability and is done with here;
+        // a reconciled catalog says the rows too, and goes on below.
+        if matches!(&event, ManagedEvent::RemoteRecovered) {
+            return;
         }
         if outlook == &self.outlook {
             self.apply_managed_event(event);
@@ -1446,6 +1509,10 @@ impl TuiState {
     /// which both a Remote that stopped answering and one whose Pairing ended
     /// leave behind.
     fn drop_origin_rows(&mut self, outlook: &Outlook) {
+        // A Remote this Client can no longer reach at all is past recovering:
+        // leaving it in hand would go on refusing everything bound for it long
+        // after a new Pairing had made it reachable again.
+        self.end_recovery(outlook);
         self.sidebar.end_origin(outlook);
         self.session_picker.end_origin(outlook);
     }
@@ -1465,9 +1532,98 @@ impl TuiState {
     }
 
     fn settle_remote_failure(&mut self, message: String) {
-        self.recovery = None;
-        self.reconnect_overlay_visible = false;
+        let outlook = self.outlook.clone();
+        self.end_recovery(&outlook);
         self.submission_error = Some(message);
+    }
+
+    /// Notes that one Origin's Server has stopped answering. A loss already
+    /// being drawn goes on being drawn across the attempts that follow, so the
+    /// grace period is served once per loss rather than once per retry.
+    pub(super) fn begin_recovery(&mut self, outlook: Outlook, status: RecoveryStatus) {
+        let (presented, served) = self
+            .recovering
+            .get(&outlook)
+            .map_or((false, false), |held| (held.presented, held.served));
+        self.recovering.insert(
+            outlook,
+            OriginRecovery {
+                status,
+                presented,
+                served,
+            },
+        );
+    }
+
+    /// An Origin answers again. Reconnection is silent: what was drawn about
+    /// the loss simply leaves.
+    pub(super) fn end_recovery(&mut self, outlook: &Outlook) {
+        self.recovering.remove(outlook);
+    }
+
+    /// One Origin's loss has outlived its grace and becomes the reader's to
+    /// see. A loss already served is left exactly as it stands: its grace was
+    /// spent once and cannot put back what something else has since taken off
+    /// the frame.
+    pub(super) fn present_recovery(&mut self, outlook: &Outlook) {
+        if let Some(held) = self.recovering.get_mut(outlook)
+            && !held.served
+        {
+            held.served = true;
+            held.presented = true;
+        }
+    }
+
+    /// Holds a loss back from the frame again while the recovery itself
+    /// stands, which is what a Fatal error does: the modal comes down, the
+    /// reading behind it does not.
+    pub(super) fn withhold_recovery(&mut self, outlook: &Outlook) {
+        if let Some(held) = self.recovering.get_mut(outlook) {
+            held.presented = false;
+        }
+    }
+
+    /// Every Origin whose loss is still waiting out its grace period — the
+    /// only Origins a wakeup has anything left to do for. An Origin already
+    /// served goes on recovering without asking for another.
+    pub(super) fn origins_awaiting_grace(&self) -> std::collections::BTreeSet<Outlook> {
+        self.recovering
+            .iter()
+            .filter(|(_, held)| !held.served)
+            .map(|(outlook, _)| outlook.clone())
+            .collect()
+    }
+
+    /// Whether this Origin is the thing the glossary calls Unreachable: a
+    /// paired Remote that has stopped answering while its Pairing stands, so
+    /// nothing sent to it goes anywhere. This machine's own Server is never
+    /// Unreachable — its loss is the whole-frame modal's to say — so it is
+    /// deliberately not part of this answer.
+    pub(super) fn is_unreachable(&self, outlook: &Outlook) -> bool {
+        outlook.remote_name().is_some() && self.recovering.contains_key(outlook)
+    }
+
+    /// The loss an Origin is presenting: one that has outlived its grace and
+    /// so is the reader's to see.
+    pub(super) fn presented_recovery(&self, outlook: &Outlook) -> Option<RecoveryStatus> {
+        self.recovering
+            .get(outlook)
+            .filter(|held| held.presented)
+            .map(|held| held.status)
+    }
+
+    /// The Remote the Outlook is turned toward while it is Unreachable, and
+    /// the schedule its recovery is on — what the banner above the composer is
+    /// drawn from. Nothing is answered for a Remote the Outlook has left.
+    pub(super) fn unreachable_remote(&self) -> Option<(&str, RecoveryStatus)> {
+        let status = self.presented_recovery(&self.outlook)?;
+        Some((self.outlook.remote_name()?, status))
+    }
+
+    /// Whether the whole-frame modal stands. Only this machine's own Server
+    /// going away raises it; a Remote that stops answering is scoped to itself.
+    pub(super) fn reconnect_overlay_visible(&self) -> bool {
+        self.presented_recovery(&Outlook::Local).is_some()
     }
 
     fn apply_managed_event(&mut self, event: ManagedEvent) {
@@ -1486,8 +1642,7 @@ impl TuiState {
             ManagedEvent::Connecting => {
                 self.skill_catalog = None;
                 self.identity = None;
-                self.recovery = None;
-                self.reconnect_overlay_visible = false;
+                self.end_recovery(&Outlook::Local);
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
@@ -1541,8 +1696,7 @@ impl TuiState {
                         .refocus(self.landing_agent_selection.as_ref());
                 }
                 self.identity = Some(health.identity);
-                self.recovery = None;
-                self.reconnect_overlay_visible = false;
+                self.end_recovery(&Outlook::Local);
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
@@ -1559,24 +1713,21 @@ impl TuiState {
                 };
                 self.load_skill_catalog(request, catalog);
             }
+            // The lifecycle stream belongs to this machine's own Server, so a
+            // recovery it reports is the local one whichever Outlook is on
+            // screen. A Remote's own loss arrives Origin-stamped instead, and
+            // is taken in `apply_origin_catalog`.
             ManagedEvent::Recovering(status) => {
-                if self.recovery.is_none() {
-                    self.reconnect_overlay_visible = false;
-                }
-                self.recovery = Some(status);
+                self.begin_recovery(Outlook::Local, status);
                 self.manually_stopped = false;
                 self.fatal_error = None;
             }
-            ManagedEvent::RemoteRecovered => {
-                self.recovery = None;
-                self.reconnect_overlay_visible = false;
-            }
+            ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 self.stop_opening_loading();
                 if shutdown.reason == ShutdownReason::Manual {
-                    self.recovery = None;
-                    self.reconnect_overlay_visible = false;
+                    self.end_recovery(&Outlook::Local);
                     self.manually_stopped = true;
                     self.fatal_error = None;
                 }
@@ -1643,7 +1794,7 @@ impl TuiState {
                 }
             }
             ManagedEvent::Fatal(error) => {
-                self.reconnect_overlay_visible = false;
+                self.withhold_recovery(&Outlook::Local);
                 self.fatal_error = Some(error);
             }
         }
@@ -2678,7 +2829,7 @@ impl TuiState {
     }
 
     fn selection_surface_visible(&self, surface: SelectionSurface) -> bool {
-        if self.reconnect_overlay_visible {
+        if self.reconnect_overlay_visible() {
             return false;
         }
         if let Some(overlay) = self.top_selection_overlay() {
@@ -3467,7 +3618,9 @@ pub enum ApplicationEvent {
     /// The optimistic shell's quiet-period wakeup. Kept explicit so another
     /// ready event cannot consume the deadline without dirtying a frame.
     OpeningLoadingDelayElapsed,
-    ReconnectGraceElapsed,
+    /// One Origin's loss has outlived its grace period and is now the
+    /// reader's to see.
+    ReconnectGraceElapsed(Outlook),
     Managed(ManagedEvent),
     OriginCatalog {
         outlook: Outlook,
@@ -4077,6 +4230,15 @@ impl Application {
             return;
         };
         self.state.prune_dismissed_interventions();
+        // An Origin that has stopped answering takes its panels off the frame
+        // rather than leaving one standing that no key reaches and no Decision
+        // leaves. Hidden, not dismissed: it presents itself again, unanswered,
+        // as soon as the Remote answers.
+        if self.state.interventions_are_held() {
+            self.state.approvals.hide();
+            self.state.questionnaires.hide();
+            return;
+        }
         if self.state.surface_above_interventions().is_some() {
             return;
         }
@@ -4115,7 +4277,9 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::ReconnectGraceElapsed => Ok(self.elapse_reconnect_grace()),
+            ApplicationEvent::ReconnectGraceElapsed(outlook) => {
+                Ok(self.elapse_reconnect_grace(&outlook))
+            }
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
             ApplicationEvent::OriginCatalog { outlook, event } => {
                 self.handle_origin_catalog(outlook, event)
@@ -4765,7 +4929,21 @@ impl Application {
         // where an overlay is about to swallow it: the reader looked away from
         // the Notice either way.
         self.state.application_notice.dismiss();
-        if self.state.reconnect_overlay_visible || self.defers_for_agent_selection(&command) {
+        // This machine's own Server going away stands the whole frame down,
+        // and only leaving is still answered: a reader must always be able to
+        // quit whatever the connection is doing.
+        if self.state.reconnect_overlay_visible() && !leaves_the_application(&command) {
+            return Ok(ApplicationTransition::Continue);
+        }
+        if self.defers_for_agent_selection(&command) {
+            return Ok(ApplicationTransition::Continue);
+        }
+        // One choke point decides every refusal a Remote that stopped
+        // answering makes: the question is only ever whether what this command
+        // would do goes to an Origin nothing reaches.
+        if let Some(origin) = self.command_origin(&command)
+            && self.refuse_if_unreachable(&origin)
+        {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
@@ -5071,6 +5249,90 @@ impl Application {
             )
     }
 
+    /// Tries an Origin that has stopped answering again, now, rather than
+    /// waiting its backoff out. It is this Client's own reading of what is
+    /// recovering that says whether there is anything to try — not the
+    /// Sidebar's, which knows only the Origins its chosen scope lists — so the
+    /// banner above the composer and the `[unreachable]` row reach the retry
+    /// on the very same terms.
+    fn retry_origin(&mut self, outlook: Outlook) -> ApplicationTransition {
+        if !self.state.is_unreachable(&outlook) {
+            return ApplicationTransition::Continue;
+        }
+        ApplicationTransition::RetryCatalogOrigin(self.state.sidebar.retry_origin(outlook))
+    }
+
+    /// Refuses, where the reader can see it, work that was bound for a Remote
+    /// that has stopped answering, and answers whether it did. Every refusal a
+    /// lost Remote makes is decided here and nowhere else, so a key, a slash,
+    /// a pointer and a Sidebar row all get the same answer.
+    fn refuse_if_unreachable(&mut self, origin: &Outlook) -> bool {
+        if !self.state.is_unreachable(origin) {
+            return false;
+        }
+        let Some(remote) = origin.remote_name() else {
+            return false;
+        };
+        // Naming the Remote, never "Suru": the rest of the Client is working.
+        self.state.submission_error = Some(format!(
+            "{remote} is unreachable; this waits until it answers"
+        ));
+        true
+    }
+
+    /// The Origin a command's work is bound for, if it is bound for one.
+    ///
+    /// A command that only moves what the Client already holds — reading a
+    /// Transcript, walking the Sidebar, Settings, Themes, turning the Outlook,
+    /// leaving — answers `None`, because nothing it does has to reach a
+    /// Server. The rest answer the Origin they would act on: the Session's own
+    /// where the command names one, and otherwise the Outlook's, since that is
+    /// the Server everything which acts or begins answers for.
+    fn command_origin(&self, command: &CommandId) -> Option<Outlook> {
+        match command {
+            // A Prompt is delivered to the Session it was written for, or
+            // begins one on the Server the Outlook is turned toward.
+            CommandId::SubmitSteer | CommandId::SubmitQueue => Some(
+                self.state
+                    .session_reference
+                    .as_ref()
+                    .map_or_else(|| self.state.outlook.clone(), |open| open.origin.clone()),
+            ),
+            // A picker's choice is applied on the Server it was fetched from.
+            CommandId::SelectModel | CommandId::SelectWorkspace => Some(self.state.outlook.clone()),
+            // Interrupting a Turn, and promoting or withdrawing a Prompt it
+            // has not started, are all asked of the Session's own Server.
+            CommandId::RequestInterrupt
+            | CommandId::ConfirmInterrupt
+            | CommandId::PromoteSelectedPrompt
+            | CommandId::CancelSelectedPrompt => self
+                .state
+                .session_reference
+                .as_ref()
+                .map(|open| open.origin.clone()),
+            // A semantic command is refused in `invoke_semantic`, where the
+            // subject it names is known — and where a Sidebar row or a menu
+            // item reaches it without passing through here at all.
+            _ => None,
+        }
+    }
+
+    /// The Origin a semantic command acts on, if its work goes to a Server at
+    /// all. The subject decides which Origin: a command naming a Session, an
+    /// Origin, or a Workspace acts on that one, and everything else acts on
+    /// the Outlook's.
+    fn semantic_origin(&self, id: SemanticCommandId, subject: &SemanticSubject) -> Option<Outlook> {
+        if super::commands::descriptor(id).reach != super::commands::SemanticReach::Origin {
+            return None;
+        }
+        Some(match subject {
+            SemanticSubject::Session(reference) => reference.origin.clone(),
+            SemanticSubject::Origin(outlook) => outlook.clone(),
+            SemanticSubject::Workspace { origin, .. } => origin.clone(),
+            _ => self.state.outlook.clone(),
+        })
+    }
+
     /// Handles the composer editing commands routed here; any other command
     /// leaves the composer untouched.
     fn handle_composer_command(&mut self, command: CommandId) -> ApplicationTransition {
@@ -5250,12 +5512,20 @@ impl Application {
         // press over that blank space when either is untrue hits nothing
         // recorded here and falls through like any other press.
         let header_icon = self.state.header_icon_area.borrow().clone();
-        if let Some((row, columns)) = header_icon
-            && row == position.y
-            && columns.contains(&position.x)
+        if let Some(icon) = header_icon
+            && icon.contains(position)
             && let Some(session) = self.state.session_reference.clone()
         {
             return self.invoke_semantic(SemanticCommandId::SessionIconChoose.on_session(session));
+        }
+        // The banner's retry, which is the same command the Sidebar's
+        // `[unreachable]` row invokes and names the same Origin.
+        let banner = self.state.unreachable_banner_area.borrow().clone();
+        if let Some(affordance) = banner
+            && affordance.contains(position)
+        {
+            let outlook = self.state.outlook.clone();
+            return self.invoke_semantic(SemanticCommandId::RemoteRetry.on_origin(outlook));
         }
         if let Some(target) = self
             .state
@@ -6371,11 +6641,14 @@ impl Application {
         self.state.begin_provisional_session(prompt)
     }
 
-    fn elapse_reconnect_grace(&mut self) -> ApplicationTransition {
-        if self.state.recovery.is_some() {
-            // The overlay owns input, including the release that would end a drag.
+    /// One Origin's loss has outlived its grace, so it becomes the reader's to
+    /// see: a banner above the composer for a Remote, and the whole-frame
+    /// modal for this machine's own Server.
+    fn elapse_reconnect_grace(&mut self, outlook: &Outlook) -> ApplicationTransition {
+        self.state.present_recovery(outlook);
+        if outlook == &Outlook::Local && self.state.reconnect_overlay_visible() {
+            // The modal owns input, including the release that would end a drag.
             self.state.left_press = None;
-            self.state.reconnect_overlay_visible = true;
         }
         ApplicationTransition::Continue
     }
@@ -6751,7 +7024,7 @@ impl Application {
     /// projected row.
     fn transcript_cell(&self, position: Position) -> Option<SelectionCell> {
         if self.state.overlay_owns_input()
-            || self.state.reconnect_overlay_visible
+            || self.state.reconnect_overlay_visible()
             || self.state.active_selection_overlay_area().is_some()
         {
             return None;
@@ -6955,6 +7228,15 @@ impl Application {
         self.refresh_text_selection();
         let invocation = invocation.into();
         let command = invocation.id;
+        // A surface that names its own subject — a Sidebar row, a picker row,
+        // a menu item — reaches a semantic command without passing the
+        // CommandId choke point, so the same one question is asked of the
+        // invocation it built.
+        if let Some(origin) = self.semantic_origin(command, &invocation.subject)
+            && self.refuse_if_unreachable(&origin)
+        {
+            return Ok(ApplicationTransition::Continue);
+        }
         if self.state.selection_update_pending()
             && matches!(
                 command,
@@ -7093,7 +7375,7 @@ impl Application {
             }
             SemanticCommandId::ComposerPlaceCursor => {
                 if !self.state.overlay_owns_input()
-                    && !self.state.reconnect_overlay_visible
+                    && !self.state.reconnect_overlay_visible()
                     && self.state.open_subagent_parent().is_none()
                     && let SemanticSubject::ComposerCursor(target) = invocation.subject
                 {
@@ -7642,14 +7924,15 @@ impl Application {
                 Ok(self.take_session_listing_transition())
             }
             SemanticCommandId::RemoteRetry => Ok(match invocation.subject {
-                SemanticSubject::Origin(outlook) => {
-                    self.state.sidebar.retry_origin(outlook).map_or(
-                        ApplicationTransition::Continue,
-                        ApplicationTransition::RetryCatalogOrigin,
-                    )
+                SemanticSubject::Origin(outlook) => self.retry_origin(outlook),
+                // Naming no Origin means the one the Outlook is turned toward,
+                // which is what a key press and the banner's own affordance
+                // both mean by it.
+                SemanticSubject::View => {
+                    let outlook = self.state.outlook.clone();
+                    self.retry_origin(outlook)
                 }
-                SemanticSubject::View
-                | SemanticSubject::ScreenPosition(_)
+                SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)
                 | SemanticSubject::Turn(_)
                 | SemanticSubject::Session(_)
@@ -8107,7 +8390,7 @@ impl Application {
         super::event_loop::frame_backend::finish_frame(
             frame.buffer_mut(),
             !self.state.overlay_owns_input()
-                && !self.state.reconnect_overlay_visible
+                && !self.state.reconnect_overlay_visible()
                 && self.state.active_selection_overlay_area().is_none(),
         );
     }
@@ -8334,7 +8617,9 @@ impl Application {
             Some(SurfaceAboveInterventions::Sidebar) => {
                 return command_for_sidebar_event(event);
             }
-            None => {}
+            // Nothing stands over the panels here; they simply have nothing to
+            // present, so the keys go on to the composer as they always would.
+            Some(SurfaceAboveInterventions::UnreachableOrigin) | None => {}
         }
         if self
             .state
@@ -8453,8 +8738,10 @@ impl Application {
             .is_some_and(|(loaded, _)| loaded == request)
     }
 
-    pub(super) fn is_recovering(&self) -> bool {
-        self.state.recovery.is_some()
+    /// Every Origin still owed its grace period, which is what the run loop
+    /// arms one timer apiece from.
+    pub(super) fn origins_awaiting_grace(&self) -> std::collections::BTreeSet<Outlook> {
+        self.state.origins_awaiting_grace()
     }
 
     /// Whether anything on screen has live presentation, so the run loop
@@ -8529,6 +8816,16 @@ fn pending_interventions(snapshot: &SessionSnapshot) -> impl Iterator<Item = Int
 /// Whether a terminal event is the reader acting rather than the terminal
 /// reporting: a key press, a click, or a paste is theirs; a resize, a focus
 /// change, and the mouse merely passing over the window are not.
+/// Whether a command is one of the two that leave. They are answered even
+/// under the whole-frame modal this machine's own Server's loss raises, so a
+/// reader is never held inside a Client that cannot reach anything.
+fn leaves_the_application(command: &CommandId) -> bool {
+    matches!(
+        command,
+        CommandId::ClearOrExit | CommandId::InvokeSemantic(SemanticCommandId::ApplicationExit)
+    )
+}
+
 fn is_reader_interaction(event: &InputEvent) -> bool {
     match event {
         InputEvent::Key(key) => key.kind == KeyEventKind::Press,
@@ -8547,6 +8844,9 @@ impl TuiState {
     /// A completion list left standing over the composer is not one of them:
     /// it is the composer's own, and the panels outrank it.
     fn surface_above_interventions(&self) -> Option<SurfaceAboveInterventions> {
+        if self.interventions_are_held() {
+            return Some(SurfaceAboveInterventions::UnreachableOrigin);
+        }
         if self.approval_posture_picker.is_open() {
             return Some(SurfaceAboveInterventions::ApprovalPosture);
         }
@@ -8662,9 +8962,20 @@ impl TuiState {
         self.intervention_armed_until = None;
     }
 
+    /// Whether the open Session's Interventions are waiting out of sight
+    /// because its Origin has stopped answering. A Decision taken now would go
+    /// nowhere, so neither the panels nor the notices that name their keys
+    /// have anything to say until the Remote answers.
+    pub(super) fn interventions_are_held(&self) -> bool {
+        self.session_reference
+            .as_ref()
+            .is_some_and(|session| self.is_unreachable(&session.origin))
+    }
+
     pub(super) fn pending_approvals(&self) -> impl Iterator<Item = &Activity> {
         self.session
             .as_ref()
+            .filter(|_| !self.interventions_are_held())
             .into_iter()
             .flat_map(|session| super::approval::pending(session.snapshot()))
     }
@@ -8687,13 +8998,17 @@ impl TuiState {
     pub(super) fn pending_questionnaires(
         &self,
     ) -> impl Iterator<Item = &crate::protocol::Questionnaire> {
-        self.session.as_ref().into_iter().flat_map(|session| {
-            super::questionnaire::pending(session.snapshot()).filter(|q| {
-                self.session_reference
-                    .as_ref()
-                    .is_some_and(|owner| self.questionnaires.available(owner, q.id))
+        self.session
+            .as_ref()
+            .filter(|_| !self.interventions_are_held())
+            .into_iter()
+            .flat_map(|session| {
+                super::questionnaire::pending(session.snapshot()).filter(|q| {
+                    self.session_reference
+                        .as_ref()
+                        .is_some_and(|owner| self.questionnaires.available(owner, q.id))
+                })
             })
-        })
     }
 
     pub(super) fn open_questionnaire(&self) -> Option<&crate::protocol::Questionnaire> {

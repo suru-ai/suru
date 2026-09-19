@@ -1310,7 +1310,7 @@ pub struct Remote {
 /// The Server whose world a Client is presently presenting. This is Client
 /// state rather than wire state: Remote requests still travel through the
 /// local Server's explicit proxy route.
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Outlook {
     #[default]
     Local,

@@ -487,8 +487,25 @@ pub(super) struct SemanticCommandDescriptor {
     pub(super) id: SemanticCommandId,
     pub(super) title: &'static str,
     pub(super) description: &'static str,
+    pub(super) reach: SemanticReach,
     pub(super) slash: Option<SlashCommand>,
     pub(super) keybinding: Option<SemanticKeybinding>,
+}
+
+/// How far a semantic command's work has to travel. It is declared beside the
+/// command itself, so the one fact that decides whether an Origin which has
+/// stopped answering refuses a command lives where the command is defined
+/// rather than in a separate list that has to be kept in step with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SemanticReach {
+    /// Moves only what the Client already holds: reading, scrolling, opening
+    /// and closing surfaces, choosing a Theme, turning the Outlook, leaving.
+    /// Nothing has to answer for it.
+    Client,
+    /// Goes to a Server — a Prompt, an Intervention answered, a Session
+    /// settled, unsettled, deleted or begun, a picker or catalog that has to
+    /// fetch. An Origin that cannot be reached refuses these and no others.
+    Origin,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -516,6 +533,7 @@ const fn numeric_insert_descriptor(
     SemanticCommandDescriptor {
         id,
         title,
+        reach: SemanticReach::Client,
         description: "Insert one digit in the open numeric Setting editor",
         slash: None,
         keybinding: None,
@@ -545,6 +563,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPostureCycle,
         title: "Cycle Approval Posture",
+        reach: SemanticReach::Origin,
         description: "Advance this Session's Provider-native Approval Posture",
         slash: None,
         keybinding: Some(SemanticKeybinding {
@@ -557,6 +576,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPostureOpen,
         title: "Choose Approval Posture",
+        reach: SemanticReach::Origin,
         description: "Choose every Provider-native Approval Posture value or follow Settings",
         slash: Some(SlashCommand {
             name: "posture",
@@ -572,6 +592,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPosturePrevious,
         title: "Previous Approval Posture",
+        reach: SemanticReach::Client,
         description: "Focus the previous Approval Posture choice",
         slash: None,
         keybinding: None,
@@ -579,6 +600,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPostureNext,
         title: "Next Approval Posture",
+        reach: SemanticReach::Client,
         description: "Focus the next Approval Posture choice",
         slash: None,
         keybinding: None,
@@ -586,6 +608,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPostureSelect,
         title: "Select Approval Posture",
+        reach: SemanticReach::Origin,
         description: "Apply the focused Approval Posture choice",
         slash: None,
         keybinding: None,
@@ -593,6 +616,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalPostureClose,
         title: "Close Approval Posture Picker",
+        reach: SemanticReach::Client,
         description: "Close the Approval Posture picker",
         slash: None,
         keybinding: None,
@@ -600,6 +624,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalOpen,
         title: "Open Approval",
+        reach: SemanticReach::Origin,
         description: "Focus a pending Approval and choose a Decision",
         slash: None,
         keybinding: Some(SemanticKeybinding {
@@ -612,6 +637,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalHide,
         title: "Hide Approval",
+        reach: SemanticReach::Client,
         description: "Return focus to the composer without deciding",
         slash: None,
         keybinding: None,
@@ -619,6 +645,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalChoicePrevious,
         title: "Previous Decision",
+        reach: SemanticReach::Client,
         description: "Focus the previous Decision without submitting it",
         slash: None,
         keybinding: None,
@@ -626,6 +653,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalChoiceNext,
         title: "Next Decision",
+        reach: SemanticReach::Client,
         description: "Focus the next Decision without submitting it",
         slash: None,
         keybinding: None,
@@ -633,6 +661,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalChoose,
         title: "Choose Decision",
+        reach: SemanticReach::Origin,
         description: "Submit the focused Decision",
         slash: None,
         keybinding: None,
@@ -640,6 +669,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalAccept,
         title: "Accept Approval",
+        reach: SemanticReach::Origin,
         description: "Accept this request once",
         slash: None,
         keybinding: None,
@@ -647,6 +677,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalAcceptForSession,
         title: "Accept Approval for Session",
+        reach: SemanticReach::Origin,
         description: "Accept this kind of request for the Session",
         slash: None,
         keybinding: None,
@@ -654,6 +685,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalDecline,
         title: "Decline Approval",
+        reach: SemanticReach::Origin,
         description: "Decline this request and let the Turn continue",
         slash: None,
         keybinding: None,
@@ -661,6 +693,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApprovalDeclineAndInterrupt,
         title: "Decline Approval and Interrupt",
+        reach: SemanticReach::Origin,
         description: "Decline this request and interrupt the Turn",
         slash: None,
         keybinding: None,
@@ -668,6 +701,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireRequestNext,
         title: "Next pending Questionnaire",
+        reach: SemanticReach::Client,
         description: "Switch pending Questionnaires without losing the Answer draft",
         slash: None,
         keybinding: None,
@@ -675,6 +709,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireRequestPrevious,
         title: "Previous pending Questionnaire",
+        reach: SemanticReach::Client,
         description: "Switch pending Questionnaires without losing the Answer draft",
         slash: None,
         keybinding: None,
@@ -682,6 +717,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireScrollUp,
         title: "Scroll Questionnaire Up",
+        reach: SemanticReach::Client,
         description: "Read more of the Question",
         slash: None,
         keybinding: None,
@@ -689,6 +725,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireScrollDown,
         title: "Scroll Questionnaire Down",
+        reach: SemanticReach::Client,
         description: "Read more of the Question",
         slash: None,
         keybinding: None,
@@ -696,6 +733,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireBack,
         title: "Previous Question",
+        reach: SemanticReach::Client,
         description: "Return to the previous Question without discarding edits",
         slash: None,
         keybinding: None,
@@ -703,6 +741,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireNext,
         title: "Next Question",
+        reach: SemanticReach::Client,
         description: "Validate this Question and advance toward review",
         slash: None,
         keybinding: None,
@@ -710,6 +749,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireOmit,
         title: "Omit Question",
+        reach: SemanticReach::Client,
         description: "Leave a Question unanswered only when the Provider permits it",
         slash: None,
         keybinding: None,
@@ -717,6 +757,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireOpen,
         title: "Open Questionnaire",
+        reach: SemanticReach::Origin,
         description: "Open the structured Answer panel",
         slash: Some(SlashCommand {
             name: "questions",
@@ -732,6 +773,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireHide,
         title: "Hide Questionnaire",
+        reach: SemanticReach::Client,
         description: "Hide the structured Answer panel",
         slash: None,
         keybinding: None,
@@ -739,6 +781,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireChoicePrevious,
         title: "Previous choice",
+        reach: SemanticReach::Client,
         description: "Highlight the previous choice without selecting it",
         slash: None,
         keybinding: None,
@@ -746,6 +789,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireChoiceNext,
         title: "Next choice",
+        reach: SemanticReach::Client,
         description: "Highlight the next choice without selecting it",
         slash: None,
         keybinding: None,
@@ -753,6 +797,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireSelect,
         title: "Select Questionnaire",
+        reach: SemanticReach::Client,
         description: "Select the structured Answer panel",
         slash: None,
         keybinding: None,
@@ -760,6 +805,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireReview,
         title: "Review Questionnaire",
+        reach: SemanticReach::Client,
         description: "Review the structured Answer panel",
         slash: None,
         keybinding: None,
@@ -767,6 +813,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireSubmit,
         title: "Submit Questionnaire",
+        reach: SemanticReach::Origin,
         description: "Submit the structured Answer panel",
         slash: None,
         keybinding: None,
@@ -774,6 +821,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::QuestionnaireDecline,
         title: "Decline Questionnaire",
+        reach: SemanticReach::Origin,
         description: "Decline the structured Answer panel",
         slash: None,
         keybinding: None,
@@ -781,6 +829,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ApplicationExit,
         title: "Exit Suru",
+        reach: SemanticReach::Client,
         description: "Close this TUI",
         slash: Some(SlashCommand {
             name: "exit",
@@ -791,6 +840,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ThemeList,
         title: "Choose Theme",
+        reach: SemanticReach::Client,
         description: "Search and preview Themes",
         slash: Some(SlashCommand {
             name: "themes",
@@ -806,6 +856,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelList,
         title: "Choose Model",
+        reach: SemanticReach::Origin,
         description: "Search available Provider Models",
         slash: Some(SlashCommand {
             name: "models",
@@ -821,6 +872,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptions,
         title: "Configure Model Options",
+        reach: SemanticReach::Origin,
         description: "Configure the current Model's options",
         slash: Some(SlashCommand {
             name: "options",
@@ -836,6 +888,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionsPrevious,
         title: "Previous Model Option",
+        reach: SemanticReach::Client,
         description: "Focus the previous Model Option or choice",
         slash: None,
         keybinding: None,
@@ -843,6 +896,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionsNext,
         title: "Next Model Option",
+        reach: SemanticReach::Client,
         description: "Focus the next Model Option or choice",
         slash: None,
         keybinding: None,
@@ -850,6 +904,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionsSelect,
         title: "Select Model Option",
+        reach: SemanticReach::Client,
         description: "Open or select the focused Model Option choice",
         slash: None,
         keybinding: None,
@@ -857,6 +912,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionsApply,
         title: "Apply Model Options",
+        reach: SemanticReach::Origin,
         description: "Apply the complete staged Agent Selection",
         slash: None,
         keybinding: None,
@@ -864,6 +920,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionsCancel,
         title: "Cancel Model Options",
+        reach: SemanticReach::Client,
         description: "Discard every staged Model Option edit",
         slash: None,
         keybinding: None,
@@ -871,6 +928,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ModelOptionReasoningCycle,
         title: "Cycle Reasoning Effort",
+        reach: SemanticReach::Origin,
         description: "Advance the Reasoning Effort to the next advertised choice",
         slash: None,
         keybinding: Some(SemanticKeybinding {
@@ -883,6 +941,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionList,
         title: "Switch Session",
+        reach: SemanticReach::Client,
         description: "Search and attach to a live Session",
         slash: Some(SlashCommand {
             name: "sessions",
@@ -898,6 +957,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeRemove,
         title: "Remove selected Worktree",
+        reach: SemanticReach::Origin,
         description: "Remove selected Worktree",
         slash: None,
         keybinding: None,
@@ -905,6 +965,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeForceRemove,
         title: "Force remove selected Worktree",
+        reach: SemanticReach::Origin,
         description: "Force remove selected Worktree",
         slash: None,
         keybinding: None,
@@ -912,6 +973,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreePrevious,
         title: "Previous Worktree",
+        reach: SemanticReach::Client,
         description: "Previous Worktree",
         slash: None,
         keybinding: None,
@@ -919,6 +981,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeNext,
         title: "Next Worktree",
+        reach: SemanticReach::Client,
         description: "Next Worktree",
         slash: None,
         keybinding: None,
@@ -926,6 +989,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeSelect,
         title: "Select Worktree",
+        reach: SemanticReach::Origin,
         description: "Select Worktree",
         slash: None,
         keybinding: None,
@@ -933,6 +997,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeClose,
         title: "Close Worktree chooser",
+        reach: SemanticReach::Client,
         description: "Close Worktree chooser",
         slash: None,
         keybinding: None,
@@ -940,6 +1005,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorktreeList,
         title: "Choose Worktree",
+        reach: SemanticReach::Origin,
         description: "Choose an existing Worktree, or a new one, for a new Session",
         slash: Some(SlashCommand {
             name: "worktree",
@@ -950,6 +1016,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorkspaceList,
         title: "Switch Workspace",
+        reach: SemanticReach::Origin,
         description: "Choose the Workspace to work in",
         // "Project" is vocabulary Suru avoids, so it stands only as a typed
         // synonym: an alias is matchable and never displayed, which lets
@@ -968,6 +1035,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionDelete,
         title: "Delete Session",
+        reach: SemanticReach::Origin,
         description: "Delete the selected Session and everything it owns",
         slash: None,
         keybinding: None,
@@ -975,6 +1043,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TranscriptFoldsToggle,
         title: "Toggle Transcript Folds",
+        reach: SemanticReach::Client,
         description: "Show every Transcript entry in full, or fold them back down",
         slash: None,
         keybinding: Some(SemanticKeybinding {
@@ -987,6 +1056,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TranscriptGroupsToggle,
         title: "Toggle Transcript Groups",
+        reach: SemanticReach::Client,
         description: "Expand every command Group into its members, or collapse them back down",
         slash: None,
         keybinding: Some(SemanticKeybinding {
@@ -999,6 +1069,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TranscriptTurnToggle,
         title: "Toggle Turn Fold",
+        reach: SemanticReach::Client,
         description: "Fold one settled Turn to its marker, or open the work behind it",
         // The command names the Turn it acts on, so it is invoked from that
         // Turn's marker rather than from a key or a slash that would have no
@@ -1009,6 +1080,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TranscriptTurnsToggle,
         title: "Toggle Turn Folds",
+        reach: SemanticReach::Client,
         description: "Open every settled Turn's Fold, or fold them back down",
         slash: None,
         keybinding: None,
@@ -1016,6 +1088,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionNew,
         title: "New Session",
+        reach: SemanticReach::Origin,
         description: "Open a fresh landing composer without ending the current Session",
         slash: Some(SlashCommand {
             name: "new",
@@ -1031,6 +1104,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionSettle,
         title: "Settle Session",
+        reach: SemanticReach::Origin,
         // The command acts on the Session it names, and names the open one
         // when nothing else says otherwise — which is what the slash means and
         // what a Sidebar row overrules.
@@ -1044,6 +1118,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionUnsettle,
         title: "Unsettle Session",
+        reach: SemanticReach::Origin,
         description: "Take a Session back off the settled shelf",
         slash: Some(SlashCommand {
             name: "unsettle",
@@ -1054,6 +1129,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionIconChoose,
         title: "Choose Session Icon",
+        reach: SemanticReach::Origin,
         // The command names the Session it acts on, so it is invoked from a
         // Sidebar row's context menu or a press on that Session's header Icon
         // rather than from a key or a slash that would have no way to say
@@ -1065,6 +1141,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorkspaceIconChoose,
         title: "Choose Workspace Icon",
+        reach: SemanticReach::Origin,
         // The command names the Workspace it acts on by Origin and identity,
         // so it is invoked from a Sidebar selector entry's context menu or a
         // Workspace Picker row's context menu rather than from a key or a
@@ -1076,6 +1153,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerLeft,
         title: "Icon Picker Left",
+        reach: SemanticReach::Client,
         description: "Move the Icon Picker's focus one cell left",
         slash: None,
         keybinding: None,
@@ -1083,6 +1161,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerRight,
         title: "Icon Picker Right",
+        reach: SemanticReach::Client,
         description: "Move the Icon Picker's focus one cell right",
         slash: None,
         keybinding: None,
@@ -1090,6 +1169,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerUp,
         title: "Icon Picker Up",
+        reach: SemanticReach::Client,
         description: "Move the Icon Picker's focus one row up",
         slash: None,
         keybinding: None,
@@ -1097,6 +1177,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerDown,
         title: "Icon Picker Down",
+        reach: SemanticReach::Client,
         description: "Move the Icon Picker's focus one row down",
         slash: None,
         keybinding: None,
@@ -1104,6 +1185,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerChoose,
         title: "Choose Icon",
+        reach: SemanticReach::Origin,
         description: "Set the target's Icon to the Icon Picker's focused glyph and close it",
         slash: None,
         keybinding: None,
@@ -1111,6 +1193,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerClose,
         title: "Close Icon Picker",
+        reach: SemanticReach::Client,
         description: "Dismiss the Icon Picker without choosing",
         slash: None,
         keybinding: None,
@@ -1118,6 +1201,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerSearchInsert,
         title: "Insert Icon Search Text",
+        reach: SemanticReach::Client,
         description: "Narrow the Icon Picker's grid by typed text",
         slash: None,
         keybinding: None,
@@ -1125,6 +1209,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::IconPickerSearchDelete,
         title: "Delete Icon Search Text",
+        reach: SemanticReach::Client,
         description: "Widen the Icon Picker's grid by deleting the last typed character",
         slash: None,
         keybinding: None,
@@ -1132,6 +1217,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorkspacePickerMenuSelect,
         title: "Invoke Workspace Picker Menu Item",
+        reach: SemanticReach::Client,
         description: "Act on the Workspace Picker row menu's selected item",
         slash: None,
         keybinding: None,
@@ -1139,6 +1225,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::WorkspacePickerMenuClose,
         title: "Close Workspace Picker Menu",
+        reach: SemanticReach::Client,
         description: "Dismiss the Workspace Picker's row menu, leaving its row alone",
         slash: None,
         keybinding: None,
@@ -1146,6 +1233,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectOpen,
         title: "Choose a Remote",
+        reach: SemanticReach::Client,
         description: "Turn the Outlook toward a paired Remote or Local",
         slash: Some(SlashCommand {
             name: "connect",
@@ -1156,6 +1244,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::PairOpen,
         title: "Pair with a Remote",
+        reach: SemanticReach::Client,
         description: "Redeem an Invite from another machine",
         slash: Some(SlashCommand {
             name: "pair",
@@ -1166,6 +1255,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectConfirm,
         title: "Confirm Connect Step",
+        reach: SemanticReach::Client,
         description: "Inspect the Invite or trust its fingerprint",
         slash: None,
         keybinding: None,
@@ -1173,6 +1263,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectFocusNext,
         title: "Next Connect Field",
+        reach: SemanticReach::Client,
         description: "Move between the Remote name and address priorities",
         slash: None,
         keybinding: None,
@@ -1180,6 +1271,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectPrevious,
         title: "Previous Connect Item",
+        reach: SemanticReach::Client,
         description: "Focus the previous Remote or address",
         slash: None,
         keybinding: None,
@@ -1187,6 +1279,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectNext,
         title: "Next Connect Item",
+        reach: SemanticReach::Client,
         description: "Focus the next Remote or address",
         slash: None,
         keybinding: None,
@@ -1194,6 +1287,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::OutlookSelect,
         title: "Turn Outlook",
+        reach: SemanticReach::Client,
         description: "Present the selected local or Remote Server",
         slash: None,
         keybinding: None,
@@ -1201,6 +1295,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectMoveAddressUp,
         title: "Raise Address Priority",
+        reach: SemanticReach::Client,
         description: "Move the focused address earlier in the dialing order",
         slash: None,
         keybinding: None,
@@ -1208,6 +1303,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectMoveAddressDown,
         title: "Lower Address Priority",
+        reach: SemanticReach::Client,
         description: "Move the focused address later in the dialing order",
         slash: None,
         keybinding: None,
@@ -1215,6 +1311,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectRemoveRemote,
         title: "Remove Remote",
+        reach: SemanticReach::Client,
         description: "End the Pairing with the selected Remote",
         slash: None,
         keybinding: None,
@@ -1222,6 +1319,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectPairAnother,
         title: "Pair Another Remote",
+        reach: SemanticReach::Client,
         description: "Open Invite entry from the paired Remotes picker",
         slash: None,
         keybinding: None,
@@ -1229,6 +1327,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ConnectClose,
         title: "Close Connect Overlay",
+        reach: SemanticReach::Client,
         description: "Dismiss the Remote Pairing surface",
         slash: None,
         keybinding: None,
@@ -1236,6 +1335,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeOpen,
         title: "Serve this machine",
+        reach: SemanticReach::Client,
         description: "Issue an Invite and manage enrolled Peers",
         slash: Some(SlashCommand {
             name: "serve",
@@ -1246,6 +1346,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServePrevious,
         title: "Previous Serve Item",
+        reach: SemanticReach::Client,
         description: "Focus the previous address or Peer",
         slash: None,
         keybinding: None,
@@ -1253,6 +1354,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeNext,
         title: "Next Serve Item",
+        reach: SemanticReach::Client,
         description: "Focus the next address or Peer",
         slash: None,
         keybinding: None,
@@ -1260,6 +1362,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeToggleAddress,
         title: "Toggle Invite Address",
+        reach: SemanticReach::Client,
         description: "Include or exclude the focused address from the Invite",
         slash: None,
         keybinding: None,
@@ -1267,6 +1370,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeConfirm,
         title: "Confirm Serve Selection",
+        reach: SemanticReach::Client,
         description: "Issue an Invite for the chosen addresses",
         slash: None,
         keybinding: None,
@@ -1274,6 +1378,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeCopyInvite,
         title: "Copy Invite",
+        reach: SemanticReach::Client,
         description: "Copy the fresh Invite through the terminal",
         slash: None,
         keybinding: None,
@@ -1281,6 +1386,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeRemovePeer,
         title: "Remove Peer",
+        reach: SemanticReach::Client,
         description: "Revoke the focused Peer and end its live connections",
         slash: None,
         keybinding: None,
@@ -1288,6 +1394,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ServeClose,
         title: "Close Serve Overlay",
+        reach: SemanticReach::Client,
         description: "Dismiss the Serving management surface",
         slash: None,
         keybinding: None,
@@ -1295,6 +1402,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarToggle,
         title: "Toggle Sidebar",
+        reach: SemanticReach::Client,
         description: "Show the Sidebar beside the main view, or reclaim its columns",
         slash: Some(SlashCommand {
             name: "sidebar",
@@ -1312,6 +1420,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarWiden,
         title: "Widen Sidebar",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar's chosen edge one column to the right",
         slash: None,
         keybinding: None,
@@ -1319,6 +1428,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarNarrow,
         title: "Narrow Sidebar",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar's chosen edge one column to the left",
         slash: None,
         keybinding: None,
@@ -1329,6 +1439,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // open integer command in the registry.
         id: SemanticCommandId::SidebarWidthSet { columns: 0 },
         title: "Set Sidebar Width",
+        reach: SemanticReach::Client,
         description: "Set the Sidebar's chosen width to an explicit column count",
         slash: None,
         keybinding: None,
@@ -1336,6 +1447,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarWidthReset,
         title: "Reset Sidebar Width",
+        reach: SemanticReach::Client,
         description: "Restore the Sidebar width from its current launch Setting",
         slash: None,
         keybinding: None,
@@ -1343,6 +1455,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarPrevious,
         title: "Previous Sidebar Session",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar's selection to the row above, wrapping past the top",
         slash: None,
         keybinding: None,
@@ -1350,6 +1463,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarNext,
         title: "Next Sidebar Session",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar's selection to the row below, wrapping past the end",
         slash: None,
         keybinding: None,
@@ -1357,6 +1471,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarAttach,
         title: "Attach Selected Session",
+        reach: SemanticReach::Client,
         // Every one of the Sidebar's own affordances is acted on from the row
         // the reader is on, so this is what Enter comes to there as well as on
         // a Session, and the account of the command names the rest of them.
@@ -1368,6 +1483,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::PointerClick,
         title: "Click",
+        reach: SemanticReach::Client,
         description: "Act on a screen cell in the active surface",
         slash: None,
         keybinding: None,
@@ -1375,6 +1491,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::HyperlinkOpen,
         title: "Open Hyperlink",
+        reach: SemanticReach::Client,
         description: "Open the hyperlink named by a rendered Transcript cell",
         slash: None,
         keybinding: None,
@@ -1382,6 +1499,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TextSelectionCopy,
         title: "Copy Text Selection",
+        reach: SemanticReach::Client,
         description: "Copy the selected Transcript text",
         slash: None,
         keybinding: None,
@@ -1389,6 +1507,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TextSelectionClear,
         title: "Clear Text Selection",
+        reach: SemanticReach::Client,
         description: "Clear the standing Text Selection",
         slash: None,
         keybinding: None,
@@ -1396,6 +1515,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TextSelectionWord,
         title: "Select Word",
+        reach: SemanticReach::Client,
         description: "Select the word under a Transcript cell as a Text Selection",
         slash: None,
         keybinding: None,
@@ -1403,6 +1523,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::TextSelectionLine,
         title: "Select Line",
+        reach: SemanticReach::Client,
         description: "Select the whole Line under a Transcript cell as a Text Selection",
         slash: None,
         keybinding: None,
@@ -1410,6 +1531,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::PointerDrag,
         title: "Drag",
+        reach: SemanticReach::Client,
         description: "Move the held pointer without invoking a click",
         slash: None,
         keybinding: None,
@@ -1417,6 +1539,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::ComposerPlaceCursor,
         title: "Place Composer Cursor",
+        reach: SemanticReach::Client,
         description: "Focus the composer and place its insertion point at a text offset",
         slash: None,
         keybinding: None,
@@ -1424,6 +1547,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarLeave,
         title: "Leave Sidebar",
+        reach: SemanticReach::Client,
         // Backing out of a path entry, a set of selector entries, or a search
         // is an inner step of backing out of the Sidebar, so the account of the
         // command says it takes one step rather than all of them.
@@ -1435,6 +1559,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarMenuPrevious,
         title: "Previous Sidebar Menu Item",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar menu's selection to the item above, wrapping past the top",
         slash: None,
         keybinding: None,
@@ -1442,6 +1567,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarMenuNext,
         title: "Next Sidebar Menu Item",
+        reach: SemanticReach::Client,
         description: "Move the Sidebar menu's selection to the item below, wrapping past the end",
         slash: None,
         keybinding: None,
@@ -1449,6 +1575,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarMenuSelect,
         title: "Invoke Sidebar Menu Item",
+        reach: SemanticReach::Client,
         // Delete asks again rather than acting, so the account of the command
         // says that acting on an item is not always the end of it.
         description: "Act on the Sidebar menu's selected item, or ask it to confirm",
@@ -1458,6 +1585,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarMenuClose,
         title: "Close Sidebar Menu",
+        reach: SemanticReach::Client,
         description: "Dismiss the Sidebar's context menu, leaving its row alone",
         slash: None,
         keybinding: None,
@@ -1465,13 +1593,23 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::RemoteRetry,
         title: "Retry Remote",
+        reach: SemanticReach::Client,
         description: "Restart an unreachable Remote's catalog stream and refresh its Sessions",
         slash: None,
-        keybinding: None,
+        // Naming no Remote, the key means the one the Outlook is turned
+        // toward — the very Remote the banner above the composer offers to
+        // try again, through this same command.
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X R",
+        }),
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsOpen,
         title: "Settings",
+        reach: SemanticReach::Client,
         description: "View and edit every Setting",
         slash: Some(SlashCommand {
             name: "settings",
@@ -1487,6 +1625,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsPrevious,
         title: "Previous Setting",
+        reach: SemanticReach::Client,
         description: "Focus the previous Setting",
         slash: None,
         keybinding: None,
@@ -1494,6 +1633,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsNext,
         title: "Next Setting",
+        reach: SemanticReach::Client,
         description: "Focus the next Setting",
         slash: None,
         keybinding: None,
@@ -1501,6 +1641,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsTabPrevious,
         title: "Previous Settings Tab",
+        reach: SemanticReach::Client,
         description: "Show the settings tab before this one, wrapping past the first",
         slash: None,
         keybinding: None,
@@ -1508,6 +1649,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsTabNext,
         title: "Next Settings Tab",
+        reach: SemanticReach::Client,
         description: "Show the settings tab after this one, wrapping past the last",
         slash: None,
         keybinding: None,
@@ -1515,6 +1657,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsRowOpen,
         title: "Open Settings Row",
+        reach: SemanticReach::Client,
         description: "Open what the focused row stands for: a Provider's further Settings, or the surface its value is chosen at",
         slash: None,
         keybinding: None,
@@ -1522,6 +1665,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsValueCycle,
         title: "Cycle Setting Value",
+        reach: SemanticReach::Client,
         description: "Pin the focused Setting's next value, wrapping past the last",
         slash: None,
         keybinding: None,
@@ -1529,6 +1673,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsReset,
         title: "Reset Setting",
+        reach: SemanticReach::Client,
         description: "Unpin the focused Setting so its built-in default resumes",
         slash: None,
         keybinding: None,
@@ -1536,6 +1681,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsClose,
         title: "Close Settings",
+        reach: SemanticReach::Client,
         description: "Leave the settings panel",
         slash: None,
         keybinding: None,
@@ -1543,6 +1689,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SubagentBrowse,
         title: "Browse Subagents",
+        reach: SemanticReach::Client,
         description: "Open the Subagent Picker over the open Session's working Subagents",
         // The picker opens from the down arrow's one free meaning — Down with
         // no caret movement or history walk left to make — which only the
@@ -1554,6 +1701,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SubagentOpen,
         title: "Open Subagent",
+        reach: SemanticReach::Client,
         description: "Open a Subagent's Session from the row that names it",
         // The command names the child Session it opens, so it is invoked from
         // the Subagent's row — its Transcript row today, a Picker entry later
@@ -1565,6 +1713,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SubagentStop,
         title: "Stop Subagent",
+        reach: SemanticReach::Origin,
         description: "Stop a working Subagent from the row that names it, where its Provider allows",
         // Like opening, the command names the child Session it stops, so it
         // is invoked from the Subagent's Picker row rather than from a key or
@@ -1575,6 +1724,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SubagentLeave,
         title: "Leave Subagent",
+        reach: SemanticReach::Client,
         description: "Return from a Subagent's Session to its parent",
         // Bound to Escape only while a Subagent's Session is open, so the
         // binding lives in that view's own key table rather than here.
@@ -1584,6 +1734,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsNumericDeleteBackward,
         title: "Delete Numeric Digit",
+        reach: SemanticReach::Client,
         description: "Delete the last digit in the open numeric Setting editor",
         slash: None,
         keybinding: None,
@@ -1591,6 +1742,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsNumericApply,
         title: "Apply Numeric Setting",
+        reach: SemanticReach::Client,
         description: "Validate and apply the open numeric Setting editor",
         slash: None,
         keybinding: None,
@@ -1598,6 +1750,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::SettingsNumericCancel,
         title: "Cancel Numeric Setting",
+        reach: SemanticReach::Client,
         description: "Discard the open numeric Setting editor",
         slash: None,
         keybinding: None,

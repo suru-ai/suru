@@ -14,9 +14,8 @@ use std::path::Path;
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        AppearanceSettings, EffectiveSettings, Outlook, Session, SessionId, SessionListItem,
-        SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings,
-        SidebarVisibility, Workspace, WorkspaceId,
+        AppearanceSettings, EffectiveSettings, Outlook, SessionId, SessionListItem,
+        SidebarSettings, SidebarVisibility, WorkspaceId,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -39,31 +38,7 @@ fn shown_with_icons(show_icons: bool) -> EffectiveSettings {
 }
 
 fn listed_as(session_id: SessionId, title: &str, workspace: &Path) -> SessionListItem {
-    SessionListItem::Readable(Box::new(SessionSummary {
-        checkout_state: None,
-        session: Session {
-            checkout: None,
-            context_fill: None,
-            id: session_id,
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.to_owned(),
-            },
-            workspace: Workspace::directory(workspace.to_owned()),
-            agent_selection: None,
-            agent_selection_availability: suru::protocol::ModelAvailability::Available,
-            approval_posture: None,
-            status: SessionStatus::Idle,
-            working_since: None,
-            parent: None,
-        },
-        title: title.to_owned(),
-        icon: None,
-        settled_at: None,
-        standing_inputs: SessionStandingInputs::default(),
-        total_usage: None,
-        created_at: SessionTimestamp(1),
-        updated_at: SessionTimestamp(1),
-    }))
+    crate::support::listed_session(session_id, title, workspace, 1, 1)
 }
 
 /// A Sidebar showing one Session, with `show_icons` as given.

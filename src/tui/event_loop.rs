@@ -3,7 +3,7 @@
 //! carry out the transitions the Application returns.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future::{Future, pending},
     net::{IpAddr, SocketAddr, SocketAddrV6},
     ops::ControlFlow,
@@ -455,7 +455,11 @@ struct RunLoop {
     application: Application,
     tasks: SessionTasks,
     channels: TaskChannels,
-    reconnect_grace: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// One grace period per Origin presently recovering, in the order they
+    /// were armed — which is the order they come due, every grace being the
+    /// same length. A Remote's drives its banner; this machine's own Server's
+    /// drives the whole-frame modal.
+    reconnect_grace: Vec<(Outlook, Pin<Box<tokio::time::Sleep>>)>,
     /// The optimistic shell's one-shot quiet-period wakeup, paired with its
     /// absolute deadline so a superseding route can replace it exactly once.
     opening_loading_delay: Option<(Instant, Pin<Box<tokio::time::Sleep>>)>,
@@ -502,7 +506,7 @@ async fn run_loop(
             workspaces,
             origin_catalog,
         },
-        reconnect_grace: None,
+        reconnect_grace: Vec::new(),
         opening_loading_delay: None,
         spinner_tick: None,
         needs_redraw: true,
@@ -532,8 +536,8 @@ async fn run_loop(
                 ControlFlow::Continue(())
             }
             managed_event = run.client.next() => run.receive_managed_event(managed_event)?,
-            () = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
-                run.expire_reconnect_grace()?
+            outlook = wait_for_reconnect_grace(&mut run.reconnect_grace) => {
+                run.expire_reconnect_grace(outlook)?
             }
             () = wait_for_opening_loading_delay(&mut run.opening_loading_delay) => {
                 run.reveal_opening_loading()
@@ -1150,17 +1154,10 @@ impl RunLoop {
                 }
             });
         }
-        let was_recovering = self.application.is_recovering();
         let transition = self
             .application
             .handle_event(ApplicationEvent::Managed(event))?;
-        if self.application.is_recovering() {
-            if !was_recovering {
-                self.reconnect_grace = Some(Box::pin(tokio::time::sleep(RECONNECT_GRACE_PERIOD)));
-            }
-        } else {
-            self.reconnect_grace = None;
-        }
+        self.sync_reconnect_grace();
         match transition {
             ApplicationTransition::Continue => {}
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
@@ -1296,12 +1293,20 @@ impl RunLoop {
         ControlFlow::Continue(())
     }
 
-    fn expire_reconnect_grace(&mut self) -> Result<ControlFlow<Exit>> {
+    fn expire_reconnect_grace(&mut self, outlook: Outlook) -> Result<ControlFlow<Exit>> {
         self.needs_redraw = true;
+        self.reconnect_grace.retain(|(armed, _)| armed != &outlook);
         self.application
-            .handle_event(ApplicationEvent::ReconnectGraceElapsed)?;
-        self.reconnect_grace = None;
+            .handle_event(ApplicationEvent::ReconnectGraceElapsed(outlook))?;
         Ok(ControlFlow::Continue(()))
+    }
+
+    fn sync_reconnect_grace(&mut self) {
+        sync_reconnect_grace(
+            &mut self.reconnect_grace,
+            &self.application.origins_awaiting_grace(),
+            RECONNECT_GRACE_PERIOD,
+        );
     }
 
     fn receive_session_event(
@@ -1868,20 +1873,13 @@ impl RunLoop {
             return Ok(ControlFlow::Continue(()));
         }
         self.needs_redraw |= event.event.is_drawn_on_arrival();
-        let was_recovering = self.application.is_recovering();
         let transition = self
             .application
             .handle_event(ApplicationEvent::OriginCatalog {
                 outlook: event.outlook,
                 event: event.event,
             })?;
-        if self.application.is_recovering() {
-            if !was_recovering {
-                self.reconnect_grace = Some(Box::pin(tokio::time::sleep(RECONNECT_GRACE_PERIOD)));
-            }
-        } else {
-            self.reconnect_grace = None;
-        }
+        self.sync_reconnect_grace();
         Ok(self.dispatch_transition(transition))
     }
 }
@@ -2931,9 +2929,38 @@ async fn next_session_event(
     }
 }
 
-async fn wait_for_reconnect_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match grace {
-        Some(grace) => grace.as_mut().await,
+/// Arms a grace period for every Origin still owed one, and gives up the one
+/// held for any Origin no longer owed it — because it answered again, or
+/// because its grace has already been served. Each loss is held back from the
+/// frame for a grace of its own, once.
+///
+/// Held apart from the run loop so the whole arming-and-expiry path can be
+/// driven at millisecond scale by a test that owns nothing else.
+fn sync_reconnect_grace(
+    armed: &mut Vec<(Outlook, Pin<Box<tokio::time::Sleep>>)>,
+    awaiting: &BTreeSet<Outlook>,
+    grace: Duration,
+) {
+    armed.retain(|(outlook, _)| awaiting.contains(outlook));
+    for outlook in awaiting {
+        if armed.iter().any(|(armed, _)| armed == outlook) {
+            continue;
+        }
+        armed.push((outlook.clone(), Box::pin(tokio::time::sleep(grace))));
+    }
+}
+
+/// The next grace period to come due. Every grace is the same length, so the
+/// one armed first is always the one that fires first and waiting on the front
+/// of the queue waits on all of them.
+async fn wait_for_reconnect_grace(
+    grace: &mut [(Outlook, Pin<Box<tokio::time::Sleep>>)],
+) -> Outlook {
+    match grace.first_mut() {
+        Some((outlook, grace)) => {
+            grace.as_mut().await;
+            outlook.clone()
+        }
         None => pending().await,
     }
 }
@@ -4863,6 +4890,147 @@ mod tests {
         assert!(
             PopModifiedKeyReporting.is_ansi_code_supported(),
             "modified-key restoration did not use the VT input stream"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_grace_tests {
+    use std::{collections::BTreeSet, time::Duration};
+
+    use crate::{
+        managed_client::ManagedEvent,
+        protocol::Outlook,
+        tui::state::{Application, ApplicationEvent},
+    };
+
+    use super::{sync_reconnect_grace, wait_for_reconnect_grace};
+
+    /// One loss is served one grace. A recovery goes on retrying long after
+    /// its grace has been spent, and every attempt reaches the run loop as an
+    /// event: if each of those armed another wakeup, an idle Client would be
+    /// woken forever and a loss taken off the frame would be put back on by
+    /// the next one to come due.
+    #[tokio::test]
+    async fn a_grace_is_served_once_however_long_the_recovery_goes_on() {
+        let grace = Duration::from_millis(5);
+        let mut application = Application::default();
+        let mut armed = Vec::new();
+        let recovering = |attempt| {
+            ApplicationEvent::Managed(ManagedEvent::Recovering(
+                crate::managed_client::RecoveryStatus {
+                    attempt,
+                    retry_in: Duration::from_millis(1),
+                },
+            ))
+        };
+
+        application
+            .handle_event(recovering(1))
+            .expect("lose the local Server");
+        sync_reconnect_grace(&mut armed, &application.origins_awaiting_grace(), grace);
+        assert_eq!(armed.len(), 1, "a fresh loss is owed its grace");
+
+        assert_eq!(wait_for_reconnect_grace(&mut armed).await, Outlook::Local);
+        drop(armed.remove(0));
+        application
+            .handle_event(ApplicationEvent::ReconnectGraceElapsed(Outlook::Local))
+            .expect("serve the grace");
+
+        // Every further attempt of the same recovery asks for nothing.
+        for attempt in 2..5 {
+            application
+                .handle_event(recovering(attempt))
+                .expect("go on retrying");
+            sync_reconnect_grace(&mut armed, &application.origins_awaiting_grace(), grace);
+            assert!(
+                armed.is_empty(),
+                "attempt {attempt} re-armed a grace already served"
+            );
+        }
+
+        // Answering and losing it again is a new loss, owed a grace of its own.
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::RemoteRecovered))
+            .expect("answer again");
+        application
+            .handle_event(recovering(1))
+            .expect("lose the local Server afresh");
+        sync_reconnect_grace(&mut armed, &application.origins_awaiting_grace(), grace);
+        assert_eq!(armed.len(), 1, "a fresh loss is owed a grace of its own");
+    }
+
+    /// The graces armed follow what is recovering: one apiece for a loss newly
+    /// arrived, and none at all for an Origin that has answered again. Driven
+    /// end to end at millisecond scale so no test waits a production grace out.
+    #[tokio::test]
+    async fn a_grace_is_armed_per_loss_and_given_up_when_the_origin_answers() {
+        let grace = Duration::from_millis(5);
+        let studio = Outlook::Remote("studio".to_owned());
+        let laptop = Outlook::Remote("laptop".to_owned());
+        let mut armed = Vec::new();
+
+        sync_reconnect_grace(&mut armed, &BTreeSet::from([studio.clone()]), grace);
+        assert_eq!(armed.len(), 1);
+
+        // A second loss takes a grace of its own; the first keeps the one it
+        // was already serving rather than starting over.
+        sync_reconnect_grace(
+            &mut armed,
+            &BTreeSet::from([studio.clone(), laptop.clone()]),
+            grace,
+        );
+        assert_eq!(
+            armed.iter().map(|(outlook, _)| outlook).collect::<Vec<_>>(),
+            vec![&studio, &laptop]
+        );
+
+        // The first Origin answers again, so its grace is given up and the
+        // one still recovering is what comes due.
+        sync_reconnect_grace(&mut armed, &BTreeSet::from([laptop.clone()]), grace);
+        assert_eq!(armed.len(), 1);
+        assert_eq!(wait_for_reconnect_grace(&mut armed).await, laptop);
+
+        // Everything answers: nothing is armed, so an idle Client schedules no
+        // wakeup at all (ADR 0009).
+        sync_reconnect_grace(&mut armed, &BTreeSet::new(), grace);
+        assert!(armed.is_empty());
+    }
+
+    /// Each Origin's loss is held back from the frame for a grace of its own,
+    /// and they come due in the order they were armed — so waiting on the
+    /// front of the queue waits on all of them. The graces here are
+    /// millisecond-scale so the test drives the real timing path without
+    /// waiting a production grace out.
+    #[tokio::test]
+    async fn each_origins_grace_comes_due_in_the_order_it_was_armed() {
+        let studio = Outlook::Remote("studio".to_owned());
+        let laptop = Outlook::Remote("laptop".to_owned());
+        let mut armed = vec![
+            (
+                studio.clone(),
+                Box::pin(tokio::time::sleep(Duration::from_millis(5))),
+            ),
+            (
+                laptop.clone(),
+                Box::pin(tokio::time::sleep(Duration::from_millis(25))),
+            ),
+        ];
+
+        assert_eq!(wait_for_reconnect_grace(&mut armed).await, studio);
+        drop(armed.remove(0));
+        assert_eq!(wait_for_reconnect_grace(&mut armed).await, laptop);
+        drop(armed.remove(0));
+
+        // Nothing armed is nothing to wake for: an idle Client schedules no
+        // wakeup at all (ADR 0009).
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(15),
+                wait_for_reconnect_grace(&mut armed),
+            )
+            .await
+            .is_err()
         );
     }
 }

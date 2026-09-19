@@ -14,12 +14,13 @@ use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
         Activity, ActivityId, AgentSelection, Approval, ApprovalId, ApprovalOutcome,
-        ApprovalSubject, Decision, EffectiveSettings, Health, LifecycleState, Message, MessageId,
-        MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Question, Questionnaire,
-        QuestionnaireId, QuestionnaireOutcome, ServerIdentity, Session, SessionChange, SessionId,
-        SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, SettingsSnapshot,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace, WorkspacePaths,
+        ApprovalSubject, Decision, EffectiveSettings, ExecutionDirectory, Health, LifecycleState,
+        Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor,
+        ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Question,
+        Questionnaire, QuestionnaireId, QuestionnaireOutcome, ServerIdentity, Session,
+        SessionChange, SessionId, SessionListItem, SessionRevision, SessionSnapshot, SessionStatus,
+        SessionSummary, SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId,
+        TurnStatus, Workspace, WorkspacePaths,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -838,4 +839,96 @@ pub fn add_request(snapshot: &mut SessionSnapshot, turn_id: TurnId, text: &str) 
         .push(TranscriptItem::Activity { activity_id });
     snapshot.revision.0 += 1;
     id
+}
+
+/// One readable Session as a listing surface receives it. The shape every
+/// listing fixture in these tests needs, held in one place so a field added to
+/// a Session Summary is answered once.
+pub fn listed_session(
+    session_id: SessionId,
+    title: &str,
+    workspace: &std::path::Path,
+    created_at: u64,
+    updated_at: u64,
+) -> SessionListItem {
+    SessionListItem::Readable(Box::new(SessionSummary {
+        checkout_state: None,
+        session: Session {
+            checkout: None,
+            context_fill: None,
+            id: session_id,
+            execution_directory: ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
+            workspace: Workspace::directory(workspace.to_owned()),
+            agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
+            status: SessionStatus::Idle,
+            working_since: None,
+            parent: None,
+        },
+        title: title.to_owned(),
+        icon: None,
+        settled_at: None,
+        standing_inputs: Default::default(),
+        total_usage: None,
+        created_at: SessionTimestamp(created_at),
+        updated_at: SessionTimestamp(updated_at),
+    }))
+}
+
+/// An Application whose Outlook the reader has turned toward the Remote named
+/// `studio`, reached the way they reach it: through the Connect picker.
+pub fn application_looking_at_studio() -> Application {
+    let mut application = Application::default();
+    type_terminal_text(&mut application, "/connect");
+    key(&mut application, KeyCode::Enter);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![
+            suru::protocol::Remote {
+                name: "studio".to_owned(),
+                fingerprint: "studio-fingerprint".to_owned(),
+                addresses: vec!["10.0.0.8:7777".parse().expect("parse the Remote address")],
+                status: suru::protocol::RemoteStatus::Available,
+            },
+        ]))
+        .expect("list the paired Remotes");
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(suru::protocol::RemoteHealth {
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
+                status: suru::protocol::RemoteStatus::Available,
+            }),
+        })
+        .expect("probe the Remote");
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Enter);
+    application
+}
+
+/// The Remote `studio` has stopped answering, on its own catalog stream.
+pub fn studio_stops_answering(
+    application: &mut Application,
+    attempt: u32,
+    retry_in: std::time::Duration,
+) {
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: suru::protocol::Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
+                attempt,
+                retry_in,
+            }),
+        })
+        .expect("take the Remote's recovery");
+}
+
+/// The grace period for one Origin's loss runs out, which is what lets the
+/// loss be drawn at all.
+pub fn grace_elapses(application: &mut Application, outlook: suru::protocol::Outlook) {
+    application
+        .handle_event(ApplicationEvent::ReconnectGraceElapsed(outlook))
+        .expect("elapse the reconnect grace period");
 }
