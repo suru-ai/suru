@@ -13,14 +13,18 @@ use ratatui::{
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        Activity, ActivityId, AgentSelection, EffectiveSettings, Health, LifecycleState, Message,
-        MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, ServerIdentity, Session,
-        SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace,
-        WorkspacePaths,
+        Activity, ActivityId, AgentSelection, Approval, ApprovalId, ApprovalOutcome,
+        ApprovalSubject, Decision, EffectiveSettings, Health, LifecycleState, Message, MessageId,
+        MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Question, Questionnaire,
+        QuestionnaireId, QuestionnaireOutcome, ServerIdentity, Session, SessionChange, SessionId,
+        SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, SettingsSnapshot,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace, WorkspacePaths,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, TerminalFacts},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
+        TerminalFacts,
+    },
 };
 use uuid::Uuid;
 
@@ -754,4 +758,84 @@ pub fn click_mouse(
     } else {
         Ok(transition)
     }
+}
+
+/// Invokes a semantic command the way a keybinding, a slash command, or a
+/// future plugin does — through the command itself rather than a key table.
+pub fn invoke(app: &mut Application, command: SemanticCommandId) -> ApplicationTransition {
+    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+        command,
+    )))
+    .expect("invoke a semantic command")
+}
+
+/// Presses one unmodified key through the production input routing.
+pub fn key(app: &mut Application, code: KeyCode) -> ApplicationTransition {
+    app.handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        .expect("deliver a key press")
+}
+
+/// One Approval Activity, in whatever state of its life a test needs it.
+pub fn approval_activity(
+    turn_id: TurnId,
+    subject: ApprovalSubject,
+    reason: Option<&str>,
+    outcome: ApprovalOutcome,
+    decision: Option<Decision>,
+) -> Activity {
+    Activity::Approval {
+        id: ActivityId::new(),
+        turn_id,
+        approval: Approval {
+            id: ApprovalId::new(),
+            subject,
+            reason: reason.map(str::to_owned),
+        },
+        tool_activity_id: None,
+        detail_truncated: false,
+        outcome,
+        decision,
+        follow_up_error: None,
+    }
+}
+
+/// Records an Activity in both the Activity list and the Transcript, which is
+/// how a Session's own projection carries one.
+pub fn add_activity(snapshot: &mut SessionSnapshot, activity: Activity) {
+    let activity_id = activity.id();
+    snapshot.activities.push(activity);
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+}
+
+/// Records one pending Questionnaire asking a single freeform Question.
+pub fn add_request(snapshot: &mut SessionSnapshot, turn_id: TurnId, text: &str) -> QuestionnaireId {
+    let id = QuestionnaireId::new();
+    let activity_id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id: activity_id,
+        turn_id,
+        questionnaire: Questionnaire {
+            id,
+            questions: vec![Question {
+                id: "question".into(),
+                title: None,
+                text: text.into(),
+                choices: vec![],
+                multiple: false,
+                freeform: true,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            }],
+        },
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id });
+    snapshot.revision.0 += 1;
+    id
 }

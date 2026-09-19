@@ -336,6 +336,24 @@ impl QuestionnairePanels {
         true
     }
 
+    /// Opens the panel the reader did not ask for. A Questionnaire opens on
+    /// nothing chosen however it is reached — a recommendation is drawn, never
+    /// selected — so a presentation is an open, and an Answer already begun is
+    /// what it comes back to either way. The arming guard is the Client's,
+    /// applied where the presentation is decided.
+    pub(super) fn present(&mut self, session: SessionReference, questionnaire: &Questionnaire) {
+        self.open(session, questionnaire);
+    }
+
+    /// Whether this Client has sent an Answer it has not seen confirmed,
+    /// which Esc leaves alone exactly as it does a Decision in flight.
+    pub(super) fn awaits_confirmation(&self) -> bool {
+        self.visible
+            .as_ref()
+            .and_then(|key| self.drafts.get(key))
+            .is_some_and(|panel| panel.awaiting_confirmation)
+    }
+
     pub(super) fn hide(&mut self) {
         self.visible = None;
     }

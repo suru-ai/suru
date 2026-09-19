@@ -20,12 +20,12 @@ use crate::{
     managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
-        AgentSelectionOperationId, CreateSessionRequest, EffectiveSettings, FoldPosture,
-        InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId, PromptStatus,
-        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
-        SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        AgentSelectionOperationId, ApprovalId, CreateSessionRequest, EffectiveSettings,
+        FoldPosture, InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId,
+        PromptStatus, QuestionnaireId, ResolveWorkspaceRequest, ServerIdentity, SessionChange,
+        SessionErrorCode, SessionId, SessionListItem, SessionReference, SessionSnapshot,
+        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        TextSelectionCopy, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -109,6 +109,38 @@ impl std::fmt::Debug for PresentationClock {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PresentationClock(..)")
     }
+}
+
+/// How long a self-presented Intervention panel ignores every key, so a
+/// reader already mid-keystroke cannot answer something they have not read.
+const INTERVENTION_ARMING_DELAY: Duration = Duration::from_millis(250);
+
+/// One Intervention of the open Session: a pending Approval awaiting a
+/// Decision or a pending Questionnaire awaiting an Answer. The two are one
+/// thing to the reader — something the Session owes them — so presentation
+/// and dismissal name them together and in one Transcript order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum InterventionId {
+    Approval(ApprovalId),
+    Questionnaire(QuestionnaireId),
+}
+
+/// An Intervention ready to present, carrying what its panel needs to open
+/// on it, so the presentation step never looks the same thing up twice.
+#[derive(Clone, Debug)]
+enum PresentableIntervention {
+    Approval(ApprovalId),
+    Questionnaire(crate::protocol::Questionnaire),
+}
+
+/// Which surface above the Intervention panels owns the keys. One reading
+/// serves both the key routing, which asks it what to dispatch to, and
+/// self-presentation, which asks it whether anything stands in the way.
+#[derive(Clone, Copy, Debug)]
+enum SurfaceAboveInterventions {
+    ApprovalPosture,
+    Selection(SelectionSurface),
+    Sidebar,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -443,6 +475,15 @@ pub struct TuiState {
     /// and writes Fold overrides only when a threshold is crossed.
     active_commands_started_at: HashMap<ActivityId, Instant>,
     presentation_clock: PresentationClock,
+    /// How long a self-presented Intervention panel ignores keys.
+    intervention_arming_delay: Duration,
+    /// When a self-presented Intervention panel starts taking keys. `None`
+    /// once the guard has been spent or the reader asked for the panel.
+    intervention_armed_until: Option<Instant>,
+    /// The Interventions the reader put away with Esc, per Session. This is
+    /// the Client's own reading, kept only while it runs: a later arrival is
+    /// an id this never saw, so it presents itself.
+    dismissed_interventions: HashMap<SessionReference, HashSet<InterventionId>>,
     pub(super) submission_error: Option<String>,
     /// The Session the main view has open, and `None` on the Landing.
     ///
@@ -743,6 +784,9 @@ impl TuiState {
             session_animation_on_screen: Cell::new(false),
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
+            intervention_arming_delay: INTERVENTION_ARMING_DELAY,
+            intervention_armed_until: None,
+            dismissed_interventions: HashMap::new(),
             submission_error: None,
             route: None,
             opening_loading: OpeningLoadingState::Inactive,
@@ -3966,6 +4010,14 @@ impl Application {
         self
     }
 
+    /// Injects how long a self-presented Intervention panel ignores keys.
+    /// Production uses the fixed delay; tests shorten it or advance the
+    /// presentation clock instead of waiting.
+    pub fn with_intervention_arming_delay(mut self, delay: Duration) -> Self {
+        self.state.intervention_arming_delay = delay;
+        self
+    }
+
     /// The one-shot delay remaining before an optimistic Session shell should
     /// reveal `Loading`. A reached but unobserved threshold returns zero; `None`
     /// means the run loop has observed it or the opening was cancelled.
@@ -4010,7 +4062,44 @@ impl Application {
             self.resolve_theme();
         }
         self.state.remember_agent_selection_presentation();
+        self.present_intervention();
         Ok(transition)
+    }
+
+    /// Presents the open Session's oldest Intervention when nothing stands in
+    /// its way. This is read from state rather than driven by an arrival, so
+    /// opening a Session that already owes the reader something, coming back
+    /// from a picker, and reconnecting all reach the same panel; and it runs
+    /// before the frame, so the reader never sees a Session that owes them a
+    /// Decision without the panel that takes it.
+    fn present_intervention(&mut self) {
+        let Some(owner) = self.state.session_reference.clone() else {
+            return;
+        };
+        self.state.prune_dismissed_interventions();
+        if self.state.surface_above_interventions().is_some() {
+            return;
+        }
+        // An arrival waits rather than replacing work already in progress.
+        if self.state.approvals.is_open(Some(&owner))
+            || self.state.questionnaires.is_open(Some(&owner))
+        {
+            return;
+        }
+        let Some(intervention) = self.state.next_intervention() else {
+            return;
+        };
+        match intervention {
+            PresentableIntervention::Approval(id) => self.state.approvals.present(owner, id),
+            PresentableIntervention::Questionnaire(questionnaire) => {
+                self.state.questionnaires.present(owner, &questionnaire);
+            }
+        }
+        self.state.intervention_armed_until = self
+            .state
+            .presentation_clock
+            .now()
+            .checked_add(self.state.intervention_arming_delay);
     }
 
     fn handle_event_inner(&mut self, event: ApplicationEvent) -> Result<ApplicationTransition> {
@@ -7245,12 +7334,19 @@ impl Application {
                 if let (Some(session), Some(id)) = (self.state.session_reference.clone(), approval)
                 {
                     self.state.questionnaires.hide();
+                    self.state.recall_dismissed_interventions();
                     self.state.approvals.open(session, id);
                 }
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ApprovalHide => {
-                self.state.approvals.hide();
+                // A Decision already sent is left to settle: Esc neither
+                // hides the panel nor dismisses anything while it is in
+                // flight, so nothing can be delivered twice.
+                if !self.state.approvals.awaits_confirmation() {
+                    self.state.approvals.hide();
+                    self.state.dismiss_interventions();
+                }
                 Ok(ApplicationTransition::Continue)
             }
             command @ (SemanticCommandId::ApprovalChoicePrevious
@@ -7307,12 +7403,16 @@ impl Application {
                     (self.state.session_reference.clone(), questionnaire)
                 {
                     self.state.approvals.hide();
+                    self.state.recall_dismissed_interventions();
                     self.state.questionnaires.open(session, &questionnaire);
                 }
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::QuestionnaireHide => {
-                self.state.questionnaires.hide();
+                if !self.state.questionnaires.awaits_confirmation() {
+                    self.state.questionnaires.hide();
+                    self.state.dismiss_interventions();
+                }
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::QuestionnaireDecline => {
@@ -8189,43 +8289,52 @@ impl Application {
     }
 
     fn command_for_input_mode(&self, event: InputEvent) -> Option<CommandId> {
-        if self.state.approval_posture_picker.is_open() {
-            return command_for_approval_posture_picker_event(event);
-        }
-        match self.state.top_selection_overlay() {
-            Some(SelectionSurface::Icons) => return command_for_icon_picker_event(event),
-            Some(SelectionSurface::Connect) => {
-                return command_for_connect_overlay_event(
-                    event,
-                    self.state.connect_overlay.input_mode(),
-                );
+        // Every surface that outranks the Intervention panels is asked here,
+        // through the one reading self-presentation also consults, so a panel
+        // never takes a key from something standing over it.
+        match self.state.surface_above_interventions() {
+            Some(SurfaceAboveInterventions::ApprovalPosture) => {
+                return command_for_approval_posture_picker_event(event);
             }
-            Some(SelectionSurface::Serve) => return command_for_serve_overlay_event(event),
-            Some(SelectionSurface::Themes) => return command_for_theme_picker_event(event),
-            Some(SelectionSurface::Models) => return command_for_model_picker_event(event),
-            Some(SelectionSurface::ModelOptions) => return command_for_model_options_event(event),
-            Some(SelectionSurface::NumericEditor) => {
-                return command_for_numeric_editor_event(event);
+            Some(SurfaceAboveInterventions::Selection(surface)) => match surface {
+                SelectionSurface::Icons => return command_for_icon_picker_event(event),
+                SelectionSurface::Connect => {
+                    return command_for_connect_overlay_event(
+                        event,
+                        self.state.connect_overlay.input_mode(),
+                    );
+                }
+                SelectionSurface::Serve => return command_for_serve_overlay_event(event),
+                SelectionSurface::Themes => return command_for_theme_picker_event(event),
+                SelectionSurface::Models => return command_for_model_picker_event(event),
+                SelectionSurface::ModelOptions => return command_for_model_options_event(event),
+                SelectionSurface::NumericEditor => {
+                    return command_for_numeric_editor_event(event);
+                }
+                SelectionSurface::Settings => return command_for_settings_panel_event(event),
+                SelectionSurface::Worktrees => {
+                    return super::keymap::command_for_worktree_picker_event(event);
+                }
+                SelectionSurface::WorkspacePickerMenu => {
+                    return command_for_workspace_picker_menu_event(event);
+                }
+                SelectionSurface::Workspaces => {
+                    return command_for_workspace_picker_event(event);
+                }
+                SelectionSurface::Sessions => return command_for_session_picker_event(event),
+                SelectionSurface::SidebarMenu => return command_for_sidebar_menu_event(event),
+                SelectionSurface::Subagents => return command_for_subagent_picker_event(event),
+                _ => {}
+            },
+            // The Sidebar comes after every overlay and before the composer's
+            // own surfaces: it stands beside the main view rather than over
+            // it, so an overlay a reader opened is still the newer surface and
+            // owns the keys, while a completion list left standing over the
+            // composer does not.
+            Some(SurfaceAboveInterventions::Sidebar) => {
+                return command_for_sidebar_event(event);
             }
-            Some(SelectionSurface::Settings) => return command_for_settings_panel_event(event),
-            Some(SelectionSurface::Worktrees) => {
-                return super::keymap::command_for_worktree_picker_event(event);
-            }
-            Some(SelectionSurface::WorkspacePickerMenu) => {
-                return command_for_workspace_picker_menu_event(event);
-            }
-            Some(SelectionSurface::Workspaces) => return command_for_workspace_picker_event(event),
-            Some(SelectionSurface::Sessions) => return command_for_session_picker_event(event),
-            Some(SelectionSurface::SidebarMenu) => return command_for_sidebar_menu_event(event),
-            Some(SelectionSurface::Subagents) => return command_for_subagent_picker_event(event),
-            _ => {}
-        }
-        // The Sidebar comes after every overlay and before the composer's own
-        // surfaces: it stands beside the main view rather than over it, so an
-        // overlay a reader opened is still the newer surface and owns the keys,
-        // while a completion list left standing over the composer does not.
-        if self.state.sidebar_owns_input() {
-            return command_for_sidebar_event(event);
+            None => {}
         }
         if self
             .state
@@ -8236,7 +8345,7 @@ impl Application {
                 return command_for_leader_event(event);
             }
             if let Some(command) = super::approval::key(&event) {
-                return Some(command);
+                return self.state.armed_against(command);
             }
             return match command_for_terminal_event(event) {
                 Some(
@@ -8262,10 +8371,12 @@ impl Application {
                 return command_for_leader_event(event);
             }
             if let InputEvent::Paste(text) = &event {
-                return Some(CommandId::QuestionnaireInsert(text.clone()));
+                return self
+                    .state
+                    .armed_against(CommandId::QuestionnaireInsert(text.clone()));
             }
             if let Some(command) = super::questionnaire::key(&event) {
-                return Some(command);
+                return self.state.armed_against(command);
             }
             return match command_for_terminal_event(event) {
                 Some(
@@ -8385,6 +8496,36 @@ fn workspace_reading(workspace: &Path) -> PathBuf {
     crate::paths::canonical(workspace).unwrap_or_else(|_| workspace.to_owned())
 }
 
+/// Everything the Session owes its reader, in Transcript order across both
+/// kinds. Each kind is read through its own module's pending reading, so
+/// presentation, dismissal, and the notices above the composer never disagree
+/// about what is still owed.
+fn pending_interventions(snapshot: &SessionSnapshot) -> impl Iterator<Item = InterventionId> {
+    let approvals: Vec<_> = super::approval::pending(snapshot)
+        .filter_map(|activity| match activity {
+            Activity::Approval { approval, .. } => Some(approval.id),
+            _ => None,
+        })
+        .collect();
+    let questionnaires: Vec<_> = super::questionnaire::pending(snapshot)
+        .map(|questionnaire| questionnaire.id)
+        .collect();
+    snapshot
+        .activities
+        .iter()
+        .filter_map(move |activity| match activity {
+            Activity::Approval { approval, .. } if approvals.contains(&approval.id) => {
+                Some(InterventionId::Approval(approval.id))
+            }
+            Activity::Questionnaire { questionnaire, .. }
+                if questionnaires.contains(&questionnaire.id) =>
+            {
+                Some(InterventionId::Questionnaire(questionnaire.id))
+            }
+            _ => None,
+        })
+}
+
 /// Whether a terminal event is the reader acting rather than the terminal
 /// reporting: a key press, a click, or a paste is theirs; a resize, a focus
 /// change, and the mouse merely passing over the window are not.
@@ -8398,6 +8539,129 @@ fn is_reader_interaction(event: &InputEvent) -> bool {
 }
 
 impl TuiState {
+    /// Which surface above the Intervention panels owns the keys, if any.
+    /// The routing in [`Application::command_for_input_mode`] and the
+    /// self-presentation step read the ladder through this one answer, so
+    /// "something else owns the keys" is said once.
+    ///
+    /// A completion list left standing over the composer is not one of them:
+    /// it is the composer's own, and the panels outrank it.
+    fn surface_above_interventions(&self) -> Option<SurfaceAboveInterventions> {
+        if self.approval_posture_picker.is_open() {
+            return Some(SurfaceAboveInterventions::ApprovalPosture);
+        }
+        if let Some(surface) = self
+            .top_selection_overlay()
+            .filter(|surface| *surface != SelectionSurface::Completions)
+        {
+            return Some(SurfaceAboveInterventions::Selection(surface));
+        }
+        self.sidebar_owns_input()
+            .then_some(SurfaceAboveInterventions::Sidebar)
+    }
+
+    /// Whether a panel that presented itself is still inside the moment it
+    /// takes no key for.
+    fn intervention_is_arming(&self) -> bool {
+        self.intervention_armed_until
+            .is_some_and(|until| self.presentation_clock.now() < until)
+    }
+
+    /// Drops a key the panel itself would act on while it is still arming, so
+    /// a reader already mid-keystroke cannot answer something they have not
+    /// read. Only what the panel would consume is dropped: Esc still puts it
+    /// away, and everything the panel lets past — reading the Transcript, the
+    /// Leader, the pointer — goes on reaching what it always did.
+    fn armed_against(&self, command: CommandId) -> Option<CommandId> {
+        let dismissal = matches!(
+            command,
+            CommandId::InvokeSemantic(
+                SemanticCommandId::ApprovalHide | SemanticCommandId::QuestionnaireHide
+            )
+        );
+        (dismissal || !self.intervention_is_arming()).then_some(command)
+    }
+
+    /// The open Session's oldest Intervention the reader has not dismissed,
+    /// ready for its panel. Only the Session the reader has open answers
+    /// here, whether it is a Subagent's or not: a Subagent's Interventions
+    /// are its own Session's, so they present themselves once the reader is
+    /// in it, and only mark the listing from anywhere else.
+    fn next_intervention(&self) -> Option<PresentableIntervention> {
+        let owner = self.session_reference.as_ref()?;
+        let snapshot = self.session.as_ref()?.snapshot();
+        let dismissed = self.dismissed_interventions.get(owner);
+        let next = pending_interventions(snapshot).find(|intervention| {
+            if dismissed.is_some_and(|dismissed| dismissed.contains(intervention)) {
+                return false;
+            }
+            match intervention {
+                InterventionId::Approval(_) => true,
+                // A Questionnaire another Client has taken off the catalog is
+                // no longer one this Client can answer.
+                InterventionId::Questionnaire(id) => self.questionnaires.available(owner, *id),
+            }
+        })?;
+        Some(match next {
+            InterventionId::Approval(id) => PresentableIntervention::Approval(id),
+            InterventionId::Questionnaire(id) => PresentableIntervention::Questionnaire(
+                super::questionnaire::pending(snapshot)
+                    .find(|questionnaire| questionnaire.id == id)?
+                    .clone(),
+            ),
+        })
+    }
+
+    /// Records every Intervention the open Session has pending right now as
+    /// dismissed, which is what Esc means: not this one, but none of them —
+    /// until one arrives the reader has not seen.
+    fn dismiss_interventions(&mut self) {
+        let Some(owner) = self.session_reference.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        let pending: Vec<_> = pending_interventions(snapshot).collect();
+        self.dismissed_interventions
+            .entry(owner)
+            .or_default()
+            .extend(pending);
+        self.intervention_armed_until = None;
+    }
+
+    /// Forgets what the open Session no longer owes. A dismissal stands for
+    /// one Intervention, so it has nothing left to say once that Intervention
+    /// is answered, withdrawn, or gone with its Turn.
+    fn prune_dismissed_interventions(&mut self) {
+        if self.dismissed_interventions.is_empty() {
+            return;
+        }
+        let Some(owner) = self.session_reference.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
+            return;
+        };
+        let pending: HashSet<_> = pending_interventions(snapshot).collect();
+        if let Some(dismissed) = self.dismissed_interventions.get_mut(&owner) {
+            dismissed.retain(|intervention| pending.contains(intervention));
+            if dismissed.is_empty() {
+                self.dismissed_interventions.remove(&owner);
+            }
+        }
+    }
+
+    /// Forgets what the reader dismissed in the open Session. Asking for a
+    /// panel by key, slash command, or click is asking for its Session's
+    /// Interventions back.
+    fn recall_dismissed_interventions(&mut self) {
+        if let Some(owner) = self.session_reference.as_ref() {
+            self.dismissed_interventions.remove(owner);
+        }
+        self.intervention_armed_until = None;
+    }
+
     pub(super) fn pending_approvals(&self) -> impl Iterator<Item = &Activity> {
         self.session
             .as_ref()

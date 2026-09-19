@@ -1,6 +1,6 @@
 use crate::support::{
-    connected_application, enter_active_session, rendered_application_rows, type_terminal_text,
-    workspace_dir,
+    add_request, connected_application, enter_active_session, invoke, key,
+    rendered_application_rows, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -9,19 +9,8 @@ use suru::{
         Activity, ActivityId, Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire,
         QuestionnaireId, QuestionnaireOutcome, QuestionnaireSubmission, TranscriptItem,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
-
-fn invoke(app: &mut Application, command: SemanticCommandId) -> ApplicationTransition {
-    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-        command,
-    )))
-    .unwrap()
-}
-fn key(app: &mut Application, code: KeyCode) -> ApplicationTransition {
-    app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-        .unwrap()
-}
 
 #[test]
 fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_both_drafts() {
@@ -63,11 +52,14 @@ fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_
         snapshot.clone(),
     )))
     .unwrap();
+    // The Questionnaire presents itself on arrival; this test is about the
+    // reader who put it away and asks for it again.
+    invoke(&mut app, SemanticCommandId::QuestionnaireHide);
     type_terminal_text(&mut app, " stays");
     let screen = rendered_application_rows(&app).join("\n");
     assert!(
         screen.contains("My composer draft stays"),
-        "arrival keeps composer focus: {screen}"
+        "the composer comes back once the panel is put away: {screen}"
     );
     assert!(screen.contains("Questionnaire pending"));
     invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
@@ -312,6 +304,9 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
         snapshot.clone(),
     )))
     .unwrap();
+    // The Questionnaire presents itself on arrival; this test is about the
+    // reader who put it away and asks for it again.
+    invoke(&mut app, SemanticCommandId::QuestionnaireHide);
     type_terminal_text(&mut app, "Keep composer");
     invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
     let before = rendered_application_rows(&app).join("\n");
@@ -545,42 +540,8 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     );
 }
 
-fn add_request(
-    snapshot: &mut suru::protocol::SessionSnapshot,
-    turn_id: suru::protocol::TurnId,
-    text: &str,
-) -> QuestionnaireId {
-    let id = QuestionnaireId::new();
-    let activity_id = ActivityId::new();
-    snapshot.activities.push(Activity::Questionnaire {
-        id: activity_id,
-        turn_id,
-        questionnaire: Questionnaire {
-            id,
-            questions: vec![Question {
-                id: "question".into(),
-                title: None,
-                text: text.into(),
-                choices: vec![],
-                multiple: false,
-                freeform: true,
-                combine_freeform: false,
-                secret: false,
-                required: true,
-            }],
-        },
-        outcome: QuestionnaireOutcome::Pending,
-        answer: None,
-    });
-    snapshot
-        .transcript
-        .push(TranscriptItem::Activity { activity_id });
-    snapshot.revision.0 += 1;
-    id
-}
-
 #[test]
-fn concurrent_questionnaires_keep_individual_drafts_and_never_take_focus_on_arrival() {
+fn concurrent_questionnaires_keep_individual_drafts_across_navigation_and_sessions() {
     let workspace = workspace_dir();
     let mut app = connected_application(workspace.path());
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
@@ -619,6 +580,24 @@ fn concurrent_questionnaires_keep_individual_drafts_and_never_take_focus_on_arri
         ApplicationTransition::SubmitQuestionnaire { id, submission: QuestionnaireSubmission::Answer { answer }, .. }
         if id == first && answer.questions == vec![QuestionAnswer::Freeform { text: "First answer".into() }])
     );
+    // An Answer in flight is left alone: the panel stays until this Client
+    // sees the submission settled, so nothing can be delivered twice.
+    invoke(&mut app, SemanticCommandId::QuestionnaireHide);
+    assert!(
+        rendered_application_rows(&app)
+            .join("\n")
+            .contains("Submitting")
+    );
+    app.handle_event(ApplicationEvent::QuestionnaireSubmissionReconciled {
+        id: first,
+        session: suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            snapshot.session.id,
+        ),
+        snapshot: Some(snapshot.clone()),
+        error: None,
+    })
+    .unwrap();
     invoke(&mut app, SemanticCommandId::QuestionnaireHide);
     assert!(
         rendered_application_rows(&app)
@@ -659,6 +638,9 @@ fn pending_transcript_activity_opens_its_own_request() {
     add_request(&mut snapshot, turn_id, "Second request");
     app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .unwrap();
+    // The Questionnaire presents itself on arrival; this test is about the
+    // reader who put it away and asks for it again.
+    invoke(&mut app, SemanticCommandId::QuestionnaireHide);
     let rows = rendered_application_rows(&app);
     let row = rows
         .iter()
@@ -815,6 +797,9 @@ fn another_clients_acceptance_disables_private_drafts_then_discards_them_on_sett
             snapshot.clone(),
         )))
         .unwrap();
+        // The Questionnaire presents itself on arrival; this test is about
+        // the reader who put it away and asks for it again.
+        invoke(app, SemanticCommandId::QuestionnaireHide);
         type_terminal_text(app, "Keep composer");
         invoke(app, SemanticCommandId::QuestionnaireOpen);
         type_terminal_text(app, draft);

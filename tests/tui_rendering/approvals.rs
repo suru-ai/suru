@@ -1,54 +1,25 @@
 use crate::support::{
-    connected_application, enter_active_session, rendered_application_buffer,
-    rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
+    add_activity, approval_activity, connected_application, enter_active_session, invoke, key,
+    rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
+    workspace_dir,
 };
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use suru::{
     protocol::{
-        Activity, ActivityId, Approval, ApprovalId, ApprovalOutcome, ApprovalSubject,
-        CommandAction, Decision, TranscriptItem,
+        Activity, ActivityId, ApprovalId, ApprovalOutcome, ApprovalSubject, CommandAction,
+        Decision, TranscriptItem,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
-fn approval_activity(
-    turn_id: suru::protocol::TurnId,
-    subject: ApprovalSubject,
-    reason: Option<&str>,
-    outcome: ApprovalOutcome,
-    decision: Option<Decision>,
-) -> Activity {
-    Activity::Approval {
-        id: ActivityId::new(),
-        turn_id,
-        approval: Approval {
-            id: ApprovalId::new(),
-            subject,
-            reason: reason.map(str::to_owned),
-        },
-        tool_activity_id: None,
-        detail_truncated: false,
-        outcome,
-        decision,
-        follow_up_error: None,
-    }
-}
-
-fn add_approval(snapshot: &mut suru::protocol::SessionSnapshot, activity: Activity) {
-    let activity_id = activity.id();
-    snapshot.activities.push(activity);
-    snapshot
-        .transcript
-        .push(TranscriptItem::Activity { activity_id });
-}
-
 fn pending_application() -> (Application, ApprovalId, suru::protocol::SessionSnapshot) {
     let workspace = workspace_dir();
-    let mut app = connected_application(workspace.path());
+    let mut app =
+        connected_application(workspace.path()).with_intervention_arming_delay(Duration::ZERO);
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
     type_terminal_text(&mut app, "kept draft");
     let activity = approval_activity(
@@ -66,7 +37,7 @@ fn pending_application() -> (Application, ApprovalId, suru::protocol::SessionSna
     let approval_id = approval.id;
     snapshot.pending_approvals = vec![approval_id];
     snapshot.pending_approvals_revision = snapshot.revision;
-    add_approval(&mut snapshot, activity);
+    add_activity(&mut snapshot, activity);
     app.handle_event(ApplicationEvent::Session(
         suru::managed_client::SessionEvent::snapshot(snapshot.clone()),
     ))
@@ -93,6 +64,9 @@ fn local_and_descendant_intervention_notices_keep_both_actions_visible() {
         suru::managed_client::SessionEvent::snapshot(snapshot),
     ))
     .unwrap();
+    // The Approval presents itself; the notices are what putting it away
+    // leaves behind.
+    key(&mut app, KeyCode::Esc);
 
     let rows = rendered_application_rows_at(&app, 110, 24);
     let local = rows
@@ -109,18 +83,6 @@ fn local_and_descendant_intervention_notices_keep_both_actions_visible() {
         local, descendants,
         "intervention notices occupy distinct rows"
     );
-}
-
-fn invoke(app: &mut Application, command: SemanticCommandId) -> ApplicationTransition {
-    app.handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-        command,
-    )))
-    .unwrap()
-}
-
-fn key(app: &mut Application, code: KeyCode) -> ApplicationTransition {
-    app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-        .unwrap()
 }
 
 #[test]
@@ -165,8 +127,8 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
         unreachable!()
     };
     *tool_activity_id = Some(command_id);
-    add_approval(&mut snapshot, command);
-    add_approval(
+    add_activity(&mut snapshot, command);
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,
@@ -182,7 +144,7 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
             None,
         ),
     );
-    add_approval(
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,
@@ -194,7 +156,7 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
             None,
         ),
     );
-    add_approval(
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,
@@ -206,7 +168,7 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
             None,
         ),
     );
-    add_approval(
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,
@@ -218,7 +180,7 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
             None,
         ),
     );
-    add_approval(
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,
@@ -269,6 +231,12 @@ fn decision_number_and_focus_keys_only_submit_from_an_explicitly_open_approval()
     ];
     for (code, expected) in decisions {
         let (mut app, id, _) = pending_application();
+        let presented = rendered_application_rows_at(&app, 100, 30).join("\n");
+        assert!(
+            presented.contains("Approval · Choose Decision"),
+            "the Approval presents itself: {presented}"
+        );
+        key(&mut app, KeyCode::Esc);
         let arrived = rendered_application_rows_at(&app, 100, 30).join("\n");
         assert!(arrived.contains("kept draft"), "{arrived}");
         type_terminal_text(&mut app, "draft ");
@@ -496,7 +464,7 @@ fn approval_history_distinguishes_every_lifecycle_outcome_and_records_full_decis
         (ApprovalOutcome::Unavailable, None),
     ];
     for (index, (outcome, decision)) in cases.into_iter().enumerate() {
-        add_approval(
+        add_activity(
             &mut snapshot,
             approval_activity(
                 turn_id,
@@ -536,7 +504,8 @@ fn approval_history_distinguishes_every_lifecycle_outcome_and_records_full_decis
 #[test]
 fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_marker() {
     let workspace = workspace_dir();
-    let mut app = connected_application(workspace.path());
+    let mut app =
+        connected_application(workspace.path()).with_intervention_arming_delay(Duration::ZERO);
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
     let long_tail = "final available input";
     let foldable = approval_activity(
@@ -560,7 +529,7 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
     let foldable_id = foldable_approval.id;
     snapshot.pending_approvals = vec![foldable_id];
     snapshot.pending_approvals_revision = snapshot.revision;
-    add_approval(&mut snapshot, foldable);
+    add_activity(&mut snapshot, foldable);
     let mut truncated = approval_activity(
         turn_id,
         ApprovalSubject::OtherTool {
@@ -578,11 +547,15 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
         unreachable!()
     };
     *detail_truncated = true;
-    add_approval(&mut snapshot, truncated);
+    add_activity(&mut snapshot, truncated);
     app.handle_event(ApplicationEvent::Session(
         suru::managed_client::SessionEvent::snapshot(snapshot),
     ))
     .unwrap();
+
+    // The Approval presents itself over the composer; the Transcript's own
+    // Fold is what putting it away leaves on screen.
+    key(&mut app, KeyCode::Esc);
 
     let folded = rendered_application_rows_at(&app, 100, 60).join("\n");
     assert!(
@@ -631,7 +604,7 @@ fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
     let hidden_tail = "HIDDEN-COMMAND-TAIL";
     let command = format!("echo {}{hidden_tail}\nsecond line", "x".repeat(2_000));
-    add_approval(
+    add_activity(
         &mut snapshot,
         approval_activity(
             turn_id,

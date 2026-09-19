@@ -26,19 +26,44 @@ const DECISIONS: [(Decision, &str); 4] = [
 #[derive(Clone, Debug, Default)]
 pub(super) struct ApprovalPanel {
     visible: Option<(SessionReference, ApprovalId)>,
-    selected: usize,
+    /// Which Decision the reader is on, if any. A panel the reader asked for
+    /// starts on the first; one that presented itself starts on none, so the
+    /// key that would confirm a choice has no choice to confirm.
+    selected: Option<usize>,
     submitting: bool,
     awaiting_confirmation: bool,
 }
 
 impl ApprovalPanel {
     pub(super) fn open(&mut self, session: SessionReference, id: ApprovalId) {
+        self.show(session, id, Some(0));
+    }
+
+    /// Opens the panel the reader did not ask for, with nothing chosen.
+    pub(super) fn present(&mut self, session: SessionReference, id: ApprovalId) {
+        self.show(session, id, None);
+    }
+
+    fn show(&mut self, session: SessionReference, id: ApprovalId, selected: Option<usize>) {
         if self.visible.as_ref() != Some(&(session.clone(), id)) {
-            self.selected = 0;
+            self.selected = selected;
             self.submitting = false;
             self.awaiting_confirmation = false;
+        } else if selected.is_some() && self.selected.is_none() {
+            // The reader asked for the Approval the panel had presented on
+            // its own, which is asking for the choice it opened without.
+            self.selected = selected;
         }
         self.visible = Some((session, id));
+    }
+
+    /// Whether this Client has sent a Decision it has not seen confirmed.
+    /// Such a wait is left alone: Esc neither hides the panel nor dismisses
+    /// anything while it stands, because the Decision is already on its way
+    /// and a second one would be a second delivery. The panel reconciles
+    /// closed when the Server settles it.
+    pub(super) fn awaits_confirmation(&self) -> bool {
+        self.awaiting_confirmation
     }
 
     pub(super) fn hide(&mut self) {
@@ -108,13 +133,20 @@ impl ApprovalPanel {
             return None;
         }
         match command {
-            ApprovalChoicePrevious => self.selected = self.selected.saturating_sub(1),
-            ApprovalChoiceNext => self.selected = (self.selected + 1).min(DECISIONS.len() - 1),
+            ApprovalChoicePrevious => {
+                self.selected = Some(self.selected.map_or(0, |index| index.saturating_sub(1)));
+            }
+            ApprovalChoiceNext => {
+                self.selected = Some(
+                    self.selected
+                        .map_or(0, |index| (index + 1).min(DECISIONS.len() - 1)),
+                );
+            }
             ApprovalAccept => return self.begin(Decision::Accept),
             ApprovalAcceptForSession => return self.begin(Decision::AcceptForSession),
             ApprovalDecline => return self.begin(Decision::Decline),
             ApprovalDeclineAndInterrupt => return self.begin(Decision::DeclineAndInterrupt),
-            ApprovalChoose => return self.begin(DECISIONS[self.selected].0),
+            ApprovalChoose => return self.begin(DECISIONS[self.selected?].0),
             _ => {}
         }
         None
@@ -159,10 +191,14 @@ impl ApprovalPanel {
             controls.push(Line::styled(
                 format!(
                     "{} {}. {label}",
-                    if index == self.selected { ">" } else { " " },
+                    if Some(index) == self.selected {
+                        ">"
+                    } else {
+                        " "
+                    },
                     index + 1
                 ),
-                if index == self.selected {
+                if Some(index) == self.selected {
                     theme.selection.focused
                 } else {
                     theme.text.primary

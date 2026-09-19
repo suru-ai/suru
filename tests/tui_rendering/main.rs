@@ -16,6 +16,7 @@ mod composer;
 mod connecting;
 mod content_width;
 mod icon_picker;
+mod interventions;
 mod landing_notice;
 mod model_options;
 mod model_picker;
