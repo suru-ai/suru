@@ -2491,6 +2491,7 @@ fn session_opened_under(
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
     let mut application = connected_application(workspace);
     deliver_settings(&mut application, settings, pinned);
+    crate::support::hide_aside(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("open a Session view under the pinned Settings");
@@ -2552,6 +2553,7 @@ fn client_showing_reasoning(workspace: &std::path::Path) -> Application {
         settings,
         &["transcript.reasoningVisibility"],
     );
+    crate::support::hide_aside(&mut application);
     application
 }
 

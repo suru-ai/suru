@@ -26,6 +26,7 @@ fn session_with_width(
             content_width_snapshot(content_width, Vec::new()),
         )))
         .expect("receive Session content width");
+    crate::support::hide_aside(&mut application);
     let (_, snapshot) = enter_session(&mut application, workspace);
     (application, snapshot)
 }

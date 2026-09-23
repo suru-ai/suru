@@ -128,6 +128,14 @@ pub enum SemanticCommandId {
     SidebarMenuNext,
     SidebarMenuSelect,
     SidebarMenuClose,
+    AsideToggle,
+    AsideWiden,
+    AsideNarrow,
+    AsideWidthSet {
+        columns: u64,
+    },
+    AsideWidthReset,
+    AsideLeave,
     RemoteRetry,
     SettingsOpen,
     SettingsPrevious,
@@ -448,6 +456,12 @@ impl SemanticCommandId {
             Self::SidebarMenuNext => "sidebar.menu.next",
             Self::SidebarMenuSelect => "sidebar.menu.select",
             Self::SidebarMenuClose => "sidebar.menu.close",
+            Self::AsideToggle => "aside.toggle",
+            Self::AsideWiden => "aside.width.widen",
+            Self::AsideNarrow => "aside.width.narrow",
+            Self::AsideWidthSet { .. } => "aside.width.set",
+            Self::AsideWidthReset => "aside.width.reset",
+            Self::AsideLeave => "aside.leave",
             Self::RemoteRetry => "remote.retry",
             Self::SettingsOpen => "settings.open",
             Self::SettingsPrevious => "settings.previous",
@@ -1557,6 +1571,63 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::AsideToggle,
+        title: "Toggle Aside",
+        reach: SemanticReach::Client,
+        description: "Show the Aside and give it the keys, give a shown Aside the keys, or hide one holding them",
+        slash: Some(SlashCommand {
+            name: "aside",
+            aliases: &[],
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X A",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::AsideWiden,
+        title: "Widen Aside",
+        reach: SemanticReach::Client,
+        description: "Move the Aside's chosen edge one column to the left",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::AsideNarrow,
+        title: "Narrow Aside",
+        reach: SemanticReach::Client,
+        description: "Move the Aside's chosen edge one column to the right",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The column count is invocation data, as it is for the Sidebar's.
+        id: SemanticCommandId::AsideWidthSet { columns: 0 },
+        title: "Set Aside Width",
+        reach: SemanticReach::Client,
+        description: "Set the Aside's chosen width to an explicit column count",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::AsideWidthReset,
+        title: "Reset Aside Width",
+        reach: SemanticReach::Client,
+        description: "Restore the Aside width it began at",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::AsideLeave,
+        title: "Leave Aside",
+        reach: SemanticReach::Client,
+        description: "Hand the keys back from the Aside to the composer, leaving it shown",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarMenuPrevious,
         title: "Previous Sidebar Menu Item",
         reach: SemanticReach::Client,
@@ -1768,6 +1839,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     (
                         SemanticCommandId::SidebarWidthSet { .. },
                         SemanticCommandId::SidebarWidthSet { .. }
+                    ) | (
+                        SemanticCommandId::AsideWidthSet { .. },
+                        SemanticCommandId::AsideWidthSet { .. }
                     )
                 )
         })

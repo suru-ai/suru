@@ -96,6 +96,8 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
                 (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                     Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
                 }
+                // The Leader reaches the Aside, the way around this tree.
+                (KeyCode::Char('x'), KeyModifiers::CONTROL) => Some(CommandId::BeginLeader),
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(CommandId::ClearOrExit),
                 _ => None,
             }
@@ -461,11 +463,41 @@ pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> 
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
             Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
         }
+        // The Leader stays reachable, so Ctrl+X A can hand the keys to the
+        // Aside from here.
+        (KeyCode::Char('x'), KeyModifiers::CONTROL) => Some(CommandId::BeginLeader),
         _ => command_for_search_key(
             key,
             &CommandId::DeleteSidebarTextBackward,
             CommandId::InsertSidebarText,
         ),
+    }
+}
+
+/// The Aside's keys while it holds them. Walking and opening its entries by
+/// key arrive with its row focus; for now Esc hands the keys back, the Leader
+/// stays reachable so the same chord that brought the reader in takes them
+/// out, and Ctrl+B passes the keys to the Sidebar. The pointer answers as it
+/// does everywhere else.
+pub(super) fn command_for_aside_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::AsideLeave))
+        }
+        (KeyCode::Char('x'), KeyModifiers::CONTROL) => Some(CommandId::BeginLeader),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::SidebarToggle))
+        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(CommandId::ClearOrExit),
+        _ => None,
     }
 }
 

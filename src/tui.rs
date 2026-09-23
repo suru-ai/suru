@@ -2,6 +2,7 @@
 
 mod approval;
 mod approval_posture_picker;
+mod aside;
 mod attachment;
 mod clipboard;
 mod commands;

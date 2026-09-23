@@ -145,6 +145,9 @@ pub(super) fn render_with_slots(
     // The Sidebar's own frame record, given up for the same reason: whether it
     // has the keys depends on whether the frame had the columns to draw it.
     state.sidebar.forget_frame();
+    // The Aside's too, on the same terms, along with the rows a press
+    // resolves against.
+    state.aside.forget_frame();
     // A frame without an editable composer must leave no pointer target.
     state.composers.forget_frame();
     // The Subagent Picker's rows are pointable, so its record of where they
@@ -169,12 +172,26 @@ pub(super) fn render_with_slots(
         render_terminal_too_small(frame, theme);
         return;
     }
-    // The frame is laid out as Sidebar | main view | right-hand column, the
-    // main view's floor outranking both columns and the right-hand column
-    // giving way first. Nothing occupies the right-hand column yet.
-    let columns = side_column::lay_out(frame.area(), Some(state.sidebar.column()), None);
+    // The frame is laid out as Sidebar | main view | Aside, the main view's
+    // floor outranking both columns and the Aside giving way first. The Aside
+    // answers for an open Session, so on the Landing it takes nothing.
+    let columns = side_column::lay_out(
+        frame.area(),
+        Some(state.sidebar.column()),
+        state.aside_is_present().then(|| state.aside.column()),
+    );
     if let Some(area) = columns.left {
         render_sidebar(frame, state, area, theme, truecolor);
+    }
+    if let (Some(area), Some(open)) = (columns.right, state.route.as_ref()) {
+        state.aside.render(
+            frame,
+            area,
+            open,
+            state.aside_owns_input(),
+            theme,
+            state.spinner_frame,
+        );
     }
     let main = columns.main;
     let main = render_application_notice(frame, state, main, slots, theme);
@@ -2527,7 +2544,11 @@ fn render_subagent_picker(
 /// The block a side column is drawn in: the elevated surface, with its rule
 /// down the side facing the main view. Holding the edge is pointer feedback
 /// of its own; at rest the rule says whether the column owns the keys.
-fn side_column_block(column: &SideColumn, owns_input: bool, theme: &Theme) -> Block<'static> {
+pub(super) fn side_column_block(
+    column: &SideColumn,
+    owns_input: bool,
+    theme: &Theme,
+) -> Block<'static> {
     Block::default()
         .style(theme.surface.elevated)
         .borders(column.side().rule())
@@ -5071,7 +5092,7 @@ fn horizontal_padding(width: u16) -> u16 {
     if width < NARROW_TERMINAL_WIDTH { 1 } else { 2 }
 }
 
-fn horizontally_inset(area: Rect, padding: u16) -> Rect {
+pub(super) fn horizontally_inset(area: Rect, padding: u16) -> Rect {
     let padding = padding.min(area.width / 2);
     Rect::new(
         area.x.saturating_add(padding),
@@ -5268,11 +5289,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::{
+        commands::SemanticCommandId,
         slots::{
             Placement, PromptContextSlotContext, PromptFooterSlotContext, RenderSlots, SlotText,
             TestContribution,
         },
-        state::{Application, ApplicationEvent},
+        state::{Application, ApplicationEvent, CommandId},
     };
     use super::{session_footer_metrics_text, working_indicator_elapsed};
     use crate::{
@@ -5630,6 +5652,14 @@ mod tests {
                 },
             )))
             .expect("receive Session content width");
+        // The Aside the Settings showed stays out of the measured width.
+        for _ in 0..2 {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::AsideToggle,
+                )))
+                .expect("put the Aside away");
+        }
         application
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {

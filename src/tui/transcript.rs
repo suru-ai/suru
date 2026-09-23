@@ -4089,7 +4089,7 @@ fn indented_reasoning_line(mut line: StyledLine, indent: &str, theme: &Theme) ->
 /// reported as hundreds of seconds. Every duration the Transcript states passes
 /// through here — a Reasoning header and a Turn Fold marker alike — so the same
 /// span never reads two ways.
-fn humanized_duration(duration_ms: u64) -> String {
+pub(super) fn humanized_duration(duration_ms: u64) -> String {
     if duration_ms < 1_000 {
         return format!("{duration_ms}ms");
     }

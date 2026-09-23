@@ -550,7 +550,7 @@ fn autocomplete_tracks_the_active_composer_when_a_session_attaches() {
     let mut application = Application::new(workspace.path(), Default::default());
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
-            "/".to_owned(),
+            "/ne".to_owned(),
         )))
         .expect("open autocomplete on landing");
     assert!(

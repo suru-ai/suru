@@ -16,6 +16,7 @@ use crate::{
     managed_client::{
         ManagedClient, ManagedEvent, RecoveryBackoff, SessionCatalogSubscription,
         SessionCommandClient, SessionEvent, SessionStreamError, SessionSubscription,
+        SubagentTreeEvent,
     },
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
@@ -115,6 +116,9 @@ struct SessionTasks {
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
     listing_skills: Option<((Outlook, SkillCatalogRequest), tokio::task::JoinHandle<()>)>,
     catalog_origins: HashMap<Outlook, tokio::task::JoinHandle<()>>,
+    /// The per-tree subscription the Aside follows, named by the Session it
+    /// was asked through.
+    subagent_tree: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
     resolving_workspaces: HashMap<WorkspaceResolutionSurface, (u64, tokio::task::JoinHandle<()>)>,
 }
 
@@ -149,6 +153,45 @@ impl SessionTasks {
         if let Some((_, task)) = self.subscribing.take() {
             task.abort();
         }
+    }
+
+    /// Keeps exactly the per-tree subscription the Aside wants: the one
+    /// asked through `wanted`, or none. A subscription asked through the same
+    /// Session is kept, whichever Session of its tree the reader moves to.
+    fn follow_subagent_tree(
+        &mut self,
+        client: &ManagedClient,
+        wanted: Option<SessionReference>,
+        events: &UnboundedSender<SubagentTreeDelivery>,
+    ) {
+        if self.subagent_tree.as_ref().map(|(through, _)| through) == wanted.as_ref() {
+            return;
+        }
+        if let Some((_, task)) = self.subagent_tree.take() {
+            task.abort();
+        }
+        let Some(through) = wanted else {
+            return;
+        };
+        let mut subscription = client
+            .session_commands_for(through.origin.clone())
+            .subscribe_subagent_tree(through.session_id);
+        let events = events.clone();
+        let forwarded = through.clone();
+        let task = tokio::spawn(async move {
+            while let Some(event) = subscription.next().await {
+                if events
+                    .send(SubagentTreeDelivery {
+                        through: forwarded.clone(),
+                        event,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        self.subagent_tree = Some((through, task));
     }
 
     fn reset_skill_listing(&mut self) {
@@ -445,6 +488,7 @@ struct TaskChannels {
     pairing: UnboundedSender<PairingResult>,
     workspaces: UnboundedSender<WorkspaceResolutionResult>,
     origin_catalog: UnboundedSender<OriginCatalogEvent>,
+    subagent_trees: UnboundedSender<SubagentTreeDelivery>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -487,6 +531,7 @@ async fn run_loop(
     let (pairing, mut pairing_rx) = tokio::sync::mpsc::unbounded_channel();
     let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
     let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (subagent_trees, mut subagent_tree_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -505,6 +550,7 @@ async fn run_loop(
             pairing,
             workspaces,
             origin_catalog,
+            subagent_trees,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -515,6 +561,7 @@ async fn run_loop(
     let mut delivery = ClipboardDelivery::default();
     loop {
         run.sync_skill_catalog();
+        run.sync_subagent_tree();
         if run.needs_redraw && run.application.first_frame_ready() {
             draw_frame(
                 terminal,
@@ -554,6 +601,7 @@ async fn run_loop(
             pairing = pairing_rx.recv() => run.receive_pairing_result(pairing)?,
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
+            tree = subagent_tree_rx.recv() => run.receive_subagent_tree(tree)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -669,6 +717,27 @@ impl RunLoop {
             request,
             &self.channels.skills,
         );
+    }
+
+    fn sync_subagent_tree(&mut self) {
+        let wanted = self.application.subagent_tree_request();
+        self.tasks
+            .follow_subagent_tree(&self.client, wanted, &self.channels.subagent_trees);
+    }
+
+    fn receive_subagent_tree(
+        &mut self,
+        delivery: Option<SubagentTreeDelivery>,
+    ) -> Result<ControlFlow<Exit>> {
+        let delivery = delivery.ok_or_else(|| anyhow!("Subagent tree task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self
+            .application
+            .handle_event(ApplicationEvent::SubagentTree {
+                through: delivery.through,
+                event: delivery.event,
+            })?;
+        Ok(self.dispatch_transition(transition))
     }
 
     fn handle_input_event(
@@ -1882,6 +1951,14 @@ impl RunLoop {
         self.sync_reconnect_grace();
         Ok(self.dispatch_transition(transition))
     }
+}
+
+/// One event from the per-tree subscription, named by the Session it was
+/// asked through so a late event from one the Aside has moved on from can be
+/// told apart.
+struct SubagentTreeDelivery {
+    through: SessionReference,
+    event: SubagentTreeEvent,
 }
 
 struct OriginCatalogEvent {

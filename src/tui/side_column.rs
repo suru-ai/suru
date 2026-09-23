@@ -38,7 +38,6 @@ pub(super) enum Side {
     /// Left of the main view, with its rule down its right.
     Left,
     /// Right of the main view, with its rule down its left.
-    #[allow(dead_code)] // The Aside is the column that will stand here.
     Right,
 }
 
@@ -257,6 +256,12 @@ impl SideColumn {
             return;
         };
         self.chosen_width = u64::from(drawn.saturating_sub(1).max(MINIMUM_COLUMN_WIDTH));
+    }
+
+    /// Where the last frame drew the column, rule included, or `None` for a
+    /// frame that did not draw it.
+    pub(super) fn drawn_area(&self) -> Option<Rect> {
+        self.drawn.get()
     }
 
     fn drawn_width(&self) -> Option<u16> {

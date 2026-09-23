@@ -761,6 +761,17 @@ pub fn click_mouse(
     }
 }
 
+/// Puts away the Aside the first Settings snapshot showed, for a fixture that
+/// measures the main view at a stated width and wants no column standing in
+/// it. The Aside's show/hide act first takes the keys from a shown Aside and
+/// then hides it, so this is two presses; call it once, after the first
+/// Settings snapshot. It stands in for delivering the Aside's
+/// initial-visibility Setting as hidden, once that Setting exists.
+pub fn hide_aside(application: &mut Application) {
+    invoke(application, SemanticCommandId::AsideToggle);
+    invoke(application, SemanticCommandId::AsideToggle);
+}
+
 /// Invokes a semantic command the way a keybinding, a slash command, or a
 /// future plugin does — through the command itself rather than a key table.
 pub fn invoke(app: &mut Application, command: SemanticCommandId) -> ApplicationTransition {

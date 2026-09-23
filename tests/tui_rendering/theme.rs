@@ -1136,6 +1136,7 @@ fn a_missing_theme_falls_back_to_system_and_notices_the_preserved_pin_in_an_open
         ..EffectiveSettings::default()
     };
     deliver_settings(&mut application, settings.clone());
+    crate::support::hide_aside(&mut application);
     deliver_settings(&mut application, settings.clone());
     assert!(
         !application.note_interaction(&InputEvent::Key(KeyEvent::new(

@@ -17,7 +17,9 @@ use crossterm::event::{
 use ratatui::{Frame, layout::Position, style::Style};
 
 use crate::{
-    managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection},
+    managed_client::{
+        ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection, SubagentTreeEvent,
+    },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, ApprovalId, CreateSessionRequest, EffectiveSettings,
@@ -35,16 +37,17 @@ use crate::{
 
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
+    aside::{Aside, AsidePress},
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::ConnectOverlay,
     icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
-        command_for_approval_posture_picker_event, command_for_completion_event,
-        command_for_connect_overlay_event, command_for_icon_picker_event,
-        command_for_interrupt_confirmation_event, command_for_leader_event,
-        command_for_model_options_event, command_for_model_picker_event,
+        command_for_approval_posture_picker_event, command_for_aside_event,
+        command_for_completion_event, command_for_connect_overlay_event,
+        command_for_icon_picker_event, command_for_interrupt_confirmation_event,
+        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
         command_for_serve_overlay_event, command_for_session_picker_event,
         command_for_settings_panel_event, command_for_sidebar_event,
@@ -142,6 +145,7 @@ enum SurfaceAboveInterventions {
     ApprovalPosture,
     Selection(SelectionSurface),
     Sidebar,
+    Aside,
     /// Not a surface at all, but the same answer: the Session's own Origin has
     /// stopped answering, so its Interventions wait out of sight — a Decision
     /// taken now would go nowhere — and present themselves as soon as it
@@ -615,6 +619,9 @@ pub struct TuiState {
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) sidebar: Sidebar,
+    /// The column on the far side of the main view from the Sidebar,
+    /// answering for the open Session through its Sections.
+    pub(super) aside: Aside,
     pub(super) settings_panel: SettingsPanel,
 }
 
@@ -877,6 +884,7 @@ impl TuiState {
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             sidebar: Sidebar::new(workspace),
+            aside: Aside::new(),
             settings_panel: SettingsPanel::default(),
         }
     }
@@ -1947,6 +1955,7 @@ impl TuiState {
         // arrival rather than on the next view opened, because the frames it
         // governs may be on screen already.
         self.sidebar.adopt_settings(&self.settings);
+        self.aside.adopt_settings();
         self.application_notice.receive(&snapshot.diagnostics);
     }
 
@@ -2734,11 +2743,11 @@ impl TuiState {
         interaction.anchor.set(None);
     }
 
-    /// Whether the composer has the keys. The Sidebar is the one surface that
-    /// takes them without opening over the composer, so a composer that has
-    /// them is simply one the Sidebar is not driving.
+    /// Whether the composer has the keys. The Sidebar and the Aside are the
+    /// surfaces that take them without opening over the composer, so a
+    /// composer that has them is simply one neither column is driving.
     pub(super) fn composer_focused(&self) -> bool {
-        !self.sidebar.has_focus()
+        !self.sidebar.has_focus() && !self.aside.has_focus()
     }
 
     /// The Session the main view has open, and `None` on the Landing. It is
@@ -2793,6 +2802,19 @@ impl TuiState {
     /// goes on saying so.
     pub(super) fn sidebar_owns_input(&self) -> bool {
         self.sidebar.has_focus() && !self.overlay_owns_input()
+    }
+
+    /// Whether the Aside is the surface the keys actually reach: its own
+    /// claim, drawn, and outranked by nothing opened over the main view. It
+    /// ranks beside the Sidebar, and the two never claim the keys at once.
+    pub(super) fn aside_owns_input(&self) -> bool {
+        self.aside.has_focus() && !self.overlay_owns_input()
+    }
+
+    /// Whether the Aside stands in this frame at all: only beside an open
+    /// Session, so it is absent on the Landing.
+    pub(super) fn aside_is_present(&self) -> bool {
+        self.route.is_some()
     }
 
     fn active_selection_overlay_area(&self) -> Option<ratatui::layout::Rect> {
@@ -3575,6 +3597,7 @@ enum ClickTarget {
     Blank,
     Selection(SelectionSurface),
     SidebarEdge,
+    AsideEdge,
 }
 
 impl LastClick {
@@ -3641,6 +3664,13 @@ pub enum ApplicationEvent {
     },
     Session(SessionEvent),
     SessionSubscriptionEnded,
+    /// One event from the per-tree subscription asked through `through`,
+    /// which is how the Aside's Subagents Section learns the tree the open
+    /// Session belongs to.
+    SubagentTree {
+        through: SessionReference,
+        event: SubagentTreeEvent,
+    },
     PromptAdmissionSucceeded {
         session: SessionReference,
         prompt_id: PromptId,
@@ -4322,6 +4352,11 @@ impl Application {
                     ApplicationTransition::Continue,
                     ApplicationTransition::ViewSession,
                 ))
+            }
+            ApplicationEvent::SubagentTree { through, event } => {
+                let open = self.state.route.clone();
+                self.state.aside.receive_tree(through, event, open.as_ref());
+                Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionSubscriptionEnded => Ok(self
                 .session_reference()
@@ -5048,6 +5083,21 @@ impl Application {
                     }
                     return Ok(ApplicationTransition::Continue);
                 }
+                // The Aside's edge answers on the same terms, beside an open
+                // Session where the Aside stands.
+                if self.state.top_selection_overlay().is_none()
+                    && !self.state.overlay_owns_input()
+                    && self.state.aside_is_present()
+                    && self.state.aside.column_mut().hold_edge_at(position)
+                {
+                    self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
+                    self.state.left_press = None;
+                    let click = self.record_click(ClickTarget::AsideEdge, position);
+                    if click.count == 2 {
+                        self.invoke_semantic(SemanticCommandId::AsideWidthReset)?;
+                    }
+                    return Ok(ApplicationTransition::Continue);
+                }
                 self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
                 let selection_anchor = self
                     .state
@@ -5115,7 +5165,9 @@ impl Application {
                 subject: SemanticSubject::ScreenPosition(position),
             }),
             CommandId::ReleaseAt { position } => {
-                if self.state.sidebar.column_mut().release_edge() {
+                if self.state.sidebar.column_mut().release_edge()
+                    | self.state.aside.column_mut().release_edge()
+                {
                     // Reset is decided by the press count. Release merely
                     // ends the held paint and cannot become a row click or a
                     // Text Selection copy.
@@ -5521,6 +5573,13 @@ impl Application {
         let press = self.state.sidebar.press_at(position);
         if press != SidebarPress::Elsewhere {
             return self.answer_sidebar_press(press);
+        }
+        // An Aside entry opens the Session it stands for without taking the
+        // keys, as a Sidebar row does; the rest of the Aside answers nothing.
+        match self.state.aside.press_at(position) {
+            AsidePress::Elsewhere => {}
+            AsidePress::Inert => return Ok(ApplicationTransition::Continue),
+            AsidePress::Invoke(invocation) => return self.invoke_semantic(invocation),
         }
         // The header draws the open Session's Icon as its own leading span
         // only while Icons are shown and the Session has one to draw, so a
@@ -7062,6 +7121,18 @@ impl Application {
             .borders_edge_on_main_side(position)
         {
             Position::new(viewport.content_left, position.y)
+        } else if self
+            .state
+            .aside
+            .column()
+            .borders_edge_on_main_side(position)
+        {
+            Position::new(
+                viewport
+                    .content_left
+                    .saturating_add(viewport.content_width.saturating_sub(1)),
+                position.y,
+            )
         } else {
             position
         };
@@ -7334,6 +7405,16 @@ impl Application {
                         return Ok(ApplicationTransition::Continue);
                     };
                     return self.invoke_semantic(SemanticCommandId::SidebarWidthSet { columns });
+                }
+                if self.state.aside.column().edge_is_held() {
+                    let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    let Some(columns) = self.state.aside.column().width_at_held_edge(*position)
+                    else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    return self.invoke_semantic(SemanticCommandId::AsideWidthSet { columns });
                 }
                 if let SemanticSubject::ScreenPosition(position) = invocation.subject {
                     self.update_text_selection_drag(position, 1);
@@ -7929,6 +8010,35 @@ impl Application {
             | SemanticCommandId::SidebarMenuNext
             | SemanticCommandId::SidebarMenuSelect
             | SemanticCommandId::SidebarMenuClose) => self.handle_sidebar_menu_command(command),
+            command @ (SemanticCommandId::AsideWiden
+            | SemanticCommandId::AsideNarrow
+            | SemanticCommandId::AsideWidthSet { .. }
+            | SemanticCommandId::AsideWidthReset) => {
+                let column = self.state.aside.column_mut();
+                match command {
+                    SemanticCommandId::AsideWiden => column.widen(),
+                    SemanticCommandId::AsideNarrow => column.narrow(),
+                    SemanticCommandId::AsideWidthSet { columns } => column.set_width(columns),
+                    _ => {
+                        let initial_width = self.state.aside.initial_width();
+                        self.state.aside.column_mut().set_width(initial_width);
+                    }
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::AsideToggle => {
+                // One of the two columns holds the keys at most, so an Aside
+                // taking them takes them from the Sidebar.
+                if self.state.aside.toggle() && self.state.sidebar.column().claims_keys() {
+                    self.state.sidebar.hand_back_keys();
+                }
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::AsideLeave => {
+                self.state.aside.hand_back_keys();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::SidebarToggle => {
                 // Reaching a Sidebar already on screen takes nothing from it;
                 // showing or hiding it gives up a path the reader had offered.
@@ -7938,6 +8048,9 @@ impl Application {
                         .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
                 let open = self.state.route.clone();
                 self.state.sidebar.toggle(open.as_ref());
+                if self.state.sidebar.column().claims_keys() {
+                    self.state.aside.hand_back_keys();
+                }
                 self.state.command_mode = CommandMode::Composer;
                 if cancelled {
                     return Ok(ApplicationTransition::CancelWorkspaceResolution(
@@ -8638,7 +8751,18 @@ impl Application {
             // owns the keys, while a completion list left standing over the
             // composer does not.
             Some(SurfaceAboveInterventions::Sidebar) => {
+                if matches!(self.state.command_mode, CommandMode::Leader) {
+                    return command_for_leader_event(event);
+                }
                 return command_for_sidebar_event(event);
+            }
+            // The Aside ranks beside the Sidebar, and holds the keys only
+            // while the Sidebar does not.
+            Some(SurfaceAboveInterventions::Aside) => {
+                if matches!(self.state.command_mode, CommandMode::Leader) {
+                    return command_for_leader_event(event);
+                }
+                return command_for_aside_event(event);
             }
             // Nothing stands over the panels here; they simply have nothing to
             // present, so the keys go on to the composer as they always would.
@@ -8709,6 +8833,11 @@ impl Application {
         // interrupt, the reading keys stay, and the composer's keys — text,
         // history, submission — reach nothing.
         if self.state.open_subagent_parent().is_some() {
+            // The Leader stays reachable, so the Aside — the way around a
+            // Subagent's tree — can be reached from inside it.
+            if matches!(self.state.command_mode, CommandMode::Leader) {
+                return command_for_leader_event(event);
+            }
             return command_for_subagent_view_event(event);
         }
         match self.state.command_mode {
@@ -8748,6 +8877,13 @@ impl Application {
         &self.state.outlook
     }
 
+    /// The Session the per-tree subscription should be asked through, or
+    /// `None` when the Aside has nothing to answer for. The run loop keeps
+    /// one subscription open for as long as this names the same Session.
+    pub(super) fn subagent_tree_request(&self) -> Option<SessionReference> {
+        self.state.aside.tree_request(self.state.route.as_ref())
+    }
+
     pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {
         self.state.skill_catalog_request()
     }
@@ -8775,6 +8911,8 @@ impl Application {
             // So is another Session's Turn, drawn in a Sidebar row whose
             // Working duration has to be seen rising.
             || self.state.sidebar.shows_live_work()
+            // And a Subagent working in the Aside, whose Marker spins.
+            || self.state.aside.shows_live_work()
             || self.state.session_animation_on_screen.get()
             || self.transcript_drag_scroll().is_some()
     }
@@ -8877,8 +9015,11 @@ impl TuiState {
         {
             return Some(SurfaceAboveInterventions::Selection(surface));
         }
-        self.sidebar_owns_input()
-            .then_some(SurfaceAboveInterventions::Sidebar)
+        if self.sidebar_owns_input() {
+            return Some(SurfaceAboveInterventions::Sidebar);
+        }
+        self.aside_owns_input()
+            .then_some(SurfaceAboveInterventions::Aside)
     }
 
     /// Whether a panel that presented itself is still inside the moment it
