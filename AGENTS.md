@@ -15,6 +15,7 @@ You have access to the following codebases under ./references/ you should use fo
 platform-specific behavior with `cfg` so the other platforms keep working, and root path fixtures per platform rather
 than assuming POSIX: `Path::is_absolute` is platform-defined, so `/home/user` is a relative path on Windows.
 - Run tests with `cargo nextest run` (parallelizes across test binaries and reports per-test timings); `cargo test` also works. Tests must not wait out production-scale delays: timing constants (timeouts, backoff, keepalive) are injectable via builders such as `ManagedClientConfig::with_startup_timeout`, `ServerTimings`, and `CodexRuntime::with_interrupt_request_timeout`, so inject millisecond-scale values instead of sleeping.
+- Use conventional commits
 
 ## Plugins
 
