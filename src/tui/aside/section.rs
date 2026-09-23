@@ -49,6 +49,11 @@ pub(in crate::tui) enum SubagentTreeView<'a> {
     Failed(&'a str),
     /// It was deleted, and there is nothing to say about it.
     Gone,
+    /// Not yet in hand for a Session the client already knows enough about
+    /// to stand in its top-level entry: the Provisional Session, and the real
+    /// Session answering it until its tree lands. Only the Server knows when
+    /// Working began, so the entry carries no time.
+    StandIn { title: &'a str, working: bool },
 }
 
 /// A Section's header: its name, and how many things it holds where it

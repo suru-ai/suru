@@ -2881,7 +2881,15 @@ impl TuiState {
     /// Whether the Aside stands in this frame at all: only beside an open
     /// Session, so it is absent on the Landing.
     pub(super) fn aside_is_present(&self) -> bool {
-        self.route.is_some()
+        self.aside_subject().is_some()
+    }
+
+    /// The Session the Aside answers for: the open Session, or the
+    /// Provisional Session from the moment the Landing's first Prompt is
+    /// submitted, so the layout changes once, at submission. `None` on the
+    /// Landing.
+    pub(super) fn aside_subject(&self) -> Option<SessionReference> {
+        self.route.clone().or_else(|| self.provisional_reference())
     }
 
     fn active_selection_overlay_area(&self) -> Option<ratatui::layout::Rect> {
@@ -3057,6 +3065,12 @@ impl TuiState {
             .as_mut()
             .expect("the refused claim was just observed")
             .standing = ClaimStanding::Refused { error };
+        // Refused, the claim is no longer Working as far as this client can
+        // say, so its Aside entry gives up the Working Marker.
+        if let Some(reference) = self.provisional_reference() {
+            self.aside
+                .stand_in_for(reference, prompt.text.trim().to_owned(), false);
+        }
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
     }
 
@@ -3184,7 +3198,11 @@ impl TuiState {
         // state — where the Transcript is scrolled, what is folded — from an
         // interaction. It gets one of its own under its local identity, given
         // up with the claim so nothing outlives what it was for.
-        self.ensure_interaction(SessionReference::new(self.outlook.clone(), session_id));
+        let reference = SessionReference::new(self.outlook.clone(), session_id);
+        self.ensure_interaction(reference.clone());
+        // The Aside answers for the claim at once, from what it says.
+        self.aside
+            .stand_in_for(reference, prompt.text.trim().to_owned(), true);
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.creation_transition(prompt)
     }
@@ -3290,6 +3308,7 @@ impl TuiState {
         if let Some(reference) = reference {
             self.session_interactions.remove(&reference);
         }
+        self.aside.drop_stand_in();
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         Some(released)
     }
@@ -6660,6 +6679,10 @@ impl Application {
         claim.standing = ClaimStanding::Claimed {
             interrupt_intent: false,
         };
+        let claimed = SessionReference::new(self.state.outlook.clone(), claim.session_id);
+        self.state
+            .aside
+            .stand_in_for(claimed, prompt.text.trim().to_owned(), true);
         self.state.transcript_generation = self.state.transcript_generation.wrapping_add(1);
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
@@ -6702,7 +6725,15 @@ impl Application {
         }
         self.state.new_worktree = None;
         self.state.session_events_blocked = false;
+        let title = snapshot.title.clone();
+        let answered = claim.is_some();
         self.state.apply_session(SessionEvent::snapshot(snapshot))?;
+        // The Session answering a claim carries on the Aside entry the claim
+        // stood in, until the per-tree subscription's tree replaces it in
+        // place, so the Aside neither blanks nor says Loading between them.
+        if answered && let Some(session) = self.state.session_reference.clone() {
+            self.state.aside.stand_in_for(session, title, true);
+        }
         if let Some(claim) = claim.filter(ProvisionalSession::interrupt_intent)
             && let Some(session) = self.state.session_reference.clone()
         {

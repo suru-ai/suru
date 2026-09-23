@@ -184,11 +184,11 @@ pub(super) fn render_with_slots(
     if let Some(area) = columns.left {
         render_sidebar(frame, state, area, theme, truecolor);
     }
-    if let (Some(area), Some(open)) = (columns.right, state.route.as_ref()) {
+    if let (Some(area), Some(open)) = (columns.right, state.aside_subject()) {
         state.aside.render(
             frame,
             area,
-            open,
+            &open,
             state.aside_owns_input(),
             AsidePresentation {
                 theme,

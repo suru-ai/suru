@@ -66,6 +66,13 @@ impl Section for SubagentsSection {
             }
             // A deleted tree has nothing left to show, and nothing went wrong.
             SubagentTreeView::Gone => return Ok(self.without_tree(Vec::new(), false)),
+            // The client's own top-level entry, standing until the tree
+            // replaces it in place: the open Session alone, Working as far as
+            // the client can say, with no time because only the Server knows
+            // when Working began.
+            SubagentTreeView::StandIn { title, working } => {
+                return Ok(self.stand_in(title, working, context));
+            }
         };
         let width = usize::from(context.width);
         let mut rows = Vec::new();
@@ -165,6 +172,37 @@ impl Section for SubagentsSection {
 }
 
 impl SubagentsSection {
+    fn stand_in(&self, title: &str, working: bool, context: &SectionContext<'_>) -> SectionView {
+        let mut line = entry_line(
+            EntryParts {
+                guides: String::new(),
+                marker: working.then(|| (spinner::MARKER.to_owned(), context.theme.accent.primary)),
+                name: None,
+                title,
+                right: None,
+            },
+            true,
+            usize::from(context.width),
+            context,
+        );
+        if working {
+            spinner::overlay_frame(
+                std::slice::from_mut(&mut line),
+                &[0],
+                context.spinner_frame / 3,
+            );
+        }
+        SectionView {
+            header: SectionHeader {
+                name: self.name(),
+                count: Some(0),
+            },
+            rows: vec![unpointable(line)],
+            current: Some(0),
+            animates: working,
+        }
+    }
+
     /// The Section with no tree to list: its header uncounted, and whatever
     /// stands in the tree's place.
     fn without_tree(&self, rows: Vec<SectionRow>, animates: bool) -> SectionView {

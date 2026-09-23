@@ -804,3 +804,211 @@ fn a_session_carrying_another_prompt_neither_replaces_the_claim_nor_takes_its_in
         "{transition:?}"
     );
 }
+
+// The Aside beside a Provisional Session: it appears the moment the first
+// Prompt is submitted, answering for the claim with the one entry the client
+// can draw, and the real Session's tree replaces that entry in place.
+
+mod aside {
+    use super::{created_session_snapshot, submit_landing_prompt};
+    use crate::support::{
+        connected_application, deliver_settings, rendered_application_rows_at, workspace_dir,
+    };
+    use suru::{
+        managed_client::SubagentTreeEvent,
+        protocol::{
+            ActivityStatus, EffectiveSettings, Outlook, SessionId, SessionReference,
+            SessionTimestamp, SidebarVisibility, SubagentTreeEntry, SubagentTreeRevision,
+            SubagentTreeSnapshot, SubagentTreeTopLevel,
+        },
+        tui::{Application, ApplicationEvent, CommandId, SemanticCommandId},
+    };
+
+    const WIDTH: u16 = 120;
+    const HEIGHT: u16 = 24;
+    /// The launch width of the Aside, rule included.
+    const ASIDE_WIDTH: u16 = 32;
+
+    /// A connected client on the Landing whose Settings show the Aside, with
+    /// the Sidebar kept off the frame, and a presentation clock the test
+    /// moves by hand so the Aside's Loading quiet period passes unwaited.
+    fn landing(
+        workspace: &std::path::Path,
+    ) -> (
+        Application,
+        std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+    ) {
+        let now = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let clock = std::sync::Arc::clone(&now);
+        let mut application = connected_application(workspace)
+            .with_presentation_clock(move || *clock.lock().expect("read the presentation clock"));
+        let mut settings = EffectiveSettings::default();
+        settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+        deliver_settings(&mut application, settings);
+        (application, now)
+    }
+
+    fn advance(now: &std::sync::Mutex<std::time::Instant>, milliseconds: u64) {
+        *now.lock().expect("advance the presentation clock") +=
+            std::time::Duration::from_millis(milliseconds);
+    }
+
+    /// Whether the frame gives the Aside its columns: its rule stands down the
+    /// left of them on every row.
+    fn aside_is_drawn(application: &Application) -> bool {
+        rendered_application_rows_at(application, WIDTH, HEIGHT)
+            .iter()
+            .all(|row| row.chars().nth(usize::from(WIDTH - ASIDE_WIDTH)) == Some('│'))
+    }
+
+    /// The Aside's own content columns of its first rows.
+    fn aside_rows(application: &Application) -> Vec<String> {
+        rendered_application_rows_at(application, WIDTH, HEIGHT)
+            .iter()
+            .take(4)
+            .map(|row| {
+                row.chars()
+                    .skip(usize::from(WIDTH - ASIDE_WIDTH + 2))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn tree(top: SessionId, subagent: SessionId) -> SubagentTreeSnapshot {
+        SubagentTreeSnapshot {
+            revision: SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: top,
+                title: "Rename the widget".to_owned(),
+                working_since: None,
+                needs_intervention: false,
+            },
+            subagents: vec![SubagentTreeEntry {
+                session_id: subagent,
+                parent_session_id: top,
+                spawn_order: 0,
+                name: "Explore".to_owned(),
+                title: "Find the widget".to_owned(),
+                status: ActivityStatus::Active,
+                duration_ms: None,
+                started_at: None,
+                needs_intervention: false,
+            }],
+        }
+    }
+
+    const PROVISIONAL_ENTRY: [&str; 3] = ["Subagents 0", "⠋ Rename the widget", ""];
+
+    #[test]
+    fn the_aside_appears_at_submission_with_the_provisional_sessions_one_entry() {
+        let workspace = workspace_dir();
+        let (mut application, _now) = landing(workspace.path());
+        assert!(
+            !aside_is_drawn(&application),
+            "the Landing has no Session for the Aside to answer for"
+        );
+
+        submit_landing_prompt(&mut application, "Rename the widget");
+
+        assert!(
+            aside_is_drawn(&application),
+            "the Aside appears the moment the first Prompt is submitted"
+        );
+        assert_eq!(
+            aside_rows(&application)[..3],
+            PROVISIONAL_ENTRY,
+            "with one entry: the Title the Prompt gives and the Working Marker, and no \
+             time, since only the Server knows when Working began"
+        );
+    }
+
+    #[test]
+    fn the_real_sessions_tree_replaces_the_provisional_entry_in_place() {
+        let workspace = workspace_dir();
+        let (mut application, now) = landing(workspace.path());
+        let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+        let top = SessionId::new();
+
+        application
+            .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(
+                top,
+                &prompt,
+                workspace.path(),
+                SessionTimestamp::now(),
+            )))
+            .expect("take the created Session");
+        for waited in [0, 300, 1_000] {
+            advance(&now, waited);
+            assert!(aside_is_drawn(&application), "the Aside never leaves");
+            assert_eq!(
+                aside_rows(&application)[..3],
+                PROVISIONAL_ENTRY,
+                "until its tree lands, the Session carries on the entry the claim stood \
+                 in — neither blank nor Loading, however long the tree takes"
+            );
+        }
+
+        let explore = SessionId::new();
+        application
+            .handle_event(ApplicationEvent::SubagentTree {
+                through: SessionReference::new(Outlook::Local, top),
+                event: SubagentTreeEvent::Snapshot(tree(top, explore)),
+            })
+            .expect("take the Session's tree");
+
+        assert_eq!(
+            aside_rows(&application)[..3],
+            [
+                "Subagents 1",
+                "Rename the widget",
+                "└ ⠋ Explore Find the widget"
+            ],
+            "the tree replaces the entry in place"
+        );
+    }
+
+    #[test]
+    fn returning_to_the_landing_takes_the_aside_with_the_provisional_session() {
+        let workspace = workspace_dir();
+        let (mut application, _now) = landing(workspace.path());
+        submit_landing_prompt(&mut application, "Rename the widget");
+
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .expect("abandon the Provisional Session for the Landing");
+
+        assert!(
+            !aside_is_drawn(&application),
+            "the Aside behaves as the Landing does"
+        );
+    }
+
+    #[test]
+    fn a_refused_provisional_session_keeps_its_entry_until_the_reader_leaves_it() {
+        let workspace = workspace_dir();
+        let (mut application, _now) = landing(workspace.path());
+        let prompt = submit_landing_prompt(&mut application, "Rename the widget");
+
+        super::refuse_creation(&mut application, &prompt, "Provider unavailable");
+
+        assert_eq!(
+            aside_rows(&application)[..2],
+            ["Subagents 0", "Rename the widget"],
+            "the refused view stands, and its entry is no longer Working"
+        );
+
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .expect("leave the refused Provisional Session");
+        assert!(
+            !aside_is_drawn(&application),
+            "leaving it for the Landing takes the Aside away"
+        );
+    }
+}

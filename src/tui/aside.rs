@@ -73,6 +73,12 @@ pub(super) struct Aside {
     scrolls: RefCell<HashMap<&'static str, SectionScroll>>,
     /// Where the last frame drew each Section's rows, for the wheel.
     drawn_sections: RefCell<Vec<DrawnSection>>,
+    /// The Session the Aside stands in a top-level entry for, drawn from what
+    /// the client already knows, while no tree of it is in hand: the
+    /// Provisional Session, then the real Session that answers it until its
+    /// tree lands. It is why the Aside appears once, at submission, rather
+    /// than blanking when the Session arrives.
+    stand_in: Option<StandIn>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +119,15 @@ pub(super) struct FocusEntry {
     current: bool,
 }
 
+/// A top-level entry the client draws before the Server has said anything
+/// about its tree.
+#[derive(Clone, Debug)]
+struct StandIn {
+    session: SessionReference,
+    title: String,
+    working: bool,
+}
+
 #[derive(Clone, Debug)]
 struct AsideRowHit {
     row: u16,
@@ -143,7 +158,31 @@ impl Aside {
             focus: RefCell::new(None),
             scrolls: RefCell::new(HashMap::new()),
             drawn_sections: RefCell::new(Vec::new()),
+            stand_in: None,
         }
+    }
+
+    /// Stands a top-level entry in for `session` until its tree is in hand:
+    /// its Title, and whether it is Working as far as the client can say.
+    /// Calling it again for the same Session updates what the entry says.
+    pub(super) fn stand_in_for(&mut self, session: SessionReference, title: String, working: bool) {
+        self.stand_in = Some(StandIn {
+            session,
+            title,
+            working,
+        });
+    }
+
+    /// Gives up the stand-in entry, as a Provisional Session given up does.
+    pub(super) fn drop_stand_in(&mut self) {
+        self.stand_in = None;
+    }
+
+    /// The stand-in entry for `open`, where the Aside draws one.
+    fn stand_in_of(&self, open: &SessionReference) -> Option<&StandIn> {
+        self.stand_in
+            .as_ref()
+            .filter(|stand_in| stand_in.session == *open)
     }
 
     /// Takes the launch visibility and width from the first Settings
@@ -423,6 +462,9 @@ impl Aside {
         if self.tree.ended_for(opened).is_some() {
             self.tree.ended = None;
         }
+        if self.stand_in_of(opened).is_none() {
+            self.stand_in = None;
+        }
     }
 
     /// When the tree the open Session wants may first say Loading, while that
@@ -437,7 +479,8 @@ impl Aside {
             return None;
         }
         let wanted = self.tree_request(open)?;
-        if self.tree.covers(open?) {
+        // A stand-in entry never says Loading: the tree replaces it in place.
+        if self.tree.covers(open?) || self.stand_in_of(open?).is_some() {
             return None;
         }
         self.waiting
@@ -459,6 +502,12 @@ impl Aside {
         }
         if let Some(reading) = self.tree_for(open) {
             return SubagentTreeView::Ready(reading);
+        }
+        if let Some(stand_in) = self.stand_in_of(open) {
+            return SubagentTreeView::StandIn {
+                title: &stand_in.title,
+                working: stand_in.working,
+            };
         }
         let wanted = self.tree.wanted(open);
         let mut waiting = self.waiting.borrow_mut();
@@ -494,6 +543,8 @@ impl Aside {
                 self.tree.reading =
                     Some(SubagentTreeReading::new(through.origin.clone(), snapshot));
                 self.tree.through = Some(through);
+                // The tree has landed, replacing any stand-in in place.
+                self.stand_in = None;
                 true
             }
             SubagentTreeEvent::Changed(change) => {
