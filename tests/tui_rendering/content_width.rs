@@ -5,6 +5,7 @@ use crate::support::{
     rendered_row, workspace_dir,
 };
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
@@ -12,7 +13,7 @@ use suru::{
         SessionSettings, SessionStatus, SettingsSnapshot, SidebarSettings, SidebarVisibility,
         TurnStatus,
     },
-    tui::{Application, ApplicationEvent, CommandId},
+    tui::{Application, ApplicationEvent, CommandId, ScrollDirection},
 };
 
 fn session_with_width(
@@ -392,9 +393,10 @@ fn changing_width_keeps_a_scrolled_reader_anchored_to_the_same_message_and_row()
     rendered_application_rows_at(&application, 120, 20);
     for _ in 0..4 {
         application
-            .handle_event(ApplicationEvent::Command(
-                CommandId::ScrollTranscriptLinesUp,
-            ))
+            .handle_event(ApplicationEvent::Command(CommandId::WheelAt {
+                position: Position::new(60, 5),
+                direction: ScrollDirection::Up,
+            }))
             .expect("move the ninth Agent Message to the viewport boundary");
     }
     let maximum = rendered_application_rows_at(&application, 120, 20);

@@ -75,7 +75,7 @@ use super::{
 };
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
-const WHEEL_SCROLL_ROWS: usize = 3;
+pub(super) const WHEEL_SCROLL_ROWS: usize = 3;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an optimistic Session shell stays visually quiet before it asks
 /// the reader to wait. This is fixed presentation behavior, not a Setting.
@@ -2450,15 +2450,26 @@ impl TuiState {
         ))
     }
 
-    fn navigate_transcript_page(&mut self, direction: TranscriptDirection) {
+    /// Answers one step of the wheel where the pointer stood: the Sidebar
+    /// takes every step over its own column, and the Transcript every other.
+    fn wheel_at(&mut self, position: Position, direction: ScrollDirection) {
+        if !self
+            .sidebar
+            .wheel_at(position, direction, WHEEL_SCROLL_ROWS)
+        {
+            self.navigate_transcript_lines(direction);
+        }
+    }
+
+    fn navigate_transcript_page(&mut self, direction: ScrollDirection) {
         self.navigate_transcript(direction, None);
     }
 
-    fn navigate_transcript_lines(&mut self, direction: TranscriptDirection) {
+    fn navigate_transcript_lines(&mut self, direction: ScrollDirection) {
         self.navigate_transcript(direction, Some(WHEEL_SCROLL_ROWS));
     }
 
-    fn navigate_transcript(&mut self, direction: TranscriptDirection, rows: Option<usize>) {
+    fn navigate_transcript(&mut self, direction: ScrollDirection, rows: Option<usize>) {
         let Some(session) = self.session_reference.clone() else {
             return;
         };
@@ -2470,8 +2481,8 @@ impl TuiState {
         };
         let step = rows.unwrap_or(viewport.height).max(1);
         let target = match direction {
-            TranscriptDirection::Up => viewport.scroll_position.saturating_sub(step),
-            TranscriptDirection::Down => viewport
+            ScrollDirection::Up => viewport.scroll_position.saturating_sub(step),
+            ScrollDirection::Down => viewport
                 .scroll_position
                 .saturating_add(step)
                 .min(viewport.maximum_scroll),
@@ -3534,8 +3545,9 @@ enum CatalogListing {
     Complete,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum TranscriptDirection {
+/// Which way a list is being read: toward its head, or toward its tail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrollDirection {
     Up,
     Down,
 }
@@ -3805,9 +3817,15 @@ pub enum CommandId {
     HistoryNext,
     ScrollTranscriptPageUp,
     ScrollTranscriptPageDown,
-    ScrollTranscriptLinesUp,
-    ScrollTranscriptLinesDown,
     FollowLatest,
+    /// One step of the wheel, at the cell the pointer stood on. Where it
+    /// stood decides what moves — the Sidebar's list over the Sidebar, the
+    /// Transcript anywhere else — so it is resolved against the frame's own
+    /// geometry, as a click is, rather than by who has the keys.
+    WheelAt {
+        position: Position,
+        direction: ScrollDirection,
+    },
     /// Begins a left-button gesture without acting on the surface beneath it.
     PressAt {
         position: Position,
@@ -5004,9 +5022,14 @@ impl Application {
             | CommandId::HistoryNext) => Ok(self.handle_composer_command(command)),
             command @ (CommandId::ScrollTranscriptPageUp
             | CommandId::ScrollTranscriptPageDown
-            | CommandId::ScrollTranscriptLinesUp
-            | CommandId::ScrollTranscriptLinesDown
             | CommandId::FollowLatest) => self.handle_transcript_command(command),
+            CommandId::WheelAt {
+                position,
+                direction,
+            } => {
+                self.state.wheel_at(position, direction);
+                Ok(ApplicationTransition::Continue)
+            }
             CommandId::PressAt { position } => {
                 // The edge is a pointer surface only in the plain
                 // Sidebar-beside-main state. Check it before any row,
@@ -5436,19 +5459,10 @@ impl Application {
     fn handle_transcript_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         match command {
             CommandId::ScrollTranscriptPageUp => {
-                self.state.navigate_transcript_page(TranscriptDirection::Up);
+                self.state.navigate_transcript_page(ScrollDirection::Up);
             }
             CommandId::ScrollTranscriptPageDown => {
-                self.state
-                    .navigate_transcript_page(TranscriptDirection::Down);
-            }
-            CommandId::ScrollTranscriptLinesUp => {
-                self.state
-                    .navigate_transcript_lines(TranscriptDirection::Up);
-            }
-            CommandId::ScrollTranscriptLinesDown => {
-                self.state
-                    .navigate_transcript_lines(TranscriptDirection::Down);
+                self.state.navigate_transcript_page(ScrollDirection::Down);
             }
             CommandId::FollowLatest => self.state.follow_latest(),
             _ => {}
@@ -7087,7 +7101,7 @@ impl Application {
     }
 
     /// Distance beyond the Transcript determines rows per presentation tick.
-    fn transcript_drag_scroll(&self) -> Option<(TranscriptDirection, usize)> {
+    fn transcript_drag_scroll(&self) -> Option<(ScrollDirection, usize)> {
         let press = self.state.left_press.as_ref()?;
         let (_, epoch, surface) = press.selection_anchor?;
         if surface != SelectionSurface::Transcript {
@@ -7107,12 +7121,12 @@ impl Application {
         let bottom = viewport.content_top + viewport.content_rows;
         if press.pointer.y < viewport.content_top {
             Some((
-                TranscriptDirection::Up,
+                ScrollDirection::Up,
                 usize::from(viewport.content_top - press.pointer.y),
             ))
         } else if press.pointer.y >= bottom {
             Some((
-                TranscriptDirection::Down,
+                ScrollDirection::Down,
                 usize::from(press.pointer.y - bottom) + 1,
             ))
         } else {
@@ -8636,8 +8650,7 @@ impl Application {
                 Some(
                     command @ (CommandId::ScrollTranscriptPageUp
                     | CommandId::ScrollTranscriptPageDown
-                    | CommandId::ScrollTranscriptLinesUp
-                    | CommandId::ScrollTranscriptLinesDown
+                    | CommandId::WheelAt { .. }
                     | CommandId::FollowLatest
                     | CommandId::BeginLeader
                     | CommandId::InvokeSemantic(_)
@@ -8667,8 +8680,7 @@ impl Application {
                 Some(
                     command @ (CommandId::ScrollTranscriptPageUp
                     | CommandId::ScrollTranscriptPageDown
-                    | CommandId::ScrollTranscriptLinesUp
-                    | CommandId::ScrollTranscriptLinesDown
+                    | CommandId::WheelAt { .. }
                     | CommandId::FollowLatest
                     | CommandId::BeginLeader
                     | CommandId::InvokeSemantic(_)

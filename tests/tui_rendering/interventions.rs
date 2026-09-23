@@ -6,6 +6,7 @@ use crate::support::{
     invoke, key, rendered_application_rows, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -17,7 +18,10 @@ use suru::{
         Activity, ApprovalId, ApprovalOutcome, ApprovalSubject, Decision, QuestionnaireId,
         SessionSnapshot, TurnId,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, ScrollDirection,
+        SemanticCommandId,
+    },
 };
 
 const ARMING: Duration = Duration::from_millis(250);
@@ -393,7 +397,10 @@ fn arming_drops_only_the_keys_the_panel_itself_would_take() {
             row: 4,
             modifiers: KeyModifiers::NONE,
         })),
-        Some(CommandId::ScrollTranscriptLinesUp),
+        Some(CommandId::WheelAt {
+            position: Position::new(4, 4),
+            direction: ScrollDirection::Up,
+        }),
         "the wheel goes on reading the Transcript while the panel arms"
     );
 

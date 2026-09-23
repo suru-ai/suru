@@ -9674,3 +9674,251 @@ fn active_remote_location_keeps_its_name_with_icons_off_and_in_workspace_scope()
         }
     }
 }
+
+// The wheel answers to where the pointer stands rather than to who has the
+// keys: over the Sidebar it moves the list, and anywhere else the Transcript.
+
+/// A column out in the main view, clear of the Sidebar and its edge.
+const MAIN_VIEW_CELL: u16 = 60;
+
+/// Eight active rows: far more than the column holds beside a frame twenty
+/// lines tall, so the list is read through a window.
+fn eight_listed(workspace: &Path) -> Vec<SessionListItem> {
+    (1..=8)
+        .map(|index| listed(&format!("Row {}", 9 - index), workspace, index, now()))
+        .collect()
+}
+
+/// Opens a Session with more Transcript than the main view holds, so the wheel
+/// over the main view has somewhere to take it.
+fn open_long_session(application: &mut Application, workspace: &Path) {
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            crate::support::navigable_session_snapshot(SessionId::new(), workspace, 8),
+        ))
+        .expect("open a Session with a long Transcript");
+}
+
+/// One step of the wheel at one cell, with the frame drawn first because the
+/// wheel resolves against the geometry the frame in force drew.
+fn wheel_at(application: &mut Application, kind: MouseEventKind, column: u16, row: u16) {
+    let _ = rendered_application_rows_at(application, WIDE, 20);
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("turn the wheel"),
+        ApplicationTransition::Continue,
+        "the wheel asks nothing of the server"
+    );
+}
+
+/// What the Sidebar draws, row by row, with the main view cut away.
+fn sidebar_rows(application: &Application) -> Vec<String> {
+    rendered_application_rows_at(application, WIDE, 20)
+        .iter()
+        .map(|row| sidebar_column(row))
+        .collect()
+}
+
+#[test]
+fn the_wheel_over_the_sidebar_moves_its_list_and_never_the_transcript() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(workspace.path(), eight_listed(workspace.path()));
+    open_long_session(&mut application, workspace.path());
+    let sidebar_before = sidebar_rows(&application);
+    let main_before = main_view(&application);
+    assert!(drawn_in_sidebar(&sidebar_before, "Row 1"));
+
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollDown,
+        SIDEBAR_CELL,
+        8,
+    );
+
+    let wheeled = sidebar_rows(&application);
+    assert!(
+        !drawn_in_sidebar(&wheeled, "Row 1") && drawn_in_sidebar(&wheeled, "Row 2"),
+        "the wheel over the Sidebar moves its list: {wheeled:?}"
+    );
+    assert_eq!(
+        wheeled[..2],
+        sidebar_before[..2],
+        "the search box and the selector stand where they were"
+    );
+    assert_eq!(
+        main_view(&application),
+        main_before,
+        "and the Transcript beside it does not move at all"
+    );
+
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollUp,
+        MAIN_VIEW_CELL,
+        8,
+    );
+
+    assert_ne!(
+        main_view(&application),
+        main_before,
+        "the wheel over the main view moves the Transcript"
+    );
+    assert_eq!(
+        sidebar_rows(&application),
+        wheeled,
+        "and leaves the Sidebar's list where the wheel left it"
+    );
+
+    let reading = main_view(&application);
+    wheel_at(&mut application, MouseEventKind::ScrollUp, SIDEBAR_CELL, 8);
+    assert_eq!(
+        sidebar_rows(&application),
+        sidebar_before,
+        "the wheel back up over the Sidebar undoes the step down exactly"
+    );
+    assert_eq!(
+        main_view(&application),
+        reading,
+        "without taking the Transcript any further up"
+    );
+
+    type_terminal_text(&mut application, "hello");
+    assert!(
+        main_view(&application).contains("hello"),
+        "wheeling over the Sidebar never took the keys from the composer"
+    );
+}
+
+#[test]
+fn the_wheel_answers_to_the_pointer_while_the_sidebar_has_the_keys() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+    open_long_session(&mut application, workspace.path());
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: eight_listed(workspace.path()),
+        })
+        .expect("hydrate the Sidebar the reader opened");
+    assert!(selected_sidebar_text(&application).contains(ALL_WORKSPACES));
+    let sidebar_before = sidebar_rows(&application);
+    let main_before = main_view(&application);
+
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollDown,
+        SIDEBAR_CELL,
+        8,
+    );
+
+    let wheeled = sidebar_rows(&application);
+    assert_ne!(
+        wheeled, sidebar_before,
+        "the wheel moves the Sidebar's list"
+    );
+    assert_eq!(
+        main_view(&application),
+        main_before,
+        "and never the Transcript"
+    );
+    assert!(
+        selected_sidebar_text(&application).contains(ALL_WORKSPACES),
+        "row focus stays on the selector the reader was on"
+    );
+
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollUp,
+        MAIN_VIEW_CELL,
+        8,
+    );
+
+    assert_ne!(
+        main_view(&application),
+        main_before,
+        "the Transcript is still the reader's to wheel through while the Sidebar has the keys"
+    );
+    assert_eq!(sidebar_rows(&application), wheeled);
+
+    type_terminal_text(&mut application, "row");
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Search: row"
+        ),
+        "the keys are still the Sidebar's"
+    );
+}
+
+#[test]
+fn the_wheel_over_the_sidebar_does_nothing_while_a_path_entry_stands() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(workspace.path(), eight_listed(workspace.path()));
+    open_long_session(&mut application, workspace.path());
+    press_add_workspace(&mut application);
+    let sidebar_before = sidebar_rows(&application);
+    let main_before = main_view(&application);
+
+    wheel_at(&mut application, MouseEventKind::ScrollUp, SIDEBAR_CELL, 8);
+
+    assert_eq!(sidebar_rows(&application), sidebar_before);
+    assert_eq!(
+        main_view(&application),
+        main_before,
+        "a wheel over the Sidebar never falls through to the Transcript"
+    );
+
+    press_sidebar_key(&mut application, KeyCode::Esc);
+    assert!(
+        drawn_in_sidebar(&sidebar_rows(&application), "Row 1"),
+        "the list behind the entry was never moved"
+    );
+}
+
+#[test]
+fn the_wheel_leaves_the_rows_under_a_menu_alone_but_still_reads_the_transcript() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(workspace.path(), eight_listed(workspace.path()));
+    open_long_session(&mut application, workspace.path());
+    let _ = open_menu_on(&mut application, "Row 2");
+    let sidebar_before = sidebar_rows(&application);
+    let main_before = main_view(&application);
+
+    wheel_at(&mut application, MouseEventKind::ScrollUp, SIDEBAR_CELL, 12);
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollDown,
+        SIDEBAR_CELL,
+        12,
+    );
+
+    assert_eq!(
+        sidebar_rows(&application),
+        sidebar_before,
+        "the rows stay under the menu opened on them"
+    );
+    assert_eq!(main_view(&application), main_before);
+    assert!(menu_is_drawn(&application));
+
+    wheel_at(
+        &mut application,
+        MouseEventKind::ScrollUp,
+        MAIN_VIEW_CELL,
+        8,
+    );
+
+    assert_ne!(
+        main_view(&application),
+        main_before,
+        "the wheel over the main view goes on moving the Transcript"
+    );
+    assert!(menu_is_drawn(&application), "and leaves the menu standing");
+}

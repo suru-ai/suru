@@ -2,7 +2,8 @@
 //! that translate a terminal event into a [`CommandId`].
 
 use crossterm::event::{
-    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::Position;
 
@@ -12,22 +13,15 @@ use super::{
         descriptor,
     },
     connect_overlay::ConnectInputMode,
-    state::CommandId,
+    state::{CommandId, ScrollDirection},
 };
 
+/// The terminal's own table: the composer's keys, and the pointer as every
+/// surface that has no use of its own for it answers it (see
+/// [`command_for_pointer`]).
 pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     match event {
-        InputEvent::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
-            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
-            MouseEventKind::Up(MouseButton::Left) => Some(CommandId::ClickAt {
-                position: Position::new(mouse.column, mouse.row),
-            }),
-            MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
-                position: Position::new(mouse.column, mouse.row),
-            }),
-            _ => None,
-        },
+        InputEvent::Mouse(mouse) => command_for_pointer(mouse),
         InputEvent::Key(key) if key.kind != KeyEventKind::Press => None,
         InputEvent::Key(key) if binding_for(key).is_some() => {
             binding_for(key).map(|binding| binding.command.clone())
@@ -50,26 +44,38 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
     }
 }
 
+/// The pointer, carried with the cell it stood on, because every gesture it
+/// makes is resolved against the frame's geometry rather than against whoever
+/// has the keys: a press lands on what is drawn under it, and the wheel moves
+/// whichever list it is over — the Sidebar's over the Sidebar, the Transcript
+/// anywhere else.
+fn command_for_pointer(mouse: MouseEvent) -> Option<CommandId> {
+    let position = Position::new(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(CommandId::WheelAt {
+            position,
+            direction: ScrollDirection::Up,
+        }),
+        MouseEventKind::ScrollDown => Some(CommandId::WheelAt {
+            position,
+            direction: ScrollDirection::Down,
+        }),
+        MouseEventKind::Up(MouseButton::Left) => Some(CommandId::ClickAt { position }),
+        MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt { position }),
+        _ => None,
+    }
+}
+
 /// A Subagent's Session is read rather than conversed with, so its view keeps
-/// only the reading keys: the pointer and the scroll gestures work as they do
-/// anywhere, Escape returns to the parent Session, and the composer's keys —
+/// only the reading keys: the pointer works as it does anywhere, the wheel
+/// included, Escape returns to the parent Session, and the composer's keys —
 /// text entry, history, submission, the interrupt Escape would otherwise mean
 /// — reach nothing, which is what keeps Prompt delivery out of the view.
 /// Ctrl+B keeps the Sidebar, so the reader can leave for any Session, and
 /// Ctrl+C still exits.
 pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<CommandId> {
     match event {
-        InputEvent::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => Some(CommandId::ScrollTranscriptLinesUp),
-            MouseEventKind::ScrollDown => Some(CommandId::ScrollTranscriptLinesDown),
-            MouseEventKind::Up(MouseButton::Left) => Some(CommandId::ClickAt {
-                position: Position::new(mouse.column, mouse.row),
-            }),
-            MouseEventKind::Down(MouseButton::Right) => Some(CommandId::OpenContextMenuAt {
-                position: Position::new(mouse.column, mouse.row),
-            }),
-            _ => None,
-        },
+        InputEvent::Mouse(mouse) => command_for_pointer(mouse),
         InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -423,9 +429,12 @@ pub(super) fn command_for_workspace_picker_menu_event(event: InputEvent) -> Opti
 /// the reader types out.
 ///
 /// The mouse is the exception, and answers as it does from the composer: the
-/// Sidebar stands beside the main view rather than over it, so the wheel is
-/// still the reader's way through a Transcript, and a press is resolved
-/// against the whole frame's geometry rather than against this surface alone.
+/// Sidebar stands beside the main view rather than over it, so the pointer is
+/// resolved against the whole frame's geometry rather than against this
+/// surface alone. A press lands on whatever is drawn under it, and the wheel
+/// moves the list it is over — this one over the Sidebar, and the Transcript
+/// over the main view, which is still the reader's to read while the keys are
+/// here.
 pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
@@ -487,7 +496,9 @@ fn command_for_search_key(
 /// away leaving the row alone. Nothing else reaches the rows behind it — a
 /// letter typed at a menu is not a query — and the mouse answers as it does
 /// everywhere else, because a press outside a menu is how a reader dismisses
-/// one.
+/// one. The wheel is the one gesture the rows do not answer while it stands,
+/// since they would move out from under the menu opened on them; over the
+/// main view it goes on moving the Transcript.
 pub(super) fn command_for_sidebar_menu_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,

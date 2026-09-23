@@ -45,6 +45,6 @@ pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
 pub use state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
-    ModelListRequest, SessionListRequest, SessionListScope, SessionListSurface, TuiState,
-    WorkspaceResolutionSurface,
+    ModelListRequest, ScrollDirection, SessionListRequest, SessionListScope, SessionListSurface,
+    TuiState, WorkspaceResolutionSurface,
 };

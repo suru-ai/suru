@@ -17,7 +17,8 @@ use crate::protocol::{
 };
 
 use super::{
-    EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
+    EverywhereListRequest, ScrollDirection, SessionListRequest, SessionListScope,
+    SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     session_listing::{ListedSession, SessionListing, everywhere_origins},
 };
@@ -271,6 +272,16 @@ pub(super) struct Sidebar {
     /// here: an anchor moving to a row already in view leaves it where it
     /// is, and only an anchor moving out of view carries it along.
     window_start: Cell<usize>,
+    /// The body as the last frame measured it, which is what the wheel steps
+    /// through: only a frame knows how many lines the column holds.
+    drawn_body: RefCell<Option<DrawnBody>>,
+    /// Where the anchor stood when the wheel last moved the window, while the
+    /// window is still the wheel's. The wheel is the reader looking rather
+    /// than choosing, so the window stays where it left it — through catch-ups
+    /// and all — until the anchor itself moves or the reader asks for another
+    /// list by what they type, and the anchor then carries the window back to
+    /// it as it always has.
+    wheeled_from: RefCell<Option<WindowAnchor>>,
     /// Where the frame in force drew the rows, which is what a press resolves
     /// against. Rendering leaves it here, so it is held behind a cell rather
     /// than taken by an edit.
@@ -281,6 +292,26 @@ pub(super) struct Sidebar {
     /// refusal is drawn by the surface that asked rather than by whichever
     /// other one happens to be listing the same work.
     deleting: Option<SessionReference>,
+}
+
+/// The body as one frame measured it: the lines each entry takes, where the
+/// wheel may open the window (see [`wheel_stops`]), the lines the column held
+/// for them, and what the window was anchored on.
+#[derive(Clone, Debug)]
+struct DrawnBody {
+    heights: Vec<usize>,
+    stops: Vec<usize>,
+    capacity: usize,
+    anchor: WindowAnchor,
+}
+
+/// What a frame anchored the window on: row focus, and the open Session that
+/// stands in for it while the Sidebar has no keys. Either moving is the
+/// anchor changing.
+#[derive(Clone, Debug, PartialEq)]
+struct WindowAnchor {
+    focus: Option<SidebarFocus>,
+    open: Option<SessionReference>,
 }
 
 /// The lines one active Sidebar row takes, the third of them saying nothing
@@ -663,6 +694,13 @@ impl SidebarGeometry {
             .map(|span| span.target.clone())
     }
 
+    /// Whether this cell is anywhere down the Sidebar's column — its search
+    /// box, its selector, its rows, or the rule closing it — which is where
+    /// the wheel moves the Sidebar rather than the Transcript.
+    fn covers(&self, position: Position) -> bool {
+        !self.columns.is_empty() && (self.columns.start..=self.columns.end).contains(&position.x)
+    }
+
     /// The menu item drawn at this cell, and `None` for a cell outside the
     /// menu's own box — including the rows behind it, because a menu is drawn
     /// over them.
@@ -919,6 +957,8 @@ impl Sidebar {
             // reader types can reach a surface.
             on_screen: Cell::new(true),
             window_start: Cell::new(0),
+            drawn_body: RefCell::new(None),
+            wheeled_from: RefCell::new(None),
             geometry: RefCell::default(),
             menu: None,
             deleting: None,
@@ -1055,6 +1095,7 @@ impl Sidebar {
         }
         let before = self.focus_order_before_change();
         self.query.push_str(text);
+        self.release_wheel();
         self.keep_focus_drawn(&before);
     }
 
@@ -1066,7 +1107,9 @@ impl Sidebar {
             return;
         }
         let before = self.focus_order_before_change();
-        self.query.pop();
+        if self.query.pop().is_some() {
+            self.release_wheel();
+        }
         self.keep_focus_drawn(&before);
     }
 
@@ -1084,7 +1127,10 @@ impl Sidebar {
     /// on is still there and still theirs.
     fn clear_query(&mut self) {
         let before = self.focus_order_before_change();
-        self.query.clear();
+        if !self.query.is_empty() {
+            self.query.clear();
+            self.release_wheel();
+        }
         self.keep_focus_drawn(&before);
     }
 
@@ -1123,6 +1169,7 @@ impl Sidebar {
         self.drawn_width.set(None);
         self.drawn_width_limit.set(None);
         self.geometry.replace(SidebarGeometry::default());
+        self.drawn_body.replace(None);
     }
 
     /// Records that this frame found the columns for the Sidebar and drew it.
@@ -1202,6 +1249,57 @@ impl Sidebar {
     /// after the body it stands over and so is recorded on its own.
     pub(super) fn record_menu_geometry(&self, menu: SidebarMenuGeometry) {
         self.geometry.borrow_mut().menu = Some(menu);
+    }
+
+    /// Answers one step of the wheel at one cell of the frame, reporting
+    /// whether it was the Sidebar's to answer. A wheel anywhere over the
+    /// column is, whether or not the list moves — even at either end of it —
+    /// because a wheel over the Sidebar never reaches the Transcript beside
+    /// it.
+    ///
+    /// The list moves only where it is what the reader is looking at: a path
+    /// entry stands in place of it, and a menu is opened on rows that must
+    /// not move out from under it, so while either stands the step is spent
+    /// on nothing.
+    pub(super) fn wheel_at(
+        &mut self,
+        position: Position,
+        direction: ScrollDirection,
+        lines: usize,
+    ) -> bool {
+        if !self.geometry.borrow().covers(position) {
+            return false;
+        }
+        if self.workspace_entry.is_none() && !self.menu_is_open() {
+            self.wheel(direction, lines);
+        }
+        true
+    }
+
+    /// Moves the window one step of the wheel through the body the last
+    /// frame measured — see [`wheel_step`] — and holds it there against the
+    /// anchor it was moved away from. Nothing else moves: the keys stay where
+    /// they are and row focus with them, and the settled shelf is not asked
+    /// for more, because wheeling is looking rather than choosing.
+    fn wheel(&mut self, direction: ScrollDirection, lines: usize) {
+        let drawn = self.drawn_body.borrow();
+        let Some(body) = drawn.as_ref() else {
+            return;
+        };
+        let start = self.window_start.get();
+        let moved = wheel_step(start, direction, body, lines);
+        if moved == start {
+            return;
+        }
+        self.window_start.set(moved);
+        self.wheeled_from.replace(Some(body.anchor.clone()));
+    }
+
+    /// Gives the window back to its anchor, which is what the reader asking
+    /// for another list does: the list they wheeled through is not the one
+    /// they are now reading.
+    fn release_wheel(&self) {
+        self.wheeled_from.replace(None);
     }
 
     /// Answers a press at one cell of the frame.
@@ -2340,6 +2438,16 @@ impl Sidebar {
     /// it lists opens on that Session rather than wherever the reader last
     /// scrolled to. Neither anchor changes what the body holds, so a Session
     /// with no row simply leaves the window where it was.
+    ///
+    /// A window the wheel moved answers to no anchor until the anchor itself
+    /// moves — row focus onto another entry, or another Session opening — so
+    /// the reader can look away from the row they are on and the list stays
+    /// where they looked.
+    ///
+    /// Drawing is what settles the window, so this is also where a frame
+    /// leaves its account of it: it remembers the window it opened, measures
+    /// the body for the wheel to step through, and gives up a wheel hold whose
+    /// anchor has since moved.
     pub(super) fn visible_entries(
         &self,
         capacity: usize,
@@ -2348,12 +2456,30 @@ impl Sidebar {
     ) -> Vec<SidebarEntry<'_>> {
         let entries = self.entries(open, name);
         let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
-        let anchor = entries
-            .iter()
-            .position(SidebarEntry::is_focused)
-            .or_else(|| entries.iter().position(SidebarEntry::is_open));
+        let drawn_anchor = WindowAnchor {
+            focus: self.focus.clone(),
+            open: open.cloned(),
+        };
+        let wheeled = self.wheeled_from.borrow().as_ref() == Some(&drawn_anchor);
+        if !wheeled {
+            self.release_wheel();
+        }
+        let anchor = (!wheeled)
+            .then(|| {
+                entries
+                    .iter()
+                    .position(SidebarEntry::is_focused)
+                    .or_else(|| entries.iter().position(SidebarEntry::is_open))
+            })
+            .flatten();
         let start = window_start(self.window_start.get(), anchor, &heights, capacity);
         self.window_start.set(start);
+        self.drawn_body.replace(Some(DrawnBody {
+            stops: wheel_stops(&entries),
+            heights,
+            capacity,
+            anchor: drawn_anchor,
+        }));
         let mut remaining = capacity;
         entries
             .into_iter()
@@ -2972,6 +3098,73 @@ fn window_start(last: usize, anchor: Option<usize>, heights: &[usize], capacity:
     last.min(anchor).min(furthest).max(earliest)
 }
 
+/// Where the wheel may open the window: at the head of the body, at every
+/// entry that is not held to a blank above it, and past the body's end. A
+/// blank belongs with the entry it stands above, so the window never opens
+/// between the two — which is what makes a step up land exactly where the
+/// step down came from, blanks and all.
+fn wheel_stops(entries: &[SidebarEntry<'_>]) -> Vec<usize> {
+    (0..=entries.len())
+        .filter(|index| {
+            index
+                .checked_sub(1)
+                .is_none_or(|above| !matches!(entries[above], SidebarEntry::Spacer))
+        })
+        .collect()
+}
+
+/// Where the window opens after one step of the wheel from `start` through
+/// the body a frame measured. The window moves from stop to stop (see
+/// [`wheel_stops`]), as many as it takes for at least `lines` lines to pass,
+/// so where the Transcript's wheel passes three lines a step passes one
+/// active row and the blank above it, or three slim rows. It stops at the
+/// head of the body, and where the body's last entry is shown whole.
+fn wheel_step(start: usize, direction: ScrollDirection, body: &DrawnBody, lines: usize) -> usize {
+    let heights = &body.heights;
+    let furthest = earliest_opening(heights, heights.len().saturating_sub(1), body.capacity);
+    let start = start.min(furthest);
+    let passing =
+        |from: usize, to: usize| heights[from.min(to)..from.max(to)].iter().sum::<usize>();
+    match direction {
+        ScrollDirection::Down => {
+            let mut at = start;
+            let mut passed = 0;
+            for &stop in body.stops.iter().filter(|stop| **stop > start) {
+                if passed >= lines || at >= furthest {
+                    break;
+                }
+                passed += passing(at, stop);
+                at = stop;
+            }
+            at.min(furthest)
+        }
+        ScrollDirection::Up => {
+            // The furthest opening stands short of a stop only because the
+            // body ends there, so a step back from it retraces the step the
+            // end cut short rather than a whole one of its own.
+            let from = if start == furthest {
+                body.stops
+                    .iter()
+                    .copied()
+                    .find(|stop| *stop >= furthest)
+                    .unwrap_or(start)
+            } else {
+                start
+            };
+            let mut at = from;
+            let mut passed = 0;
+            for &stop in body.stops.iter().rev().filter(|stop| **stop < from) {
+                if passed >= lines {
+                    break;
+                }
+                passed += passing(stop, at);
+                at = stop;
+            }
+            at.min(start)
+        }
+    }
+}
+
 /// The earliest entry a column holding `capacity` lines can open on while
 /// still showing every line of the entry at `last_shown`. An entry too tall
 /// for the column at all is opened on regardless, because a column that showed
@@ -3056,6 +3249,8 @@ pub(super) fn workspace_name(workspace: &Path) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use ratatui::layout::Position;
+
     use crate::{
         protocol::{
             AutoSettle, EffectiveSettings, ModelAvailability, Outlook, Session, SessionId,
@@ -3063,13 +3258,14 @@ mod tests {
             SidebarSettings, SidebarVisibility, Workspace,
         },
         tui::{
-            SessionListRequest,
+            ScrollDirection, SessionListRequest,
             commands::SemanticCommandId,
             sidebar::{
                 SessionStanding, Sidebar, SidebarActivation, SidebarEntry, SidebarPress,
                 SidebarSpan, SidebarTarget, StandingInputs, session_standing, width_beside,
                 workspace_name,
             },
+            state::WHEEL_SCROLL_ROWS,
         },
     };
 
@@ -3719,6 +3915,413 @@ mod tests {
         );
     }
 
+    // The wheel: whole entries at a time, as far per step as the Transcript's
+    // wheel moves, and held where it was left until the anchor itself moves.
+
+    #[test]
+    fn a_wheel_step_passes_whole_slim_rows_until_three_lines_have_gone_by() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"]
+        );
+
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![
+                "Settled 2",
+                "Settled 3",
+                "Settled 4",
+                "Settled 5",
+                "Settled 6"
+            ],
+            "three one-line entries pass for one step of the wheel"
+        );
+
+        sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"],
+            "and the step back up passes the same three"
+        );
+    }
+
+    #[test]
+    fn a_wheel_step_passes_one_active_row_and_the_blank_above_it() {
+        let mut sidebar = showing(vec![
+            summary("First", 4, 4),
+            summary("Second", 3, 3),
+            summary("Third", 2, 2),
+            summary("Fourth", 1, 1),
+        ]);
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            vec![BLANK, "First", BLANK, "Second"]
+        );
+
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            vec![BLANK, "Second", BLANK, "Third"],
+            "a row is never cut, so the step runs on past the blank to the whole row under it"
+        );
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_head_of_the_body_and_where_its_last_entry_shows_whole() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        let _ = drawn_within(&sidebar, 5);
+
+        sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"],
+            "there is nothing above the head of the body to wheel onto"
+        );
+
+        for _ in 0..10 {
+            sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+            let _ = drawn_within(&sidebar, 5);
+        }
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![
+                "Settled 6",
+                "Settled 7",
+                "Settled 8",
+                "Settled 9",
+                "Show 2 more"
+            ],
+            "the wheel stops with the last entry whole rather than trailing blank lines"
+        );
+    }
+
+    #[test]
+    fn the_wheel_stops_at_what_is_loaded_and_moves_neither_the_keys_nor_row_focus() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        let _ = drawn_within(&sidebar, 5);
+        let focus = sidebar.focus.clone();
+
+        for _ in 0..10 {
+            sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        }
+
+        assert_eq!(
+            drawn_within(&sidebar, 5).last().map(String::as_str),
+            Some("Show 2 more"),
+            "the wheel reaches the affordance and leaves it for the reader to act on"
+        );
+        assert!(
+            sidebar.take_listing_request().is_none(),
+            "wheeling asks the server for nothing"
+        );
+        assert_eq!(drawn(&sidebar).len(), 12, "nor brings up more of the shelf");
+        assert_eq!(sidebar.focus, focus, "wheeling is looking, not choosing");
+        assert!(sidebar.has_focus(), "and the keys stay where they were");
+    }
+
+    #[test]
+    fn a_catch_up_leaves_the_window_where_the_wheel_left_it() {
+        let open = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 0, open.session_id);
+        let mut sidebar = showing_on(shelf.clone(), Some(open.session_id));
+        let _ = drawn_opening_on(&sidebar, 5, &open);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        let wheeled = drawn_opening_on(&sidebar, 5, &open);
+        assert_eq!(
+            wheeled.first().map(String::as_str),
+            Some("Settled 5"),
+            "the wheel carried the row the keys are on out of view: {wheeled:?}"
+        );
+
+        let request = caught_up(&mut sidebar);
+        sidebar.load(&request, shelf, Some(&open));
+
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &open),
+            wheeled,
+            "catching up is not the reader looking again"
+        );
+    }
+
+    #[test]
+    fn row_focus_moving_carries_the_window_back_to_it() {
+        let open = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 0, open.session_id);
+        let mut sidebar = showing_on(shelf, Some(open.session_id));
+        let _ = drawn_opening_on(&sidebar, 5, &open);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        let _ = drawn_opening_on(&sidebar, 5, &open);
+
+        sidebar.focus_next();
+
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &open)
+                .first()
+                .map(String::as_str),
+            Some("Settled 1"),
+            "the row the keys moved onto is carried back into view"
+        );
+    }
+
+    #[test]
+    fn another_session_opening_carries_the_window_back_to_its_row() {
+        let first = SessionReference::new(Outlook::Local, SessionId::new());
+        let second = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 0, first.session_id);
+        identify(&mut shelf, 1, second.session_id);
+        let mut sidebar = showing_on(shelf, Some(first.session_id));
+        // The keys go back to the composer, so the open Session is the anchor.
+        sidebar.hand_back_keys();
+        let _ = drawn_opening_on(&sidebar, 5, &first);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        let wheeled = drawn_opening_on(&sidebar, 5, &first);
+        assert_eq!(wheeled.first().map(String::as_str), Some("Settled 5"));
+
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &first),
+            wheeled,
+            "the same Session standing open is not the anchor moving"
+        );
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &second)
+                .first()
+                .map(String::as_str),
+            Some("Settled 1"),
+            "another Session opening carries its row back into view"
+        );
+    }
+
+    #[test]
+    fn a_wheeled_window_never_trails_blank_lines_past_a_list_that_shrank() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        let _ = drawn_within(&sidebar, 5);
+        for _ in 0..10 {
+            sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        }
+        let _ = drawn_within(&sidebar, 5);
+
+        let request = caught_up(&mut sidebar);
+        sidebar.load(&request, set_aside_shelf(3), None);
+
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2"],
+            "a list shorter than the column is shown whole"
+        );
+    }
+
+    #[test]
+    fn the_wheel_answers_over_the_sidebar_and_nowhere_else() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        let _ = drawn_within(&sidebar, 5);
+        sidebar.record_geometry(0..32, 30..33, Vec::new());
+
+        assert!(
+            !sidebar.wheel_at(
+                Position::new(40, 3),
+                ScrollDirection::Down,
+                WHEEL_SCROLL_ROWS
+            ),
+            "a wheel out in the main view is the main view's"
+        );
+        assert_eq!(drawn_within(&sidebar, 5)[0], DIVIDER);
+
+        assert!(
+            sidebar.wheel_at(
+                Position::new(4, 0),
+                ScrollDirection::Down,
+                WHEEL_SCROLL_ROWS
+            ),
+            "a wheel anywhere down the column is the Sidebar's, its search box included"
+        );
+        assert_eq!(drawn_within(&sidebar, 5)[0], "Settled 2");
+        assert!(
+            sidebar.wheel_at(
+                Position::new(32, 3),
+                ScrollDirection::Down,
+                WHEEL_SCROLL_ROWS
+            ),
+            "and so is one on the rule closing it"
+        );
+    }
+
+    #[test]
+    fn the_wheel_is_spent_on_nothing_while_a_menu_or_a_path_entry_stands() {
+        let wanted = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 0, wanted.session_id);
+        let mut sidebar = showing(shelf);
+        let opening = drawn_within(&sidebar, 5);
+        sidebar.record_geometry(
+            0..32,
+            30..33,
+            vec![SidebarSpan {
+                rows: 3..4,
+                columns: None,
+                target: SidebarTarget::Session(wanted),
+            }],
+        );
+        sidebar.open_menu_at(Position::new(4, 3));
+        assert!(sidebar.menu_is_open());
+
+        assert!(
+            sidebar.wheel_at(
+                Position::new(4, 3),
+                ScrollDirection::Down,
+                WHEEL_SCROLL_ROWS
+            ),
+            "a wheel over the Sidebar is still the Sidebar's"
+        );
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            opening,
+            "but the rows stay under the menu opened on them"
+        );
+        assert!(sidebar.menu_is_open());
+
+        sidebar.close_menu();
+        sidebar.open_workspace_entry();
+        assert!(sidebar.wheel_at(
+            Position::new(4, 3),
+            ScrollDirection::Down,
+            WHEEL_SCROLL_ROWS
+        ));
+        sidebar.leave();
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            opening,
+            "nor does a wheel over a path entry move the list standing behind it"
+        );
+    }
+
+    #[test]
+    fn a_wheel_step_up_passes_one_active_row_and_brings_back_the_blank_above_it() {
+        let mut sidebar = showing(
+            (1..=6)
+                .map(|ordinal| summary(&format!("Row {ordinal}"), 7 - ordinal, 1))
+                .collect(),
+        );
+        let _ = drawn_within(&sidebar, 8);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            vec![BLANK, "Row 3", BLANK, "Row 4"]
+        );
+
+        sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            vec![BLANK, "Row 2", BLANK, "Row 3"],
+            "a step up passes one row and the blank standing above it, as a step down does"
+        );
+
+        sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            vec![BLANK, "Row 1", BLANK, "Row 2"],
+            "and the step reaching the head brings back the blank the list opens on"
+        );
+    }
+
+    #[test]
+    fn a_step_up_undoes_a_step_down_all_the_way_through_the_active_rows() {
+        let mut sidebar = showing(
+            (1..=4)
+                .map(|ordinal| summary(&format!("Row {ordinal}"), 5 - ordinal, 1))
+                .collect(),
+        );
+        let mut windows = vec![drawn_within(&sidebar, 8)];
+        for _ in 0..3 {
+            sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+            windows.push(drawn_within(&sidebar, 8));
+        }
+        assert_eq!(
+            windows
+                .last()
+                .and_then(|window| window.last())
+                .map(String::as_str),
+            Some(BLANK),
+            "the last step stops where the body's last entry shows whole: {windows:?}"
+        );
+
+        for expected in windows.iter().rev().skip(1) {
+            sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+            assert_eq!(
+                &drawn_within(&sidebar, 8),
+                expected,
+                "each step up lands exactly where the step down came from"
+            );
+        }
+
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Up, WHEEL_SCROLL_ROWS);
+        assert_eq!(
+            drawn_within(&sidebar, 8),
+            windows[0],
+            "down then up is no move at all"
+        );
+    }
+
+    #[test]
+    fn a_new_query_opens_its_results_where_the_anchor_says_rather_than_where_the_wheel_was() {
+        let open = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 0, open.session_id);
+        let mut sidebar = showing_on(shelf, Some(open.session_id));
+        let _ = drawn_opening_on(&sidebar, 5, &open);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+        let _ = drawn_opening_on(&sidebar, 5, &open);
+
+        sidebar.insert("Settled");
+
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &open)
+                .first()
+                .map(String::as_str),
+            Some("Settled 0"),
+            "the results are a new list, and open on the row the keys are on"
+        );
+    }
+
+    #[test]
+    fn the_wheel_moves_the_selectors_open_entries() {
+        let mut sidebar = showing(
+            (1..=8)
+                .map(|ordinal| rooted(&format!("Work {ordinal}"), ordinal, &format!("w{ordinal}")))
+                .collect(),
+        );
+        // Opening with no Session open starts the keys on the selector.
+        let _ = sidebar.activate(None, false);
+        let entries = drawn(&sidebar);
+        assert_eq!(
+            entries.len(),
+            11,
+            "Everywhere, all Workspaces, the one the client runs in, and each of the eight"
+        );
+        assert_eq!(drawn_within(&sidebar, 4), entries[..4]);
+
+        sidebar.wheel(ScrollDirection::Down, WHEEL_SCROLL_ROWS);
+
+        assert_eq!(
+            drawn_within(&sidebar, 4),
+            entries[3..7],
+            "the entries under the selector are the body, and move as the body does"
+        );
+    }
+
     /// What stands in for the divider where the Titles the Sidebar draws are
     /// read out in order.
     const BLANK: &str = "<blank>";
@@ -3908,6 +4511,37 @@ mod tests {
     /// The Sidebar's body as a column `capacity` lines tall shows it.
     fn drawn_within(sidebar: &Sidebar, capacity: usize) -> Vec<String> {
         entry_titles(sidebar.visible_entries(capacity, None, &workspace_name))
+    }
+
+    /// Gives the listed Session at `index` the identity `session_id`, so a
+    /// test can open it or point at it.
+    fn identify(sessions: &mut [SessionListItem], index: usize, session_id: SessionId) {
+        let SessionListItem::Readable(listed) = &mut sessions[index] else {
+            unreachable!("the fixture builds readable Sessions");
+        };
+        listed.session.id = session_id;
+    }
+
+    /// A listed Session rooted in its own Workspace, `directory` under the
+    /// root, which is what gives the selector an entry to offer for it.
+    fn rooted(title: &str, created_at: u64, directory: &str) -> SessionListItem {
+        let SessionListItem::Readable(mut listed) = summary(title, created_at, created_at) else {
+            unreachable!("the fixture builds a readable Session");
+        };
+        let path = root().join(directory);
+        listed.session.execution_directory =
+            crate::protocol::ExecutionDirectory { path: path.clone() };
+        listed.session.workspace = Workspace::directory(path);
+        SessionListItem::Readable(listed)
+    }
+
+    /// The same, beside a main view with `open` open.
+    fn drawn_opening_on(
+        sidebar: &Sidebar,
+        capacity: usize,
+        open: &SessionReference,
+    ) -> Vec<String> {
+        entry_titles(sidebar.visible_entries(capacity, Some(open), &workspace_name))
     }
 
     fn entry_titles(entries: Vec<SidebarEntry<'_>>) -> Vec<String> {
