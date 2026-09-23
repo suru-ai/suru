@@ -47,12 +47,13 @@
 //! Worktree name goes through, and handed to source control, which renames
 //! the branch on the owning Server — see
 //! [`crate::source_control::SourceControlService::rename_branch`] for the
-//! locks it takes and when it declines. The rename runs on this same task,
-//! after the Title Errand's answer is committed and before the Workspace
-//! Errand is built, so it too waits on nothing but that answer and never on
-//! the Workspace Icon. The Worktree's location keeps the name it was created
-//! with, and the Session's Checkout State reports the new branch the next time
-//! checkout observation reads it. Every other Session's Errand — one working
+//! locks it takes and when it declines. The rename runs on this same task
+//! once the Title Errand's answer is committed, alongside the Workspace
+//! Errand rather than in front of it or behind it: the rename may wait out the
+//! first Turn's hold on the Repository, and the Workspace Icon never waits for
+//! that, just as the rename never waits for the Workspace Icon. The Worktree's
+//! location keeps the name it was created with, and the Session's Checkout
+//! State reports the new branch the next time checkout observation reads it. Every other Session's Errand — one working
 //! in an existing Worktree, or in none — asks for no branch at all.
 //!
 //! Everything here is best-effort by construction. Derivation runs in the
@@ -307,15 +308,22 @@ impl Derivation {
                     None
                 }
             };
-            if let Some(created) = &created_branch {
-                match proposed_branch {
+            // The rename may wait out the first Turn's execution lease, and
+            // the Workspace Errand on its Provider: neither waits on the other,
+            // though both wait on the Title Errand, so no two Errands are ever
+            // outstanding at once.
+            let rename = async {
+                let Some(created) = &created_branch else {
+                    return;
+                };
+                match &proposed_branch {
                     Some(proposal) => {
                         rename_branch(
                             session_id,
                             &source_control,
                             &preparations,
                             created,
-                            &proposal,
+                            proposal,
                         )
                         .await
                     }
@@ -325,40 +333,24 @@ impl Derivation {
                         "no usable branch was derived, so the Managed Worktree keeps its first name"
                     ),
                 }
-            }
-
-            let Some((workspace_id, prompt)) = workspace_errand else {
-                return;
             };
-            let errand = ProviderErrand {
-                prompt,
-                schema: workspace_icon::reply_schema(),
-                selection,
-                execution_directory,
-            };
-            let answer = match errands.run(errand).await {
-                Ok(answer) => answer,
-                Err(failure) => {
-                    tracing::info!(
-                        ?workspace_id,
-                        "Workspace Icon Errand produced no Icon: {failure}"
-                    );
-                    return;
+            let workspace_icon = async {
+                if let Some((workspace_id, prompt)) = workspace_errand {
+                    derive_workspace_icon(
+                        &errands,
+                        &sessions,
+                        workspace_id,
+                        ProviderErrand {
+                            prompt,
+                            schema: workspace_icon::reply_schema(),
+                            selection,
+                            execution_directory,
+                        },
+                    )
+                    .await
                 }
             };
-            let Some(icon) = workspace_icon::derived_icon(&answer) else {
-                tracing::info!(
-                    ?workspace_id,
-                    "Workspace Icon Errand answered outside its schema"
-                );
-                return;
-            };
-            if !sessions.commit_workspace_icon(&workspace_id, icon) {
-                tracing::debug!(
-                    ?workspace_id,
-                    "a derived Workspace Icon was discarded because the Workspace already carries one"
-                );
-            }
+            tokio::join!(rename, workspace_icon);
         });
     }
 
@@ -383,6 +375,39 @@ impl Derivation {
                 }
             },
         }
+    }
+}
+
+/// Runs a Workspace Icon Errand and commits its answer where the Workspace
+/// still carries no Icon.
+async fn derive_workspace_icon(
+    errands: &ErrandRunner,
+    sessions: &SessionStore,
+    workspace_id: crate::protocol::WorkspaceId,
+    errand: ProviderErrand,
+) {
+    let answer = match errands.run(errand).await {
+        Ok(answer) => answer,
+        Err(failure) => {
+            tracing::info!(
+                ?workspace_id,
+                "Workspace Icon Errand produced no Icon: {failure}"
+            );
+            return;
+        }
+    };
+    let Some(icon) = workspace_icon::derived_icon(&answer) else {
+        tracing::info!(
+            ?workspace_id,
+            "Workspace Icon Errand answered outside its schema"
+        );
+        return;
+    };
+    if !sessions.commit_workspace_icon(&workspace_id, icon) {
+        tracing::debug!(
+            ?workspace_id,
+            "a derived Workspace Icon was discarded because the Workspace already carries one"
+        );
     }
 }
 

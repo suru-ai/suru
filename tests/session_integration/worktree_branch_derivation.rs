@@ -19,8 +19,12 @@ use suru::{
     protocol::*,
     provider::ProviderEvent,
     server::{self, RunningServer, ServerConfig, ServerTimings},
+    source_control::{BranchRename, CreatedBranch, GitSourceControl, SourceControl},
 };
-use tokio::time::{Duration, timeout};
+use tokio::{
+    sync::mpsc,
+    time::{Duration, timeout},
+};
 
 const PROVIDER: &str = "controlled";
 const MODEL: &str = "controlled-default";
@@ -95,6 +99,74 @@ struct Fixture {
     server: RunningServer,
     client: ManagedClient,
     provider: ControlledProvider,
+    renames: mpsc::UnboundedReceiver<Result<BranchRename, String>>,
+}
+
+/// Git in every respect, reporting each rename it is asked for once Git has
+/// answered. A rename that fails or changes nothing is otherwise invisible by
+/// design, and this is what lets a test say one was attempted, and how it
+/// went, without waiting out a deadline.
+struct WitnessedGit {
+    git: GitSourceControl,
+    renames: mpsc::UnboundedSender<Result<BranchRename, String>>,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for WitnessedGit {
+    async fn rename_branch(
+        &self,
+        created: &CreatedBranch,
+        proposal: &str,
+    ) -> Result<BranchRename, String> {
+        let outcome = self.git.rename_branch(created, proposal).await;
+        let _ = self.renames.send(outcome.clone());
+        outcome
+    }
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        self.git.discover(directory).await
+    }
+    async fn checkpoint(
+        &self,
+        at: suru::source_control::PreparationCheckpoint,
+        preparation: &PreparedCheckout,
+    ) -> Result<(), String> {
+        self.git.checkpoint(at, preparation).await
+    }
+    async fn plan_checkout(
+        &self,
+        id: PreparationId,
+        source: &ResolvedWorkspace,
+        name: &str,
+        reserved: &[PathBuf],
+    ) -> Result<PreparedCheckout, String> {
+        self.git.plan_checkout(id, source, name, reserved).await
+    }
+    async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
+        self.git.prepare_checkout(plan).await
+    }
+    async fn recover_checkout(
+        &self,
+        repository: &Repository,
+        checkout: &CheckoutAssociation,
+    ) -> Result<CheckoutRecovery, String> {
+        self.git.recover_checkout(repository, checkout).await
+    }
+    async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+        self.git.observe(checkout).await
+    }
+    async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Result<Vec<CheckoutAssociation>, String> {
+        self.git.list_checkouts(repository).await
+    }
+    fn reuse_discovery(
+        &self,
+        directory: &Path,
+        previous: &ResolvedWorkspace,
+    ) -> Option<ResolvedWorkspace> {
+        self.git.reuse_discovery(directory, previous)
+    }
 }
 
 fn timings() -> ServerTimings {
@@ -130,7 +202,8 @@ impl Fixture {
         committed(&main);
         let config = errand.as_ref().map(config_root_pinning);
         let state = root.join("state");
-        let (server, client, provider) = spawn(&state, channel, config.as_ref(), timings).await;
+        let (server, client, provider, renames) =
+            spawn(&state, channel, config.as_ref(), timings).await;
         Self {
             _temporary: temporary,
             _config: config,
@@ -141,6 +214,7 @@ impl Fixture {
             server,
             client,
             provider,
+            renames,
         }
     }
 
@@ -240,14 +314,29 @@ impl Fixture {
             .await;
     }
 
-    /// Waits for the Workspace Icon Errand, which the derivation task builds
-    /// only once any rename it was going to make is behind it — so what Git
-    /// says afterwards is final without waiting out a deadline. Only a
-    /// Workspace's first Session asks for one.
-    async fn derivation_finished(&mut self) {
+    /// Answers the Workspace Icon Errand, which only a Workspace's first
+    /// Session asks for, once its Title Errand is settled. By then the
+    /// derivation has decided whether to rename anything: a rename it will not
+    /// attempt never reaches source control after this.
+    async fn workspace_errand(&mut self) {
         let errand = self.next_errand().await;
         assert!(errand.prompt.contains("Workspace"), "{}", errand.prompt);
         errand.succeed(json!({ "icon": "dev-rust" }));
+    }
+
+    /// How the one rename this derivation attempted went.
+    async fn rename_attempted(&mut self) -> Result<BranchRename, String> {
+        timeout(PROGRESS_DEADLINE, self.renames.recv())
+            .await
+            .expect("the rename reaches source control")
+            .expect("the Server is still running")
+    }
+
+    fn no_rename_attempted(&mut self) {
+        assert!(
+            self.renames.try_recv().is_err(),
+            "no rename reached source control"
+        );
     }
 }
 
@@ -256,21 +345,35 @@ async fn spawn(
     channel: &str,
     config: Option<&tempfile::TempDir>,
     timings: ServerTimings,
-) -> (RunningServer, ManagedClient, ControlledProvider) {
+) -> (
+    RunningServer,
+    ManagedClient,
+    ControlledProvider,
+    mpsc::UnboundedReceiver<Result<BranchRename, String>>,
+) {
     let (runtime, provider) = controlled_provider();
     let mut server_config = ServerConfig::new(state, channel).expect("configure server");
     if let Some(config) = config {
         server_config = server_config.with_config_dir(config.path());
     }
-    let server = server::spawn_with_provider_and_timings(server_config, runtime, timings)
-        .await
-        .expect("spawn server");
+    let (renames, witnessed) = mpsc::unbounded_channel();
+    let server = server::spawn_with_source_control(
+        server_config,
+        vec![runtime],
+        timings,
+        Arc::new(WitnessedGit {
+            git: GitSourceControl::default(),
+            renames,
+        }),
+    )
+    .await
+    .expect("spawn server");
     let mut client =
         ManagedClient::connect(ManagedClientConfig::new(state, channel).expect("configure client"))
             .await
             .expect("connect client");
     crate::support::receive_managed_client_initial_state(&mut client).await;
-    (server, client, provider)
+    (server, client, provider, witnessed)
 }
 
 /// An Errand the test has taken from the Provider, with what it asked kept
@@ -362,12 +465,26 @@ async fn a_derived_branch_renames_the_fresh_worktree_its_session_was_admitted_fr
         }
     );
 
+    // The rename now waits on the first Turn, which holds the Repository
+    // until its Prompt is delivered; the Workspace Errand waits on neither.
+    fixture.workspace_errand().await;
+    fixture.no_rename_attempted();
+    assert_eq!(
+        read_git(&destination, &["symbolic-ref", "--short", "HEAD"]).as_deref(),
+        Some(created_branch.as_str())
+    );
+
     // The Title has landed and the rename is due, yet the first Turn starts
     // regardless: neither the Errand nor the rename stands in front of it.
     fixture.work_the_first_turn().await;
     let renamed = "suru/reasoning-group-flicker";
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: renamed.to_owned()
+        })
+    );
     branch_reading(&mut catalog, &checkout.id, renamed).await;
-    fixture.derivation_finished().await;
 
     assert!(
         branches(&fixture.main).contains(&renamed.to_owned())
@@ -456,7 +573,8 @@ async fn a_session_in_an_existing_worktree_is_asked_for_no_branch_and_renames_no
         "branch": "something else entirely",
     }));
     fixture.work_the_first_turn().await;
-    fixture.derivation_finished().await;
+    fixture.workspace_errand().await;
+    fixture.no_rename_attempted();
 
     assert_eq!(branches(&fixture.main), before);
     assert_eq!(
@@ -484,7 +602,11 @@ async fn a_worktree_no_longer_on_its_created_branch_is_not_renamed() {
             "branch": "renamed anyway",
         }));
         fixture.work_the_first_turn().await;
-        fixture.derivation_finished().await;
+        fixture.workspace_errand().await;
+        assert!(
+            fixture.rename_attempted().await.is_err(),
+            "{move_head:?}: a Worktree off its created branch is declined"
+        );
 
         let branches = branches(&source);
         assert!(
@@ -519,7 +641,13 @@ async fn a_taken_derived_name_is_numbered_and_the_current_name_is_left_alone() {
         "branch": "reasoning flicker",
     }));
     fixture.work_the_first_turn().await;
-    fixture.derivation_finished().await;
+    fixture.workspace_errand().await;
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: "suru/reasoning-flicker-4".to_owned()
+        })
+    );
     assert_eq!(
         read_git(
             &preparation.destination.path,
@@ -558,7 +686,11 @@ async fn a_taken_derived_name_is_numbered_and_the_current_name_is_left_alone() {
             json!({ "title": "Ship the picker", "icon": "md-bug", "branch": "ship picker" }),
         );
         fixture.work_the_first_turn().await;
-        fixture.derivation_finished().await;
+        fixture.workspace_errand().await;
+        assert_eq!(
+            fixture.rename_attempted().await,
+            Ok(BranchRename::Unchanged)
+        );
         assert_eq!(
             read_git(
                 &preparation.destination.path,
@@ -622,7 +754,13 @@ async fn a_pinned_selection_derives_the_branch() {
         "branch": "repair config parser",
     }));
     fixture.work_the_first_turn().await;
-    fixture.derivation_finished().await;
+    fixture.workspace_errand().await;
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: "suru/repair-config-parser".to_owned()
+        })
+    );
 
     assert_eq!(
         read_git(
@@ -681,7 +819,8 @@ async fn an_errand_without_a_usable_branch_leaves_the_first_name_standing() {
             );
         }
         fixture.work_the_first_turn().await;
-        fixture.derivation_finished().await;
+        fixture.workspace_errand().await;
+        fixture.no_rename_attempted();
         assert_eq!(
             branches(&source),
             ["main", "suru/fix-parser"],
@@ -706,6 +845,7 @@ async fn an_errand_that_never_answers_leaves_the_first_name_standing() {
     let (preparation, _, _wedged) = fixture.admitted(&main, "Fix the parser").await;
     fixture.work_the_first_turn().await;
     let _workspace_errand = fixture.next_errand().await;
+    fixture.no_rename_attempted();
 
     assert_eq!(branches(&main), ["main", "suru/fix-parser"]);
     assert_eq!(
@@ -742,7 +882,7 @@ async fn a_restart_after_admission_attempts_no_rename() {
     server.shutdown().await.expect("shut down server");
     drop((outstanding, provider));
 
-    let (server, client, mut provider) = spawn(&state, channel, None, timings()).await;
+    let (server, client, mut provider, mut renames) = spawn(&state, channel, None, timings()).await;
     // A new Session's Errand is the first to reach the Provider after the
     // restart: had the admitted Session's derivation been attempted again,
     // its own Errand, asking for a branch, would have come first.
@@ -765,6 +905,14 @@ async fn a_restart_after_admission_attempts_no_rename() {
     assert!(errand.prompt().contains("Explain the seam"));
     assert!(errand.schema()["properties"].get("branch").is_none());
     errand.fail("done");
+    let workspace_errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Workspace Icon Errand follows");
+    assert!(workspace_errand.prompt().contains("Workspace"));
+    assert!(
+        renames.try_recv().is_err(),
+        "no rename reached source control"
+    );
     assert_eq!(
         read_git(
             &preparation.destination.path,
