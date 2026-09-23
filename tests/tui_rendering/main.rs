@@ -12,6 +12,7 @@ mod failing_provider_support;
 mod approval_posture;
 mod approvals;
 mod aside;
+mod aside_neighbours;
 mod commands;
 mod composer;
 mod connecting;
