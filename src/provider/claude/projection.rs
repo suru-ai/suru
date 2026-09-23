@@ -15,7 +15,7 @@
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent under the spawning tool use's identity,
-//! `task_progress` and `task_updated` revise what it is doing, and `task_notification` settles it.
+//! `task_updated` revises what it is doing, and `task_notification` settles it.
 //! A settled background agent the loop resumes through SendMessage starts its task again under the
 //! SendMessage tool use's identity, and that resume is a Subagent of its own; the resumed agent's
 //! conversation still rides under the original spawn's id, so it is routed to the resume.
@@ -277,8 +277,8 @@ struct RunningCommand {
 }
 
 /// One task the CLI is running an agent for: the identity its Subagent's events are attributed
-/// by, and the description its row currently reads, kept so progress ticks repeating it
-/// unchanged publish nothing.
+/// by, and the description its row currently reads, kept so updates repeating it unchanged
+/// publish nothing.
 struct SubagentTask {
     subagent: String,
     description: String,
@@ -381,7 +381,9 @@ impl ClaudeProjection {
         };
         match message.subtype.as_str() {
             "task_started" => self.project_task_started(message),
-            "task_progress" => self.project_task_description(message.task_id, message.description),
+            // A progress tick's description is the subagent's latest tool activity ("Running
+            // cargo test"), not what it was asked to do, so it revises nothing.
+            "task_progress" => Vec::new(),
             "task_updated" => self.project_task_description(
                 message.task_id,
                 message.patch.and_then(|patch| patch.description),
@@ -459,7 +461,7 @@ impl ClaudeProjection {
     }
 
     /// A revised description for a running Subagent. Tasks that are not Subagents, tasks never
-    /// started, and ticks repeating the description unchanged all publish nothing.
+    /// started, and updates repeating the description unchanged all publish nothing.
     fn project_task_description(
         &mut self,
         task_id: Option<String>,

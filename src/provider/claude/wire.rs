@@ -300,11 +300,12 @@ pub(super) struct SystemMessage {
     /// keep riding under the original spawn's id.
     #[serde(default)]
     pub(super) tool_use_id: Option<String>,
-    /// What the task was asked to do, on `task_started` and repeated on `task_progress`.
     #[serde(default)]
     pub(super) task_type: Option<String>,
     #[serde(default)]
     pub(super) subagent_type: Option<String>,
+    /// What the task was asked to do, on `task_started`; on `task_progress`, the subagent's latest
+    /// tool activity instead.
     #[serde(default)]
     pub(super) description: Option<String>,
     /// How the task ended, on `task_notification` — `completed`, or whatever failing or being

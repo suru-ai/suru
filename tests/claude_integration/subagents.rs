@@ -18,7 +18,8 @@ use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
 /// A fan-out running in the foreground of the Turn: the conversation spawns a subagent through
 /// the Task tool, the CLI reports the task starting with the spawning tool use's identity, the
 /// subagent narrates, thinks, and runs Bash — arriving as full snapshots attributed by
-/// `parent_tool_use_id` — and the CLI notifies the task settling before the conversation answers.
+/// `parent_tool_use_id` — the CLI ticks the task's progress with the subagent's latest tool
+/// activity, and notifies the task settling before the conversation answers.
 /// The loop's own answer streams with its snapshot restating it beside the chunks.
 const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -29,6 +30,7 @@ const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type"
       emit '{"type":"assistant","message":{"id":"msg-child-1","role":"assistant","model":"claude-sonnet-child","content":[{"type":"text","text":"Scouting the workspace now."}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"**Scouting plan**\n\nLook for TODO markers.","signature":"sig"},{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{"command":"rg -l TODO"}}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub","content":"src/main.rs\n","is_error":false}]},"parent_tool_use_id":"task_1","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_progress","task_id":"agent-task-1","tool_use_id":"task_1","description":"Running rg -l TODO","subagent_type":"Explore","usage":{"total_tokens":1200,"tool_uses":1,"duration_ms":900},"last_tool_name":"Bash","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-1","status":"completed","summary":"Found one file.","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_1","content":"Found one file.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -90,7 +92,10 @@ async fn a_task_spawn_opens_the_row_and_the_child_session_that_holds_the_subagen
     };
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(name, "Explore", "the row names the subagent's own type");
-    assert_eq!(description, "Scout the workspace");
+    assert_eq!(
+        description, "Scout the workspace",
+        "a task_progress tick leaves the row reading what the subagent was asked to do"
+    );
     assert_eq!(
         model.as_ref().map(|model| model.as_str()),
         Some("claude-sonnet-child")
@@ -791,7 +796,10 @@ async fn a_subagent_resumed_through_send_message_lands_its_new_work_in_the_resum
         );
     };
     assert_eq!(*status, ActivityStatus::Completed);
-    assert_eq!(description, "Saying goodbye");
+    assert_eq!(
+        description, "Say hello",
+        "the resume reads what its task was started to do, not its latest progress tick"
+    );
     assert_eq!(
         model.as_ref().map(|model| model.as_str()),
         Some("claude-haiku-child"),
