@@ -46,11 +46,15 @@ fn client_showing(workspace: &Path, settings: EffectiveSettings, pinned: &[&str]
     let sidebar_is_shown = settings.sidebar.initial_visibility == SidebarVisibility::Shown;
     deliver_snapshot(&mut application, settings, pinned);
     if sidebar_is_shown {
-        application
-            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                SemanticCommandId::SidebarToggle,
-            )))
-            .expect("hide the fixture Sidebar without changing its effective Settings");
+        // The Setting's reveal leaves the keys with the composer, so the first
+        // toggle only reaches the Sidebar and the second hides it.
+        for _ in 0..2 {
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::SidebarToggle,
+                )))
+                .expect("hide the fixture Sidebar without changing its effective Settings");
+        }
     }
     application
 }

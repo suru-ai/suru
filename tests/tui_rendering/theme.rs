@@ -51,14 +51,18 @@ fn open_theme_picker(application: &mut Application) -> ApplicationTransition {
 /// Keeps Theme preview assertions on the full main-view canvas after a
 /// snapshot seeds the independently configured Sidebar as shown.
 fn hide_sidebar_as_view_state(application: &mut Application) {
-    assert_eq!(
-        application
-            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                SemanticCommandId::SidebarToggle,
-            )))
-            .expect("hide the Sidebar without changing effective Settings"),
-        ApplicationTransition::Continue
-    );
+    // The Setting's reveal leaves the keys with the composer, so the first
+    // toggle only reaches the Sidebar and the second hides it.
+    for _ in 0..2 {
+        assert_eq!(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::SidebarToggle,
+                )))
+                .expect("hide the Sidebar without changing effective Settings"),
+            ApplicationTransition::Continue
+        );
+    }
 }
 
 fn truecolor_application() -> Application {

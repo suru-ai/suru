@@ -36,6 +36,7 @@ use super::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
     },
     shimmer,
+    side_column::{self, SideColumn},
     sidebar::{
         self, ADD_WORKSPACE, SessionStanding, Sidebar, SidebarEntry, SidebarMenuGeometry,
         SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
@@ -168,7 +169,14 @@ pub(super) fn render_with_slots(
         render_terminal_too_small(frame, theme);
         return;
     }
-    let main = render_sidebar(frame, state, theme, truecolor);
+    // The frame is laid out as Sidebar | main view | right-hand column, the
+    // main view's floor outranking both columns and the right-hand column
+    // giving way first. Nothing occupies the right-hand column yet.
+    let columns = side_column::lay_out(frame.area(), Some(state.sidebar.column()), None);
+    if let Some(area) = columns.left {
+        render_sidebar(frame, state, area, theme, truecolor);
+    }
+    let main = columns.main;
     let main = render_application_notice(frame, state, main, slots, theme);
     let composer = if state.session.is_some() {
         render_session(frame, state, main, slots, theme, truecolor)
@@ -2516,35 +2524,31 @@ fn render_subagent_picker(
     record_overlay_selection(frame, state, area, SelectionSurface::Subagents, bordered);
 }
 
-/// Draws the Sidebar down the left of the frame and reports what is left for
-/// the main view — the whole frame when the reader has the Sidebar hidden, or
-/// when the terminal cannot spare its columns.
-fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme, truecolor: bool) -> Rect {
-    let frame_area = frame.area();
-    if !state.sidebar.is_revealed() {
-        return frame_area;
-    }
-    let Some(width) = sidebar::width_beside(state.sidebar.chosen_width(), frame_area.width) else {
-        return frame_area;
-    };
-    state.sidebar.record_drawn(
-        width,
-        sidebar::width_limit(frame_area.width).unwrap_or(width),
-    );
-    let [column, main] =
-        Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(frame_area);
-    // Holding the edge is pointer feedback of its own. At rest the rule keeps
-    // the same key-ownership paint it had before it became draggable.
-    let block = Block::default()
+/// The block a side column is drawn in: the elevated surface, with its rule
+/// down the side facing the main view. Holding the edge is pointer feedback
+/// of its own; at rest the rule says whether the column owns the keys.
+fn side_column_block(column: &SideColumn, owns_input: bool, theme: &Theme) -> Block<'static> {
+    Block::default()
         .style(theme.surface.elevated)
-        .borders(Borders::RIGHT)
-        .border_style(if state.sidebar.edge_is_held() {
+        .borders(column.side().rule())
+        .border_style(if column.edge_is_held() {
             theme.accent.primary
-        } else if state.sidebar_owns_input() {
+        } else if owns_input {
             theme.border.default
         } else {
             theme.border.subdued
-        });
+        })
+}
+
+/// Draws the Sidebar in the column the frame's layout gave it.
+fn render_sidebar(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    column: Rect,
+    theme: &Theme,
+    truecolor: bool,
+) {
+    let block = side_column_block(state.sidebar.column(), state.sidebar_owns_input(), theme);
     let inside = block.inner(column);
     let content = horizontally_inset(inside, 1);
     frame.render_widget(block, column);
@@ -2563,11 +2567,9 @@ fn render_sidebar(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme, trueco
     // padding a row is inset by presses the row it insets. The spans the body
     // narrows to a run of one line are measured from the same edges, in
     // `sidebar_lines`.
-    let edge = column.right().saturating_sub(2)..column.right().saturating_add(1);
     state
         .sidebar
-        .record_geometry(inside.x..inside.right(), edge, rows);
-    main
+        .record_geometry(inside.x..inside.right(), rows);
 }
 
 /// Paints each active row's Standing Rail over the column of padding at its

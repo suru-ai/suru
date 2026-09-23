@@ -1403,7 +1403,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SidebarToggle,
         title: "Toggle Sidebar",
         reach: SemanticReach::Client,
-        description: "Show the Sidebar beside the main view, or reclaim its columns",
+        description: "Show the Sidebar and give it the keys, give a shown Sidebar the keys, or hide one holding them",
         slash: Some(SlashCommand {
             name: "sidebar",
             aliases: &[],

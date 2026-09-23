@@ -21,51 +21,8 @@ use super::{
     SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     session_listing::{ListedSession, SessionListing, everywhere_origins},
+    side_column::{Side, SideColumn, ToggleStep},
 };
-
-/// The narrowest Sidebar a reader can use. The chosen width may be greater,
-/// but draw-time clamping never lets a narrow frame overwrite that choice.
-const MINIMUM_SIDEBAR_WIDTH: u16 = 24;
-
-/// The narrowest main view the Sidebar will leave behind: the 50 columns a
-/// reader is allowed to cap the Session Content Column at (ADR 0012), inside
-/// the two columns of padding the frame insets it by. Below that the Sidebar
-/// would be buying its own columns out of the conversation.
-const MINIMUM_MAIN_WIDTH: u16 = 54;
-
-/// The columns the Sidebar takes from a frame this wide, and `None` where the
-/// frame cannot spare them. This is the whole of the squeeze: a terminal too
-/// narrow for the Sidebar plus a usable main view keeps the main view, and the
-/// reader's own show-or-hide choice is untouched, so widening the terminal
-/// brings the Sidebar back exactly as they left it.
-pub(super) const fn width_beside(chosen_width: u64, frame_width: u16) -> Option<u16> {
-    match width_limit(frame_width) {
-        None => None,
-        Some(maximum) => {
-            let chosen = if chosen_width > u16::MAX as u64 {
-                u16::MAX
-            } else {
-                chosen_width as u16
-            };
-            Some(if chosen < MINIMUM_SIDEBAR_WIDTH {
-                MINIMUM_SIDEBAR_WIDTH
-            } else if chosen > maximum {
-                maximum
-            } else {
-                chosen
-            })
-        }
-    }
-}
-
-/// The widest Sidebar this frame can carry beside a main view at its floor.
-pub(super) const fn width_limit(frame_width: u16) -> Option<u16> {
-    if frame_width < MINIMUM_SIDEBAR_WIDTH + MINIMUM_MAIN_WIDTH {
-        None
-    } else {
-        Some(frame_width - MINIMUM_MAIN_WIDTH)
-    }
-}
 
 /// What the selector calls every Workspace on the current Outlook, as distinct
 /// from Everywhere's wider set of Origin servers.
@@ -158,41 +115,17 @@ impl SidebarListingScope {
 /// The Sidebar's own state: whether the reader wants it, where the reader
 /// works, and the Sessions it lists.
 ///
-/// Visibility has two independent halves. The reader's choice — seeded once
-/// from the initial-visibility Setting and flipped by the toggle — lives here
-/// and is never
-/// written back to configuration. Whether the frame can actually spare the
-/// columns is decided at draw time by [`width_beside`], so a terminal that
-/// squeezes the Sidebar out forgets nothing.
+/// Its column chrome — visibility, width, edge, and its claim on the keys — is
+/// the [`SideColumn`] it stands in on the left of the main view, shared with
+/// the Aside on the right. Everything else here is what the Sidebar lists.
 #[derive(Clone, Debug)]
 pub(super) struct Sidebar {
     execution_directory: Option<PathBuf>,
-    revealed: bool,
-    /// Whether the reader is driving the Sidebar rather than the composer.
-    /// Opening it themselves is what claims the keys; Esc, the toggle, and the
+    /// The column the Sidebar stands in. Whether the reader is driving the
+    /// Sidebar rather than the composer is the column's claim on the keys:
+    /// opening it themselves is what claims them; Esc, the toggle, and the
     /// Session they attach hand them back.
-    focused: bool,
-    /// Whether the Settings that seed the Sidebar have had their say. Only the
-    /// first snapshot
-    /// seeds: every later one carries some other Setting's edit, and a reader
-    /// who toggled the Sidebar since should not have it flipped back under
-    /// them.
-    seeded: bool,
-    /// The width the reader wants, independently of how many columns the
-    /// current frame can spare. Seeded once from the launch Setting; a draw
-    /// clamps a copy and leaves this choice whole.
-    chosen_width: u64,
-    /// The width the last frame actually drew. Incremental commands move the
-    /// visible edge from here, so they stop at both draw-time floors and a
-    /// command after a terminal clamp still moves one visible column.
-    drawn_width: Cell<Option<u16>>,
-    /// The widest the last frame could draw while keeping the main view at
-    /// its floor. Kept with the drawn width so widening at that boundary does
-    /// not create a latent choice that appears only after a later resize.
-    drawn_width_limit: Cell<Option<u16>>,
-    /// Whether the reader is holding the Sidebar's edge. This is pointer
-    /// interaction state, separate from both key ownership and row focus.
-    edge_held: bool,
+    column: SideColumn,
     /// When a Session settles without anyone saying so. Adopted from every
     /// snapshot rather than seeded from the first, because unlike the two
     /// Settings that seed the Sidebar this one governs what the Sidebar shows for as long as it is
@@ -262,11 +195,6 @@ pub(super) struct Sidebar {
     /// so only that request's answer can alter the merged listing.
     everywhere_remote_dispatch_pending: bool,
     pending_everywhere_remotes: Option<u64>,
-    /// Whether the last frame had the columns to draw the Sidebar. Only a
-    /// frame can answer that, so each one records it here and input routing
-    /// reads it back: a Sidebar squeezed off a narrow terminal keeps the
-    /// reader's focus but cannot act on it.
-    on_screen: Cell<bool>,
     /// The entry the column's window opens on. Only a frame knows how many
     /// lines it holds, so the window is settled at draw time and remembered
     /// here: an anchor moving to a row already in view leaves it where it
@@ -628,12 +556,9 @@ impl SidebarEntry<'_> {
 #[derive(Clone, Debug, Default)]
 pub(super) struct SidebarGeometry {
     /// The columns inside the Sidebar's own rule, so a press on the rule
-    /// itself or out in the main view lands on nothing.
+    /// itself or out in the main view lands on nothing. The edge's grab zone
+    /// is the column's, not the Sidebar's: see [`SideColumn`].
     columns: Range<u16>,
-    /// The edge's three-column grab zone: the rule and one column on either
-    /// side. It exists only in geometry recorded by a frame that drew the
-    /// Sidebar beside the main view.
-    edge: Option<Range<u16>>,
     /// The entries the body drew, top to bottom. The divider draws no span:
     /// it stands for nothing to press.
     rows: Vec<SidebarSpan>,
@@ -922,16 +847,8 @@ impl Sidebar {
             execution_directory: Some(current_workspace.path.clone()),
             // Down until the initial-visibility Setting raises it. A Sidebar with no
             // Settings in hand has not spoken to a server either, so it has
-            // nothing to list; drawing one before the snapshot lands would put
-            // an empty column on screen and take it away again for a reader
-            // who configured it hidden.
-            revealed: false,
-            focused: false,
-            seeded: false,
-            chosen_width: 32,
-            drawn_width: Cell::new(None),
-            drawn_width_limit: Cell::new(None),
-            edge_held: false,
+            // nothing to list.
+            column: SideColumn::new(Side::Left),
             auto_settle: AutoSettle::default(),
             show_icons: false,
             scope: SidebarListingScope::AllWorkspaces,
@@ -953,9 +870,6 @@ impl Sidebar {
             everywhere_remote_sequence: 0,
             everywhere_remote_dispatch_pending: false,
             pending_everywhere_remotes: None,
-            // Until a frame says otherwise, which it does before anything the
-            // reader types can reach a surface.
-            on_screen: Cell::new(true),
             window_start: Cell::new(0),
             drawn_body: RefCell::new(None),
             wheeled_from: RefCell::new(None),
@@ -974,11 +888,9 @@ impl Sidebar {
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
         self.auto_settle = settings.sidebar.auto_settle;
         self.show_icons = settings.appearance.show_icons;
-        if self.seeded {
+        if !self.column.seed(settings.sidebar.initial_width) {
             return;
         }
-        self.seeded = true;
-        self.chosen_width = settings.sidebar.initial_width;
         self.scope = match settings.sidebar.initial_scope {
             InitialSidebarScope::Everywhere => SidebarListingScope::Everywhere,
             InitialSidebarScope::AllWorkspaces => SidebarListingScope::AllWorkspaces,
@@ -989,62 +901,43 @@ impl Sidebar {
         self.reveal(settings.sidebar.initial_visibility == SidebarVisibility::Shown);
     }
 
-    pub(super) fn chosen_width(&self) -> u64 {
-        self.chosen_width
+    /// The column the Sidebar stands in, whose chrome — width, edge, and
+    /// whether the frame drew it — input routing and drawing read directly.
+    pub(super) const fn column(&self) -> &SideColumn {
+        &self.column
     }
 
-    /// Sets a freely chosen width. The Sidebar floor is part of every valid
-    /// choice; the frame-dependent upper clamp remains a draw-time concern so
-    /// a wider terminal can reveal the choice whole later.
-    pub(super) fn set_width(&mut self, columns: u64) {
-        self.chosen_width = columns.max(u64::from(MINIMUM_SIDEBAR_WIDTH));
+    /// The column the Sidebar stands in, for resizing it and holding its edge.
+    pub(super) fn column_mut(&mut self) -> &mut SideColumn {
+        &mut self.column
     }
 
-    /// Moves the drawn edge one column where the current frame has room.
-    pub(super) fn widen(&mut self) {
-        if !self.revealed {
-            return;
-        }
-        let Some(drawn) = self.drawn_width.get() else {
-            return;
-        };
-        let Some(limit) = self.drawn_width_limit.get() else {
-            return;
-        };
-        if drawn < limit {
-            self.chosen_width = u64::from(drawn + 1);
-        }
-    }
-
-    /// Moves the drawn edge one column left, stopping at the Sidebar floor.
-    pub(super) fn narrow(&mut self) {
-        if !self.revealed {
-            return;
-        }
-        let Some(drawn) = self.drawn_width.get() else {
-            return;
-        };
-        self.chosen_width = u64::from(drawn.saturating_sub(1).max(MINIMUM_SIDEBAR_WIDTH));
-    }
-
-    /// Shows the Sidebar, or hides it. This is view state and nothing more: the
+    /// The Sidebar's show/hide act. This is view state and nothing more: the
     /// initial-visibility Setting is not rewritten.
     ///
-    /// A reader who opens the Sidebar is asking to drive it, so it takes the
-    /// keys — and with them the row focus that says what Enter would act on,
-    /// seeded from the Session the main view has open. Closing hands both
-    /// back. The initial-visibility Setting's own
-    /// reveal in [`Self::adopt_settings`] does neither, because a reader who has not touched the
-    /// Sidebar is typing their first Prompt.
+    /// The act brings the reader into the Sidebar as well as showing it, so
+    /// reaching a Sidebar already on screen never costs them their place:
+    /// asked for while it is hidden it shows and takes the keys — and with
+    /// them the row focus that says what Enter would act on, seeded from the
+    /// Session the main view has open — while it is shown without them it
+    /// takes them, and only while it holds them does it hide and hand them
+    /// back. The initial-visibility Setting's own reveal in
+    /// [`Self::adopt_settings`] takes nothing, because a reader who has not
+    /// touched the Sidebar is typing their first Prompt.
     pub(super) fn toggle(&mut self, open: Option<&SessionReference>) {
-        self.reveal(!self.revealed);
-        if self.revealed {
-            self.enter(open);
-        } else {
-            // Closing is one of the ways out of the Sidebar, so it leaves by
-            // the same door the others do — and a Sidebar nobody can see is
-            // not one holding a query on the reader's behalf.
-            self.hand_back_keys();
+        match self.column.toggle_step() {
+            ToggleStep::Show => {
+                self.reveal(true);
+                self.enter(open);
+            }
+            ToggleStep::TakeKeys => self.enter(open),
+            ToggleStep::Hide => {
+                self.reveal(false);
+                // Closing is one of the ways out of the Sidebar, so it leaves
+                // by the same door the others do — and a Sidebar nobody can
+                // see is not one holding a query on the reader's behalf.
+                self.hand_back_keys();
+            }
         }
     }
 
@@ -1053,7 +946,7 @@ impl Sidebar {
     /// selector otherwise, so entering has a starting point without the
     /// Sidebar having to pretend some Session is selected.
     fn enter(&mut self, open: Option<&SessionReference>) {
-        self.focused = true;
+        self.column.take_keys();
         self.seed_focus(open);
     }
 
@@ -1143,7 +1036,7 @@ impl Sidebar {
     /// answers to Enter any more — a mark left standing would be the Sidebar
     /// claiming a Session the reader is not in.
     pub(super) fn hand_back_keys(&mut self) {
-        self.focused = false;
+        self.column.hand_back_keys();
         self.menu = None;
         // A path entry is a line the reader was typing into, and they have
         // stopped typing.
@@ -1159,90 +1052,23 @@ impl Sidebar {
     /// spare the columns for is not one they can be driving, whatever they last
     /// asked for, so the composer keeps the keys until the terminal widens.
     pub(super) fn has_focus(&self) -> bool {
-        self.focused && self.on_screen.get()
+        self.column.has_keys()
     }
 
     /// Gives up what the last frame recorded, so the geometry input routing
     /// reads is always the one on screen.
     pub(super) fn forget_frame(&self) {
-        self.on_screen.set(false);
-        self.drawn_width.set(None);
-        self.drawn_width_limit.set(None);
+        self.column.forget_frame();
         self.geometry.replace(SidebarGeometry::default());
         self.drawn_body.replace(None);
     }
 
-    /// Records that this frame found the columns for the Sidebar and drew it.
-    pub(super) fn record_drawn(&self, width: u16, width_limit: u16) {
-        self.on_screen.set(true);
-        self.drawn_width.set(Some(width));
-        self.drawn_width_limit.set(Some(width_limit));
-    }
-
     /// Takes the geometry the frame just drew its body in, which is the only
     /// account of the Sidebar a press can be resolved against.
-    pub(super) fn record_geometry(
-        &self,
-        columns: Range<u16>,
-        edge: Range<u16>,
-        rows: Vec<SidebarSpan>,
-    ) {
+    pub(super) fn record_geometry(&self, columns: Range<u16>, rows: Vec<SidebarSpan>) {
         let mut geometry = self.geometry.borrow_mut();
         geometry.columns = columns;
-        geometry.edge = Some(edge);
         geometry.rows = rows;
-    }
-
-    /// Begins holding the edge where the last frame drew its grab zone.
-    /// Returns false when that frame drew no Sidebar or the press missed it.
-    pub(super) fn hold_edge_at(&mut self, position: Position) -> bool {
-        let hit = self
-            .geometry
-            .borrow()
-            .edge
-            .as_ref()
-            .is_some_and(|edge| edge.contains(&position.x));
-        if hit {
-            self.edge_held = true;
-        }
-        hit
-    }
-
-    pub(super) const fn edge_is_held(&self) -> bool {
-        self.edge_held
-    }
-
-    /// Resolves a held edge's pointer column to a chosen Sidebar width under
-    /// the last frame's two floors. Unlike an explicit set-width command, a
-    /// drag stops at the room that frame actually offered rather than keeping
-    /// an over-limit choice for a later, wider frame.
-    pub(super) fn width_at_held_edge(&self, position: Position) -> Option<u64> {
-        if !self.edge_held {
-            return None;
-        }
-        let limit = u64::from(self.drawn_width_limit.get()?);
-        Some(
-            (u64::from(position.x) + 1)
-                .max(u64::from(MINIMUM_SIDEBAR_WIDTH))
-                .min(limit),
-        )
-    }
-
-    /// Whether this cell is the first one beyond the grab zone in the main
-    /// view. The Session Content Column begins after layout padding, but this
-    /// boundary cell retains the ordinary Text Selection behavior promised
-    /// immediately outside the edge.
-    pub(super) fn borders_edge_on_main_side(&self, position: Position) -> bool {
-        self.geometry
-            .borrow()
-            .edge
-            .as_ref()
-            .is_some_and(|edge| position.x == edge.end)
-    }
-
-    /// Releases a held edge and reports whether this release belonged to it.
-    pub(super) fn release_edge(&mut self) -> bool {
-        std::mem::take(&mut self.edge_held)
     }
 
     /// Takes the geometry the frame drew the context menu in, which is drawn
@@ -1459,12 +1285,12 @@ impl Sidebar {
     /// the keys — the reader keeps the menu they opened, as they keep the
     /// focus, and both come back when the terminal widens.
     pub(super) fn menu_is_open(&self) -> bool {
-        self.menu.is_some() && self.on_screen.get()
+        self.menu.is_some() && self.column.is_on_screen()
     }
 
     /// The menu as a frame draws it, and `None` where there is none to draw.
     pub(super) fn menu(&self) -> Option<SidebarMenuView> {
-        if !self.on_screen.get() {
+        if !self.column.is_on_screen() {
             return None;
         }
         let menu = self.menu.as_ref()?;
@@ -1579,7 +1405,7 @@ impl Sidebar {
     /// the one such — keeps what it set, because by then the reader is
     /// driving the Sidebar after all.
     fn release_borrowed_focus(&mut self) {
-        if !self.focused {
+        if !self.column.claims_keys() {
             self.focus = None;
         }
     }
@@ -1610,18 +1436,8 @@ impl Sidebar {
     /// Hiding keeps what it holds: nothing is looking at it, and revealing
     /// again asks anyway.
     fn reveal(&mut self, revealed: bool) {
-        self.revealed = revealed;
-        if !revealed {
-            self.edge_held = false;
-        }
+        self.column.set_revealed(revealed);
         if revealed {
-            // A reader opening the Sidebar can type into it before the next
-            // frame is drawn: the run loop takes a whole run of terminal events
-            // at once, so the toggle and the arrow after it are handled with no
-            // draw between them. The Sidebar assumes it has the columns until a
-            // frame reports otherwise, so that run reaches the surface the
-            // reader just opened.
-            self.on_screen.set(true);
             // A query belongs to the look the reader was taking, and a Sidebar
             // coming into view is the start of another one — so it opens on
             // the whole body of work, as the settled shelf opens on its first
@@ -1693,7 +1509,9 @@ impl Sidebar {
         } else {
             outlook == *self.listing.outlook()
         };
-        if !participates || (!self.revealed && self.scope != SidebarListingScope::Everywhere) {
+        if !participates
+            || (!self.column.is_revealed() && self.scope != SidebarListingScope::Everywhere)
+        {
             return;
         }
         self.asked_afresh = false;
@@ -1723,7 +1541,7 @@ impl Sidebar {
     /// Whether the reader wants the Sidebar on screen, which is not the same
     /// question as whether the frame has room for it.
     pub(super) const fn is_revealed(&self) -> bool {
-        self.revealed
+        self.column.is_revealed()
     }
 
     /// Whether a row the Sidebar has on screen is running work, which is what
@@ -1739,8 +1557,8 @@ impl Sidebar {
     /// armed exactly while something listed is live and an idle TUI schedules
     /// zero wakeups (ADR 0007, ADR 0009).
     pub(super) fn shows_live_work(&self) -> bool {
-        self.revealed
-            && self.on_screen.get()
+        self.column.is_revealed()
+            && self.column.is_on_screen()
             && self.body().into_iter().any(|entry| match entry {
                 BodyEntry::Session(session, _) => session.working_since().is_some(),
                 BodyEntry::Spacer
@@ -1915,7 +1733,7 @@ impl Sidebar {
             // So row focus is seeded again — where the reader is driving the
             // column. A Sidebar revealed by its Setting is driving nothing and
             // is left pointing at nothing.
-            if self.focused {
+            if self.column.claims_keys() {
                 self.seed_focus(open);
             }
             return;
@@ -2121,7 +1939,7 @@ impl Sidebar {
     /// can type into is no entry at all.
     fn open_workspace_entry(&mut self) {
         self.close_selector();
-        self.focused = true;
+        self.column.take_keys();
         self.focus = Some(SidebarFocus::AddWorkspace);
         self.workspace_entry = Some(WorkspaceEntry::default());
     }
@@ -2226,7 +2044,7 @@ impl Sidebar {
         self.awaiting_dispatch.clear();
         self.everywhere_remote_dispatch_pending = false;
         self.pending_everywhere_remotes = None;
-        if !self.revealed {
+        if !self.column.is_revealed() {
             return;
         }
         if self.scope == SidebarListingScope::Everywhere
@@ -2269,7 +2087,7 @@ impl Sidebar {
     /// Everywhere Sidebar lists every Workspace and needs nothing from the
     /// resolution.
     pub(super) fn refresh_after_outlook_workspace(&mut self) {
-        if !self.revealed || self.scope == SidebarListingScope::Everywhere {
+        if !self.column.is_revealed() || self.scope == SidebarListingScope::Everywhere {
             return;
         }
         self.revisit_origin_on_show();
@@ -3262,8 +3080,7 @@ mod tests {
             commands::SemanticCommandId,
             sidebar::{
                 SessionStanding, Sidebar, SidebarActivation, SidebarEntry, SidebarPress,
-                SidebarSpan, SidebarTarget, StandingInputs, session_standing, width_beside,
-                workspace_name,
+                SidebarSpan, SidebarTarget, StandingInputs, session_standing, workspace_name,
             },
             state::WHEEL_SCROLL_ROWS,
         },
@@ -3354,7 +3171,6 @@ mod tests {
 
         sidebar.record_geometry(
             0..32,
-            30..33,
             vec![SidebarSpan {
                 rows: 1..4,
                 columns: None,
@@ -3497,13 +3313,19 @@ mod tests {
 
         sidebar.toggle(None);
         assert!(
-            !sidebar.has_focus(),
+            sidebar.is_revealed() && sidebar.has_focus(),
+            "reaching a Sidebar already on screen takes the keys without hiding it"
+        );
+
+        sidebar.toggle(None);
+        assert!(
+            !sidebar.is_revealed() && !sidebar.has_focus(),
             "the toggle that closes it holds nothing"
         );
 
         sidebar.toggle(None);
         assert!(
-            sidebar.has_focus(),
+            sidebar.is_revealed() && sidebar.has_focus(),
             "opening the Sidebar is the reader asking to drive it"
         );
 
@@ -3528,7 +3350,9 @@ mod tests {
             "a Sidebar squeezed off a narrow terminal cannot act on the focus it keeps"
         );
 
-        sidebar.record_drawn(32, 46);
+        sidebar
+            .column()
+            .record_drawn(ratatui::layout::Rect::new(0, 0, 32, 20), 46);
 
         assert!(
             sidebar.has_focus(),
@@ -3631,15 +3455,6 @@ mod tests {
             "the reader is already in this Session, so Enter means only that they are done"
         );
         assert!(!sidebar.is_attaching());
-    }
-
-    #[test]
-    fn the_drawn_width_clamps_without_changing_the_chosen_width() {
-        assert_eq!(width_beside(40, 100), Some(40));
-        assert_eq!(width_beside(60, 100), Some(46));
-        assert_eq!(width_beside(60, 78), Some(24));
-        assert_eq!(width_beside(60, 77), None);
-        assert_eq!(width_beside(1_000_000, u16::MAX), Some(65_481));
     }
 
     #[test]
@@ -4125,7 +3940,7 @@ mod tests {
     fn the_wheel_answers_over_the_sidebar_and_nowhere_else() {
         let mut sidebar = showing(set_aside_shelf(12));
         let _ = drawn_within(&sidebar, 5);
-        sidebar.record_geometry(0..32, 30..33, Vec::new());
+        sidebar.record_geometry(0..32, Vec::new());
 
         assert!(
             !sidebar.wheel_at(
@@ -4165,7 +3980,6 @@ mod tests {
         let opening = drawn_within(&sidebar, 5);
         sidebar.record_geometry(
             0..32,
-            30..33,
             vec![SidebarSpan {
                 rows: 3..4,
                 columns: None,
@@ -4374,7 +4188,9 @@ mod tests {
             "a Sidebar the frame found no columns for animates nothing"
         );
 
-        sidebar.record_drawn(32, 46);
+        sidebar
+            .column()
+            .record_drawn(ratatui::layout::Rect::new(0, 0, 32, 20), 46);
         sidebar.toggle(None);
 
         assert!(
@@ -4493,8 +4309,7 @@ mod tests {
         let mut sidebar = Sidebar::new(root());
         sidebar.adopt_settings(&settling_nothing());
         // The Setting revealed it without taking the keys, so the reader
-        // closes it and opens it themselves.
-        sidebar.toggle(None);
+        // reaches it themselves.
         sidebar.toggle(None);
         let request = sidebar
             .take_listing_request()

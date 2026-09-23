@@ -732,6 +732,11 @@ fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
     assert_eq!(
         press_toggle(&mut application),
         ApplicationTransition::Continue,
+        "reaching the Sidebar the Setting showed asks the server for nothing"
+    );
+    assert_eq!(
+        press_toggle(&mut application),
+        ApplicationTransition::Continue,
         "hiding the Sidebar asks the server for nothing, least of all a Setting edit"
     );
     let hidden = rendered_application_rows_at(&application, WIDE, 20);
@@ -759,6 +764,123 @@ fn ctrl_b_hides_the_sidebar_and_shows_it_again_without_touching_the_setting() {
     );
 }
 
+// Ctrl+B's three-way rule: a hidden Sidebar is shown and takes the keys, one
+// shown without the keys takes them and stays, and only one holding the keys
+// hides and hands them back. Where the keys are is read off where typing
+// lands: the Sidebar's search box, or the composer.
+
+#[test]
+fn ctrl_b_shows_a_hidden_sidebar_and_gives_it_the_keys() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_initial_visibility(&mut application, SidebarVisibility::Hidden);
+
+    let request = expect_sidebar_listing(press_toggle(&mut application));
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed("Listed work", workspace.path(), 1, now())],
+        })
+        .expect("hydrate the Sidebar the toggle showed");
+    type_terminal_text(&mut application, "zz");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(sidebar_is_drawn(&rows), "the Sidebar is shown: {rows:?}");
+    assert!(
+        drawn_in_sidebar(&rows, "Search: zz"),
+        "and what the reader types next goes to it: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Type a prompt")),
+        "leaving the composer untouched: {rows:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_gives_a_sidebar_shown_without_the_keys_the_keys_and_leaves_it_shown() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", workspace.path(), 1, now())],
+    );
+    enter_session(&mut application, workspace.path());
+
+    assert_eq!(
+        press_toggle(&mut application),
+        ApplicationTransition::Continue,
+        "reaching a Sidebar already on screen asks the server for nothing"
+    );
+    type_terminal_text(&mut application, "zz");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_is_drawn(&rows),
+        "the Sidebar the reader reached stays on screen: {rows:?}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Search: zz"),
+        "and holds the keys: {rows:?}"
+    );
+    assert!(
+        !main_view(&application).contains("zz"),
+        "so nothing the reader types reaches the composer"
+    );
+}
+
+#[test]
+fn ctrl_b_hides_a_sidebar_holding_the_keys_and_hands_them_back() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", workspace.path(), 1, now())],
+    );
+    enter_session(&mut application, workspace.path());
+    press_toggle(&mut application);
+
+    assert_eq!(
+        press_toggle(&mut application),
+        ApplicationTransition::Continue,
+        "hiding the Sidebar asks the server for nothing"
+    );
+    type_terminal_text(&mut application, "zz");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        !sidebar_is_drawn(&rows),
+        "the second press hides the Sidebar the first reached: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("zz")),
+        "and hands the keys back to the composer: {rows:?}"
+    );
+}
+
+#[test]
+fn a_sidebar_the_setting_reveals_leaves_the_keys_with_the_composer() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed("Listed work", workspace.path(), 1, now())],
+    );
+
+    type_terminal_text(&mut application, "zz");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(sidebar_is_drawn(&rows), "the Setting shows the Sidebar");
+    assert!(
+        !drawn_in_sidebar(&rows, "Search: zz"),
+        "without giving it the keys: {rows:?}"
+    );
+    assert!(
+        main_view(&application).contains("zz"),
+        "a reader who has not touched the Sidebar is typing their first Prompt"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "and no row focus is painted in a Sidebar without the keys"
+    );
+}
+
 #[test]
 fn the_slash_command_toggles_the_same_sidebar_the_keybinding_does() {
     let workspace = workspace_dir();
@@ -776,10 +898,19 @@ fn the_slash_command_toggles_the_same_sidebar_the_keybinding_does() {
         .expect("select /sidebar");
 
     assert!(
-        !rendered_application_rows_at(&application, WIDE, 20)
+        rendered_application_rows_at(&application, WIDE, 20)
             .iter()
             .any(|row| row.contains("Listed work")),
-        "the slash command hides the Sidebar the keybinding hides"
+        "the slash command leaves a Sidebar on screen standing, as the keybinding does"
+    );
+    assert!(
+        !selected_sidebar_text(&application).is_empty(),
+        "and gives it the keys the keybinding gives it"
+    );
+    press_toggle(&mut application);
+    assert!(
+        !sidebar_is_drawn(&rendered_application_rows_at(&application, WIDE, 20)),
+        "so the keybinding's next press hides the Sidebar the slash command reached"
     );
 }
 
@@ -809,7 +940,7 @@ fn a_sidebar_the_setting_hides_is_absent_until_the_reader_asks_for_it() {
 fn a_later_settings_snapshot_leaves_the_readers_own_choice_alone() {
     let workspace = workspace_dir();
     let mut application = sidebar_showing(workspace.path(), Vec::new());
-    press_toggle(&mut application);
+    hide_the_revealed_sidebar(&mut application);
 
     deliver_initial_visibility(&mut application, SidebarVisibility::Shown);
 
@@ -1047,10 +1178,7 @@ fn hidden_incremental_commands_do_nothing_and_hide_show_keeps_a_set_width() {
     );
     assert_eq!(drawn_sidebar_width(&application, 120), Some(50));
 
-    assert_eq!(
-        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarToggle),
-        ApplicationTransition::Continue
-    );
+    hide_the_revealed_sidebar(&mut application);
     assert_eq!(
         invoke_sidebar_width(&mut application, SemanticCommandId::SidebarWiden),
         ApplicationTransition::Continue
@@ -1269,10 +1397,7 @@ fn dragging_the_held_edge_reflows_the_sidebar_and_main_view_until_release() {
     );
     assert_ne!(released[(39, 0)].fg, Color::Cyan);
 
-    assert_eq!(
-        invoke_sidebar_width(&mut application, SemanticCommandId::SidebarToggle),
-        ApplicationTransition::Continue
-    );
+    hide_the_revealed_sidebar(&mut application);
     answer_sidebar_reveal(&mut application);
     assert_eq!(
         drawn_sidebar_width(&application, WIDE),
@@ -2059,6 +2184,34 @@ fn deliver_sidebar_settings(
             ..EffectiveSettings::default()
         },
     )
+}
+
+/// Puts away the Sidebar standing on screen and shows it again with the
+/// toggle, returning the listing that showing asks for. Ctrl+B hides only a
+/// Sidebar holding the keys, so one standing without them is reached first:
+/// a Sidebar the reader is already driving takes two presses to reopen, and
+/// one the Setting revealed takes three.
+fn reopen_the_sidebar(application: &mut Application) -> suru::tui::SessionListRequest {
+    for _ in 0..3 {
+        let transition = press_toggle(application);
+        if matches!(transition, ApplicationTransition::ListSessions(_)) {
+            return expect_sidebar_listing(transition);
+        }
+    }
+    panic!("three presses of the toggle reach, hide, and show any Sidebar on screen");
+}
+
+/// Hides a Sidebar standing on screen without the keys, as the
+/// initial-visibility Setting's reveal leaves it. The toggle hides only a
+/// Sidebar holding the keys, so its first press reaches the Sidebar and the
+/// second hides it; neither asks the server for anything.
+fn hide_the_revealed_sidebar(application: &mut Application) {
+    for _ in 0..2 {
+        assert_eq!(
+            invoke_sidebar_width(application, SemanticCommandId::SidebarToggle),
+            ApplicationTransition::Continue
+        );
+    }
 }
 
 fn press_toggle(application: &mut Application) -> ApplicationTransition {
@@ -3041,11 +3194,10 @@ fn open_subagent_session(application: &mut Application, workspace: &Path, parent
         .expect("open a Subagent's Session in the main view");
 }
 
-/// Opens the Sidebar the way the reader does — the toggle, which takes the
-/// keys — and answers the listing that opening asks for.
+/// Opens the Sidebar afresh the way the reader does — the toggle, which takes
+/// the keys — and answers the listing that opening asks for.
 fn enter_the_sidebar(application: &mut Application, sessions: Vec<SessionListItem>) {
-    press_toggle(application);
-    let request = expect_sidebar_listing(press_toggle(application));
+    let request = reopen_the_sidebar(application);
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
         .expect("hydrate the Sidebar the reader opened");
@@ -3659,8 +3811,7 @@ fn a_listing_refreshed_with_a_settled_marker_moves_the_session_onto_the_shelf() 
 
     // Hiding and showing the Sidebar is what asks the server afresh, so this
     // is a whole listing landing rather than a change announced in place.
-    press_toggle(&mut application);
-    let request = expect_sidebar_listing(press_toggle(&mut application));
+    let request = reopen_the_sidebar(&mut application);
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
@@ -4053,8 +4204,7 @@ fn a_sidebar_asking_for_its_sessions_afresh_opens_the_shelf_on_its_first_rows() 
         "the reader revealed the whole of the shelf"
     );
 
-    press_toggle(&mut application);
-    let request = expect_sidebar_listing(press_toggle(&mut application));
+    let request = reopen_the_sidebar(&mut application);
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
@@ -4551,8 +4701,7 @@ fn a_sidebar_coming_back_into_view_opens_on_the_whole_list_again() {
     let mut application = sidebar_focused(workspace.path(), sessions.clone());
     type_terminal_text(&mut application, "shell");
 
-    press_toggle(&mut application);
-    let request = expect_sidebar_listing(press_toggle(&mut application));
+    let request = reopen_the_sidebar(&mut application);
     application
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
         .expect("hydrate the Sidebar it asked for afresh");
@@ -7414,8 +7563,7 @@ fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
 
     // And the Sidebar goes on drawing the work the server reports there, which
     // it reports under the canonical Workspace.
-    press_toggle(&mut application);
-    let listing = expect_sidebar_listing(press_toggle(&mut application));
+    let listing = reopen_the_sidebar(&mut application);
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request: listing,
@@ -7842,7 +7990,7 @@ fn a_sidebar_the_reader_closed_asks_for_nothing() {
             1,
         )],
     );
-    press_toggle(&mut application);
+    hide_the_revealed_sidebar(&mut application);
 
     let made = SessionId::new();
     assert_eq!(

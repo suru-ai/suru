@@ -63,6 +63,7 @@ use super::{
     serve_overlay::ServeOverlay,
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
+    side_column::ToggleStep,
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
     subagent_picker::{SubagentPicker, working_subagents},
@@ -5037,7 +5038,7 @@ impl Application {
                 // remain newer surfaces and keep their existing routing.
                 if self.state.top_selection_overlay().is_none()
                     && !self.state.overlay_owns_input()
-                    && self.state.sidebar.hold_edge_at(position)
+                    && self.state.sidebar.column_mut().hold_edge_at(position)
                 {
                     self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
                     self.state.left_press = None;
@@ -5114,7 +5115,7 @@ impl Application {
                 subject: SemanticSubject::ScreenPosition(position),
             }),
             CommandId::ReleaseAt { position } => {
-                if self.state.sidebar.release_edge() {
+                if self.state.sidebar.column_mut().release_edge() {
                     // Reset is decided by the press count. Release merely
                     // ends the held paint and cannot become a row click or a
                     // Text Selection copy.
@@ -6140,15 +6141,14 @@ impl Application {
         command: SemanticCommandId,
     ) -> ApplicationTransition {
         match command {
-            SemanticCommandId::SidebarWiden => self.state.sidebar.widen(),
-            SemanticCommandId::SidebarNarrow => self.state.sidebar.narrow(),
+            SemanticCommandId::SidebarWiden => self.state.sidebar.column_mut().widen(),
+            SemanticCommandId::SidebarNarrow => self.state.sidebar.column_mut().narrow(),
             SemanticCommandId::SidebarWidthSet { columns } => {
-                self.state.sidebar.set_width(columns);
+                self.state.sidebar.column_mut().set_width(columns);
             }
             SemanticCommandId::SidebarWidthReset => {
-                self.state
-                    .sidebar
-                    .set_width(self.state.settings.sidebar.initial_width);
+                let initial_width = self.state.settings.sidebar.initial_width;
+                self.state.sidebar.column_mut().set_width(initial_width);
             }
             _ => {}
         }
@@ -7055,7 +7055,12 @@ impl Application {
         // padding leaves its first painted cell one column farther right.
         // Map only that boundary cell; the rest of a centered gutter remains
         // inert as ADR 0012 requires.
-        let position = if self.state.sidebar.borders_edge_on_main_side(position) {
+        let position = if self
+            .state
+            .sidebar
+            .column()
+            .borders_edge_on_main_side(position)
+        {
             Position::new(viewport.content_left, position.y)
         } else {
             position
@@ -7315,7 +7320,7 @@ impl Application {
                     })
             }
             SemanticCommandId::PointerDrag => {
-                if self.state.sidebar.edge_is_held() {
+                if self.state.sidebar.column().edge_is_held() {
                     let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
                         return Ok(ApplicationTransition::Continue);
                     };
@@ -7324,7 +7329,8 @@ impl Application {
                     // that rule directly under the pointer. The Sidebar
                     // resolves that choice under the last frame's floors,
                     // then the semantic setter owns the view-state mutation.
-                    let Some(columns) = self.state.sidebar.width_at_held_edge(*position) else {
+                    let Some(columns) = self.state.sidebar.column().width_at_held_edge(*position)
+                    else {
                         return Ok(ApplicationTransition::Continue);
                     };
                     return self.invoke_semantic(SemanticCommandId::SidebarWidthSet { columns });
@@ -7924,9 +7930,12 @@ impl Application {
             | SemanticCommandId::SidebarMenuSelect
             | SemanticCommandId::SidebarMenuClose) => self.handle_sidebar_menu_command(command),
             SemanticCommandId::SidebarToggle => {
-                let cancelled = self
-                    .state
-                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
+                // Reaching a Sidebar already on screen takes nothing from it;
+                // showing or hiding it gives up a path the reader had offered.
+                let cancelled = self.state.sidebar.column().toggle_step() != ToggleStep::TakeKeys
+                    && self
+                        .state
+                        .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
                 let open = self.state.route.clone();
                 self.state.sidebar.toggle(open.as_ref());
                 self.state.command_mode = CommandMode::Composer;
