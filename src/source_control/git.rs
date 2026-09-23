@@ -405,7 +405,8 @@ impl SourceControl for GitSourceControl {
         &self,
         id: PreparationId,
         source: &ResolvedWorkspace,
-        description: &str,
+        name: &str,
+        reserved: &[PathBuf],
     ) -> Result<PreparedCheckout, String> {
         let repository = source
             .workspace
@@ -463,15 +464,13 @@ impl SourceControl for GitSourceControl {
         if confirmed_reference != source_reference || confirmed_commit.as_deref() != Some(&commit) {
             return Err("The source checkout changed while its Worktree was being planned; retry preparation".into());
         }
-        let description = portable_description(description);
-        for _ in 0..32 {
-            let name = format!(
-                "{description}-{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            );
-            let branch = format!("suru/{name}");
+        for name in super::naming::numbered(name) {
+            let branch = format!("{}{name}", super::naming::BRANCH_PREFIX);
             let destination = root.join(MANAGED_WORKTREE_DIRECTORY).join(&name);
-            if destination.exists()
+            // Whatever holds a name keeps it: an occupied location (even a
+            // dangling link), a branch, or another stored intention's plan.
+            if std::fs::symlink_metadata(&destination).is_ok()
+                || reserved.contains(&destination)
                 || self
                     .text(
                         source_path,
@@ -1136,32 +1135,6 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Entry> {
         }
     }
     result
-}
-
-fn portable_description(prompt: &str) -> String {
-    let mut value = String::new();
-    for word in prompt
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-    {
-        if !value.is_empty() {
-            value.push('-');
-        }
-        value.extend(
-            word.to_ascii_lowercase()
-                .chars()
-                .take(40usize.saturating_sub(value.len())),
-        );
-        if value.len() >= 40 {
-            break;
-        }
-    }
-    let value = value.trim_matches('-');
-    if value.is_empty() {
-        "work".to_owned()
-    } else {
-        value.to_owned()
-    }
 }
 
 /// An unfinished recovery must not replace the durable revision it is restoring.

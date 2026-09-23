@@ -1461,7 +1461,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         Ok(request) => request,
         Err(response) => return response,
     };
-    if request.description.trim().is_empty() {
+    if request.prompt.text.trim().is_empty() {
         return preparation_error("Prompt must contain non-whitespace text");
     }
     // A dropped handler leaves no response and no final record; the guard logs that so a
@@ -1476,7 +1476,11 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
             progress.stage("resuming retained preparation");
             plan
         }
-        Ok(None) => match state.source_control.plan_checkout(&request).await {
+        Ok(None) => match state
+            .source_control
+            .plan_checkout(&request, &state.preparations.intended_destinations())
+            .await
+        {
             Ok((plan, guard)) => {
                 planned_guard = Some(guard);
                 if let Err(e) = state.preparations.save(&plan) {

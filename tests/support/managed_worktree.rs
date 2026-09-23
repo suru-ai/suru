@@ -37,7 +37,10 @@ pub async fn prepare(client: &ManagedClient, source: &Path, provider: &str) -> P
             source: ExecutionDirectory {
                 path: source.to_owned(),
             },
-            description: "Native prepared startup".to_owned(),
+            prompt: PreparationPrompt {
+                text: "Native prepared startup".to_owned(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new(provider),
         })
         .await

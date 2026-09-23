@@ -144,7 +144,7 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
         if point == Point::CheckoutCreated {
             std::fs::remove_dir_all(&captured.destination.path).unwrap(); // Own stale registration, not global prune.
         }
-        request.description = "Edited draft after replacement".into();
+        request.prompt.text = "Edited draft after replacement".into();
         let server = server::spawn_with_source_control(
             config,
             vec![runtime],
@@ -200,6 +200,58 @@ async fn restart_reconciles_each_git_preparation_window_and_duplicate_edited_ret
         assert!(provider.try_next_start().is_none());
         server.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn an_unfinished_intention_keeps_its_name_from_a_later_preparation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(root.join("state"), "held-name").unwrap(),
+        vec![runtime],
+        timings(),
+        Arc::new(
+            GitSourceControl::default()
+                .with_preparation_observer(Fault::once(Point::IntentPersisted)),
+        ),
+    )
+    .await
+    .unwrap();
+    // Interrupted before its branch or location exist, the first intention
+    // holds its name only through its stored plan.
+    let first = request(&main, "Fix the parser");
+    let interrupted = prepare(server.descriptor(), &first).await;
+    assert!(interrupted.error.is_some());
+    let container = main.join(".suru-worktrees");
+    assert_eq!(
+        interrupted.preparation.destination.path,
+        container.join("fix-parser")
+    );
+    assert!(!interrupted.preparation.destination.path.exists());
+
+    let later = prepare(server.descriptor(), &request(&main, "Fix the parser")).await;
+    assert_eq!(later.error, None);
+    assert_eq!(branch(&later.preparation), "suru/fix-parser-2");
+    assert_eq!(
+        later.preparation.destination.path,
+        container.join("fix-parser-2")
+    );
+
+    let retried = prepare(server.descriptor(), &first).await;
+    assert_eq!(retried.error, None);
+    assert_eq!(retried.preparation.plan, interrupted.preparation.plan);
+    assert_eq!(branch(&retried.preparation), "suru/fix-parser");
+    assert_eq!(
+        read_git(
+            &retried.preparation.destination.path,
+            &["symbolic-ref", "--short", "HEAD"]
+        ),
+        "suru/fix-parser"
+    );
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -214,12 +214,22 @@ impl Default for PreparationId {
     }
 }
 
+/// The first Prompt a Worktree is being prepared for, as its composer bound
+/// it. The owning Server names the Managed Worktree from this text, leaving out
+/// the markers of its bound Skill Invocations; an unbound `$token` is text.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationPrompt {
+    pub text: String,
+    pub skill_invocations: Vec<super::SkillInvocation>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareCheckoutRequest {
     pub id: PreparationId,
     pub source: ExecutionDirectory,
-    pub description: String,
+    pub prompt: PreparationPrompt,
     pub provider: super::ProviderId,
 }
 

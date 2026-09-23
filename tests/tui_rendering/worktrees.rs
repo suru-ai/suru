@@ -1572,7 +1572,7 @@ fn server_replacement_restores_draft_and_retries_the_same_worktree_intent_after_
     };
     assert_eq!(retry.id, request.id);
     assert_eq!(retry.source, request.source);
-    assert!(retry.description.contains("edited"));
+    assert!(retry.prompt.text.contains("edited"));
     let mut result = prepared(&layout, &retry);
     let intended = result.preparation.intended_session;
     result.preparation.admitted_session = Some(intended);

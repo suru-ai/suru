@@ -167,6 +167,17 @@ impl PreparationStore {
             .collect())
     }
 
+    /// Where every live stored intention means to put its Worktree. A new
+    /// plan never takes one of these, even before its branch or location
+    /// exists, so no intention can be retried into another's name.
+    pub(crate) fn intended_destinations(&self) -> Vec<PathBuf> {
+        self.intentions(UnreadableIntent::Skip, RetiredIntent::Exclude)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|preparation| preparation.destination.path)
+            .collect()
+    }
+
     fn intentions(
         &self,
         unreadable: UnreadableIntent,

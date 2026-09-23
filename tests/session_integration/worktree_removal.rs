@@ -141,7 +141,10 @@ async fn merged_managed_branch_is_previewed_deleted_and_recovers_its_session_det
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "Merged recovery".into(),
+            prompt: PreparationPrompt {
+                text: "Merged recovery".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -582,7 +585,10 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "Remove interrupted preparation".into(),
+            prompt: PreparationPrompt {
+                text: "Remove interrupted preparation".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -686,7 +692,10 @@ async fn removal_retires_an_interrupted_admission_and_restart_keeps_its_prompt_c
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "Remove interrupted admission".into(),
+            prompt: PreparationPrompt {
+                text: "Remove interrupted admission".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()

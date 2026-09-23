@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 mod git;
+pub mod naming;
 mod preparation;
 pub use git::GitSourceControl;
 pub(crate) use preparation::PreparationStore;
@@ -121,11 +122,17 @@ pub trait SourceControl: Send + Sync {
         Err("Preparation ownership retirement is unsupported".into())
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
+    /// Plan a Managed Worktree named from `name`, a fragment already shaped by
+    /// [`naming::name_fragment`]. It takes the first of [`naming::numbered`]
+    /// whose location and branch are free and whose destination is not
+    /// `reserved` by another stored preparation; nothing already holding a
+    /// name is displaced to make room.
     async fn plan_checkout(
         &self,
         _id: crate::protocol::PreparationId,
         _source: &ResolvedWorkspace,
-        _description: &str,
+        _name: &str,
+        _reserved: &[PathBuf],
     ) -> Result<crate::protocol::PreparedCheckout, String> {
         Err("Working-copy creation is unsupported".to_owned())
     }
@@ -386,9 +393,12 @@ impl SourceControlService {
     ) -> Result<(), String> {
         self.adapter.checkpoint(at, plan).await
     }
+    /// Plan the Worktree a preparation request asks for, named from its first
+    /// Prompt without the markers of that Prompt's bound Skill Invocations.
     pub(crate) async fn plan_checkout(
         &self,
         request: &crate::protocol::PrepareCheckoutRequest,
+        reserved: &[PathBuf],
     ) -> Result<
         (
             crate::protocol::PreparedCheckout,
@@ -396,6 +406,10 @@ impl SourceControlService {
         ),
         String,
     > {
+        let name = naming::name_fragment(&naming::without_skill_markers(
+            &request.prompt.text,
+            &request.prompt.skill_invocations,
+        )?);
         let source = self.resolve(&request.source.path, None).await;
         let repository = source
             .workspace
@@ -411,7 +425,7 @@ impl SourceControlService {
         }
         let plan = self
             .adapter
-            .plan_checkout(request.id, &current, &request.description)
+            .plan_checkout(request.id, &current, &name, reserved)
             .await?;
         Ok((plan, guard))
     }

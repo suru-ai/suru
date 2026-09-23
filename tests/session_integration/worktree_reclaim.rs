@@ -158,7 +158,7 @@ async fn remember_repository(server: &server::RunningServer, root: &Path) -> Res
 async fn fail_preparation(
     server: &server::RunningServer,
     main: &Path,
-    description: &str,
+    text: &str,
 ) -> PreparedCheckout {
     let result = reqwest::Client::new()
         .post(format!(
@@ -171,7 +171,10 @@ async fn fail_preparation(
             source: ExecutionDirectory {
                 path: main.to_owned(),
             },
-            description: description.into(),
+            prompt: PreparationPrompt {
+                text: text.into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -1420,7 +1423,10 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "Reclaim after restart".into(),
+            prompt: PreparationPrompt {
+                text: "Reclaim after restart".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -1913,7 +1919,10 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "retry metadata retirement".into(),
+            prompt: PreparationPrompt {
+                text: "retry metadata retirement".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -2013,7 +2022,10 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
         source: ExecutionDirectory {
             path: layout.main.clone(),
         },
-        description: "unfinished preparation".into(),
+        prompt: PreparationPrompt {
+            text: "unfinished preparation".into(),
+            skill_invocations: vec![],
+        },
         provider: ProviderId::new("controlled"),
     };
     let prepared = reqwest::Client::new()
@@ -2102,7 +2114,10 @@ async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repos
             source: ExecutionDirectory {
                 path: layout.main.clone(),
             },
-            description: "old failed preparation".into(),
+            prompt: PreparationPrompt {
+                text: "old failed preparation".into(),
+                skill_invocations: vec![],
+            },
             provider: ProviderId::new("controlled"),
         })
         .send()
@@ -2268,7 +2283,10 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
         source: ExecutionDirectory {
             path: layout.main.clone(),
         },
-        description: "failed Session shell".into(),
+        prompt: PreparationPrompt {
+            text: "failed Session shell".into(),
+            skill_invocations: vec![],
+        },
         provider: ProviderId::new("controlled"),
     };
     let prepared = reqwest::Client::new()

@@ -68,7 +68,10 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
     let mut request = PrepareCheckoutRequest {
         id: Default::default(),
         source: ExecutionDirectory { path: root.clone() },
-        description: "Remote preparation".into(),
+        prompt: PreparationPrompt {
+            text: "Remote preparation".into(),
+            skill_invocations: vec![],
+        },
         provider: ProviderId::new("controlled"),
     };
     let failed = remote.prepare_checkout(request.clone()).await.unwrap();
@@ -83,7 +86,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
         "-m",
         "source advanced",
     ]);
-    request.description = "Edited Remote draft".into();
+    request.prompt.text = "Edited Remote draft".into();
     let (a, b) = tokio::join!(
         remote.prepare_checkout(request.clone()),
         remote.prepare_checkout(request)

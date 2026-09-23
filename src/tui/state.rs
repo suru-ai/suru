@@ -3258,7 +3258,12 @@ impl TuiState {
             });
         }
         if let Some(request) = &mut self.new_worktree {
-            request.description = prompt.text.clone();
+            // The owning Server names the Worktree from the Prompt as bound,
+            // leaving out its Skill markers itself.
+            request.prompt = crate::protocol::PreparationPrompt {
+                text: prompt.text.clone(),
+                skill_invocations: prompt.skill_invocations.clone(),
+            };
             if let Some(selection) = &self.landing_agent_selection {
                 request.provider = selection.provider.clone();
             }
@@ -5879,7 +5884,7 @@ impl Application {
                                             .clone()
                                             .unwrap_or_else(|| self.state.workspace.path.clone()),
                                     },
-                                    description: String::new(),
+                                    prompt: Default::default(),
                                     provider: selection.provider.clone(),
                                 });
                         }

@@ -1,6 +1,6 @@
 //! Managed preparation through authenticated owning-Server operations and real Git.
 use crate::{provider_support::ControlledProvider, repositories::git, support};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use suru::{
     protocol::*,
     server::{self, ServerConfig},
@@ -30,17 +30,23 @@ fn read_git(root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
-async fn prepare(
+async fn prepare_response(
     descriptor: &RuntimeDescriptor,
     request: &PrepareCheckoutRequest,
-) -> PrepareCheckoutResult {
-    let response = reqwest::Client::new()
+) -> reqwest::Response {
+    reqwest::Client::new()
         .post(format!("{}/v1/checkouts/prepare", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(request)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+async fn prepare(
+    descriptor: &RuntimeDescriptor,
+    request: &PrepareCheckoutRequest,
+) -> PrepareCheckoutResult {
+    let response = prepare_response(descriptor, request).await;
     let status = response.status();
     let body = response.text().await.unwrap();
     assert!(status.is_success(), "{status}: {body}");
@@ -58,15 +64,43 @@ async fn create_response(
         .await
         .unwrap()
 }
-fn request(root: &Path, description: &str) -> PrepareCheckoutRequest {
+fn request(root: &Path, text: &str) -> PrepareCheckoutRequest {
     PrepareCheckoutRequest {
         id: Default::default(),
         source: ExecutionDirectory {
             path: root.to_owned(),
         },
-        description: description.to_owned(),
+        prompt: PreparationPrompt {
+            text: text.to_owned(),
+            skill_invocations: vec![],
+        },
         provider: ProviderId::new("controlled"),
     }
+}
+fn bound(name: &str, start: u32, end: u32) -> SkillInvocation {
+    SkillInvocation {
+        skill_id: SkillId::new(format!("source-{name}")),
+        name: name.to_owned(),
+        scope: Some("Source".to_owned()),
+        marker: SkillMarkerSpan { start, end },
+    }
+}
+fn branch(preparation: &PreparedCheckout) -> &str {
+    let CheckoutPreparationPlan::Git { branch, .. } = &preparation.plan;
+    branch
+}
+/// The branch and location a preparation planned, which must be one valid
+/// Git branch and one directory directly beneath the managed container.
+fn planned(result: &PrepareCheckoutResult, container: &Path) -> (String, PathBuf) {
+    let branch = branch(&result.preparation).to_owned();
+    git(container, &["check-ref-format", "--branch", &branch]);
+    git(
+        container,
+        &["check-ref-format", &format!("refs/heads/{branch}")],
+    );
+    let destination = result.preparation.destination.path.clone();
+    assert_eq!(destination.parent(), Some(container), "{branch}");
+    (branch, destination)
 }
 fn creation(preparation: &PreparedCheckout, text: &str) -> CreateSessionRequest {
     CreateSessionRequest {
@@ -149,7 +183,7 @@ async fn managed_preparation_captures_local_commit_once_and_reuses_checkout_and_
             "later tip",
         ],
     );
-    request.description = "Corrected draft is not another checkout".to_owned();
+    request.prompt.text = "Corrected draft is not another checkout".to_owned();
     let (one, two) = tokio::join!(
         prepare(server.descriptor(), &request),
         prepare(server.descriptor(), &request)
@@ -259,27 +293,21 @@ async fn naming_bare_storage_and_destination_validation_preserve_existing_resour
     )
     .await
     .unwrap();
-    let mut destinations = std::collections::HashSet::new();
-    for description in [
-        "👩🏽‍💻 / ... ~ @{}",
-        &"A_very.Long~name / ".repeat(100),
-        "same",
-        "same",
+    let container = bare.join(".suru-worktrees");
+    for (text, expected) in [
+        ("👩🏽‍💻 / ... ~ @{}", "work"),
+        (
+            &"A_very.Long~name / ".repeat(100),
+            "long-name-long-name-long",
+        ),
+        ("same", "same"),
+        ("same", "same-2"),
     ] {
-        let result = prepare(server.descriptor(), &request(&bare, description)).await;
+        let result = prepare(server.descriptor(), &request(&bare, text)).await;
         assert_eq!(result.error, None);
-        let CheckoutPreparationPlan::Git { branch, .. } = &result.preparation.plan;
-        assert!(branch.starts_with("suru/"));
-        assert!(branch.len() < 64);
-        git(&bare, &["check-ref-format", branch]);
-        assert!(
-            result
-                .preparation
-                .destination
-                .path
-                .starts_with(bare.join(".suru-worktrees"))
-        );
-        assert!(destinations.insert(result.preparation.destination.path.clone()));
+        let (branch, destination) = planned(&result, &container);
+        assert_eq!(branch, format!("suru/{expected}"));
+        assert_eq!(destination, container.join(expected));
     }
     let intent = request(&main, "validation");
     let result = prepare(server.descriptor(), &intent).await;
@@ -297,6 +325,309 @@ async fn naming_bare_storage_and_destination_validation_preserve_existing_resour
         "unrelated"
     );
     assert!(provider.try_next_start().is_none());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_names_leave_out_filler_and_bound_skills_but_keep_unbound_tokens_as_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "local-names").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let container = main.join(".suru-worktrees");
+
+    let mut invoking = request(
+        &main,
+        "$grill-with-docs when we create a new worktree currently we get an incredibly long name",
+    );
+    invoking.prompt.skill_invocations = vec![bound("grill-with-docs", 0, 16)];
+    let invoked = prepare(server.descriptor(), &invoking).await;
+    assert_eq!(invoked.error, None);
+    let (branch, destination) = planned(&invoked, &container);
+    assert_eq!(branch, "suru/create-new-worktree-get");
+    assert_eq!(destination, container.join("create-new-worktree-get"));
+    assert_eq!(
+        read_git(&destination, &["symbolic-ref", "--short", "HEAD"]),
+        branch
+    );
+
+    // The same marker left unbound is ordinary text, filler still left out.
+    let unbound = prepare(
+        server.descriptor(),
+        &request(&main, "$grill-with-docs tidy the parser"),
+    )
+    .await;
+    assert_eq!(unbound.error, None);
+    let (branch, destination) = planned(&unbound, &container);
+    assert_eq!(branch, "suru/grill-docs-tidy-parser");
+    assert_eq!(destination, container.join("grill-docs-tidy-parser"));
+
+    // Retrying under the same identity keeps its plan, however the Prompt
+    // was edited in between.
+    invoking.prompt = PreparationPrompt {
+        text: "An edited Prompt naming other work".to_owned(),
+        skill_invocations: vec![],
+    };
+    let retried = prepare(server.descriptor(), &invoking).await;
+    assert_eq!(retried.error, None);
+    assert_eq!(retried.preparation.plan, invoked.preparation.plan);
+    assert_eq!(
+        retried.preparation.destination,
+        invoked.preparation.destination
+    );
+
+    // A binding its span does not name is refused before anything is made.
+    let mut misbound = request(&main, "$review the naming");
+    misbound.prompt.skill_invocations = vec![bound("explain", 0, 7)];
+    let refused = prepare_response(server.descriptor(), &misbound).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(refused.text().await.unwrap().contains("explain"));
+    assert!(!container.join("review-naming").exists());
+    assert!(!container.join("naming").exists());
+    assert!(provider.try_next_start().is_none());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_taken_name_is_numbered_and_whatever_holds_it_is_left_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let retained = read_git(&main, &["rev-parse", "HEAD"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "newer source",
+        ],
+    );
+    let source = read_git(&main, &["rev-parse", "HEAD"]);
+    // A branch holding the name, as one retained after its Worktree was
+    // Reclaimed would, and a location holding another with no branch at all.
+    git(&main, &["branch", "suru/fix-parser", &retained]);
+    let container = main.join(".suru-worktrees");
+    std::fs::create_dir_all(container.join("tidy-docs")).unwrap();
+    std::fs::write(container.join("tidy-docs/keep"), "unrelated").unwrap();
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "numbered-names").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+
+    for (text, expected) in [
+        ("Fix the parser", "fix-parser-2"),
+        ("fix parser", "fix-parser-3"),
+        ("Tidy docs", "tidy-docs-2"),
+        ("Tidy up the release notes", "tidy-up-release-notes"),
+    ] {
+        let result = prepare(server.descriptor(), &request(&main, text)).await;
+        assert_eq!(result.error, None, "{text}");
+        let (branch, destination) = planned(&result, &container);
+        assert_eq!(branch, format!("suru/{expected}"));
+        assert_eq!(destination, container.join(expected));
+        assert_eq!(read_git(&destination, &["rev-parse", "HEAD"]), source);
+    }
+    assert_eq!(
+        read_git(&main, &["rev-parse", "refs/heads/suru/fix-parser"]),
+        retained
+    );
+    assert_eq!(
+        read_git(&main, &["reflog", "show", "--format=%H", "suru/fix-parser"]),
+        retained,
+        "the colliding branch was never moved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(container.join("tidy-docs/keep")).unwrap(),
+        "unrelated"
+    );
+    let unclaimed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/suru/tidy-docs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !unclaimed.status.success(),
+        "the occupied location's name made no branch"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_tui_prepares_a_worktree_named_from_its_prompt_and_starts_its_session_there() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use suru::{
+        managed_client::ManagedEvent,
+        tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("controlled"),
+        vec![support::hosted_model("controlled", "controlled-model")],
+    );
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "tui-local-names").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let descriptor = server.descriptor();
+    let client = reqwest::Client::new();
+    let post = |path: &str| {
+        client
+            .post(format!("{}{path}", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+    };
+    async fn answered<T: serde::de::DeserializeOwned>(request: reqwest::RequestBuilder) -> T {
+        request
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let health: Health = answered(
+        client
+            .get(format!("{}/health", descriptor.base_url))
+            .bearer_auth(&descriptor.token),
+    )
+    .await;
+    let mut app = Application::new(&main, Default::default());
+    // The Landing's Agent Selection, as confirmed before the first Prompt.
+    let health = health.with_landing_agent_selection(Some(support::hosted_selection(
+        "controlled",
+        "controlled-model",
+    )));
+    let mut transition = app
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(health)))
+        .unwrap();
+    // The launch location and then the Worktree Selector are resolved by the
+    // owning Server, as the event loop would ask it to.
+    for surface_command in [None, Some(SemanticCommandId::WorktreeList)] {
+        if let Some(command) = surface_command {
+            transition = app
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    command,
+                )))
+                .unwrap();
+        }
+        let ApplicationTransition::ResolveWorkspace {
+            outlook,
+            surface,
+            request_id,
+            request,
+        } = transition
+        else {
+            panic!("expected owning Server resolution: {transition:?}")
+        };
+        let resolved = answered(post("/v1/workspaces/resolve").json(&request)).await;
+        app.handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(resolved),
+        })
+        .unwrap();
+        transition = ApplicationTransition::Continue;
+    }
+    let skills = SkillCatalogRequest {
+        provider: ProviderId::new("controlled"),
+        execution_directory: ExecutionDirectory { path: main.clone() },
+    };
+    // Discovery settles on its own; the event loop would take the fresh
+    // catalog from the Server's stream.
+    let catalog = tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+        loop {
+            let catalog: SkillCatalog = answered(post("/v1/skills").json(&skills)).await;
+            if matches!(catalog.status, SkillCatalogStatus::Fresh { .. }) {
+                return catalog;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the source Skill Catalog is discovered");
+    app.handle_event(ApplicationEvent::SkillsListed {
+        request: skills,
+        catalog,
+    })
+    .unwrap();
+    let enter = |app: &mut Application| {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap()
+    };
+    // The Selector opens on its new-Worktree row.
+    assert_eq!(enter(&mut app), ApplicationTransition::Continue);
+    app.handle_event(ApplicationEvent::Command(CommandId::InsertText(
+        "$explain why we keep the parser slow".to_owned(),
+    )))
+    .unwrap();
+    let submitted = enter(&mut app);
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = submitted
+    else {
+        panic!("the first Prompt asks for its Worktree: {submitted:?}")
+    };
+    assert_eq!(request.prompt.text, "$explain why we keep the parser slow");
+    assert_eq!(request.prompt.skill_invocations.len(), 1);
+    assert_eq!(
+        request.prompt.skill_invocations[0].marker,
+        SkillMarkerSpan { start: 0, end: 8 }
+    );
+
+    let result = prepare(descriptor, &request).await;
+    assert_eq!(result.error, None);
+    let container = main.join(".suru-worktrees");
+    let (branch, destination) = planned(&result, &container);
+    assert_eq!(branch, "suru/keep-parser-slow");
+    assert_eq!(destination, container.join("keep-parser-slow"));
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
+        .unwrap()
+    else {
+        panic!("a prepared Worktree continues to Session creation")
+    };
+    let created = support::create_session(descriptor, &create).await;
+    assert_eq!(created.session.execution_directory.path, destination);
+    let start = provider.next_start().await;
+    assert_eq!(start.execution_directory(), destination);
+    drop(start);
     server.shutdown().await.unwrap();
 }
 
@@ -606,9 +937,10 @@ impl suru::source_control::SourceControl for CollisionAdapter {
         &self,
         id: PreparationId,
         source: &ResolvedWorkspace,
-        description: &str,
+        name: &str,
+        reserved: &[std::path::PathBuf],
     ) -> Result<PreparedCheckout, String> {
-        let plan = self.git.plan_checkout(id, source, description).await?;
+        let plan = self.git.plan_checkout(id, source, name, reserved).await?;
         let CheckoutPreparationPlan::Git { branch, .. } = &plan.plan;
         // Another Git actor wins this name after planning, before Suru mutation.
         git(&plan.source.path, &["branch", branch]);

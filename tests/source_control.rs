@@ -64,7 +64,7 @@ async fn reclaim_accepts_a_preparation_lock_only_with_git_owned_marker_and_ref_e
     let adapter = GitSourceControl::default();
     let source = adapter.discover(&main).await;
     let plan = adapter
-        .plan_checkout(Default::default(), &source, "owned lock")
+        .plan_checkout(Default::default(), &source, "owned-lock", &[])
         .await
         .unwrap();
     adapter.prepare_checkout(&plan).await.unwrap();
@@ -126,7 +126,7 @@ async fn managed_branch_records_the_planned_source_commit_and_branch_when_claime
     let adapter = GitSourceControl::default();
     let source = adapter.discover(&main).await;
     let plan = adapter
-        .plan_checkout(Default::default(), &source, "remember provenance")
+        .plan_checkout(Default::default(), &source, "remember-provenance", &[])
         .await
         .unwrap();
     let CheckoutPreparationPlan::Git {
@@ -171,7 +171,7 @@ async fn same_named_tag_cannot_hide_an_unmerged_local_source_branch() {
     let adapter = GitSourceControl::default();
     let source = adapter.discover(&main).await;
     let plan = adapter
-        .plan_checkout(Default::default(), &source, "ambiguous short ref")
+        .plan_checkout(Default::default(), &source, "ambiguous-short-ref", &[])
         .await
         .unwrap();
     let CheckoutPreparationPlan::Git { source_branch, .. } = &plan.plan;
