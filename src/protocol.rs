@@ -27,6 +27,8 @@ pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
+pub const SUBAGENT_TREE_SNAPSHOT_EVENT: &str = "subagent_tree_snapshot";
+pub const SUBAGENT_TREE_UPDATED_EVENT: &str = "subagent_tree_updated";
 
 macro_rules! session_identity {
     ($name:ident) => {
@@ -402,6 +404,21 @@ impl SessionRevision {
 pub struct SessionCatalogRevision(pub u64);
 
 impl SessionCatalogRevision {
+    pub const INITIAL: Self = Self(1);
+
+    pub fn immediately_follows(self, previous: Self) -> bool {
+        previous.0.checked_add(1) == Some(self.0)
+    }
+}
+
+/// Where one per-tree subscription stands in the changes it has carried. It
+/// counts within one subscription's life only: every connection begins with a
+/// snapshot, which is authoritative whatever revision it names.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SubagentTreeRevision(pub u64);
+
+impl SubagentTreeRevision {
     pub const INITIAL: Self = Self(1);
 
     pub fn immediately_follows(self, previous: Self) -> bool {
@@ -2354,6 +2371,85 @@ pub enum SessionCatalogChange {
 pub struct SessionCatalogUpdate {
     pub revision: SessionCatalogRevision,
     pub change: SessionCatalogChange,
+}
+
+/// The whole tree of Sessions one top-level Session heads, as the per-tree
+/// subscription opens with it: that Session, then every Subagent's Session
+/// beneath the one that spawned it. Asked for through any Session in the
+/// tree, at any depth, it answers for the same tree, and names its top-level
+/// Session so a client can tell whether two Sessions share one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTreeSnapshot {
+    pub revision: SubagentTreeRevision,
+    pub top_level: SubagentTreeTopLevel,
+    /// Every Subagent's Session in the tree, depth-first: each follows the
+    /// Session that spawned it, its own descendants follow it, and siblings
+    /// stand in the order they spawned.
+    pub subagents: Vec<SubagentTreeEntry>,
+}
+
+/// The top-level Session heading a tree.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTreeTopLevel {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+/// One Subagent's Session in a tree, read off the Subagent row in its
+/// spawner's Transcript, so it says what that row says.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTreeEntry {
+    pub session_id: SessionId,
+    /// The Session whose Turn spawned this Subagent: the top-level Session or
+    /// another Subagent's.
+    pub parent_session_id: SessionId,
+    /// Where this Subagent stands among its spawner's Subagents, counting from
+    /// zero in the order they spawned. It never changes once assigned.
+    pub spawn_order: u32,
+    /// Which kind of agent the Provider ran.
+    pub name: String,
+    /// What the Subagent was asked to do, as its spawn — or the Provider's
+    /// latest update to it — described it.
+    pub title: String,
+    pub status: ActivityStatus,
+    /// How long the Subagent worked, once it has settled and where Suru
+    /// learned when its work ended.
+    pub duration_ms: Option<u64>,
+}
+
+/// One change to a tree after its snapshot. An entry never moves: a spawn
+/// joins its spawner's Subagents last, and nothing else reorders them.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubagentTreeChange {
+    /// A Subagent spawned. Its spawner is already in the tree, and the entry
+    /// comes last among that spawner's Subagents.
+    SubagentSpawned { entry: SubagentTreeEntry },
+    /// A Subagent settled: completed, failed, or interrupted, with how long it
+    /// worked where Suru learned when its work ended.
+    SubagentSettled {
+        session_id: SessionId,
+        status: ActivityStatus,
+        duration_ms: Option<u64>,
+    },
+    /// A Subagent's name or Title changed, carried whole.
+    SubagentRetitled {
+        session_id: SessionId,
+        name: String,
+        title: String,
+    },
+    /// The top-level Session's Title changed.
+    TopLevelRetitled { title: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTreeUpdate {
+    pub revision: SubagentTreeRevision,
+    pub change: SubagentTreeChange,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

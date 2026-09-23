@@ -35,12 +35,13 @@ use crate::protocol::{
     MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
     RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
-    SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, ServerIdentity,
-    ServerShutdown, SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode,
-    SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest, SetWorkspaceIconRequest,
+    SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT,
+    SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown,
+    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionUpdate, SetSessionIconRequest, SetWorkspaceIconRequest,
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-    SkillCatalogRequest, SkillPromptDelivery, TurnId, UpdateAgentSelectionRequest,
-    UpdateApprovalPostureRequest, ViewSessionRequest,
+    SkillCatalogRequest, SkillPromptDelivery, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
+    UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -763,6 +764,10 @@ pub async fn spawn_with_source_control(
                     post(interrupt_session),
                 )
                 .route("/v1/sessions/{session_id}/events", get(session_events))
+                .route(
+                    "/v1/sessions/{session_id}/subagent-tree",
+                    get(subagent_tree_events),
+                )
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     hydrate_session_request,
@@ -3137,6 +3142,47 @@ fn session_event_stream(
     )
 }
 
+/// The live tree the Session belongs to, headed by its top-level Session
+/// whichever Session in the tree is asked through: a snapshot, then every
+/// change to it, beside the Session's own event stream.
+async fn subagent_tree_events(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let shutdown = state.shutdown.subscribe_to_intent();
+    let shutdown_requested = shutdown.borrow().is_some();
+    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(feed) = state.sessions.subscribe_subagent_tree(session_id) else {
+        return session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        );
+    };
+    let revision = feed.snapshot.revision;
+    Sse::new(snapshot_first_event_stream(
+        feed.snapshot,
+        revision,
+        feed.updates,
+        shutdown,
+        state.timings.sse_keepalive_interval,
+        RevisionedEventProtocol {
+            event_names: RevisionedEventNames {
+                snapshot: SUBAGENT_TREE_SNAPSHOT_EVENT,
+                update: SUBAGENT_TREE_UPDATED_EVENT,
+            },
+            update_revision: |update: &SubagentTreeUpdate| update.revision,
+        },
+    ))
+    .into_response()
+}
+
 #[derive(Clone, Copy)]
 struct RevisionedEventNames {
     snapshot: &'static str,
@@ -3156,6 +3202,16 @@ trait StreamRevision: Copy {
 impl StreamRevision for SessionRevision {
     fn immediately_follows(self, previous: Self) -> bool {
         SessionRevision::immediately_follows(self, previous)
+    }
+
+    fn event_id(self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl StreamRevision for SubagentTreeRevision {
+    fn immediately_follows(self, previous: Self) -> bool {
+        SubagentTreeRevision::immediately_follows(self, previous)
     }
 
     fn event_id(self) -> String {

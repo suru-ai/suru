@@ -387,6 +387,7 @@ impl SessionStore {
             title,
             icon,
         });
+        state.announce_subagent_tree(session_id);
         true
     }
 

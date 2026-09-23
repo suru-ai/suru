@@ -38,6 +38,7 @@ mod restoration_tests;
 mod selection;
 mod settled;
 mod settlement;
+mod subagent_tree;
 mod subagents;
 mod title;
 mod viewed;
@@ -90,6 +91,9 @@ struct SessionStoreState {
     prompts: HashMap<PromptId, PromptOwner>,
     last_timestamp: Option<SessionTimestamp>,
     catalog: SessionCatalogPublisher,
+    /// Every Subagent tree a client is subscribed to, and what each was last
+    /// heard to say.
+    subagent_trees: subagent_tree::SubagentTreePublisher,
     /// The current reading of every Worktree observation presently watches,
     /// deduplicated by checkout id. It holds Worktrees no Session works in
     /// alongside the ones Sessions reference, and is empty whenever no catalog
@@ -243,6 +247,7 @@ impl SessionStore {
             prompts,
             last_timestamp,
             catalog,
+            subagent_trees: Default::default(),
             observed_checkouts: HashMap::new(),
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
@@ -509,6 +514,7 @@ impl SessionStore {
             .prompts
             .retain(|_, owner| !doomed.contains(&owner.session_id));
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
+        state.subagent_trees.forget(session_id);
         Ok(DeletedSession { repository })
     }
 

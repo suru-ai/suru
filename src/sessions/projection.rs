@@ -148,6 +148,13 @@ impl SessionStoreState {
         self.reconcile_working(storage, session_id);
         self.reconcile_usage(storage, session_id);
         self.reconcile_interventions(storage, session_id);
+        if update
+            .changes
+            .iter()
+            .any(super::subagent_tree::moves_subagent_tree)
+        {
+            self.announce_subagent_tree(session_id);
+        }
         Ok(update)
     }
 

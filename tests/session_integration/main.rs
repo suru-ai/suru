@@ -28,6 +28,7 @@ mod skills;
 mod stops;
 mod storage;
 mod streams;
+mod subagent_tree;
 mod subagents;
 mod support;
 mod titles;

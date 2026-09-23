@@ -12,7 +12,7 @@ use suru::{
         ModelOptionId, ModelOptionSelection, ModelOptionValue, PromptId, ProviderId,
         RuntimeDescriptor, SessionId, SessionRevision, SessionSnapshot, SessionUpdate,
     },
-    server::{self, RunningServer, ServerConfig},
+    server::{self, RunningServer, ServerConfig, ServerTimings},
 };
 use tokio::time::timeout;
 
@@ -180,11 +180,23 @@ pub struct WorkingTurn {
 }
 
 pub async fn working_turn(state_dir: &std::path::Path, channel: &str) -> WorkingTurn {
+    working_turn_with_timings(state_dir, channel, ServerTimings::default()).await
+}
+
+/// [`working_turn`] on a server running at the given timings, for a test that
+/// must see a production-scale interval — a stream's keepalive — pass at a
+/// millisecond scale.
+pub async fn working_turn_with_timings(
+    state_dir: &std::path::Path,
+    channel: &str,
+    timings: ServerTimings,
+) -> WorkingTurn {
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = ControlledProvider::new();
-    let server = server::spawn_with_provider(
+    let server = server::spawn_with_provider_and_timings(
         ServerConfig::new(state_dir, channel).expect("configure server"),
         runtime.clone(),
+        timings,
     )
     .await
     .expect("spawn server");
