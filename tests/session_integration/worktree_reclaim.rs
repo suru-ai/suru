@@ -1733,9 +1733,51 @@ async fn an_unmerged_recorded_branch_is_retained() {
     std::fs::write(layout.managed.join("tracked"), "committed divergence").unwrap();
     git(&layout.managed, &["add", "."]);
     commit(&layout.managed, "unmerged work");
+    let tip = read_git(&layout.managed, &["rev-parse", "HEAD"]);
     let server = spawn(&layout, "reclaim-unmerged-branch").await;
     wait_for_path(&layout.managed, false).await;
-    assert!(!read_git(&layout.main, &["rev-parse", "refs/heads/suru/unmerged"]).is_empty());
+    assert_eq!(
+        read_git(&layout.main, &["rev-parse", "refs/heads/suru/unmerged"]),
+        tip
+    );
+
+    // The retained branch still holds its name once its location is gone.
+    let result = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/checkouts/prepare",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .json(&PrepareCheckoutRequest {
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: layout.main.clone(),
+            },
+            prompt: PreparationPrompt {
+                text: "Unmerged".into(),
+                skill_invocations: vec![],
+            },
+            provider: ProviderId::new("controlled"),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<PrepareCheckoutResult>()
+        .await
+        .unwrap();
+    assert_eq!(result.error, None);
+    let CheckoutPreparationPlan::Git { branch, .. } = &result.preparation.plan;
+    assert_eq!(branch, "suru/unmerged-2");
+    assert_eq!(
+        result.preparation.destination.path,
+        layout.managed.with_file_name("unmerged-2")
+    );
+    assert_eq!(
+        read_git(&layout.main, &["rev-parse", "refs/heads/suru/unmerged"]),
+        tip
+    );
     server.shutdown().await.unwrap();
 }
 
