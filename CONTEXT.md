@@ -41,7 +41,7 @@ A workspace for conversation between a user and an agent. A Session is independe
 _Avoid_: Chat, thread, conversation
 
 **Title**:
-The short line by which a Session is known both while viewing it and wherever Sessions are listed, and the text a reader searches those listings by. A Title begins as the Session's first Prompt trimmed of the space around it — a real Title rather than a placeholder — and Suru replaces it once it has derived a better one through an Errand. Derivation is attempted once, when the first Prompt is admitted, and never again: a Session whose derivation was skipped, failed, or abandoned keeps the Title its Prompt gave it for good. A derived Title only replaces the Title it was derived from, so a Title since set by other means stands. A Setting decides whether Suru derives Titles at all, and which Agent Selection does the deriving.
+The short line by which a Session is known both while viewing it and wherever Sessions are listed, and the text a reader searches those listings by. A Title begins as the Session's first Prompt trimmed of the space around it — a real Title rather than a placeholder — and Suru replaces it once it has derived a better one through an Errand. Derivation is attempted once, when the first Prompt is admitted, and never again: a Session whose derivation was skipped, failed, or abandoned keeps the Title its Prompt gave it for good. A derived Title only replaces the Title it was derived from, so a Title since set by other means stands. A Setting decides whether Suru derives Titles at all, and which Agent Selection does the deriving; the same Setting governs the branch names Suru derives for Managed Worktrees alongside them.
 _Avoid_: Name, subject, summary
 
 **Icon**:
@@ -73,7 +73,7 @@ A Git Repository's working copy, either its main working copy or a linked one el
 _Avoid_: Workspace (for an individual linked working copy)
 
 **Managed Worktree**:
-A linked Worktree that Suru created for a Session, living under the Repository's managed container on a branch Suru named and started from the commit the Session was created against. Only Managed Worktrees are ever Reclaimed; a linked Worktree the user created elsewhere is theirs to remove.
+A linked Worktree that Suru created for a Session, living under the Repository's managed container on a branch Suru named and started from the commit the Session was created against. Its location and branch are first named from a few words of that Session's first Prompt, leaving out its Skill Invocations, and its location keeps that name for good. Suru then replaces the branch's name once, with a better one derived in the same Errand as the Session's Title, and only while the Worktree is still on that branch and the branch has not yet been pushed; a derivation that is off, fails, or comes too late leaves the first name standing. A name already taken gains a number rather than displacing whatever holds it. Only Managed Worktrees are ever Reclaimed; a linked Worktree the user created elsewhere is theirs to remove.
 _Avoid_: temporary worktree, auto worktree, sandbox
 
 **Reclaimable**:
