@@ -44,6 +44,7 @@ mod approvals;
 mod questionnaires;
 mod repositories;
 
+mod worktree_branch_derivation;
 mod worktree_navigation;
 
 mod worktree_preparation;

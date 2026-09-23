@@ -394,8 +394,9 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
-    /// Derives a Session's Title, and its Workspace's Icon where it has none,
-    /// from its first Prompt, in the background and beside the first Turn
+    /// Derives a Session's Title, its Workspace's Icon where it has none, and
+    /// a better name for the branch of a Managed Worktree just prepared for
+    /// it, from its first Prompt, in the background and beside the first Turn
     /// rather than in front of it.
     derivation: Derivation,
     model_catalog: ModelCatalogService,
@@ -665,6 +666,8 @@ pub async fn spawn_with_source_control(
         model_catalog.clone(),
         sessions.clone(),
         settings.subscribe(),
+        source_control.clone(),
+        preparations.clone(),
     );
     let state = AppState {
         preparations,
@@ -2164,7 +2167,21 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             // cosmetic and the user's actual work does not wait on one. Only a
             // freshly created Session reaches here, which is what makes the
             // derivation once-per-Session — a retried creation answers with the
-            // Session it already made and asks for nothing.
+            // Session it already made and asks for nothing. The same holds for
+            // the branch a fresh preparation just created, the one thing that
+            // lets derivation propose renaming it.
+            let created_branch = preparation.as_ref().and_then(|plan| {
+                let checkout = snapshot
+                    .session
+                    .checkout
+                    .clone()
+                    .filter(|checkout| checkout.root == plan.destination.path)?;
+                Some(crate::source_control::CreatedBranch {
+                    repository: plan.repository.clone(),
+                    checkout,
+                    branch: plan.plan.branch()?.to_owned(),
+                })
+            });
             state.derivation.derive(
                 snapshot.session.id,
                 snapshot.session.execution_directory.path.clone(),
@@ -2175,6 +2192,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                     .map(|selection| selection.provider.clone()),
                 &snapshot.prompts[0],
                 &snapshot.session.workspace,
+                created_branch,
             );
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }

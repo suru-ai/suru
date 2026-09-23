@@ -1,5 +1,7 @@
-//! Which branch names are free.
+//! Which branch names are free, and renaming the branch Suru created for a
+//! Managed Worktree to one a Title derivation proposed.
 use super::*;
+use crate::source_control::{BranchRename, CreatedBranch, naming};
 
 impl GitSourceControl {
     /// Every local branch's short name, read in one listing so a whole run of
@@ -22,6 +24,51 @@ impl GitSourceControl {
             .filter_map(|reference| reference.strip_prefix("refs/heads/"))
             .map(str::to_owned)
             .collect())
+    }
+
+    /// Rename a created branch whose Worktree is still on it. See
+    /// [`crate::source_control::SourceControl::rename_branch`].
+    pub(super) async fn rename_created_branch(
+        &self,
+        created: &CreatedBranch,
+        proposal: &str,
+    ) -> Result<BranchRename, String> {
+        let root = &created.checkout.root;
+        let metadata = &created.repository.metadata_directory;
+        if self.valid_root(root, metadata).await.as_ref() != Some(root) {
+            return Err(
+                "The Worktree is missing or no longer belongs to its Repository".to_owned(),
+            );
+        }
+        let head = self.text(root, &["symbolic-ref", "--quiet", "HEAD"]).await;
+        if head.as_deref() != Some(format!("refs/heads/{}", created.branch).as_str()) {
+            return Err("The Worktree is no longer on the branch Suru created for it".to_owned());
+        }
+        // The branch being renamed is the one name that never stands in its
+        // own way.
+        let others = self
+            .branch_names(root)
+            .await?
+            .into_iter()
+            .filter(|name| name != &created.branch)
+            .collect::<Vec<_>>();
+        for name in naming::numbered(proposal) {
+            let branch = format!("{}{name}", naming::BRANCH_PREFIX);
+            if branch == created.branch {
+                return Ok(BranchRename::Unchanged);
+            }
+            if !branch_available(&others, &branch) {
+                continue;
+            }
+            // Git moves the branch's reflog and its `branch.<name>.*`
+            // configuration with it, Reclaim's recorded base included, and
+            // refuses rather than overwrites a branch that appeared since the
+            // listing.
+            self.mutate(root, &["branch", "-m", &created.branch, &branch])
+                .await?;
+            return Ok(BranchRename::Renamed { branch });
+        }
+        Err("Every numbered form of the proposed branch name is taken".to_owned())
     }
 }
 

@@ -49,6 +49,26 @@ pub enum PreparationCheckpoint {
     IntentRetired,
 }
 
+/// The branch a fresh Managed Worktree preparation created, named for the
+/// Worktree it belongs to: what a Title derivation may propose a better name
+/// for. Only a Session admitted from that preparation carries one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedBranch {
+    pub repository: Repository,
+    pub checkout: crate::protocol::CheckoutAssociation,
+    /// The branch's full name as Suru created it, prefix included.
+    pub branch: String,
+}
+
+/// What renaming a [`CreatedBranch`] came to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchRename {
+    /// The proposal already names the branch, so nothing changed.
+    Unchanged,
+    /// The branch goes by this full name now.
+    Renamed { branch: String },
+}
+
 #[async_trait]
 pub trait PreparationObserver: Send + Sync {
     async fn checkpoint(
@@ -122,13 +142,30 @@ pub trait SourceControl: Send + Sync {
         Err("Preparation ownership retirement is unsupported".into())
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
+    /// Rename the branch a fresh preparation created for a Managed Worktree
+    /// to the first of [`naming::numbered`] `proposal` — a fragment already
+    /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
+    /// leaving the Worktree's location where it is. Proceeds only while the
+    /// Worktree's HEAD is still the created branch, and changes nothing where
+    /// the proposal already names it. The caller holds the preparation serial
+    /// and the Repository's mutation guard.
+    ///
+    /// Only systems whose Repositories report the `rename_branch` capability
+    /// offer this; a system without branches keeps the default, which refuses.
+    async fn rename_branch(
+        &self,
+        _created: &CreatedBranch,
+        _proposal: &str,
+    ) -> Result<BranchRename, String> {
+        Err("Branch renaming is unsupported".to_owned())
+    }
     /// Plan a Managed Worktree named from `name`, a fragment already shaped by
     /// [`naming::name_fragment`]. It takes the first of [`naming::numbered`]
     /// whose location and branch are free and whose destination is not
     /// `reserved` by another stored preparation; nothing already holding a
-    /// name is displaced to make room. A branch Git would refuse beside
-    /// another — one differing only in case, or clashing with it as a
-    /// directory — counts as held.
+    /// name is displaced to make room. A branch is free by the same test
+    /// [`SourceControl::rename_branch`] applies, so a name differing only in
+    /// case, or clashing with another as a directory, counts as held.
     async fn plan_checkout(
         &self,
         _id: crate::protocol::PreparationId,
@@ -436,6 +473,32 @@ impl SourceControlService {
         plan: &crate::protocol::PreparedCheckout,
     ) -> Result<ResolvedWorkspace, String> {
         self.adapter.prepare_checkout(plan).await
+    }
+    /// Rename a fresh Managed Worktree's branch to what its Title derivation
+    /// proposed, on this owning Server, where its Repository advertises the
+    /// capability.
+    ///
+    /// Takes the preparation serial and then the Repository's mutation guard,
+    /// the order preparation, admission, and removal take them in, so the
+    /// rename never races any of them and waits out an admitted Turn's
+    /// execution lease rather than skipping. It first waits for the guard to
+    /// come free without holding the serial, so a Turn still starting in this
+    /// Repository never holds up every other preparation behind the rename.
+    pub(crate) async fn rename_branch(
+        &self,
+        preparations: &PreparationStore,
+        created: &CreatedBranch,
+        proposal: &str,
+    ) -> Result<BranchRename, String> {
+        if let crate::protocol::SourceControlCapability::Unsupported { reason } =
+            &created.repository.capabilities.rename_branch
+        {
+            return Err(reason.clone());
+        }
+        drop(self.mutation_guard(&created.repository.id).await);
+        let _serial = preparations.serial.lock().await;
+        let _mutation = self.mutation_guard(&created.repository.id).await;
+        self.adapter.rename_branch(created, proposal).await
     }
     pub(crate) async fn observe(
         &self,

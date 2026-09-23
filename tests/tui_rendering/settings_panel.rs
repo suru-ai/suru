@@ -2704,9 +2704,9 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
     focus_setting(&mut application, "derivation.errand");
 
     assert!(
-        row(&application, "Title and Icon derivation").contains("· session"),
+        row(&application, "Title, Icon, and branch derivation").contains("· session"),
         "the built-in default follows the Session's own Provider: {:?}",
-        row(&application, "Title and Icon derivation")
+        row(&application, "Title, Icon, and branch derivation")
     );
     assert!(
         rendered_application_rows(&application)
@@ -2728,7 +2728,7 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
         deriving_titles_with(DerivationErrand::Pinned(pinned_selection())),
         &["derivation.errand"],
     );
-    let pinned_row = row(&application, "Title and Icon derivation");
+    let pinned_row = row(&application, "Title, Icon, and branch derivation");
     assert!(
         pinned_row.contains("codex · gpt-5-mini") && pinned_row.contains("[pinned]"),
         "a value the schema never named is spelled by the Setting itself: {pinned_row:?}"
@@ -2762,7 +2762,7 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
         .expect("receive the catalog the picker asked for");
     let showing = rendered_application_rows(&application).join("\n");
     assert!(
-        showing.contains("GPT-5 Mini") && !showing.contains("Title and Icon derivation"),
+        showing.contains("GPT-5 Mini") && !showing.contains("Title, Icon, and branch derivation"),
         "the picker is drawn over the panel that opened it, and answers the keys: {showing}"
     );
     assert!(
@@ -2887,7 +2887,7 @@ fn cancelling_the_picker_leaves_the_settings_panel_where_it_was() {
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
 
     assert!(
-        has_row(&application, "Title and Icon derivation"),
+        has_row(&application, "Title, Icon, and branch derivation"),
         "Esc closes the picker alone"
     );
     assert_eq!(
@@ -3032,7 +3032,7 @@ fn cancelling_title_options_discards_staged_changes_and_preserves_the_setting() 
         ApplicationTransition::Continue
     );
     assert_eq!(focused_key(&application), "derivation.errand");
-    assert!(row(&application, "Title and Icon derivation").contains("· session"));
+    assert!(row(&application, "Title, Icon, and branch derivation").contains("· session"));
 }
 
 #[test]

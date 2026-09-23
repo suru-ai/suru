@@ -50,6 +50,28 @@ const WINDOWS_DEVICES: &[&str] = &[
 /// apostrophe, and keep only their ASCII letters and digits, so every
 /// fragment is a Git ref component and a portable directory name.
 pub fn name_fragment(text: &str) -> String {
+    meaningful_fragment(text).unwrap_or_else(|| FALLBACK.to_owned())
+}
+
+/// A name a Title derivation proposed, shaped into a fragment exactly as
+/// Prompt text is once any leading `refs/heads/` or [`BRANCH_PREFIX`] it was
+/// spelled with is stripped. Where Prompt text with nothing meaningful left
+/// falls back to `work`, a proposal like that is no proposal at all: `None`.
+pub fn proposed_fragment(proposal: &str) -> Option<String> {
+    let mut proposal = proposal.trim();
+    for prefix in ["refs/heads/", BRANCH_PREFIX] {
+        if let Some(head) = proposal.get(..prefix.len())
+            && head.eq_ignore_ascii_case(prefix)
+        {
+            proposal = &proposal[prefix.len()..];
+        }
+    }
+    meaningful_fragment(proposal)
+}
+
+/// [`name_fragment`] without its fallback: `None` where no meaningful word is
+/// left to name anything.
+fn meaningful_fragment(text: &str) -> Option<String> {
     let words = text
         .split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '\u{2019}')
         .map(|word| {
@@ -72,12 +94,13 @@ pub fn name_fragment(text: &str) -> String {
         }
     }
     if name.is_empty() {
-        name.push_str(FALLBACK);
-    } else if WINDOWS_DEVICES.contains(&name.as_str()) {
+        return None;
+    }
+    if WINDOWS_DEVICES.contains(&name.as_str()) {
         name.push('-');
         name.push_str(FALLBACK);
     }
-    name
+    Some(name)
 }
 
 /// The names uniqueness tries for a fragment, in order: the fragment itself,
@@ -202,6 +225,41 @@ mod tests {
             names.last().unwrap(),
             &format!("fix-parser-{NAME_ATTEMPTS}")
         );
+    }
+
+    #[test]
+    fn a_proposal_is_shaped_like_prompt_text_without_its_prefix_or_a_fallback() {
+        for (proposal, expected) in [
+            ("fix-reasoning-flicker", Some("fix-reasoning-flicker")),
+            ("Fix reasoning flicker", Some("fix-reasoning-flicker")),
+            ("suru/fix-reasoning-flicker", Some("fix-reasoning-flicker")),
+            ("SURU/Fix Flicker", Some("fix-flicker")),
+            (
+                "refs/heads/suru/fix-reasoning-flicker",
+                Some("fix-reasoning-flicker"),
+            ),
+            ("  refs/heads/ship picker  ", Some("ship-picker")),
+            // Only a leading prefix is Suru's own; one further in is words.
+            ("fix suru/prefix", Some("fix-suru-prefix")),
+            (
+                "one two three four five six seven",
+                Some("one-two-three-four-five"),
+            ),
+            ("aux", Some("aux-work")),
+            // Nothing meaningful is no proposal, never the `work` fallback.
+            ("", None),
+            ("   ", None),
+            ("suru/", None),
+            ("refs/heads/suru/", None),
+            ("please do it for me", None),
+            ("修正", None),
+        ] {
+            assert_eq!(
+                proposed_fragment(proposal).as_deref(),
+                expected,
+                "{proposal:?}"
+            );
+        }
     }
 
     fn bound(name: &str, start: u32, end: u32) -> SkillInvocation {

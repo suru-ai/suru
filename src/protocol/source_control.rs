@@ -65,18 +65,29 @@ pub struct SourceControlCapabilities {
     pub create_checkout: SourceControlCapability,
     pub recover_checkout: SourceControlCapability,
     pub remove_checkout: SourceControlCapability,
+    /// Renaming the branch Suru created for a Managed Worktree to the one a
+    /// Title derivation proposed. Only systems with branches offer it.
+    #[serde(default = "SourceControlCapability::unimplemented")]
+    pub rename_branch: SourceControlCapability,
+}
+
+impl SourceControlCapability {
+    fn unimplemented() -> Self {
+        Self::Unsupported {
+            reason: "This source control operation is not implemented".to_owned(),
+        }
+    }
 }
 
 impl SourceControlCapabilities {
     pub fn discovery_only() -> Self {
-        let unsupported = || SourceControlCapability::Unsupported {
-            reason: "This source control operation is not implemented".to_owned(),
-        };
+        let unsupported = SourceControlCapability::unimplemented;
         Self {
             list_checkouts: SourceControlCapability::Available,
             create_checkout: unsupported(),
             recover_checkout: unsupported(),
             remove_checkout: unsupported(),
+            rename_branch: unsupported(),
         }
     }
 }
@@ -270,6 +281,16 @@ pub enum CheckoutPreparationPlan {
         #[serde(default)]
         source_branch: Option<String>,
     },
+}
+
+impl CheckoutPreparationPlan {
+    /// The branch this plan creates, for source control systems that have
+    /// branches.
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            Self::Git { branch, .. } => Some(branch),
+        }
+    }
 }
 
 /// Owning-Server validation/recreation result for a retained working copy.

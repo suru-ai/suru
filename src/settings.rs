@@ -840,8 +840,8 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     },
     SettingDescriptor {
         key: DERIVATION_ERRAND,
-        label: "Title and Icon derivation",
-        description: "Which Agent Selection derives a Session's Title and a Workspace's Icon, if any",
+        label: "Title, Icon, and branch derivation",
+        description: "Which Agent Selection derives a Session's Title, a Workspace's Icon, and a new Managed Worktree's branch name, if any",
         group: SettingGroup::General,
         scope: SettingScope::Server,
         values: SettingValues::Open {
@@ -2276,7 +2276,7 @@ mod tests {
         let descriptor = SCHEMA
             .iter()
             .find(|descriptor| descriptor.key == DERIVATION_ERRAND)
-            .expect("the Title and Icon derivation Setting is defined");
+            .expect("the Title, Icon, and branch derivation Setting is defined");
         let chosen = AgentSelection {
             provider: crate::protocol::ProviderId::new("codex"),
             model: crate::protocol::ModelId::new("gpt-5-mini"),

@@ -499,6 +499,13 @@ impl SourceControl for GitSourceControl {
         }
         Err("Could not allocate a unique managed Worktree name".to_owned())
     }
+    async fn rename_branch(
+        &self,
+        created: &super::CreatedBranch,
+        proposal: &str,
+    ) -> Result<super::BranchRename, String> {
+        self.rename_created_branch(created, proposal).await
+    }
     async fn inspect_removal(
         &self,
         target: &CheckoutRemovalTarget,
@@ -982,6 +989,7 @@ impl SourceControl for GitSourceControl {
         let mut capabilities = SourceControlCapabilities::discovery_only();
         capabilities.recover_checkout = SourceControlCapability::Available;
         capabilities.remove_checkout = SourceControlCapability::Available;
+        capabilities.rename_branch = SourceControlCapability::Available;
         capabilities.create_checkout = if matches!(location, RepositoryLocation::UnknownMain) {
             SourceControlCapability::Unsupported {
                 reason: "The main checkout location is unknown".to_owned(),

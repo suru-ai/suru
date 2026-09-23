@@ -2252,10 +2252,11 @@ fn pinned_title_selection() -> AgentSelection {
     }
 }
 
-/// Title and Icon derivation is the first Setting whose values the schema
-/// cannot enumerate, so these hold the line on a value richer than a word:
-/// pinned from a document, pinned by an edit, and diagnosed by naming the
-/// values that do have words alongside a description of the one that does not.
+/// Title, Icon, and branch derivation is the first Setting whose values the
+/// schema cannot enumerate, so these hold the line on a value richer than a
+/// word: pinned from a document, pinned by an edit, and diagnosed by naming
+/// the values that do have words alongside a description of the one that does
+/// not.
 #[tokio::test]
 async fn a_pinned_derivation_errand_selection_round_trips_through_a_config_document() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -2295,7 +2296,7 @@ async fn a_pinned_derivation_errand_selection_round_trips_through_a_config_docum
             value: Some(DerivationErrand::Off),
         })
         .await
-        .expect("turn Title and Icon derivation off");
+        .expect("turn Title, Icon, and branch derivation off");
     assert_eq!(off.settings.derivation.errand, DerivationErrand::Off);
     let document = config_document(config_dir.path());
     assert!(

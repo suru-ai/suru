@@ -36,13 +36,35 @@
 //! the two apart by position, which is what keeps this ordering a documented
 //! guarantee rather than an accident of scheduling.
 //!
+//! A Session admitted from a fresh Managed Worktree preparation is also told
+//! the branch that preparation created and the Worktree it belongs to, and
+//! only then does its Title Errand ask for a branch name too: 2 to 5 plain
+//! words describing the requested work, carried by the same reply as the Title
+//! and Icon. The Model reads the Prompt exactly as the Title is asked about
+//! it, Skill names included, but is asked not to make a Skill the subject.
+//! A proposal Suru can use is stripped of any `refs/heads/` or `suru/` it was
+//! spelled with, shaped by the one name-shaping function every Managed
+//! Worktree name goes through, and handed to source control, which renames
+//! the branch on the owning Server — see
+//! [`crate::source_control::SourceControlService::rename_branch`] for the
+//! locks it takes and when it declines. The rename runs on this same task,
+//! after the Title Errand's answer is committed and before the Workspace
+//! Errand is built, so it too waits on nothing but that answer and never on
+//! the Workspace Icon. The Worktree's location keeps the name it was created
+//! with, and the Session's Checkout State reports the new branch the next time
+//! checkout observation reads it. Every other Session's Errand — one working
+//! in an existing Worktree, or in none — asks for no branch at all.
+//!
 //! Everything here is best-effort by construction. Derivation runs in the
 //! background alongside the real first Turn and never blocks or gates it; the
-//! Title is attempted once per Session and never again; and a failure of any
-//! kind — a Provider that cannot be reached, a reply that arrives too late, a
-//! reply that is not the shape Suru asked for — leaves the Prompt-derived
-//! Title standing, or the Workspace without an Icon, and reaches the Log and
-//! nowhere else.
+//! Title is attempted once per Session and never again, so its branch is too;
+//! and a failure of any kind — a Provider that cannot be reached, a reply that
+//! arrives too late, a reply that is not the shape Suru asked for, a branch
+//! source control could not rename — leaves the Prompt-derived Title standing,
+//! the Workspace without an Icon, or the branch with the name its preparation
+//! gave it, and reaches the Log and nowhere else. A reply whose Title is good
+//! but whose branch is missing or unusable lands its Title and Icon and
+//! renames nothing, exactly as an unusable Icon leaves its Title to land alone.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -57,6 +79,7 @@ use crate::{
         SessionId, SessionSummary, SettingsSnapshot, SkillInvocation, Workspace,
     },
     provider::ProviderErrand,
+    source_control::{BranchRename, CreatedBranch, PreparationStore, SourceControlService, naming},
 };
 
 use super::{SessionStore, workspace_icon};
@@ -99,17 +122,23 @@ const QUOTE_PAIRS: [(char, char); 6] = [
 /// Icon: a Model that volunteers a field Suru did not ask for, or names an
 /// Icon Suru's Catalog does not carry, has still answered the Title question,
 /// and throwing a good Title away over it costs the user more than ignoring
-/// it does. The requested schema still marks both properties required and
+/// it does. The requested schema still marks every property required and
 /// rejects unasked ones because Codex sends output schemas in strict mode,
 /// where every property must be required and no others allowed. Providers
 /// that cannot enforce the schema may return outside it anyway, and Suru will
 /// keep validating regardless. A reply missing the Title is what does not
 /// deserialize at all, and it is discarded whole.
+///
+/// The branch a fresh Managed Worktree's Errand also asks for is held to the
+/// same leniency, and further: it is read as whatever JSON arrives, so even a
+/// branch of the wrong type costs the reply nothing but its branch.
 #[derive(Debug, Deserialize)]
 struct DerivedTitleReply {
     title: String,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    branch: Value,
 }
 
 /// What one derivation yields: the Title Suru will store, and the Icon
@@ -123,9 +152,17 @@ pub(crate) struct DerivedTitle {
     icon: Option<String>,
 }
 
-/// Derives Sessions' Titles and Icons, and Workspaces' Icons. Cloned into the
-/// server's shared state, which is what lets Session creation fork a
-/// derivation and return without waiting.
+/// What one Title Errand's reply yields: the Title and Icon, and the branch
+/// fragment it proposed where it proposed a usable one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DerivedReply {
+    title: DerivedTitle,
+    branch: Option<String>,
+}
+
+/// Derives Sessions' Titles and Icons, Workspaces' Icons, and fresh Managed
+/// Worktrees' branch names. Cloned into the server's shared state, which is
+/// what lets Session creation fork a derivation and return without waiting.
 #[derive(Clone)]
 pub(crate) struct Derivation {
     errands: ErrandRunner,
@@ -137,6 +174,10 @@ pub(crate) struct Derivation {
     /// Setting the user changes governs the Sessions they start next rather
     /// than reaching back into a derivation already under way.
     settings: watch::Receiver<SettingsSnapshot>,
+    /// This owning Server's source control, which renames a fresh Managed
+    /// Worktree's branch under the locks it shares with preparation.
+    source_control: SourceControlService,
+    preparations: PreparationStore,
 }
 
 impl Derivation {
@@ -145,12 +186,16 @@ impl Derivation {
         models: ModelCatalogService,
         sessions: SessionStore,
         settings: watch::Receiver<SettingsSnapshot>,
+        source_control: SourceControlService,
+        preparations: PreparationStore,
     ) -> Self {
         Self {
             errands,
             models,
             sessions,
             settings,
+            source_control,
+            preparations,
         }
     }
 
@@ -181,6 +226,12 @@ impl Derivation {
     /// another Session created in the same Workspace before either commits is
     /// possible and harmless, because [`SessionStore::commit_workspace_icon`]
     /// only ever fills an absence.
+    ///
+    /// `created_branch` is the branch a fresh Managed Worktree preparation
+    /// made for this Session, and `None` for every other Session: it is what
+    /// puts a branch into the Errand's question, and what a usable answer
+    /// renames. The same gate governs it, so a Setting or Session that skips
+    /// the Title leaves the branch its first name.
     pub(crate) fn derive(
         &self,
         session_id: SessionId,
@@ -188,6 +239,7 @@ impl Derivation {
         provider: Option<ProviderId>,
         prompt: &Prompt,
         workspace: &Workspace,
+        created_branch: Option<CreatedBranch>,
     ) {
         let Some(errand_at) = self.errand_at(session_id, provider) else {
             return;
@@ -197,7 +249,8 @@ impl Derivation {
         let Some(derived_from) = self.sessions.title(session_id) else {
             return;
         };
-        let title_prompt = errand_prompt(&prompt.text, &prompt.skill_invocations);
+        let asks_branch = created_branch.is_some();
+        let title_prompt = errand_prompt(&prompt.text, &prompt.skill_invocations, asks_branch);
         let workspace_errand = workspace.icon.is_none().then(|| {
             (
                 workspace.id.clone(),
@@ -207,6 +260,8 @@ impl Derivation {
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
+        let source_control = self.source_control.clone();
+        let preparations = self.preparations.clone();
         tokio::spawn(async move {
             let (provider, pinned) = match &errand_at {
                 ErrandAt::Provider(provider) => (provider, None),
@@ -224,27 +279,51 @@ impl Derivation {
             // order is a guarantee rather than a scheduling accident.
             let title_errand = ProviderErrand {
                 prompt: title_prompt,
-                schema: reply_schema(),
+                schema: reply_schema(asks_branch),
                 selection: selection.clone(),
                 execution_directory: execution_directory.clone(),
             };
-            match errands.run(title_errand).await {
-                Ok(answer) => match derived_title(&answer) {
-                    Some(derived) => {
-                        if !sessions.replace_derived_title(session_id, &derived_from, derived) {
+            let proposed_branch = match errands.run(title_errand).await {
+                Ok(answer) => match derived_reply(&answer) {
+                    Some(DerivedReply { title, branch }) => {
+                        if !sessions.replace_derived_title(session_id, &derived_from, title) {
                             tracing::debug!(
                                 %session_id,
                                 "a derived Title was discarded because the Title it was derived from has since changed"
                             );
                         }
+                        branch
+                    }
+                    None => {
+                        tracing::info!(
+                            %session_id,
+                            "Title Errand answered outside its schema, so the Prompt-derived Title stands"
+                        );
+                        None
+                    }
+                },
+                Err(failure) => {
+                    tracing::info!(%session_id, "Title Errand produced no Title: {failure}");
+                    None
+                }
+            };
+            if let Some(created) = &created_branch {
+                match proposed_branch {
+                    Some(proposal) => {
+                        rename_branch(
+                            session_id,
+                            &source_control,
+                            &preparations,
+                            created,
+                            &proposal,
+                        )
+                        .await
                     }
                     None => tracing::info!(
                         %session_id,
-                        "Title Errand answered outside its schema, so the Prompt-derived Title stands"
+                        branch = %created.branch,
+                        "no usable branch was derived, so the Managed Worktree keeps its first name"
                     ),
-                },
-                Err(failure) => {
-                    tracing::info!(%session_id, "Title Errand produced no Title: {failure}")
                 }
             }
 
@@ -304,6 +383,39 @@ impl Derivation {
                 }
             },
         }
+    }
+}
+
+/// Renames a fresh Managed Worktree's branch to a derived proposal, saying in
+/// the Log and nowhere else how that went: a branch that keeps its first name
+/// is a cosmetic loss, never a failure the Session hears about.
+async fn rename_branch(
+    session_id: SessionId,
+    source_control: &SourceControlService,
+    preparations: &PreparationStore,
+    created: &CreatedBranch,
+    proposal: &str,
+) {
+    match source_control
+        .rename_branch(preparations, created, proposal)
+        .await
+    {
+        Ok(BranchRename::Renamed { branch }) => tracing::info!(
+            %session_id,
+            from = %created.branch,
+            to = %branch,
+            "renamed a Managed Worktree's branch to the derived name"
+        ),
+        Ok(BranchRename::Unchanged) => tracing::debug!(
+            %session_id,
+            branch = %created.branch,
+            "the derived branch name is the one the Managed Worktree already has"
+        ),
+        Err(failure) => tracing::info!(
+            %session_id,
+            branch = %created.branch,
+            "the Managed Worktree keeps its first name: {failure}"
+        ),
     }
 }
 
@@ -451,8 +563,9 @@ pub(crate) enum SetIconError {
 }
 
 /// The Prompt one Title Errand carries: what to write, and the first Prompt to
-/// write it about.
-fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation]) -> String {
+/// write it about. `asks_branch` adds the branch name a fresh Managed Worktree
+/// is renamed to.
+fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation], asks_branch: bool) -> String {
     let mut prompt = prompt.to_owned();
     let mut marker_starts = skill_invocations
         .iter()
@@ -473,22 +586,30 @@ fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation]) -> String 
         .by_ref()
         .take(MAX_ERRAND_PROMPT_CHARS)
         .collect::<String>();
+    let branch = if asks_branch {
+        " Answer also with a branch name of 2 to 5 plain words describing the requested \
+         work, with no prefix and no issue numbers, and never naming a Skill as its subject."
+    } else {
+        ""
+    };
     format!(
         "Name the piece of work the request below begins.\n\n\
          Answer with a title of 3 to 8 words, under 50 characters, naming the subject of \
          the work and what it is meant to achieve. Do not echo the wording of the request, \
          do not address the reader, and do not end with a full stop. Answer also with an \
          Icon standing for the work, chosen from the offered names alongside the title \
-         rather than fitted to it afterwards.\n\n\
+         rather than fitted to it afterwards.{branch}\n\n\
          The request:\n{opening}"
     )
 }
 
 /// The shape Suru asks an Errand to answer in. A request rather than a
 /// guarantee — every reply is validated here regardless of whether the harness
-/// could enforce it.
-fn reply_schema() -> Value {
-    json!({
+/// could enforce it. Only `asks_branch` puts a `branch` in it, required like
+/// every other property for strict mode's sake and validated as leniently as
+/// the Icon.
+fn reply_schema(asks_branch: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "title": {
@@ -503,20 +624,33 @@ fn reply_schema() -> Value {
         },
         "required": ["title", "icon"],
         "additionalProperties": false,
-    })
+    });
+    if asks_branch {
+        schema["properties"]["branch"] = json!({
+            "type": "string",
+            "description": "2 to 5 plain words describing the requested work, with no prefix, no issue numbers, and no Skill's name as its subject",
+        });
+        schema["required"] = json!(["title", "icon", "branch"]);
+    }
+    schema
 }
 
-/// The Title and Icon an Errand's reply yields, or `None` when it yields
-/// neither. Sanitizing runs on every path, whether or not the harness was
-/// able to enforce the schema, because no Provider can be relied on to have
-/// done it.
-fn derived_title(answer: &Value) -> Option<DerivedTitle> {
+/// What a Title Errand's reply yields: its Title and Icon, and the branch
+/// fragment it proposed where that is a string with meaningful words left once
+/// shaped — or `None` when it yields no Title, and so nothing at all, its
+/// branch included. Sanitizing runs on every path, whether or not the harness
+/// was able to enforce the schema, because no Provider can be relied on to
+/// have done it.
+fn derived_reply(answer: &Value) -> Option<DerivedReply> {
     let reply: DerivedTitleReply = serde_json::from_value(answer.clone()).ok()?;
-    Some(DerivedTitle {
-        title: sanitized_title(&reply.title)?,
-        icon: reply
-            .icon
-            .filter(|name| icon_catalog::glyph(name).is_some()),
+    Some(DerivedReply {
+        title: DerivedTitle {
+            title: sanitized_title(&reply.title)?,
+            icon: reply
+                .icon
+                .filter(|name| icon_catalog::glyph(name).is_some()),
+        },
+        branch: reply.branch.as_str().and_then(naming::proposed_fragment),
     })
 }
 
@@ -561,6 +695,10 @@ fn unquoted(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn derived_title(answer: &Value) -> Option<DerivedTitle> {
+        derived_reply(answer).map(|reply| reply.title)
+    }
 
     #[test]
     fn a_title_is_taken_from_the_first_non_empty_line() {
@@ -654,13 +792,58 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_yields_its_branch_only_where_it_is_usable() {
+        let branch = |value: Value| {
+            derived_reply(&json!({ "title": "Fix the flicker", "icon": "md-bug", "branch": value }))
+                .expect("the Title is derived whatever the branch")
+                .branch
+        };
+        assert_eq!(
+            branch(json!("suru/Fix reasoning flicker")),
+            Some("fix-reasoning-flicker".to_owned())
+        );
+        assert_eq!(branch(json!("")), None);
+        assert_eq!(branch(json!("please do it")), None);
+        assert_eq!(branch(json!(null)), None);
+        assert_eq!(branch(json!(42)), None);
+        assert_eq!(
+            derived_reply(&json!({ "title": "Fix the flicker" }))
+                .expect("a reply without a branch still yields its Title")
+                .branch,
+            None
+        );
+        assert!(
+            derived_reply(&json!({ "branch": "fix-flicker" })).is_none(),
+            "a reply without a Title yields no branch either"
+        );
+    }
+
+    #[test]
+    fn only_a_fresh_worktree_is_asked_for_a_branch() {
+        let without = reply_schema(false);
+        assert!(without["properties"].get("branch").is_none());
+        assert_eq!(without["required"], json!(["title", "icon"]));
+        assert!(!errand_prompt("Fix the flicker", &[], false).contains("branch"));
+
+        let with = reply_schema(true);
+        assert_eq!(with["properties"]["branch"]["type"], json!("string"));
+        assert_eq!(
+            with["required"],
+            json!(["title", "icon", "branch"]),
+            "strict mode requires every property the schema names"
+        );
+        assert_eq!(with["additionalProperties"], json!(false));
+        assert!(errand_prompt("Fix the flicker", &[], true).contains("branch name"));
+    }
+
+    #[test]
     fn a_title_errand_schema_rejects_unasked_properties() {
-        assert_eq!(reply_schema()["additionalProperties"], json!(false));
+        assert_eq!(reply_schema(false)["additionalProperties"], json!(false));
     }
 
     #[test]
     fn a_title_errand_schema_enumerates_the_icon_catalog() {
-        let schema = reply_schema();
+        let schema = reply_schema(false);
         assert_eq!(
             schema["properties"]["icon"]["enum"],
             json!(icon_catalog::names()),
@@ -821,7 +1004,7 @@ mod tests {
     #[test]
     fn an_errand_carries_only_the_opening_of_a_long_prompt() {
         let prompt = "x".repeat(MAX_ERRAND_PROMPT_CHARS + 500);
-        let carried = errand_prompt(&prompt, &[]);
+        let carried = errand_prompt(&prompt, &[], false);
         assert!(carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS)));
         assert!(!carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS + 1)));
     }
