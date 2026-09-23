@@ -85,6 +85,17 @@ pub trait SourceControl: Send + Sync {
     /// deterministic Server tests use it to admit work in that race window.
     async fn reclaim_candidate_observed(&self, _target: &crate::protocol::CheckoutRemovalTarget) {}
 
+    /// Observation point once a branch rename has settled: declined, found
+    /// unchanged, or renamed and recorded. Adapters ordinarily do nothing;
+    /// deterministic Server tests use it to learn how a rename went, which is
+    /// otherwise visible only in the Log wherever nothing changed.
+    async fn branch_rename_settled(
+        &self,
+        _created: &CreatedBranch,
+        _outcome: &Result<BranchRename, String>,
+    ) {
+    }
+
     async fn checkpoint(
         &self,
         _at: PreparationCheckpoint,
@@ -146,9 +157,10 @@ pub trait SourceControl: Send + Sync {
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
     /// leaving the Worktree's location where it is. Proceeds only while the
-    /// Worktree's HEAD is still the created branch, and changes nothing where
-    /// the proposal already names it. The caller holds the preparation serial
-    /// and the Repository's mutation guard.
+    /// Worktree's HEAD is still the created branch and that branch has no
+    /// upstream configured, and changes nothing where the proposal already
+    /// names it. The caller holds the preparation serial and the Repository's
+    /// mutation guard.
     ///
     /// Only systems whose Repositories report the `rename_branch` capability
     /// offer this; a system without branches keeps the default, which refuses.
@@ -476,7 +488,8 @@ impl SourceControlService {
     }
     /// Rename a fresh Managed Worktree's branch to what its Title derivation
     /// proposed, on this owning Server, where its Repository advertises the
-    /// capability.
+    /// capability, and hand the Worktree's fresh reading to `record` the
+    /// moment it is renamed.
     ///
     /// Takes the preparation serial and then the Repository's mutation guard,
     /// the order preparation, admission, and removal take them in, so the
@@ -484,11 +497,32 @@ impl SourceControlService {
     /// execution lease rather than skipping. It first waits for the guard to
     /// come free without holding the serial, so a Turn still starting in this
     /// Repository never holds up every other preparation behind the rename.
+    ///
+    /// Inside those locks it declines while any retained preparation intent
+    /// for the Worktree still names the branch — one whose deletion after
+    /// admission failed, say — so no intent is left naming a branch that no
+    /// longer exists. A rename then reads the Worktree and records it before
+    /// either lock is let go, so no removal or recovery can come between the
+    /// new name and the recovery facts that carry it.
     pub(crate) async fn rename_branch(
         &self,
         preparations: &PreparationStore,
         created: &CreatedBranch,
         proposal: &str,
+        record: impl FnOnce(crate::protocol::CheckoutSummary) -> Result<(), String>,
+    ) -> Result<BranchRename, String> {
+        let outcome = self
+            .guarded_rename(preparations, created, proposal, record)
+            .await;
+        self.adapter.branch_rename_settled(created, &outcome).await;
+        outcome
+    }
+    async fn guarded_rename(
+        &self,
+        preparations: &PreparationStore,
+        created: &CreatedBranch,
+        proposal: &str,
+        record: impl FnOnce(crate::protocol::CheckoutSummary) -> Result<(), String>,
     ) -> Result<BranchRename, String> {
         if let crate::protocol::SourceControlCapability::Unsupported { reason } =
             &created.repository.capabilities.rename_branch
@@ -498,7 +532,25 @@ impl SourceControlService {
         drop(self.mutation_guard(&created.repository.id).await);
         let _serial = preparations.serial.lock().await;
         let _mutation = self.mutation_guard(&created.repository.id).await;
-        self.adapter.rename_branch(created, proposal).await
+        if preparations
+            .for_destination(&created.checkout.root)?
+            .iter()
+            .any(|intent| intent.plan.branch() == Some(created.branch.as_str()))
+        {
+            return Err("A retained preparation intent still names the branch".to_owned());
+        }
+        let renamed = self.adapter.rename_branch(created, proposal).await?;
+        if let BranchRename::Renamed { branch } = &renamed
+            && let Err(error) = record(self.adapter.observe(&created.checkout).await)
+        {
+            // The branch is renamed whatever this says. Recovery facts that
+            // could not be written are caught up by the next observation.
+            tracing::warn!(
+                %branch,
+                "a renamed Managed Worktree's Checkout State could not be recorded: {error}"
+            );
+        }
+        Ok(renamed)
     }
     pub(crate) async fn observe(
         &self,

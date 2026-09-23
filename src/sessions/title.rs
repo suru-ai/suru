@@ -47,14 +47,19 @@
 //! Worktree name goes through, and handed to source control, which renames
 //! the branch on the owning Server — see
 //! [`crate::source_control::SourceControlService::rename_branch`] for the
-//! locks it takes and when it declines. The rename runs on this same task
-//! once the Title Errand's answer is committed, alongside the Workspace
-//! Errand rather than in front of it or behind it: the rename may wait out the
-//! first Turn's hold on the Repository, and the Workspace Icon never waits for
-//! that, just as the rename never waits for the Workspace Icon. The Worktree's
-//! location keeps the name it was created with, and the Session's Checkout
-//! State reports the new branch the next time checkout observation reads it. Every other Session's Errand — one working
-//! in an existing Worktree, or in none — asks for no branch at all.
+//! locks it takes and when it declines: a branch whose Worktree has left it,
+//! that has an upstream configured, or that a retained preparation intent
+//! still names keeps its first name. The rename runs on this same task once
+//! the Title Errand's answer is committed, alongside the Workspace Errand
+//! rather than in front of it or behind it: the rename may wait out the first
+//! Turn's hold on the Repository, and the Workspace Icon never waits for that,
+//! just as the rename never waits for the Workspace Icon. The Worktree's
+//! location keeps the name it was created with. The rename is recorded as the
+//! Checkout State of every Session sharing the Worktree before source
+//! control's locks are let go, so their recovery facts name the new branch at
+//! once and clients hear of it as they hear of any other reading. Every other
+//! Session's Errand — one working in an existing Worktree, or in none — asks
+//! for no branch at all.
 //!
 //! Everything here is best-effort by construction. Derivation runs in the
 //! background alongside the real first Turn and never blocks or gates it; the
@@ -322,6 +327,7 @@ impl Derivation {
                             session_id,
                             &source_control,
                             &preparations,
+                            &sessions,
                             created,
                             proposal,
                         )
@@ -414,15 +420,26 @@ async fn derive_workspace_icon(
 /// Renames a fresh Managed Worktree's branch to a derived proposal, saying in
 /// the Log and nowhere else how that went: a branch that keeps its first name
 /// is a cosmetic loss, never a failure the Session hears about.
+///
+/// A rename is recorded as the Checkout State of every Session sharing the
+/// Worktree the moment it happens, under source control's locks: their
+/// recovery facts name the new branch from then on, and clients hear of it
+/// the way they hear of any other reading.
 async fn rename_branch(
     session_id: SessionId,
     source_control: &SourceControlService,
     preparations: &PreparationStore,
+    sessions: &SessionStore,
     created: &CreatedBranch,
     proposal: &str,
 ) {
+    let record = |reading| {
+        sessions
+            .record_checkout(reading)
+            .map_err(|error| error.to_string())
+    };
     match source_control
-        .rename_branch(preparations, created, proposal)
+        .rename_branch(preparations, created, proposal, record)
         .await
     {
         Ok(BranchRename::Renamed { branch }) => tracing::info!(

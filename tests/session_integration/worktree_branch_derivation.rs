@@ -1,7 +1,7 @@
 //! A fresh Managed Worktree's branch renamed to the name its Session's Title
 //! Errand derives, through the owning Server's protocol and real Git.
 use crate::{
-    provider_support::{ControlledProvider, ControlledProviderRuntime},
+    provider_support::{ControlledProvider, ControlledProviderRuntime, ControlledProviderSession},
     repositories::git,
     server_support::{
         PROGRESS_DEADLINE, config_root_pinning, next_catalog_change_matching, next_derived_title,
@@ -102,10 +102,11 @@ struct Fixture {
     renames: mpsc::UnboundedReceiver<Result<BranchRename, String>>,
 }
 
-/// Git in every respect, reporting each rename it is asked for once Git has
-/// answered. A rename that fails or changes nothing is otherwise invisible by
-/// design, and this is what lets a test say one was attempted, and how it
-/// went, without waiting out a deadline.
+/// Git in every respect, reporting how each rename settled once the Server is
+/// done with it — its recording included. A rename that is declined or
+/// changes nothing is otherwise invisible by design, and this is what lets a
+/// test say one was attempted, and how it went, without waiting out a
+/// deadline.
 struct WitnessedGit {
     git: GitSourceControl,
     renames: mpsc::UnboundedSender<Result<BranchRename, String>>,
@@ -118,9 +119,14 @@ impl SourceControl for WitnessedGit {
         created: &CreatedBranch,
         proposal: &str,
     ) -> Result<BranchRename, String> {
-        let outcome = self.git.rename_branch(created, proposal).await;
+        self.git.rename_branch(created, proposal).await
+    }
+    async fn branch_rename_settled(
+        &self,
+        _created: &CreatedBranch,
+        outcome: &Result<BranchRename, String>,
+    ) {
         let _ = self.renames.send(outcome.clone());
-        outcome
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
@@ -196,14 +202,29 @@ impl Fixture {
         errand: Option<DerivationErrand>,
         timings: ServerTimings,
     ) -> Self {
+        Self::start_with_git(channel, errand, timings, |_| GitSourceControl::default()).await
+    }
+
+    /// A Fixture whose Git is built knowing the Server's data directory, for
+    /// an observer that reaches into what the Server stores.
+    async fn start_with_git(
+        channel: &'static str,
+        errand: Option<DerivationErrand>,
+        timings: ServerTimings,
+        git: impl FnOnce(&Path) -> GitSourceControl,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let root = suru::paths::canonical(temporary.path()).unwrap();
         let main = root.join("repo");
         committed(&main);
         let config = errand.as_ref().map(config_root_pinning);
         let state = root.join("state");
+        let data = ServerConfig::new(&state, channel)
+            .expect("configure server")
+            .data_dir()
+            .to_owned();
         let (server, client, provider, renames) =
-            spawn(&state, channel, config.as_ref(), timings).await;
+            spawn(&state, channel, config.as_ref(), timings, git(&data)).await;
         Self {
             _temporary: temporary,
             _config: config,
@@ -296,8 +317,9 @@ impl Fixture {
     }
 
     /// Runs the Session's first Turn to completion: every point at which its
-    /// execution lease on the Repository could still be held.
-    async fn work_the_first_turn(&mut self) {
+    /// execution lease on the Repository could still be held. The Provider
+    /// Session stays open for as long as the caller keeps it.
+    async fn work_the_first_turn(&mut self) -> ControlledProviderSession {
         let mut session = timeout(PROGRESS_DEADLINE, self.provider.next_start())
             .await
             .expect("the first Turn starts a Provider Session")
@@ -312,6 +334,7 @@ impl Fixture {
         session
             .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
             .await;
+        session
     }
 
     /// Answers the Workspace Icon Errand, which only a Workspace's first
@@ -324,7 +347,7 @@ impl Fixture {
         errand.succeed(json!({ "icon": "dev-rust" }));
     }
 
-    /// How the one rename this derivation attempted went.
+    /// How the one rename this derivation attempted settled.
     async fn rename_attempted(&mut self) -> Result<BranchRename, String> {
         timeout(PROGRESS_DEADLINE, self.renames.recv())
             .await
@@ -345,6 +368,7 @@ async fn spawn(
     channel: &str,
     config: Option<&tempfile::TempDir>,
     timings: ServerTimings,
+    git: GitSourceControl,
 ) -> (
     RunningServer,
     ManagedClient,
@@ -361,10 +385,7 @@ async fn spawn(
         server_config,
         vec![runtime],
         timings,
-        Arc::new(WitnessedGit {
-            git: GitSourceControl::default(),
-            renames,
-        }),
+        Arc::new(WitnessedGit { git, renames }),
     )
     .await
     .expect("spawn server");
@@ -882,7 +903,14 @@ async fn a_restart_after_admission_attempts_no_rename() {
     server.shutdown().await.expect("shut down server");
     drop((outstanding, provider));
 
-    let (server, client, mut provider, mut renames) = spawn(&state, channel, None, timings()).await;
+    let (server, client, mut provider, mut renames) = spawn(
+        &state,
+        channel,
+        None,
+        timings(),
+        GitSourceControl::default(),
+    )
+    .await;
     // A new Session's Errand is the first to reach the Provider after the
     // restart: had the admitted Session's derivation been attempted again,
     // its own Errand, asking for a branch, would have come first.
@@ -923,4 +951,295 @@ async fn a_restart_after_admission_attempts_no_rename() {
     );
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// Checkout observation that never ticks again after startup, so whatever a
+/// test sees of a rename was recorded when the rename happened.
+fn without_observation() -> ServerTimings {
+    ServerTimings::default().with_checkout_observation_interval(Duration::from_secs(60 * 60))
+}
+
+fn head(root: &Path) -> Option<String> {
+    read_git(root, &["symbolic-ref", "--short", "HEAD"])
+}
+
+fn recovery_branch(snapshot: &SessionSnapshot) -> Option<&str> {
+    match snapshot
+        .session
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.recovery_revision.as_ref())
+    {
+        Some(CheckoutRevision::Branch { name, .. }) => Some(name),
+        _ => None,
+    }
+}
+
+/// Waits for a Session's recovery facts to name `branch`, which with
+/// observation stood down only the rename's own recording can bring about.
+async fn recovers_on(fixture: &Fixture, session_id: SessionId, branch: &str) -> SessionSnapshot {
+    crate::support::read_session_until(
+        &reqwest::Client::new(),
+        fixture.server.descriptor(),
+        session_id,
+        &format!("recovery facts name {branch}"),
+        |snapshot| recovery_branch(snapshot) == Some(branch),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_branch_with_an_upstream_keeps_its_name() {
+    let mut fixture = Fixture::start("derived-branch-upstream").await;
+    let remote = fixture.root.join("remote.git");
+    git(
+        &fixture.root,
+        &["init", "--bare", "-b", "main", remote.to_str().unwrap()],
+    );
+    git(
+        &fixture.main,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let main = fixture.main.clone();
+    let (preparation, _, errand) = fixture.admitted(&main, "Fix the parser").await;
+    let created = branch_of(&preparation);
+    // The Agent pushes its branch before the Errand answers.
+    git(
+        &preparation.destination.path,
+        &["push", "--set-upstream", "origin", &created],
+    );
+    errand.succeed(json!({
+        "title": "Repair the config parser",
+        "icon": "md-bug",
+        "branch": "repair config parser",
+    }));
+    fixture.work_the_first_turn().await;
+    fixture.workspace_errand().await;
+
+    assert!(
+        fixture
+            .rename_attempted()
+            .await
+            .is_err_and(|reason| reason.contains("upstream")),
+        "a branch with an upstream is declined"
+    );
+    assert_eq!(
+        head(&preparation.destination.path).as_deref(),
+        Some(created.as_str())
+    );
+    assert_eq!(branches(&main), ["main", created.as_str()]);
+    assert_eq!(
+        read_git(&main, &["config", &format!("branch.{created}.remote")]).as_deref(),
+        Some("origin")
+    );
+
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// Admits the preparation exactly as the Server does, then puts its intent
+/// back where the Server just deleted it from — as a deletion that failed
+/// after admission leaves it.
+struct RetainIntentAfterAdmission {
+    data: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl suru::source_control::PreparationObserver for RetainIntentAfterAdmission {
+    async fn checkpoint(
+        &self,
+        at: suru::source_control::PreparationCheckpoint,
+        preparation: &PreparedCheckout,
+    ) -> Result<(), String> {
+        if at == suru::source_control::PreparationCheckpoint::Admitted {
+            let intents = self.data.join("checkout-preparations");
+            std::fs::create_dir_all(&intents).unwrap();
+            std::fs::write(
+                intents.join(format!("{}.json", preparation.id.0)),
+                serde_json::to_vec(preparation).unwrap(),
+            )
+            .unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_retained_preparation_intent_naming_the_branch_prevents_the_rename() {
+    let mut fixture =
+        Fixture::start_with_git("derived-branch-retained-intent", None, timings(), |data| {
+            GitSourceControl::default().with_preparation_observer(Arc::new(
+                RetainIntentAfterAdmission {
+                    data: data.to_owned(),
+                },
+            ))
+        })
+        .await;
+    let main = fixture.main.clone();
+    let (preparation, _, errand) = fixture.admitted(&main, "Fix the parser").await;
+    errand.succeed(json!({
+        "title": "Repair the config parser",
+        "icon": "md-bug",
+        "branch": "repair config parser",
+    }));
+    fixture.work_the_first_turn().await;
+    fixture.workspace_errand().await;
+
+    assert!(
+        fixture
+            .rename_attempted()
+            .await
+            .is_err_and(|reason| reason.contains("intent")),
+        "a retained intent naming the branch keeps it"
+    );
+    assert_eq!(
+        head(&preparation.destination.path).as_deref(),
+        Some("suru/fix-parser")
+    );
+    assert!(branches(&main).contains(&"suru/fix-parser".to_owned()));
+
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_worktree_removed_right_after_its_rename_recovers_on_the_new_branch() {
+    let mut fixture =
+        Fixture::start_with("derived-branch-recovery", None, without_observation()).await;
+    let main = fixture.main.clone();
+    let (preparation, created, errand) = fixture.admitted(&main, "Fix the parser").await;
+    let destination = preparation.destination.path.clone();
+    errand.succeed(json!({
+        "title": "Repair the config parser",
+        "icon": "md-bug",
+        "branch": "repair config parser",
+    }));
+    let _first = fixture.work_the_first_turn().await;
+    fixture.workspace_errand().await;
+    let renamed = "suru/repair-config-parser";
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: renamed.to_owned()
+        })
+    );
+    recovers_on(&fixture, created.session.id, renamed).await;
+
+    // Gone outside Suru, with no observation to have noticed either change.
+    git(
+        &main,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            destination.to_str().unwrap(),
+        ],
+    );
+    assert!(!destination.exists());
+    fixture
+        .client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Carry on".to_owned(),
+                    skill_invocations: vec![],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit a Prompt to the Session");
+    let start = timeout(PROGRESS_DEADLINE, fixture.provider.next_start())
+        .await
+        .expect("the recreated Worktree reconnects its Provider");
+    assert_eq!(start.execution_directory(), destination);
+    let mut session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: hosted_selection(PROVIDER, MODEL),
+    });
+    timeout(PROGRESS_DEADLINE, session.next_turn())
+        .await
+        .expect("the Prompt reaches the Provider")
+        .succeed();
+
+    assert_eq!(head(&destination).as_deref(), Some(renamed));
+    assert!(!branches(&main).contains(&"suru/fix-parser".to_owned()));
+    assert!(
+        suru_base(&main, renamed).is_some(),
+        "Reclaim still finds the branch's recorded base"
+    );
+
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn every_session_sharing_the_worktree_reports_the_new_branch() {
+    let mut fixture =
+        Fixture::start_with("derived-branch-shared", None, without_observation()).await;
+    let descriptor = fixture.server.descriptor().clone();
+    let mut catalog = open_catalog_stream(&descriptor).await;
+    let main = fixture.main.clone();
+    let (preparation, first, first_errand) = fixture.admitted(&main, "Fix the parser").await;
+    let destination = preparation.destination.path.clone();
+    let _first_turn = fixture.work_the_first_turn().await;
+
+    // A second Session in the same Managed Worktree, which was not prepared
+    // for it and so is asked for no branch.
+    let second = fixture.create(None, &destination).await;
+    let second_errand = fixture.next_errand().await;
+    assert!(!second_errand.asks_for_a_branch());
+    second_errand.fail("the Provider is signed out");
+    fixture.workspace_errand().await;
+    let _second_turn = fixture.work_the_first_turn().await;
+    let checkout = first.session.checkout.clone().expect("a Managed Worktree");
+    assert_eq!(
+        second.session.checkout.as_ref().map(|c| &c.id),
+        Some(&checkout.id)
+    );
+
+    first_errand.succeed(json!({
+        "title": "Repair the config parser",
+        "icon": "md-bug",
+        "branch": "repair config parser",
+    }));
+    fixture.workspace_errand().await;
+    let renamed = "suru/repair-config-parser";
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: renamed.to_owned()
+        })
+    );
+    branch_reading(&mut catalog, &checkout.id, renamed).await;
+    for session in [&first, &second] {
+        recovers_on(&fixture, session.session.id, renamed).await;
+    }
+    let listed = fixture
+        .client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .filter_map(|item| match item {
+            SessionListItem::Readable(summary) => Some(summary),
+            SessionListItem::Unreadable(_) => None,
+        })
+        .collect::<Vec<_>>();
+    for session in [&first, &second] {
+        let summary = listed
+            .iter()
+            .find(|summary| summary.session.id == session.session.id)
+            .expect("the Session is listed");
+        assert!(
+            matches!(
+                summary.checkout_state.as_ref().and_then(|state| state.revision.as_ref()),
+                Some(CheckoutRevision::Branch { name, .. }) if name == renamed
+            ),
+            "{:?}",
+            summary.checkout_state
+        );
+    }
+
+    drop(catalog);
+    fixture.server.shutdown().await.expect("shut down server");
 }
