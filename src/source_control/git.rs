@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::process::Command;
+mod branches;
 mod preparation;
 mod recovery;
 mod removal;
@@ -464,20 +465,16 @@ impl SourceControl for GitSourceControl {
         if confirmed_reference != source_reference || confirmed_commit.as_deref() != Some(&commit) {
             return Err("The source checkout changed while its Worktree was being planned; retry preparation".into());
         }
+        let branches = self.branch_names(source_path).await?;
         for name in super::naming::numbered(name) {
             let branch = format!("{}{name}", super::naming::BRANCH_PREFIX);
             let destination = root.join(MANAGED_WORKTREE_DIRECTORY).join(&name);
             // Whatever holds a name keeps it: an occupied location (even a
-            // dangling link), a branch, or another stored intention's plan.
+            // dangling link), a branch Git would refuse this one beside, or
+            // another stored intention's plan.
             if std::fs::symlink_metadata(&destination).is_ok()
                 || reserved.contains(&destination)
-                || self
-                    .text(
-                        source_path,
-                        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-                    )
-                    .await
-                    .is_some()
+                || !branches::branch_available(&branches, &branch)
             {
                 continue;
             }

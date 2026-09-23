@@ -126,7 +126,9 @@ pub trait SourceControl: Send + Sync {
     /// [`naming::name_fragment`]. It takes the first of [`naming::numbered`]
     /// whose location and branch are free and whose destination is not
     /// `reserved` by another stored preparation; nothing already holding a
-    /// name is displaced to make room.
+    /// name is displaced to make room. A branch Git would refuse beside
+    /// another — one differing only in case, or clashing with it as a
+    /// directory — counts as held.
     async fn plan_checkout(
         &self,
         _id: crate::protocol::PreparationId,

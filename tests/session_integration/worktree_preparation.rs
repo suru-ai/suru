@@ -472,6 +472,35 @@ async fn a_taken_name_is_numbered_and_whatever_holds_it_is_left_untouched() {
     server.shutdown().await.unwrap();
 }
 
+/// Git refuses a branch beside another that uses its name as a directory, and a
+/// case-insensitive filesystem holds only one of two loose refs differing in
+/// case. Planning counts both as taken wherever it runs, so the name it picks
+/// never depends on the platform.
+#[tokio::test]
+async fn a_name_clashing_by_case_or_as_a_directory_is_taken() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    git(&main, &["branch", "suru/Fix-Parser"]);
+    git(&main, &["branch", "suru/fix-parser-2/old"]);
+    let (runtime, _provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "clashing-names").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+
+    let result = prepare(server.descriptor(), &request(&main, "Fix the parser")).await;
+    assert_eq!(result.error, None);
+    let container = main.join(".suru-worktrees");
+    let (branch, destination) = planned(&result, &container);
+    assert_eq!(branch, "suru/fix-parser-3");
+    assert_eq!(destination, container.join("fix-parser-3"));
+    server.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn the_tui_prepares_a_worktree_named_from_its_prompt_and_starts_its_session_there() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
