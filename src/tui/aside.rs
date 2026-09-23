@@ -180,9 +180,13 @@ impl Aside {
     }
 
     /// The Session the per-tree subscription should be asked through, or
-    /// `None` when there is nothing for the Aside to answer for. Moving
-    /// between Sessions of the tree already in hand keeps the subscription
-    /// it came from, so the Section stands as it is.
+    /// `None` when no Session is open. Moving between Sessions of the tree
+    /// already in hand keeps the subscription it came from, so the Section
+    /// stands as it is.
+    ///
+    /// The tree is followed whether or not the Aside is shown, because the
+    /// Sidebar reads the top-level Session it heads from it too (see
+    /// [`Self::top_level_of`]).
     ///
     /// A tree whose subscription ended — it could not be read, or it was
     /// deleted — is not asked for again until a Session of it is next opened
@@ -190,10 +194,24 @@ impl Aside {
     /// subscription go and starts a fresh one then.
     pub(super) fn tree_request(&self, open: Option<&SessionReference>) -> Option<SessionReference> {
         let open = open?;
-        if !self.column.is_revealed() || self.tree.ended_for(open).is_some() {
+        if self.tree.ended_for(open).is_some() {
             return None;
         }
         Some(self.tree.wanted(open))
+    }
+
+    /// The top-level Session heading the tree `open` belongs to, where a tree
+    /// the per-tree subscription delivered says — including one whose
+    /// subscription has since failed, which still names it. `None` while no
+    /// such tree is in hand.
+    pub(super) fn top_level_of(&self, open: &SessionReference) -> Option<SessionReference> {
+        let reading = self
+            .tree_for(open)
+            .or_else(|| self.tree.ended_for(open).and_then(|end| end.tree.as_ref()))?;
+        Some(SessionReference::new(
+            reading.origin().clone(),
+            reading.top_level().session_id,
+        ))
     }
 
     /// Notes that the reader opened `opened`. Opening a Session of a tree
@@ -211,6 +229,10 @@ impl Aside {
         open: Option<&SessionReference>,
         now: Instant,
     ) -> Option<Instant> {
+        // Only a shown Aside says Loading, so only it is owed the wakeup.
+        if !self.column.is_revealed() {
+            return None;
+        }
         let wanted = self.tree_request(open)?;
         if self.tree.covers(open?) {
             return None;
@@ -721,8 +743,13 @@ mod tests {
         aside.toggle(true);
         assert_eq!(
             aside.tree_request(Some(&reference(top))),
-            None,
-            "a hidden Aside asks for nothing"
+            Some(reference(child)),
+            "a hidden Aside still follows the tree, which the Sidebar reads too"
+        );
+        assert_eq!(
+            aside.top_level_of(&reference(child)),
+            Some(reference(top)),
+            "and names its top-level Session"
         );
     }
 

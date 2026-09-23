@@ -2794,6 +2794,25 @@ impl TuiState {
         self.route.as_ref()
     }
 
+    /// The Session the Sidebar's open-Session highlight and its starting row
+    /// focus answer for: the open Session, or — while a Subagent's Session is
+    /// open, at any depth — the top-level Session heading its tree, since that
+    /// tree is still what the main view is for. The top-level Session is read
+    /// off the per-tree subscription's snapshot, so until that arrives a
+    /// Subagent's Session answers for itself and no row is highlighted.
+    /// `None` on the Landing.
+    ///
+    /// Opening a row is not answered from here: from a Subagent's Session the
+    /// top-level row is another Session, and choosing it opens it.
+    pub(super) fn sidebar_highlight(&self) -> Option<SessionReference> {
+        let open = self.route.as_ref()?;
+        Some(
+            self.aside
+                .top_level_of(open)
+                .unwrap_or_else(|| open.clone()),
+        )
+    }
+
     /// Whether activating the open Sidebar row means retry rather than merely
     /// handing the keys back. Only a failed optimistic shell has that meaning:
     /// an attachment still in flight must not be duplicated, and a hydrated
@@ -4948,7 +4967,7 @@ impl Application {
                         self.state.workspace_picker.load(&request, sessions);
                     }
                     SessionListSurface::Sidebar => {
-                        let open = self.state.route.clone();
+                        let open = self.state.sidebar_highlight();
                         self.state.sidebar.load(&request, sessions, open.as_ref());
                     }
                 }
@@ -8095,7 +8114,7 @@ impl Application {
                     && self
                         .state
                         .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                let open = self.state.route.clone();
+                let open = self.state.sidebar_highlight();
                 self.state.sidebar.toggle(open.as_ref());
                 if self.state.sidebar.column().claims_keys() {
                     self.state.aside.hand_back_keys();

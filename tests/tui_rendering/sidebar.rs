@@ -21,17 +21,19 @@ use crossterm::event::{
 };
 use ratatui::{buffer::Buffer, style::Color};
 use suru::{
-    managed_client::{ManagedEvent, RecoveryStatus, SessionEvent},
+    managed_client::{ManagedEvent, RecoveryStatus, SessionEvent, SubagentTreeEvent},
     protocol::{
-        Activity, ActivityId, ActivityStatus, AppearanceSettings, ApprovalId, AutoSettle,
-        EffectiveSettings, LatestTurnStatus, Message, MessageId, MessageRole, MessageStatus,
-        Outlook, PromptId, Remote, RemoteStatus, ServerShutdown, SessionCatalogRevision,
-        SessionCatalogSnapshot, SessionChange, SessionContentWidth, SessionCreated, SessionDeleted,
-        SessionId, SessionListItem, SessionReference, SessionRevision, SessionSettings,
-        SessionSettlementChanged, SessionStandingInputs, SessionStandingInputsChanged,
-        SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged, SessionUpdate,
-        SessionWorkingChanged, ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility,
-        SubagentInterventions, TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
+        Activity, ActivityId, ActivityStatus, AppearanceSettings, ApprovalId, AsideSettings,
+        AsideVisibility, AutoSettle, EffectiveSettings, LatestTurnStatus, Message, MessageId,
+        MessageRole, MessageStatus, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown,
+        SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
+        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
+        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
+        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
+        SidebarSettings, SidebarVisibility, SubagentInterventions, SubagentTreeEntry,
+        SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel, TextSelectionCopy,
+        TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -3562,12 +3564,13 @@ fn a_settled_open_session_below_the_shelf_cap_highlights_nothing() {
     );
 }
 
-/// A Subagent's Session joins no listing, so opening one leaves the column
-/// with nothing to highlight — and nothing to put the keys on but the
-/// selector. It must never reach for the parent's row, or some other row, to
+/// A Subagent's Session joins no listing, and which top-level Session heads
+/// its tree is read off the per-tree subscription. Until that tree arrives the
+/// column has nothing to highlight — and nothing to put the keys on but the
+/// selector. It must never guess at the parent's row, or some other row, to
 /// have something to mark.
 #[test]
-fn an_open_subagent_session_highlights_nothing_and_seeds_the_selector() {
+fn an_open_subagent_session_highlights_nothing_until_its_tree_arrives() {
     let workspace = workspace_dir();
     let parent = SessionId::new();
     let sessions = vec![listed_as(parent, "The parent work", workspace.path(), 1)];
@@ -10090,4 +10093,237 @@ fn the_wheel_leaves_the_rows_under_a_menu_alone_but_still_reads_the_transcript()
         "the wheel over the main view goes on moving the Transcript"
     );
     assert!(menu_is_drawn(&application), "and leaves the menu standing");
+}
+
+// While a Subagent's Session is open, the Sidebar's highlight stands on the
+// row of the top-level Session heading its tree, which is still what the main
+// view is for.
+
+/// A Sidebar shown beside a hidden Aside, so nothing the Aside draws can be
+/// what puts the top-level Session in reach.
+fn sidebar_beside_a_hidden_aside(workspace: &Path, sessions: Vec<SessionListItem>) -> Application {
+    sidebar_hydrated(
+        workspace,
+        EffectiveSettings {
+            sidebar: shown(AutoSettle::default()),
+            aside: AsideSettings {
+                initial_visibility: AsideVisibility::Hidden,
+                ..AsideSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        sessions,
+    )
+}
+
+/// A top-level Session with one Subagent, which spawned one more.
+struct Family {
+    top: SessionId,
+    child: SessionId,
+    grandchild: SessionId,
+}
+
+impl Family {
+    fn new() -> Self {
+        Self {
+            top: SessionId::new(),
+            child: SessionId::new(),
+            grandchild: SessionId::new(),
+        }
+    }
+
+    fn tree(&self) -> SubagentTreeSnapshot {
+        let entry = |session_id, parent_session_id, name: &str| SubagentTreeEntry {
+            session_id,
+            parent_session_id,
+            spawn_order: 0,
+            name: name.to_owned(),
+            title: format!("{name} the seams"),
+            status: ActivityStatus::Active,
+            duration_ms: None,
+            started_at: None,
+            needs_intervention: false,
+        };
+        SubagentTreeSnapshot {
+            revision: SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: self.top,
+                title: "The delegating work".to_owned(),
+                working_since: Some(SessionTimestamp(seconds_ago(90))),
+                needs_intervention: false,
+            },
+            subagents: vec![
+                entry(self.child, self.top, "Explore"),
+                entry(self.grandchild, self.child, "Review"),
+            ],
+        }
+    }
+}
+
+/// Opens `session_id` in the main view as a Subagent's Session under
+/// `parent`.
+fn open_subagent(
+    application: &mut Application,
+    workspace: &Path,
+    session_id: SessionId,
+    parent: SessionId,
+) {
+    let mut snapshot =
+        failed_session_snapshot(session_id, PromptId::new(), "Delegated work", workspace);
+    snapshot.session.parent = Some(parent);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("open a Subagent's Session in the main view");
+}
+
+/// The per-tree subscription asked through `through` delivering the family's
+/// tree.
+fn deliver_family_tree(application: &mut Application, through: SessionId, family: &Family) {
+    application
+        .handle_event(ApplicationEvent::SubagentTree {
+            through: SessionReference::new(Outlook::Local, through),
+            event: SubagentTreeEvent::Snapshot(family.tree()),
+        })
+        .expect("take the per-tree subscription's snapshot");
+}
+
+/// The screen rows a Working row's Rail should fill: the three lines of the
+/// active row titled `title`.
+fn rail_of(application: &Application, title: &str) -> Vec<u16> {
+    let rows = rendered_application_rows_at(application, WIDE, 20);
+    let title = u16::try_from(rendered_row(&rows, title)).expect("a screen row");
+    vec![title - 1, title, title + 1]
+}
+
+#[test]
+fn a_subagent_session_open_directly_or_nested_highlights_its_top_level_row() {
+    let workspace = workspace_dir();
+    let family = Family::new();
+    let sessions = vec![
+        listed_as(SessionId::new(), "Other work", workspace.path(), 2),
+        working(
+            listed_as(family.top, "The delegating work", workspace.path(), 1),
+            seconds_ago(90),
+        ),
+    ];
+    let mut application = sidebar_beside_a_hidden_aside(workspace.path(), sessions);
+
+    open_subagent(&mut application, workspace.path(), family.child, family.top);
+    deliver_family_tree(&mut application, family.child, &family);
+
+    assert_eq!(
+        open_sidebar_text(&application),
+        "The delegating work",
+        "the top-level Session's row carries the highlight while its Subagent is open, \
+         the Aside hidden or not"
+    );
+    assert_eq!(
+        standing_rail_rows(&application),
+        rail_of(&application, "The delegating work"),
+        "with its Working Rail intact"
+    );
+    assert!(
+        drawn_in_sidebar(
+            &rendered_application_rows_at(&application, WIDE, 20),
+            "Working 1m"
+        ),
+        "and its other readings too"
+    );
+
+    open_subagent(
+        &mut application,
+        workspace.path(),
+        family.grandchild,
+        family.child,
+    );
+    assert_eq!(
+        open_sidebar_text(&application),
+        "The delegating work",
+        "a Subagent nested deeper answers for the same top-level row"
+    );
+
+    press_toggle(&mut application);
+    assert!(
+        selected_sidebar_text(&application).contains("The delegating work"),
+        "entering the Sidebar begins row focus on that row"
+    );
+}
+
+#[test]
+fn returning_to_the_top_level_session_keeps_its_row_highlighted() {
+    let workspace = workspace_dir();
+    let family = Family::new();
+    let sessions = vec![listed_as(
+        family.top,
+        "The delegating work",
+        workspace.path(),
+        1,
+    )];
+    let mut application = sidebar_beside_a_hidden_aside(workspace.path(), sessions);
+    open_session(&mut application, workspace.path(), family.top);
+    deliver_family_tree(&mut application, family.top, &family);
+    open_subagent(
+        &mut application,
+        workspace.path(),
+        family.grandchild,
+        family.child,
+    );
+    assert_eq!(open_sidebar_text(&application), "The delegating work");
+
+    open_session(&mut application, workspace.path(), family.top);
+
+    assert_eq!(
+        open_sidebar_text(&application),
+        "The delegating work",
+        "the row the Subagent's Session highlighted is the one its top-level Session does"
+    );
+}
+
+#[test]
+fn a_top_level_session_searched_out_leaves_its_subagent_nothing_highlighted() {
+    let workspace = workspace_dir();
+    let family = Family::new();
+    let sessions = vec![
+        listed_as(SessionId::new(), "Match kept", workspace.path(), 2),
+        listed_as(family.top, "The delegating work", workspace.path(), 1),
+    ];
+    let mut application = sidebar_beside_a_hidden_aside(workspace.path(), sessions);
+    open_subagent(&mut application, workspace.path(), family.child, family.top);
+    deliver_family_tree(&mut application, family.child, &family);
+    press_toggle(&mut application);
+
+    type_terminal_text(&mut application, "match");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(!drawn_in_sidebar(&rows, "The delegating work"), "{rows:?}");
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "no result stands in for the top-level row the query left out"
+    );
+}
+
+#[test]
+fn a_top_level_session_scoped_out_leaves_its_subagent_nothing_highlighted() {
+    let workspace = workspace_dir();
+    let family = Family::new();
+    let mut sessions = two_workspaces(workspace.path());
+    sessions.push(listed_as(
+        family.top,
+        "Rooted apart",
+        &workspace.path().join("apart"),
+        5,
+    ));
+    let mut application = sidebar_beside_a_hidden_aside(workspace.path(), sessions);
+    open_subagent(&mut application, workspace.path(), family.child, family.top);
+    deliver_family_tree(&mut application, family.child, &family);
+    assert_eq!(open_sidebar_text(&application), "Rooted apart");
+
+    choose_workspace(&mut application, "notes");
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(!drawn_in_sidebar(&rows, "Rooted apart"), "{rows:?}");
+    assert!(
+        open_sidebar_text(&application).is_empty(),
+        "and the Workspace's own rows are not highlighted in its place"
+    );
 }

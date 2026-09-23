@@ -2859,7 +2859,7 @@ fn sidebar_lines(
     let entries =
         state
             .sidebar
-            .visible_entries(capacity, state.open_session_reference(), &|path| {
+            .visible_entries(capacity, state.sidebar_highlight().as_ref(), &|path| {
                 state.workspace_name(&state.outlook, path)
             });
     if entries.is_empty() {
