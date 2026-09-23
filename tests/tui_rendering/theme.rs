@@ -1133,13 +1133,13 @@ fn a_missing_theme_falls_back_to_system_and_notices_the_preserved_pin_in_an_open
             initial_visibility: SidebarVisibility::Hidden,
             ..SidebarSettings::default()
         },
+        aside: suru::protocol::AsideSettings {
+            initial_visibility: suru::protocol::AsideVisibility::Hidden,
+            ..suru::protocol::AsideSettings::default()
+        },
         ..EffectiveSettings::default()
     };
     deliver_settings(&mut application, settings.clone());
-    // Beside an open Session the Aside's act takes the keys before it hides.
-    for _ in 0..2 {
-        crate::support::invoke(&mut application, suru::tui::SemanticCommandId::AsideToggle);
-    }
     deliver_settings(&mut application, settings.clone());
     assert!(
         !application.note_interaction(&InputEvent::Key(KeyEvent::new(

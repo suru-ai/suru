@@ -1045,12 +1045,31 @@ fn a_changed_launch_setting_does_not_move_a_sidebar_already_seeded() {
 #[test]
 fn the_session_content_column_recenters_inside_the_width_the_sidebar_leaves() {
     let workspace = workspace_dir();
-    let mut narrower_sidebar =
-        sidebar_showing_at_width(workspace.path(), 40, SessionContentWidth::Maximum(70));
-    let mut wider_sidebar =
-        sidebar_showing_at_width(workspace.path(), 60, SessionContentWidth::Maximum(70));
-    crate::support::hide_aside(&mut narrower_sidebar);
-    crate::support::hide_aside(&mut wider_sidebar);
+    // The Aside stays off the frame, so the Sidebar is the only column the
+    // main view shares its width with.
+    let at_width = |initial_width| {
+        sidebar_hydrated(
+            workspace.path(),
+            EffectiveSettings {
+                sidebar: SidebarSettings {
+                    initial_visibility: SidebarVisibility::Shown,
+                    initial_width,
+                    ..SidebarSettings::default()
+                },
+                session: SessionSettings {
+                    content_width: SessionContentWidth::Maximum(70),
+                },
+                aside: suru::protocol::AsideSettings {
+                    initial_visibility: suru::protocol::AsideVisibility::Hidden,
+                    ..suru::protocol::AsideSettings::default()
+                },
+                ..EffectiveSettings::default()
+            },
+            Vec::new(),
+        )
+    };
+    let mut narrower_sidebar = at_width(40);
+    let mut wider_sidebar = at_width(60);
     enter_session(&mut narrower_sidebar, workspace.path());
     enter_session(&mut wider_sidebar, workspace.path());
 

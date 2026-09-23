@@ -22,8 +22,8 @@ use ratatui::{
 
 use crate::managed_client::SubagentTreeEvent;
 use crate::protocol::{
-    Outlook, SessionId, SessionReference, SubagentTreeChange, SubagentTreeEntry,
-    SubagentTreeSnapshot, SubagentTreeTopLevel,
+    AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference, SubagentTreeChange,
+    SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeTopLevel,
 };
 use crate::theme::Theme;
 
@@ -44,11 +44,6 @@ use section::{SectionContext, SectionView, SubagentTreeView, built_in_sections};
 /// quiet period a Session still opening keeps, so a fast arrival never
 /// flashes.
 const TREE_LOADING_DELAY: Duration = Duration::from_millis(300);
-
-/// Whether the Aside begins shown, until its Setting arrives (#367).
-const INITIAL_VISIBILITY_SHOWN: bool = true;
-/// How wide the Aside begins, until its Setting arrives (#367).
-const INITIAL_WIDTH: u64 = 32;
 
 #[derive(Clone, Debug)]
 pub(super) struct Aside {
@@ -97,16 +92,14 @@ impl Aside {
     }
 
     /// Takes the launch visibility and width from the first Settings
-    /// snapshot; later snapshots leave the reader's own choices alone.
-    pub(super) fn adopt_settings(&mut self) {
-        if self.column.seed(INITIAL_WIDTH) {
-            self.column.set_revealed(INITIAL_VISIBILITY_SHOWN);
+    /// snapshot; later snapshots leave the reader's own showing, hiding and
+    /// dragging alone. The reveal takes no keys: a reader who has not touched
+    /// the Aside is typing their first Prompt.
+    pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
+        if self.column.seed(settings.aside.initial_width) {
+            self.column
+                .set_revealed(settings.aside.initial_visibility == AsideVisibility::Shown);
         }
-    }
-
-    /// The width a reset returns the Aside to.
-    pub(super) const fn initial_width(&self) -> u64 {
-        INITIAL_WIDTH
     }
 
     pub(super) const fn column(&self) -> &SideColumn {
@@ -652,7 +645,7 @@ mod tests {
     #[test]
     fn the_subscription_is_kept_while_the_reader_moves_within_its_tree() {
         let mut aside = Aside::new();
-        aside.adopt_settings();
+        aside.adopt_settings(&EffectiveSettings::default());
         let top = SessionId::new();
         let child = SessionId::new();
         let reference = |id| SessionReference::new(Outlook::Local, id);
@@ -714,7 +707,7 @@ mod tests {
     #[test]
     fn an_ended_subscription_is_let_go_and_asked_for_again_when_its_tree_is_next_opened() {
         let mut aside = Aside::new();
-        aside.adopt_settings();
+        aside.adopt_settings(&EffectiveSettings::default());
         let top = SessionId::new();
         let child = SessionId::new();
         let reference = |id| SessionReference::new(Outlook::Local, id);

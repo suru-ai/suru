@@ -5295,21 +5295,20 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::{
-        commands::SemanticCommandId,
         slots::{
             Placement, PromptContextSlotContext, PromptFooterSlotContext, RenderSlots, SlotText,
             TestContribution,
         },
-        state::{Application, ApplicationEvent, CommandId},
+        state::{Application, ApplicationEvent},
     };
     use super::{session_footer_metrics_text, working_indicator_elapsed};
     use crate::{
         managed_client::{ManagedEvent, SessionEvent},
         protocol::{
-            EffectiveSettings, Health, LifecycleState, ModelAvailability, ServerIdentity, Session,
-            SessionContentWidth, SessionId, SessionRevision, SessionSettings, SessionSnapshot,
-            SessionStatus, SessionTimestamp, SettingsSnapshot, SidebarSettings, SidebarVisibility,
-            Workspace,
+            AsideSettings, AsideVisibility, EffectiveSettings, Health, LifecycleState,
+            ModelAvailability, ServerIdentity, Session, SessionContentWidth, SessionId,
+            SessionRevision, SessionSettings, SessionSnapshot, SessionStatus, SessionTimestamp,
+            SettingsSnapshot, SidebarSettings, SidebarVisibility, Workspace,
         },
     };
 
@@ -5651,6 +5650,10 @@ mod tests {
                             initial_visibility: SidebarVisibility::Hidden,
                             ..SidebarSettings::default()
                         },
+                        aside: AsideSettings {
+                            initial_visibility: AsideVisibility::Hidden,
+                            ..AsideSettings::default()
+                        },
                         ..EffectiveSettings::default()
                     },
                     pinned: vec!["session.contentWidth".to_owned()],
@@ -5658,12 +5661,6 @@ mod tests {
                 },
             )))
             .expect("receive Session content width");
-        // The Aside the Settings showed stays out of the measured width.
-        application
-            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                SemanticCommandId::AsideToggle,
-            )))
-            .expect("put the Aside away");
         application
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {

@@ -17,6 +17,7 @@ use suru::{
 fn settings(application: &mut Application) {
     let mut settings = EffectiveSettings::default();
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.aside.initial_visibility = suru::protocol::AsideVisibility::Hidden;
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {
@@ -31,6 +32,7 @@ fn settings(application: &mut Application) {
 fn enable_icons(application: &mut Application) {
     let mut settings = EffectiveSettings::default();
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.aside.initial_visibility = suru::protocol::AsideVisibility::Hidden;
     settings.appearance.show_icons = true;
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
@@ -216,7 +218,6 @@ fn remote_header_icons_preserve_the_centered_title_and_compact_remote_label() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     enable_icons(&mut application);
-    crate::support::hide_aside(&mut application);
     crate::connecting::turn_to_studio(&mut application);
     let mut snapshot =
         navigable_session_snapshot(suru::protocol::SessionId::new(), workspace.path(), 1);
@@ -307,7 +308,6 @@ fn title_is_centered_in_the_view_and_updates_with_the_session() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     settings(&mut application);
-    crate::support::hide_aside(&mut application);
     let (_, mut snapshot) = enter_session(&mut application, workspace.path());
     snapshot.title = "Alpha".into();
     show(&mut application, &snapshot);

@@ -26,7 +26,6 @@ fn session_with_width(
             content_width_snapshot(content_width, Vec::new()),
         )))
         .expect("receive Session content width");
-    crate::support::hide_aside(&mut application);
     let (_, snapshot) = enter_session(&mut application, workspace);
     (application, snapshot)
 }
@@ -126,11 +125,14 @@ fn content_width_snapshot(
                 ..SessionSettings::default()
             },
             // The Session Content Column is what every measurement here is
-            // about, so the Sidebar stays off the frame rather than standing
-            // in the middle of it.
+            // about, so neither column stands in the middle of it.
             sidebar: SidebarSettings {
                 initial_visibility: SidebarVisibility::Hidden,
                 ..SidebarSettings::default()
+            },
+            aside: suru::protocol::AsideSettings {
+                initial_visibility: suru::protocol::AsideVisibility::Hidden,
+                ..suru::protocol::AsideSettings::default()
             },
             ..EffectiveSettings::default()
         },

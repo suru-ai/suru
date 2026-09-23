@@ -1956,7 +1956,7 @@ impl TuiState {
         // arrival rather than on the next view opened, because the frames it
         // governs may be on screen already.
         self.sidebar.adopt_settings(&self.settings);
-        self.aside.adopt_settings();
+        self.aside.adopt_settings(&self.settings);
         self.application_notice.receive(&snapshot.diagnostics);
     }
 
@@ -8027,7 +8027,7 @@ impl Application {
                     SemanticCommandId::AsideNarrow => column.narrow(),
                     SemanticCommandId::AsideWidthSet { columns } => column.set_width(columns),
                     _ => {
-                        let initial_width = self.state.aside.initial_width();
+                        let initial_width = self.state.settings.aside.initial_width;
                         self.state.aside.column_mut().set_width(initial_width);
                     }
                 }

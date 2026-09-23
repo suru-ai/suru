@@ -14,10 +14,10 @@ use ratatui::style::Color;
 use suru::{
     managed_client::SubagentTreeEvent,
     protocol::{
-        Activity, ActivityStatus, EffectiveSettings, Outlook, PromptId, SessionId,
-        SessionReference, SessionSnapshot, SessionStatus, SessionTimestamp, SidebarVisibility,
-        SubagentTreeChange, SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot,
-        SubagentTreeTopLevel, TurnStatus,
+        Activity, ActivityStatus, AsideSettings, AsideVisibility, EffectiveSettings, Outlook,
+        PromptId, SessionId, SessionReference, SessionSnapshot, SessionStatus, SessionTimestamp,
+        SidebarVisibility, SubagentTreeChange, SubagentTreeEntry, SubagentTreeRevision,
+        SubagentTreeSnapshot, SubagentTreeTopLevel, TurnStatus,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
 };
@@ -1085,5 +1085,163 @@ fn an_unreachable_remote_leaves_the_last_tree_standing() {
     assert!(
         rows[..5] == before[..5],
         "the tree the Remote last gave stands while it is Unreachable: {rows:#?}"
+    );
+}
+
+// How the Aside begins: its two Settings, adopted once at launch and then the
+// reader's to overrule.
+
+fn aside_settings(visibility: AsideVisibility, initial_width: u64) -> AsideSettings {
+    AsideSettings {
+        initial_visibility: visibility,
+        initial_width,
+    }
+}
+
+/// Delivers a Settings snapshot carrying `aside`, with the Sidebar kept off
+/// the frame so the Aside is the only column beside the main view.
+fn deliver_aside_settings(application: &mut Application, aside: AsideSettings) {
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.aside = aside;
+    deliver_settings(application, settings);
+}
+
+fn launched_with(workspace: &std::path::Path, aside: AsideSettings) -> Application {
+    let mut application = connected_application(workspace);
+    deliver_aside_settings(&mut application, aside);
+    enter_session(&mut application, workspace);
+    application
+}
+
+/// The column the Aside's rule stands at in a frame this wide, or `None`
+/// where the frame draws no Aside.
+fn aside_rule_column(application: &Application, width: u16) -> Option<usize> {
+    let rows = rendered_application_rows_at(application, width, HEIGHT);
+    rows[0]
+        .chars()
+        .position(|character| character == '│')
+        .filter(|_| rows.join("\n").contains("Subagents"))
+}
+
+#[test]
+fn an_aside_the_setting_hides_is_absent_until_the_reader_asks_for_it() {
+    let workspace = workspace_dir();
+    let mut application = launched_with(
+        workspace.path(),
+        aside_settings(AsideVisibility::Hidden, 32),
+    );
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        None,
+        "the first frame honours the initial-visibility Setting"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        Some(usize::from(WIDTH - 32)),
+        "the toggle overrides the Setting for this run"
+    );
+}
+
+#[test]
+fn the_setting_reveals_the_aside_without_taking_the_keys() {
+    let workspace = workspace_dir();
+    let mut application =
+        launched_with(workspace.path(), aside_settings(AsideVisibility::Shown, 32));
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        Some(usize::from(WIDTH - 32))
+    );
+    type_terminal_text(&mut application, "zq");
+    assert!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+            .join("\n")
+            .contains("zq"),
+        "a reader who has not touched the Aside is still typing into the composer"
+    );
+}
+
+#[test]
+fn a_later_settings_snapshot_leaves_the_readers_own_choice_alone() {
+    let workspace = workspace_dir();
+
+    let mut hidden_by_the_reader =
+        launched_with(workspace.path(), aside_settings(AsideVisibility::Shown, 32));
+    invoke(&mut hidden_by_the_reader, SemanticCommandId::AsideToggle);
+    invoke(&mut hidden_by_the_reader, SemanticCommandId::AsideToggle);
+    assert_eq!(aside_rule_column(&hidden_by_the_reader, WIDTH), None);
+    deliver_aside_settings(
+        &mut hidden_by_the_reader,
+        aside_settings(AsideVisibility::Shown, 32),
+    );
+    assert_eq!(
+        aside_rule_column(&hidden_by_the_reader, WIDTH),
+        None,
+        "another Setting's edit does not reopen an Aside the reader hid"
+    );
+
+    let mut shown_by_the_reader = launched_with(
+        workspace.path(),
+        aside_settings(AsideVisibility::Hidden, 32),
+    );
+    invoke(&mut shown_by_the_reader, SemanticCommandId::AsideToggle);
+    deliver_aside_settings(
+        &mut shown_by_the_reader,
+        aside_settings(AsideVisibility::Hidden, 32),
+    );
+    assert_eq!(
+        aside_rule_column(&shown_by_the_reader, WIDTH),
+        Some(usize::from(WIDTH - 32)),
+        "nor does it put away an Aside the reader showed"
+    );
+}
+
+#[test]
+fn the_launch_setting_chooses_the_aside_width_clamped_by_both_floors() {
+    let workspace = workspace_dir();
+    let application = launched_with(workspace.path(), aside_settings(AsideVisibility::Shown, 40));
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        Some(usize::from(WIDTH - 40)),
+        "the Aside begins at the configured width"
+    );
+
+    let wide = launched_with(workspace.path(), aside_settings(AsideVisibility::Shown, 60));
+    assert_eq!(
+        aside_rule_column(&wide, 100),
+        Some(54),
+        "the main view keeps its 54-column floor"
+    );
+    assert_eq!(
+        aside_rule_column(&wide, 78),
+        Some(54),
+        "the Aside keeps its 24-column floor"
+    );
+    assert_eq!(
+        aside_rule_column(&wide, 140),
+        Some(80),
+        "drawing narrow never overwrites the configured width"
+    );
+}
+
+#[test]
+fn a_changed_launch_setting_moves_nothing_but_the_width_a_reset_returns_to() {
+    let workspace = workspace_dir();
+    let mut application =
+        launched_with(workspace.path(), aside_settings(AsideVisibility::Shown, 40));
+    deliver_aside_settings(&mut application, aside_settings(AsideVisibility::Shown, 50));
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        Some(usize::from(WIDTH - 40)),
+        "a later delivery leaves the live width alone"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideWidthReset);
+    assert_eq!(
+        aside_rule_column(&application, WIDTH),
+        Some(usize::from(WIDTH - 50)),
+        "a reset returns to the launch width Setting currently delivered"
     );
 }

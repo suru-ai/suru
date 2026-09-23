@@ -2489,9 +2489,9 @@ fn session_opened_under(
     // widths. Keep the adjacent Sidebar out of that width unless a test is
     // explicitly about composing the two surfaces.
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    settings.aside.initial_visibility = suru::protocol::AsideVisibility::Hidden;
     let mut application = connected_application(workspace);
     deliver_settings(&mut application, settings, pinned);
-    crate::support::hide_aside(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("open a Session view under the pinned Settings");
@@ -2548,12 +2548,12 @@ fn client_showing_reasoning(workspace: &std::path::Path) -> Application {
     // Initial visibility is seeded by the first Settings snapshot, so hide
     // the Sidebar here rather than trying to correct the fixture later.
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    settings.aside.initial_visibility = suru::protocol::AsideVisibility::Hidden;
     deliver_settings(
         &mut application,
         settings,
         &["transcript.reasoningVisibility"],
     );
-    crate::support::hide_aside(&mut application);
     application
 }
 
