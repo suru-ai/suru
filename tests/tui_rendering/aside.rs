@@ -1506,3 +1506,383 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
     );
     assert!(aside_rows(&application, WIDTH)[1].ends_with(" 30s"));
 }
+
+// Row focus and scrolling: the Aside driven by the keys, and a tree taller
+// than its column.
+
+/// The Aside rows painted with row focus: the focus block's background at the
+/// Aside's first content column.
+fn focused_aside_rows(application: &Application) -> Vec<String> {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let rows = aside_rows(application, WIDTH);
+    (0..HEIGHT)
+        .filter(|row| buffer[(WIDTH - ASIDE_WIDTH + 2, *row)].bg == Color::Blue)
+        .map(|row| rows[usize::from(row)].trim_end().to_owned())
+        .collect()
+}
+
+fn press(
+    application: &mut Application,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, modifiers)))
+        .expect("press a key")
+}
+
+/// The fixture tree open at `open`, with the Aside holding the keys.
+fn driving_the_aside(
+    open_at: impl FnOnce(&Tree) -> (SessionId, Option<SessionId>),
+) -> (Application, Tree, crate::support::WorkspaceDir) {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    let (session, parent) = open_at(&tree);
+    if session != tree.top {
+        open(&mut application, workspace.path(), session, parent);
+    }
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    (application, tree, workspace)
+}
+
+#[test]
+fn row_focus_begins_on_the_open_entry_and_walks_with_the_arrows_and_ctrl_p_n() {
+    let (mut application, _, _workspace) =
+        driving_the_aside(|tree| (tree.review, Some(tree.explore)));
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["│ └ ⠋ Review Check the mappe…"],
+        "focus begins on the open Session's entry"
+    );
+
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["└ ✓ Plan Weigh the options"]
+    );
+    press(&mut application, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["Map every seam"],
+        "Ctrl+N walks on, wrapping past the end"
+    );
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["└ ✓ Plan Weigh the options"],
+        "Up wraps back past the top"
+    );
+    press(&mut application, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["│ └ ⠋ Review Check the mappe…"]
+    );
+}
+
+#[test]
+fn enter_opens_the_focused_entry_and_does_nothing_on_the_open_one() {
+    let (mut application, tree, _workspace) = driving_the_aside(|tree| (tree.top, None));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "the open Session's own entry opens nothing"
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::AttachSession(local(tree.explore)),
+        "Enter opens the focused entry through the ordinary attach route"
+    );
+}
+
+#[test]
+fn esc_hands_the_keys_back_and_focus_begins_again_on_the_open_entry() {
+    let (mut application, _, _workspace) = driving_the_aside(|tree| (tree.top, None));
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(focused_aside_rows(&application).len(), 1);
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        focused_aside_rows(&application).is_empty(),
+        "focus goes with the keys"
+    );
+    type_terminal_text(&mut application, "zq");
+    assert!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+            .join("\n")
+            .contains("zq"),
+        "and the composer has them back"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["Map every seam"],
+        "taking the keys again begins on the open entry, not where focus was left"
+    );
+}
+
+#[test]
+fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
+    let (mut application, tree, _workspace) = driving_the_aside(|tree| (tree.top, None));
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["└ ✓ Plan Weigh the options"]
+    );
+
+    let before = SessionId::new();
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSpawned {
+            entry: entry(
+                before,
+                tree.explore,
+                1,
+                ("Probe", "Probe a seam"),
+                ActivityStatus::Active,
+                None,
+            ),
+        }),
+    );
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["└ ✓ Plan Weigh the options"],
+        "a spawn drawn above the focused entry does not move focus off it"
+    );
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSpawned {
+            entry: entry(
+                SessionId::new(),
+                tree.plan,
+                0,
+                ("Check", "Check the plan"),
+                ActivityStatus::Active,
+                None,
+            ),
+        }),
+    );
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSettled {
+            session_id: tree.plan,
+            status: ActivityStatus::Failed,
+            duration_ms: Some(1_000),
+        }),
+    );
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["└ × Plan Weigh the options 1s"],
+        "nor does a spawn below it, or its own settle"
+    );
+
+    // A fresh tree without the focused entry hands focus to the nearest
+    // entry left.
+    let mut fresh = tree.snapshot();
+    fresh
+        .subagents
+        .retain(|entry| entry.session_id != tree.plan);
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(fresh),
+    );
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["  └ ⠋ Review Check the mappe…"],
+        "the last entry left, standing nearest where Plan stood"
+    );
+}
+
+#[test]
+fn focus_is_painted_only_while_the_aside_holds_the_keys() {
+    let workspace = workspace_dir();
+    let (mut application, _) = tree_open_at_top(workspace.path());
+    assert!(
+        focused_aside_rows(&application).is_empty(),
+        "an Aside without the keys paints no focus"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_eq!(focused_aside_rows(&application), ["Map every seam"]);
+
+    invoke(&mut application, SemanticCommandId::SidebarToggle);
+    assert!(
+        focused_aside_rows(&application).is_empty(),
+        "the Sidebar taking the keys takes them, and the paint, from the Aside"
+    );
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_eq!(
+        focused_aside_rows(&application),
+        ["Map every seam"],
+        "and the Aside takes them back"
+    );
+
+    invoke(&mut application, SemanticCommandId::SettingsOpen);
+    assert!(
+        focused_aside_rows(&application).is_empty(),
+        "an overlay outranks the Aside, so its focus is not painted beneath it"
+    );
+}
+
+#[test]
+fn clicking_an_entry_opens_it_without_raising_row_focus() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    let plan = aside_row_position(&application, "Plan");
+    assert_eq!(
+        click(&mut application, plan),
+        ApplicationTransition::AttachSession(local(tree.plan))
+    );
+    assert!(focused_aside_rows(&application).is_empty());
+    type_terminal_text(&mut application, "zq");
+    assert!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+            .join("\n")
+            .contains("zq"),
+        "the keys stay with the composer"
+    );
+}
+
+/// A top-level Session with forty Subagents of its own, far more than the
+/// column holds.
+fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
+    let children = (0..40).map(|_| SessionId::new()).collect::<Vec<_>>();
+    let snapshot = SubagentTreeSnapshot {
+        revision: SubagentTreeRevision::INITIAL,
+        top_level: SubagentTreeTopLevel {
+            session_id: top,
+            title: "Map every seam".to_owned(),
+            working_since: None,
+            needs_intervention: false,
+        },
+        subagents: children
+            .iter()
+            .enumerate()
+            .map(|(order, child)| {
+                entry(
+                    *child,
+                    top,
+                    u32::try_from(order).expect("fits"),
+                    ("Agent", &format!("Task {order:02}")),
+                    ActivityStatus::Completed,
+                    None,
+                )
+            })
+            .collect(),
+    };
+    (snapshot, children)
+}
+
+/// The first and last entries the Aside's window shows, below its header.
+fn window(application: &Application) -> (String, String) {
+    let rows = aside_rows(application, WIDTH);
+    let body = rows[1..]
+        .iter()
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    (
+        (*body.first().expect("a first row")).clone(),
+        (*body.last().expect("a last row")).clone(),
+    )
+}
+
+#[test]
+fn a_tall_tree_scrolls_to_keep_the_open_then_the_focused_entry_in_view() {
+    let workspace = workspace_dir();
+    let top = SessionId::new();
+    let mut application = client(workspace.path());
+    let (snapshot, children) = tall_tree(top);
+    open(&mut application, workspace.path(), children[30], Some(top));
+    // The subscription is asked through the Session the reader opened.
+    deliver_tree(
+        &mut application,
+        children[30],
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+    assert!(
+        aside_text(&application).contains("Task 30"),
+        "{:#?}",
+        aside_rows(&application, WIDTH)
+    );
+    assert_eq!(
+        window(&application).1,
+        "├ ✓ Agent Task 30",
+        "the window scrolls just far enough to show the open entry"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    for _ in 0..5 {
+        press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    }
+    assert_eq!(focused_aside_rows(&application), ["├ ✓ Agent Task 35"]);
+    assert_eq!(
+        window(&application).1,
+        "├ ✓ Agent Task 35",
+        "the window follows row focus"
+    );
+    for _ in 0..36 {
+        press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    }
+    assert_eq!(focused_aside_rows(&application), ["Map every seam"]);
+    assert_eq!(window(&application).0, "Map every seam");
+}
+
+fn wheel(application: &mut Application, kind: MouseEventKind) {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind,
+            column: WIDTH - ASIDE_WIDTH + 6,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("wheel over the Aside");
+}
+
+#[test]
+fn the_wheel_scrolls_the_aside_without_taking_the_keys() {
+    let workspace = workspace_dir();
+    let top = SessionId::new();
+    let mut application = client(workspace.path());
+    open(&mut application, workspace.path(), top, None);
+    let (snapshot, _) = tall_tree(top);
+    deliver_tree(&mut application, top, SubagentTreeEvent::Snapshot(snapshot));
+    assert_eq!(window(&application).0, "Map every seam");
+
+    wheel(&mut application, MouseEventKind::ScrollDown);
+    assert_eq!(
+        window(&application).0,
+        "├ ✓ Agent Task 02",
+        "a tick moves the window three rows"
+    );
+    assert_eq!(
+        window(&application).0,
+        "├ ✓ Agent Task 02",
+        "and it holds there, though the open entry is out of view"
+    );
+    for _ in 0..20 {
+        wheel(&mut application, MouseEventKind::ScrollDown);
+    }
+    assert_eq!(
+        window(&application).1,
+        "└ ✓ Agent Task 39",
+        "the wheel stops at the end of the tree"
+    );
+    wheel(&mut application, MouseEventKind::ScrollUp);
+    assert_eq!(window(&application).1, "├ ✓ Agent Task 36");
+    assert!(
+        focused_aside_rows(&application).is_empty(),
+        "wheeling is looking, not taking the keys"
+    );
+
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_eq!(
+        window(&application).0,
+        "Map every seam",
+        "taking the keys brings the focused entry back into view"
+    );
+}

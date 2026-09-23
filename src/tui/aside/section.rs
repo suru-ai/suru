@@ -66,6 +66,17 @@ pub(in crate::tui) struct SectionHeader {
 pub(in crate::tui) struct SectionRow {
     pub(in crate::tui) line: Line<'static>,
     pub(in crate::tui) invocation: Option<SemanticInvocation>,
+    /// What the row is an entry for, so row focus and the scroll anchor can
+    /// follow it however the rows around it move. A row with no key — a
+    /// Loading line, an error — takes no row focus.
+    pub(in crate::tui) key: Option<SectionRowKey>,
+}
+
+/// The identity of a Section's entry, stable across frames.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(in crate::tui) enum SectionRowKey {
+    /// An entry standing for one Session.
+    Session(SessionReference),
 }
 
 /// Everything one Section says for one frame.

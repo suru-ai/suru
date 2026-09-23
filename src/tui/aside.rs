@@ -20,6 +20,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::managed_client::SubagentTreeEvent;
 use crate::protocol::{
     AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference, SessionTimestamp,
@@ -38,7 +40,9 @@ use super::{
 mod section;
 mod subagents;
 
-use section::{SectionContext, SectionView, SubagentTreeView, built_in_sections};
+use section::{
+    Section, SectionContext, SectionRowKey, SectionView, SubagentTreeView, built_in_sections,
+};
 
 /// How long a tree not yet in hand is drawn blank before it says Loading: the
 /// quiet period a Session still opening keeps, so a fast arrival never
@@ -59,6 +63,54 @@ pub(super) struct Aside {
     /// Loading. Only a frame can start the wait, because the wait is about
     /// what the reader has been looking at.
     waiting: RefCell<Option<(SessionReference, Instant)>>,
+    /// The entry the keys stand on while the Aside holds them: named by its
+    /// Section and key, so it follows the entry however the rows around it
+    /// move, and by where it stood, so a vanished entry hands focus to the
+    /// nearest one left. Resolved again by every frame, hence the cell.
+    focus: RefCell<Option<AsideFocus>>,
+    /// Each Section's scroll: the first row its window shows, and the entry
+    /// it was wheeled away from, if the reader wheeled it.
+    scrolls: RefCell<HashMap<&'static str, SectionScroll>>,
+    /// Where the last frame drew each Section's rows, for the wheel.
+    drawn_sections: RefCell<Vec<DrawnSection>>,
+}
+
+#[derive(Clone, Debug)]
+struct AsideFocus {
+    section: &'static str,
+    key: SectionRowKey,
+    /// Where the entry stood in the Aside's focus order.
+    position: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SectionScroll {
+    offset: usize,
+    /// The entry the window was anchored to when the reader wheeled it. The
+    /// window holds where the wheel left it until the anchor moves — row
+    /// focus walking, or another Session opening — because wheeling is
+    /// looking rather than choosing.
+    wheeled_from: Option<Option<SectionRowKey>>,
+}
+
+#[derive(Clone, Debug)]
+struct DrawnSection {
+    name: &'static str,
+    /// The screen rows the Section's window was drawn across.
+    rows: Range<u16>,
+    row_count: usize,
+    room: usize,
+    anchor: Option<SectionRowKey>,
+}
+
+/// One entry row focus can stand on, in the order the Aside draws them.
+#[derive(Clone, Debug)]
+pub(super) struct FocusEntry {
+    section: &'static str,
+    key: SectionRowKey,
+    invocation: Option<SemanticInvocation>,
+    /// Whether this is the open Session's own entry.
+    current: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +140,9 @@ impl Aside {
             rows: RefCell::new(Vec::new()),
             animating: Cell::new(false),
             waiting: RefCell::new(None),
+            focus: RefCell::new(None),
+            scrolls: RefCell::new(HashMap::new()),
+            drawn_sections: RefCell::new(Vec::new()),
         }
     }
 
@@ -141,8 +196,156 @@ impl Aside {
         self.column.claims_keys()
     }
 
+    /// Hands the keys back, and row focus with them: it says what Enter would
+    /// act on, and nothing here answers to Enter any more.
     pub(super) fn hand_back_keys(&mut self) {
         self.column.hand_back_keys();
+        self.focus.replace(None);
+    }
+
+    /// Puts row focus where the reader is — on the open Session's entry, or
+    /// the first entry where none stands for it — as the Aside takes the
+    /// keys.
+    pub(super) fn seed_focus(&mut self, entries: &[FocusEntry]) {
+        let seeded = entries
+            .iter()
+            .position(|entry| entry.current)
+            .or((!entries.is_empty()).then_some(0))
+            .map(|position| focus_at(entries, position));
+        self.focus.replace(seeded);
+        self.release_wheel();
+    }
+
+    /// Lets every window go back to following its anchor, which row focus
+    /// moving is the reader asking for.
+    fn release_wheel(&self) {
+        for scroll in self.scrolls.borrow_mut().values_mut() {
+            scroll.wheeled_from = None;
+        }
+    }
+
+    /// Walks row focus one entry, wrapping past either end.
+    pub(super) fn move_focus(&mut self, entries: &[FocusEntry], forward: bool) {
+        if entries.is_empty() {
+            return;
+        }
+        let position = match self.resolve_focus(entries) {
+            Some(position) if forward => (position + 1) % entries.len(),
+            Some(position) => (position + entries.len() - 1) % entries.len(),
+            None => entries.iter().position(|entry| entry.current).unwrap_or(0),
+        };
+        self.focus.replace(Some(focus_at(entries, position)));
+        self.release_wheel();
+    }
+
+    /// What Enter on the focused entry does, if anything.
+    pub(super) fn focused_invocation(&self, entries: &[FocusEntry]) -> Option<SemanticInvocation> {
+        let position = self.resolve_focus(entries)?;
+        entries[position].invocation.clone()
+    }
+
+    /// Finds the focused entry in `entries`: the same entry where it
+    /// survives, the nearest one left where it does not. Focus with nothing
+    /// to stand on — a tree still arriving — is kept for when it arrives.
+    fn resolve_focus(&self, entries: &[FocusEntry]) -> Option<usize> {
+        let mut focus = self.focus.borrow_mut();
+        let held = focus.as_ref()?;
+        if let Some(position) = entries
+            .iter()
+            .position(|entry| entry.section == held.section && entry.key == held.key)
+        {
+            focus.as_mut().expect("focus is held").position = position;
+            return Some(position);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        let position = held.position.min(entries.len() - 1);
+        *focus = Some(focus_at(entries, position));
+        Some(position)
+    }
+
+    /// Every entry row focus can stand on, as the Sections say for `open`.
+    pub(super) fn focus_entries(
+        &self,
+        open: &SessionReference,
+        presentation: AsidePresentation<'_>,
+    ) -> Vec<FocusEntry> {
+        let width = self.column.drawn_area().map_or(0, |area| area.width);
+        self.views(open, presentation, width)
+            .into_iter()
+            .filter_map(|(section, view)| Some((section.name(), view.ok()?)))
+            .flat_map(|(section, view)| {
+                let current = view.current;
+                view.rows
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(move |(index, row)| {
+                        Some(FocusEntry {
+                            section,
+                            key: row.key?,
+                            invocation: row.invocation,
+                            current: current == Some(index),
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    fn views(
+        &self,
+        open: &SessionReference,
+        presentation: AsidePresentation<'_>,
+        width: u16,
+    ) -> Vec<(&'static dyn Section, Result<SectionView, String>)> {
+        let context = SectionContext {
+            open,
+            subagent_tree: self.tree_view(open, presentation.now),
+            width,
+            theme: presentation.theme,
+            spinner_frame: presentation.spinner_frame,
+            shimmer: presentation.shimmer,
+            truecolor: presentation.truecolor,
+            now: presentation.session_now,
+        };
+        built_in_sections()
+            .into_iter()
+            .map(|section| (section, section.view(&context)))
+            .collect()
+    }
+
+    /// Moves the window of the Section under the pointer by the wheel's
+    /// step, answering whether the pointer stood over the Aside at all —
+    /// wheeling over it never reaches the Transcript. It takes neither the
+    /// keys nor row focus.
+    pub(super) fn wheel_at(&self, position: Position, scrolling_down: bool, lines: usize) -> bool {
+        let Some(area) = self.column.drawn_area() else {
+            return false;
+        };
+        if !area.contains(position) {
+            return false;
+        }
+        let drawn = self.drawn_sections.borrow();
+        let Some(section) = drawn
+            .iter()
+            .find(|section| section.rows.contains(&position.y))
+            .or_else(|| drawn.first())
+        else {
+            return true;
+        };
+        let mut scrolls = self.scrolls.borrow_mut();
+        let scroll = scrolls.entry(section.name).or_default();
+        let furthest = section.row_count.saturating_sub(section.room);
+        let offset = if scrolling_down {
+            scroll.offset.saturating_add(lines).min(furthest)
+        } else {
+            scroll.offset.saturating_sub(lines)
+        };
+        if offset != scroll.offset {
+            scroll.offset = offset;
+            scroll.wheeled_from = Some(section.anchor.clone());
+        }
+        true
     }
 
     /// Whether the reader is driving the Aside: it claims the keys and the
@@ -351,33 +554,43 @@ impl Aside {
         owns_input: bool,
         presentation: AsidePresentation<'_>,
     ) {
-        let AsidePresentation {
-            theme,
-            spinner_frame,
-            shimmer,
-            truecolor,
-            now,
-            session_now,
-        } = presentation;
+        let theme = presentation.theme;
         let block = side_column_block(&self.column, owns_input, theme);
         let inside = block.inner(area);
         let content = horizontally_inset(inside, 1);
         frame.render_widget(block, area);
-        let context = SectionContext {
-            open,
-            subagent_tree: self.tree_view(open, now),
-            width: content.width,
-            theme,
-            spinner_frame,
-            shimmer,
-            truecolor,
-            now: session_now,
-        };
+        let views = self.views(open, presentation, content.width);
+        // Row focus is resolved against every entry the Sections offer, not
+        // only the ones the windows show, so it survives scrolling out of
+        // view and the tree moving beneath it.
+        let focused = owns_input
+            .then(|| {
+                let entries = views
+                    .iter()
+                    .filter_map(|(section, view)| Some((section.name(), view.as_ref().ok()?)))
+                    .flat_map(|(section, view)| {
+                        view.rows.iter().filter_map(move |row| {
+                            Some(FocusEntry {
+                                section,
+                                key: row.key.clone()?,
+                                invocation: None,
+                                current: false,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let position = self.resolve_focus(&entries)?;
+                let entry = entries.into_iter().nth(position)?;
+                Some((entry.section, entry.key))
+            })
+            .flatten();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut hits = Vec::new();
+        let mut drawn_sections = Vec::new();
         let mut animates = false;
-        for section in built_in_sections() {
-            let view = match section.view(&context) {
+        let mut scrolls = self.scrolls.borrow_mut();
+        for (section, view) in views {
+            let view = match view {
                 Ok(view) => view,
                 Err(message) => {
                     // A failing Section is drawn as failed, in its own place,
@@ -401,24 +614,63 @@ impl Aside {
             } = view;
             animates |= section_animates;
             lines.push(header_line(header.name, header.count, content.width, theme));
-            // Rows past the column's foot are dropped from the top where that
-            // is what keeps the open Session's entry in view.
+            // The window keeps its anchor in view: the focused entry while
+            // the keys stand on one here, the open Session's entry otherwise.
             let room = usize::from(content.height).saturating_sub(lines.len());
-            let skipped = current.map_or(0, |current| (current + 1).saturating_sub(room));
-            for row in rows.into_iter().skip(skipped) {
+            let anchor_index = focused
+                .as_ref()
+                .filter(|(focused_section, _)| *focused_section == section.name())
+                .and_then(|(_, key)| rows.iter().position(|row| row.key.as_ref() == Some(key)))
+                .or(current);
+            let anchor = anchor_index.and_then(|index| rows[index].key.clone());
+            let scroll = scrolls.entry(section.name()).or_default();
+            let mut offset = scroll.offset.min(rows.len().saturating_sub(room));
+            if scroll.wheeled_from.as_ref() != Some(&anchor) {
+                scroll.wheeled_from = None;
+                if let Some(index) = anchor_index {
+                    if index < offset {
+                        offset = index;
+                    } else if room > 0 && index >= offset + room {
+                        offset = index + 1 - room;
+                    }
+                }
+            }
+            scroll.offset = offset;
+            let first_row = content
+                .y
+                .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            let row_count = rows.len();
+            for row in rows.into_iter().skip(offset).take(room) {
                 let y = content
                     .y
                     .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-                if y < content.bottom() {
-                    hits.push(AsideRowHit {
-                        row: y,
-                        columns: inside.x..inside.right(),
-                        invocation: row.invocation,
-                    });
-                }
-                lines.push(row.line);
+                hits.push(AsideRowHit {
+                    row: y,
+                    columns: inside.x..inside.right(),
+                    invocation: row.invocation,
+                });
+                let is_focused = focused.as_ref().is_some_and(|(focused_section, key)| {
+                    *focused_section == section.name() && row.key.as_ref() == Some(key)
+                });
+                lines.push(if is_focused {
+                    focus_painted(row.line, content.width, theme)
+                } else {
+                    row.line
+                });
             }
+            let last_row = content
+                .y
+                .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            drawn_sections.push(DrawnSection {
+                name: section.name(),
+                rows: first_row..last_row.max(first_row.saturating_add(1)),
+                row_count,
+                room,
+                anchor,
+            });
         }
+        drop(scrolls);
+        *self.drawn_sections.borrow_mut() = drawn_sections;
         frame.render_widget(Paragraph::new(lines).style(theme.surface.elevated), content);
         *self.rows.borrow_mut() = hits;
         self.animating.set(animates);
@@ -427,6 +679,7 @@ impl Aside {
 
 /// What the Aside draws with beyond its own state: the Theme and the run
 /// loop's presentation clock, frame, and colour depth.
+#[derive(Clone, Copy)]
 pub(super) struct AsidePresentation<'a> {
     pub(super) theme: &'a Theme,
     pub(super) spinner_frame: usize,
@@ -436,6 +689,39 @@ pub(super) struct AsidePresentation<'a> {
     /// The moment now on the clock the Server's timestamps are read against,
     /// for ticking how long live work has been running.
     pub(super) session_now: SessionTimestamp,
+}
+
+fn focus_at(entries: &[FocusEntry], position: usize) -> AsideFocus {
+    AsideFocus {
+        section: entries[position].section,
+        key: entries[position].key.clone(),
+        position,
+    }
+}
+
+/// A row painted with row focus: the focus block the whole width across,
+/// each span keeping its own colour except where that colour would vanish
+/// into the block, as the Sidebar paints its row focus.
+fn focus_painted(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static> {
+    let focused = theme.selection.focused;
+    let mut spans = line
+        .spans
+        .into_iter()
+        .map(|mut span| {
+            let vanishes = span.style.fg.is_none() || span.style.fg == focused.bg;
+            span.style = span.style.bg(focused.bg.unwrap_or_default());
+            if vanishes {
+                span.style = span.style.fg(focused.fg.unwrap_or_default());
+            }
+            span
+        })
+        .collect::<Vec<_>>();
+    let drawn: usize = spans.iter().map(|span| span.content.width()).sum();
+    let gap = usize::from(width).saturating_sub(drawn);
+    if gap > 0 {
+        spans.push(Span::styled(" ".repeat(gap), focused));
+    }
+    Line::from(spans)
 }
 
 /// A Section's header: its name, and its count beside it where it knows one.

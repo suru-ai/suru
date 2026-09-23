@@ -37,7 +37,7 @@ use crate::{
 
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
-    aside::{Aside, AsidePress},
+    aside::{Aside, AsidePresentation, AsidePress},
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
@@ -2490,6 +2490,17 @@ impl TuiState {
     /// Answers one step of the wheel where the pointer stood: the Sidebar
     /// takes every step over its own column, and the Transcript every other.
     fn wheel_at(&mut self, position: Position, direction: ScrollDirection) {
+        // Over the Aside the wheel moves its Sections, and never the
+        // Transcript beside them.
+        if self.aside_is_present()
+            && self.aside.wheel_at(
+                position,
+                direction == ScrollDirection::Down,
+                WHEEL_SCROLL_ROWS,
+            )
+        {
+            return;
+        }
         if !self
             .sidebar
             .wheel_at(position, direction, WHEEL_SCROLL_ROWS)
@@ -8097,8 +8108,13 @@ impl Application {
                 // One of the two columns holds the keys at most, so an Aside
                 // taking them takes them from the Sidebar.
                 let present = self.state.aside_is_present();
-                if self.state.aside.toggle(present) && self.state.sidebar.column().claims_keys() {
-                    self.state.sidebar.hand_back_keys();
+                if self.state.aside.toggle(present) {
+                    if self.state.sidebar.column().claims_keys() {
+                        self.state.sidebar.hand_back_keys();
+                    }
+                    // Row focus begins where the reader is, each time.
+                    let entries = self.aside_focus_entries();
+                    self.state.aside.seed_focus(&entries);
                 }
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
@@ -8106,6 +8122,28 @@ impl Application {
             SemanticCommandId::AsideLeave => {
                 self.state.aside.hand_back_keys();
                 Ok(ApplicationTransition::Continue)
+            }
+            // Row focus answers only while the Aside holds the keys.
+            command @ (SemanticCommandId::AsidePrevious | SemanticCommandId::AsideNext) => {
+                if self.state.aside.column().claims_keys() {
+                    let entries = self.aside_focus_entries();
+                    self.state
+                        .aside
+                        .move_focus(&entries, command == SemanticCommandId::AsideNext);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            // Enter opens the focused entry through the invocation its row
+            // stands for; the open Session's own entry stands for none.
+            SemanticCommandId::AsideOpen => {
+                if !self.state.aside.column().claims_keys() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let entries = self.aside_focus_entries();
+                match self.state.aside.focused_invocation(&entries) {
+                    Some(invocation) => self.invoke_semantic(invocation),
+                    None => Ok(ApplicationTransition::Continue),
+                }
             }
             SemanticCommandId::SidebarToggle => {
                 // Reaching a Sidebar already on screen takes nothing from it;
@@ -8948,6 +8986,24 @@ impl Application {
     /// The Session the per-tree subscription should be asked through, or
     /// `None` when the Aside has nothing to answer for. The run loop keeps
     /// one subscription open for as long as this names the same Session.
+    /// Every entry the Aside's row focus can stand on for the open Session.
+    fn aside_focus_entries(&self) -> Vec<super::aside::FocusEntry> {
+        let Some(open) = self.state.route.as_ref() else {
+            return Vec::new();
+        };
+        self.state.aside.focus_entries(
+            open,
+            AsidePresentation {
+                theme: &self.theme,
+                spinner_frame: self.state.spinner_frame,
+                shimmer: &self.state.shimmer_clock,
+                truecolor: self.terminal_facts.truecolor,
+                now: self.state.presentation_clock.now(),
+                session_now: self.state.session_now(),
+            },
+        )
+    }
+
     pub(super) fn subagent_tree_request(&self) -> Option<SessionReference> {
         self.state.aside.tree_request(self.state.route.as_ref())
     }

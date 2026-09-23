@@ -486,11 +486,11 @@ pub(super) fn command_for_sidebar_event(event: InputEvent) -> Option<CommandId> 
     }
 }
 
-/// The Aside's keys while it holds them. Walking and opening its entries by
-/// key arrive with its row focus; for now Esc hands the keys back, the Leader
-/// stays reachable so the same chord that brought the reader in takes them
-/// out, and Ctrl+B passes the keys to the Sidebar. The pointer answers as it
-/// does everywhere else.
+/// The Aside's keys while it holds them: Up/Down and Ctrl+P/Ctrl+N walk its
+/// row focus, Enter opens the focused entry, and Esc hands the keys back. The
+/// Leader stays reachable so the same chord that brought the reader in takes
+/// them out, and Ctrl+B passes the keys to the Sidebar. The pointer answers
+/// as it does everywhere else.
 pub(super) fn command_for_aside_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
@@ -501,6 +501,15 @@ pub(super) fn command_for_aside_event(event: InputEvent) -> Option<CommandId> {
         return None;
     }
     match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::AsidePrevious))
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::AsideNext))
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::AsideOpen))
+        }
         (KeyCode::Esc, KeyModifiers::NONE) => {
             Some(CommandId::InvokeSemantic(SemanticCommandId::AsideLeave))
         }

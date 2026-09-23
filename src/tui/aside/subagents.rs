@@ -20,7 +20,10 @@ use super::super::{
 };
 use super::{
     SubagentTreeReading,
-    section::{Section, SectionContext, SectionHeader, SectionRow, SectionView, SubagentTreeView},
+    section::{
+        Section, SectionContext, SectionHeader, SectionRow, SectionRowKey, SectionView,
+        SubagentTreeView,
+    },
 };
 
 pub(in crate::tui) struct SubagentsSection;
@@ -98,6 +101,7 @@ impl Section for SubagentsSection {
                 context,
             ),
             invocation: open_invocation(tree, top_level.session_id, context.open),
+            key: Some(entry_key(tree, top_level.session_id)),
         });
         if top_level_working && let Some(row) = rows.last_mut() {
             spinner::overlay_frame(
@@ -137,6 +141,7 @@ impl Section for SubagentsSection {
                     context,
                 ),
                 invocation: open_invocation(tree, subagent.session_id, context.open),
+                key: Some(entry_key(tree, subagent.session_id)),
             });
             if working && let Some(row) = rows.last_mut() {
                 // The Spinner turns at the pace the Transcript row's does.
@@ -179,7 +184,13 @@ fn unpointable(line: Line<'static>) -> SectionRow {
     SectionRow {
         line,
         invocation: None,
+        key: None,
     }
+}
+
+/// The key an entry is followed by: the Session it stands for.
+fn entry_key(tree: &SubagentTreeReading, session_id: crate::protocol::SessionId) -> SectionRowKey {
+    SectionRowKey::Session(SessionReference::new(tree.origin().clone(), session_id))
 }
 
 /// `text` broken at spaces into lines no wider than `width`, a word wider
