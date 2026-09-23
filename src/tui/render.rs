@@ -196,6 +196,7 @@ pub(super) fn render_with_slots(
                 shimmer: &state.shimmer_clock,
                 truecolor,
                 now: state.presentation_now(),
+                session_now: state.session_now(),
             },
         );
     }
@@ -3400,7 +3401,7 @@ fn sidebar_active_slot(
 /// there is a minute to say, then minutes, then hours and the minutes past
 /// them. Unlike the compact time beside it this is a duration rather than an
 /// age, so it is granular enough to be seen moving.
-fn working_duration(since: SessionTimestamp, now: u64) -> String {
+pub(super) fn working_duration(since: SessionTimestamp, now: u64) -> String {
     let seconds = now.saturating_sub(since.0) / 1_000;
     if seconds < 60 {
         return format!("{seconds}s");

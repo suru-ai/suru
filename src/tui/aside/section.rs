@@ -11,7 +11,7 @@
 
 use ratatui::text::Line;
 
-use crate::protocol::SessionReference;
+use crate::protocol::{SessionReference, SessionTimestamp};
 use crate::theme::Theme;
 
 use super::super::{commands::SemanticInvocation, shimmer};
@@ -32,6 +32,9 @@ pub(in crate::tui) struct SectionContext<'a> {
     /// The shimmer's clock and the colour depth it draws at, for Loading.
     pub(in crate::tui) shimmer: &'a shimmer::Clock,
     pub(in crate::tui) truecolor: bool,
+    /// The moment now on the clock the Server's timestamps are read against,
+    /// for ticking how long live work has been running.
+    pub(in crate::tui) now: SessionTimestamp,
 }
 
 /// The tree the open Session belongs to, as far as the Aside knows it.

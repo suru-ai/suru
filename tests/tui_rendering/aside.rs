@@ -53,6 +53,8 @@ impl Tree {
             top_level: SubagentTreeTopLevel {
                 session_id: self.top,
                 title: "Map every seam".to_owned(),
+                working_since: None,
+                needs_intervention: false,
             },
             subagents: vec![
                 entry(
@@ -100,6 +102,9 @@ fn entry(
         title: title.to_owned(),
         status,
         duration_ms,
+        // Unknown unless a test says when the work began.
+        started_at: None,
+        needs_intervention: false,
     }
 }
 
@@ -1244,4 +1249,260 @@ fn a_changed_launch_setting_moves_nothing_but_the_width_a_reset_returns_to() {
         Some(usize::from(WIDTH - 50)),
         "a reset returns to the launch width Setting currently delivered"
     );
+}
+
+// Live state: how long work has been running, the top-level Session's
+// Working, and which Session waits on an Intervention.
+
+/// When the fixture's clock starts, in milliseconds since the Unix epoch.
+const CLOCK_START: u64 = 1_800_000_000_000;
+
+/// A client whose Session clock the test moves by hand, so a time can be seen
+/// advancing without being waited out.
+fn session_clocked_client(
+    workspace: &std::path::Path,
+) -> (Application, std::sync::Arc<std::sync::Mutex<u64>>) {
+    let now = std::sync::Arc::new(std::sync::Mutex::new(CLOCK_START));
+    let clock = std::sync::Arc::clone(&now);
+    let mut application = connected_application(workspace).with_session_clock(move || {
+        SessionTimestamp(*clock.lock().expect("read the Session clock"))
+    });
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    (application, now)
+}
+
+fn advance_session_clock(now: &std::sync::Mutex<u64>, milliseconds: u64) {
+    *now.lock().expect("advance the Session clock") += milliseconds;
+}
+
+/// A moment `milliseconds` before the fixture's clock starts.
+const fn before_start(milliseconds: u64) -> SessionTimestamp {
+    SessionTimestamp(CLOCK_START - milliseconds)
+}
+
+/// The Aside row naming `needle`.
+fn aside_row(application: &Application, needle: &str) -> String {
+    let rows = aside_rows(application, WIDTH);
+    rows.iter()
+        .find(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("the Aside draws {needle:?}: {rows:#?}"))
+        .clone()
+}
+
+/// The colour "Needs Intervention" is drawn in on the Aside row at `row`.
+fn needs_intervention_colour(application: &Application, row: usize) -> Option<Color> {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let line = aside_rows(application, WIDTH)[row].clone();
+    let column = line.find("Needs Intervention")?;
+    let x = WIDTH - ASIDE_WIDTH
+        + 2
+        + u16::try_from(line[..column].chars().count()).expect("column fits");
+    buffer
+        .cell((x, u16::try_from(row).expect("row fits")))?
+        .fg
+        .into()
+}
+
+fn change(application: &mut Application, through: SessionId, change: SubagentTreeChange) {
+    deliver_tree(application, through, SubagentTreeEvent::Changed(change));
+}
+
+#[test]
+fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_duration() {
+    let workspace = workspace_dir();
+    let (mut application, now) = session_clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    snapshot.subagents[1].started_at = Some(before_start(5_000));
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    assert!(
+        aside_row(&application, "Review").ends_with(" 5s"),
+        "a working entry says how long its work has run: {:?}",
+        aside_row(&application, "Review")
+    );
+    assert!(
+        application.wants_spinner(),
+        "and keeps the run loop ticking while it is on screen"
+    );
+    advance_session_clock(&now, 7_000);
+    assert!(aside_row(&application, "Review").ends_with(" 12s"));
+    advance_session_clock(&now, 78_000);
+    assert!(
+        aside_row(&application, "Review").ends_with(" 1m"),
+        "read the way the Sidebar reads a Working duration: {:?}",
+        aside_row(&application, "Review")
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentSettled {
+            session_id: tree.review,
+            status: ActivityStatus::Completed,
+            duration_ms: Some(95_000),
+        },
+    );
+    let settled = aside_row(&application, "Review");
+    assert!(
+        settled.ends_with(" 1m 35s") && settled.contains('✓'),
+        "a settle stands the entry at the duration its work took: {settled:?}"
+    );
+    advance_session_clock(&now, 60_000);
+    assert_eq!(
+        aside_row(&application, "Review"),
+        settled,
+        "and the time no longer moves"
+    );
+    assert!(
+        !application.wants_spinner(),
+        "nothing in the Aside is live any more"
+    );
+}
+
+#[test]
+fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
+    let workspace = workspace_dir();
+    let (mut application, now) = session_clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    // Nothing else in the tree is live, so what ticks is the top level alone.
+    snapshot.subagents[1].status = ActivityStatus::Completed;
+    snapshot.top_level.working_since = Some(before_start(42_000));
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let working = aside_rows(&application, WIDTH)[1].clone();
+    assert!(
+        working.starts_with("⠋ Map every seam") && working.ends_with(" 42s"),
+        "a Working top-level Session wears the Working Marker and its elapsed time: {working:?}"
+    );
+    assert!(
+        application.wants_spinner(),
+        "its Marker spins and its time rises"
+    );
+    advance_session_clock(&now, 3_000);
+    assert!(aside_rows(&application, WIDTH)[1].ends_with(" 45s"));
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::TopLevelWorkingChanged {
+            working_since: None,
+        },
+    );
+    assert_eq!(
+        aside_rows(&application, WIDTH)[1],
+        "Map every seam",
+        "both clear once it stops Working"
+    );
+    assert!(!application.wants_spinner());
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::TopLevelWorkingChanged {
+            // Begun at the moment the clock now reads.
+            working_since: Some(SessionTimestamp(CLOCK_START + 3_000)),
+        },
+    );
+    advance_session_clock(&now, 2_000);
+    let resumed = aside_rows(&application, WIDTH)[1].clone();
+    assert!(
+        resumed.starts_with("⠋ Map every seam") && resumed.ends_with(" 2s"),
+        "and come back, counting afresh, when it Works again: {resumed:?}"
+    );
+}
+
+#[test]
+fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
+    let workspace = workspace_dir();
+    let (mut application, _now) = session_clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    snapshot.top_level.working_since = Some(before_start(30_000));
+    snapshot.subagents[1].started_at = Some(before_start(5_000));
+    snapshot.subagents[1].needs_intervention = true;
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let rows = aside_rows(&application, WIDTH);
+    assert!(
+        rows[3].starts_with("│ └ ⠋ ") && rows[3].ends_with(" Needs Intervention"),
+        "the nested Subagent whose own Session waits says so in its time's place: {rows:#?}"
+    );
+    assert_eq!(
+        needs_intervention_colour(&application, 3),
+        Some(Color::Yellow)
+    );
+    assert!(
+        rows[2].ends_with(" 12s") && rows[1].ends_with(" 30s"),
+        "while neither its spawner nor the top-level Session repeats it: {rows:#?}"
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::NeedsInterventionChanged {
+            session_id: tree.review,
+            needs_intervention: false,
+        },
+    );
+    let answered = aside_rows(&application, WIDTH);
+    assert!(
+        answered[3].contains("Review") && answered[3].ends_with(" 5s"),
+        "answered, the entry has its time back: {answered:#?}"
+    );
+    assert!(!answered.join("\n").contains("Needs Intervention"));
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::NeedsInterventionChanged {
+            session_id: tree.top,
+            needs_intervention: true,
+        },
+    );
+    let asked = aside_rows(&application, WIDTH);
+    assert!(
+        asked[1].starts_with("⠋ ") && asked[1].ends_with(" Needs Intervention"),
+        "the top-level entry says so too, where the Intervention is its own: {asked:#?}"
+    );
+    assert_eq!(
+        needs_intervention_colour(&application, 1),
+        Some(Color::Yellow)
+    );
+    assert_eq!(
+        asked
+            .iter()
+            .filter(|row| row.contains("Needs Intervention"))
+            .count(),
+        1,
+        "and it is the only entry that does"
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::NeedsInterventionChanged {
+            session_id: tree.top,
+            needs_intervention: false,
+        },
+    );
+    assert!(aside_rows(&application, WIDTH)[1].ends_with(" 30s"));
 }

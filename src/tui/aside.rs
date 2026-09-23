@@ -22,8 +22,8 @@ use ratatui::{
 
 use crate::managed_client::SubagentTreeEvent;
 use crate::protocol::{
-    AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference, SubagentTreeChange,
-    SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeTopLevel,
+    AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference, SessionTimestamp,
+    SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeTopLevel,
 };
 use crate::theme::Theme;
 
@@ -335,6 +335,7 @@ impl Aside {
             shimmer,
             truecolor,
             now,
+            session_now,
         } = presentation;
         let block = side_column_block(&self.column, owns_input, theme);
         let inside = block.inner(area);
@@ -348,6 +349,7 @@ impl Aside {
             spinner_frame,
             shimmer,
             truecolor,
+            now: session_now,
         };
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut hits = Vec::new();
@@ -409,6 +411,9 @@ pub(super) struct AsidePresentation<'a> {
     pub(super) shimmer: &'a shimmer::Clock,
     pub(super) truecolor: bool,
     pub(super) now: Instant,
+    /// The moment now on the clock the Server's timestamps are read against,
+    /// for ticking how long live work has been running.
+    pub(super) session_now: SessionTimestamp,
 }
 
 /// A Section's header: its name, and its count beside it where it knows one.
@@ -563,6 +568,19 @@ impl SubagentTreeReading {
                 }
             }
             SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
+            SubagentTreeChange::TopLevelWorkingChanged { working_since } => {
+                self.top_level.working_since = working_since;
+            }
+            SubagentTreeChange::NeedsInterventionChanged {
+                session_id,
+                needs_intervention,
+            } => {
+                if session_id == self.top_level.session_id {
+                    self.top_level.needs_intervention = needs_intervention;
+                } else if let Some(entry) = self.entry_mut(session_id) {
+                    entry.needs_intervention = needs_intervention;
+                }
+            }
             // The managed client ends a deleted tree's subscription with
             // `SubagentTreeEvent::Deleted` rather than forwarding this.
             SubagentTreeChange::TreeDeleted => {}
@@ -639,6 +657,8 @@ mod tests {
             title: "Map".to_owned(),
             status: ActivityStatus::Active,
             duration_ms: None,
+            started_at: None,
+            needs_intervention: false,
         }
     }
 
@@ -667,6 +687,8 @@ mod tests {
                 top_level: SubagentTreeTopLevel {
                     session_id: top,
                     title: "Delegate".to_owned(),
+                    working_since: None,
+                    needs_intervention: false,
                 },
                 subagents: vec![entry(child, top, 0)],
             }),
@@ -716,6 +738,8 @@ mod tests {
             top_level: SubagentTreeTopLevel {
                 session_id: top,
                 title: "Delegate".to_owned(),
+                working_since: None,
+                needs_intervention: false,
             },
             subagents: vec![entry(child, top, 0)],
         };
@@ -775,6 +799,8 @@ mod tests {
                 top_level: SubagentTreeTopLevel {
                     session_id: top,
                     title: "Delegate".to_owned(),
+                    working_since: None,
+                    needs_intervention: false,
                 },
                 subagents: vec![entry(first, top, 0), entry(second, top, 1)],
             },

@@ -8,11 +8,12 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::protocol::{ActivityStatus, SessionReference};
+use crate::protocol::{ActivityStatus, SessionReference, SessionTimestamp};
+use crate::theme::Theme;
 
 use super::super::{
     commands::SemanticCommandId,
-    render::shimmered_label_spans,
+    render::{shimmered_label_spans, working_duration},
     slots::truncate_to_width,
     spinner,
     transcript::{humanized_duration, subagent_marker},
@@ -72,14 +73,25 @@ impl Section for SubagentsSection {
         if open_top_level {
             current = Some(rows.len());
         }
+        // The top-level entry wears the Working Marker and its elapsed time
+        // only while it is Working, as its Sidebar row does.
+        let top_level_working = top_level.working_since.is_some();
+        animates |= top_level_working;
         rows.push(SectionRow {
             line: entry_line(
                 EntryParts {
                     guides: String::new(),
-                    marker: None,
+                    marker: top_level_working
+                        .then(|| (spinner::MARKER.to_owned(), theme.accent.primary)),
                     name: None,
                     title: &top_level.title,
-                    duration: None,
+                    right: right_slot(
+                        top_level.needs_intervention,
+                        top_level
+                            .working_since
+                            .map(|since| ticking(since, context.now)),
+                        theme,
+                    ),
                 },
                 open_top_level,
                 width,
@@ -87,6 +99,13 @@ impl Section for SubagentsSection {
             ),
             invocation: open_invocation(tree, top_level.session_id, context.open),
         });
+        if top_level_working && let Some(row) = rows.last_mut() {
+            spinner::overlay_frame(
+                std::slice::from_mut(&mut row.line),
+                &[0],
+                context.spinner_frame / 3,
+            );
+        }
         for entry in tree.depth_first() {
             let subagent = entry.entry;
             let open = context.open.session_id == subagent.session_id;
@@ -96,6 +115,14 @@ impl Section for SubagentsSection {
             let (marker, marker_style) = subagent_marker(subagent.status, theme);
             let working = subagent.status == ActivityStatus::Active;
             animates |= working;
+            // A working entry ticks from the moment its work began; a settled
+            // one stands at the duration its work took, or says nothing where
+            // that was never learned.
+            let time = if working {
+                subagent.started_at.map(|since| ticking(since, context.now))
+            } else {
+                subagent.duration_ms.map(humanized_duration)
+            };
             rows.push(SectionRow {
                 line: entry_line(
                     EntryParts {
@@ -103,7 +130,7 @@ impl Section for SubagentsSection {
                         marker: Some((marker.to_owned(), marker_style)),
                         name: Some(&subagent.name),
                         title: &subagent.title,
-                        duration: subagent.duration_ms.map(humanized_duration),
+                        right: right_slot(subagent.needs_intervention, time, theme),
                     },
                     open,
                     width,
@@ -207,7 +234,28 @@ struct EntryParts<'a> {
     marker: Option<(String, Style)>,
     name: Option<&'a str>,
     title: &'a str,
-    duration: Option<String>,
+    /// What the entry's right-aligned slot says, in its style.
+    right: Option<(String, Style)>,
+}
+
+/// How long live work has been running, read the way the Sidebar's Working
+/// duration reads it, so both columns tick alike.
+fn ticking(since: SessionTimestamp, now: SessionTimestamp) -> String {
+    working_duration(since, now.0)
+}
+
+/// An entry's right slot: its time, unless its own Session waits on an
+/// Intervention, which it then says in the time's place.
+fn right_slot(
+    needs_intervention: bool,
+    time: Option<String>,
+    theme: &Theme,
+) -> Option<(String, Style)> {
+    if needs_intervention {
+        Some(("Needs Intervention".to_owned(), theme.feedback.warning))
+    } else {
+        time.map(|time| (time, theme.text.subdued))
+    }
 }
 
 /// One entry's line: tree guides, the Marker, the name dimmed, then the
@@ -225,10 +273,10 @@ fn entry_line(
     if let Some((marker, style)) = parts.marker {
         line.push(marker, style);
     }
-    let right = parts
-        .duration
-        .map(|duration| format!(" {duration}"))
-        .unwrap_or_default();
+    let (right, right_style) = parts.right.map_or_else(
+        || (String::new(), theme.text.subdued),
+        |(text, style)| (format!(" {text}"), style),
+    );
     let mut room = width
         .saturating_sub(line.used)
         .saturating_sub(right.width());
@@ -254,7 +302,7 @@ fn entry_line(
             .saturating_sub(line.used)
             .saturating_sub(right.width());
         line.push(" ".repeat(gap), theme.text.subdued);
-        line.push(right, theme.text.subdued);
+        line.push(right, right_style);
     }
     Line::from(line.spans)
 }

@@ -115,6 +115,29 @@ impl std::fmt::Debug for PresentationClock {
     }
 }
 
+/// The wall clock a Session's own timestamps are read against, for a surface
+/// ticking how long work has been running from when the Server said it began.
+#[derive(Clone)]
+struct SessionClock(Arc<dyn Fn() -> crate::protocol::SessionTimestamp + Send + Sync>);
+
+impl SessionClock {
+    fn now(&self) -> crate::protocol::SessionTimestamp {
+        (self.0)()
+    }
+}
+
+impl Default for SessionClock {
+    fn default() -> Self {
+        Self(Arc::new(crate::protocol::SessionTimestamp::now))
+    }
+}
+
+impl std::fmt::Debug for SessionClock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionClock(..)")
+    }
+}
+
 /// How long a self-presented Intervention panel ignores every key, so a
 /// reader already mid-keystroke cannot answer something they have not read.
 const INTERVENTION_ARMING_DELAY: Duration = Duration::from_millis(250);
@@ -528,6 +551,7 @@ pub struct TuiState {
     /// and writes Fold overrides only when a threshold is crossed.
     active_commands_started_at: HashMap<ActivityId, Instant>,
     presentation_clock: PresentationClock,
+    session_clock: SessionClock,
     /// How long a self-presented Intervention panel ignores keys.
     intervention_arming_delay: Duration,
     /// When a self-presented Intervention panel starts taking keys. `None`
@@ -842,6 +866,7 @@ impl TuiState {
             session_animation_on_screen: Cell::new(false),
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
+            session_clock: SessionClock::default(),
             intervention_arming_delay: INTERVENTION_ARMING_DELAY,
             intervention_armed_until: None,
             dismissed_interventions: HashMap::new(),
@@ -2760,6 +2785,11 @@ impl TuiState {
         self.route.as_ref().map(|route| route.session_id)
     }
 
+    /// The moment now on the clock a Session's timestamps are read against.
+    pub(super) fn session_now(&self) -> crate::protocol::SessionTimestamp {
+        self.session_clock.now()
+    }
+
     pub(super) fn open_session_reference(&self) -> Option<&SessionReference> {
         self.route.as_ref()
     }
@@ -4208,6 +4238,17 @@ impl Application {
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Self {
         self.state.presentation_clock = PresentationClock(Arc::new(clock));
+        self
+    }
+
+    /// Injects the wall clock the Aside's elapsed times are read against.
+    /// Production reads the system clock, as the Server stamps its Sessions;
+    /// tests move a deterministic one to see a time advance.
+    pub fn with_session_clock(
+        mut self,
+        clock: impl Fn() -> crate::protocol::SessionTimestamp + Send + Sync + 'static,
+    ) -> Self {
+        self.state.session_clock = SessionClock(Arc::new(clock));
         self
     }
 
@@ -8929,7 +8970,8 @@ impl Application {
             // So is another Session's Turn, drawn in a Sidebar row whose
             // Working duration has to be seen rising.
             || self.state.sidebar.shows_live_work()
-            // And a Subagent working in the Aside, whose Marker spins.
+            // And live work in the Aside — a working Subagent, or a Working
+            // top-level Session — whose Marker spins and whose time rises.
             || self.state.aside.shows_live_work()
             || self.state.session_animation_on_screen.get()
             || self.transcript_drag_scroll().is_some()
