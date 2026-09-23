@@ -1,5 +1,6 @@
 //! The per-tree subscription: the tree a top-level Session heads, read off
-//! the Provider-neutral Subagent rows, as a snapshot and then live changes.
+//! the Provider-neutral Subagent rows, as a snapshot and then live changes —
+//! over the Server's own route and through the managed client.
 
 use std::pin::Pin;
 
@@ -7,16 +8,17 @@ use crate::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     server_support::PROGRESS_DEADLINE,
     support::{
-        WorkingTurn, create_session, hosted_model, hosted_selection, working_turn,
-        working_turn_with_timings,
+        WorkingTurn, create_session, hosted_model, hosted_selection,
+        receive_managed_client_initial_state, working_turn, working_turn_with_timings,
     },
 };
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig, SubagentTreeEvent},
     protocol::{
-        ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, RuntimeDescriptor,
+        ActivityStatus, CreateSessionRequest, InitialPrompt, Outlook, PromptId, RuntimeDescriptor,
         SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode,
         SessionId, SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
     },
@@ -515,6 +517,110 @@ async fn the_tree_stream_keeps_alive_at_the_servers_interval() {
     .await
     .expect("a keepalive follows the snapshot");
 
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+async fn next_tree_event(
+    subscription: &mut suru::managed_client::SubagentTreeSubscription,
+) -> SubagentTreeEvent {
+    timeout(PROGRESS_DEADLINE, subscription.next())
+        .await
+        .expect("a tree event arrives")
+        .expect("the tree subscription stays open")
+}
+
+#[tokio::test]
+async fn the_managed_client_surfaces_the_tree_and_its_changes() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-tree-managed-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let provider = &fixture.provider_session;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    spawn(
+        provider,
+        Some("task-1"),
+        "task-2",
+        "Review",
+        "Check the seams",
+    )
+    .await;
+    let (known, _updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    let review = named(&known.subagents, "Review").clone();
+
+    let mut subscription = client
+        .outlook(Outlook::Local)
+        .subscribe_subagent_tree(review.session_id);
+    let SubagentTreeEvent::Snapshot(snapshot) = next_tree_event(&mut subscription).await else {
+        panic!("the subscription opens with the tree");
+    };
+    assert_eq!(snapshot.top_level.session_id, fixture.session_id);
+    assert_eq!(
+        shape(&snapshot),
+        owned(&[("Explore", "top-level", 0), ("Review", "Explore", 0)])
+    );
+
+    settle(
+        provider,
+        Some("task-1"),
+        "task-2",
+        ProviderSubagentStatus::Completed,
+    )
+    .await;
+    let SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSettled {
+        session_id,
+        status,
+        duration_ms,
+    }) = next_tree_event(&mut subscription).await
+    else {
+        panic!("a settle reaches the managed client as a change");
+    };
+    assert_eq!(session_id, review.session_id);
+    assert_eq!(status, ActivityStatus::Completed);
+    assert!(duration_ms.is_some());
+
+    spawn(provider, None, "task-3", "Plan", "Weigh the options").await;
+    let SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSpawned { entry }) =
+        next_tree_event(&mut subscription).await
+    else {
+        panic!("a spawn reaches the managed client as a change");
+    };
+    assert_eq!(entry.name, "Plan");
+    assert_eq!(entry.parent_session_id, fixture.session_id);
+    assert_eq!(entry.spawn_order, 1);
+
+    let mut missing = client.subscribe_subagent_tree(SessionId::new());
+    assert!(
+        matches!(
+            next_tree_event(&mut missing).await,
+            SubagentTreeEvent::Failed(_)
+        ),
+        "a tree the Server does not hold fails rather than retrying forever"
+    );
+    assert!(
+        timeout(PROGRESS_DEADLINE, missing.next())
+            .await
+            .expect("the failed subscription ends")
+            .is_none()
+    );
+
+    drop(subscription);
+    drop(client);
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
 }

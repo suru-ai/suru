@@ -37,11 +37,13 @@ mod remote_connection;
 mod session_catalog_stream;
 mod session_projection;
 mod session_stream;
+mod subagent_tree_stream;
 
 pub(crate) use recovery::RecoveryBackoff;
 pub use session_catalog_stream::SessionCatalogSubscription;
 pub(crate) use session_projection::SessionProjection;
 pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
+pub use subagent_tree_stream::{SubagentTreeEvent, SubagentTreeSubscription};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -610,6 +612,11 @@ impl ManagedClient {
         self.session_commands().attach_session(session_id).await
     }
 
+    /// Subscribes to the tree `session_id` belongs to on the local Server.
+    pub fn subscribe_subagent_tree(&self, session_id: SessionId) -> SubagentTreeSubscription {
+        self.session_commands().subscribe_subagent_tree(session_id)
+    }
+
     pub(crate) fn session_commands(&self) -> SessionCommandClient {
         self.session_commands_for(Outlook::Local)
     }
@@ -628,6 +635,12 @@ impl ManagedClient {
 impl OutlookClient {
     pub fn subscribe_catalog(&self) -> SessionCatalogSubscription {
         self.commands.subscribe_catalog()
+    }
+
+    /// Subscribes to the tree `session_id` belongs to, headed by its
+    /// top-level Session, on the Server this Outlook names.
+    pub fn subscribe_subagent_tree(&self, session_id: SessionId) -> SubagentTreeSubscription {
+        self.commands.subscribe_subagent_tree(session_id)
     }
 
     pub async fn preview_checkout_removal(
@@ -819,6 +832,20 @@ impl SessionCommandClient {
             self.http.clone(),
             self.descriptor.clone(),
             self.outlook.clone(),
+            self.initial_recovery_backoff,
+            self.max_recovery_backoff,
+        )
+    }
+
+    pub(crate) fn subscribe_subagent_tree(
+        &self,
+        session_id: SessionId,
+    ) -> SubagentTreeSubscription {
+        SubagentTreeSubscription::open(
+            self.http.clone(),
+            self.descriptor.clone(),
+            self.outlook.clone(),
+            session_id,
             self.initial_recovery_backoff,
             self.max_recovery_backoff,
         )
