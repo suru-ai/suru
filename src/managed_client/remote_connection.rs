@@ -9,6 +9,10 @@ pub(super) enum RemoteConnectionFailure {
         message: String,
     },
     Rejected(String),
+    /// The Server holds no Session the request named — never did, or no
+    /// longer does. A subscription that has already heard from that Session
+    /// reads it as the Session having been deleted.
+    Missing(String),
 }
 
 pub(super) async fn classify(
@@ -37,6 +41,9 @@ pub(super) async fn classify(
             Err(RemoteConnectionFailure::Transient)
         }
         Some(_) | None if status.is_server_error() => Err(RemoteConnectionFailure::Transient),
+        Some(error) if error.code == SessionErrorCode::SessionNotFound => {
+            Err(RemoteConnectionFailure::Missing(error.message))
+        }
         Some(error) => Err(RemoteConnectionFailure::Rejected(error.message)),
         None => Err(RemoteConnectionFailure::Rejected(format!(
             "Remote proxy rejected the request with {status}"

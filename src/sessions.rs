@@ -514,7 +514,7 @@ impl SessionStore {
             .prompts
             .retain(|_, owner| !doomed.contains(&owner.session_id));
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
-        state.subagent_trees.forget(session_id);
+        state.subagent_trees.invalidate(session_id);
         Ok(DeletedSession { repository })
     }
 

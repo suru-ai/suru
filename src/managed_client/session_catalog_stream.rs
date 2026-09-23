@@ -171,7 +171,11 @@ async fn run_attached(
                     .await;
                 return;
             }
-            Err(RemoteConnectionFailure::Transient | RemoteConnectionFailure::Rejected(_)) => {
+            Err(
+                RemoteConnectionFailure::Transient
+                | RemoteConnectionFailure::Rejected(_)
+                | RemoteConnectionFailure::Missing(_),
+            ) => {
                 if !recovery.wait_after_failure(&events, &mut descriptor).await {
                     return;
                 }

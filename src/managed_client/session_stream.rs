@@ -182,7 +182,8 @@ async fn open_response(
                 RemoteConnectionFailure::Terminal { status, message } => {
                     SessionStreamError::remote(status, message)
                 }
-                RemoteConnectionFailure::Rejected(message) => {
+                RemoteConnectionFailure::Rejected(message)
+                | RemoteConnectionFailure::Missing(message) => {
                     SessionStreamError::protocol(anyhow::anyhow!(message))
                 }
             });

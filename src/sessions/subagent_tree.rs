@@ -50,10 +50,31 @@ struct TreeChannel {
 }
 
 impl SubagentTreePublisher {
-    /// Forgets a tree outright, ending every subscription to it. Used when the
-    /// top-level Session heading it is gone.
-    pub(super) fn forget(&mut self, top_level: SessionId) {
-        self.trees.remove(&top_level);
+    /// Tells a tree's subscribers the tree is gone, then forgets it, ending
+    /// every subscription to it once they have heard. Used when the top-level
+    /// Session heading it is deleted: a subscriber learns why its stream ended
+    /// rather than reconnecting to find nothing there.
+    pub(super) fn invalidate(&mut self, top_level: SessionId) {
+        let Some(mut channel) = self.trees.remove(&top_level) else {
+            return;
+        };
+        channel.announce_change(SubagentTreeChange::TreeDeleted);
+    }
+}
+
+impl TreeChannel {
+    /// Sends one change at the revision after the last.
+    fn announce_change(&mut self, change: SubagentTreeChange) {
+        self.revision = SubagentTreeRevision(
+            self.revision
+                .0
+                .checked_add(1)
+                .expect("Subagent tree revision space is not exhausted"),
+        );
+        let _ = self.updates.send(SubagentTreeUpdate {
+            revision: self.revision,
+            change,
+        });
     }
 }
 
@@ -113,7 +134,7 @@ impl SessionStoreState {
         }
         match self.read_subagent_tree(top_level) {
             Some(tree) => self.subagent_trees.announce(top_level, tree),
-            None => self.subagent_trees.forget(top_level),
+            None => self.subagent_trees.invalidate(top_level),
         }
     }
 
@@ -216,17 +237,7 @@ impl SubagentTreePublisher {
             return;
         }
         for change in tree_changes(&channel.announced, &tree) {
-            channel.revision = SubagentTreeRevision(
-                channel
-                    .revision
-                    .0
-                    .checked_add(1)
-                    .expect("Subagent tree revision space is not exhausted"),
-            );
-            let _ = channel.updates.send(SubagentTreeUpdate {
-                revision: channel.revision,
-                change,
-            });
+            channel.announce_change(change);
         }
         channel.announced = tree;
     }

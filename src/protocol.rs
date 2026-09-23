@@ -2443,6 +2443,10 @@ pub enum SubagentTreeChange {
     },
     /// The top-level Session's Title changed.
     TopLevelRetitled { title: String },
+    /// The top-level Session was deleted, and every Session in its tree with
+    /// it. It is the stream's last word: nothing follows it, and asking for
+    /// the tree again finds no Session to answer for.
+    TreeDeleted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

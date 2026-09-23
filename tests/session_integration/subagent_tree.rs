@@ -8,7 +8,7 @@ use crate::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     server_support::PROGRESS_DEADLINE,
     support::{
-        WorkingTurn, create_session, hosted_model, hosted_selection,
+        WorkingTurn, create_session, hosted_model, hosted_selection, read_session_until,
         receive_managed_client_initial_state, working_turn, working_turn_with_timings,
     },
 };
@@ -623,4 +623,192 @@ async fn the_managed_client_surfaces_the_tree_and_its_changes() {
     drop(client);
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// Settles every Subagent [`spawn_a_family`] spawned, deepest first, then the
+/// Turn that spawned them, and waits until nothing in the tree is Working — the
+/// state a top-level Session must be in to be deleted, and the one a restart
+/// finds nothing to repair in.
+async fn settle_the_family(fixture: &WorkingTurn) {
+    let provider = &fixture.provider_session;
+    settle(
+        provider,
+        Some("task-3"),
+        "task-5",
+        ProviderSubagentStatus::Completed,
+    )
+    .await;
+    settle(
+        provider,
+        Some("task-1"),
+        "task-3",
+        ProviderSubagentStatus::Completed,
+    )
+    .await;
+    settle(
+        provider,
+        Some("task-1"),
+        "task-4",
+        ProviderSubagentStatus::Failed,
+    )
+    .await;
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    settle(
+        provider,
+        None,
+        "task-2",
+        ProviderSubagentStatus::Interrupted,
+    )
+    .await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the whole tree stops Working",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deleting_the_top_level_session_invalidates_its_tree() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-tree-deletion-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    spawn_a_family(&fixture).await;
+    settle_the_family(&fixture).await;
+    let descriptor = fixture.server.descriptor();
+    let (tree, _updates) = open_tree(descriptor, fixture.session_id).await;
+    let deepest = named(&tree.subagents, "Probe").session_id;
+    let (through_child, mut updates) = open_tree(descriptor, deepest).await;
+    let mut revision = through_child.revision;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+    let mut subscription = client.subscribe_subagent_tree(deepest);
+    assert!(matches!(
+        next_tree_event(&mut subscription).await,
+        SubagentTreeEvent::Snapshot(_)
+    ));
+
+    fixture
+        .client
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            descriptor.base_url, fixture.session_id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("delete the top-level Session")
+        .error_for_status()
+        .expect("an idle top-level Session is deleted");
+
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::TreeDeleted,
+        "a subscriber is told the tree is gone, whichever Session it subscribed through"
+    );
+    assert!(
+        timeout(PROGRESS_DEADLINE, updates.next())
+            .await
+            .expect("the stream ends after the deletion")
+            .is_none(),
+        "the deletion is the stream's last word"
+    );
+    assert_eq!(
+        next_tree_event(&mut subscription).await,
+        SubagentTreeEvent::Deleted,
+        "the managed client surfaces the deletion as the subscription's end"
+    );
+    assert!(
+        timeout(PROGRESS_DEADLINE, subscription.next())
+            .await
+            .expect("the deleted subscription ends")
+            .is_none(),
+        "rather than reconnecting to a tree that is no longer there"
+    );
+    let reopened = reqwest::Client::new()
+        .get(tree_url(descriptor, deepest))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("ask for the deleted tree again");
+    assert_eq!(
+        reopened.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "no Session in a deleted tree answers for it"
+    );
+
+    drop(subscription);
+    drop(client);
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_restart_restores_the_tree_and_its_entries() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-tree-restart-test";
+    let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
+    let fixture = working_turn(state_dir.path(), channel).await;
+    spawn_a_family(&fixture).await;
+    settle_the_family(&fixture).await;
+    let (before, before_updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    let deepest = named(&before.subagents, "Probe").session_id;
+    drop(before_updates);
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("respawn server");
+    // Asked through the deepest Subagent first, before anything else has
+    // read the tree back from storage.
+    let (after, _updates) = open_tree(restarted.descriptor(), deepest).await;
+
+    assert_eq!(after.top_level, before.top_level);
+    assert_eq!(
+        after.subagents, before.subagents,
+        "every entry comes back where it stood, as it last said it"
+    );
+    assert_eq!(
+        shape(&after),
+        owned(&[
+            ("Explore", "top-level", 0),
+            ("Review", "Explore", 0),
+            ("Probe", "Review", 0),
+            ("Test", "Explore", 1),
+            ("Plan", "top-level", 1),
+        ])
+    );
+    assert_eq!(
+        named(&after.subagents, "Test").status,
+        ActivityStatus::Failed
+    );
+    assert_eq!(
+        named(&after.subagents, "Plan").status,
+        ActivityStatus::Interrupted
+    );
+    assert!(
+        after
+            .subagents
+            .iter()
+            .all(|entry| entry.duration_ms.is_some()),
+        "settled durations are restored with their entries"
+    );
+
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
 }
