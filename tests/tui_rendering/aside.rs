@@ -134,11 +134,16 @@ fn open(
 }
 
 fn deliver_tree(application: &mut Application, through: SessionId, event: SubagentTreeEvent) {
+    deliver_tree_through(application, local(through), event);
+}
+
+fn deliver_tree_through(
+    application: &mut Application,
+    through: SessionReference,
+    event: SubagentTreeEvent,
+) {
     application
-        .handle_event(ApplicationEvent::SubagentTree {
-            through: local(through),
-            event,
-        })
+        .handle_event(ApplicationEvent::SubagentTree { through, event })
         .expect("take a Subagent tree event");
 }
 
@@ -496,19 +501,6 @@ fn switching_within_a_tree_keeps_the_section_and_another_tree_does_not_borrow_it
 }
 
 #[test]
-fn a_failed_subscription_leaves_the_last_tree_standing() {
-    let workspace = workspace_dir();
-    let (mut application, tree) = tree_open_at_top(workspace.path());
-    let before = aside_rows(&application, WIDTH);
-    deliver_tree(
-        &mut application,
-        tree.top,
-        SubagentTreeEvent::Failed("gone".to_owned()),
-    );
-    assert_eq!(aside_rows(&application, WIDTH), before);
-}
-
-#[test]
 fn ctrl_x_a_and_slash_aside_follow_the_three_way_rule() {
     let workspace = workspace_dir();
     let (mut application, _) = tree_open_at_top(workspace.path());
@@ -842,5 +834,256 @@ fn in_a_subagents_session_the_leader_reaches_the_aside_and_nothing_else() {
     assert!(
         !aside_text(&application).contains("Subagents"),
         "Ctrl+X A takes the keys and then hides the Aside from inside it"
+    );
+}
+
+// Arriving, failing, deletion and an Unreachable Remote: the Section stays
+// trustworthy whatever the per-tree subscription is doing.
+
+/// A client drawing under a presentation clock the test moves by hand, so the
+/// Section's 300 ms quiet period passes without being waited out.
+fn clocked_client(
+    workspace: &std::path::Path,
+) -> (
+    Application,
+    std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+) {
+    let now = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let clock = std::sync::Arc::clone(&now);
+    let mut application = connected_application(workspace)
+        .with_presentation_clock(move || *clock.lock().expect("read the presentation clock"));
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    (application, now)
+}
+
+fn advance(now: &std::sync::Mutex<std::time::Instant>, milliseconds: u64) {
+    *now.lock().expect("advance the presentation clock") +=
+        std::time::Duration::from_millis(milliseconds);
+}
+
+#[test]
+fn a_tree_still_arriving_is_blank_and_then_says_loading() {
+    let workspace = workspace_dir();
+    let (mut application, now) = clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+
+    assert_eq!(
+        aside_rows(&application, WIDTH)[..2],
+        ["Subagents", ""],
+        "a tree not yet in hand is drawn blank"
+    );
+    advance(&now, 299);
+    assert_eq!(
+        aside_rows(&application, WIDTH)[1],
+        "",
+        "still quiet at 299 ms"
+    );
+    advance(&now, 1);
+    assert_eq!(
+        aside_rows(&application, WIDTH)[1],
+        "Loading",
+        "Loading once the quiet period has passed"
+    );
+
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    assert_eq!(aside_rows(&application, WIDTH)[1], "Map every seam");
+}
+
+#[test]
+fn a_fast_arrival_never_flashes_loading_and_moving_within_the_tree_never_blanks() {
+    let workspace = workspace_dir();
+    let (mut application, now) = clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    aside_rows(&application, WIDTH);
+    advance(&now, 200);
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    let arrived = aside_rows(&application, WIDTH);
+    assert_eq!(arrived[1], "Map every seam");
+
+    advance(&now, 400);
+    assert_eq!(
+        aside_rows(&application, WIDTH),
+        arrived,
+        "a tree that arrived inside the quiet period never says Loading"
+    );
+
+    open(
+        &mut application,
+        workspace.path(),
+        tree.review,
+        Some(tree.explore),
+    );
+    assert_eq!(aside_rows(&application, WIDTH)[..5], arrived[..5]);
+    advance(&now, 400);
+    assert_eq!(
+        aside_rows(&application, WIDTH)[..5],
+        arrived[..5],
+        "moving to another Session of the tree neither blanks nor loads it"
+    );
+}
+
+#[test]
+fn a_tree_that_cannot_be_read_says_so_until_a_session_of_it_is_opened_again() {
+    let workspace = workspace_dir();
+    let (mut application, now) = clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Failed("Session does not exist on this server instance".to_owned()),
+    );
+
+    let rows = aside_rows(&application, WIDTH);
+    assert_eq!(
+        rows[1..4],
+        [
+            "Error: Could not load",
+            "Subagents: Session does not",
+            "exist on this server instance",
+        ],
+        "the Section says why it has no tree: {rows:#?}"
+    );
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    assert_eq!(
+        buffer[(WIDTH - ASIDE_WIDTH + 2, 1)].fg,
+        Color::Red,
+        "in the Theme's error colour"
+    );
+    advance(&now, 400);
+    assert_eq!(
+        aside_rows(&application, WIDTH),
+        rows,
+        "the error line stands rather than giving way to Loading"
+    );
+
+    // The ended subscription is not asked again while the reader stays put:
+    // a snapshot still in flight from it is not taken.
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    assert_eq!(aside_rows(&application, WIDTH), rows);
+
+    // Opening a Session of the tree asks for it again.
+    open(&mut application, workspace.path(), tree.top, None);
+    assert_eq!(
+        aside_rows(&application, WIDTH)[1],
+        "",
+        "the retry begins quiet, as any tree still arriving does"
+    );
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    assert_eq!(
+        aside_rows(&application, WIDTH)[..2],
+        ["Subagents 3", "Map every seam"],
+        "the retried subscription's tree is taken"
+    );
+}
+
+#[test]
+fn a_tree_lost_while_in_hand_is_retried_from_any_session_of_it() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Failed("Remote revoked this Pairing".to_owned()),
+    );
+    assert!(aside_text(&application).contains("Error: Could not load"));
+
+    open(
+        &mut application,
+        workspace.path(),
+        tree.review,
+        Some(tree.explore),
+    );
+    assert!(
+        !aside_text(&application).contains("Error"),
+        "opening a Session of the lost tree asks for it again"
+    );
+    deliver_tree(
+        &mut application,
+        tree.review,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    assert_eq!(aside_rows(&application, WIDTH)[1], "Map every seam");
+}
+
+#[test]
+fn a_deleted_tree_is_dropped_without_an_error_line() {
+    let workspace = workspace_dir();
+    let (mut application, now) = clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    deliver_tree(&mut application, tree.top, SubagentTreeEvent::Deleted);
+
+    let rows = aside_rows(&application, WIDTH);
+    assert_eq!(rows[..3], ["Subagents", "", ""], "{rows:#?}");
+    advance(&now, 400);
+    assert!(
+        !aside_text(&application).contains("Loading")
+            && !aside_text(&application).contains("Error"),
+        "a deleted tree neither loads again nor complains"
+    );
+}
+
+#[test]
+fn an_unreachable_remote_leaves_the_last_tree_standing() {
+    let mut application = crate::support::application_looking_at_studio();
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    let tree = Tree::new();
+    let mut snapshot = failed_session_snapshot(
+        tree.top,
+        PromptId::new(),
+        "Open work",
+        std::path::Path::new("."),
+    );
+    snapshot.session.parent = None;
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("open the Remote Session");
+    let studio = Outlook::Remote("studio".to_owned());
+    deliver_tree_through(
+        &mut application,
+        SessionReference::new(studio.clone(), tree.top),
+        SubagentTreeEvent::Snapshot(tree.snapshot()),
+    );
+    let before = aside_rows(&application, WIDTH);
+    assert_eq!(before[1], "Map every seam");
+
+    crate::support::studio_stops_answering(
+        &mut application,
+        1,
+        std::time::Duration::from_millis(5),
+    );
+    crate::support::grace_elapses(&mut application, studio);
+    let rows = aside_rows(&application, WIDTH);
+    assert!(
+        rows[..5] == before[..5],
+        "the tree the Remote last gave stands while it is Unreachable: {rows:#?}"
     );
 }

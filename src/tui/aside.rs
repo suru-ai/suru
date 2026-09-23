@@ -10,6 +10,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ops::Range,
+    time::{Duration, Instant},
 };
 
 use ratatui::{
@@ -29,6 +30,7 @@ use crate::theme::Theme;
 use super::{
     commands::SemanticInvocation,
     render::{horizontally_inset, side_column_block},
+    shimmer,
     side_column::{Side, SideColumn, ToggleStep},
     slots::truncate_to_width,
 };
@@ -36,7 +38,12 @@ use super::{
 mod section;
 mod subagents;
 
-use section::{SectionContext, SectionView, built_in_sections};
+use section::{SectionContext, SectionView, SubagentTreeView, built_in_sections};
+
+/// How long a tree not yet in hand is drawn blank before it says Loading: the
+/// quiet period a Session still opening keeps, so a fast arrival never
+/// flashes.
+const TREE_LOADING_DELAY: Duration = Duration::from_millis(300);
 
 /// Whether the Aside begins shown, until its Setting arrives (#367).
 const INITIAL_VISIBILITY_SHOWN: bool = true;
@@ -52,6 +59,11 @@ pub(super) struct Aside {
     rows: RefCell<Vec<AsideRowHit>>,
     /// Whether the last frame drew live presentation in the Aside.
     animating: Cell<bool>,
+    /// The tree the Aside has been waiting on since a frame first wanted it,
+    /// named by the Session it is asked through, and the moment it may say
+    /// Loading. Only a frame can start the wait, because the wait is about
+    /// what the reader has been looking at.
+    waiting: RefCell<Option<(SessionReference, Instant)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +92,7 @@ impl Aside {
             tree: TreeFollow::default(),
             rows: RefCell::new(Vec::new()),
             animating: Cell::new(false),
+            waiting: RefCell::new(None),
         }
     }
 
@@ -177,17 +190,73 @@ impl Aside {
     /// `None` when there is nothing for the Aside to answer for. Moving
     /// between Sessions of the tree already in hand keeps the subscription
     /// it came from, so the Section stands as it is.
+    ///
+    /// A tree whose subscription ended — it could not be read, or it was
+    /// deleted — is not asked for again until a Session of it is next opened
+    /// (see [`Self::note_opened`]), so the run loop lets the ended
+    /// subscription go and starts a fresh one then.
     pub(super) fn tree_request(&self, open: Option<&SessionReference>) -> Option<SessionReference> {
         let open = open?;
-        if !self.column.is_revealed() {
+        if !self.column.is_revealed() || self.tree.ended_for(open).is_some() {
             return None;
         }
-        if let Some(through) = &self.tree.through
-            && self.tree.covers(open)
-        {
-            return Some(through.clone());
+        Some(self.tree.wanted(open))
+    }
+
+    /// Notes that the reader opened `opened`. Opening a Session of a tree
+    /// whose subscription ended is what asks for that tree again.
+    pub(super) fn note_opened(&mut self, opened: &SessionReference) {
+        if self.tree.ended_for(opened).is_some() {
+            self.tree.ended = None;
         }
-        Some(open.clone())
+    }
+
+    /// When the tree the open Session wants may first say Loading, while that
+    /// moment is still ahead: the one wakeup the run loop owes the Aside.
+    pub(super) fn loading_deadline(
+        &self,
+        open: Option<&SessionReference>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let wanted = self.tree_request(open)?;
+        if self.tree.covers(open?) {
+            return None;
+        }
+        self.waiting
+            .borrow()
+            .as_ref()
+            .filter(|(waited_for, deadline)| *waited_for == wanted && *deadline > now)
+            .map(|(_, deadline)| *deadline)
+    }
+
+    /// What the Aside knows of the tree `open` belongs to, as of `now`. A
+    /// tree not yet in hand starts its quiet period the first time a frame
+    /// asks.
+    fn tree_view(&self, open: &SessionReference, now: Instant) -> SubagentTreeView<'_> {
+        if let Some(end) = self.tree.ended_for(open) {
+            return end
+                .failure
+                .as_deref()
+                .map_or(SubagentTreeView::Gone, SubagentTreeView::Failed);
+        }
+        if let Some(reading) = self.tree_for(open) {
+            return SubagentTreeView::Ready(reading);
+        }
+        let wanted = self.tree.wanted(open);
+        let mut waiting = self.waiting.borrow_mut();
+        let deadline = match waiting.as_ref() {
+            Some((waited_for, deadline)) if *waited_for == wanted => *deadline,
+            _ => {
+                let deadline = now
+                    .checked_add(TREE_LOADING_DELAY)
+                    .expect("the tree loading delay fits a monotonic clock");
+                *waiting = Some((wanted, deadline));
+                deadline
+            }
+        };
+        SubagentTreeView::Arriving {
+            loading: now >= deadline,
+        }
     }
 
     /// Takes one event from the subscription asked through `through`,
@@ -219,10 +288,34 @@ impl Aside {
                 reading.apply(change);
                 true
             }
-            // The last tree in hand stands. Saying the tree could not be
-            // read, and reading it again, is #370's.
-            SubagentTreeEvent::Failed(_) => false,
+            // The subscription has ended. What it was answering for — the
+            // tree in hand, or the Session it was asked through — says so
+            // until one of its Sessions is next opened.
+            SubagentTreeEvent::Failed(message) => {
+                self.end_tree(through, Some(message));
+                true
+            }
+            // A deleted tree is dropped without complaint: deleting the open
+            // top-level Session has already moved the view away.
+            SubagentTreeEvent::Deleted => {
+                self.end_tree(through, None);
+                true
+            }
         }
+    }
+
+    fn end_tree(&mut self, through: SessionReference, failure: Option<String>) {
+        let tree = if self.tree.through.as_ref() == Some(&through) {
+            self.tree.through = None;
+            self.tree.reading.take()
+        } else {
+            None
+        };
+        self.tree.ended = Some(TreeEnd {
+            through,
+            tree,
+            failure,
+        });
     }
 
     /// The tree the open Session belongs to, where the Aside holds it.
@@ -241,19 +334,27 @@ impl Aside {
         area: Rect,
         open: &SessionReference,
         owns_input: bool,
-        theme: &Theme,
-        spinner_frame: usize,
+        presentation: AsidePresentation<'_>,
     ) {
+        let AsidePresentation {
+            theme,
+            spinner_frame,
+            shimmer,
+            truecolor,
+            now,
+        } = presentation;
         let block = side_column_block(&self.column, owns_input, theme);
         let inside = block.inner(area);
         let content = horizontally_inset(inside, 1);
         frame.render_widget(block, area);
         let context = SectionContext {
             open,
-            subagent_tree: self.tree_for(open),
+            subagent_tree: self.tree_view(open, now),
             width: content.width,
             theme,
             spinner_frame,
+            shimmer,
+            truecolor,
         };
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut hits = Vec::new();
@@ -307,6 +408,16 @@ impl Aside {
     }
 }
 
+/// What the Aside draws with beyond its own state: the Theme and the run
+/// loop's presentation clock, frame, and colour depth.
+pub(super) struct AsidePresentation<'a> {
+    pub(super) theme: &'a Theme,
+    pub(super) spinner_frame: usize,
+    pub(super) shimmer: &'a shimmer::Clock,
+    pub(super) truecolor: bool,
+    pub(super) now: Instant,
+}
+
 /// A Section's header: its name, and its count beside it where it knows one.
 fn header_line(name: &str, count: Option<usize>, width: u16, theme: &Theme) -> Line<'static> {
     let mut spans = vec![Span::styled(
@@ -325,9 +436,37 @@ struct TreeFollow {
     /// The Session the subscription whose tree is in hand was asked through.
     through: Option<SessionReference>,
     reading: Option<SubagentTreeReading>,
+    /// The subscription that ended without a tree to go on showing.
+    ended: Option<TreeEnd>,
+}
+
+/// A subscription that ended, and what it answered for.
+#[derive(Clone, Debug)]
+struct TreeEnd {
+    through: SessionReference,
+    /// The tree it had delivered, which names the Sessions the end stands for.
+    tree: Option<SubagentTreeReading>,
+    /// Why the tree could not be read, or `None` for a tree deleted.
+    failure: Option<String>,
 }
 
 impl TreeFollow {
+    /// The Session the tree `open` belongs to is asked through: the
+    /// subscription already delivering it, or `open` itself.
+    fn wanted(&self, open: &SessionReference) -> SessionReference {
+        match &self.through {
+            Some(through) if self.covers(open) => through.clone(),
+            _ => open.clone(),
+        }
+    }
+
+    /// The ended subscription `open` belongs to, if one does.
+    fn ended_for(&self, open: &SessionReference) -> Option<&TreeEnd> {
+        self.ended.as_ref().filter(|end| {
+            end.through == *open || end.tree.as_ref().is_some_and(|tree| tree.contains(open))
+        })
+    }
+
     /// Whether the tree in hand is the one `open` belongs to.
     fn covers(&self, open: &SessionReference) -> bool {
         self.reading
@@ -431,6 +570,9 @@ impl SubagentTreeReading {
                 }
             }
             SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
+            // The managed client ends a deleted tree's subscription with
+            // `SubagentTreeEvent::Deleted` rather than forwarding this.
+            SubagentTreeChange::TreeDeleted => {}
         }
     }
 
@@ -566,6 +708,64 @@ mod tests {
             aside.tree_request(Some(&reference(top))),
             None,
             "a hidden Aside asks for nothing"
+        );
+    }
+
+    #[test]
+    fn an_ended_subscription_is_let_go_and_asked_for_again_when_its_tree_is_next_opened() {
+        let mut aside = Aside::new();
+        aside.adopt_settings();
+        let top = SessionId::new();
+        let child = SessionId::new();
+        let reference = |id| SessionReference::new(Outlook::Local, id);
+        let snapshot = SubagentTreeSnapshot {
+            revision: crate::protocol::SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: top,
+                title: "Delegate".to_owned(),
+            },
+            subagents: vec![entry(child, top, 0)],
+        };
+        let open = reference(top);
+        aside.receive_tree(
+            open.clone(),
+            SubagentTreeEvent::Snapshot(snapshot),
+            Some(&open),
+        );
+        aside.receive_tree(
+            open.clone(),
+            SubagentTreeEvent::Failed("revoked".to_owned()),
+            Some(&open),
+        );
+        assert_eq!(
+            aside.tree_request(Some(&open)),
+            None,
+            "the run loop lets the ended subscription go"
+        );
+        assert_eq!(
+            aside.tree_request(Some(&reference(child))),
+            None,
+            "for every Session of the tree it was delivering"
+        );
+
+        aside.note_opened(&reference(child));
+        assert_eq!(
+            aside.tree_request(Some(&reference(child))),
+            Some(reference(child)),
+            "opening a Session of the tree asks for it afresh"
+        );
+
+        aside.receive_tree(
+            reference(child),
+            SubagentTreeEvent::Deleted,
+            Some(&reference(child)),
+        );
+        assert_eq!(aside.tree_request(Some(&reference(child))), None);
+        aside.note_opened(&reference(SessionId::new()));
+        assert_eq!(
+            aside.tree_request(Some(&reference(child))),
+            None,
+            "opening another tree's Session asks nothing of this one"
         );
     }
 

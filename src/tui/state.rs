@@ -996,6 +996,7 @@ impl TuiState {
         self.left_press = None;
         self.session = None;
         self.session_reference = None;
+        self.aside.note_opened(&target);
         self.route = Some(target);
         self.opening_error = None;
         let deadline = self
@@ -2163,6 +2164,7 @@ impl TuiState {
         // The snapshot is the route as much as the projection: a Session
         // reached without an optimistic opening — one just created, or one
         // picked from an overlay — arrives as both at once.
+        self.aside.note_opened(&reference);
         self.route = Some(reference.clone());
         self.stop_opening_loading();
         self.opening_error = None;
@@ -2781,6 +2783,11 @@ impl TuiState {
     /// Whether the optimistic shell has waited long enough to draw its
     /// loading feedback. Time is read only at presentation boundaries, so the
     /// run loop stays idle until the one-shot threshold wakeup.
+    /// The presentation clock's reading of now.
+    pub(super) fn presentation_now(&self) -> Instant {
+        self.presentation_clock.now()
+    }
+
     pub(super) fn opening_loading_is_visible(&self) -> bool {
         match self.opening_loading {
             OpeningLoadingState::Inactive => false,
@@ -8883,6 +8890,16 @@ impl Application {
     /// one subscription open for as long as this names the same Session.
     pub(super) fn subagent_tree_request(&self) -> Option<SessionReference> {
         self.state.aside.tree_request(self.state.route.as_ref())
+    }
+
+    /// When the Aside's Subagents Section may next say Loading for a tree
+    /// still arriving, while that moment is ahead: the one wakeup the run
+    /// loop arms for it, so a quiet period passing redraws the frame.
+    pub(super) fn subagent_tree_loading_deadline(&self) -> Option<Instant> {
+        self.state.aside.loading_deadline(
+            self.state.route.as_ref(),
+            self.state.presentation_clock.now(),
+        )
     }
 
     pub(super) fn skill_catalog_request(&self) -> Option<SkillCatalogRequest> {

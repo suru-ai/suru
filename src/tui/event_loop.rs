@@ -507,6 +507,9 @@ struct RunLoop {
     /// The optimistic shell's one-shot quiet-period wakeup, paired with its
     /// absolute deadline so a superseding route can replace it exactly once.
     opening_loading_delay: Option<(Instant, Pin<Box<tokio::time::Sleep>>)>,
+    /// The Aside's one-shot wakeup at the end of a tree's quiet period, so a
+    /// tree still arriving is redrawn saying Loading.
+    tree_loading_delay: Option<(Instant, Pin<Box<tokio::time::Sleep>>)>,
     /// Armed only while something on screen animates, so an idle TUI schedules
     /// zero wakeups (ADR 0009). Re-armed on every fire.
     spinner_tick: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -554,6 +557,7 @@ async fn run_loop(
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
+        tree_loading_delay: None,
         spinner_tick: None,
         needs_redraw: true,
     };
@@ -573,6 +577,7 @@ async fn run_loop(
         // Rendering records which animation is actually visible, including a
         // Working Indicator that may have scrolled out of the viewport.
         run.sync_opening_loading_delay();
+        run.sync_tree_loading_delay();
         run.sync_spinner_tick();
         // Every arm reports through ControlFlow so the two events that can end
         // the run -- a Provider shutdown and the exit command -- leave by the
@@ -588,6 +593,13 @@ async fn run_loop(
             }
             () = wait_for_opening_loading_delay(&mut run.opening_loading_delay) => {
                 run.reveal_opening_loading()
+            }
+            () = wait_for_opening_loading_delay(&mut run.tree_loading_delay) => {
+                // The frame reads Loading off the presentation clock, so the
+                // wakeup only has to draw it.
+                run.tree_loading_delay = None;
+                run.needs_redraw = true;
+                ControlFlow::Continue(())
             }
             () = wait_for_spinner_tick(&mut run.spinner_tick) => run.advance_spinner(),
             session_event = next_session_event(&mut run.tasks.subscription) => {
@@ -1319,6 +1331,25 @@ impl RunLoop {
             return;
         }
         self.opening_loading_delay = wanted.map(|deadline| {
+            (
+                deadline,
+                Box::pin(tokio::time::sleep_until(deadline.into())),
+            )
+        });
+    }
+
+    /// Keeps exactly one wakeup at the end of the Aside's quiet period for a
+    /// tree still arriving, and none once it has passed or the tree is in.
+    fn sync_tree_loading_delay(&mut self) {
+        let wanted = self.application.subagent_tree_loading_deadline();
+        let armed = self
+            .tree_loading_delay
+            .as_ref()
+            .map(|(deadline, _)| *deadline);
+        if armed == wanted {
+            return;
+        }
+        self.tree_loading_delay = wanted.map(|deadline| {
             (
                 deadline,
                 Box::pin(tokio::time::sleep_until(deadline.into())),

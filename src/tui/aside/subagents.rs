@@ -12,13 +12,14 @@ use crate::protocol::{ActivityStatus, SessionReference};
 
 use super::super::{
     commands::SemanticCommandId,
+    render::shimmered_label_spans,
     slots::truncate_to_width,
     spinner,
     transcript::{humanized_duration, subagent_marker},
 };
 use super::{
     SubagentTreeReading,
-    section::{Section, SectionContext, SectionHeader, SectionRow, SectionView},
+    section::{Section, SectionContext, SectionHeader, SectionRow, SectionView, SubagentTreeView},
 };
 
 pub(in crate::tui) struct SubagentsSection;
@@ -29,19 +30,39 @@ impl Section for SubagentsSection {
     }
 
     fn view(&self, context: &SectionContext<'_>) -> Result<SectionView, String> {
-        let Some(tree) = context.subagent_tree else {
-            // A tree not yet in hand is drawn blank.
-            return Ok(SectionView {
-                header: SectionHeader {
-                    name: self.name(),
-                    count: None,
-                },
-                rows: Vec::new(),
-                current: None,
-                animates: false,
-            });
-        };
         let theme = context.theme;
+        let tree = match context.subagent_tree {
+            SubagentTreeView::Ready(tree) => tree,
+            // A tree not yet in hand is drawn blank, then says Loading in the
+            // Working Indicator's shimmer once the quiet period has passed.
+            SubagentTreeView::Arriving { loading } => {
+                let rows = if loading {
+                    vec![unpointable(Line::from(shimmered_label_spans(
+                        "Loading",
+                        context.shimmer.frame("Loading", context.spinner_frame),
+                        theme.text.primary,
+                        theme.text.subdued,
+                        context.truecolor,
+                    )))]
+                } else {
+                    Vec::new()
+                };
+                return Ok(self.without_tree(rows, loading));
+            }
+            // A tree that could not be read says so where it would stand.
+            SubagentTreeView::Failed(message) => {
+                let rows = wrapped(
+                    &format!("Error: Could not load Subagents: {message}"),
+                    usize::from(context.width),
+                )
+                .into_iter()
+                .map(|line| unpointable(Line::styled(line, theme.feedback.error)))
+                .collect();
+                return Ok(self.without_tree(rows, false));
+            }
+            // A deleted tree has nothing left to show, and nothing went wrong.
+            SubagentTreeView::Gone => return Ok(self.without_tree(Vec::new(), false)),
+        };
         let width = usize::from(context.width);
         let mut rows = Vec::new();
         let mut current = None;
@@ -109,6 +130,64 @@ impl Section for SubagentsSection {
             animates,
         })
     }
+}
+
+impl SubagentsSection {
+    /// The Section with no tree to list: its header uncounted, and whatever
+    /// stands in the tree's place.
+    fn without_tree(&self, rows: Vec<SectionRow>, animates: bool) -> SectionView {
+        SectionView {
+            header: SectionHeader {
+                name: self.name(),
+                count: None,
+            },
+            rows,
+            current: None,
+            animates,
+        }
+    }
+}
+
+fn unpointable(line: Line<'static>) -> SectionRow {
+    SectionRow {
+        line,
+        invocation: None,
+    }
+}
+
+/// `text` broken at spaces into lines no wider than `width`, a word wider
+/// than a line being cut.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let needed = if line.is_empty() {
+            word.width()
+        } else {
+            line.width() + 1 + word.width()
+        };
+        if needed > width && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+        while line.width() > width {
+            let cut = truncate_to_width(&line, width);
+            let kept = cut.trim_end_matches('…').to_owned();
+            if kept.is_empty() {
+                break;
+            }
+            line = line[kept.len()..].to_owned();
+            lines.push(kept);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// What choosing an entry does: opening its Session through the same route a

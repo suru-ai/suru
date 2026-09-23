@@ -25,6 +25,7 @@ use crate::{
 
 use super::{
     approval_posture_picker::ApprovalPostureChoice,
+    aside::AsidePresentation,
     completion::CompletionRow,
     composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
     icon_picker,
@@ -189,8 +190,13 @@ pub(super) fn render_with_slots(
             area,
             open,
             state.aside_owns_input(),
-            theme,
-            state.spinner_frame,
+            AsidePresentation {
+                theme,
+                spinner_frame: state.spinner_frame,
+                shimmer: &state.shimmer_clock,
+                truecolor,
+                now: state.presentation_now(),
+            },
         );
     }
     let main = columns.main;
@@ -4554,7 +4560,7 @@ fn working_indicator_line(
     )
 }
 
-fn shimmered_label_spans(
+pub(super) fn shimmered_label_spans(
     label: &str,
     animation_frame: usize,
     primary: Style,

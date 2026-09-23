@@ -14,7 +14,7 @@ use ratatui::text::Line;
 use crate::protocol::SessionReference;
 use crate::theme::Theme;
 
-use super::super::commands::SemanticInvocation;
+use super::super::{commands::SemanticInvocation, shimmer};
 use super::SubagentTreeReading;
 
 /// What a Section is told about the open Session. Every field is a reading
@@ -22,14 +22,30 @@ use super::SubagentTreeReading;
 pub(in crate::tui) struct SectionContext<'a> {
     /// The Session the main view has open.
     pub(in crate::tui) open: &'a SessionReference,
-    /// The tree the open Session belongs to, once the per-tree subscription
-    /// has delivered it, and `None` while it has not.
-    pub(in crate::tui) subagent_tree: Option<&'a SubagentTreeReading>,
+    /// What the Aside knows of the tree the open Session belongs to.
+    pub(in crate::tui) subagent_tree: SubagentTreeView<'a>,
     /// The columns a row may take.
     pub(in crate::tui) width: u16,
     pub(in crate::tui) theme: &'a Theme,
     /// The run loop's presentation frame, for a live Marker's Spinner.
     pub(in crate::tui) spinner_frame: usize,
+    /// The shimmer's clock and the colour depth it draws at, for Loading.
+    pub(in crate::tui) shimmer: &'a shimmer::Clock,
+    pub(in crate::tui) truecolor: bool,
+}
+
+/// The tree the open Session belongs to, as far as the Aside knows it.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) enum SubagentTreeView<'a> {
+    /// The per-tree subscription has delivered it.
+    Ready(&'a SubagentTreeReading),
+    /// Not yet in hand: drawn blank, then `loading` once the quiet period
+    /// has passed.
+    Arriving { loading: bool },
+    /// It could not be read, for this reason.
+    Failed(&'a str),
+    /// It was deleted, and there is nothing to say about it.
+    Gone,
 }
 
 /// A Section's header: its name, and how many things it holds where it
