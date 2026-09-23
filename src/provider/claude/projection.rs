@@ -16,6 +16,9 @@
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent under the spawning tool use's identity,
 //! `task_progress` and `task_updated` revise what it is doing, and `task_notification` settles it.
+//! A settled background agent the loop resumes through SendMessage starts its task again under the
+//! SendMessage tool use's identity, and that resume is a Subagent of its own; the resumed agent's
+//! conversation still rides under the original spawn's id, so it is routed to the resume.
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
 //! result is still to come, since the CLI answers every message queued into a running loop with a
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
@@ -60,6 +63,10 @@ const COMMAND_TOOL: &str = "Bash";
 /// `tool_use_id` and what the subagent's every chunk rides under as `parent_tool_use_id`.
 const TASK_TOOL: &str = "Task";
 const AGENT_TOOL: &str = "Agent";
+
+/// The tool that resumes a settled background agent. The CLI restarts the agent's task naming this
+/// tool use as its `tool_use_id`, so the resume opens in the conversation that ran it, like a spawn.
+const SEND_MESSAGE_TOOL: &str = "SendMessage";
 
 /// The task type the CLI reports for a task running an agent — a Subagent. Every other type
 /// (`local_bash` above all) is background work with no conversation of its own, already in the
@@ -291,6 +298,12 @@ struct ClaudeProjection {
     spawn_tools: BTreeMap<String, ConversationKey>,
     /// The agent tasks running as Subagents, by the task id the rest of the lifecycle names.
     subagent_tasks: BTreeMap<String, SubagentTask>,
+    /// Every agent task ever started, by task id, with the `parent_tool_use_id` its conversation
+    /// rides under — the spawning tool use's id, which a resume of the task does not change.
+    task_conversations: BTreeMap<String, String>,
+    /// The resumed conversations, from the `parent_tool_use_id` they still ride under to the
+    /// Subagent the latest resume opened, which is whose work they now are.
+    resumed_conversations: BTreeMap<String, String>,
     /// Latest assistant-snapshot Model evidence by spawning tool-use id. A
     /// snapshot can race the task lifecycle, so evidence waits here until the
     /// Subagent row exists.
@@ -331,6 +344,8 @@ impl ClaudeProjection {
             running_commands: BTreeMap::new(),
             spawn_tools: BTreeMap::new(),
             subagent_tasks: BTreeMap::new(),
+            task_conversations: BTreeMap::new(),
+            resumed_conversations: BTreeMap::new(),
             subagent_models: BTreeMap::new(),
             reporting_lifetime: uuid::Uuid::new_v4().to_string(),
             latest_reported_cost: None,
@@ -394,6 +409,16 @@ impl ClaudeProjection {
         let subagent = message.tool_use_id.unwrap_or_else(|| task_id.clone());
         self.turn
             .subagent_task_started(task_id.clone(), subagent.clone());
+        // A task started before is a settled agent resumed: its conversation goes on under the
+        // original spawn's id, and from here on is the resume's work.
+        let conversation = self
+            .task_conversations
+            .entry(task_id.clone())
+            .or_insert_with(|| subagent.clone());
+        if *conversation != subagent {
+            self.resumed_conversations
+                .insert(conversation.clone(), subagent.clone());
+        }
         let spawner = self
             .spawn_tools
             .remove(&subagent)
@@ -501,7 +526,7 @@ impl ClaudeProjection {
                 "Claude Code CLI sent a malformed stream event: {error}"
             ))
         })?;
-        let owner = message.parent_tool_use_id;
+        let owner = self.conversation_owner(message.parent_tool_use_id);
         let event = message.event;
         // The conversation steps out of the table while its chunk projects, so the projection's
         // shared state — the commands and spawns other conversations feed too — stays reachable.
@@ -613,7 +638,7 @@ impl ClaudeProjection {
         let Ok(message) = serde_json::from_value::<AssistantMessageSnapshot>(message) else {
             return Vec::new();
         };
-        let owner: ConversationKey = message.parent_tool_use_id;
+        let owner = self.conversation_owner(message.parent_tool_use_id);
         let observed_model = owner.as_ref().and_then(|subagent| {
             message
                 .message
@@ -689,9 +714,20 @@ impl ClaudeProjection {
         attributed_events
     }
 
+    /// The conversation a message's `parent_tool_use_id` names: the Subagent it rides under, or
+    /// the latest resume of that Subagent's agent.
+    fn conversation_owner(&self, parent_tool_use_id: Option<String>) -> ConversationKey {
+        parent_tool_use_id.map(|owner| {
+            self.resumed_conversations
+                .get(&owner)
+                .cloned()
+                .unwrap_or(owner)
+        })
+    }
+
     /// Starts tracking a `tool_use` block whose input is about to stream. A Task tool use is
-    /// remembered as a spawn, so the task the CLI starts for it opens its Subagent in the
-    /// conversation that ran the tool.
+    /// remembered as a spawn, and a SendMessage tool use as a possible resume, so the task the CLI
+    /// starts for either opens its Subagent in the conversation that ran the tool.
     fn open_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -703,7 +739,7 @@ impl ClaudeProjection {
             return;
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
-        if name == TASK_TOOL || name == AGENT_TOOL {
+        if name == TASK_TOOL || name == AGENT_TOOL || name == SEND_MESSAGE_TOOL {
             self.spawn_tools.insert(id.clone(), owner.clone());
         }
         conversation.open_tools.insert(

@@ -295,7 +295,9 @@ pub(super) struct SystemMessage {
     #[serde(default)]
     pub(super) task_id: Option<String>,
     /// The tool use that spawned the task, on `task_started`. It is the identity every chunk the
-    /// subagent streams carries as `parent_tool_use_id`, which is what makes it the Subagent's.
+    /// subagent streams carries as `parent_tool_use_id`, which is what makes it the Subagent's. A
+    /// resumed agent's task starts again naming the SendMessage tool use instead, while its chunks
+    /// keep riding under the original spawn's id.
     #[serde(default)]
     pub(super) tool_use_id: Option<String>,
     /// What the task was asked to do, on `task_started` and repeated on `task_progress`.

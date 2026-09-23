@@ -734,3 +734,92 @@ async fn stopping_one_subagent_by_its_session_leaves_the_other_working() {
         .await
         .expect("shut the server down");
 }
+
+/// A background agent resumed through SendMessage, as the live 2.1.280 CLI reports it: the resume
+/// restarts the same task under the SendMessage tool use's identity, yet the resumed agent's
+/// conversation still rides under the original Agent tool use as `parent_tool_use_id`, and the
+/// settle names the SendMessage tool use again. Each resume stands as its own Subagent until
+/// #378 reopens the resumed agent's own Session instead.
+const RESUMED_SUBAGENT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent_1","content":"Async agent launched successfully.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"HELLO"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","status":"completed","summary":"Agent \"Say hello\" completed","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"send_1","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"send_1","content":"{\"success\":true,\"message\":\"Resuming agent a2046db\"}","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"GOODBYE"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_progress","task_id":"a2046dbbe8ecd4a5c","description":"Saying goodbye","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","status":"completed","summary":"Agent \"Say hello\" completed","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"DONE"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"DONE","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn a_subagent_resumed_through_send_message_lands_its_new_work_in_the_resumes_own_child() {
+    let claude = conversation_fixture(RESUMED_SUBAGENT_TURN);
+    let opened = opened_session(&claude, "claude-subagent-resumed", "Hello then goodbye").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+
+    let [
+        Activity::Subagent {
+            session_id: spawn_child,
+            ..
+        },
+        Activity::Subagent {
+            status,
+            description,
+            model,
+            session_id: resume_child,
+            ..
+        },
+    ] = subagent_rows(&settled)[..]
+    else {
+        panic!(
+            "the spawn and the resume each stand as a row, got {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(description, "Saying goodbye");
+    assert_eq!(
+        model.as_ref().map(|model| model.as_str()),
+        Some("claude-haiku-child"),
+        "the resumed conversation's snapshots are the resume's Model evidence"
+    );
+
+    let spawned = settled_session(client, *spawn_child, 0).await;
+    let [hello] = agent_messages(&spawned)[..] else {
+        panic!(
+            "the spawn's child holds only the spawn's work, got {:?}",
+            spawned.messages
+        );
+    };
+    assert_eq!(hello.content, "HELLO");
+
+    let resumed = settled_session(client, *resume_child, 0).await;
+    assert_eq!(resumed.turns[0].status, TurnStatus::Completed);
+    let [goodbye] = agent_messages(&resumed)[..] else {
+        panic!(
+            "the resumed work lands in the resume's own child, got {:?}",
+            resumed.messages
+        );
+    };
+    assert_eq!(goodbye.content, "GOODBYE");
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
