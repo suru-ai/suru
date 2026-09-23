@@ -8,8 +8,9 @@ use crate::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     server_support::PROGRESS_DEADLINE,
     support::{
-        WorkingTurn, create_session, hosted_model, hosted_selection, read_session_until,
-        receive_managed_client_initial_state, working_turn, working_turn_with_timings,
+        WorkingTurn, create_session, hosted_model, hosted_selection, read_session,
+        read_session_until, receive_managed_client_initial_state, working_turn,
+        working_turn_with_timings,
     },
 };
 use eventsource_stream::Eventsource;
@@ -18,9 +19,11 @@ use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SubagentTreeEvent},
     protocol::{
-        ActivityStatus, CreateSessionRequest, InitialPrompt, Outlook, PromptId, RuntimeDescriptor,
-        SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode,
-        SessionId, SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
+        ActivityStatus, AdmitPromptRequest, Approval, ApprovalId, ApprovalSubject,
+        CreateSessionRequest, Decision, InitialPrompt, Outlook, PromptDelivery, PromptId, Question,
+        Questionnaire, QuestionnaireId, RuntimeDescriptor, SUBAGENT_TREE_SNAPSHOT_EVENT,
+        SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode, SessionId, SubagentTreeChange,
+        SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
     },
     provider::{
         ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderSubagentStatus,
@@ -811,4 +814,337 @@ async fn a_restart_restores_the_tree_and_its_entries() {
         .shutdown()
         .await
         .expect("shut down restarted server");
+}
+
+/// Every change up to and including the first that `wanted` picks out, each
+/// checked to follow the one before it without a gap.
+async fn changes_until(
+    updates: &mut TreeUpdates,
+    revision: &mut suru::protocol::SubagentTreeRevision,
+    wanted: impl Fn(&SubagentTreeChange) -> bool,
+) -> Vec<SubagentTreeChange> {
+    let mut changes = Vec::new();
+    loop {
+        let change = next_change(updates, revision).await;
+        let found = wanted(&change);
+        changes.push(change);
+        if found {
+            return changes;
+        }
+    }
+}
+
+fn is_top_level_working_change(change: &SubagentTreeChange) -> bool {
+    matches!(change, SubagentTreeChange::TopLevelWorkingChanged { .. })
+}
+
+#[tokio::test]
+async fn entries_say_when_their_work_began_and_the_top_level_since_when_it_works() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-timing-test").await;
+    spawn_a_family(&fixture).await;
+    let descriptor = fixture.server.descriptor();
+
+    let (tree, _updates) = open_tree(descriptor, fixture.session_id).await;
+
+    let working_since = tree
+        .top_level
+        .working_since
+        .expect("a top-level Session in the middle of its Turn is Working");
+    assert_eq!(
+        Some(working_since),
+        read_session(descriptor, fixture.session_id)
+            .await
+            .working_since(),
+        "the top-level entry's Working reads what its Sidebar row reads"
+    );
+    for entry in &tree.subagents {
+        let started_at = entry
+            .started_at
+            .unwrap_or_else(|| panic!("{} says when its work began", entry.name));
+        assert_eq!(
+            Some(started_at),
+            read_session(descriptor, entry.session_id).await.turns[0].started_at,
+            "{} began its work when its own Session's Turn began, at its spawn",
+            entry.name
+        );
+        assert!(started_at >= working_since);
+        assert!(!entry.needs_intervention);
+    }
+    let started = |name| named(&tree.subagents, name).started_at;
+    assert!(
+        started("Explore") <= started("Review") && started("Review") <= started("Probe"),
+        "a Subagent begins no earlier than the Subagent that spawned it"
+    );
+    assert!(!tree.top_level.needs_intervention);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "subagent-tree-working-test").await;
+    spawn(
+        &fixture.provider_session,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    let descriptor = fixture.server.descriptor().clone();
+    let (tree, mut updates) = open_tree(&descriptor, fixture.session_id).await;
+    let mut revision = tree.revision;
+    assert!(tree.top_level.working_since.is_some());
+
+    settle(
+        &fixture.provider_session,
+        None,
+        "task-1",
+        ProviderSubagentStatus::Completed,
+    )
+    .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let stopped = changes_until(&mut updates, &mut revision, is_top_level_working_change).await;
+    assert_eq!(
+        stopped.last(),
+        Some(&SubagentTreeChange::TopLevelWorkingChanged {
+            working_since: None
+        }),
+        "the tree says when its top-level Session stops Working"
+    );
+    assert!(
+        !stopped[..stopped.len() - 1]
+            .iter()
+            .any(is_top_level_working_change),
+        "and only when it stops: {stopped:?}"
+    );
+
+    fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            descriptor.base_url, fixture.session_id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Map the rest".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+            delivery: PromptDelivery::Queue,
+        })
+        .send()
+        .await
+        .expect("admit another Prompt")
+        .error_for_status()
+        .expect("the idle Session admits it");
+    let resumed = changes_until(&mut updates, &mut revision, is_top_level_working_change).await;
+    let Some(SubagentTreeChange::TopLevelWorkingChanged {
+        working_since: Some(resumed_since),
+    }) = resumed.last()
+    else {
+        panic!("a Prompt admitted sets the top-level Session Working again: {resumed:?}");
+    };
+    assert_eq!(
+        Some(*resumed_since),
+        read_session(&descriptor, fixture.session_id)
+            .await
+            .working_since()
+    );
+    timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the next Turn reaches the Provider")
+        .succeed();
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+fn approval() -> Approval {
+    Approval {
+        id: ApprovalId::new(),
+        subject: ApprovalSubject::Command {
+            command: "cargo nextest run".into(),
+            cwd: None,
+            actions: Vec::new(),
+        },
+        reason: Some("Run the project tests".into()),
+    }
+}
+
+fn questionnaire() -> Questionnaire {
+    Questionnaire {
+        id: QuestionnaireId::new(),
+        questions: vec![Question {
+            id: "scope".into(),
+            title: None,
+            text: "Which scope?".into(),
+            choices: Vec::new(),
+            multiple: false,
+            freeform: true,
+            combine_freeform: false,
+            secret: false,
+            required: true,
+        }],
+    }
+}
+
+/// Each entry's own-Intervention flag, top-level first, as (name, flag).
+fn interventions(snapshot: &SubagentTreeSnapshot) -> Vec<(String, bool)> {
+    std::iter::once((
+        "top-level".to_owned(),
+        snapshot.top_level.needs_intervention,
+    ))
+    .chain(
+        snapshot
+            .subagents
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.needs_intervention)),
+    )
+    .collect()
+}
+
+fn flags(expected: &[(&str, bool)]) -> Vec<(String, bool)> {
+    expected
+        .iter()
+        .map(|(name, flag)| ((*name).to_owned(), *flag))
+        .collect()
+}
+
+async fn next_managed_change(
+    subscription: &mut suru::managed_client::SubagentTreeSubscription,
+) -> SubagentTreeChange {
+    loop {
+        match next_tree_event(subscription).await {
+            SubagentTreeEvent::Changed(change) => return change,
+            SubagentTreeEvent::Snapshot(_) => {}
+            other => panic!("the subscription stays live: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_intervention_flags_only_the_session_that_owns_it_until_it_is_answered() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-tree-intervention-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let provider = &fixture.provider_session;
+    spawn(provider, None, "task-1", "Explore", "Map the seams").await;
+    spawn(
+        provider,
+        Some("task-1"),
+        "task-2",
+        "Review",
+        "Check the seams",
+    )
+    .await;
+    let descriptor = fixture.server.descriptor();
+    let (tree, mut updates) = open_tree(descriptor, fixture.session_id).await;
+    let mut revision = tree.revision;
+    let review = named(&tree.subagents, "Review").session_id;
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel)
+            .expect("configure managed client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+    let mut subscription = client.subscribe_subagent_tree(fixture.session_id);
+    let SubagentTreeEvent::Snapshot(managed) = next_tree_event(&mut subscription).await else {
+        panic!("the subscription opens with the tree");
+    };
+    assert_eq!(
+        managed.top_level.working_since, tree.top_level.working_since,
+        "the managed client carries the top-level Working reading"
+    );
+    assert_eq!(
+        managed.subagents, tree.subagents,
+        "and each entry's start and Intervention flag"
+    );
+
+    let request = approval();
+    provider
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("task-2")),
+            ProviderEvent::ApprovalRequested {
+                approval: request.clone(),
+                tool_activity_id: None,
+            },
+        )
+        .await;
+    let raised = SubagentTreeChange::NeedsInterventionChanged {
+        session_id: review,
+        needs_intervention: true,
+    };
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        raised,
+        "an Approval raised in the nested Subagent's Session flags that Session's entry"
+    );
+    assert_eq!(next_managed_change(&mut subscription).await, raised);
+    let (flagged, _flagged_updates) = open_tree(descriptor, review).await;
+    assert_eq!(
+        interventions(&flagged),
+        flags(&[("top-level", false), ("Explore", false), ("Review", true)]),
+        "and neither its spawner nor the top-level Session repeats it"
+    );
+
+    client
+        .submit_decision(review, request.id, Decision::Accept)
+        .await
+        .expect("answer the Approval");
+    let answered = SubagentTreeChange::NeedsInterventionChanged {
+        session_id: review,
+        needs_intervention: false,
+    };
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        answered,
+        "the flag clears once the Approval is answered"
+    );
+    assert_eq!(next_managed_change(&mut subscription).await, answered);
+
+    let question = questionnaire();
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+            questionnaire: question.clone(),
+        })
+        .await;
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::NeedsInterventionChanged {
+            session_id: fixture.session_id,
+            needs_intervention: true,
+        },
+        "a Questionnaire in the top-level Session's own Transcript flags the top-level entry"
+    );
+    let (asked, _asked_updates) = open_tree(descriptor, review).await;
+    assert_eq!(
+        interventions(&asked),
+        flags(&[("top-level", true), ("Explore", false), ("Review", false)]),
+        "and only that entry"
+    );
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireWithdrawn { id: question.id })
+        .await;
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::NeedsInterventionChanged {
+            session_id: fixture.session_id,
+            needs_intervention: false,
+        }
+    );
+
+    drop(subscription);
+    drop(client);
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
 }

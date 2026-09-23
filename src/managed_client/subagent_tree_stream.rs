@@ -267,6 +267,8 @@ mod tests {
             top_level: SubagentTreeTopLevel {
                 session_id: SessionId::new(),
                 title: "Delegate".to_owned(),
+                working_since: Some(crate::protocol::SessionTimestamp(500)),
+                needs_intervention: false,
             },
             subagents: Vec::new(),
         }
@@ -508,6 +510,8 @@ mod tests {
             title: "Map the seams".to_owned(),
             status: ActivityStatus::Active,
             duration_ms: None,
+            started_at: Some(crate::protocol::SessionTimestamp(1_000)),
+            needs_intervention: false,
         });
         (tree, subagent)
     }

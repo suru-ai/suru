@@ -85,6 +85,7 @@ impl SessionStoreState {
         if self.is_deferred(session_id) {
             return Err(anyhow!("Session history must be hydrated before mutation"));
         }
+        let tree_working = self.subscribed_tree_working(session_id);
         let updated_at = self.next_timestamp();
         if let Some(prompt_id) = turn_start
             && let Some(record) = self.sessions.get_mut(&session_id)
@@ -125,6 +126,11 @@ impl SessionStoreState {
         let previous_standing = record.summary.standing_inputs.clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
         let standing_inputs = record.summary.standing_inputs.clone();
+        // Whether this Session's own Interventions came or went, which its
+        // entry in a subscribed tree says.
+        let own_interventions_moved = previous_standing.pending_questionnaires
+            != standing_inputs.pending_questionnaires
+            || previous_standing.pending_approvals != standing_inputs.pending_approvals;
         if (turn_settled
             || previous_standing.pending_questionnaires != standing_inputs.pending_questionnaires
             || previous_standing.submitting_questionnaires
@@ -148,10 +154,12 @@ impl SessionStoreState {
         self.reconcile_working(storage, session_id);
         self.reconcile_usage(storage, session_id);
         self.reconcile_interventions(storage, session_id);
-        if update
-            .changes
-            .iter()
-            .any(super::subagent_tree::moves_subagent_tree)
+        if own_interventions_moved
+            || self.moved_tree_working(tree_working)
+            || update
+                .changes
+                .iter()
+                .any(super::subagent_tree::moves_subagent_tree)
         {
             self.announce_subagent_tree(session_id);
         }

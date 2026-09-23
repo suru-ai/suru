@@ -14,11 +14,11 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, SessionChange, SessionId, SubagentTreeChange, SubagentTreeEntry,
+    Activity, SessionChange, SessionId, SessionTimestamp, SubagentTreeChange, SubagentTreeEntry,
     SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel, SubagentTreeUpdate,
 };
 
-use super::{SESSION_UPDATE_CAPACITY, SessionStore, SessionStoreState};
+use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState};
 
 /// A subscription's opening snapshot, with a receiver opened at its revision.
 pub(crate) struct SubagentTreeFeed {
@@ -138,6 +138,45 @@ impl SessionStoreState {
         }
     }
 
+    /// Where the tree `session_id` belongs to stands on Working, taken before a
+    /// commit so the commit can tell whether it moved it — a commit anywhere
+    /// in the tree can, through the Working reading rolled up above it. `None`
+    /// when nobody subscribes to that tree, which is what keeps this free for
+    /// every commit to a tree nobody is watching.
+    pub(super) fn subscribed_tree_working(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(SessionId, Option<SessionTimestamp>)> {
+        if self.subagent_trees.trees.is_empty() {
+            return None;
+        }
+        let top_level = self.top_level_of(session_id)?;
+        if !self.subagent_trees.trees.contains_key(&top_level) {
+            return None;
+        }
+        let working_since = self
+            .sessions
+            .get(&top_level)?
+            .snapshot
+            .session
+            .working_since;
+        Some((top_level, working_since))
+    }
+
+    /// Whether the top-level Session's Working reading has moved from what
+    /// [`Self::subscribed_tree_working`] took before a commit.
+    pub(super) fn moved_tree_working(
+        &self,
+        before: Option<(SessionId, Option<SessionTimestamp>)>,
+    ) -> bool {
+        before.is_some_and(|(top_level, working_since)| {
+            self.sessions
+                .get(&top_level)
+                .map(|record| record.snapshot.session.working_since)
+                != Some(working_since)
+        })
+    }
+
     /// The top-level Session heading the tree `session_id` belongs to, or
     /// `None` when the Session is not held or its line up to a top-level
     /// Session is broken.
@@ -177,6 +216,8 @@ impl SessionStoreState {
             top_level: SubagentTreeTopLevel {
                 session_id: top_level,
                 title: record.snapshot.title.clone(),
+                working_since: record.snapshot.session.working_since,
+                needs_intervention: needs_intervention(record),
             },
             subagents,
         })
@@ -206,6 +247,9 @@ impl SessionStoreState {
             .zip(0..)
             .map(
                 |((session_id, name, description, status, duration_ms), spawn_order)| {
+                    // The Subagent's own Session came into being at its spawn,
+                    // so its creation is when its work began.
+                    let own = self.sessions.get(&session_id);
                     SubagentTreeEntry {
                         session_id,
                         parent_session_id: spawner,
@@ -214,6 +258,8 @@ impl SessionStoreState {
                         title: description.clone(),
                         status,
                         duration_ms,
+                        started_at: own.map(|record| record.summary.created_at),
+                        needs_intervention: own.is_some_and(needs_intervention),
                     }
                 },
             )
@@ -221,10 +267,24 @@ impl SessionStoreState {
     }
 }
 
+/// Whether a Session's own Transcript holds a live Approval or Questionnaire —
+/// the same pending readings the Sidebar's Standing counts, but this Session's
+/// alone, without its Subagents'.
+fn needs_intervention(record: &SessionRecord) -> bool {
+    let inputs = &record.summary.standing_inputs;
+    !inputs.pending_approvals.is_empty() || !inputs.pending_questionnaires.is_empty()
+}
+
 impl SubagentTreePublisher {
     /// Announces the difference between what a tree's subscribers last heard
     /// and `tree`, one change per revision. A tree whose subscribers have all
     /// gone is forgotten instead.
+    ///
+    /// A difference the changes cannot say — an entry leaving the tree or
+    /// moving within it, which nothing the Server does today brings about —
+    /// ends every subscription instead, without a deletion, so each
+    /// subscriber reconnects to a snapshot that says it whole rather than
+    /// holding a tree that has quietly drifted.
     fn announce(&mut self, top_level: SessionId, tree: SubagentTree) {
         let Some(channel) = self.trees.get_mut(&top_level) else {
             return;
@@ -236,7 +296,11 @@ impl SubagentTreePublisher {
         if channel.announced == tree {
             return;
         }
-        for change in tree_changes(&channel.announced, &tree) {
+        let Some(changes) = tree_changes(&channel.announced, &tree) else {
+            self.trees.remove(&top_level);
+            return;
+        };
+        for change in changes {
             channel.announce_change(change);
         }
         channel.announced = tree;
@@ -244,12 +308,28 @@ impl SubagentTreePublisher {
 }
 
 /// What moved between two readings of one tree, in the order a reader applying
-/// them needs: a spawner always joins before what it spawns.
-fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Vec<SubagentTreeChange> {
+/// them needs: a spawner always joins before what it spawns. `None` when the
+/// difference is one no change can say: an entry gone, or moved from where it
+/// stood, or begun at another moment.
+fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<SubagentTreeChange>> {
     let mut changes = Vec::new();
+    if before.top_level.session_id != after.top_level.session_id {
+        return None;
+    }
     if before.top_level.title != after.top_level.title {
         changes.push(SubagentTreeChange::TopLevelRetitled {
             title: after.top_level.title.clone(),
+        });
+    }
+    if before.top_level.working_since != after.top_level.working_since {
+        changes.push(SubagentTreeChange::TopLevelWorkingChanged {
+            working_since: after.top_level.working_since,
+        });
+    }
+    if before.top_level.needs_intervention != after.top_level.needs_intervention {
+        changes.push(SubagentTreeChange::NeedsInterventionChanged {
+            session_id: after.top_level.session_id,
+            needs_intervention: after.top_level.needs_intervention,
         });
     }
     let known = before
@@ -257,6 +337,14 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Vec<SubagentTree
         .iter()
         .map(|entry| (entry.session_id, entry))
         .collect::<HashMap<_, _>>();
+    let kept = after
+        .subagents
+        .iter()
+        .filter(|entry| known.contains_key(&entry.session_id))
+        .count();
+    if kept != before.subagents.len() {
+        return None;
+    }
     for entry in &after.subagents {
         let Some(previous) = known.get(&entry.session_id) else {
             changes.push(SubagentTreeChange::SubagentSpawned {
@@ -264,6 +352,12 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Vec<SubagentTree
             });
             continue;
         };
+        if previous.parent_session_id != entry.parent_session_id
+            || previous.spawn_order != entry.spawn_order
+            || previous.started_at != entry.started_at
+        {
+            return None;
+        }
         if previous.name != entry.name || previous.title != entry.title {
             changes.push(SubagentTreeChange::SubagentRetitled {
                 session_id: entry.session_id,
@@ -278,12 +372,21 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Vec<SubagentTree
                 duration_ms: entry.duration_ms,
             });
         }
+        if previous.needs_intervention != entry.needs_intervention {
+            changes.push(SubagentTreeChange::NeedsInterventionChanged {
+                session_id: entry.session_id,
+                needs_intervention: entry.needs_intervention,
+            });
+        }
     }
-    changes
+    Some(changes)
 }
 
-/// Whether a committed change could move what a tree says, so a commit that
-/// carries none leaves every subscribed tree unread.
+/// Whether a committed change could move a tree's rows or its top-level Title.
+/// The tree's Working and Intervention readings are compared by the commit
+/// itself, because what moves them is derived rather than carried by any one
+/// change. A commit that moves none of them leaves every subscribed tree
+/// unread.
 pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
     matches!(
         change,
@@ -309,6 +412,17 @@ mod tests {
             title: "Map the seams".to_owned(),
             status: ActivityStatus::Active,
             duration_ms: None,
+            started_at: Some(SessionTimestamp(1_000)),
+            needs_intervention: false,
+        }
+    }
+
+    fn top_level(session_id: SessionId, title: &str) -> SubagentTreeTopLevel {
+        SubagentTreeTopLevel {
+            session_id,
+            title: title.to_owned(),
+            working_since: Some(SessionTimestamp(500)),
+            needs_intervention: false,
         }
     }
 
@@ -318,29 +432,34 @@ mod tests {
         let child = SessionId::new();
         let grandchild = SessionId::new();
         let before = SubagentTree {
-            top_level: SubagentTreeTopLevel {
-                session_id: top,
-                title: "Delegate".to_owned(),
-            },
+            top_level: top_level(top, "Delegate"),
             subagents: vec![entry(child, top, 0)],
         };
         let mut settled = entry(child, top, 0);
         settled.status = ActivityStatus::Completed;
         settled.duration_ms = Some(12);
         settled.title = "Mapped the seams".to_owned();
+        settled.needs_intervention = true;
+        let mut after_top_level = top_level(top, "Delegate the mapping");
+        after_top_level.working_since = None;
+        after_top_level.needs_intervention = true;
         let after = SubagentTree {
-            top_level: SubagentTreeTopLevel {
-                session_id: top,
-                title: "Delegate the mapping".to_owned(),
-            },
+            top_level: after_top_level,
             subagents: vec![settled, entry(grandchild, child, 0)],
         };
 
         assert_eq!(
             tree_changes(&before, &after),
-            vec![
+            Some(vec![
                 SubagentTreeChange::TopLevelRetitled {
                     title: "Delegate the mapping".to_owned(),
+                },
+                SubagentTreeChange::TopLevelWorkingChanged {
+                    working_since: None,
+                },
+                SubagentTreeChange::NeedsInterventionChanged {
+                    session_id: top,
+                    needs_intervention: true,
                 },
                 SubagentTreeChange::SubagentRetitled {
                     session_id: child,
@@ -352,11 +471,43 @@ mod tests {
                     status: ActivityStatus::Completed,
                     duration_ms: Some(12),
                 },
+                SubagentTreeChange::NeedsInterventionChanged {
+                    session_id: child,
+                    needs_intervention: true,
+                },
                 SubagentTreeChange::SubagentSpawned {
                     entry: entry(grandchild, child, 0),
                 },
-            ]
+            ])
         );
-        assert!(tree_changes(&after, &after).is_empty());
+        assert_eq!(tree_changes(&after, &after), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_difference_no_change_can_say_is_left_to_a_fresh_snapshot() {
+        let top = SessionId::new();
+        let child = SessionId::new();
+        let before = SubagentTree {
+            top_level: top_level(top, "Delegate"),
+            subagents: vec![entry(child, top, 0)],
+        };
+
+        let vanished = SubagentTree {
+            subagents: Vec::new(),
+            ..before.clone()
+        };
+        assert_eq!(tree_changes(&before, &vanished), None, "an entry gone");
+
+        let mut moved = before.clone();
+        moved.subagents[0].spawn_order = 1;
+        assert_eq!(tree_changes(&before, &moved), None, "an entry moved");
+
+        let mut restarted = before.clone();
+        restarted.subagents[0].started_at = Some(SessionTimestamp(2_000));
+        assert_eq!(
+            tree_changes(&before, &restarted),
+            None,
+            "an entry begun at another moment"
+        );
     }
 }

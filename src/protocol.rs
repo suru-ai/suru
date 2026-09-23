@@ -2395,6 +2395,16 @@ pub struct SubagentTreeSnapshot {
 pub struct SubagentTreeTopLevel {
     pub session_id: SessionId,
     pub title: String,
+    /// When the top-level Session's uninterrupted Working interval began —
+    /// the reading its Sidebar row's Working duration rises from, work
+    /// continued by surviving Subagents included — and `None` while nothing
+    /// in the tree is Working.
+    #[serde(default)]
+    pub working_since: Option<SessionTimestamp>,
+    /// Whether the top-level Session's own Transcript holds a live Approval
+    /// or Questionnaire. Its Subagents' Interventions are theirs to say.
+    #[serde(default)]
+    pub needs_intervention: bool,
 }
 
 /// One Subagent's Session in a tree, read off the Subagent row in its
@@ -2418,6 +2428,18 @@ pub struct SubagentTreeEntry {
     /// How long the Subagent worked, once it has settled and where Suru
     /// learned when its work ended.
     pub duration_ms: Option<u64>,
+    /// When the Subagent's work began: the moment it spawned, which is also
+    /// the moment [`Self::duration_ms`] is timed from. A client ticks a
+    /// working entry's elapsed time from here, as it ticks a Sidebar row's
+    /// Working duration from its `working_since`. `None` only where the
+    /// Subagent's own Session could not be read.
+    #[serde(default)]
+    pub started_at: Option<SessionTimestamp>,
+    /// Whether this Subagent's own Session holds a live Approval or
+    /// Questionnaire. It is never rolled up: a Subagent whose descendant waits
+    /// on an Intervention does not say so itself.
+    #[serde(default)]
+    pub needs_intervention: bool,
 }
 
 /// One change to a tree after its snapshot. An entry never moves: a spawn
@@ -2443,6 +2465,17 @@ pub enum SubagentTreeChange {
     },
     /// The top-level Session's Title changed.
     TopLevelRetitled { title: String },
+    /// The top-level Session began Working, or stopped: its new
+    /// `working_since`, carried whole.
+    TopLevelWorkingChanged {
+        working_since: Option<SessionTimestamp>,
+    },
+    /// Whether one Session of the tree — the top-level Session or any
+    /// Subagent's — holds a live Intervention of its own changed.
+    NeedsInterventionChanged {
+        session_id: SessionId,
+        needs_intervention: bool,
+    },
     /// The top-level Session was deleted, and every Session in its tree with
     /// it. It is the stream's last word: nothing follows it, and asking for
     /// the tree again finds no Session to answer for.
