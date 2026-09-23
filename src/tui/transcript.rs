@@ -4049,16 +4049,7 @@ fn push_subagent_activity(
     duration_ms: Option<u64>,
     theme: &Theme,
 ) -> UnitAnchor {
-    use crate::protocol::ActivityStatus;
-
-    let (marker, style) = match status {
-        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
-        ActivityStatus::Completed => ("✓ ", theme.text.subdued),
-        ActivityStatus::Failed => ("× ", theme.feedback.error),
-        // Stopped on request: the same face an interrupted Turn wears, so a
-        // stop reads as a stop rather than as the Subagent going wrong.
-        ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
-    };
+    let (marker, style) = subagent_marker(status, theme);
     let mut header = format!("Subagent: {name}");
     if !description.trim().is_empty() {
         header.push_str(": ");
@@ -4073,6 +4064,27 @@ fn push_subagent_activity(
     // The row hides nothing — it is the way into the child Session, so the
     // anchor exists to make its whole extent a press target.
     UnitAnchor::binary(lines.len() - start, false)
+}
+
+/// The Marker a Subagent wears wherever it is listed — its Transcript row and
+/// its Aside entry alike — with the style its row is drawn in: the Spinner
+/// while it works, and its outcome glyph once it settles. A working Marker is
+/// [`spinner::MARKER`], the Spinner's first frame; each draw patches the
+/// current frame into it with [`spinner::overlay_frame`].
+pub(super) fn subagent_marker(
+    status: crate::protocol::ActivityStatus,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    use crate::protocol::ActivityStatus;
+
+    match status {
+        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", theme.text.subdued),
+        ActivityStatus::Failed => ("× ", theme.feedback.error),
+        // Stopped on request: the same face an interrupted Turn wears, so a
+        // stop reads as a stop rather than as the Subagent going wrong.
+        ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
+    }
 }
 
 /// Places already-styled Reasoning content in the Activity gutter.

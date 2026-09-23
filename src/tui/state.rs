@@ -52,9 +52,9 @@ use super::{
         command_for_serve_overlay_event, command_for_session_picker_event,
         command_for_settings_panel_event, command_for_sidebar_event,
         command_for_sidebar_menu_event, command_for_subagent_picker_event,
-        command_for_subagent_view_event, command_for_terminal_event,
-        command_for_theme_picker_event, command_for_workspace_picker_event,
-        command_for_workspace_picker_menu_event,
+        command_for_subagent_view_event, command_for_subagent_view_leader_event,
+        command_for_terminal_event, command_for_theme_picker_event,
+        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -8029,7 +8029,8 @@ impl Application {
             SemanticCommandId::AsideToggle => {
                 // One of the two columns holds the keys at most, so an Aside
                 // taking them takes them from the Sidebar.
-                if self.state.aside.toggle() && self.state.sidebar.column().claims_keys() {
+                let present = self.state.aside_is_present();
+                if self.state.aside.toggle(present) && self.state.sidebar.column().claims_keys() {
                     self.state.sidebar.hand_back_keys();
                 }
                 self.state.command_mode = CommandMode::Composer;
@@ -8833,10 +8834,10 @@ impl Application {
         // interrupt, the reading keys stay, and the composer's keys — text,
         // history, submission — reach nothing.
         if self.state.open_subagent_parent().is_some() {
-            // The Leader stays reachable, so the Aside — the way around a
-            // Subagent's tree — can be reached from inside it.
+            // The Leader reaches the Aside — the way around a Subagent's
+            // tree — from inside it, and nothing else.
             if matches!(self.state.command_mode, CommandMode::Leader) {
-                return command_for_leader_event(event);
+                return command_for_subagent_view_leader_event(event);
             }
             return command_for_subagent_view_event(event);
         }

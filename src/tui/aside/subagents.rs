@@ -11,7 +11,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::protocol::{ActivityStatus, SessionReference};
 
 use super::super::{
-    commands::SemanticCommandId, slots::truncate_to_width, spinner, transcript::humanized_duration,
+    commands::SemanticCommandId,
+    slots::truncate_to_width,
+    spinner,
+    transcript::{humanized_duration, subagent_marker},
 };
 use super::{
     SubagentTreeReading,
@@ -69,23 +72,14 @@ impl Section for SubagentsSection {
             if open {
                 current = Some(rows.len());
             }
-            let marker = match subagent.status {
-                ActivityStatus::Active => {
-                    animates = true;
-                    (
-                        format!("{} ", spinner::frame(context.spinner_frame / 3)),
-                        theme.accent.primary,
-                    )
-                }
-                ActivityStatus::Completed => ("✓ ".to_owned(), theme.text.subdued),
-                ActivityStatus::Failed => ("× ".to_owned(), theme.feedback.error),
-                ActivityStatus::Interrupted => ("× ".to_owned(), theme.feedback.warning),
-            };
+            let (marker, marker_style) = subagent_marker(subagent.status, theme);
+            let working = subagent.status == ActivityStatus::Active;
+            animates |= working;
             rows.push(SectionRow {
                 line: entry_line(
                     EntryParts {
                         guides: entry.guides(),
-                        marker: Some(marker),
+                        marker: Some((marker.to_owned(), marker_style)),
                         name: Some(&subagent.name),
                         title: &subagent.title,
                         duration: subagent.duration_ms.map(humanized_duration),
@@ -96,6 +90,14 @@ impl Section for SubagentsSection {
                 ),
                 invocation: open_invocation(tree, subagent.session_id, context.open),
             });
+            if working && let Some(row) = rows.last_mut() {
+                // The Spinner turns at the pace the Transcript row's does.
+                spinner::overlay_frame(
+                    std::slice::from_mut(&mut row.line),
+                    &[0],
+                    context.spinner_frame / 3,
+                );
+            }
         }
         Ok(SectionView {
             header: SectionHeader {

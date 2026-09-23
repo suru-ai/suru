@@ -106,6 +106,18 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
     }
 }
 
+/// The Leader inside a Subagent's Session. That view is read, never prompted,
+/// so the one Leader command it answers is the Aside's show/hide act — the way
+/// around the tree the reader is in. Every other Leader command, choosing a
+/// Model or beginning a Session among them, stays out of reach and the
+/// chord simply ends.
+pub(super) fn command_for_subagent_view_leader_event(event: InputEvent) -> Option<CommandId> {
+    match command_for_leader_event(event) {
+        command @ Some(CommandId::InvokeSemantic(SemanticCommandId::AsideToggle)) => command,
+        _ => Some(CommandId::CloseCommandMode),
+    }
+}
+
 /// The Icon Picker is the newest thing on screen while it is up, so it has
 /// the keys: the arrows walk its grid in two dimensions, Enter chooses the
 /// focused glyph, and Esc puts the picker away leaving its target's Icon

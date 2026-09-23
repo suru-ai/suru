@@ -5653,13 +5653,11 @@ mod tests {
             )))
             .expect("receive Session content width");
         // The Aside the Settings showed stays out of the measured width.
-        for _ in 0..2 {
-            application
-                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                    SemanticCommandId::AsideToggle,
-                )))
-                .expect("put the Aside away");
-        }
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::AsideToggle,
+            )))
+            .expect("put the Aside away");
         application
             .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
                 SessionSnapshot {

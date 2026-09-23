@@ -756,3 +756,91 @@ fn the_subagent_picker_and_esc_to_parent_are_unchanged_beside_the_aside() {
         "Esc in a Subagent's Session still returns to its parent"
     );
 }
+
+#[test]
+fn on_the_landing_the_toggle_only_shows_and_hides() {
+    let workspace = workspace_dir();
+    let mut application = client(workspace.path());
+
+    press_leader_chord(&mut application, 'a');
+    enter_session(&mut application, workspace.path());
+    assert!(
+        !aside_text(&application).contains("Subagents"),
+        "on the Landing the act hid the Aside the Settings showed"
+    );
+
+    let mut application = client(workspace.path());
+    press_leader_chord(&mut application, 'a');
+    press_leader_chord(&mut application, 'a');
+    enter_session(&mut application, workspace.path());
+    let rows = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+    let resting =
+        rendered_application_buffer(&application, WIDTH, HEIGHT)[(WIDTH - ASIDE_WIDTH, 0)].fg;
+    assert!(
+        aside_text(&application).contains("Subagents"),
+        "and showed it again: {rows:#?}"
+    );
+    type_terminal_text(&mut application, "zq");
+    assert!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+            .join("\n")
+            .contains("zq"),
+        "no claim on the keys was left behind to take them once a Session opened"
+    );
+    press_leader_chord(&mut application, 'a');
+    assert!(aside_text(&application).contains("Subagents"));
+    assert_ne!(
+        rendered_application_buffer(&application, WIDTH, HEIGHT)[(WIDTH - ASIDE_WIDTH, 0)].fg,
+        resting,
+        "beside a Session the act takes the keys as the three-way rule says"
+    );
+}
+
+#[test]
+fn in_a_subagents_session_the_leader_reaches_the_aside_and_nothing_else() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    open(
+        &mut application,
+        workspace.path(),
+        tree.review,
+        Some(tree.explore),
+    );
+    let before = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+
+    for key in [
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    ] {
+        assert_eq!(
+            application
+                .handle_terminal_event(InputEvent::Key(key))
+                .expect("press Ctrl+X M"),
+            ApplicationTransition::Continue,
+            "the Model Picker is not offered in a Session that is read, never prompted"
+        );
+    }
+    assert_eq!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT),
+        before,
+        "Ctrl+X M changes nothing in a Subagent's Session"
+    );
+    assert_eq!(
+        key(&mut application, KeyCode::Esc),
+        ApplicationTransition::ViewAndAttachSession(local(tree.explore)),
+        "and the ended chord leaves Esc returning to the parent"
+    );
+
+    open(
+        &mut application,
+        workspace.path(),
+        tree.review,
+        Some(tree.explore),
+    );
+    press_leader_chord(&mut application, 'a');
+    press_leader_chord(&mut application, 'a');
+    assert!(
+        !aside_text(&application).contains("Subagents"),
+        "Ctrl+X A takes the keys and then hides the Aside from inside it"
+    );
+}

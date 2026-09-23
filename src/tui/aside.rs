@@ -109,7 +109,18 @@ impl Aside {
     /// them; holding them, it hides and hands them back. Answers whether the
     /// Aside now claims the keys, so the caller can take them from the
     /// Sidebar.
-    pub(super) fn toggle(&mut self) -> bool {
+    ///
+    /// Where the Aside is not `present` — on the Landing, with no Session for
+    /// it to answer for — there is nothing to hold the keys, so the act only
+    /// flips whether the reader wants it shown, and leaves no claim behind
+    /// to take the keys once a Session opens.
+    pub(super) fn toggle(&mut self, present: bool) -> bool {
+        if !present {
+            let revealed = self.column.is_revealed();
+            self.column.set_revealed(!revealed);
+            self.hand_back_keys();
+            return false;
+        }
         match self.column.toggle_step() {
             ToggleStep::Show => {
                 self.column.set_revealed(true);
@@ -549,8 +560,8 @@ mod tests {
             "the same id on another Server is another tree"
         );
 
-        aside.toggle();
-        aside.toggle();
+        aside.toggle(true);
+        aside.toggle(true);
         assert_eq!(
             aside.tree_request(Some(&reference(top))),
             None,
