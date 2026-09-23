@@ -928,6 +928,19 @@ pub enum SidebarVisibility {
     Hidden,
 }
 
+/// Whether a TUI's Aside is on screen once a Session is open.
+///
+/// Like [`SidebarVisibility`], the Setting this spells governs only how the
+/// client begins: a reader who shows or hides the Aside afterwards is changing
+/// their view, not their configuration, so nothing writes the choice back.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsideVisibility {
+    #[default]
+    Shown,
+    Hidden,
+}
+
 /// Which Workspaces a TUI's Sidebar lists.
 ///
 /// The Setting this spells governs only the scope a Sidebar launches with: the
@@ -1096,6 +1109,24 @@ impl Default for SidebarSettings {
             initial_width: 32,
             initial_scope: SidebarScope::default(),
             auto_settle: AutoSettle::default(),
+        }
+    }
+}
+
+/// How a TUI's Aside begins. Both are launch Settings: the Aside adopts them
+/// once, and the reader's own showing, hiding, and dragging rule after that.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsideSettings {
+    pub initial_visibility: AsideVisibility,
+    pub initial_width: u64,
+}
+
+impl Default for AsideSettings {
+    fn default() -> Self {
+        Self {
+            initial_visibility: AsideVisibility::default(),
+            initial_width: 32,
         }
     }
 }
@@ -1425,6 +1456,7 @@ pub struct EffectiveSettings {
     /// outlives any one Session and the Errand this governs derives both.
     pub derivation: DerivationSettings,
     pub sidebar: SidebarSettings,
+    pub aside: AsideSettings,
     pub worktree: WorktreeSettings,
     pub provider: ProviderSettings,
     pub serving: ServingSettings,
@@ -1629,6 +1661,12 @@ pub enum SettingMutation {
     },
     SidebarAutoSettle {
         value: Option<AutoSettle>,
+    },
+    AsideInitialVisibility {
+        value: Option<AsideVisibility>,
+    },
+    AsideInitialWidth {
+        value: Option<u64>,
     },
     WorktreeAutoReclaim {
         value: Option<AutoReclaim>,

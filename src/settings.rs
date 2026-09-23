@@ -31,7 +31,7 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
+    AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim, AutoSettle, ClaudePermissionMode,
     CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions, DerivationErrand,
     EffectiveSettings, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
@@ -63,6 +63,8 @@ const SIDEBAR_INITIAL_VISIBILITY: &str = "sidebar.initialVisibility";
 const SIDEBAR_INITIAL_WIDTH: &str = "sidebar.initialWidth";
 const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
+const ASIDE_INITIAL_VISIBILITY: &str = "aside.initialVisibility";
+const ASIDE_INITIAL_WIDTH: &str = "aside.initialWidth";
 const WORKTREE_AUTO_RECLAIM: &str = "worktree.autoReclaim";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
@@ -326,20 +328,43 @@ const WORKTREE_AUTO_RECLAIM_NUMERIC: NumericSettingChoice = NumericSettingChoice
     },
 );
 
-fn validate_sidebar_initial_width(value: &str) -> Result<u64, &'static str> {
+/// The narrowest a side column — the Sidebar or the Aside — may be asked to
+/// begin. It is the TUI's own floor for either column, so a launch width below
+/// it could never be drawn.
+const MINIMUM_SIDE_COLUMN_WIDTH: u64 = 24;
+
+fn validate_side_column_width(value: &str) -> Result<u64, &'static str> {
     value
         .parse::<u64>()
         .ok()
-        .filter(|columns| *columns >= 24)
+        .filter(|columns| *columns >= MINIMUM_SIDE_COLUMN_WIDTH)
         .ok_or("minimum: 24")
+}
+
+/// Takes a side column's launch width from a Config Document, refusing one
+/// below the columns' floor.
+fn side_column_width(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|width| *width >= MINIMUM_SIDE_COLUMN_WIDTH)
 }
 
 const SIDEBAR_INITIAL_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
     "Columns at launch",
     |settings| settings.sidebar.initial_width,
-    validate_sidebar_initial_width,
+    validate_side_column_width,
     |columns| format!("{columns} columns"),
     |columns| SettingMutation::SidebarInitialWidth {
+        value: Some(columns),
+    },
+);
+
+const ASIDE_INITIAL_WIDTH_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Columns at launch",
+    |settings| settings.aside.initial_width,
+    validate_side_column_width,
+    |columns| format!("{columns} columns"),
+    |columns| SettingMutation::AsideInitialWidth {
         value: Some(columns),
     },
 );
@@ -540,6 +565,12 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         }
         SettingMutation::SidebarAutoSettle { value } => {
             *value == Some(settings.sidebar.auto_settle)
+        }
+        SettingMutation::AsideInitialVisibility { value } => {
+            *value == Some(settings.aside.initial_visibility)
+        }
+        SettingMutation::AsideInitialWidth { value } => {
+            *value == Some(settings.aside.initial_width)
         }
         SettingMutation::WorktreeAutoReclaim { value } => {
             *value == Some(settings.worktree.auto_reclaim)
@@ -905,7 +936,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
         reset: SettingMutation::SidebarInitialWidth { value: None },
         apply: |settings, value| {
-            let Some(width) = value.as_u64().filter(|width| *width >= 24) else {
+            let Some(width) = side_column_width(value) else {
                 return false;
             };
             settings.sidebar.initial_width = width;
@@ -973,6 +1004,54 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             apply_value(value, |auto_settle| {
                 settings.sidebar.auto_settle = auto_settle;
             })
+        },
+    },
+    SettingDescriptor {
+        key: ASIDE_INITIAL_VISIBILITY,
+        label: "Aside at launch",
+        description: "Whether a TUI opens a Session with the Aside beside its main view",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "shown",
+                build_mutation: || SettingMutation::AsideInitialVisibility {
+                    value: Some(AsideVisibility::Shown),
+                },
+            },
+            SettingChoice {
+                value: "hidden",
+                build_mutation: || SettingMutation::AsideInitialVisibility {
+                    value: Some(AsideVisibility::Hidden),
+                },
+            },
+        ]),
+        reset: SettingMutation::AsideInitialVisibility { value: None },
+        apply: |settings, value| {
+            apply_value(value, |visibility| {
+                settings.aside.initial_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: ASIDE_INITIAL_WIDTH,
+        label: "Aside width at launch",
+        description: "How many columns wide a TUI's Aside opens",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Open {
+            named: &[],
+            accepts: "an integer of at least 24",
+            spell: |settings| ASIDE_INITIAL_WIDTH_NUMERIC.spell(settings.aside.initial_width),
+            chosen_at: Some(SettingChoiceSurface::Numeric(ASIDE_INITIAL_WIDTH_NUMERIC)),
+        },
+        reset: SettingMutation::AsideInitialWidth { value: None },
+        apply: |settings, value| {
+            let Some(width) = side_column_width(value) else {
+                return false;
+            };
+            settings.aside.initial_width = width;
+            true
         },
     },
     // Each Provider's Enablement is ordered immediately before that Provider's
@@ -1536,6 +1615,10 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::SidebarInitialWidth { value } => (SIDEBAR_INITIAL_WIDTH, pinned(value)),
         SettingMutation::SidebarInitialScope { value } => (SIDEBAR_INITIAL_SCOPE, pinned(value)),
         SettingMutation::SidebarAutoSettle { value } => (SIDEBAR_AUTO_SETTLE, pinned(value)),
+        SettingMutation::AsideInitialVisibility { value } => {
+            (ASIDE_INITIAL_VISIBILITY, pinned(value))
+        }
+        SettingMutation::AsideInitialWidth { value } => (ASIDE_INITIAL_WIDTH, pinned(value)),
         SettingMutation::WorktreeAutoReclaim { value } => (WORKTREE_AUTO_RECLAIM, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -2074,6 +2157,8 @@ mod tests {
                 "an integer of at least 24".to_owned(),
                 "one of \"all_workspaces\", \"current_workspace\", or \"everywhere\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
+                "one of \"shown\" or \"hidden\"".to_owned(),
+                "an integer of at least 24".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or
                 // `false`, unquoted, because that is what the reader must type.
                 "one of \"release\" or \"manual\"".to_owned(),

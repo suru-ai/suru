@@ -11,11 +11,11 @@ use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AgentSelection, AppearanceMode, AutoReclaim, AutoSettle, ClaudePermissionMode,
-        CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions,
-        DerivationErrand, FoldPosture, ModelId, ProviderId, ReasoningSummaryDetail,
-        ReasoningVisibility, SessionContentWidth, SettingMutation, SettingsDiagnosticSeverity,
-        SettingsSnapshot, SidebarScope, SidebarVisibility,
+        AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim, AutoSettle,
+        ClaudePermissionMode, CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand,
+        CopilotPermissions, DerivationErrand, FoldPosture, ModelId, ProviderId,
+        ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
+        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
     },
     server::{self, ServerConfig},
 };
@@ -587,6 +587,134 @@ async fn a_sidebar_width_below_the_floor_is_ignored_individually_with_a_diagnost
     };
     assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
     assert_eq!(diagnostic.key.as_deref(), Some("sidebar.initialWidth"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not an integer of at least 24"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_hidden_aside_pins_from_a_document_and_resets_to_the_shown_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // I would rather have the columns.
+            "aside": { "initialVisibility": "hidden" },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-aside")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-aside").await;
+    assert_eq!(
+        opening.settings.aside.initial_visibility,
+        AsideVisibility::Hidden
+    );
+    assert_eq!(opening.pinned, ["aside.initialVisibility"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::AsideInitialVisibility { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.aside.initial_visibility,
+        AsideVisibility::Shown,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(answered.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn aside_initial_width_pins_from_a_document_and_resets_to_its_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "aside": { "initialWidth": 48 } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-aside-width")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, opening) = attach(state_dir.path(), "settings-aside-width").await;
+    assert_eq!(opening.settings.aside.initial_width, 48);
+    assert_eq!(
+        opening.settings.sidebar.initial_width, 32,
+        "the Aside's width is its own, not the Sidebar's"
+    );
+    assert_eq!(opening.pinned, ["aside.initialWidth"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let minimum = client
+        .mutate_setting(SettingMutation::AsideInitialWidth { value: Some(24) })
+        .await
+        .expect("pin the minimum Aside width");
+    assert_eq!(minimum.settings.aside.initial_width, 24);
+    assert_eq!(minimum.pinned, ["aside.initialWidth"]);
+
+    let reset = client
+        .mutate_setting(SettingMutation::AsideInitialWidth { value: None })
+        .await
+        .expect("reset Aside width at launch");
+    assert_eq!(reset.settings.aside.initial_width, 32);
+    assert_eq!(reset.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_aside_width_below_the_floor_is_ignored_individually_with_a_diagnostic() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "aside": { "initialWidth": 23 },
+            "transcript": { "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-aside-width-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (_, snapshot) = attach(state_dir.path(), "settings-aside-width-invalid").await;
+    assert_eq!(snapshot.settings.aside.initial_width, 32);
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "the unrelated valid pin still applies"
+    );
+    assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("the invalid width should produce one diagnostic");
+    };
+    assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+    assert_eq!(diagnostic.key.as_deref(), Some("aside.initialWidth"));
     assert_eq!(
         diagnostic.message,
         "ignored because its value is not an integer of at least 24"

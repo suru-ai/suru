@@ -19,15 +19,15 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AppearanceMode, AppearanceSettings, AutoReclaim, AutoSettle, CodexSettings,
-        CopilotSettings, DerivationErrand, DerivationSettings, EffectiveSettings, FoldPosture,
-        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ModelOptionSelection, ModelOptionValue, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderSettings, ProviderUnavailability, ReasoningSummaryDetail,
-        ReasoningVisibility, SessionContentWidth, SessionId, SessionSettings, SettingMutation,
-        SettingScope, SettingsSnapshot, SidebarScope, SidebarSettings, SidebarVisibility,
-        TranscriptSettings,
+        AgentSelection, AppearanceMode, AppearanceSettings, AsideSettings, AsideVisibility,
+        AutoReclaim, AutoSettle, CodexSettings, CopilotSettings, DerivationErrand,
+        DerivationSettings, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog,
+        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
+        ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+        SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
+        SidebarSettings, SidebarVisibility, TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -124,6 +124,16 @@ fn with_sidebar_width(initial_width: u64) -> EffectiveSettings {
         sidebar: SidebarSettings {
             initial_width,
             ..SidebarSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+fn with_aside_width(initial_width: u64) -> EffectiveSettings {
+    EffectiveSettings {
+        aside: AsideSettings {
+            initial_width,
+            ..AsideSettings::default()
         },
         ..EffectiveSettings::default()
     }
@@ -1870,6 +1880,49 @@ fn sidebar_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
 }
 
 #[test]
+fn aside_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_aside_width(48),
+        &["aside.initialWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "aside.initialWidth");
+
+    assert!(
+        row(&application, "Aside width at launch").contains("48 columns [pinned]"),
+        "the active width is shown in General"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Columns at launch") && rendered.contains("48"),
+        "Enter opens the numeric editor prefilled from the effective Setting: {rendered}"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('2'), KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('3'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a width below the columns' floor is refused rather than written"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char('4'), KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AsideInitialWidth {
+            value: Some(24),
+        })
+    );
+}
+
+#[test]
 fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snapshot() {
     let workspace = workspace_dir();
     let mut application = client_showing(
@@ -2218,6 +2271,36 @@ fn the_sidebar_scope_row_cycles_through_all_workspaces_current_workspace_and_eve
             value: Some(SidebarScope::AllWorkspaces),
         }),
         "the third value wraps to the first"
+    );
+}
+
+#[test]
+fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "aside.initialVisibility");
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        row_index(&rows, "Settle idle Sessions") < row_index(&rows, "Aside at launch"),
+        "the Aside's Settings follow the Sidebar's on the General tab: {rows:?}"
+    );
+    assert!(
+        row(&application, "Aside at launch").contains("shown [default]"),
+        "the Aside begins shown unless a Setting says otherwise"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::AsideInitialVisibility {
+            value: Some(AsideVisibility::Hidden),
+        })
+    );
+
+    focus_setting(&mut application, "aside.initialWidth");
+    assert!(
+        row(&application, "Aside width at launch").contains("32 columns [default]"),
+        "and begins 32 columns wide"
     );
 }
 
