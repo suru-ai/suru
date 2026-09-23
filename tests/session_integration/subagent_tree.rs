@@ -1148,3 +1148,46 @@ async fn an_intervention_flags_only_the_session_that_owns_it_until_it_is_answere
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+#[tokio::test]
+async fn two_subscribers_to_one_tree_hear_the_same_change() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-two-subscribers-test").await;
+    let provider = &fixture.provider_session;
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    let (through_top, mut top_updates) =
+        open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    let explore = named(&through_top.subagents, "Explore").session_id;
+    // A second reader, as another Client with the Subagent open would be.
+    let (through_child, mut child_updates) = open_tree(fixture.server.descriptor(), explore).await;
+    assert_eq!(through_child.revision, through_top.revision);
+
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    let mut top_revision = through_top.revision;
+    let mut child_revision = through_child.revision;
+    let heard_at_top = next_change(&mut top_updates, &mut top_revision).await;
+    let heard_at_child = next_change(&mut child_updates, &mut child_revision).await;
+    assert!(
+        matches!(
+            &heard_at_top,
+            SubagentTreeChange::SubagentSettled { session_id, status: ActivityStatus::Completed, .. }
+                if *session_id == explore
+        ),
+        "{heard_at_top:?}"
+    );
+    assert_eq!(
+        heard_at_child, heard_at_top,
+        "every subscriber to the tree hears the same change"
+    );
+    assert_eq!(child_revision, top_revision, "under the same revision");
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}

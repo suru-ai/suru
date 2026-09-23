@@ -4503,3 +4503,92 @@ async fn remote_catalog_delivers_model_names_and_updates_without_listing_models(
     drop(subscription);
     pair.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_subagent_tree_streams_through_a_remote_outlook() {
+    let (runtime, mut provider) = provider_support::ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("codex"),
+            id: ModelId::new("gpt-test"),
+            display_name: "Codex fixture".into(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let pair = paired_servers_with_runtime("remote-subagent-tree", false, Some(runtime)).await;
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let created = remote
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Delegate through the Remote".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create a Session on the Remote");
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("the Remote's Provider starts");
+    let mut native = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: suru::protocol::AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-test"),
+            options: Vec::new(),
+        },
+    });
+    timeout(PROGRESS_DEADLINE, native.next_turn())
+        .await
+        .expect("the first Turn reaches the Remote's Provider")
+        .succeed();
+
+    let mut tree = remote.subscribe_subagent_tree(created.session.id);
+    let suru::managed_client::SubagentTreeEvent::Snapshot(snapshot) =
+        next_remote_tree_event(&mut tree).await
+    else {
+        panic!("the Remote tree opens with its snapshot");
+    };
+    assert_eq!(snapshot.top_level.session_id, created.session.id);
+    assert!(snapshot.subagents.is_empty());
+
+    native
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: suru::provider::ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the Remote's seams".to_owned(),
+        })
+        .await;
+    let suru::managed_client::SubagentTreeEvent::Changed(
+        suru::protocol::SubagentTreeChange::SubagentSpawned { entry },
+    ) = next_remote_tree_event(&mut tree).await
+    else {
+        panic!("a spawn on the Remote arrives as a change through the proxy");
+    };
+    assert_eq!(entry.name, "Explore");
+    assert_eq!(entry.parent_session_id, created.session.id);
+
+    drop(tree);
+    drop(native);
+    pair.shutdown().await;
+}
+
+async fn next_remote_tree_event(
+    tree: &mut suru::managed_client::SubagentTreeSubscription,
+) -> suru::managed_client::SubagentTreeEvent {
+    timeout(PROGRESS_DEADLINE, tree.next())
+        .await
+        .expect("a tree event arrives through the Remote")
+        .expect("the Remote tree subscription stays open")
+}
