@@ -86,6 +86,10 @@ pub struct ServerTimings {
     pub remote_withdrawal_timeout: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
+    /// How long a starting server waits for the channel's election lock to
+    /// come free before conceding that another server owns the channel. See
+    /// `take_election_lock` for why a stopped server's lock can outlive it.
+    pub election_handoff: Duration,
 }
 
 impl Default for ServerTimings {
@@ -101,6 +105,7 @@ impl Default for ServerTimings {
             invite_ttl: Duration::from_secs(10 * 60),
             remote_withdrawal_timeout: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
+            election_handoff: Duration::from_secs(1),
         }
     }
 }
@@ -515,7 +520,8 @@ pub async fn spawn_with_source_control(
         .truncate(false)
         .open(config.lock_path())
         .context("open server election lock")?;
-    lock.try_lock_exclusive()
+    take_election_lock(&lock, timings.election_handoff)
+        .await
         .context("another server already owns this channel")?;
     protect_current_user_file(&config.lock_path())?;
 
@@ -843,6 +849,34 @@ pub async fn spawn_with_source_control(
         workspace_discovery: workspace_discovery_rx,
         task,
     })
+}
+
+/// Takes the channel's election lock, waiting up to `handoff` for a hold that
+/// is only draining. The lock belongs to an open file description, and a child
+/// being spawned shares every description its parent has open until its `exec`
+/// closes them. So a lock goes on being held after its owner lets go, for as
+/// long as any spawn begun in that owner's process takes to finish — which on
+/// macOS, where a program is assessed on its first run, can be a few hundred
+/// milliseconds. Only a lock still held once `handoff` has passed belongs to a
+/// server that is running.
+async fn take_election_lock(lock: &std::fs::File, handoff: Duration) -> std::io::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let deadline = tokio::time::Instant::now() + handoff;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + POLL_INTERVAL).min(deadline),
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {

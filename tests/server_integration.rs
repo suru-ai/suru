@@ -5,6 +5,7 @@ use diesel::{
     sql_types::BigInt,
 };
 use eventsource_stream::Eventsource;
+use fs2::FileExt;
 use futures_util::StreamExt;
 use suru::{
     build_identity,
@@ -3732,6 +3733,75 @@ async fn authenticated_health_describes_the_ready_server() {
     }
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// The channel's lock, held the way a server holds it, from outside any server.
+fn hold_channel_lock(state_dir: &std::path::Path, channel: &str) -> std::fs::File {
+    let runtime_dir = state_dir.join(channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create the channel's runtime directory");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(runtime_dir.join("server.lock"))
+        .expect("open the channel lock");
+    lock.try_lock_exclusive().expect("hold the channel lock");
+    lock
+}
+
+/// A lock goes on being held after its server lets go, for as long as any
+/// child that server's process was spawning at that moment takes to `exec`.
+/// A successor started then waits the hold out rather than losing an election
+/// no one else is standing in.
+#[tokio::test]
+async fn a_server_waits_out_a_channel_lock_that_is_still_draining() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "draining-lock-test";
+    let lock = hold_channel_lock(state_dir.path(), channel);
+    let starting = tokio::spawn(server::spawn_with_timings(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        ServerTimings {
+            election_handoff: PROGRESS_DEADLINE,
+            ..ServerTimings::default()
+        },
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !starting.is_finished(),
+        "the successor is still waiting while the lock is held"
+    );
+    drop(lock);
+
+    let server = timeout(PROGRESS_DEADLINE, starting)
+        .await
+        .expect("the successor starts once the lock drains")
+        .expect("the starting task does not panic")
+        .expect("the successor wins the election");
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_channel_lock_still_held_after_the_handoff_belongs_to_another_server() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "owned-lock-test";
+    let _lock = hold_channel_lock(state_dir.path(), channel);
+
+    let error = server::spawn_with_timings(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        ServerTimings {
+            election_handoff: Duration::from_millis(50),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .err()
+    .expect("a server cannot start on a channel another server owns");
+    assert_eq!(
+        error.to_string(),
+        "another server already owns this channel"
+    );
 }
 
 #[tokio::test]
