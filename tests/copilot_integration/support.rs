@@ -65,6 +65,12 @@ agent_event() {
   reply '{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"'"$sid"'","event":{"id":"'"$1"'","timestamp":"2026-01-01T00:00:00Z","agentId":"'"$2"'","type":"'"$3"'","data":'"$4"'}}}'
 }
 
+# An entry exactly as a live CLI wrote it, envelope and all: `raw_event <event-object>`. This is how
+# a sanitized capture replays in stream order.
+raw_event() {
+  reply '{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"'"$sid"'","event":'"$1"'}}'
+}
+
 while IFS= read -r header; do
   case "$header" in
     Content-Length:*) ;;
