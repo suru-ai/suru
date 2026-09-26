@@ -10,7 +10,9 @@
 //! Turn the steer joined.
 //!
 //! The roster of background work outlives any one Turn, as the CLI's own does; it is only ever read
-//! while a Turn is in flight, because stopping that work is something only an interrupt does.
+//! while a Turn is in flight, because stopping that work is something only an interrupt does. It
+//! does not outlive the process, though, any more than the CLI's own does: the work on it runs in
+//! the CLI's process group and dies with it, and a replacement CLI announces nothing it inherited.
 
 use std::{
     collections::BTreeSet,
@@ -124,6 +126,17 @@ impl TurnInFlight {
         state.subagents.remove(task_id);
     }
 
+    /// The CLI process this roster was kept for has ended — stopped by the Session, or replaced
+    /// by one spawned under another Agent Selection — and every task on it died with that process.
+    /// None will ever report settling, and the process that replaces it has never heard of them,
+    /// so a stop asking it for one would be refused and leave the task on the roster for good.
+    /// The roster starts empty again, the way the new CLI's own does.
+    pub(super) fn tasks_died_with_process(&self) {
+        let mut state = self.state();
+        state.tasks.clear();
+        state.subagents.clear();
+    }
+
     /// The background work the CLI has reported running, which an interrupt stops before the loop.
     pub(super) fn live_tasks(&self) -> Vec<String> {
         self.state().tasks.iter().cloned().collect()
@@ -231,6 +244,32 @@ mod tests {
             turn.subagent_task("task-one"),
             None,
             "a settled task leaves nothing for a stop to resolve"
+        );
+    }
+
+    #[test]
+    fn the_roster_starts_empty_again_once_its_process_has_ended() {
+        let turn = TurnInFlight::new();
+        turn.task_started("task-bash".to_owned());
+        turn.task_started("task-agent".to_owned());
+        turn.subagent_task_started("task-agent".to_owned());
+
+        turn.tasks_died_with_process();
+
+        assert!(
+            turn.live_tasks().is_empty(),
+            "no task outlives the process it ran in"
+        );
+        assert_eq!(
+            turn.subagent_task("task-agent"),
+            None,
+            "a Subagent whose task died has nothing left for a stop to resolve"
+        );
+        turn.task_started("task-next".to_owned());
+        assert_eq!(
+            turn.live_tasks(),
+            ["task-next"],
+            "the replacement process's own work joins an empty roster"
         );
     }
 

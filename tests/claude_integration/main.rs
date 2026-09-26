@@ -25,6 +25,7 @@ mod continuations;
 mod errands;
 mod interruption;
 mod models;
+mod respawn;
 mod resume;
 mod skills;
 mod steering;

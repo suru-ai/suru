@@ -490,15 +490,20 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_started(task_id.clone());
-        if message.task_type.as_deref() != Some(SUBAGENT_TASK_TYPE)
-            || self
-                .agent_tasks
-                .get(&task_id)
-                .is_some_and(|task| task.working.is_some())
+        if message.task_type.as_deref() != Some(SUBAGENT_TASK_TYPE) {
+            return Vec::new();
+        }
+        // The roster is the running process's, so an agent task joins it on every start — even
+        // one whose row is still working, which is what an agent the previous process was running
+        // looks like when the process that replaced it resumes the same task.
+        self.turn.subagent_task_started(task_id.clone());
+        if self
+            .agent_tasks
+            .get(&task_id)
+            .is_some_and(|task| task.working.is_some())
         {
             return Vec::new();
         }
-        self.turn.subagent_task_started(task_id.clone());
         // The tool use the start names is the Delegation, and the conversation that ran it is the
         // delegating one. A start naming no tool this projection saw delegates from the loop's own
         // conversation, which always has a Turn to land in (ADR 0015).

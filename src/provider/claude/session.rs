@@ -22,6 +22,12 @@
 //! names: a steer is simply another user message on the running loop's stdin, and the interrupt is
 //! a Session-level control request. Both therefore refuse a Session with no Turn running rather
 //! than acting on whatever came next, and both read what is running from [`super::turn_in_flight`].
+//!
+//! The background work an interrupt stops first is the running child's own: the CLI keeps its task
+//! roster per process, runs that work in the process group Suru stops as a whole, and announces
+//! nothing it did not start itself. So the Session forgets the roster whenever it stops a child —
+//! for a Selection change as much as at shutdown — and an interrupt afterwards asks the new child
+//! to stop only the work it has reported.
 
 use std::{
     collections::BTreeMap,
@@ -300,6 +306,15 @@ impl ClaudeChild {
 }
 
 impl ClaudeSession {
+    /// Stops `child`, and with it every background task it was running: they share its process
+    /// group, and none of them will ever report settling. The roster forgets them however the stop
+    /// went, because the child is no longer the one this Session's interrupts reach.
+    async fn stop_child(&self, child: &ClaudeChild) -> Result<(), ProviderError> {
+        let stopped = child.stop().await;
+        self.turn.tasks_died_with_process();
+        stopped
+    }
+
     async fn apply_permission_mode(
         &self,
         slot: &mut ChildSlot,
@@ -430,8 +445,7 @@ impl ProviderSession for ClaudeSession {
                     permission_mode,
                 )?;
                 if let Some(previous) = slot.running.take() {
-                    previous
-                        .stop()
+                    self.stop_child(&previous)
                         .await
                         .map_err(|error| claude_error_context(CONTEXT, error))?;
                 }
@@ -628,7 +642,7 @@ impl ProviderSession for ClaudeSession {
             let Some(child) = slot.running.as_ref() else {
                 return Ok(());
             };
-            child.stop().await
+            self.stop_child(child).await
         })
     }
 }
