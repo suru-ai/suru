@@ -14,4 +14,5 @@ Claude's stream never reports that point. The Subagent's side of the stream carr
 
 - A resume begun by a late steer can start after the parent Turn that sent it has Settled. Its row then lands in whatever parent Turn is active, or begins a Continuation. This amends ADR 0031's "in the Turn that delegated it".
 - A steer never changes the parent's Transcript. Codex's `sendInput` no longer revises the live Subagent row's description, and Copilot's `write_agent` call is absorbed rather than shown as a Command.
+- Live, Copilot CLI 1.0.87 delivered every `write_agent` to a working Subagent as `queued`, after that Subagent's `subagent.completed`, so no Copilot steer has been observed (`docs/validation/0397-copilot-subagent-steer.md`). Suru's Copilot steer path follows the SDK's documented `steering` shape until a capture shows one, and what a `queued` delivery is remains #398's decision.
 - Codex's V2 `send_message` / `followup_task` reach clients only as experimental raw response items. Until Codex surfaces them as thread items, a V2 steer is not shown.
