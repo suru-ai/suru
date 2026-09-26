@@ -33,10 +33,23 @@ fn reclaim_log() -> &'static std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
     })
 }
 
-async fn wait_for_log(expectation: &str, matches: impl Fn(&str) -> bool) -> String {
+/// Where the shared Log stands now, for a test to read only what is logged
+/// after it. A process installs one Log subscriber, so every test running
+/// beside this one writes to the same Log, and none may clear what another is
+/// still reading.
+fn log_mark() -> usize {
+    reclaim_log().lock().unwrap().len()
+}
+
+/// Everything logged since `mark`, by this test and any running beside it.
+fn log_since(mark: usize) -> String {
+    String::from_utf8_lossy(&reclaim_log().lock().unwrap()[mark..]).into_owned()
+}
+
+async fn wait_for_log(since: usize, expectation: &str, matches: impl Fn(&str) -> bool) -> String {
     timeout(PROGRESS_DEADLINE, async {
         loop {
-            let log = String::from_utf8_lossy(&reclaim_log().lock().unwrap()).into_owned();
+            let log = log_since(since);
             if matches(&log) {
                 return log;
             }
@@ -1884,8 +1897,7 @@ impl SourceControl for FailFirstReclaim {
 #[tokio::test]
 async fn a_failed_removal_is_retried_on_a_later_interval() {
     let layout = ReclaimLayout::new("retry");
-    let log = reclaim_log();
-    log.lock().unwrap().clear();
+    let mark = log_mark();
     let (runtime, _) = ControlledProvider::new();
     let adapter = Arc::new(FailFirstReclaim {
         git: GitSourceControl::default(),
@@ -1904,7 +1916,7 @@ async fn a_failed_removal_is_retried_on_a_later_interval() {
     wait_for_path(&layout.managed, false).await;
     assert!(adapter.failed.load(Ordering::SeqCst));
     let path = layout.managed.display().to_string();
-    let rendered = wait_for_log("this Worktree's failure and success", |log| {
+    let rendered = wait_for_log(mark, "this Worktree's failure and success", |log| {
         log.lines().any(|line| {
             line.contains(&path) && line.contains("Managed Worktree Reclaim failed; will retry")
         }) && log
@@ -1997,7 +2009,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
     let intent = age_preparation(&config, &preparation);
     let ownership = format!("refs/suru/preparations/{}", preparation.id.0.simple());
     preparing.shutdown().await.unwrap();
-    reclaim_log().lock().unwrap().clear();
+    let mark = log_mark();
 
     let adapter = Arc::new(FailFirstPreparationRetirement {
         git: GitSourceControl::default(),
@@ -2034,7 +2046,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
     assert_eq!(retired.prompts[0].status, PromptStatus::Cancelled);
     server.shutdown().await.unwrap();
     let path = preparation.destination.path.display().to_string();
-    let log = String::from_utf8_lossy(&reclaim_log().lock().unwrap()).into_owned();
+    let log = log_since(mark);
     assert_eq!(
         log.lines()
             .filter(|line| line.contains(&path) && line.contains("Managed Worktree Reclaimed"))
@@ -2374,7 +2386,7 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
     document["persisted_at"] = serde_json::json!(0);
     std::fs::write(&intent, serde_json::to_vec(&document).unwrap()).unwrap();
     server.shutdown().await.unwrap();
-    reclaim_log().lock().unwrap().clear();
+    let mark = log_mark();
 
     let restarted = server::spawn_with_source_control(
         config,
@@ -2398,7 +2410,7 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
     assert_eq!(restored.prompts[0].status, PromptStatus::Cancelled);
     assert!(restored.turns.is_empty());
     assert!(provider.try_next_start().is_none());
-    let log = wait_for_log("the withheld Prompt's first line", |log| {
+    let log = wait_for_log(mark, "the withheld Prompt's first line", |log| {
         log.contains("Failed Worktree preparation intent retired")
             && log.contains("Keep this exact first line")
     })
