@@ -1,8 +1,9 @@
 //! Codex collab threads as Subagents: a spawn item on the parent thread opens the inline row and
 //! a child Session, Suru attaches the child thread so its own items stream into that Session, a
 //! child completion arriving after the parent's turn completed settles the row rather than
-//! erroring, a child's own spawns recurse one level down, and a delegation that starts another
-//! turn on a settled child's thread resumes it in its own Session — across a restart too.
+//! erroring, a child's own spawns recurse one level down, a delegation that starts another turn on
+//! a settled child's thread resumes it in its own Session — across a restart too — and one a
+//! working child drains into its running turn steers that Turn instead.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
@@ -2663,4 +2664,398 @@ async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into
 
     drop(client);
     replacement.shutdown().await.expect("shut down server");
+}
+
+// Steers: a `sendInput` delivered into a child's running turn stands in the Turn it steers, where
+// the child drained it, as a Delegation from the Agent that sent it — and nowhere else.
+
+/// Input `thread`'s `turn` drained, as Codex reports it: a `userMessage` item started and
+/// completed together, carrying `text`.
+fn user_message(thread: &str, turn: &str, id: &str, text: &str) -> String {
+    let message = json!({
+        "type": "userMessage",
+        "id": id,
+        "clientId": null,
+        "content": [{ "type": "text", "text": text, "text_elements": [] }],
+    });
+    [
+        item("started", thread, turn, message.clone()),
+        item("completed", thread, turn, message),
+    ]
+    .concat()
+}
+
+/// A `sendInput` from `sender`'s `turn` to `receiver` handing it `prompt`, at `stage`, with the
+/// receiver still running.
+fn send_input(stage: &str, sender: &str, turn: &str, receiver: &str, prompt: &str) -> String {
+    let status = if stage == "started" {
+        "inProgress"
+    } else {
+        "completed"
+    };
+    item(
+        stage,
+        sender,
+        turn,
+        json!({
+            "type": "collabAgentToolCall",
+            "id": format!("call-send-from-{sender}"),
+            "tool": "sendInput",
+            "status": status,
+            "senderThreadId": sender,
+            "receiverThreadIds": [receiver],
+            "prompt": prompt,
+            "agentsStates": { receiver: { "status": "running" } },
+        }),
+    )
+}
+
+/// The parent spawns the child, which opens its turn with the spawn's input and says something;
+/// the parent's `sendInput` then hands the running turn more, which the child drains before
+/// answering it. The child's turn ends there, and the parent's after it.
+fn steered_by_send_script() -> String {
+    let child_turn = [
+        child_attached(),
+        turn_started("child-thread", "child-turn"),
+        user_message(
+            "child-thread",
+            "child-turn",
+            "child-input-1",
+            "Map the crate layout",
+        ),
+        agent_message(
+            "child-thread",
+            "child-turn",
+            "child-message-1",
+            "Two crates so far.",
+        ),
+        send_input(
+            "started",
+            "root-thread",
+            "root-turn",
+            "child-thread",
+            "Count the lines too.",
+        ),
+        send_input(
+            "completed",
+            "root-thread",
+            "root-turn",
+            "child-thread",
+            "Count the lines too.",
+        ),
+        user_message(
+            "child-thread",
+            "child-turn",
+            "child-input-2",
+            "Count the lines too.",
+        ),
+        agent_message(
+            "child-thread",
+            "child-turn",
+            "child-message-2",
+            "Two crates, 4k lines.",
+        ),
+        turn_completed("child-thread", "child-turn"),
+        collab_call("root-turn", "wait", None, "completed"),
+        agent_message("root-thread", "root-turn", "root-message", "Mapped."),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                collab_call(
+                    "root-turn",
+                    "spawnAgent",
+                    Some("Map the crate layout"),
+                    "running",
+                ),
+            ]
+            .concat(),
+        ),
+        arm(
+            r#"*'"method":"thread/resume"'*'"threadId":"child-thread"'*"#,
+            &child_turn,
+        ),
+    ]
+    .concat()
+}
+
+/// The parent's Session once its Turn and every Subagent row in it have settled.
+async fn settled_parent(
+    client: &ManagedClient,
+    session_id: SessionId,
+    rows: usize,
+) -> SessionSnapshot {
+    session_where(
+        client,
+        session_id,
+        "the parent's Turn and its Subagent rows settle",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+                && subagent_rows(snapshot).len() == rows
+                && subagent_rows(snapshot).iter().all(|row| {
+                    matches!(
+                        row,
+                        Activity::Subagent {
+                            status: ActivityStatus::Completed,
+                            ..
+                        }
+                    )
+                })
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_send_into_a_working_childs_turn_steers_that_turn_where_the_child_drained_it() {
+    let fixture = ScriptedCodex::new_multiprocess(&steered_by_send_script());
+    let opened = opened_session(&fixture, "codex-subagent-steered-by-send", "Map the crates").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let parent = settled_parent(client, session_id, 1).await;
+    let [
+        Activity::Subagent {
+            description,
+            session_id: child_id,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!(
+            "the steer adds no row to the parent's Transcript, got {:?}",
+            parent.activities
+        );
+    };
+    let child_id = *child_id;
+    assert_eq!(
+        description, "Map the crate layout",
+        "the steer leaves the row reading its spawn's description"
+    );
+    assert_eq!(
+        parent.activities.len(),
+        1,
+        "the row is all the parent's Transcript carries of the child: {:?}",
+        parent.activities
+    );
+    assert!(
+        parent
+            .messages
+            .iter()
+            .all(|message| !matches!(message.role, MessageRole::Delegation(_))),
+        "the steer stands nowhere in the parent's Transcript: {:?}",
+        parent.messages
+    );
+
+    let child = settled_session(client, child_id, 0).await;
+    let [turn] = child.turns.as_slice() else {
+        panic!(
+            "the steer begins no second Turn in the child's Session, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(
+        messages(&child),
+        [
+            (delegation_from(session_id), "Map the crate layout", turn.id),
+            (MessageRole::Agent, "Two crates so far.", turn.id),
+            (delegation_from(session_id), "Count the lines too.", turn.id),
+            (MessageRole::Agent, "Two crates, 4k lines.", turn.id),
+        ],
+        "the Turn opens with the spawn's Delegation once, not again for the item that opened \
+         the child's turn, and the steer stands where the child drained it, from the parent"
+    );
+    assert_eq!(
+        child
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Message { .. }))
+            .count(),
+        4,
+        "each Message stands once in the child's Transcript"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// The attach reply for `thread`, spawned by the root thread.
+fn attached(thread: &str) -> String {
+    answer(json!({
+        "thread": { "id": thread, "parentThreadId": "root-thread" },
+        "model": "gpt-child",
+    }))
+}
+
+/// The parent spawns two children; the sibling's `sendInput` hands the first child's running
+/// turn more to do, and the first child drains it before the sibling's call has even completed.
+fn steered_by_sibling_script() -> String {
+    let spawn = |receiver: &str, prompt: &str| {
+        item(
+            "completed",
+            "root-thread",
+            "root-turn",
+            json!({
+                "type": "collabAgentToolCall",
+                "id": format!("call-spawn-{receiver}"),
+                "tool": "spawnAgent",
+                "status": "completed",
+                "senderThreadId": "root-thread",
+                "receiverThreadIds": [receiver],
+                "prompt": prompt,
+                "agentsStates": { receiver: { "status": "running" } },
+            }),
+        )
+    };
+    let work = [
+        attached("sibling-thread"),
+        turn_started("child-thread", "child-turn"),
+        agent_message(
+            "child-thread",
+            "child-turn",
+            "child-message-1",
+            "Two crates so far.",
+        ),
+        turn_started("sibling-thread", "sibling-turn"),
+        send_input(
+            "started",
+            "sibling-thread",
+            "sibling-turn",
+            "child-thread",
+            "Also count the tests.",
+        ),
+        user_message(
+            "child-thread",
+            "child-turn",
+            "child-input",
+            "Also count the tests.",
+        ),
+        send_input(
+            "completed",
+            "sibling-thread",
+            "sibling-turn",
+            "child-thread",
+            "Also count the tests.",
+        ),
+        agent_message(
+            "child-thread",
+            "child-turn",
+            "child-message-2",
+            "Two crates, 30 tests.",
+        ),
+        turn_completed("child-thread", "child-turn"),
+        agent_message(
+            "sibling-thread",
+            "sibling-turn",
+            "sibling-message",
+            "The map holds up.",
+        ),
+        turn_completed("sibling-thread", "sibling-turn"),
+        agent_message("root-thread", "root-turn", "root-message", "Reviewed."),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                spawn("child-thread", "Map the crate layout"),
+                spawn("sibling-thread", "Review the map"),
+            ]
+            .concat(),
+        ),
+        arm(
+            r#"*'"method":"thread/resume"'*'"threadId":"child-thread"'*"#,
+            &attached("child-thread"),
+        ),
+        arm(
+            r#"*'"method":"thread/resume"'*'"threadId":"sibling-thread"'*"#,
+            &work,
+        ),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_siblings_send_into_a_working_childs_turn_steers_it_from_the_sibling() {
+    let fixture = ScriptedCodex::new_multiprocess(&steered_by_sibling_script());
+    let opened = opened_session(
+        &fixture,
+        "codex-subagent-steered-by-sibling",
+        "Map the crates",
+    )
+    .await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let parent = settled_parent(client, session_id, 2).await;
+    let [
+        Activity::Subagent {
+            description: child_description,
+            session_id: child_id,
+            ..
+        },
+        Activity::Subagent {
+            description: sibling_description,
+            session_id: sibling_id,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!(
+            "the parent's Transcript holds the two spawns' rows alone, got {:?}",
+            parent.activities
+        );
+    };
+    let (child_id, sibling_id) = (*child_id, *sibling_id);
+    assert_eq!(
+        [child_description.as_str(), sibling_description.as_str()],
+        ["Map the crate layout", "Review the map"],
+        "the steer rewrites neither row"
+    );
+
+    let child = settled_session(client, child_id, 0).await;
+    let [turn] = child.turns.as_slice() else {
+        panic!("the steer begins no second Turn, got {:?}", child.turns);
+    };
+    let [
+        (opening_from, "Map the crate layout", opening_turn),
+        (MessageRole::Agent, "Two crates so far.", _),
+        (MessageRole::Delegation(steer_from), "Also count the tests.", steer_turn),
+        (MessageRole::Agent, "Two crates, 30 tests.", _),
+    ] = &messages(&child)[..]
+    else {
+        panic!(
+            "the steer stands in the child's Turn where it drained it, got {:?}",
+            messages(&child)
+        );
+    };
+    assert_eq!(*opening_from, delegation_from(session_id));
+    assert_eq!([*opening_turn, *steer_turn], [turn.id; 2]);
+    assert_eq!(
+        steer_from.session_id, sibling_id,
+        "the steer names the sibling whose send carried it, not the child's parent"
+    );
+
+    let sibling = settled_session(client, sibling_id, 0).await;
+    assert!(
+        sibling
+            .messages
+            .iter()
+            .all(|message| message.content != "Also count the tests."),
+        "the steer stands only in the Transcript of the Subagent it steered: {:?}",
+        sibling.messages
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
 }
