@@ -13,7 +13,7 @@ use suru::{
     provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 const PREFIX: &str = r#"#!/bin/sh
 while IFS= read -r line; do

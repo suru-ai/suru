@@ -1711,9 +1711,9 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
         .connecting_client
         .outlook(Outlook::Remote("laptop".to_owned()));
     let mut laptop_catalog = laptop_outlook.subscribe_catalog();
-    for mut catalog in [&mut workstation_catalog, &mut laptop_catalog] {
+    for catalog in [&mut workstation_catalog, &mut laptop_catalog] {
         assert!(matches!(
-            timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            timeout(PROGRESS_DEADLINE, next_session_catalog_event(catalog))
                 .await
                 .expect("Remote catalog snapshot arrives"),
             Some(ManagedEvent::SessionCatalogReconciled(_))

@@ -561,7 +561,7 @@ impl SourceControlService {
         self.adapter.observe(checkout).await
     }
     pub(crate) fn remember(&self, workspace: &Workspace) {
-        if let Some(repository) = &workspace.repository {
+        if let Some(repository) = workspace.repository.as_deref() {
             self.repositories
                 .lock()
                 .unwrap()
@@ -765,26 +765,26 @@ impl SourceControlService {
                 resolved.checkouts = remembered.checkouts;
             }
         }
-        if resolved.workspace.repository.is_none() {
-            if let Some(known) = known.filter(|known| known.repository.is_some()) {
-                // No membership is guessed from a missing path's spelling. Only a
-                // previously persisted association keeps an unavailable Repository known.
-                let reason = match &resolved.workspace.source_control {
-                    SourceControlAvailability::Unavailable { reason } => reason.clone(),
-                    _ => "The known Repository is no longer readable at this Execution Directory"
-                        .to_owned(),
-                };
-                resolved.workspace = known.clone();
-                resolved.workspace.source_control = SourceControlAvailability::Unavailable {
+        if resolved.workspace.repository.is_none()
+            && let Some(known) = known.filter(|known| known.repository.is_some())
+        {
+            // No membership is guessed from a missing path's spelling. Only a
+            // previously persisted association keeps an unavailable Repository known.
+            let reason = match &resolved.workspace.source_control {
+                SourceControlAvailability::Unavailable { reason } => reason.clone(),
+                _ => "The known Repository is no longer readable at this Execution Directory"
+                    .to_owned(),
+            };
+            resolved.workspace = known.clone();
+            resolved.workspace.source_control = SourceControlAvailability::Unavailable {
+                reason: reason.clone(),
+            };
+            let repository = resolved.workspace.repository.as_mut().unwrap();
+            repository.capabilities.list_checkouts =
+                crate::protocol::SourceControlCapability::Unsupported {
                     reason: reason.clone(),
                 };
-                let repository = resolved.workspace.repository.as_mut().unwrap();
-                repository.capabilities.list_checkouts =
-                    crate::protocol::SourceControlCapability::Unsupported {
-                        reason: reason.clone(),
-                    };
-                repository.availability = SourceControlAvailability::Unavailable { reason };
-            }
+            repository.availability = SourceControlAvailability::Unavailable { reason };
         }
         // Git cannot name a separately located main checkout from its metadata.
         // A previously observed root can be revalidated without treating the label
@@ -839,7 +839,7 @@ impl SourceControlService {
                 });
             }
         }
-        if let Some(repository) = &mut resolved.workspace.repository {
+        if let Some(repository) = resolved.workspace.repository.as_deref_mut() {
             let mut repositories = self.repositories.lock().unwrap();
             if matches!(repository.location, RepositoryLocation::UnknownMain)
                 && let Some(previous) = repositories.get(&repository.id)
@@ -889,7 +889,7 @@ pub(crate) fn repository_workspace(repository: &Repository) -> Workspace {
     Workspace {
         id: repository.id.workspace_id(),
         path: repository.presentation_path().to_owned(),
-        repository: Some(repository.clone()),
+        repository: Some(Box::new(repository.clone())),
         source_control: repository.availability.clone(),
         // Resolution never knows a Workspace's Icon: it is read from the
         // `workspaces` table wherever this freshly resolved value is applied

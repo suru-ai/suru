@@ -16,7 +16,7 @@ pub(super) struct WorktreePicker {
 /// Worktrees rather than an entry of its own, so choosing it is choosing a
 /// Checkout like any other and the Landing decides it has nowhere to move to.
 pub(super) enum WorktreeChoice {
-    Checkout(CheckoutSummary),
+    Checkout(Box<CheckoutSummary>),
     New,
 }
 
@@ -64,8 +64,7 @@ impl WorktreePicker {
             context
                 .checkouts
                 .get(self.selected - 1)
-                .cloned()
-                .map(WorktreeChoice::Checkout)
+                .map(|checkout| WorktreeChoice::Checkout(Box::new(checkout.clone())))
         }
     }
     /// The Worktree the next Session would already work in, which its row

@@ -77,6 +77,10 @@ const SUBAGENT_CONNECTION_LOST_MESSAGE: &str =
 const SUBAGENT_FAILED_MESSAGE: &str =
     "Provider execution failed: the Provider reported this Subagent failing.";
 
+/// Checkout guards taken while admitting a Prompt, held until that Prompt's
+/// preparation inherits them or the Prompt leaves the queue.
+type CheckoutGuards = Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>;
+
 #[derive(Clone)]
 pub(crate) struct ProviderOrchestrator {
     /// Every Provider runtime this server hosts, in the fixed built-in order.
@@ -94,7 +98,7 @@ pub(crate) struct ProviderOrchestrator {
     settings: watch::Receiver<SettingsSnapshot>,
     skill_catalog: SkillCatalogService,
     source_control: crate::source_control::SourceControlService,
-    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
 }
@@ -216,7 +220,7 @@ struct ConnectedProviderSession {
 
 struct ProviderSessionContext {
     source_control: crate::source_control::SourceControlService,
-    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
     runtime: Arc<dyn ProviderRuntime>,
@@ -914,6 +918,9 @@ enum ProviderEventProjection {
 }
 
 impl ProviderOrchestrator {
+    // One parameter per server-wide service the orchestrator coordinates; each
+    // is shared with other owners, so none is built here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtimes: Vec<Arc<dyn ProviderRuntime>>,
         sessions: SessionStore,
@@ -979,17 +986,15 @@ impl ProviderOrchestrator {
     ) {
         if let Ok(commands_tx) =
             self.actor_commands_or_fail_prompt(session_id, execution_directory, prompt_id)
-        {
-            if commands_tx
+            && commands_tx
                 .send(ProviderCommand::StartPrompt { prompt_id })
                 .is_err()
-            {
-                let _ = self.fail_prompt(
-                    session_id,
-                    prompt_id,
-                    "Session Provider actor stopped unexpectedly".to_owned(),
-                );
-            }
+        {
+            let _ = self.fail_prompt(
+                session_id,
+                prompt_id,
+                "Session Provider actor stopped unexpectedly".to_owned(),
+            );
         }
     }
 
@@ -1472,7 +1477,7 @@ impl ProviderOrchestrator {
 /// Drop also handles cancellation or a panic before the normal shutdown path.
 struct CheckoutActorCleanup {
     session_id: SessionId,
-    checkout_guards: Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>,
+    checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
 }
 impl Drop for CheckoutActorCleanup {
@@ -2790,7 +2795,7 @@ fn effective_approval_posture(
         .approval_posture
         .as_ref()
         .filter(|posture| posture.pinned)
-        .map(|posture| posture.value.clone())
+        .map(|posture| posture.value)
         .filter(|posture| posture.provider() == *provider)
         .or_else(|| crate::protocol::ApprovalPosture::for_provider(provider, &settings.settings))
 }

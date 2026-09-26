@@ -248,7 +248,7 @@ async fn native_permission_families_keep_their_typed_detail_and_all_decisions() 
         matches!(approval(&pending, "Edit file").1, ApprovalSubject::FileChange { paths, .. } if paths == [std::path::PathBuf::from("src/main.rs")])
     );
     assert!(
-        matches!(approval(&pending, "Read manifest").1, ApprovalSubject::Read { path } if path == std::path::PathBuf::from("Cargo.toml"))
+        matches!(approval(&pending, "Read manifest").1, ApprovalSubject::Read { path } if path == *"Cargo.toml")
     );
     assert!(
         matches!(approval(&pending, "Fetch docs").1, ApprovalSubject::Network { host_or_url } if host_or_url.contains("2001:db8"))

@@ -793,7 +793,7 @@ impl RunLoop {
                 let results = self.channels.submissions.clone();
                 tokio::spawn(async move {
                     let result = commands
-                        .preview_checkout_removal(target)
+                        .preview_checkout_removal(*target)
                         .await
                         .map(|preview| crate::protocol::RemoveCheckoutResult {
                             preview,
@@ -817,7 +817,7 @@ impl RunLoop {
                 let results = self.channels.submissions.clone();
                 tokio::spawn(async move {
                     let result = commands
-                        .remove_checkout(request)
+                        .remove_checkout(*request)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = results.send(SubmissionResult::CheckoutRemoval {

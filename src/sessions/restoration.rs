@@ -136,22 +136,12 @@ impl SessionStoreState {
     }
 }
 
+#[derive(Default)]
 struct RestoredCostState {
     components: Vec<RestoredCostComponent>,
     uncovered_work: Vec<RestoredWork>,
     total_cost: Option<Cost>,
     incomplete: usize,
-}
-
-impl Default for RestoredCostState {
-    fn default() -> Self {
-        Self {
-            components: Vec::new(),
-            uncovered_work: Vec::new(),
-            total_cost: None,
-            incomplete: 0,
-        }
-    }
 }
 
 impl RestoredCostState {

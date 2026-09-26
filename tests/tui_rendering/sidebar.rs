@@ -2149,10 +2149,7 @@ fn sidebar_showing_at_width(
                 initial_width,
                 ..SidebarSettings::default()
             },
-            session: SessionSettings {
-                content_width,
-                ..SessionSettings::default()
-            },
+            session: SessionSettings { content_width },
             ..EffectiveSettings::default()
         },
         Vec::new(),
@@ -9442,9 +9439,13 @@ fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
             listed_as(SessionId::new(), "Second title", workspace.path(), 2),
         ],
     );
-    let mut settings = EffectiveSettings::default();
-    settings.sidebar = shown(AutoSettle::default());
-    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let settings = EffectiveSettings {
+        sidebar: shown(AutoSettle::default()),
+        text_selection: suru::protocol::TextSelectionSettings {
+            copy: suru::protocol::TextSelectionCopy::Release,
+        },
+        ..EffectiveSettings::default()
+    };
     deliver_settings(&mut application, settings);
     let buffer = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
     let first = text_position(&buffer, "A title far");

@@ -7565,7 +7565,7 @@ fn transcript_edge_drag_speed_tracks_distance_and_reentry_disarms_ticks() {
                     row.split_once("line ")
                         .and_then(|(_, tail)| tail.trim().parse().ok())
                 })
-                .last()
+                .next_back()
                 .unwrap()
         };
         let before = last_number(&buffer);

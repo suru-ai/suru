@@ -23,11 +23,13 @@ struct HyperlinkCell {
     cell: Cell,
 }
 
+type Hyperlinks = BTreeMap<(u16, u16), HyperlinkCell>;
+
 #[derive(Default)]
 struct HyperlinkFrame {
     enabled: bool,
     targets: BTreeMap<(u16, u16), String>,
-    cells: BTreeMap<(u16, u16), HyperlinkCell>,
+    cells: Hyperlinks,
     covered: BTreeSet<(u16, u16)>,
 }
 
@@ -99,7 +101,7 @@ pub(crate) fn finish_frame(buffer: &Buffer, hyperlinks_visible: bool) {
     });
 }
 
-fn take_frame() -> (BTreeMap<(u16, u16), HyperlinkCell>, BTreeSet<(u16, u16)>) {
+fn take_frame() -> (Hyperlinks, BTreeSet<(u16, u16)>) {
     HYPERLINK_FRAME.with(|frame| {
         let mut frame = frame.borrow_mut();
         (
@@ -155,7 +157,7 @@ pub(super) struct FrameBackend<B> {
     /// The last MoveTo written, or `None` when the terminal's cursor is
     /// somewhere else: unknown at start, or displaced by the diff's own moves.
     position: Option<Position>,
-    hyperlinks: BTreeMap<(u16, u16), HyperlinkCell>,
+    hyperlinks: Hyperlinks,
 }
 
 impl<B> FrameBackend<B> {

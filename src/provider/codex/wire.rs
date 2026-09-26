@@ -322,19 +322,10 @@ impl From<NativeModel> for ModelDescriptor {
 
 // Thread lifecycle.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct CodexPosture {
     pub(super) approval_policy: CodexApprovalPolicy,
     pub(super) sandbox_mode: CodexSandboxMode,
-}
-
-impl Default for CodexPosture {
-    fn default() -> Self {
-        Self {
-            approval_policy: CodexApprovalPolicy::default(),
-            sandbox_mode: CodexSandboxMode::default(),
-        }
-    }
 }
 
 impl CodexPosture {

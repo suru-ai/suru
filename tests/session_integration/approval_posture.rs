@@ -455,13 +455,13 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
             .update_approval_posture(
                 created.session.id,
                 UpdateApprovalPostureRequest {
-                    posture: Some(pinned.clone()),
+                    posture: Some(pinned),
                 },
             )
             .await
             .unwrap(),
         SessionApprovalPosture {
-            value: pinned.clone(),
+            value: pinned,
             pinned: true,
             application: suru::protocol::ApprovalPostureApplication::Applied,
         }
@@ -486,7 +486,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
             .session
             .approval_posture,
         Some(SessionApprovalPosture {
-            value: pinned.clone(),
+            value: pinned,
             pinned: true,
             application: suru::protocol::ApprovalPostureApplication::Applied,
         })
@@ -524,7 +524,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
             .await
             .unwrap(),
         SessionApprovalPosture {
-            value: followed.clone(),
+            value: followed,
             pinned: false,
             application: suru::protocol::ApprovalPostureApplication::Applied,
         }

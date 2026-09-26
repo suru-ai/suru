@@ -4,7 +4,7 @@ use suru::{
     protocol::{Activity, Answer, QuestionAnswer, QuestionnaireOutcome, QuestionnaireSubmission},
     provider::CopilotRuntime,
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 pub(super) const ASK: &str = r#"      reply '{"jsonrpc":"2.0","id":9001,"method":"userInput.request","params":{"sessionId":"'"$sid"'","question":"Where should I run?","choices":["Local","Remote"],"allowFreeform":true}}'
 "#;

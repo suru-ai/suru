@@ -124,8 +124,7 @@ fn list_plans(content: &str) -> VecDeque<ListPlan> {
                     .and_then(|_| {
                         content[range]
                             .bytes()
-                            .skip_while(u8::is_ascii_digit)
-                            .next()
+                            .find(|byte| !byte.is_ascii_digit())
                             .map(char::from)
                     })
                     .filter(|delimiter| matches!(delimiter, '.' | ')'))
@@ -756,8 +755,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn emit_separator(&mut self) {
-        let mut line = StyledLine::default();
-        line.spans = self.structural_prefix(false);
+        let line = StyledLine {
+            spans: self.structural_prefix(false),
+            ..StyledLine::default()
+        };
         self.output_lines_mut().push(line);
     }
 
@@ -1652,7 +1653,7 @@ mod tests {
         assert!(lines.len() > 3, "the table keeps its bordered projection");
         assert!(lines.iter().all(|line| line.width() <= 28));
         assert!(lines.iter().all(|line| {
-            line.spans.get(0).is_some_and(|span| span.content == "│ ")
+            line.spans.first().is_some_and(|span| span.content == "│ ")
                 && line.spans.get(1).is_some_and(|span| span.content == "│ ")
         }));
     }

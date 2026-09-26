@@ -111,10 +111,7 @@ fn without_codex() -> EffectiveSettings {
 
 fn with_content_width(content_width: SessionContentWidth) -> EffectiveSettings {
     EffectiveSettings {
-        session: SessionSettings {
-            content_width,
-            ..SessionSettings::default()
-        },
+        session: SessionSettings { content_width },
         ..EffectiveSettings::default()
     }
 }
@@ -2618,10 +2615,7 @@ fn the_open_panel_takes_the_keys_the_composer_would_otherwise_get() {
 /// Agent Selection derives a Session's Title.
 fn deriving_titles_with(errand: DerivationErrand) -> EffectiveSettings {
     EffectiveSettings {
-        derivation: DerivationSettings {
-            errand,
-            ..DerivationSettings::default()
-        },
+        derivation: DerivationSettings { errand },
         ..EffectiveSettings::default()
     }
 }

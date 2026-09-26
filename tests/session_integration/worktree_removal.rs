@@ -10,7 +10,7 @@ use suru::source_control::{
 async fn target(path: &Path) -> CheckoutRemovalTarget {
     let resolved = GitSourceControl::default().discover(path).await;
     CheckoutRemovalTarget {
-        repository: resolved.workspace.repository.unwrap(),
+        repository: *resolved.workspace.repository.unwrap(),
         checkout: resolved.checkout.unwrap(),
     }
 }

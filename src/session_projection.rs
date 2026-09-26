@@ -34,7 +34,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 next.session.agent_selection_availability = *availability;
             }
             SessionChange::ApprovalPostureChanged { approval_posture } => {
-                next.session.approval_posture = approval_posture.clone();
+                next.session.approval_posture = *approval_posture;
             }
             SessionChange::PromptAdded { prompt } => {
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {

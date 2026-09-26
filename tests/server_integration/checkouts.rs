@@ -830,7 +830,7 @@ async fn remote_removal_routes_to_owner_counts_its_catalog_and_streams_missing()
     observed(&remote, &mut subscription, 1, |r| branch(r, "topic")).await;
     let location = GitSourceControl::default().discover(&linked).await;
     let target = CheckoutRemovalTarget {
-        repository: location.workspace.repository.unwrap(),
+        repository: *location.workspace.repository.unwrap(),
         checkout: location.checkout.unwrap(),
     };
     let facts = remote.preview_checkout_removal(target).await.unwrap();

@@ -2154,14 +2154,13 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 snapshot.session.execution_directory.path.clone(),
                 snapshot.prompts[0].id,
             );
-            if let Some(plan) = &preparation {
-                if let Err(error) = state
+            if let Some(plan) = &preparation
+                && let Err(error) = state
                     .source_control
                     .checkpoint(crate::source_control::PreparationCheckpoint::Admitted, plan)
                     .await
-                {
-                    return preparation_error(error);
-                }
+            {
+                return preparation_error(error);
             }
             // After the Turn is scheduled and never in front of it: a Title is
             // cosmetic and the user's actual work does not wait on one. Only a
@@ -2428,64 +2427,63 @@ async fn admit_prompt(
     let mut execution = None;
     if !state.sessions.knows_prompt(request.prompt.id)
         && let Some(snapshot) = state.sessions.snapshot(session_id)
+        && snapshot.session.checkout.is_some()
     {
-        if snapshot.session.checkout.is_some() {
-            let lease = match state
-                .source_control
-                .prepare_execution(&snapshot.session, None)
-                .await
-            {
-                Ok(lease) => lease,
-                Err(e) => {
-                    return preparation_error(format!(
-                        "Worktree unavailable; retry after resolving recovery: {e}"
-                    ));
-                }
-            };
-            if let Some(reading) = lease.reading.clone()
-                && let Err(error) = state.sessions.record_execution_checkout(reading)
-            {
+        let lease = match state
+            .source_control
+            .prepare_execution(&snapshot.session, None)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(e) => {
                 return preparation_error(format!(
-                    "Cannot persist current checkout recovery facts: {error}"
+                    "Worktree unavailable; retry after resolving recovery: {e}"
                 ));
             }
-            if snapshot
+        };
+        if let Some(reading) = lease.reading.clone()
+            && let Err(error) = state.sessions.record_execution_checkout(reading)
+        {
+            return preparation_error(format!(
+                "Cannot persist current checkout recovery facts: {error}"
+            ));
+        }
+        if snapshot
+            .session
+            .checkout
+            .as_ref()
+            .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
+        {
+            let provider = snapshot
                 .session
-                .checkout
+                .agent_selection
                 .as_ref()
-                .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
-            {
-                let provider = snapshot
-                    .session
-                    .agent_selection
-                    .as_ref()
-                    .map(|s| s.provider.clone())
-                    .or_else(|| state.hosted_providers.first().cloned());
-                if let Some(provider) = provider {
-                    match tokio::time::timeout(
-                        state.timings.checkout_skill_timeout,
-                        state.skill_catalog.refresh_current(SkillCatalogRequest {
-                            provider,
-                            execution_directory: snapshot.session.execution_directory.clone(),
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(Ok(catalog))
-                            if matches!(
-                                catalog.status,
-                                crate::protocol::SkillCatalogStatus::Fresh { .. }
-                            ) => {}
-                        _ => {
-                            return preparation_error(
-                                "Destination Skills are unavailable; Worktree retained, retry after restoring the catalog",
-                            );
-                        }
+                .map(|s| s.provider.clone())
+                .or_else(|| state.hosted_providers.first().cloned());
+            if let Some(provider) = provider {
+                match tokio::time::timeout(
+                    state.timings.checkout_skill_timeout,
+                    state.skill_catalog.refresh_current(SkillCatalogRequest {
+                        provider,
+                        execution_directory: snapshot.session.execution_directory.clone(),
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(catalog))
+                        if matches!(
+                            catalog.status,
+                            crate::protocol::SkillCatalogStatus::Fresh { .. }
+                        ) => {}
+                    _ => {
+                        return preparation_error(
+                            "Destination Skills are unavailable; Worktree retained, retry after restoring the catalog",
+                        );
                     }
                 }
             }
-            execution = Some(lease);
         }
+        execution = Some(lease);
     }
 
     if !request.prompt.skill_invocations.is_empty()
@@ -2584,6 +2582,9 @@ async fn admit_prompt(
     }
 }
 
+// A rejection is the Response the handler returns as-is, which is the axum
+// idiom; boxing it would only add an allocation to every refusal.
+#[allow(clippy::result_large_err)]
 async fn validate_new_prompt_skills(
     state: &AppState,
     provider: Option<ProviderId>,
@@ -2763,6 +2764,9 @@ async fn interrupt_session(
     }
 }
 
+// A rejection is the Response the handler returns as-is, which is the axum
+// idiom; boxing it would only add an allocation to every refusal.
+#[allow(clippy::result_large_err)]
 async fn decode_session_command<T: DeserializeOwned>(
     state: &AppState,
     request: Request,

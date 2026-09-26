@@ -16,7 +16,7 @@ use suru::{
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 use crate::{
     scripted_binary_support::{captured_methods, captured_requests, write_executable},
@@ -628,7 +628,6 @@ impl LiveTurn {
             server,
             client,
             feed,
-            _config_dir: _,
             ..
         } = self;
         drop(feed);

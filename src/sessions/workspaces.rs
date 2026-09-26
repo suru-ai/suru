@@ -64,15 +64,14 @@ impl SessionStore {
             // A retained working copy is an execution identity, not a path hint.
             // A different repository or checkout replacing that path cannot
             // inherit the Session or its opaque Provider Resume State.
-            if let Some(known) = &session.checkout {
-                if resolution.workspace.id != session.workspace.id
+            if let Some(known) = &session.checkout
+                && (resolution.workspace.id != session.workspace.id
                     || resolution
                         .checkout
                         .as_ref()
-                        .is_some_and(|actual| actual.id != known.id)
-                {
-                    continue;
-                }
+                        .is_some_and(|actual| actual.id != known.id))
+            {
+                continue;
             }
             self.regroup(
                 session.id,

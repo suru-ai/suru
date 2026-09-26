@@ -41,7 +41,7 @@ impl Layout {
         let workspace = Workspace {
             id: id.workspace_id(),
             path: main.clone(),
-            repository: Some(repository),
+            repository: Some(Box::new(repository)),
             source_control: SourceControlAvailability::Available,
             icon: None,
         };
@@ -980,7 +980,7 @@ fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckou
     let destination = layout.main.join(".suru-worktrees/prepared");
     std::fs::create_dir_all(&destination).unwrap();
     let mut location = layout.at(&destination);
-    let repository = location.workspace.repository.clone().unwrap();
+    let repository = *location.workspace.repository.clone().unwrap();
     location.checkout = Some(CheckoutAssociation {
         recovery_revision: None,
         reclaim: None,
@@ -1605,7 +1605,7 @@ fn linked_removal_confirmation_warns_counts_cancel_is_read_only_and_force_is_dis
         panic!("read-only preview");
     };
     let preview = CheckoutRemovalPreview {
-        target,
+        target: *target,
         inspection: CheckoutRemovalInspection {
             checkout: layout.context.checkouts[1].clone(),
             tracked: vec!["tracked".into()],
@@ -1682,7 +1682,7 @@ fn main_removal_unavailable_and_canceled_preview_response_is_ignored() {
     };
     key(&mut app, KeyCode::Esc);
     let preview = CheckoutRemovalPreview {
-        target,
+        target: *target,
         inspection: CheckoutRemovalInspection {
             checkout: layout.context.checkouts[1].clone(),
             tracked: vec![],
@@ -1721,7 +1721,7 @@ fn successful_removal_marks_selected_exact_directory_unavailable_and_keeps_it_se
         panic!("preview linked");
     };
     let preview = CheckoutRemovalPreview {
-        target,
+        target: *target,
         inspection: CheckoutRemovalInspection {
             checkout: layout.context.checkouts[1].clone(),
             tracked: vec![],

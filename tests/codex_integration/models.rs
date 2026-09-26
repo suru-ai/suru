@@ -15,7 +15,7 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 const MODEL_CATALOG_CODEX: &str = r#"#!/bin/sh
 attempt=1

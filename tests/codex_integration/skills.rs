@@ -18,7 +18,7 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 const SKILL_CODEX: &str = r#"
     *'"method":"initialize"'*)

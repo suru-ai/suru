@@ -412,7 +412,7 @@ impl SourceControl for GitSourceControl {
         let repository = source
             .workspace
             .repository
-            .as_ref()
+            .as_deref()
             .ok_or("A Repository is required")?;
         let root = match &repository.location {
             RepositoryLocation::Main { root } | RepositoryLocation::Bare { root } => root,
@@ -995,7 +995,7 @@ impl SourceControl for GitSourceControl {
                 reason: "The main checkout location is unknown".to_owned(),
             }
         } else if self
-            .text(&directory, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .text(directory, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await
             .is_none()
         {

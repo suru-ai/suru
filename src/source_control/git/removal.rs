@@ -254,10 +254,10 @@ impl GitSourceControl {
                 b"!!" => ignored.push(path),
                 _ => {
                     tracked.push(path);
-                    if entry[..2].contains(&b'R') || entry[..2].contains(&b'C') {
-                        if let Some(old) = entries.next() {
-                            tracked.push(String::from_utf8_lossy(old).into_owned());
-                        }
+                    if (entry[..2].contains(&b'R') || entry[..2].contains(&b'C'))
+                        && let Some(old) = entries.next()
+                    {
+                        tracked.push(String::from_utf8_lossy(old).into_owned());
                     }
                 }
             }

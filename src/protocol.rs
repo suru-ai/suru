@@ -461,7 +461,10 @@ pub struct Workspace {
     pub id: WorkspaceId,
     /// Presentation only: identity is unchanged when a main root becomes known.
     pub path: PathBuf,
-    pub repository: Option<Repository>,
+    /// Boxed because a Repository's capabilities and location outweigh the
+    /// rest of the Workspace several times over, and a Workspace rides along
+    /// in many enums that would otherwise all be sized to it.
+    pub repository: Option<Box<Repository>>,
     pub source_control: SourceControlAvailability,
     /// The Workspace's Icon, as the `workspaces` table holds it: absent until
     /// a derivation lands one for good. It rides every copy of a Workspace —

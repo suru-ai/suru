@@ -622,6 +622,9 @@ impl TranscriptCache {
         )
     }
 
+    // One parameter per input the cached view is keyed on, so a change to any
+    // of them is visibly a change to what gets rebuilt.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn view_with_hyperlinks(
         &self,
         generation: u64,
@@ -1561,8 +1564,7 @@ impl RenderUnit<'_> {
     /// the unit has one.
     fn render(
         &self,
-        lines: &mut Vec<StyledLine>,
-        links: &mut Vec<TranscriptLink>,
+        projection: &mut ActivityProjection<'_>,
         folds: &TranscriptFolds,
         theme: &Theme,
         width: u16,
@@ -1571,12 +1573,11 @@ impl RenderUnit<'_> {
     ) -> Option<UnitAnchor> {
         match self {
             Self::Message(message, parent) => {
-                render_message(lines, message, *parent, theme, width, hyperlinks);
+                render_message(projection.lines, message, *parent, theme, width, hyperlinks);
                 None
             }
             Self::Activity(activity) => render_activity(
-                lines,
-                links,
+                projection,
                 activity,
                 resolved_fold_step(folds, activity),
                 theme,
@@ -1589,13 +1590,18 @@ impl RenderUnit<'_> {
                 members,
                 expanded,
             } => Some(render_group(
-                lines, *kind, members, *expanded, theme, width, hyperlinks,
+                projection.lines,
+                *kind,
+                members,
+                *expanded,
+                theme,
+                width,
+                hyperlinks,
             )),
             Self::GroupMember(activity) => {
-                let start = lines.len();
+                let start = projection.lines.len();
                 let anchor = render_activity(
-                    lines,
-                    links,
+                    projection,
                     activity,
                     resolved_fold_step(folds, activity),
                     theme,
@@ -1603,26 +1609,31 @@ impl RenderUnit<'_> {
                     hyperlinks,
                     workspace,
                 );
-                indent_members(&mut lines[start..]);
+                indent_members(&mut projection.lines[start..]);
                 anchor
             }
             Self::TurnMember(unit) => {
-                let start = lines.len();
+                let start = projection.lines.len();
                 let anchor = unit.render(
-                    lines,
-                    links,
+                    projection,
                     folds,
                     theme,
                     width.saturating_sub(MEMBER_INDENT.len() as u16),
                     hyperlinks,
                     workspace,
                 );
-                indent_members(&mut lines[start..]);
+                indent_members(&mut projection.lines[start..]);
                 anchor
             }
-            Self::TurnFold(marker) => Some(render_turn_fold(lines, *marker, theme)),
+            Self::TurnFold(marker) => Some(render_turn_fold(projection.lines, *marker, theme)),
             Self::Provisional(prompt) => {
-                push_user_message(lines, &prompt.text, &prompt.skill_invocations, theme, width);
+                push_user_message(
+                    projection.lines,
+                    &prompt.text,
+                    &prompt.skill_invocations,
+                    theme,
+                    width,
+                );
                 None
             }
         }
@@ -2600,8 +2611,10 @@ fn reuse_or_render(
     let mut rendered = Vec::new();
     let mut links = Vec::new();
     let rendered_anchor = unit.render(
-        &mut rendered,
-        &mut links,
+        &mut ActivityProjection {
+            lines: &mut rendered,
+            links: &mut links,
+        },
         folds,
         theme,
         width,
@@ -2959,8 +2972,7 @@ fn delegation_sender(delegator: &Delegator, parent: Option<SessionId>) -> String
 /// Each kind projects through its own renderer, so what one kind shows never
 /// depends on how another renders.
 fn render_activity(
-    lines: &mut Vec<StyledLine>,
-    links: &mut Vec<TranscriptLink>,
+    projection: &mut ActivityProjection<'_>,
     activity: &Activity,
     step: FoldStep,
     theme: &Theme,
@@ -2968,7 +2980,6 @@ fn render_activity(
     hyperlinks: bool,
     workspace: &Path,
 ) -> Option<UnitAnchor> {
-    let mut projection = ActivityProjection { lines, links };
     match activity {
         Activity::Approval {
             approval,
@@ -3089,7 +3100,7 @@ fn render_activity(
         }
         Activity::Status { text, .. } => {
             push_styled_prefixed_lines(
-                &mut projection,
+                projection,
                 ContentGutter {
                     lead: "  ",
                     indent: "  ",
@@ -3102,7 +3113,7 @@ fn render_activity(
         }
         Activity::Error { text, .. } => {
             push_styled_prefixed_lines(
-                &mut projection,
+                projection,
                 ContentGutter {
                     lead: "  Error: ",
                     indent: "  ",
@@ -3122,7 +3133,7 @@ fn render_activity(
             exit_status,
             ..
         } => Some(push_command_activity(
-            &mut projection,
+            projection,
             CommandActivity {
                 status: *status,
                 command,
@@ -4783,10 +4794,10 @@ mod tests {
     };
 
     use super::{
-        CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan,
-        TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
-        TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
-        render_activity, render_message, split_oversized_line,
+        ActivityProjection, CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine,
+        StyledSpan, TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds,
+        TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line,
+        push_user_message, render_activity, render_message, split_oversized_line,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -4954,8 +4965,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Expanded,
             &theme,
@@ -5005,8 +5018,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Expanded,
             &theme,
@@ -5299,8 +5314,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Peek,
             &theme,
@@ -5334,8 +5351,10 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
         render_activity(
-            &mut lines,
-            &mut Vec::new(),
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut Vec::new(),
+            },
             &activity,
             FoldStep::Expanded,
             &theme,
@@ -5373,8 +5392,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Expanded,
             &theme,
@@ -5460,8 +5481,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Peek,
             &theme,
@@ -5535,8 +5558,10 @@ mod tests {
         let mut links = Vec::new();
 
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Expanded,
             &Theme::system(),
@@ -7107,8 +7132,10 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &activity,
             FoldStep::Peek,
             &Theme::system(),
@@ -7156,8 +7183,10 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &command("cargo build --release --workspace --all-targets", ""),
             FoldStep::Folded,
             &Theme::system(),
@@ -7294,8 +7323,10 @@ mod tests {
 
         let mut reasoning_lines = Vec::new();
         render_activity(
-            &mut reasoning_lines,
-            &mut Vec::new(),
+            &mut ActivityProjection {
+                lines: &mut reasoning_lines,
+                links: &mut Vec::new(),
+            },
             &reasoning(ActivityStatus::Completed, None, table),
             FoldStep::Expanded,
             &theme,
@@ -7317,8 +7348,10 @@ mod tests {
         let mut lines = Vec::new();
         let mut links = Vec::new();
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
             FoldStep::Folded,
             &Theme::system(),
@@ -7338,8 +7371,10 @@ mod tests {
 
         let mut lines = Vec::new();
         render_activity(
-            &mut lines,
-            &mut links,
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut links,
+            },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
             FoldStep::Expanded,
             &Theme::system(),
@@ -7614,8 +7649,10 @@ mod tests {
             let mut lines = Vec::new();
             let mut links = Vec::new();
             render_activity(
-                &mut lines,
-                &mut links,
+                &mut ActivityProjection {
+                    lines: &mut lines,
+                    links: &mut links,
+                },
                 &activity,
                 FoldStep::Folded,
                 &Theme::system(),

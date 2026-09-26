@@ -454,15 +454,15 @@ async fn next_provider_event(
                 return Some((Err(error), events));
             }
             Some(Ok(event)) => {
-                if let TimelineEvent::Native(event) = &event {
-                    if matches!(
+                if let TimelineEvent::Native(event) = &event
+                    && matches!(
                         event.parsed_type(),
                         SessionEventType::SessionIdle
                             | SessionEventType::SubagentCompleted
                             | SessionEventType::SubagentFailed
-                    ) {
-                        events.approvals.wait_for_settled_decision().await;
-                    }
+                    )
+                {
+                    events.approvals.wait_for_settled_decision().await;
                 }
                 queue_projected(&mut events, event);
             }
@@ -601,7 +601,7 @@ fn project_session_event(
         };
         if event.parsed_type() == SessionEventType::AssistantUsage {
             let model = reported::<AssistantUsageData>(&event)
-                .and_then(|usage| (!usage.model.is_empty()).then(|| usage.model));
+                .and_then(|usage| (!usage.model.is_empty()).then_some(usage.model));
             let mut projected = Vec::new();
             if let Some(model) = model {
                 projected.push(attributed(

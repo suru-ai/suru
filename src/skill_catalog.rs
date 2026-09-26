@@ -321,11 +321,7 @@ impl SkillCatalogService {
         }
 
         let mut rebound = prompt.clone();
-        for (invocation, destination) in rebound
-            .skill_invocations
-            .iter_mut()
-            .zip(destinations.into_iter())
-        {
+        for (invocation, destination) in rebound.skill_invocations.iter_mut().zip(destinations) {
             let destination = destination.expect("every destination match was validated");
             invocation.skill_id = destination.id.clone();
             invocation.name.clone_from(&destination.name);

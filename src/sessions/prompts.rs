@@ -425,7 +425,7 @@ impl SessionStore {
         // `Some` the moment `Derivation::derive` looks at it.
         location.workspace.icon = state.workspace_icons.get(&location.workspace.id).cloned();
         let title = request.prompt.text.trim().to_owned();
-        let session_id = intended_session.unwrap_or_else(SessionId::new);
+        let session_id = intended_session.unwrap_or_default();
         // The Session is Working from this moment: its Prompt is admitted to
         // begin a Turn, and the elapsed time every surface reads is attributed
         // from here rather than from whenever the Provider answers (ADR 0024).

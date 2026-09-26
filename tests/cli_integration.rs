@@ -2351,7 +2351,7 @@ impl FixtureHandshake {
             .forget();
     }
 
-    async fn open(&self) -> Result<HandshakeConnection, Response> {
+    async fn open(&self) -> Result<HandshakeConnection, StatusCode> {
         let connection = HandshakeConnection {
             closed: self.closed.clone(),
             body_ready: self.body_ready.subscribe(),
@@ -2365,7 +2365,7 @@ impl FixtureHandshake {
             .expect("handshake response control remains open");
         match status.expect("response was released") {
             StatusCode::OK => Ok(connection),
-            status => Err(status.into_response()),
+            status => Err(status),
         }
     }
 }
@@ -2640,7 +2640,7 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
     let request_index = state.event_requests.fetch_add(1, Ordering::SeqCst);
     let connection = match state.lifecycle_handshake.open().await {
         Ok(connection) => connection,
-        Err(response) => return response,
+        Err(status) => return status.into_response(),
     };
     if *state.lifecycle.lock().expect("lock lifecycle") != LifecycleState::Ready {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2702,7 +2702,7 @@ async fn readiness_catalog_events(
     }
     match state.catalog_handshake.open().await {
         Ok(connection) => connection.track(empty_catalog_stream()),
-        Err(response) => response,
+        Err(status) => status.into_response(),
     }
 }
 

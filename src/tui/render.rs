@@ -2147,7 +2147,6 @@ fn session_picker_row_text(
     let mut metadata = remote_tag
         .iter()
         .cloned()
-        .into_iter()
         .chain(status)
         .chain([age])
         .collect::<Vec<_>>();
@@ -2992,7 +2991,6 @@ fn sidebar_entry_lines(
         SidebarEntry::Row(row) => match row.shelf {
             SidebarShelf::Active {
                 workspace,
-                workspace_icon,
                 updated_at,
                 working_since,
                 ..
@@ -3001,7 +2999,6 @@ fn sidebar_entry_lines(
                 workspace
                     .map(|path| state.workspace_name(&row.reference.origin, path))
                     .unwrap_or_default(),
-                workspace_icon,
                 sidebar_active_slot(row.standing, working_since, updated_at, now),
                 width,
                 driving,
@@ -3177,7 +3174,6 @@ fn sidebar_plain_line(
 fn sidebar_active_row_lines(
     row: SidebarRow<'_>,
     workspace: String,
-    workspace_icon: Option<char>,
     slot: String,
     width: usize,
     driving: bool,
@@ -3186,6 +3182,10 @@ fn sidebar_active_row_lines(
 ) -> [Line<'static>; sidebar::ACTIVE_ROW_LINES] {
     let highlight = sidebar_row_style(row, driving, theme);
     let label_style = highlight.unwrap_or(theme.text.subdued);
+    let workspace_icon = match row.shelf {
+        SidebarShelf::Active { workspace_icon, .. } => workspace_icon,
+        SidebarShelf::Settled { .. } => None,
+    };
     let workspace = if workspace.is_empty() {
         workspace
     } else {
@@ -4666,7 +4666,7 @@ fn render_session_header(
     // It draws only beside a Title that has something to stand beside: an
     // empty Title leaves the center blank, Icon included.
     let icon_prefix = (!title.is_empty())
-        .then(|| snapshot.icon.as_deref())
+        .then_some(snapshot.icon.as_deref())
         .flatten()
         .filter(|_| show_icons)
         .and_then(crate::icon_catalog::glyph)
@@ -5645,7 +5645,6 @@ mod tests {
                     settings: EffectiveSettings {
                         session: SessionSettings {
                             content_width: SessionContentWidth::Maximum(60),
-                            ..SessionSettings::default()
                         },
                         sidebar: SidebarSettings {
                             initial_visibility: SidebarVisibility::Hidden,

@@ -4082,13 +4082,15 @@ pub enum ApplicationTransition {
         workspace_id: WorkspaceId,
         icon: String,
     },
+    /// Both removal requests are boxed: each carries a whole Repository and
+    /// Checkout, which would otherwise size every transition to them.
     PreviewCheckoutRemoval {
         request_id: uuid::Uuid,
-        target: crate::protocol::CheckoutRemovalTarget,
+        target: Box<crate::protocol::CheckoutRemovalTarget>,
     },
     RemoveCheckout {
         request_id: uuid::Uuid,
-        request: crate::protocol::RemoveCheckoutRequest,
+        request: Box<crate::protocol::RemoveCheckoutRequest>,
     },
     PrepareCheckout {
         attempt_id: uuid::Uuid,
@@ -5771,7 +5773,10 @@ impl Application {
                     picker.removal_request = Some(request_id);
                     return ApplicationTransition::RemoveCheckout {
                         request_id,
-                        request: crate::protocol::RemoveCheckoutRequest { preview, force },
+                        request: Box::new(crate::protocol::RemoveCheckoutRequest {
+                            preview,
+                            force,
+                        }),
                     };
                 }
                 if command == SemanticCommandId::WorktreeForceRemove {
@@ -5786,17 +5791,17 @@ impl Application {
                     && let Some(repository) = picker
                         .context
                         .as_ref()
-                        .and_then(|c| c.workspace.repository.clone())
+                        .and_then(|c| c.workspace.repository.as_deref().cloned())
                 {
                     picker.loading = true;
                     picker.removal_request = Some(request_id);
                     picker.error = None;
                     return ApplicationTransition::PreviewCheckoutRemoval {
                         request_id,
-                        target: crate::protocol::CheckoutRemovalTarget {
+                        target: Box::new(crate::protocol::CheckoutRemovalTarget {
                             repository,
                             checkout,
-                        },
+                        }),
                     };
                 }
                 picker.error =

@@ -463,13 +463,21 @@ impl SessionStore {
         let repository = state
             .sessions
             .get(&session_id)
-            .and_then(|record| record.summary.session.workspace.repository.clone())
+            .and_then(|record| {
+                record
+                    .summary
+                    .session
+                    .workspace
+                    .repository
+                    .as_deref()
+                    .cloned()
+            })
             .or_else(|| {
                 state
                     .unreadable_sessions
                     .get(&session_id)
                     .and_then(|unreadable| unreadable.summary.workspace.as_ref())
-                    .and_then(|workspace| workspace.repository.clone())
+                    .and_then(|workspace| workspace.repository.as_deref().cloned())
             });
         // A Session's Subagent subtree shares its deletion, walked deepest
         // first so a failure partway leaves no child severed from the parent

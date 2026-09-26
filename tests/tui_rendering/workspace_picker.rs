@@ -1496,7 +1496,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
     let unknown = Workspace {
         id: repository.id.workspace_id(),
         path: metadata,
-        repository: Some(repository.clone()),
+        repository: Some(Box::new(repository.clone())),
         source_control: SourceControlAvailability::Available,
         icon: None,
     };
@@ -1599,7 +1599,7 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
     let workspace = Workspace {
         id: repository.id.workspace_id(),
         path: root.clone(),
-        repository: Some(repository),
+        repository: Some(Box::new(repository)),
         source_control: SourceControlAvailability::Available,
         icon: None,
     };

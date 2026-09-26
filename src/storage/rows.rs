@@ -421,7 +421,7 @@ impl SessionRow {
                 workspace: Some(session.workspace.clone()),
                 execution_directory: Some(session.execution_directory.clone()),
                 checkout: session.checkout.clone(),
-                approval_posture: session.approval_posture.clone(),
+                approval_posture: session.approval_posture,
             },
         )
     }

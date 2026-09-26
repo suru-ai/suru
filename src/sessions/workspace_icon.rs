@@ -397,7 +397,7 @@ mod tests {
         let root = tempfile::tempdir().expect("create a per-platform temp root");
         std::fs::write(root.path().join("README.md"), "What this project does").unwrap();
         let mut workspace = Workspace::directory(root.path().to_owned());
-        workspace.repository = Some(repository_with_root(root.path().to_owned()));
+        workspace.repository = Some(Box::new(repository_with_root(root.path().to_owned())));
 
         let prompt = errand_prompt(&workspace);
         assert!(prompt.contains("What this project does"));

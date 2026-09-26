@@ -385,10 +385,10 @@ impl QuestionnairePanels {
             .visible
             .as_ref()
             .and_then(|key| self.drafts.get_mut(key))
+            && !panel.review
+            && !panel.submitting
         {
-            if !panel.review && !panel.submitting {
-                panel.questions[panel.current].text.pop();
-            }
+            panel.questions[panel.current].text.pop();
         }
     }
     pub(super) fn command(
@@ -493,8 +493,8 @@ impl QuestionnairePanels {
                 "Answer was not delivered. Review your draft and retry.",
             ));
         }
-        let navigation;
-        if panel.review {
+
+        let navigation = if panel.review {
             lines.push(Line::styled("Review Answer", theme.accent.primary));
             for (index, (question, draft)) in questionnaire
                 .questions
@@ -505,12 +505,12 @@ impl QuestionnairePanels {
                 lines.push(Line::from(format!("{}. {}", index + 1, question.text)));
                 lines.push(Line::from(answer_text(question, Some(&draft.answer()))));
             }
-            navigation = if panel.submitting {
+            if panel.submitting {
                 "Submitting… · waiting for server confirmation"
             } else {
                 "Ctrl+Enter submit · Shift+Tab back · Esc hide"
             }
-            .to_owned();
+            .to_owned()
         } else {
             lines.push(Line::styled(
                 format!(
@@ -576,7 +576,7 @@ impl QuestionnairePanels {
                     }
                 )));
             }
-            navigation = format!(
+            format!(
                 "↑/↓ choose · Space select · Enter {} · Shift+Tab back{}",
                 if panel.current + 1 < questionnaire.questions.len() {
                     "next"
@@ -588,8 +588,8 @@ impl QuestionnairePanels {
                 } else {
                     ""
                 }
-            );
-        }
+            )
+        };
         let footer = if panel.submitting {
             vec![
                 Line::from("Submitting… · waiting for server confirmation"),

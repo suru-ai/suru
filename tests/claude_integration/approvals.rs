@@ -577,12 +577,8 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
                 (ApprovalSubject::Command { command, .. }, "bash-repeat") => {
                     command == "cargo test"
                 }
-                (ApprovalSubject::FileChange { paths, .. }, "edit") => {
-                    paths[0] == std::path::PathBuf::from("src/main.rs")
-                }
-                (ApprovalSubject::FileChange { paths, .. }, "write") => {
-                    paths[0] == std::path::PathBuf::from("notes.txt")
-                }
+                (ApprovalSubject::FileChange { paths, .. }, "edit") => paths[0] == *"src/main.rs",
+                (ApprovalSubject::FileChange { paths, .. }, "write") => paths[0] == *"notes.txt",
                 (ApprovalSubject::Read { .. }, "read") => true,
                 (ApprovalSubject::Network { .. }, "network") => true,
                 (ApprovalSubject::OtherTool { .. }, "other") => true,

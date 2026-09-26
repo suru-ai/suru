@@ -18,7 +18,7 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig},
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 /// A server hosting the scripted Codex, a client connected past its initial state, and a Session
 /// opened on `prompt`, with the directories the Session lives in held for the fixture's lifetime.

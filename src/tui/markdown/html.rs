@@ -51,7 +51,7 @@ impl Normalizer {
             Event::FootnoteReference(label) if self.code.is_some() => {
                 self.code.as_mut().unwrap().push_str(&format!("[^{label}]"));
             }
-            Event::End(end) if self.stack.iter().any(|entry| *entry == Open::Markdown(end)) => {
+            Event::End(end) if self.stack.contains(&Open::Markdown(end)) => {
                 self.close_markdown(end);
             }
             Event::Start(_) if self.code.is_some() => {}
@@ -134,12 +134,14 @@ impl Normalizer {
             .find(|c: char| c.is_ascii_whitespace() || c == '/')
             .unwrap_or(body.len());
         let name = body[..name_end].to_ascii_lowercase();
-        if self.code.is_some() && !matches!(name.as_str(), "code" | "kbd") {
+        if let Some(code) = &mut self.code
+            && !matches!(name.as_str(), "code" | "kbd")
+        {
             if !closing
                 && name == "img"
                 && let Some(alt) = attribute(body, "alt")
             {
-                self.code.as_mut().unwrap().push_str(&alt);
+                code.push_str(&alt);
             }
             return;
         }

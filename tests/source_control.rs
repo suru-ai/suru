@@ -200,7 +200,7 @@ async fn same_named_tag_cannot_hide_an_unmerged_local_source_branch() {
 async fn removal_target(adapter: &GitSourceControl, path: &Path) -> CheckoutRemovalTarget {
     let resolved = adapter.discover(path).await;
     CheckoutRemovalTarget {
-        repository: resolved.workspace.repository.unwrap(),
+        repository: *resolved.workspace.repository.unwrap(),
         checkout: resolved.checkout.unwrap(),
     }
 }

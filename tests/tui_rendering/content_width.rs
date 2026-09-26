@@ -120,10 +120,7 @@ fn content_width_snapshot(
 ) -> SettingsSnapshot {
     SettingsSnapshot {
         settings: EffectiveSettings {
-            session: SessionSettings {
-                content_width,
-                ..SessionSettings::default()
-            },
+            session: SessionSettings { content_width },
             // The Session Content Column is what every measurement here is
             // about, so neither column stands in the middle of it.
             sidebar: SidebarSettings {
