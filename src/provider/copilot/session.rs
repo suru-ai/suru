@@ -35,7 +35,7 @@ use super::{
     COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
-    projection::{CopilotCorrelation, TaskRoster, provider_events},
+    projection::{CopilotCorrelation, TaskRosterSource, provider_events},
     skills::CopilotSkills,
     transport::CopilotConnection,
 };
@@ -179,7 +179,7 @@ pub(super) async fn start_copilot_session(
         correlation.clone(),
         skills.clone(),
         approvals.clone(),
-        TaskRoster {
+        TaskRosterSource {
             native: native.clone(),
             request_timeout: interrupt_request_timeout,
         },

@@ -7,13 +7,15 @@
 //! roster rather than aborting a loop that is not running.
 
 use crate::support::{
-    Opened, ScriptedCopilot, agent_messages, conversation_arms, opened_session, send_arm,
-    session_where, settled_session,
+    Opened, ScriptedCopilot, agent_messages, conversation_arms, opened_session, opened_session_on,
+    send_arm, session_where, settled_session,
 };
 use suru::protocol::{
     Activity, InterruptOutcome, SessionSnapshot, SessionStatus, TranscriptItem, TurnStatus,
     WatchOutcomeStatus,
 };
+use suru::provider::CopilotRuntime;
+use tokio::time::Duration;
 
 /// A Turn that starts a docs server as a detached shell and ends its loop, the way a live CLI
 /// reports it: the shell tool's start, the task roster changing as the shell registers, the tool
@@ -99,19 +101,17 @@ fn heading_activity(snapshot: &SessionSnapshot, turn_index: usize) -> &Activity 
         .unwrap_or_else(|| panic!("the Turn begins with an Activity: {snapshot:#?}"))
 }
 
-#[tokio::test]
-async fn a_detached_shells_completion_wakes_the_monitoring_session_into_a_continuation_headed_by_its_watch_outcome()
- {
-    let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}",
-        conversation_arms(),
-        send_arm(DETACHED_SHELL_LEFT_RUNNING),
-        task_roster_arm(DETACHED_SHELL_ROSTER, DETACHED_SHELL_COMPLETES),
-    ));
-    let opened = opened_session(&copilot, "copilot-detached-shell-watch", "Serve the docs").await;
-    monitoring_the_detached_shell(&opened).await;
+/// The detached shell's completion, played without waiting: the shell ran shorter than it took
+/// Suru to read the roster, or the read never came back.
+const DETACHED_SHELL_COMPLETES_AT_ONCE: &str = r#"      event e6 system.notification '{"content":"<system_notification>\nDetached shell \"Serve the docs\" (shellId: shell-1) has completed.\n</system_notification>","kind":{"type":"shell_detached_completed","shellId":"shell-1","description":"Serve the docs"}}'
+      event e7 assistant.message '{"messageId":"m2","content":"The docs server exited."}'
+      event e8 session.idle '{}'
+"#;
 
-    copilot.release();
+/// The Session once the loop the detached shell's completion woke has settled, which must have
+/// shown that work as a Continuation headed by the shell's Watch Outcome and left nothing to
+/// Monitor.
+async fn woken_by_the_detached_shell(opened: &Opened) -> SessionSnapshot {
     let woken = settled_session(&opened.client, opened.session_id, 1).await;
     let continuation = &woken.turns[1];
     assert_eq!(
@@ -144,6 +144,83 @@ async fn a_detached_shells_completion_wakes_the_monitoring_session_into_a_contin
         "the shell that woke the Agent is settled, so nothing is left to Monitor"
     );
     assert!(woken.watches.is_empty());
+    woken
+}
+
+#[tokio::test]
+async fn a_detached_shells_completion_wakes_the_monitoring_session_into_a_continuation_headed_by_its_watch_outcome()
+ {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(DETACHED_SHELL_LEFT_RUNNING),
+        task_roster_arm(DETACHED_SHELL_ROSTER, DETACHED_SHELL_COMPLETES),
+    ));
+    let opened = opened_session(&copilot, "copilot-detached-shell-watch", "Serve the docs").await;
+    monitoring_the_detached_shell(&opened).await;
+
+    copilot.release();
+    woken_by_the_detached_shell(&opened).await;
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_detached_shell_that_finished_before_the_roster_read_still_wakes_a_continuation_headed_by_its_watch_outcome()
+ {
+    let finished =
+        DETACHED_SHELL_ROSTER.replace(r#""status":"running""#, r#""status":"completed""#);
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(DETACHED_SHELL_LEFT_RUNNING),
+        task_roster_arm(&finished, DETACHED_SHELL_COMPLETES_AT_ONCE),
+    ));
+    let opened = opened_session(&copilot, "copilot-short-detached-shell", "Serve the docs").await;
+
+    let woken = woken_by_the_detached_shell(&opened).await;
+    assert_eq!(
+        woken.turns[0].status,
+        TurnStatus::Completed,
+        "the Turn settled on its own idle, with no Watch left for the Session to Monitor"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_roster_read_copilot_never_answers_gives_up_within_the_injected_timeout_and_the_completion_still_wakes_a_continuation()
+ {
+    // The roster arm plays the rest of the timeline without ever answering the read.
+    let silent_roster_arm = format!(
+        r#"    *'"method":"session.tasks.list"'*)
+{DETACHED_SHELL_COMPLETES_AT_ONCE}      ;;
+"#
+    );
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(DETACHED_SHELL_LEFT_RUNNING),
+        silent_roster_arm,
+    ));
+    let opened = opened_session_on(
+        CopilotRuntime::new(copilot.executable())
+            .with_interrupt_request_timeout(Duration::from_millis(300)),
+        "copilot-silent-task-roster",
+        "Serve the docs",
+    )
+    .await;
+
+    let woken = woken_by_the_detached_shell(&opened).await;
+    assert_eq!(woken.turns[0].status, TurnStatus::Completed);
 
     opened
         .server
@@ -314,6 +391,59 @@ async fn a_detached_shell_copilot_declines_to_cancel_leaves_the_session_monitori
     assert_eq!(
         still.session.monitoring_since, monitoring.session.monitoring_since,
         "the shell still runs, so the Session is still Monitoring it"
+    );
+    assert_eq!(still.watches, monitoring.watches);
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_cancel_copilot_never_answers_fails_the_stop_within_the_injected_timeout_and_leaves_the_session_monitoring()
+ {
+    let silent_cancel_arm = r#"    *'"method":"session.tasks.cancel"'*)
+      :
+      ;;
+"#;
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        conversation_arms(),
+        send_arm(DETACHED_SHELL_LEFT_RUNNING),
+        task_roster_arm(DETACHED_SHELL_ROSTER, ""),
+        silent_cancel_arm,
+    ));
+    let opened = opened_session_on(
+        CopilotRuntime::new(copilot.executable())
+            .with_interrupt_request_timeout(Duration::from_millis(300)),
+        "copilot-silent-shell-cancel",
+        "Serve the docs",
+    )
+    .await;
+    let monitoring = monitoring_the_detached_shell(&opened).await;
+
+    let error = opened
+        .client
+        .interrupt_session_reporting_outcome(opened.session_id)
+        .await
+        .expect_err("a cancel Copilot never answers reaches the client as a failure");
+    assert!(
+        error
+            .to_string()
+            .contains("timed out handling `session.tasks.cancel`"),
+        "the failure says Copilot never answered, got: {error:#}"
+    );
+
+    let still = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(
+        still.session.monitoring_since,
+        monitoring.session.monitoring_since
     );
     assert_eq!(still.watches, monitoring.watches);
 

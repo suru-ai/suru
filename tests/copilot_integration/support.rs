@@ -648,11 +648,21 @@ pub struct Opened {
 }
 
 pub async fn opened_session(copilot: &ScriptedCopilot, name: &'static str, prompt: &str) -> Opened {
+    opened_session_on(CopilotRuntime::new(copilot.executable()), name, prompt).await
+}
+
+/// The same Session opened on a `runtime` the caller has already tuned — injected timings above
+/// all.
+pub async fn opened_session_on(
+    runtime: CopilotRuntime,
+    name: &'static str,
+    prompt: &str,
+) -> Opened {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), name).expect("configure server"),
-        std::sync::Arc::new(CopilotRuntime::new(copilot.executable())),
+        std::sync::Arc::new(runtime),
     )
     .await
     .expect("spawn server");

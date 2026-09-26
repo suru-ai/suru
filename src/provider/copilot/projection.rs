@@ -351,7 +351,7 @@ impl CopilotCorrelation {
 /// changed: the Copilot Session itself, asked no longer than `request_timeout` — the bound every
 /// request Suru makes of the Session's loop waits under — because the timeline projects no
 /// further while the read is out.
-pub(super) struct TaskRoster {
+pub(super) struct TaskRosterSource {
     pub(super) native: Arc<NativeSession>,
     pub(super) request_timeout: Duration,
 }
@@ -365,7 +365,7 @@ pub(super) fn provider_events(
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
     approvals: Arc<super::approval::CopilotApprovals>,
-    roster: TaskRoster,
+    roster: TaskRosterSource,
 ) -> ProviderEventStream {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
@@ -444,7 +444,7 @@ struct CopilotEvents {
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
     approvals: Arc<super::approval::CopilotApprovals>,
-    roster: TaskRoster,
+    roster: TaskRosterSource,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
     ended: bool,
 }
@@ -530,7 +530,8 @@ async fn next_provider_event(
 /// so the Watch's start and settle agree on it. The timeline waits on the read, which puts the
 /// Watch's start ahead of the idle that follows it: the Session reads Monitoring from the Turn's
 /// settle rather than idle for a moment first. A read that fails costs the Session its Monitoring
-/// reading, not the Session: the shell's completion still wakes the loop into a Continuation.
+/// reading, not the Session: the shell's completion still records its Watch and wakes the loop
+/// into a Continuation headed by the Watch Outcome.
 ///
 /// Why the roster rather than the tool call (github-copilot-sdk 1.0.12-preview.0, CLI 1.0.82):
 /// - `ToolExecutionStartData` carries the shell tool's `arguments` — `detach: true` beside
@@ -541,9 +542,12 @@ async fn next_provider_event(
 ///   `ToolExecutionCompleteContentShellExit`, needs an exit code a detached start never has.
 /// - `SessionBackgroundTasksChangedData` is empty: it says only that the roster changed.
 /// - `session.tasks.list` (`SessionRpcTasks::list`) answers `TaskShellInfo` entries whose `id`
-///   is the shell identity `SystemNotificationShellDetachedCompleted.shellId` names, and whose
-///   `attachment_mode` (`TaskShellInfoAttachmentMode::Detached`) says outright what the tool
-///   arguments only request.
+///   is the shell identity the completion notification names, and whose `attachment_mode`
+///   (`TaskShellInfoAttachmentMode::Detached`) says outright what the tool arguments only
+///   request. The Rust SDK leaves `SystemNotificationData.kind` untyped; the
+///   `shell_detached_completed { shellId, description? }` shape is the CLI's wire, as issues
+///   #380 and #387 record it (and as the Node and .NET SDKs' generated notification kinds type
+///   it).
 async fn read_task_roster(events: &mut CopilotEvents) {
     const CONTEXT: &str = "Copilot task roster read failed";
     let listed = timeout(
@@ -1038,12 +1042,13 @@ impl CopilotCorrelation {
     /// not one already. Only a detached shell is a Watch: its tool call returns at once, the loop
     /// goes idle without waiting on it, and its completion is delivered back to the loop. An
     /// attached shell holds the idle back instead, keeping its Turn open (#379), and an agent task
-    /// is a Subagent. A shell listed already ended is left alone — whatever notification it
-    /// raises still wakes the loop, but there is nothing left to wait on.
+    /// is a Subagent. A shell listed already ended is left alone: there is nothing left to wait
+    /// on, and the completion notification it raises records its Watch whole.
     ///
     /// The roster's entries are the SDK's `TaskShellInfo` and `TaskAgentInfo`, told apart by
     /// their `type`, which is why an entry that is not a shell this build can read is passed
-    /// over rather than failing the read.
+    /// over — with a warning, since a shell entry that no longer parses is the CLI drifting from
+    /// the SDK — rather than failing the read.
     pub(super) fn project_task_roster(
         &mut self,
         tasks: &[serde_json::Value],
@@ -1051,7 +1056,15 @@ impl CopilotCorrelation {
         tasks
             .iter()
             .filter(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("shell"))
-            .filter_map(|task| serde_json::from_value::<TaskShellInfo>(task.clone()).ok())
+            .filter_map(|task| {
+                serde_json::from_value::<TaskShellInfo>(task.clone())
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            "passed over a Copilot task roster shell Suru could not read: {error}"
+                        );
+                    })
+                    .ok()
+            })
             .filter(|shell| {
                 shell.attachment_mode == TaskShellInfoAttachmentMode::Detached
                     && matches!(shell.status, TaskStatus::Running | TaskStatus::Idle)
@@ -1083,11 +1096,14 @@ impl CopilotCorrelation {
     /// completed is all it says — with the notification's text, less the `<system_notification>`
     /// wrapper the loop reads it in, as Copilot's account of how it settled.
     ///
-    /// The notification is what wakes the loop, so it leaves a Continuation owed to the output
-    /// that follows, as a Subagent's settle does — including for a shell that was no live Watch,
-    /// one Suru stopped or never saw start, since the loop wakes all the same. While a Turn is
-    /// running the woken work lands in it and nothing is owed. Every other kind wakes nothing
-    /// this projection follows.
+    /// The notification is what wakes the loop, and orchestration owes the woken output a
+    /// Continuation only through the settle of a Watch it knows. So a shell never seen as a Watch
+    /// — its roster read failed, or found it already finished because it ran shorter than the
+    /// round trip — starts its Watch here, described in the notification's own words, and
+    /// settles it at once: the woken work is still shown, headed by how the shell settled. A
+    /// shell whose Watch already settled — stopped by an interrupt, which records nothing (ADR
+    /// 0030) — wakes nothing Suru shows. While a Turn is running the woken work lands in it and
+    /// nothing is owed. Every other kind wakes nothing this projection follows.
     fn project_system_notification(
         &mut self,
         notification: &SystemNotificationData,
@@ -1097,17 +1113,35 @@ impl CopilotCorrelation {
         {
             return Vec::new();
         }
-        if self.turn.is_none() {
-            self.late_settle_owes_continuation = true;
-        }
         let Some(shell) = kind
             .get("shellId")
             .and_then(serde_json::Value::as_str)
-            .filter(|shell| self.watches.remove(*shell))
+            .filter(|shell| !shell.is_empty())
         else {
             return Vec::new();
         };
-        vec![attributed(
+        let mut projected = Vec::with_capacity(2);
+        if self.watched_shells.insert(shell.to_owned()) {
+            let description = kind
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .filter(|description| !description.trim().is_empty())
+                .unwrap_or(shell)
+                .to_owned();
+            projected.push(attributed(
+                None,
+                ProviderEvent::WatchStarted {
+                    watch_id: ProviderWatchId::new(shell),
+                    description,
+                },
+            ));
+        } else if !self.watches.remove(shell) {
+            return Vec::new();
+        }
+        if self.turn.is_none() {
+            self.late_settle_owes_continuation = true;
+        }
+        projected.push(attributed(
             None,
             ProviderEvent::WatchSettled {
                 watch_id: ProviderWatchId::new(shell),
@@ -1115,7 +1149,8 @@ impl CopilotCorrelation {
                 summary: notification_text(&notification.content),
                 woke_agent: true,
             },
-        )]
+        ));
+        projected
     }
 
     /// Those of `watches` still live, which are all a stop has left to stop.
@@ -3023,17 +3058,33 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_for_a_shell_no_watch_holds_still_owes_the_woken_loop_a_continuation() {
+    fn a_completion_for_a_shell_never_seen_records_its_watch_whole_and_owes_the_woken_loop_a_continuation()
+     {
         let mut correlation = in_turn();
         project(&mut correlation, "session.idle", json!({}));
 
-        assert!(
+        assert_eq!(
             project(
                 &mut correlation,
                 "system.notification",
                 detached_completion("unseen")
-            )
-            .is_empty()
+            ),
+            [
+                ProviderEvent::WatchStarted {
+                    watch_id: ProviderWatchId::new("unseen"),
+                    description: "Serve the docs".to_owned(),
+                },
+                ProviderEvent::WatchSettled {
+                    watch_id: ProviderWatchId::new("unseen"),
+                    outcome: ProviderWatchOutcome::Completed,
+                    summary: Some(
+                        r#"Detached shell "Serve the docs" (shellId: shell-1) has completed."#
+                            .to_owned()
+                    ),
+                    woke_agent: true,
+                },
+            ],
+            "orchestration owes the woken output a Continuation only through a Watch it knows"
         );
         assert!(
             !project(
@@ -3043,6 +3094,45 @@ mod tests {
             )
             .is_empty(),
             "the loop wakes all the same, and its output is shown"
+        );
+        project(&mut correlation, "session.idle", json!({}));
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                detached_completion("unseen")
+            )
+            .is_empty(),
+            "a repeated completion records nothing twice"
+        );
+    }
+
+    #[test]
+    fn a_completion_for_a_shell_suru_stopped_wakes_nothing_suru_shows() {
+        let mut correlation = in_turn();
+        roster(
+            &mut correlation,
+            &[listed_shell("shell-1", "detached", "running")],
+        );
+        project(&mut correlation, "session.idle", json!({}));
+        correlation.project_watches_stopped(&["shell-1".to_owned()]);
+
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                detached_completion("shell-1")
+            )
+            .is_empty()
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m2", "content": "stray" }),
+            )
+            .is_empty(),
+            "a Watch stopped by an interrupt wakes nothing Suru records"
         );
     }
 
