@@ -23,6 +23,16 @@
 //! Copilot report the projection cannot make sense of costs the reader that report rather than the
 //! Turn it belongs to.
 //!
+//! A Delegation sent to a Subagent still working — through `write_agent`, by the main agent or by
+//! a sibling Subagent — **steers** it once Copilot delivers it into the working stretch (ADR
+//! 0032): the Subagent's `user.message` with `delivery: "steering"` stands in its current Turn, at
+//! the point it arrives, as a Delegation Message from the Agent its `source` names
+//! ([`CopilotCorrelation::project_subagent_message`]). The send itself is no work of the sender's,
+//! so its `write_agent` execution projects nothing in the sender's Transcript
+//! ([`WRITE_AGENT_TOOL`]). The CLI verified against, 1.0.87, never delivers a `write_agent` that
+//! way, though: it queues each one until the stretch has ended, which is no steer
+//! (docs/validation/0397-copilot-subagent-steer.md).
+//!
 //! A Suru Turn spans one stretch of Copilot's agentic loop: it opens when the Prompt is delivered
 //! and settles on the session-level idle signal, not on the per-model-call `assistant.turn_end`.
 //! Idle is the Turn's only settle point, because Copilot emits it mechanically whenever the loop
@@ -59,7 +69,8 @@ use github_copilot_sdk::{
         AssistantReasoningData, AssistantReasoningDeltaData, AssistantUsageData, SessionErrorData,
         SessionEventType, SessionIdleData, SubagentCompletedData, SubagentFailedData,
         SubagentStartedData, SystemNotificationData, ToolExecutionCompleteData,
-        ToolExecutionPartialResultData, ToolExecutionStartData,
+        ToolExecutionPartialResultData, ToolExecutionStartData, UserMessageData,
+        UserMessageDelivery,
     },
     subscription::RecvErrorKind,
 };
@@ -104,6 +115,10 @@ pub(super) struct CopilotCorrelation {
     /// settle: the Subagent row answers for the delegation, so the spawn's own execution stays
     /// withheld however late it is reported — before its `subagent.started` or after the settle.
     delegations: HashSet<String>,
+    /// Every Subagent instance ever opened on this timeline, kept past its settle: a steer names
+    /// the Agent that sent it by instance identity, and a sibling may settle before the Subagent
+    /// it wrote to receives what it sent.
+    agents: HashSet<String>,
     /// Whether a Subagent has settled since a Turn last began — or a detached shell's completion
     /// woke the loop while no Turn was running. The output a completion provokes arrives only
     /// after the settle, so every settle leaves a Continuation owed to whatever that output turns
@@ -194,6 +209,13 @@ struct ActiveMessage {
 /// withheld rather than showing the reader the same delegation twice.
 const SPAWN_TOOL: &str = "task";
 
+/// The tool an Agent sends a message to another agent's loop with — the main agent to a Subagent,
+/// or one Subagent to a sibling. Its execution is not work of its own either: what it sends is a
+/// Delegation, which stands in the Subagent that receives it where that Subagent received it —
+/// as a steer, when Copilot delivers it into the working stretch — and never in the sender's
+/// Transcript, so the execution projects nothing, whatever it came to.
+const WRITE_AGENT_TOOL: &str = "write_agent";
+
 /// A Command Copilot is still running, and the output it has streamed so far — against which the
 /// completed execution's repeat of it is reconciled.
 #[derive(Default)]
@@ -208,6 +230,8 @@ struct ActiveCommand {
     /// argument — kept for the `subagent.started` that opens it, which names the spawning tool
     /// call but never carries the prompt itself.
     spawn_prompt: Option<String>,
+    /// Whether the execution is a [`WRITE_AGENT_TOOL`] send, which projects nothing at all.
+    absorbed: bool,
 }
 
 /// A Reasoning block Copilot still has open: the text it has streamed so far — against
@@ -233,6 +257,7 @@ impl CopilotCorrelation {
             subagents: HashMap::new(),
             spawns: HashMap::new(),
             delegations: HashSet::new(),
+            agents: HashSet::new(),
             late_settle_owes_continuation: false,
             watches: HashSet::new(),
             watched_shells: HashSet::new(),
@@ -716,6 +741,9 @@ fn project_session_event(
     // whether or not the main conversation has a Turn open — a Subagent outlives the Turn that
     // spawned it (ADR 0015). One attributed to an instance no Subagent holds lands nowhere.
     if let Some(subagent) = event.agent_id.clone() {
+        if event.parsed_type() == SessionEventType::UserMessage {
+            return Ok(correlation.project_subagent_message(&subagent, &event));
+        }
         let Some(streams) = correlation.subagents.get_mut(&subagent) else {
             return Ok(Vec::new());
         };
@@ -958,6 +986,7 @@ impl CopilotCorrelation {
         self.spawns
             .insert(started.tool_call_id.clone(), subagent.clone());
         self.delegations.insert(started.tool_call_id.clone());
+        self.agents.insert(subagent.clone());
         // Copilot's display name is the readable one, but a spawn made through its task tool
         // writes the invocation's description there, leaving the configured name the stable one.
         let name = if started.agent_display_name.is_empty() {
@@ -1006,6 +1035,50 @@ impl CopilotCorrelation {
             .iter()
             .find(|(_, streams)| streams.commands.contains_key(tool_call_id))
             .map(|(subagent, _)| subagent.clone())
+    }
+
+    /// Reads a message Copilot delivered to a Subagent's own loop. One delivered into the stretch
+    /// the Subagent is working (`delivery: "steering"`) is a steer: a Delegation standing at the
+    /// point the Subagent received it, which is where this event arrives. It is attributed to the
+    /// Agent that sent it, named by `source` — `agent-<id>` names a sibling Subagent by its
+    /// instance identity, and every other origin, the main agent's `agent-<session id>` among
+    /// them, is the owning Session's.
+    ///
+    /// No other delivery steers. An `idle` one begins a run: the spawn's own prompt, which the
+    /// spawning tool call already carried in as the Delegation opening the Subagent's Turn. A
+    /// `queued` one waits for the stretch to end and runs as its own afterward — which is how
+    /// Copilot 1.0.87 delivers every `write_agent` to a working Subagent, the message arriving
+    /// only after the stretch's `subagent.completed`
+    /// (docs/validation/0397-copilot-subagent-steer.md). A message for a Subagent not working
+    /// stands nowhere, like the rest of its output.
+    fn project_subagent_message(
+        &self,
+        subagent: &str,
+        event: &SessionEvent,
+    ) -> Vec<AttributedProviderEvent> {
+        if !self.subagents.contains_key(subagent) {
+            return Vec::new();
+        }
+        let Some(message) = reported::<UserMessageData>(event) else {
+            return Vec::new();
+        };
+        if message.delivery != Some(UserMessageDelivery::Steering)
+            || message.content.trim().is_empty()
+        {
+            return Vec::new();
+        }
+        let sender = message
+            .source
+            .as_deref()
+            .and_then(|source| source.strip_prefix("agent-"))
+            .filter(|sender| self.agents.contains(*sender));
+        vec![attributed(
+            sender,
+            ProviderEvent::SubagentSteered {
+                subagent_id: ProviderSubagentId::new(subagent),
+                delegation: message.content,
+            },
+        )]
     }
 
     /// Settles the Subagent the spawning tool call names, closing whatever its streams leave open
@@ -1373,6 +1446,16 @@ fn project_command_started(
         // its withheld header.
         return Vec::new();
     }
+    if started.tool_name == WRITE_AGENT_TOOL {
+        streams.commands.insert(
+            started.tool_call_id.clone(),
+            ActiveCommand {
+                absorbed: true,
+                ..ActiveCommand::default()
+            },
+        );
+        return Vec::new();
+    }
     let command = command_text(started);
     if started.tool_name == SPAWN_TOOL {
         let spawn_prompt = started
@@ -1411,6 +1494,9 @@ fn project_command_output(
     let Some(command) = streams.commands.get_mut(tool_call_id) else {
         return Vec::new();
     };
+    if command.absorbed {
+        return Vec::new();
+    }
     command.streamed_output.push_str(&output);
     if command.withheld_spawn.is_some() {
         return Vec::new();
@@ -1431,6 +1517,9 @@ fn project_command_completed(
     let Some(command) = streams.commands.remove(&completed.tool_call_id) else {
         return Vec::new();
     };
+    if command.absorbed {
+        return Vec::new();
+    }
     if let Some(withheld) = command.withheld_spawn {
         if delegations.remove(&completed.tool_call_id) {
             return Vec::new();
@@ -3224,6 +3313,263 @@ mod tests {
         assert_eq!(
             notification_text("<system_notification></system_notification>"),
             None
+        );
+    }
+
+    /// A `user.message` Copilot delivers to `agent`'s own loop, as `delivery`, from `source`.
+    fn delivered_message(
+        agent: &str,
+        delivery: &str,
+        source: Option<&str>,
+        content: &str,
+    ) -> SessionEvent {
+        let mut data = json!({ "content": content, "delivery": delivery, "turnId": "1" });
+        if let Some(source) = source {
+            data["source"] = json!(source);
+        }
+        agent_event(agent, "user.message", data)
+    }
+
+    fn steer(subagent: &str, delegation: &str) -> ProviderEvent {
+        ProviderEvent::SubagentSteered {
+            subagent_id: ProviderSubagentId::new(subagent),
+            delegation: delegation.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_message_steering_a_working_subagent_is_a_steer_the_main_agent_sent() {
+        let mut correlation = with_subagent();
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message(
+                    "agent-1",
+                    "steering",
+                    Some("agent-94bf4cb4-74ac-43d9-8903-038759ca8a86"),
+                    "Also say PINEAPPLE.",
+                ),
+            ),
+            [AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: steer("agent-1", "Also say PINEAPPLE."),
+            }],
+            "the main agent sends as `agent-<its session id>`, which names no Subagent"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "steering", None, "And MANGO."),
+            ),
+            [AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: steer("agent-1", "And MANGO."),
+            }],
+            "a steer naming no sender is the owning Session's"
+        );
+    }
+
+    #[test]
+    fn a_message_a_sibling_sent_steers_on_that_siblings_behalf_even_once_it_settled() {
+        let mut correlation = with_subagent();
+        project_attributed(&mut correlation, spawn_started("agent-2", "t-sibling"));
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "steering", Some("agent-agent-2"), "Say MANGO."),
+            ),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-2"),
+                event: steer("agent-1", "Say MANGO."),
+            }]
+        );
+
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-2",
+                "subagent.completed",
+                json!({ "toolCallId": "t-sibling", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "steering", Some("agent-agent-2"), "Say KIWI."),
+            ),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-2"),
+                event: steer("agent-1", "Say KIWI."),
+            }],
+            "the sender is still the sibling that sent it after that sibling settled"
+        );
+    }
+
+    #[test]
+    fn a_message_that_does_not_steer_a_working_subagent_is_no_steer() {
+        let mut correlation = with_subagent();
+        for delivery in ["idle", "queued", "later"] {
+            assert!(
+                project_attributed(
+                    &mut correlation,
+                    delivered_message("agent-1", delivery, None, "Read the notes."),
+                )
+                .is_empty(),
+                "a `{delivery}` delivery begins or awaits a run of its own rather than steering"
+            );
+        }
+        assert!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "user.message",
+                    json!({ "content": "Read the notes." })
+                ),
+            )
+            .is_empty(),
+            "a message with no delivery reported steers nothing"
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "steering", None, "  "),
+            )
+            .is_empty(),
+            "a steer carrying nothing to read stands nowhere"
+        );
+    }
+
+    #[test]
+    fn a_steering_message_for_a_subagent_not_working_stands_nowhere() {
+        let mut correlation = with_subagent();
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "subagent.completed",
+                json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "steering", None, "Too late."),
+            )
+            .is_empty(),
+            "a settled Subagent has no working Turn for a steer to stand in"
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-9", "steering", None, "Who?"),
+            )
+            .is_empty(),
+            "an instance no Subagent holds has no Turn at all"
+        );
+    }
+
+    #[test]
+    fn a_main_agent_message_is_not_a_subagent_steer() {
+        let mut correlation = with_subagent();
+        assert!(
+            project(
+                &mut correlation,
+                "user.message",
+                json!({ "content": "Answer in French", "delivery": "steering" }),
+            )
+            .is_empty(),
+            "the main loop's own messages are the user's Prompts, which Suru already holds"
+        );
+    }
+
+    #[test]
+    fn a_write_agent_execution_adds_nothing_to_the_senders_transcript() {
+        let mut correlation = with_subagent();
+        let write_agent = |tool_call_id: &str| {
+            json!({
+                "toolCallId": tool_call_id,
+                "toolName": "write_agent",
+                "arguments": { "agent_id": "agent-1", "message": "Also say PINEAPPLE." },
+            })
+        };
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                write_agent("t-write")
+            )
+            .is_empty()
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_partial_result",
+                json!({ "toolCallId": "t-write", "partialOutput": "Message delivered" }),
+            )
+            .is_empty()
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t-write",
+                    "success": true,
+                    "result": { "content": "Message delivered to agent agent-1." },
+                }),
+            )
+            .is_empty(),
+            "the send is a Delegation standing in the Subagent it reached, not a Command"
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                write_agent("t-refused")
+            )
+            .is_empty()
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t-refused",
+                    "success": false,
+                    "error": { "message": "No agent agent-1" },
+                }),
+            )
+            .is_empty(),
+            "a send that delivered nothing stands nowhere either"
+        );
+
+        // A sibling's send out of its own conversation is absorbed there just the same.
+        project_attributed(&mut correlation, spawn_started("agent-2", "t-sibling"));
+        for event in [
+            agent_event(
+                "agent-2",
+                "tool.execution_start",
+                write_agent("t-sib-write"),
+            ),
+            agent_event(
+                "agent-2",
+                "tool.execution_complete",
+                json!({ "toolCallId": "t-sib-write", "success": true }),
+            ),
+        ] {
+            assert!(project_attributed(&mut correlation, event).is_empty());
+        }
+
+        // One still running when the loop stops surfaces nothing for the store to settle.
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            write_agent("t-open"),
+        );
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({})),
+            [ProviderEvent::TurnCompleted]
         );
     }
 }
