@@ -22,8 +22,10 @@ use std::{
 
 use github_copilot_sdk::{
     DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
-    SessionId as CopilotSessionId, SetModelOptions, rpc::CurrentModel,
-    session::Session as NativeSession, session_events::ContextTier,
+    SessionId as CopilotSessionId, SetModelOptions,
+    rpc::{CurrentModel, TasksCancelRequest},
+    session::Session as NativeSession,
+    session_events::ContextTier,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
@@ -33,7 +35,7 @@ use super::{
     COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
-    projection::{CopilotCorrelation, provider_events},
+    projection::{CopilotCorrelation, TaskRoster, provider_events},
     skills::CopilotSkills,
     transport::CopilotConnection,
 };
@@ -44,9 +46,9 @@ use crate::{
         ProviderId,
     },
     provider::{
-        ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
-        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
-        harness::SharedHarnessHandle,
+        AttributedProviderEvent, ProviderError, ProviderFuture, ProviderResumeState,
+        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+        ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle,
     },
 };
 
@@ -87,6 +89,7 @@ pub(super) async fn start_copilot_session(
     };
     let handle = Arc::new(handle);
     let (request_events, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let watch_events = request_events.clone();
     let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
         request_events.clone(),
     ));
@@ -176,6 +179,10 @@ pub(super) async fn start_copilot_session(
         correlation.clone(),
         skills.clone(),
         approvals.clone(),
+        TaskRoster {
+            native: native.clone(),
+            request_timeout: interrupt_request_timeout,
+        },
     );
     let question_lifecycle = questionnaires.clone();
     let approval_lifecycle = approvals.clone();
@@ -220,6 +227,7 @@ pub(super) async fn start_copilot_session(
         skills,
         execution_directory,
         interrupt_request_timeout,
+        watch_events,
     });
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
@@ -349,6 +357,10 @@ struct CopilotSession {
     execution_directory: PathBuf,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
     interrupt_request_timeout: Duration,
+    /// Where a Watch this Session stopped settles: on the Session's own event stream, since
+    /// Copilot's timeline reports nothing of a shell it was asked to cancel.
+    watch_events:
+        tokio::sync::mpsc::UnboundedSender<Result<AttributedProviderEvent, ProviderError>>,
 }
 
 impl CopilotSession {
@@ -370,6 +382,31 @@ impl CopilotSession {
             approvals.clear();
         }
         result
+    }
+
+    /// Cancels one detached shell through the Session's task roster, by the identity the roster
+    /// listed it under, bounded like an interrupt. Copilot answering that it did not cancel the
+    /// shell is a refusal: the shell runs on.
+    async fn cancel_shell(&self, shell: &str) -> Result<(), ProviderError> {
+        const CONTEXT: &str = "Copilot Watch stop failed";
+        let tasks = self.native.rpc().tasks();
+        let cancel = until_crash(
+            &self.handle,
+            CONTEXT,
+            tasks.cancel(TasksCancelRequest {
+                id: shell.to_owned(),
+            }),
+        );
+        match timeout(self.interrupt_request_timeout, cancel).await {
+            Ok(Ok(result)) if result.cancelled => Ok(()),
+            Ok(Ok(_)) => Err(copilot_error(format!(
+                "{CONTEXT}: Copilot declined to cancel detached shell `{shell}`"
+            ))),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(copilot_error(format!(
+                "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.tasks.cancel`"
+            ))),
+        }
     }
 
     /// Fails unless a Turn is running for `operation` to act on. Copilot takes both live-Turn
@@ -633,13 +670,41 @@ impl ProviderSession for CopilotSession {
         })
     }
 
-    /// Copilot reports no Watches yet, so no Session of its is ever Monitoring and there is
-    /// nothing to stop; its detached shells become Watches, and this their stop, in #387.
-    fn stop_watches(
-        &self,
-        _watches: Vec<crate::provider::ProviderWatchId>,
-    ) -> ProviderFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+    /// Stops the detached shells the Watches name through the Session's task roster
+    /// (`session.tasks.cancel`, by the shell identity the roster listed it under) — the stop
+    /// Copilot's own task view offers a detached shell — without touching the loop, which runs
+    /// nothing while the Session is only Monitoring. Every shell Copilot confirms cancelling
+    /// settles as stopped on the event stream. One Copilot declines to cancel — it cannot signal
+    /// a detached shell whose process identity it never learned — is left running and its Watch
+    /// live, and the stop reports the refusal.
+    fn stop_watches(&self, watches: Vec<ProviderWatchId>) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let shells = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .live_watches(&watches);
+            let cancelled =
+                futures_util::future::join_all(shells.iter().map(|shell| self.cancel_shell(shell)))
+                    .await;
+            let mut stopped = Vec::new();
+            let mut failure = None;
+            for (shell, cancelled) in shells.into_iter().zip(cancelled) {
+                match cancelled {
+                    Ok(()) => stopped.push(shell),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let settled = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .project_watches_stopped(&stopped);
+            for event in settled {
+                let _ = self.watch_events.send(Ok(event));
+            }
+            failure.map_or(Ok(()), Err)
+        })
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {

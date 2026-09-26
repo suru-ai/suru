@@ -69,7 +69,9 @@ impl CopilotRuntime {
         }
     }
 
-    /// Bounds how long an interrupt waits for Copilot to acknowledge it; injectable so tests can
+    /// Bounds how long an interrupt waits for Copilot to acknowledge it — and with it the other
+    /// requests Suru makes of a Session's loop on its own account: the task roster read that
+    /// finds a detached shell's Watch, and the cancel that stops one. Injectable so tests can
     /// exercise the timeout without waiting out the default.
     pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
         self.interrupt_request_timeout = timeout;

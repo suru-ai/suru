@@ -636,6 +636,51 @@ impl LiveTurn {
     }
 }
 
+/// A Session opened on `copilot` with `prompt` delivered, holding everything the Turn runs on for
+/// as long as the test does — without waiting on the Turn, which may settle before a test could
+/// see it running. `name` is the client channel, so each test needs its own.
+pub struct Opened {
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    pub server: RunningServer,
+    pub client: ManagedClient,
+    pub session_id: SessionId,
+}
+
+pub async fn opened_session(copilot: &ScriptedCopilot, name: &'static str, prompt: &str) -> Opened {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), name).expect("configure server"),
+        std::sync::Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), name).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: prompt.to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    Opened {
+        _state_dir: state_dir,
+        _workspace: workspace,
+        server,
+        client,
+        session_id: created.session.id,
+    }
+}
+
 /// A server hosting Copilot alone, driven against `copilot`, and a client connected to it. `name`
 /// is the client channel, so each test needs its own.
 pub async fn hosting(

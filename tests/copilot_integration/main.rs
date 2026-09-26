@@ -24,6 +24,7 @@ mod context_fill;
 mod errands;
 mod interruption;
 mod models;
+mod monitoring;
 mod resume;
 mod skills;
 mod steering;

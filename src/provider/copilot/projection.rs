@@ -35,6 +35,14 @@
 //! to Subagents still working or just settled, begins a Continuation stretch that the loop's next
 //! idle settles — unless a Prompt settles the Continuation first, in which case that stretch's
 //! idle is owed nothing and is swallowed rather than read against the Prompt's own Turn.
+//!
+//! A **detached** background shell is the Copilot Watch (ADR 0030): the shell tool run with
+//! `mode: "async", detach: true` outlives the loop without deferring its idle, and its completion
+//! notification wakes the loop again. Its start is read off the Session's task roster rather than
+//! the tool call ([`CopilotCorrelation::project_task_roster`]), and its settle off the
+//! `shell_detached_completed` notification ([`CopilotCorrelation::project_system_notification`]).
+//! An *attached* background shell is no Watch here: Copilot holds the idle back until it ends,
+//! so it keeps the Turn itself open (#379).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -44,28 +52,33 @@ use std::{
 use futures_util::stream;
 use github_copilot_sdk::{
     EventSubscription, SessionEvent,
+    rpc::{TaskShellInfo, TaskShellInfoAttachmentMode, TaskStatus},
+    session::Session as NativeSession,
     session_events::{
         AssistantMessageData, AssistantMessageDeltaData, AssistantMessageStartData,
         AssistantReasoningData, AssistantReasoningDeltaData, AssistantUsageData, SessionErrorData,
         SessionEventType, SessionIdleData, SubagentCompletedData, SubagentFailedData,
-        SubagentStartedData, ToolExecutionCompleteData, ToolExecutionPartialResultData,
-        ToolExecutionStartData,
+        SubagentStartedData, SystemNotificationData, ToolExecutionCompleteData,
+        ToolExecutionPartialResultData, ToolExecutionStartData,
     },
     subscription::RecvErrorKind,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{Duration, timeout},
+};
 
 use super::{
-    COPILOT_FAILURE_FALLBACK, copilot_error, event_drain::EventDrainCheckpoint,
-    pricing::CopilotPricing, skills::CopilotSkills, tools::command_text,
-    transport::CopilotConnection,
+    COPILOT_FAILURE_FALLBACK, COPILOT_HARNESS_NAME, copilot_error,
+    event_drain::EventDrainCheckpoint, pricing::CopilotPricing, session::until_crash,
+    skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
 };
 use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
 use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-    ProviderSubagentId, ProviderSubagentStatus, ReportedTurnMetering, concise_remote_message,
-    exclusive_count,
+    ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
+    ReportedTurnMetering, concise_remote_message, exclusive_count,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     reported_count,
@@ -91,11 +104,21 @@ pub(super) struct CopilotCorrelation {
     /// settle: the Subagent row answers for the delegation, so the spawn's own execution stays
     /// withheld however late it is reported — before its `subagent.started` or after the settle.
     delegations: HashSet<String>,
-    /// Whether a Subagent has settled since a Turn last began. The output a completion provokes
-    /// arrives only after the settle, so every settle leaves a Continuation owed to whatever
-    /// that output turns out to be; a Turn beginning clears it, because from then on such
-    /// output has a Turn to land in.
+    /// Whether a Subagent has settled since a Turn last began — or a detached shell's completion
+    /// woke the loop while no Turn was running. The output a completion provokes arrives only
+    /// after the settle, so every settle leaves a Continuation owed to whatever that output turns
+    /// out to be; a Turn beginning clears it, because from then on such output has a Turn to
+    /// land in.
     late_settle_owes_continuation: bool,
+    /// The detached shells live as Watches, by the shell identity Copilot's completion
+    /// notification names them by. All are the owning Session's: the task roster says nothing of
+    /// which conversation ran the shell tool, and Copilot delivers the completion to the main
+    /// loop.
+    watches: HashSet<String>,
+    /// Every detached shell ever started as a Watch on this timeline, kept past its settle: the
+    /// roster keeps listing a shell for a while after it ends, and a read racing the completion
+    /// could otherwise start the settled shell's Watch a second time.
+    watched_shells: HashSet<String>,
     /// Copilot's most recently published per-Model prices. The connection
     /// updates this on catalog discovery; each usage event reads it once while
     /// the call still belongs to an active Turn.
@@ -211,6 +234,8 @@ impl CopilotCorrelation {
             spawns: HashMap::new(),
             delegations: HashSet::new(),
             late_settle_owes_continuation: false,
+            watches: HashSet::new(),
+            watched_shells: HashSet::new(),
             pricing,
             context_turn: None,
             context_sequence: 0,
@@ -300,10 +325,10 @@ impl CopilotCorrelation {
     }
 
     /// Whether main output arriving with no Turn active is owed a Continuation rather than being
-    /// stray: some Subagent is still working, or one just settled and its provoked output is
-    /// still to come.
+    /// stray: some Subagent is still working, a Watch that may wake the loop is still live, or a
+    /// Subagent or Watch just settled and its provoked output is still to come.
     fn owes_late_output(&self) -> bool {
-        self.late_settle_owes_continuation || !self.subagents.is_empty()
+        self.late_settle_owes_continuation || !self.subagents.is_empty() || !self.watches.is_empty()
     }
 
     /// Opens the main conversation's streams to the event in hand: the active Turn's, or the
@@ -322,6 +347,15 @@ impl CopilotCorrelation {
     }
 }
 
+/// Where the projection reads the Session's background tasks from when the timeline says they
+/// changed: the Copilot Session itself, asked no longer than `request_timeout` — the bound every
+/// request Suru makes of the Session's loop waits under — because the timeline projects no
+/// further while the read is out.
+pub(super) struct TaskRoster {
+    pub(super) native: Arc<NativeSession>,
+    pub(super) request_timeout: Duration,
+}
+
 /// Streams the Provider events projected from one Copilot Session's timeline, failing the stream
 /// when the shared harness process hosting it dies.
 pub(super) fn provider_events(
@@ -331,6 +365,7 @@ pub(super) fn provider_events(
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
     approvals: Arc<super::approval::CopilotApprovals>,
+    roster: TaskRoster,
 ) -> ProviderEventStream {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
@@ -350,6 +385,7 @@ pub(super) fn provider_events(
             correlation,
             skills,
             approvals,
+            roster,
             pending: VecDeque::new(),
             ended: false,
         },
@@ -408,6 +444,7 @@ struct CopilotEvents {
     correlation: Arc<StdMutex<CopilotCorrelation>>,
     skills: CopilotSkills,
     approvals: Arc<super::approval::CopilotApprovals>,
+    roster: TaskRoster,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
     ended: bool,
 }
@@ -438,6 +475,12 @@ async fn next_provider_event(
                         Err(error) => events.pending.push_back(Err(error)),
                     }
                 }
+                let lost = events
+                    .correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .project_watches_lost();
+                events.pending.extend(lost.into_iter().map(Ok));
                 events.pending.push_back(Err(crashed));
                 events.ended = true;
                 continue;
@@ -464,10 +507,73 @@ async fn next_provider_event(
                 {
                     events.approvals.wait_for_settled_decision().await;
                 }
+                let roster_changed = matches!(
+                    &event,
+                    TimelineEvent::Native(event)
+                        if event.parsed_type() == SessionEventType::SessionBackgroundTasksChanged
+                );
                 queue_projected(&mut events, event);
+                if roster_changed {
+                    read_task_roster(&mut events).await;
+                }
             }
         }
     }
+}
+
+/// Reads the Session's background tasks the moment the timeline says they changed, and starts a
+/// Watch for each detached shell the read finds newly running.
+///
+/// `session.background_tasks_changed` carries no payload, so the roster Copilot's own task view
+/// refreshes on it (`session.tasks.list`) is where a shell's attachment mode is recorded — and the
+/// identity it lists the shell under is the `shellId` the shell's completion notification names,
+/// so the Watch's start and settle agree on it. The timeline waits on the read, which puts the
+/// Watch's start ahead of the idle that follows it: the Session reads Monitoring from the Turn's
+/// settle rather than idle for a moment first. A read that fails costs the Session its Monitoring
+/// reading, not the Session: the shell's completion still wakes the loop into a Continuation.
+///
+/// Why the roster rather than the tool call (github-copilot-sdk 1.0.12-preview.0, CLI 1.0.82):
+/// - `ToolExecutionStartData` carries the shell tool's `arguments` — `detach: true` beside
+///   `mode: "async"` is how the Model asks for a detached shell — but no shell identity, and
+///   `ToolExecutionStartShellToolInfo` only path hints.
+/// - The tool's result names the shell only in text addressed to the Model (`<command started in
+///   detached background with shellId: …>`); the one structured content carrying a `shellId`,
+///   `ToolExecutionCompleteContentShellExit`, needs an exit code a detached start never has.
+/// - `SessionBackgroundTasksChangedData` is empty: it says only that the roster changed.
+/// - `session.tasks.list` (`SessionRpcTasks::list`) answers `TaskShellInfo` entries whose `id`
+///   is the shell identity `SystemNotificationShellDetachedCompleted.shellId` names, and whose
+///   `attachment_mode` (`TaskShellInfoAttachmentMode::Detached`) says outright what the tool
+///   arguments only request.
+async fn read_task_roster(events: &mut CopilotEvents) {
+    const CONTEXT: &str = "Copilot task roster read failed";
+    let listed = timeout(
+        events.roster.request_timeout,
+        until_crash(
+            &events.harness,
+            CONTEXT,
+            events.roster.native.rpc().tasks().list(),
+        ),
+    )
+    .await;
+    let tasks = match listed {
+        Ok(Ok(listed)) => listed.tasks,
+        Ok(Err(error)) => {
+            tracing::warn!("{error}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.tasks.list`"
+            );
+            return;
+        }
+    };
+    let started = events
+        .correlation
+        .lock()
+        .expect("Copilot correlation lock is not poisoned")
+        .project_task_roster(&tasks);
+    events.pending.extend(started.into_iter().map(Ok));
 }
 
 fn queue_projected(events: &mut CopilotEvents, event: TimelineEvent) {
@@ -589,6 +695,16 @@ fn project_session_event(
                     )
                 }),
             );
+        }
+        // A notification wakes the main loop whichever conversation's context Copilot stamped
+        // on it, so it is read before the envelope's attribution too.
+        SessionEventType::SystemNotification => {
+            return Ok(reported(&event).map_or_else(
+                Vec::new,
+                |notification: SystemNotificationData| {
+                    correlation.project_system_notification(&notification)
+                },
+            ));
         }
         _ => {}
     }
@@ -918,6 +1034,148 @@ impl CopilotCorrelation {
         projected
     }
 
+    /// Starts a Watch for every detached shell the Session's task roster lists as running that is
+    /// not one already. Only a detached shell is a Watch: its tool call returns at once, the loop
+    /// goes idle without waiting on it, and its completion is delivered back to the loop. An
+    /// attached shell holds the idle back instead, keeping its Turn open (#379), and an agent task
+    /// is a Subagent. A shell listed already ended is left alone — whatever notification it
+    /// raises still wakes the loop, but there is nothing left to wait on.
+    ///
+    /// The roster's entries are the SDK's `TaskShellInfo` and `TaskAgentInfo`, told apart by
+    /// their `type`, which is why an entry that is not a shell this build can read is passed
+    /// over rather than failing the read.
+    pub(super) fn project_task_roster(
+        &mut self,
+        tasks: &[serde_json::Value],
+    ) -> Vec<AttributedProviderEvent> {
+        tasks
+            .iter()
+            .filter(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("shell"))
+            .filter_map(|task| serde_json::from_value::<TaskShellInfo>(task.clone()).ok())
+            .filter(|shell| {
+                shell.attachment_mode == TaskShellInfoAttachmentMode::Detached
+                    && matches!(shell.status, TaskStatus::Running | TaskStatus::Idle)
+                    && !shell.id.is_empty()
+            })
+            .filter_map(|shell| {
+                if !self.watched_shells.insert(shell.id.clone()) {
+                    return None;
+                }
+                self.watches.insert(shell.id.clone());
+                let description = [shell.description, shell.command]
+                    .into_iter()
+                    .find(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| shell.id.clone());
+                Some(attributed(
+                    None,
+                    ProviderEvent::WatchStarted {
+                        watch_id: ProviderWatchId::new(shell.id),
+                        description,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Reads a notification Copilot delivers to the main loop. The one this projection acts on is
+    /// a detached shell completing (`kind.type: "shell_detached_completed"`, naming the shell by
+    /// `shellId`): it settles the shell's Watch as completed — the kind carries no exit code, so
+    /// completed is all it says — with the notification's text, less the `<system_notification>`
+    /// wrapper the loop reads it in, as Copilot's account of how it settled.
+    ///
+    /// The notification is what wakes the loop, so it leaves a Continuation owed to the output
+    /// that follows, as a Subagent's settle does — including for a shell that was no live Watch,
+    /// one Suru stopped or never saw start, since the loop wakes all the same. While a Turn is
+    /// running the woken work lands in it and nothing is owed. Every other kind wakes nothing
+    /// this projection follows.
+    fn project_system_notification(
+        &mut self,
+        notification: &SystemNotificationData,
+    ) -> Vec<AttributedProviderEvent> {
+        let kind = &notification.kind;
+        if kind.get("type").and_then(serde_json::Value::as_str) != Some("shell_detached_completed")
+        {
+            return Vec::new();
+        }
+        if self.turn.is_none() {
+            self.late_settle_owes_continuation = true;
+        }
+        let Some(shell) = kind
+            .get("shellId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|shell| self.watches.remove(*shell))
+        else {
+            return Vec::new();
+        };
+        vec![attributed(
+            None,
+            ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new(shell),
+                outcome: ProviderWatchOutcome::Completed,
+                summary: notification_text(&notification.content),
+                woke_agent: true,
+            },
+        )]
+    }
+
+    /// Those of `watches` still live, which are all a stop has left to stop.
+    pub(super) fn live_watches(&self, watches: &[ProviderWatchId]) -> Vec<String> {
+        watches
+            .iter()
+            .map(ProviderWatchId::as_str)
+            .filter(|shell| self.watches.contains(*shell))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Detached shells the Session stopped and Copilot confirmed cancelling. Each still a live
+    /// Watch settles as stopped, waking nothing, so the Session stops Monitoring on the
+    /// confirmation alone; a completion notification arriving afterwards finds the Watch already
+    /// settled and repeats nothing.
+    pub(super) fn project_watches_stopped(
+        &mut self,
+        shells: &[String],
+    ) -> Vec<AttributedProviderEvent> {
+        shells
+            .iter()
+            .filter(|shell| self.watches.remove(*shell))
+            .map(|shell| {
+                attributed(
+                    None,
+                    ProviderEvent::WatchSettled {
+                        watch_id: ProviderWatchId::new(shell.clone()),
+                        outcome: ProviderWatchOutcome::Stopped,
+                        summary: None,
+                        woke_agent: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The harness process hosting the Session died. A detached shell outlives it, but nothing is
+    /// left to deliver its completion to the loop, so it can wake nothing: every live Watch
+    /// settles as lost.
+    fn project_watches_lost(&mut self) -> Vec<AttributedProviderEvent> {
+        let mut lost = std::mem::take(&mut self.watches)
+            .into_iter()
+            .collect::<Vec<_>>();
+        lost.sort_unstable();
+        lost.into_iter()
+            .map(|shell| {
+                attributed(
+                    None,
+                    ProviderEvent::WatchSettled {
+                        watch_id: ProviderWatchId::new(shell),
+                        outcome: ProviderWatchOutcome::Lost,
+                        summary: None,
+                        woke_agent: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Records what the Turn will settle as when Copilot reports an error — authentication,
     /// quota, rate limit, and the rest — naming the category Copilot typed it as, so a remote
     /// failure reads without opening the Log. The loop stopping is what settles the Turn on it.
@@ -960,6 +1218,19 @@ impl CopilotCorrelation {
         });
         projected
     }
+}
+
+/// The text of a notification as a reader should see it: Copilot hands the loop its
+/// notifications wrapped in `<system_notification>` tags, which are addressed to the Model rather
+/// than to anyone reading the Transcript.
+fn notification_text(content: &str) -> Option<String> {
+    let text = content.trim();
+    let text = text
+        .strip_prefix("<system_notification>")
+        .and_then(|text| text.strip_suffix("</system_notification>"))
+        .unwrap_or(text)
+        .trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn project_message_started(
@@ -2577,6 +2848,292 @@ mod tests {
                 },
             }],
             "the settle still reaches the row it opened"
+        );
+    }
+
+    /// One shell as `session.tasks.list` lists it.
+    fn listed_shell(id: &str, attachment: &str, status: &str) -> serde_json::Value {
+        json!({
+            "type": "shell",
+            "id": id,
+            "description": "Serve the docs",
+            "command": "mdbook serve",
+            "status": status,
+            "startedAt": "2026-01-01T00:00:00Z",
+            "attachmentMode": attachment,
+        })
+    }
+
+    fn detached_completion(shell: &str) -> serde_json::Value {
+        json!({
+            "content": "<system_notification>\nDetached shell \"Serve the docs\" (shellId: shell-1) has completed.\n</system_notification>",
+            "kind": { "type": "shell_detached_completed", "shellId": shell, "description": "Serve the docs" },
+        })
+    }
+
+    fn roster(
+        correlation: &mut CopilotCorrelation,
+        tasks: &[serde_json::Value],
+    ) -> Vec<ProviderEvent> {
+        correlation
+            .project_task_roster(tasks)
+            .into_iter()
+            .map(|attributed| {
+                assert_eq!(
+                    attributed.attribution,
+                    ProviderEventAttribution::OwningSession
+                );
+                attributed.event
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_running_detached_shell_on_the_roster_starts_a_watch_under_its_shell_identity() {
+        let mut correlation = in_turn();
+        assert_eq!(
+            roster(
+                &mut correlation,
+                &[
+                    listed_shell("shell-1", "detached", "running"),
+                    json!({ "type": "agent", "id": "agent-1", "description": "Audit" }),
+                ],
+            ),
+            [ProviderEvent::WatchStarted {
+                watch_id: ProviderWatchId::new("shell-1"),
+                description: "Serve the docs".to_owned(),
+            }]
+        );
+        assert!(
+            roster(
+                &mut correlation,
+                &[listed_shell("shell-1", "detached", "running")]
+            )
+            .is_empty(),
+            "a shell already watched is not announced again"
+        );
+    }
+
+    #[test]
+    fn attached_and_already_ended_shells_on_the_roster_are_no_watches() {
+        let mut correlation = in_turn();
+        assert!(
+            roster(
+                &mut correlation,
+                &[
+                    listed_shell("attached", "attached", "running"),
+                    listed_shell("ended", "detached", "completed"),
+                    listed_shell("cancelled", "detached", "cancelled"),
+                ],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_detached_shell_described_by_nothing_is_described_by_its_command() {
+        let mut correlation = in_turn();
+        let mut shell = listed_shell("shell-1", "detached", "running");
+        shell["description"] = json!(" ");
+        assert_eq!(
+            roster(&mut correlation, &[shell]),
+            [ProviderEvent::WatchStarted {
+                watch_id: ProviderWatchId::new("shell-1"),
+                description: "mdbook serve".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_detached_shells_completion_settles_its_watch_and_begins_a_continuation() {
+        let mut correlation = in_turn();
+        roster(
+            &mut correlation,
+            &[listed_shell("shell-1", "detached", "running")],
+        );
+        project(&mut correlation, "session.idle", json!({}));
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                "system.notification",
+                detached_completion("shell-1")
+            ),
+            [ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("shell-1"),
+                outcome: ProviderWatchOutcome::Completed,
+                summary: Some(
+                    r#"Detached shell "Serve the docs" (shellId: shell-1) has completed."#
+                        .to_owned()
+                ),
+                woke_agent: true,
+            }],
+            "the notification's text, out of its wrapper, is how the Watch settled"
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m2", "content": "The docs server stopped." }),
+            )
+            .len(),
+            3,
+            "the woken loop's output opens a Continuation rather than being dropped"
+        );
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({})),
+            [ProviderEvent::TurnCompleted]
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                detached_completion("shell-1")
+            )
+            .is_empty(),
+            "a settled Watch settles once"
+        );
+        assert!(
+            roster(
+                &mut correlation,
+                &[listed_shell("shell-1", "detached", "running")]
+            )
+            .is_empty(),
+            "a roster read racing the completion does not start the settled Watch again"
+        );
+    }
+
+    #[test]
+    fn a_live_watch_owes_the_loops_output_a_continuation() {
+        let mut correlation = in_turn();
+        roster(
+            &mut correlation,
+            &[listed_shell("shell-1", "detached", "running")],
+        );
+        project(&mut correlation, "session.idle", json!({}));
+
+        assert!(
+            !project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m2", "content": "Checking the server." }),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_completion_for_a_shell_no_watch_holds_still_owes_the_woken_loop_a_continuation() {
+        let mut correlation = in_turn();
+        project(&mut correlation, "session.idle", json!({}));
+
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                detached_completion("unseen")
+            )
+            .is_empty()
+        );
+        assert!(
+            !project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m2", "content": "Woken." }),
+            )
+            .is_empty(),
+            "the loop wakes all the same, and its output is shown"
+        );
+    }
+
+    #[test]
+    fn other_notifications_wake_nothing_this_projection_follows() {
+        let mut correlation = in_turn();
+        project(&mut correlation, "session.idle", json!({}));
+
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                json!({ "content": "done", "kind": { "type": "shell_completed", "shellId": "s" } }),
+            )
+            .is_empty()
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m2", "content": "stray" }),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stopped_watches_settle_as_stopped_and_a_later_completion_repeats_nothing() {
+        let mut correlation = in_turn();
+        roster(
+            &mut correlation,
+            &[
+                listed_shell("shell-1", "detached", "running"),
+                listed_shell("shell-2", "detached", "running"),
+            ],
+        );
+        project(&mut correlation, "session.idle", json!({}));
+        assert_eq!(
+            correlation.live_watches(&[
+                ProviderWatchId::new("shell-1"),
+                ProviderWatchId::new("gone")
+            ]),
+            ["shell-1"]
+        );
+
+        let stopped = correlation.project_watches_stopped(&["shell-1".to_owned()]);
+        assert_eq!(
+            stopped
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>(),
+            [ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("shell-1"),
+                outcome: ProviderWatchOutcome::Stopped,
+                summary: None,
+                woke_agent: false,
+            }]
+        );
+        assert!(
+            correlation
+                .project_watches_stopped(&["shell-1".to_owned()])
+                .is_empty()
+        );
+        let lost = correlation.project_watches_lost();
+        assert_eq!(
+            lost.into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>(),
+            [ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("shell-2"),
+                outcome: ProviderWatchOutcome::Lost,
+                summary: None,
+                woke_agent: false,
+            }],
+            "a process that dies loses every Watch still live"
+        );
+    }
+
+    #[test]
+    fn a_notification_out_of_its_wrapper_is_what_a_reader_sees() {
+        assert_eq!(
+            notification_text("<system_notification>\n  Shell done.\n</system_notification>\n"),
+            Some("Shell done.".to_owned())
+        );
+        assert_eq!(
+            notification_text("Unwrapped."),
+            Some("Unwrapped.".to_owned())
+        );
+        assert_eq!(
+            notification_text("<system_notification></system_notification>"),
+            None
         );
     }
 }

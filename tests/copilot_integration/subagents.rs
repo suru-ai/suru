@@ -3,65 +3,13 @@
 //! — no longer failing the Session as the main agent's second Message — a Subagent outliving the
 //! Turn keeps running past `session.idle`, and its late output streams into a Continuation.
 
-use std::sync::Arc;
-
 use crate::support::{
-    ScriptedCopilot, abort_arm, agent_messages, connect, conversation_arms, conversation_fixture,
-    send_arm, session_where, settled_session,
+    ScriptedCopilot, abort_arm, agent_messages, conversation_arms, conversation_fixture,
+    opened_session, send_arm, session_where, settled_session,
 };
-use suru::{
-    managed_client::ManagedClient,
-    protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
-        PromptId, SessionId, SessionSnapshot, TranscriptItem, TurnStatus,
-    },
-    provider::CopilotRuntime,
-    server::{self, RunningServer, ServerConfig},
+use suru::protocol::{
+    Activity, ActivityStatus, Delegator, MessageRole, SessionSnapshot, TranscriptItem, TurnStatus,
 };
-
-/// A Session opened on `copilot` with `prompt` delivered, holding everything the Turn runs on for
-/// as long as the test does. `name` is the client channel, so each test needs its own.
-struct Opened {
-    _state_dir: tempfile::TempDir,
-    _workspace: tempfile::TempDir,
-    server: RunningServer,
-    client: ManagedClient,
-    session_id: SessionId,
-}
-
-async fn opened_session(copilot: &ScriptedCopilot, name: &'static str, prompt: &str) -> Opened {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), name).expect("configure server"),
-        Arc::new(CopilotRuntime::new(copilot.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let client = connect(state_dir.path(), name).await;
-    let created = client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: prompt.to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .await
-        .expect("create Session");
-    Opened {
-        _state_dir: state_dir,
-        _workspace: workspace,
-        server,
-        client,
-        session_id: created.session.id,
-    }
-}
 
 /// The one Subagent row in `snapshot`.
 fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
