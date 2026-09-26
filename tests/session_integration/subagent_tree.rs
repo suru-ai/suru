@@ -22,8 +22,9 @@ use suru::{
         ActivityStatus, AdmitPromptRequest, Approval, ApprovalId, ApprovalSubject,
         CreateSessionRequest, Decision, InitialPrompt, Outlook, PromptDelivery, PromptId, Question,
         Questionnaire, QuestionnaireId, RuntimeDescriptor, SUBAGENT_TREE_SNAPSHOT_EVENT,
-        SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode, SessionId, SubagentTreeChange,
-        SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
+        SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode, SessionId, SessionTimestamp,
+        SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
+        TurnStatus,
     },
     provider::{
         ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderSubagentStatus,
@@ -258,9 +259,11 @@ async fn the_snapshot_lists_the_tree_depth_first_in_spawn_order() {
     assert_eq!(explore.title, "Map the provider seams");
     assert_eq!(explore.status, ActivityStatus::Active);
     assert_eq!(
-        explore.duration_ms, None,
-        "a working Subagent has no duration"
+        explore.worked_ms,
+        Some(0),
+        "a Subagent working its first Turn has nothing settled to count up from"
     );
+    assert!(explore.working_since.is_some());
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
@@ -323,7 +326,8 @@ async fn spawns_settles_and_updates_arrive_as_changes_and_settled_entries_keep_t
     assert_eq!(explore.name, "Explore");
     assert_eq!(explore.title, "Map the provider seams");
     assert_eq!(explore.status, ActivityStatus::Active);
-    assert_eq!(explore.duration_ms, None);
+    assert_eq!(explore.worked_ms, Some(0));
+    assert!(explore.working_since.is_some());
 
     spawn(
         provider,
@@ -378,10 +382,11 @@ async fn spawns_settles_and_updates_arrive_as_changes_and_settled_entries_keep_t
         ProviderSubagentStatus::Completed,
     )
     .await;
-    let SubagentTreeChange::SubagentSettled {
+    let SubagentTreeChange::SubagentWorkingChanged {
         session_id,
         status,
-        duration_ms,
+        worked_ms,
+        working_since,
     } = next_change(&mut updates, &mut revision).await
     else {
         panic!("a nested settle arrives as a settled entry");
@@ -389,22 +394,24 @@ async fn spawns_settles_and_updates_arrive_as_changes_and_settled_entries_keep_t
     assert_eq!(session_id, review.session_id);
     assert_eq!(status, ActivityStatus::Completed);
     assert!(
-        duration_ms.is_some(),
+        worked_ms.is_some(),
         "a settle the Provider reported carries how long the Subagent worked"
     );
+    assert_eq!(working_since, None, "and it no longer works");
 
     settle(provider, None, "task-1", ProviderSubagentStatus::Failed).await;
-    let SubagentTreeChange::SubagentSettled {
+    let SubagentTreeChange::SubagentWorkingChanged {
         session_id,
         status,
-        duration_ms,
+        worked_ms,
+        ..
     } = next_change(&mut updates, &mut revision).await
     else {
         panic!("a failed settle arrives as a settled entry");
     };
     assert_eq!(session_id, explore.session_id);
     assert_eq!(status, ActivityStatus::Failed);
-    assert!(duration_ms.is_some());
+    assert!(worked_ms.is_some());
 
     let (settled, _updates) = open_tree(fixture.server.descriptor(), plan.session_id).await;
     assert_eq!(
@@ -609,17 +616,18 @@ async fn the_managed_client_surfaces_the_tree_and_its_changes() {
         ProviderSubagentStatus::Completed,
     )
     .await;
-    let SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSettled {
+    let SubagentTreeEvent::Changed(SubagentTreeChange::SubagentWorkingChanged {
         session_id,
         status,
-        duration_ms,
+        worked_ms,
+        ..
     }) = next_tree_event(&mut subscription).await
     else {
         panic!("a settle reaches the managed client as a change");
     };
     assert_eq!(session_id, review.session_id);
     assert_eq!(status, ActivityStatus::Completed);
-    assert!(duration_ms.is_some());
+    assert!(worked_ms.is_some());
 
     spawn(provider, None, "task-3", "Plan", "Weigh the options").await;
     let SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSpawned { entry }) =
@@ -830,8 +838,8 @@ async fn a_restart_restores_the_tree_and_its_entries() {
         after
             .subagents
             .iter()
-            .all(|entry| entry.duration_ms.is_some()),
-        "settled durations are restored with their entries"
+            .all(|entry| entry.worked_ms.is_some()),
+        "settled times are restored with their entries"
     );
 
     restarted
@@ -884,18 +892,19 @@ async fn entries_say_when_their_work_began_and_the_top_level_since_when_it_works
     );
     for entry in &tree.subagents {
         let started_at = entry
-            .started_at
-            .unwrap_or_else(|| panic!("{} says when its work began", entry.name));
+            .working_since
+            .unwrap_or_else(|| panic!("{} says since when it works", entry.name));
         assert_eq!(
             Some(started_at),
             read_session(descriptor, entry.session_id).await.turns[0].started_at,
-            "{} began its work when its own Session's Turn began, at its spawn",
+            "{} works since its own Session's Turn began, at its spawn",
             entry.name
         );
+        assert_eq!(entry.worked_ms, Some(0), "with no earlier Turn to add");
         assert!(started_at >= working_since);
         assert!(!entry.needs_intervention);
     }
-    let started = |name| named(&tree.subagents, name).started_at;
+    let started = |name| named(&tree.subagents, name).working_since;
     assert!(
         started("Explore") <= started("Review") && started("Review") <= started("Probe"),
         "a Subagent begins no earlier than the Subagent that spawned it"
@@ -1201,7 +1210,7 @@ async fn two_subscribers_to_one_tree_hear_the_same_change() {
     assert!(
         matches!(
             &heard_at_top,
-            SubagentTreeChange::SubagentSettled { session_id, status: ActivityStatus::Completed, .. }
+            SubagentTreeChange::SubagentWorkingChanged { session_id, status: ActivityStatus::Completed, .. }
                 if *session_id == explore
         ),
         "{heard_at_top:?}"
@@ -1214,6 +1223,33 @@ async fn two_subscribers_to_one_tree_hear_the_same_change() {
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// How long each of a Subagent's Turns worked, oldest first, as its own
+/// Session records them.
+async fn turn_spans(descriptor: &RuntimeDescriptor, session_id: SessionId) -> Vec<u64> {
+    read_session(descriptor, session_id)
+        .await
+        .turns
+        .iter()
+        .map(|turn| {
+            turn.settled_at.expect("the Turn settled").0
+                - turn.started_at.expect("the Turn began").0
+        })
+        .collect()
+}
+
+/// When a Subagent's latest Turn began, as its own Session records it.
+async fn latest_turn_began(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> Option<SessionTimestamp> {
+    read_session(descriptor, session_id)
+        .await
+        .turns
+        .last()
+        .expect("a Subagent's Session holds a Turn")
+        .started_at
 }
 
 #[tokio::test]
@@ -1276,10 +1312,21 @@ async fn a_resumed_subagent_is_one_entry_standing_where_it_first_spawned() {
     .await;
     spawn(provider, None, "task-3", "Plan", "Weigh the options").await;
 
-    let SubagentTreeChange::SubagentSpawned { entry } =
-        next_change(&mut updates, &mut revision).await
-    else {
-        panic!("the resumes move nothing in the tree, so the next change is the new spawn");
+    let changes = changes_until(&mut updates, &mut revision, |change| {
+        matches!(change, SubagentTreeChange::SubagentSpawned { .. })
+    })
+    .await;
+    let (spawned, resumed) = changes.split_last().expect("the spawn arrived");
+    assert!(
+        resumed.iter().all(|change| matches!(
+            change,
+            SubagentTreeChange::SubagentWorkingChanged { session_id, .. }
+                if *session_id == explore.session_id
+        )),
+        "the resumes move only the explorer's own entry: {resumed:?}"
+    );
+    let SubagentTreeChange::SubagentSpawned { entry } = spawned else {
+        unreachable!()
     };
     assert_eq!(entry.name, "Plan");
     assert_eq!(
@@ -1297,12 +1344,219 @@ async fn a_resumed_subagent_is_one_entry_standing_where_it_first_spawned() {
         ]),
         "the explorer is listed once, where it first spawned, and not again under the reviewer"
     );
+    let resumed = named(&after.subagents, "Explore");
     assert_eq!(
-        named(&after.subagents, "Explore"),
-        &explore,
-        "the entry still reads as the spawn left it"
+        (
+            &resumed.title,
+            resumed.parent_session_id,
+            resumed.spawn_order
+        ),
+        (
+            &explore.title,
+            explore.parent_session_id,
+            explore.spawn_order
+        ),
+        "the entry is still named and placed as the spawn left it"
+    );
+    assert_eq!(
+        resumed.status,
+        ActivityStatus::Active,
+        "and works again while the latest resume does"
     );
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_resumed_subagent_works_again_counting_up_from_its_earlier_turns_then_settles() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-resume-time-test").await;
+    let provider = &fixture.provider_session;
+    let descriptor = fixture.server.descriptor();
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    let (tree, mut updates) = open_tree(descriptor, fixture.session_id).await;
+    let mut revision = tree.revision;
+    let explore = named(&tree.subagents, "Explore").clone();
+    let [first_ms] = turn_spans(descriptor, explore.session_id).await[..] else {
+        panic!("the spawn's Turn alone has settled");
+    };
+    assert_eq!(
+        (explore.status, explore.worked_ms, explore.working_since),
+        (ActivityStatus::Completed, Some(first_ms), None),
+        "settled, the entry stands at its one Turn's time"
+    );
+
+    resume(provider, None, "task-1", "Map the tests too").await;
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: explore.session_id,
+            status: ActivityStatus::Active,
+            worked_ms: Some(first_ms),
+            working_since: latest_turn_began(descriptor, explore.session_id).await,
+        },
+        "resumed, the entry is Working again, counting up from its first Turn's time from \
+         the moment the resume's Turn began"
+    );
+
+    settle(
+        provider,
+        None,
+        "task-1",
+        ProviderSubagentStatus::Interrupted,
+    )
+    .await;
+    let spans = turn_spans(descriptor, explore.session_id).await;
+    assert_eq!(spans.len(), 2, "the resume ran a second Turn");
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: explore.session_id,
+            status: ActivityStatus::Interrupted,
+            worked_ms: Some(spans.iter().sum()),
+            working_since: None,
+        },
+        "settled again, it wears the resume's outcome over both Turns' time"
+    );
+    let parent = read_session(descriptor, fixture.session_id).await;
+    let durations = parent
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            suru::protocol::Activity::Subagent {
+                status,
+                duration_ms,
+                ..
+            } => Some((*status, duration_ms.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        durations,
+        [
+            (ActivityStatus::Completed, true),
+            (ActivityStatus::Interrupted, true),
+        ],
+        "while each row still describes only its own stretch"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_subagent_whose_resume_completed_after_its_first_turn_failed_shows_completed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-resume-outcome-test").await;
+    let provider = &fixture.provider_session;
+    let descriptor = fixture.server.descriptor();
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    settle(provider, None, "task-1", ProviderSubagentStatus::Failed).await;
+    resume(provider, None, "task-1", "Try the mapping again").await;
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+
+    let (tree, _updates) = open_tree(descriptor, fixture.session_id).await;
+    let explore = named(&tree.subagents, "Explore");
+    let spans = turn_spans(descriptor, explore.session_id).await;
+    assert_eq!(
+        read_session(descriptor, explore.session_id)
+            .await
+            .turns
+            .iter()
+            .map(|turn| turn.status)
+            .collect::<Vec<_>>(),
+        [TurnStatus::Failed, TurnStatus::Completed]
+    );
+    assert_eq!(
+        (explore.status, explore.worked_ms),
+        (ActivityStatus::Completed, Some(spans.iter().sum())),
+        "the entry wears its latest Turn's outcome, not its first's"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_subagent_settled_without_suru_learning_when_its_work_ended_leaves_its_time_blank() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "subagent-tree-unlearned-end-test";
+    let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
+    let fixture = working_turn(state_dir.path(), channel).await;
+    spawn(
+        &fixture.provider_session,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    let row = read_session(fixture.server.descriptor(), fixture.session_id)
+        .await
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            suru::protocol::Activity::Subagent { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("the spawn stands as a row");
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    // Put the history back the way a process that never settled its work
+    // would have left it: every Turn open, the Subagent's row still live.
+    {
+        use diesel::{Connection, RunQueryDsl, SqliteConnection};
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        diesel::sql_query(
+            "UPDATE turns SET payload = json_set(payload, '$.status', 'active', '$.settled_at', json('null'))",
+        )
+        .execute(&mut database)
+        .unwrap();
+        diesel::sql_query(format!(
+            "UPDATE activities SET payload = json_set(payload, '$.status', 'active', '$.duration_ms', json('null')) WHERE id = '{row}'"
+        ))
+        .execute(&mut database)
+        .unwrap();
+    }
+
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, runtime)
+        .await
+        .expect("respawn server");
+    let (tree, _updates) = open_tree(restarted.descriptor(), fixture.session_id).await;
+    let explore = named(&tree.subagents, "Explore");
+    let child = read_session(restarted.descriptor(), explore.session_id).await;
+    assert_eq!(
+        child.turns[0].settled_at, child.turns[0].started_at,
+        "the restart settled the Turn where it began, having seen no work to time"
+    );
+    assert_eq!(
+        (explore.status, explore.worked_ms, explore.working_since),
+        (ActivityStatus::Failed, None, None),
+        "the entry wears its failure and leaves the time it never learned blank"
+    );
+
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted server");
 }

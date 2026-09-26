@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 60;
+pub const PROTOCOL_VERSION: u32 = 61;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -2443,10 +2443,11 @@ pub struct SubagentTreeTopLevel {
     pub needs_intervention: bool,
 }
 
-/// One Subagent's Session in a tree, read off the Subagent row its spawn left
-/// in its spawner's Transcript, so it says what that row says. A resumed
-/// Subagent is still one entry: the rows its resumes add lead into the same
-/// Session and stand only in the Transcripts that delegated them.
+/// One Subagent's Session in a tree. It stands where the Subagent's spawn
+/// left its row in the spawner's Transcript and is named by that row, but its
+/// Marker and time are read from the Subagent's own Session's Turns, never
+/// from any one row: a resumed Subagent is still one entry, and a resume or a
+/// Continuation of its Session sets it Working again (ADR 0031).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeEntry {
@@ -2462,17 +2463,19 @@ pub struct SubagentTreeEntry {
     /// What the Subagent was asked to do, as its spawn — or the Provider's
     /// latest update to it — described it.
     pub title: String,
+    /// The Marker of the Subagent's Session's latest Turn: `Active` while
+    /// that Turn works, and otherwise the outcome it settled with.
     pub status: ActivityStatus,
-    /// How long the Subagent worked, once it has settled and where Suru
-    /// learned when its work ended.
-    pub duration_ms: Option<u64>,
-    /// When the Subagent's work began: the moment it spawned, which is also
-    /// the moment [`Self::duration_ms`] is timed from. A client ticks a
-    /// working entry's elapsed time from here, as it ticks a Sidebar row's
-    /// Working duration from its `working_since`. `None` only where the
-    /// Subagent's own Session could not be read.
-    #[serde(default)]
-    pub started_at: Option<SessionTimestamp>,
+    /// How long the Subagent's settled Turns worked, summed. While it works
+    /// this is the total its time counts up from; once it settles, the whole
+    /// of it. `None` where it settled without Suru learning when its work
+    /// ended.
+    pub worked_ms: Option<u64>,
+    /// When the Turn the Subagent works in began, while it works, and `None`
+    /// once it settles. A client ticks a working entry's time up from
+    /// [`Self::worked_ms`] from here, as it ticks a Sidebar row's Working
+    /// duration from its `working_since`.
+    pub working_since: Option<SessionTimestamp>,
     /// Whether this Subagent's own Session holds a live Approval or
     /// Questionnaire. It is never rolled up: a Subagent whose descendant waits
     /// on an Intervention does not say so itself.
@@ -2488,12 +2491,14 @@ pub enum SubagentTreeChange {
     /// A Subagent spawned. Its spawner is already in the tree, and the entry
     /// comes last among that spawner's Subagents.
     SubagentSpawned { entry: SubagentTreeEntry },
-    /// A Subagent settled: completed, failed, or interrupted, with how long it
-    /// worked where Suru learned when its work ended.
-    SubagentSettled {
+    /// A Subagent's latest Turn began or Settled — a resume or a Continuation
+    /// setting it Working again, or its work settling as completed, failed,
+    /// or interrupted — so its Marker and time moved, carried whole.
+    SubagentWorkingChanged {
         session_id: SessionId,
         status: ActivityStatus,
-        duration_ms: Option<u64>,
+        worked_ms: Option<u64>,
+        working_since: Option<SessionTimestamp>,
     },
     /// A Subagent's name or Title changed, carried whole.
     SubagentRetitled {

@@ -10140,8 +10140,8 @@ impl Family {
             name: name.to_owned(),
             title: format!("{name} the seams"),
             status: ActivityStatus::Active,
-            duration_ms: None,
-            started_at: None,
+            worked_ms: Some(0),
+            working_since: None,
             needs_intervention: false,
         };
         SubagentTreeSnapshot {

@@ -92,7 +92,7 @@ fn entry(
     spawn_order: u32,
     (name, title): (&str, &str),
     status: ActivityStatus,
-    duration_ms: Option<u64>,
+    worked_ms: Option<u64>,
 ) -> SubagentTreeEntry {
     SubagentTreeEntry {
         session_id,
@@ -101,9 +101,9 @@ fn entry(
         name: name.to_owned(),
         title: title.to_owned(),
         status,
-        duration_ms,
-        // Unknown unless a test says when the work began.
-        started_at: None,
+        worked_ms,
+        // Unknown unless a test says when the working Turn began.
+        working_since: None,
         needs_intervention: false,
     }
 }
@@ -357,10 +357,11 @@ fn a_settle_never_moves_an_entry() {
     deliver_tree(
         &mut application,
         tree.top,
-        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSettled {
+        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentWorkingChanged {
             session_id: tree.review,
             status: ActivityStatus::Failed,
-            duration_ms: Some(3_000),
+            worked_ms: Some(3_000),
+            working_since: None,
         }),
     );
 
@@ -1316,7 +1317,7 @@ fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_durati
     let tree = Tree::new();
     open(&mut application, workspace.path(), tree.top, None);
     let mut snapshot = tree.snapshot();
-    snapshot.subagents[1].started_at = Some(before_start(5_000));
+    snapshot.subagents[1].working_since = Some(before_start(5_000));
     deliver_tree(
         &mut application,
         tree.top,
@@ -1344,10 +1345,11 @@ fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_durati
     change(
         &mut application,
         tree.top,
-        SubagentTreeChange::SubagentSettled {
+        SubagentTreeChange::SubagentWorkingChanged {
             session_id: tree.review,
             status: ActivityStatus::Completed,
-            duration_ms: Some(95_000),
+            worked_ms: Some(95_000),
+            working_since: None,
         },
     );
     let settled = aside_row(&application, "Review");
@@ -1364,6 +1366,108 @@ fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_durati
     assert!(
         !application.wants_spinner(),
         "nothing in the Aside is live any more"
+    );
+}
+
+/// A settled Subagent a resume — or a Continuation its own work began —
+/// sets Working again counts up from what its earlier Turns worked, and once
+/// that Turn settles stands at the time all of them took, the change arriving
+/// live with the Section open.
+#[test]
+fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_their_sum() {
+    let workspace = workspace_dir();
+    let (mut application, now) = session_clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    // Nothing else in the tree is live, so what ticks is the resumed entry.
+    snapshot.subagents[1].status = ActivityStatus::Completed;
+    snapshot.subagents[1].worked_ms = Some(3_000);
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+    assert_eq!(
+        aside_row(&application, "Explore"),
+        "├ ✓ Explore Map the prov… 12s"
+    );
+    assert!(!application.wants_spinner());
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: tree.explore,
+            status: ActivityStatus::Active,
+            worked_ms: Some(12_000),
+            // Begun at the moment the clock now reads.
+            working_since: Some(SessionTimestamp(CLOCK_START)),
+        },
+    );
+    let resumed = aside_row(&application, "Explore");
+    assert!(
+        resumed.starts_with("├ ⠋ Explore") && resumed.ends_with(" 12s"),
+        "working again, the entry wears the Working Marker and counts up from its earlier \
+         Turns' time: {resumed:?}"
+    );
+    assert!(
+        application.wants_spinner(),
+        "and keeps the run loop ticking while it works"
+    );
+    advance_session_clock(&now, 5_000);
+    assert!(aside_row(&application, "Explore").ends_with(" 17s"));
+    advance_session_clock(&now, 60_000);
+    assert!(
+        aside_row(&application, "Explore").ends_with(" 1m"),
+        "read the way a working entry always reads: {:?}",
+        aside_row(&application, "Explore")
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: tree.explore,
+            status: ActivityStatus::Failed,
+            worked_ms: Some(77_000),
+            working_since: None,
+        },
+    );
+    let settled = aside_row(&application, "Explore");
+    assert!(
+        settled.starts_with("├ × Explore") && settled.ends_with(" 1m 17s"),
+        "settled again, it wears the latest Turn's outcome over all its Turns' time: \
+         {settled:?}"
+    );
+    advance_session_clock(&now, 60_000);
+    assert_eq!(
+        aside_row(&application, "Explore"),
+        settled,
+        "and the time no longer moves"
+    );
+    assert!(!application.wants_spinner());
+}
+
+#[test]
+fn a_settled_entry_whose_end_went_unlearned_leaves_its_time_blank() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: tree.review,
+            status: ActivityStatus::Failed,
+            worked_ms: None,
+            working_since: None,
+        },
+    );
+
+    assert_eq!(
+        aside_rows(&application, WIDTH)[3],
+        "│ └ × Review Check the mappe…",
+        "no time stands beside it, the Marker saying enough"
     );
 }
 
@@ -1433,7 +1537,7 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
     open(&mut application, workspace.path(), tree.top, None);
     let mut snapshot = tree.snapshot();
     snapshot.top_level.working_since = Some(before_start(30_000));
-    snapshot.subagents[1].started_at = Some(before_start(5_000));
+    snapshot.subagents[1].working_since = Some(before_start(5_000));
     snapshot.subagents[1].needs_intervention = true;
     deliver_tree(
         &mut application,
@@ -1668,10 +1772,11 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     deliver_tree(
         &mut application,
         tree.top,
-        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentSettled {
+        SubagentTreeEvent::Changed(SubagentTreeChange::SubagentWorkingChanged {
             session_id: tree.plan,
             status: ActivityStatus::Failed,
-            duration_ms: Some(1_000),
+            worked_ms: Some(1_000),
+            working_since: None,
         }),
     );
     assert_eq!(

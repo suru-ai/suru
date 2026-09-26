@@ -126,13 +126,22 @@ impl Section for SubagentsSection {
             let (marker, marker_style) = subagent_marker(subagent.status, theme);
             let working = subagent.status == ActivityStatus::Active;
             animates |= working;
-            // A working entry ticks from the moment its work began; a settled
-            // one stands at the duration its work took, or says nothing where
-            // that was never learned.
+            // A working entry counts up from what its settled Turns worked,
+            // from the moment the Turn it works in began; a settled one stands
+            // at the time all its Turns took, or says nothing where Suru never
+            // learned when its work ended.
             let time = if working {
-                subagent.started_at.map(|since| ticking(since, context.now))
+                subagent.working_since.map(|since| {
+                    // Counted from as long before this Turn began as its
+                    // earlier Turns worked.
+                    let earlier = subagent.worked_ms.unwrap_or(0);
+                    ticking(
+                        SessionTimestamp(since.0.saturating_sub(earlier)),
+                        context.now,
+                    )
+                })
             } else {
-                subagent.duration_ms.map(humanized_duration)
+                subagent.worked_ms.map(humanized_duration)
             };
             rows.push(SectionRow {
                 line: entry_line(

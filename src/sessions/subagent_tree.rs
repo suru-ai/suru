@@ -1,23 +1,27 @@
 //! The live reading of the tree a top-level Session heads: that Session and
 //! every Subagent's Session beneath the one that spawned it, to any depth.
 //!
-//! The tree is read off the Subagent rows each Session's Transcript already
-//! carries — the rows the Provider-neutral Subagent orchestration writes on a
-//! spawn, a resume, a settle, and an update — so every Provider is covered
-//! without a word of its own. A resumed Subagent has a row for every stretch
-//! of its work, all leading into its one Session, so the tree lists it once,
-//! by the row its spawn left where it first spawned (ADR 0031). A subscribed
-//! tree is read again after each commit that could move it and compared with
-//! what its subscribers last heard, so the changes they are told about are
-//! exactly the difference, however the rows came to move.
+//! The tree's shape is read off the Subagent rows each Session's Transcript
+//! already carries — the rows the Provider-neutral Subagent orchestration
+//! writes on a spawn, a resume, a settle, and an update — so every Provider is
+//! covered without a word of its own. A resumed Subagent has a row for every
+//! stretch of its work, all leading into its one Session, so the tree lists it
+//! once, by the row its spawn left where it first spawned. Each row describes
+//! only its own stretch, so where a Subagent's work stands — its Marker and
+//! its time — is read from its own Session's Turns instead: the latest Turn's
+//! Marker, and the time summed over them all (ADR 0031). A subscribed tree is
+//! read again after each commit that could move it and compared with what its
+//! subscribers last heard, so the changes they are told about are exactly the
+//! difference, however the rows or Turns came to move.
 
 use std::collections::{HashMap, HashSet};
 
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Activity, SessionChange, SessionId, SessionTimestamp, SubagentTreeChange, SubagentTreeEntry,
-    SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel, SubagentTreeUpdate,
+    Activity, ActivityStatus, SessionChange, SessionId, SessionTimestamp, SubagentTreeChange,
+    SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel,
+    SubagentTreeUpdate, Turn, TurnStatus,
 };
 
 use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState};
@@ -264,24 +268,90 @@ impl SessionStoreState {
             .zip(0..)
             .map(
                 |((session_id, name, description, status, duration_ms), spawn_order)| {
-                    // The Subagent's own Session came into being at its spawn,
-                    // so its creation is when its work began.
                     let own = self.sessions.get(&session_id);
+                    // Where the Subagent's work stands is its own Session's
+                    // to say. Only a Session not held here leaves its first
+                    // row to say it instead.
+                    let work = own
+                        .and_then(|record| SubagentWork::read(&record.snapshot.turns))
+                        .unwrap_or(SubagentWork {
+                            status,
+                            worked_ms: duration_ms,
+                            working_since: None,
+                        });
                     SubagentTreeEntry {
                         session_id,
                         parent_session_id: spawner,
                         spawn_order,
                         name: name.clone(),
                         title: description.clone(),
-                        status,
-                        duration_ms,
-                        started_at: own.map(|record| record.summary.created_at),
+                        status: work.status,
+                        worked_ms: work.worked_ms,
+                        working_since: work.working_since,
                         needs_intervention: own.is_some_and(needs_intervention),
                     }
                 },
             )
             .collect()
     }
+}
+
+/// Where a Subagent's work stands, as its entry says it: read from its own
+/// Session's Turns, since the Subagent itself never Settles — only its Turns
+/// do — and each of its rows describes only its own stretch.
+#[derive(Debug, Eq, PartialEq)]
+struct SubagentWork {
+    /// The Marker of the latest Turn.
+    status: ActivityStatus,
+    /// The settled Turns' time, summed.
+    worked_ms: Option<u64>,
+    /// When the latest Turn began, while it works.
+    working_since: Option<SessionTimestamp>,
+}
+
+impl SubagentWork {
+    /// Reads a Subagent's Turns, oldest first: the latest Turn's Marker —
+    /// Working while it works, and otherwise the outcome it settled with —
+    /// and the time every settled Turn worked, summed. While the latest Turn
+    /// works, that sum is what its time counts up from, from the moment the
+    /// Turn began. Once it settles, the sum takes it in too, unless Suru never
+    /// learned when its work ended, which leaves the time unsaid rather than
+    /// understated; an earlier Turn whose end went unlearned adds nothing.
+    /// `None` for a Session with no Turn at all, which says nothing.
+    fn read(turns: &[Turn]) -> Option<Self> {
+        let (latest, earlier) = turns.split_last()?;
+        let earlier_ms = earlier
+            .iter()
+            .filter_map(worked_span)
+            .fold(0_u64, u64::saturating_add);
+        let status = match latest.status {
+            TurnStatus::Active => {
+                return Some(Self {
+                    status: ActivityStatus::Active,
+                    worked_ms: Some(earlier_ms),
+                    working_since: latest.started_at,
+                });
+            }
+            TurnStatus::Completed => ActivityStatus::Completed,
+            TurnStatus::Failed => ActivityStatus::Failed,
+            TurnStatus::Interrupted => ActivityStatus::Interrupted,
+        };
+        Some(Self {
+            status,
+            worked_ms: worked_span(latest).map(|latest_ms| latest_ms.saturating_add(earlier_ms)),
+            working_since: None,
+        })
+    }
+}
+
+/// How long one settled Turn worked, where Suru learned when its work ended:
+/// from the commit that began it to the one that settled it. A Turn missing
+/// either moment has no span to give, and neither has one settled no later
+/// than it began: a restart settles a Turn that never showed any work where
+/// it began (ADR 0029), which says nothing of when that work ended.
+fn worked_span(turn: &Turn) -> Option<u64> {
+    let span = turn.settled_at?.0.checked_sub(turn.started_at?.0)?;
+    (span > 0).then_some(span)
 }
 
 /// Whether a Session's own Transcript holds a live Approval or Questionnaire —
@@ -327,7 +397,7 @@ impl SubagentTreePublisher {
 /// What moved between two readings of one tree, in the order a reader applying
 /// them needs: a spawner always joins before what it spawns. `None` when the
 /// difference is one no change can say: an entry gone, or moved from where it
-/// stood, or begun at another moment.
+/// stood.
 fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<SubagentTreeChange>> {
     let mut changes = Vec::new();
     if before.top_level.session_id != after.top_level.session_id {
@@ -371,7 +441,6 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
         };
         if previous.parent_session_id != entry.parent_session_id
             || previous.spawn_order != entry.spawn_order
-            || previous.started_at != entry.started_at
         {
             return None;
         }
@@ -382,11 +451,15 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
                 title: entry.title.clone(),
             });
         }
-        if previous.status != entry.status || previous.duration_ms != entry.duration_ms {
-            changes.push(SubagentTreeChange::SubagentSettled {
+        if previous.status != entry.status
+            || previous.worked_ms != entry.worked_ms
+            || previous.working_since != entry.working_since
+        {
+            changes.push(SubagentTreeChange::SubagentWorkingChanged {
                 session_id: entry.session_id,
                 status: entry.status,
-                duration_ms: entry.duration_ms,
+                worked_ms: entry.worked_ms,
+                working_since: entry.working_since,
             });
         }
         if previous.needs_intervention != entry.needs_intervention {
@@ -399,11 +472,14 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
     Some(changes)
 }
 
-/// Whether a committed change could move a tree's rows or its top-level Title.
-/// The tree's Working and Intervention readings are compared by the commit
-/// itself, because what moves them is derived rather than carried by any one
-/// change. A commit that moves none of them leaves every subscribed tree
-/// unread.
+/// Whether a committed change could move a tree's rows, a Subagent's work, or
+/// the top-level Title. A Turn beginning or settling in a Subagent's Session
+/// moves its entry's Marker and time — a resume, or a Continuation its own
+/// work began, as much as a settle — even where no row in its spawner moves
+/// with it. The tree's top-level Working and Intervention readings are
+/// compared by the commit itself, because what moves them is derived rather
+/// than carried by any one change. A commit that moves none of them leaves
+/// every subscribed tree unread.
 pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
     matches!(
         change,
@@ -412,6 +488,8 @@ pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
         } | SessionChange::SubagentStatusChanged { .. }
             | SessionChange::SubagentDescriptionChanged { .. }
             | SessionChange::TitleChanged { .. }
+            | SessionChange::TurnAdded { .. }
+            | SessionChange::TurnStatusChanged { .. }
     )
 }
 
@@ -428,8 +506,8 @@ mod tests {
             name: "Explore".to_owned(),
             title: "Map the seams".to_owned(),
             status: ActivityStatus::Active,
-            duration_ms: None,
-            started_at: Some(SessionTimestamp(1_000)),
+            worked_ms: Some(0),
+            working_since: Some(SessionTimestamp(1_000)),
             needs_intervention: false,
         }
     }
@@ -454,7 +532,8 @@ mod tests {
         };
         let mut settled = entry(child, top, 0);
         settled.status = ActivityStatus::Completed;
-        settled.duration_ms = Some(12);
+        settled.worked_ms = Some(12);
+        settled.working_since = None;
         settled.title = "Mapped the seams".to_owned();
         settled.needs_intervention = true;
         let mut after_top_level = top_level(top, "Delegate the mapping");
@@ -483,10 +562,11 @@ mod tests {
                     name: "Explore".to_owned(),
                     title: "Mapped the seams".to_owned(),
                 },
-                SubagentTreeChange::SubagentSettled {
+                SubagentTreeChange::SubagentWorkingChanged {
                     session_id: child,
                     status: ActivityStatus::Completed,
-                    duration_ms: Some(12),
+                    worked_ms: Some(12),
+                    working_since: None,
                 },
                 SubagentTreeChange::NeedsInterventionChanged {
                     session_id: child,
@@ -518,13 +598,268 @@ mod tests {
         let mut moved = before.clone();
         moved.subagents[0].spawn_order = 1;
         assert_eq!(tree_changes(&before, &moved), None, "an entry moved");
+    }
 
-        let mut restarted = before.clone();
-        restarted.subagents[0].started_at = Some(SessionTimestamp(2_000));
+    fn turn(status: TurnStatus, started_at: Option<u64>, settled_at: Option<u64>) -> Turn {
+        Turn {
+            id: crate::protocol::TurnId::new(),
+            prompt_id: None,
+            agent: None,
+            status,
+            started_at: started_at.map(SessionTimestamp),
+            settled_at: settled_at.map(SessionTimestamp),
+            last_output_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
+            cost_details: None,
+        }
+    }
+
+    fn work(
+        status: ActivityStatus,
+        worked_ms: Option<u64>,
+        working_since: Option<u64>,
+    ) -> Option<SubagentWork> {
+        Some(SubagentWork {
+            status,
+            worked_ms,
+            working_since: working_since.map(SessionTimestamp),
+        })
+    }
+
+    #[test]
+    fn a_subagents_work_is_its_latest_turns_marker_and_its_turns_time_summed() {
         assert_eq!(
-            tree_changes(&before, &restarted),
-            None,
-            "an entry begun at another moment"
+            SubagentWork::read(&[turn(TurnStatus::Active, Some(1_000), None)]),
+            work(ActivityStatus::Active, Some(0), Some(1_000)),
+            "working its first Turn, it counts up from nothing, from when that Turn began"
+        );
+        let first = turn(TurnStatus::Completed, Some(1_000), Some(4_000));
+        assert_eq!(
+            SubagentWork::read(std::slice::from_ref(&first)),
+            work(ActivityStatus::Completed, Some(3_000), None)
+        );
+        assert_eq!(
+            SubagentWork::read(&[first.clone(), turn(TurnStatus::Active, Some(9_000), None)]),
+            work(ActivityStatus::Active, Some(3_000), Some(9_000)),
+            "working again, it counts up from its first Turn's time, from when the new Turn began"
+        );
+        assert_eq!(
+            SubagentWork::read(&[
+                first,
+                turn(TurnStatus::Interrupted, Some(9_000), Some(11_000)),
+            ]),
+            work(ActivityStatus::Interrupted, Some(5_000), None),
+            "settled again, it wears the new Turn's outcome over both Turns' time"
+        );
+        assert_eq!(
+            SubagentWork::read(&[
+                turn(TurnStatus::Failed, Some(1_000), Some(2_000)),
+                turn(TurnStatus::Completed, Some(5_000), Some(8_000)),
+            ]),
+            work(ActivityStatus::Completed, Some(4_000), None),
+            "a failed Turn a later one completed after says nothing of the Marker"
+        );
+        assert_eq!(SubagentWork::read(&[]), None, "no Turn, nothing to say");
+    }
+
+    #[test]
+    fn a_settled_subagent_whose_work_ended_unlearned_leaves_its_time_unsaid() {
+        assert_eq!(
+            SubagentWork::read(&[turn(TurnStatus::Failed, Some(1_000), Some(1_000))]),
+            work(ActivityStatus::Failed, None, None),
+            "a Turn a restart settled where it began showed no work to time"
+        );
+        assert_eq!(
+            SubagentWork::read(&[turn(TurnStatus::Completed, None, Some(3_000))]),
+            work(ActivityStatus::Completed, None, None),
+            "a Turn stored before Suru timed Turns has no span"
+        );
+        let unlearned = turn(TurnStatus::Failed, Some(1_000), Some(1_000));
+        assert_eq!(
+            SubagentWork::read(&[
+                unlearned.clone(),
+                turn(TurnStatus::Active, Some(5_000), None)
+            ]),
+            work(ActivityStatus::Active, Some(0), Some(5_000)),
+            "an earlier Turn whose end went unlearned adds nothing to count up from"
+        );
+        assert_eq!(
+            SubagentWork::read(&[
+                unlearned,
+                turn(TurnStatus::Completed, Some(5_000), Some(7_000)),
+            ]),
+            work(ActivityStatus::Completed, Some(2_000), None),
+            "nor to the time a later settle states"
+        );
+    }
+
+    /// A settled Subagent woken by its own work — a Watch firing, say — runs on
+    /// in a Continuation of its own Session. Nothing moves in its spawner's
+    /// Transcript, yet its entry is Working again until that Continuation
+    /// settles.
+    #[tokio::test]
+    async fn a_continuation_of_a_settled_subagents_own_session_sets_its_entry_working() {
+        use crate::{
+            protocol::{
+                ActivityId, AgentId, AgentIdentity, AgentSelection, CreateSessionRequest,
+                InitialPrompt, ModelId, PromptId, ProviderId,
+            },
+            sessions::{DeliveredTurnStatus, ProviderTurnOutcome, StoreOutcome},
+            storage::{StorageRepository, StorageWriter, StoredSubagentIdentity},
+        };
+
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let StoreOutcome::Created(parent) = store
+            .create(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Delegate the mapping".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .expect("create the parent Session")
+        else {
+            panic!("a fresh Prompt creates a Session");
+        };
+        let parent_id = parent.session.id;
+        let delivered = store
+            .deliver_prompt(
+                parent_id,
+                parent.prompts[0].id,
+                None,
+                DeliveredTurnStatus::Active,
+            )
+            .expect("deliver the parent's Prompt")
+            .expect("the parent has no other active Turn");
+        let spawned = store
+            .create_subagent(
+                parent_id,
+                StoredSubagentIdentity {
+                    provider: ProviderId::new("controlled"),
+                    subagent_id: crate::provider::ProviderSubagentId::new("task-1"),
+                },
+                "Explore",
+                "Map the seams",
+                None,
+            )
+            .expect("spawn the Subagent");
+        let child = spawned.session_id;
+        let row = ActivityId::new();
+        store
+            .publish_agent_output(
+                parent_id,
+                SessionChange::ActivityAdded {
+                    activity: Activity::Subagent {
+                        id: row,
+                        turn_id: delivered.turn_id,
+                        status: ActivityStatus::Active,
+                        name: "Explore".to_owned(),
+                        description: "Map the seams".to_owned(),
+                        model: None,
+                        session_id: child,
+                        duration_ms: None,
+                    },
+                },
+            )
+            .expect("add the spawn's row");
+        let settle = |turn_id| {
+            store
+                .finish_provider_turn(
+                    child,
+                    turn_id,
+                    ProviderTurnOutcome::Completed {
+                        trailing_output: Default::default(),
+                    },
+                )
+                .expect("settle the Subagent's Turn");
+        };
+        settle(spawned.turn_id);
+        store
+            .publish_agent_output(
+                parent_id,
+                SessionChange::SubagentStatusChanged {
+                    activity_id: row,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(1),
+                },
+            )
+            .expect("settle the spawn's row");
+        let span = |turn: &Turn| {
+            turn.settled_at.expect("the Turn settled").0
+                - turn.started_at.expect("the Turn began").0
+        };
+        let first_ms = span(&store.snapshot(child).expect("the child is held").turns[0]);
+
+        let mut feed = store
+            .subscribe_subagent_tree(parent_id)
+            .expect("the tree is held");
+        let [settled] = feed.snapshot.subagents.as_slice() else {
+            panic!("the tree lists the one Subagent");
+        };
+        assert_eq!(
+            (settled.status, settled.worked_ms, settled.working_since),
+            (ActivityStatus::Completed, Some(first_ms), None)
+        );
+
+        let identity = AgentIdentity {
+            agent: AgentId::new("controlled"),
+            selection: AgentSelection {
+                provider: ProviderId::new("controlled"),
+                model: ModelId::new("model"),
+                options: Vec::new(),
+            },
+        };
+        let continuation = store
+            .begin_continuation(child, identity)
+            .expect("the Subagent's own work begins a Continuation");
+        let began = store.snapshot(child).expect("the child is held").turns[1].started_at;
+        assert_eq!(
+            feed.updates.try_recv().map(|update| update.change),
+            Ok(SubagentTreeChange::SubagentWorkingChanged {
+                session_id: child,
+                status: ActivityStatus::Active,
+                worked_ms: Some(first_ms),
+                working_since: began,
+            }),
+            "the entry is Working again, counting up from its first Turn's time"
+        );
+        assert!(
+            feed.updates.try_recv().is_err(),
+            "and nothing else in the tree moved"
+        );
+        let rows = store
+            .snapshot(parent_id)
+            .expect("the parent is held")
+            .activities
+            .iter()
+            .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+            .count();
+        assert_eq!(rows, 1, "the Continuation adds no row to the parent");
+
+        settle(continuation);
+        let turns = store.snapshot(child).expect("the child is held").turns;
+        assert_eq!(
+            feed.updates.try_recv().map(|update| update.change),
+            Ok(SubagentTreeChange::SubagentWorkingChanged {
+                session_id: child,
+                status: ActivityStatus::Completed,
+                worked_ms: Some(first_ms + span(&turns[1])),
+                working_since: None,
+            }),
+            "settled, it stands at both Turns' time"
         );
     }
 }

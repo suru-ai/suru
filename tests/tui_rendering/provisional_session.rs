@@ -892,8 +892,8 @@ mod aside {
                 name: "Explore".to_owned(),
                 title: "Find the widget".to_owned(),
                 status: ActivityStatus::Active,
-                duration_ms: None,
-                started_at: None,
+                worked_ms: Some(0),
+                working_since: None,
                 needs_intervention: false,
             }],
         }

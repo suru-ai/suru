@@ -908,6 +908,23 @@ async fn a_subagent_resumed_through_send_message_continues_in_its_own_session_as
     assert_eq!(entry.session_id, *spawn_child);
     assert_eq!(entry.parent_session_id, session_id);
     assert_eq!(entry.title, "Say hello");
+    assert_eq!(
+        (entry.status, entry.worked_ms),
+        (
+            ActivityStatus::Completed,
+            Some(
+                child
+                    .turns
+                    .iter()
+                    .map(|turn| {
+                        turn.settled_at.expect("the Turn settled").0
+                            - turn.started_at.expect("the Turn began").0
+                    })
+                    .sum()
+            )
+        ),
+        "the entry wears the resume's outcome, its time summed over both Turns"
+    );
 
     opened
         .server

@@ -277,10 +277,11 @@ mod tests {
     fn settle(revision: u64) -> SubagentTreeUpdate {
         SubagentTreeUpdate {
             revision: SubagentTreeRevision(revision),
-            change: SubagentTreeChange::SubagentSettled {
+            change: SubagentTreeChange::SubagentWorkingChanged {
                 session_id: SessionId::new(),
                 status: ActivityStatus::Completed,
-                duration_ms: Some(5),
+                worked_ms: Some(5),
+                working_since: None,
             },
         }
     }
@@ -509,8 +510,8 @@ mod tests {
             name: "Explore".to_owned(),
             title: "Map the seams".to_owned(),
             status: ActivityStatus::Active,
-            duration_ms: None,
-            started_at: Some(crate::protocol::SessionTimestamp(1_000)),
+            worked_ms: Some(0),
+            working_since: Some(crate::protocol::SessionTimestamp(1_000)),
             needs_intervention: false,
         });
         (tree, subagent)
@@ -524,7 +525,8 @@ mod tests {
         // authoritative whatever it says.
         after.revision = SubagentTreeRevision::INITIAL;
         after.subagents[0].status = ActivityStatus::Completed;
-        after.subagents[0].duration_ms = Some(40);
+        after.subagents[0].worked_ms = Some(40);
+        after.subagents[0].working_since = None;
         let server = TreeServer::spawn(vec![
             Answer::Ends(before.clone(), Vec::new()),
             Answer::Stays(after.clone(), Vec::new()),
@@ -550,12 +552,15 @@ mod tests {
         let (before, subagent) = working_tree(1);
         let mut after = before.clone();
         after.subagents[0].status = ActivityStatus::Failed;
+        after.subagents[0].worked_ms = None;
+        after.subagents[0].working_since = None;
         let skipped = SubagentTreeUpdate {
             revision: SubagentTreeRevision(3),
-            change: SubagentTreeChange::SubagentSettled {
+            change: SubagentTreeChange::SubagentWorkingChanged {
                 session_id: subagent,
                 status: ActivityStatus::Failed,
-                duration_ms: None,
+                worked_ms: None,
+                working_since: None,
             },
         };
         let server = TreeServer::spawn(vec![

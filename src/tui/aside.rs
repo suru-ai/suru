@@ -906,14 +906,16 @@ impl SubagentTreeReading {
                     self.subagents.push(entry);
                 }
             }
-            SubagentTreeChange::SubagentSettled {
+            SubagentTreeChange::SubagentWorkingChanged {
                 session_id,
                 status,
-                duration_ms,
+                worked_ms,
+                working_since,
             } => {
                 if let Some(entry) = self.entry_mut(session_id) {
                     entry.status = status;
-                    entry.duration_ms = duration_ms;
+                    entry.worked_ms = worked_ms;
+                    entry.working_since = working_since;
                 }
             }
             SubagentTreeChange::SubagentRetitled {
@@ -1015,8 +1017,8 @@ mod tests {
             name: "Explore".to_owned(),
             title: "Map".to_owned(),
             status: ActivityStatus::Active,
-            duration_ms: None,
-            started_at: None,
+            worked_ms: Some(0),
+            working_since: None,
             needs_intervention: false,
         }
     }
