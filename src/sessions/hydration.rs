@@ -1,4 +1,7 @@
 //! The shared admission boundary between durable metadata and mutable histories.
+
+use std::collections::HashSet;
+
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState,
     prompts::{PromptOrigin, PromptOwner},
@@ -261,7 +264,9 @@ impl SessionStoreState {
     /// survives a stop, so nothing is left to finish the Turn, and reading it
     /// as live would keep its whole ancestry Working forever. It fails the way
     /// a lost Provider connection fails it, at the moment it last showed work,
-    /// and a Subagent's row in its parent settles with it (ADR 0029).
+    /// and a Subagent's open row settles with it (ADR 0029) — in its parent,
+    /// and wherever a resume added one: a sibling Subagent that sent the
+    /// resume holds that row in its own Transcript (ADR 0031).
     ///
     /// Deferred Sessions are passed over: hydrating one is what brings it
     /// here. A parent still deferred keeps its row until its own hydration.
@@ -270,7 +275,10 @@ impl SessionStoreState {
         storage: &StorageSink,
         sessions: impl IntoIterator<Item = SessionId>,
     ) {
-        for session_id in sessions {
+        let sessions = sessions.into_iter().collect::<Vec<_>>();
+        let mut stopped_subagents = HashSet::new();
+        let mut parents = Vec::new();
+        for &session_id in &sessions {
             if self.is_deferred(session_id) {
                 continue;
             }
@@ -316,23 +324,34 @@ impl SessionStoreState {
             let Some(parent) = parent else {
                 continue;
             };
-            self.settle_stopped_subagent_row(storage, parent, session_id);
+            stopped_subagents.insert(session_id);
+            parents.push(parent);
+        }
+        if stopped_subagents.is_empty() {
+            return;
+        }
+        let mut visited = HashSet::new();
+        for holder in sessions.into_iter().chain(parents) {
+            if visited.insert(holder) {
+                self.settle_stopped_subagent_rows(storage, holder, &stopped_subagents);
+            }
         }
     }
 
-    /// Settles the row `parent` holds for `child`, if it still stands open,
-    /// the way a lost Provider connection would have: Failed, with no
-    /// duration, since the Provider never reported the Subagent settling.
-    fn settle_stopped_subagent_row(
+    /// Settles every row `holder` holds for one of the `stopped` Subagents, if
+    /// it still stands open, the way a lost Provider connection would have:
+    /// Failed, with no duration, since the Provider never reported the
+    /// Subagent's stretch settling.
+    fn settle_stopped_subagent_rows(
         &mut self,
         storage: &StorageSink,
-        parent: SessionId,
-        child: SessionId,
+        holder: SessionId,
+        stopped: &HashSet<SessionId>,
     ) {
-        if self.is_deferred(parent) {
+        if self.is_deferred(holder) {
             return;
         }
-        let Some(record) = self.sessions.get(&parent) else {
+        let Some(record) = self.sessions.get(&holder) else {
             return;
         };
         let rows = record
@@ -345,7 +364,7 @@ impl SessionStoreState {
                     status: ActivityStatus::Active,
                     session_id,
                     ..
-                } if *session_id == child => Some(SessionChange::SubagentStatusChanged {
+                } if stopped.contains(session_id) => Some(SessionChange::SubagentStatusChanged {
                     activity_id: *id,
                     status: ActivityStatus::Failed,
                     duration_ms: None,
@@ -356,9 +375,9 @@ impl SessionStoreState {
         if rows.is_empty() {
             return;
         }
-        if let Err(error) = self.commit(storage, parent, rows) {
+        if let Err(error) = self.commit(storage, holder, rows) {
             tracing::warn!(
-                session_id = %parent,
+                session_id = %holder,
                 "Subagent row left open by a stop could not be settled: {error}"
             );
         }

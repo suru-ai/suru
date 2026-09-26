@@ -497,6 +497,64 @@ async fn a_subagent_already_settled_is_left_exactly_as_it_was() {
     );
 }
 
+/// A resumed Subagent's open row may stand in a sibling's Transcript — the
+/// sibling sent the resume — rather than in its parent's. It settles with the
+/// Turn the resume began all the same, while the rows its earlier stretches
+/// settled with stay as they were (ADR 0031).
+#[tokio::test]
+async fn a_resume_row_a_sibling_holds_settles_with_the_turn_left_open_by_a_stop() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![turn(10, Some(32), None)];
+    let root_id = root.snapshot.session.id;
+    let mut resumed = persisted(directory.path(), Some(root_id));
+    resumed.snapshot.turns = vec![turn(12, Some(20), None), turn(30, None, None)];
+    resumed.snapshot.session.status = SessionStatus::Active;
+    let resumed_id = resumed.snapshot.session.id;
+    let mut sibling = persisted(directory.path(), Some(root_id));
+    sibling.snapshot.turns = vec![turn(14, Some(31), None)];
+    let sibling_id = sibling.snapshot.session.id;
+    let spawn_row = subagent_row(&mut root, resumed_id);
+    let Some(Activity::Subagent {
+        status,
+        duration_ms,
+        ..
+    }) = root.snapshot.activities.last_mut()
+    else {
+        unreachable!()
+    };
+    *status = ActivityStatus::Completed;
+    *duration_ms = Some(8);
+    let resume_row = subagent_row(&mut sibling, resumed_id);
+    let records = vec![root, resumed, sibling];
+    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: records,
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+        Default::default(),
+    );
+
+    let restored = store.subscribe(resumed_id).unwrap().snapshot;
+    assert_eq!(restored.turns[0].status, TurnStatus::Completed);
+    assert_eq!(restored.turns[1].status, TurnStatus::Failed);
+    assert_eq!(
+        subagent_status(&store.subscribe(sibling_id).unwrap().snapshot, resume_row),
+        (ActivityStatus::Failed, None),
+        "the resume row settles wherever it stands"
+    );
+    assert_eq!(
+        subagent_status(&store.subscribe(root_id).unwrap().snapshot, spawn_row),
+        (ActivityStatus::Completed, Some(8)),
+        "the spawn's row keeps what its own stretch settled with"
+    );
+    writer.shutdown().await.unwrap();
+}
+
 async fn restore_tree(wide: bool) {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
