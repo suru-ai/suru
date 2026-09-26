@@ -3587,10 +3587,13 @@ fn pad_to_width(text: &str, width: usize) -> String {
 /// The Landing and the Provisional Session share it word for word, because the
 /// Provisional Session is drawn from the very reading the Landing was showing
 /// when the Prompt was submitted.
-fn execution_context(state: &TuiState, show_icons: bool) -> String {
-    match state.execution_directory.as_deref() {
+///
+/// It fits `width` by giving up the path's front first: what follows the path
+/// is what the reader acts on, and a path keeps its most telling end, as a
+/// Workspace Picker row's does.
+fn execution_context(state: &TuiState, show_icons: bool, width: usize) -> String {
+    let trailing = match state.execution_directory.as_deref() {
         Some(_) => {
-            let label = workspace_context(state, &state.workspace, true);
             let status = if matches!(
                 state.execution_status,
                 crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
@@ -3626,7 +3629,7 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
             } else {
                 String::new()
             };
-            format!("{label}{status}{checkout}{subdirectory}{intent}")
+            format!("{status}{checkout}{subdirectory}{intent}")
         }
         None => {
             let intent = if state.new_worktree.is_some() {
@@ -3634,12 +3637,15 @@ fn execution_context(state: &TuiState, show_icons: bool) -> String {
             } else {
                 "Choose a working copy to start a Session".to_owned()
             };
-            format!(
-                "{} · {intent}",
-                workspace_context(state, &state.workspace, true)
-            )
+            format!(" · {intent}")
         }
-    }
+    };
+    let workspace = workspace_context(
+        state,
+        &state.workspace,
+        width.saturating_sub(trailing.width()),
+    );
+    truncate_to_width(&format!("{workspace}{trailing}"), width)
 }
 
 fn render_landing(
@@ -3750,8 +3756,9 @@ fn render_landing(
     ));
 
     frame.render_widget(
-        Paragraph::new(truncate_to_width(
-            &execution_context(state, show_icons),
+        Paragraph::new(execution_context(
+            state,
+            show_icons,
             usize::from(panel.width),
         ))
         .style(theme.text.subdued),
@@ -4438,8 +4445,9 @@ fn render_session_surface(
     };
     if execution_height > 0 && footer_area.height >= execution_height {
         frame.render_widget(
-            Paragraph::new(truncate_to_width(
-                &execution_context(state, state.settings().appearance.show_icons),
+            Paragraph::new(execution_context(
+                state,
+                state.settings().appearance.show_icons,
                 usize::from(footer_area.width),
             ))
             .style(theme.text.subdued),
@@ -5179,34 +5187,34 @@ fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String 
     }
 }
 
+/// The Workspace an execution context names: its Remote, when it has one, and
+/// its path, cut from the left to fit `width`. The path always keeps at least
+/// the marker saying it was cut.
 fn workspace_context(
     state: &TuiState,
     workspace: &crate::protocol::Workspace,
-    show_path: bool,
+    width: usize,
 ) -> String {
     let show_icons = state.settings().appearance.show_icons;
     let remote = state
         .outlook
         .remote_name()
-        .map(|remote| icon_label(show_icons, NF_MD_MONITOR, remote));
+        .map(|remote| format!("{} · ", icon_label(show_icons, NF_MD_MONITOR, remote)))
+        .unwrap_or_default();
     let workspace_icon = workspace
         .icon
         .as_deref()
         .and_then(crate::icon_catalog::glyph)
         .unwrap_or(NF_COD_FOLDER);
-    let path = show_path.then(|| {
-        icon_label(
-            show_icons,
-            workspace_icon,
-            &state.workspace_label(&state.outlook, &workspace.path),
-        )
-    });
-    remote
-        .as_deref()
-        .into_iter()
-        .chain(path.as_deref())
-        .collect::<Vec<_>>()
-        .join(" · ")
+    let path_budget = width
+        .saturating_sub(remote.width())
+        .saturating_sub(icon_label(show_icons, workspace_icon, "").width())
+        .max(1);
+    let path = truncate_from_left_to_width(
+        &state.workspace_label(&state.outlook, &workspace.path),
+        path_budget,
+    );
+    format!("{remote}{}", icon_label(show_icons, workspace_icon, &path))
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {

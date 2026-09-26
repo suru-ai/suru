@@ -363,16 +363,20 @@ fn symlinked_homes_shorten_resolved_workspaces_but_links_outside_home_stay_absol
     std::os::unix::fs::symlink(&home, &alias).unwrap();
     std::os::unix::fs::symlink(&outside, home.join("linked")).unwrap();
     let paths = WorkspacePaths::from_home(Some(&alias));
-    for (workspace, expected) in [
-        (alias.join("suru"), "~/suru".to_owned()),
-        (
-            alias.join("linked"),
-            suru::paths::canonical(&outside)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned(),
-        ),
+    // The Landing's line is only as wide as its composer, so a long temporary
+    // path gives up its front. A link outside home is known by the end it
+    // keeps — its resolved target's — and by nothing of it being spelled from
+    // home.
+    let resolved_outside = suru::paths::canonical(&outside).unwrap();
+    let resolved_outside_end = resolved_outside
+        .strip_prefix(resolved_outside.parent().unwrap().parent().unwrap())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (workspace, expected, spelled_from_home) in [
+        (alias.join("suru"), "~/suru".to_owned(), true),
+        (alias.join("linked"), resolved_outside_end, false),
     ] {
         let mut application = connected_application(&workspace);
         hide_sidebar(&mut application);
@@ -383,6 +387,7 @@ fn symlinked_homes_shorten_resolved_workspaces_but_links_outside_home_stay_absol
             .unwrap();
         let rendered = screen(&application);
         assert!(rendered.contains(&format!("{expected} ")), "{rendered}");
+        assert_eq!(rendered.contains("~/"), spelled_from_home, "{rendered}");
         assert!(
             !rendered.contains(&format!("Workspace {expected}")),
             "{rendered}"

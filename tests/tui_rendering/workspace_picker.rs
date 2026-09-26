@@ -480,7 +480,6 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
          whatever it was on or on its way to"
     );
 
-    // Wide enough for the footer to spell the Workspace rather than truncate it.
     let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
     assert!(
         !landing.contains("Workspaces"),
@@ -490,8 +489,14 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
         landing.contains("Type a prompt"),
         "the Landing stands in its place: {landing}"
     );
+    // The Landing's line is only as wide as its composer, so a long temporary
+    // path gives up its front: the Workspace is known by the end it keeps —
+    // the fixture root, then the name that sets it apart from `here`.
+    let chosen = atlas
+        .strip_prefix(root.path().parent().expect("the fixture root has a parent"))
+        .expect("the chosen Workspace lies in the fixture root");
     assert!(
-        landing.contains(atlas.to_string_lossy().as_ref()),
+        landing.contains(chosen.to_string_lossy().as_ref()),
         "and it stands in the Workspace the reader chose: {landing}"
     );
 }
@@ -1580,14 +1585,14 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
     );
 }
 
-#[test]
-fn bare_repository_landing_requires_working_copy_before_creating_session() {
+/// The Landing of a bare Repository at `root`, which has metadata but no
+/// working copy for a Session to execute in.
+fn bare_repository_landing(root: &Path) -> Application {
     use suru::protocol::{
         Repository, RepositoryId, RepositoryLocation, ResolvedWorkspace, SourceControlAvailability,
         SourceControlCapabilities,
     };
-    let temporary = tempfile::tempdir().unwrap();
-    let root = suru::paths::canonical(temporary.path()).unwrap();
+    let root = root.to_owned();
     let repository = Repository {
         id: RepositoryId::from_metadata("git", &root),
         system: "git".to_owned(),
@@ -1631,6 +1636,14 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
             }),
         })
         .unwrap();
+    application
+}
+
+#[test]
+fn bare_repository_landing_requires_working_copy_before_creating_session() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temporary.path()).unwrap();
+    let mut application = bare_repository_landing(&root);
     assert!(
         rendered_application_rows_at(&application, 160, 25)
             .join("\n")
@@ -1647,4 +1660,30 @@ fn bare_repository_landing_requires_working_copy_before_creating_session() {
     let rendered = rendered_application_rows_at(&application, 160, 25).join("\n");
     assert!(rendered.contains("Keep this draft"));
     assert!(rendered.contains("working copy"));
+}
+
+/// The Landing's line is only as wide as its composer, whatever the terminal.
+/// A path too long for it gives up its front, as a Workspace Picker row's
+/// does, so the line still ends on the Repository's own name and on what the
+/// reader has to do next.
+#[test]
+fn a_long_workspace_path_gives_up_its_front_to_what_the_landing_asks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary
+        .path()
+        .join("a-directory-name-long-enough-to-crowd-the-landing")
+        .join("repository.git");
+    std::fs::create_dir_all(&nested).unwrap();
+    let root = suru::paths::canonical(nested).unwrap();
+    let application = bare_repository_landing(&root);
+
+    let line = rendered_application_rows_at(&application, 160, 25)
+        .into_iter()
+        .find(|row| row.contains("repository.git"))
+        .expect("the Landing names the Repository");
+    assert!(line.contains("…"), "the path gives up its front: {line}");
+    assert!(
+        line.contains("repository.git · Choose a working copy to start a Session"),
+        "the path keeps its end, and what to do comes whole after it: {line}"
+    );
 }
