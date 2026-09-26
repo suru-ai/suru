@@ -605,7 +605,10 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(requests[1], serde_json::json!({ "method": "initialized" }));
     assert_eq!(
         requests[2]["params"]["cwd"],
-        workspace.path().to_string_lossy().as_ref()
+        suru::paths::canonical(workspace.path())
+            .expect("canonicalize Workspace")
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(requests[2]["params"]["approvalPolicy"], "on-request");
     assert_eq!(requests[2]["params"]["sandbox"], "workspace-write");

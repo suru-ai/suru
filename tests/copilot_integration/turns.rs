@@ -299,7 +299,9 @@ async fn a_prompt_streams_a_copilot_message_into_the_transcript_and_settles_the_
     );
     assert_eq!(
         parameters["workingDirectory"].as_str(),
-        workspace.path().to_str(),
+        suru::paths::canonical(workspace.path())
+            .expect("canonicalize Workspace")
+            .to_str(),
         "the Copilot Session works in the Suru Session's Workspace"
     );
     assert_eq!(

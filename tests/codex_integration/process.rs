@@ -292,7 +292,10 @@ async fn codex_resumes_the_known_thread_after_active_process_loss() {
     assert_eq!(resume["params"]["threadId"], "recoverable-thread");
     assert_eq!(
         resume["params"]["cwd"],
-        fixture.workspace.path().to_string_lossy().as_ref()
+        suru::paths::canonical(fixture.workspace.path())
+            .expect("canonicalize Workspace")
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(resume["params"]["approvalPolicy"], "on-request");
     assert_eq!(resume["params"]["sandbox"], "workspace-write");

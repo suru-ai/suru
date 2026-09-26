@@ -330,7 +330,9 @@ async fn an_errand_runs_at_copilots_declared_selection_carrying_no_tools_and_sto
     );
     assert_eq!(
         params["workingDirectory"].as_str(),
-        workspace.path().to_str(),
+        suru::paths::canonical(workspace.path())
+            .expect("canonicalize Workspace")
+            .to_str(),
         "an Errand runs in the Session's own Workspace"
     );
     let sent = errand_send(&copilot).await;
