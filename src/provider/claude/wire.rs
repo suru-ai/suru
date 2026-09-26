@@ -328,6 +328,11 @@ pub(super) struct SystemMessage {
     /// What changed about a running task, on `task_updated`.
     #[serde(default)]
     pub(super) patch: Option<TaskPatch>,
+    /// Whether a subagent, rather than the loop itself, left the task running, on `task_started`.
+    /// The CLI sets it for a background shell an agent started; it confirms the owner the task's
+    /// launching tool use already names, and never names one by itself.
+    #[serde(default)]
+    pub(super) owned_by_subagent: Option<bool>,
 }
 
 /// The revision a `task_updated` carries. Only the description is decoded: every way a task ends

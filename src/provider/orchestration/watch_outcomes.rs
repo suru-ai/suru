@@ -110,6 +110,15 @@ impl HeldWatchOutcomes {
         Ok(())
     }
 
+    /// Drops the outcomes held for `sessions`, because the wakes they waited
+    /// on will begin no Turn there: the Watches of those Sessions were
+    /// interrupted, which leaves the Sessions above them waking as before.
+    pub(super) fn drop_for(&mut self, sessions: &[SessionId]) {
+        for session_id in sessions {
+            self.held.remove(session_id);
+        }
+    }
+
     /// Drops every held outcome, because the wake it waited on will begin no
     /// Turn: the Session was interrupted first, or the Provider connection that
     /// would have delivered it is gone.

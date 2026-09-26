@@ -18,7 +18,9 @@
 //! conversation whose tool use spawned it, `task_updated` revises what it is doing, and
 //! `task_notification` settles its stretch of work. A background shell or monitor is instead a
 //! Watch (ADR 0030): its start and its notification bracket the time its Session may read
-//! Monitoring, and every Watch still live when the CLI process ends settles as lost. A settled
+//! Monitoring, and every Watch still live when the CLI process ends settles as lost. A Watch
+//! belongs to the conversation whose tool use launched it — a subagent's own, even after that
+//! subagent settles, since its Watches outlive it and wake it. A settled
 //! agent the loop resumes through
 //! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
 //! Subagent rather than a new one, and since the resumed conversation still rides under the
@@ -545,6 +547,7 @@ impl ClaudeProjection {
                     task_id,
                     message.description,
                     message.tool_use_id.as_deref(),
+                    message.owned_by_subagent,
                 );
             }
             TaskKind::Unwatched => return Vec::new(),
@@ -686,16 +689,14 @@ impl ClaudeProjection {
 
     /// A background task that may wake the loop once its Turn has ended: a Watch, described by
     /// what the task's start says it does, or else by the command that started it. A start
-    /// repeating a Watch already live announces nothing new.
-    ///
-    /// Every Watch is attributed to the loop's own conversation: which subagent, if any, left a
-    /// task running is not yet read off the wire, so its settling is taken to wake the owning
-    /// Session's agent. The owner is kept with the Watch so its settle lands where its start did.
+    /// repeating a Watch already live announces nothing new. The owner is kept with the Watch, so
+    /// its settle — or its stop, or its loss with the process — lands where its start did.
     fn project_watch_started(
         &mut self,
         task_id: String,
         description: Option<String>,
         tool_use_id: Option<&str>,
+        owned_by_subagent: Option<bool>,
     ) -> Vec<AttributedProviderEvent> {
         if self.watches.contains_key(&task_id) {
             return Vec::new();
@@ -708,7 +709,7 @@ impl ClaudeProjection {
                     .map(|command| command.command.clone())
             })
             .unwrap_or_else(|| task_id.clone());
-        let owner = OWNING_CONVERSATION;
+        let owner = self.watch_owner(&task_id, tool_use_id, owned_by_subagent);
         let event = ProviderEvent::WatchStarted {
             watch_id: ProviderWatchId::new(task_id.clone()),
             description,
@@ -716,6 +717,37 @@ impl ClaudeProjection {
         let started = self.attributed(&owner, event);
         self.watches.insert(task_id, owner);
         vec![started]
+    }
+
+    /// The conversation whose agent left a Watch running, and so the one its settling wakes: the
+    /// conversation that ran the tool use launching it, the way a spawn's delegating conversation
+    /// is found (ADR 0030). A background Subagent's Watch stays its own after the Subagent settles,
+    /// because the conversation keeps naming the agent it belongs to.
+    ///
+    /// The loop's own conversation owns whatever cannot be placed: a start naming no tool this
+    /// wire saw, or one run by a conversation no Subagent claims yet — which would otherwise land
+    /// nowhere, and leave its Session reading idle while the Watch runs. `owned_by_subagent` only
+    /// confirms the reading: where the CLI says a subagent owns a Watch this projection cannot
+    /// place under one, the disagreement is logged and the loop keeps it.
+    fn watch_owner(
+        &self,
+        task_id: &str,
+        tool_use_id: Option<&str>,
+        owned_by_subagent: Option<bool>,
+    ) -> ConversationKey {
+        let owner = tool_use_id
+            .and_then(|tool| self.intervention_tools.get(tool))
+            .cloned()
+            .flatten()
+            .filter(|conversation| self.conversation_agents.contains_key(conversation));
+        if owner.is_none() && owned_by_subagent == Some(true) {
+            tracing::debug!(
+                task_id,
+                tool_use_id,
+                "a Watch the CLI says a subagent owns names no subagent conversation; the loop's own conversation keeps it"
+            );
+        }
+        owner
     }
 
     /// A Watch's own notification that it settled, which the CLI delivers to the agent whose
@@ -1781,6 +1813,152 @@ mod tests {
         assert!(
             projection.project_process_ended().is_empty(),
             "a Watch is lost once"
+        );
+    }
+
+    /// A background agent spawned from the loop, whose conversation then runs a Bash tool use
+    /// that the CLI backgrounds as task `task-shell`, telling Suru a subagent owns it.
+    fn subagent_backgrounds_a_shell() -> Vec<Value> {
+        vec![
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "agent_1", "name": "Agent", "input": {}},
+                },
+                "parent_tool_use_id": null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": 0},
+                "parent_tool_use_id": null,
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "agent-task",
+                "tool_use_id": "agent_1",
+                "task_type": "local_agent",
+                "description": "Run the suite",
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_sub",
+                        "name": "Bash",
+                        "input": {"command": "cargo test", "run_in_background": true},
+                    }],
+                },
+                "parent_tool_use_id": "agent_1",
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-shell",
+                "tool_use_id": "toolu_sub",
+                "task_type": "local_bash",
+                "description": "cargo test",
+                "owned_by_subagent": true,
+            }),
+        ]
+    }
+
+    fn watch_events(events: &[AttributedProviderEvent]) -> Vec<AttributedProviderEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    ProviderEvent::WatchStarted { .. } | ProviderEvent::WatchSettled { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_watch_a_subagent_launched_is_the_subagents_and_stays_so_after_the_subagent_settles() {
+        let mut projection = fresh_projection();
+        let started = project(&mut projection, &subagent_backgrounds_a_shell());
+        assert_eq!(
+            watch_events(&started),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-task"),
+                event: ProviderEvent::WatchStarted {
+                    watch_id: ProviderWatchId::new("task-shell"),
+                    description: "cargo test".to_owned(),
+                },
+            }],
+            "the conversation that ran the launching tool use owns the Watch"
+        );
+
+        let settled = project(
+            &mut projection,
+            &[
+                task_notification("agent-task", "completed", Some("Started the suite")),
+                task_notification("task-shell", "completed", Some("cargo test passed")),
+            ],
+        );
+        assert_eq!(
+            watch_events(&settled),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-task"),
+                event: ProviderEvent::WatchSettled {
+                    watch_id: ProviderWatchId::new("task-shell"),
+                    outcome: ProviderWatchOutcome::Completed,
+                    summary: Some("cargo test passed".to_owned()),
+                    woke_agent: true,
+                },
+            }],
+            "a background Subagent's Watch outlives it and settles where it started"
+        );
+    }
+
+    #[test]
+    fn a_subagents_watch_lost_with_the_process_is_lost_under_the_subagent() {
+        let mut projection = fresh_projection();
+        project(&mut projection, &subagent_backgrounds_a_shell());
+
+        assert_eq!(
+            projection.project_process_ended(),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-task"),
+                event: ProviderEvent::WatchSettled {
+                    watch_id: ProviderWatchId::new("task-shell"),
+                    outcome: ProviderWatchOutcome::Lost,
+                    summary: None,
+                    woke_agent: false,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn a_watch_said_to_be_a_subagents_that_no_subagent_launched_stays_with_the_loop() {
+        let mut projection = fresh_projection();
+        let events = project(
+            &mut projection,
+            &[json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-shell",
+                "tool_use_id": "toolu_unseen",
+                "task_type": "local_bash",
+                "description": "cargo test",
+                "owned_by_subagent": true,
+            })],
+        );
+        assert_eq!(
+            events,
+            [owning(ProviderEvent::WatchStarted {
+                watch_id: ProviderWatchId::new("task-shell"),
+                description: "cargo test".to_owned(),
+            })],
+            "a Watch no conversation can be found for keeps the owning Session Monitoring"
         );
     }
 

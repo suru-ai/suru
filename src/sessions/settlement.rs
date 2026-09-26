@@ -49,9 +49,11 @@ pub(crate) enum InterruptTarget {
     /// Subagent — through the Provider connection its root ancestor owns.
     Subagent { root: SessionId },
     /// Nothing is Working, but the Session is Monitoring: the interrupt asks
-    /// the Provider to stop the Watches live in its subtree. No Turn settles
-    /// and no Prompt is withdrawn; the Session goes idle as they settle.
-    Watches,
+    /// the Provider to stop the Watches live in its subtree, and none above
+    /// it — through the Provider connection its root ancestor owns, which is
+    /// the Session itself for a top-level one. No Turn settles and no Prompt
+    /// is withdrawn; the Session goes idle as they settle.
+    Watches { root: SessionId },
     /// The Session was Working only because it owed a Turn to a Prompt it had
     /// not delivered, so the interrupt withdrew that Prompt where it stood.
     /// The Prompt is already Cancelled by the time this is returned: the
@@ -70,7 +72,9 @@ enum InterruptReading {
     Subagent {
         root: SessionId,
     },
-    Watches,
+    Watches {
+        root: SessionId,
+    },
     /// No work is under way: the Session is Working only because it owes a
     /// Turn to this Prompt, which it has admitted and not delivered.
     UndeliveredPrompt(Box<Prompt>),
@@ -373,7 +377,7 @@ impl SessionStore {
             InterruptReading::Subagent { root } => {
                 return Ok(InterruptTarget::Subagent { root });
             }
-            InterruptReading::Watches => return Ok(InterruptTarget::Watches),
+            InterruptReading::Watches { root } => return Ok(InterruptTarget::Watches { root }),
             InterruptReading::UndeliveredPrompt(prompt) => prompt,
         };
         let prompt_id = prompt.id;
@@ -400,14 +404,27 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        match state.interrupt_reading(session_id) {
-            Ok(InterruptReading::Subagent { root }) => root,
-            _ => session_id,
-        }
+        state.root_of(session_id)
     }
 }
 
 impl SessionStoreState {
+    /// The Session whose Provider actor holds `session_id`'s conversation:
+    /// its root ancestor. The walk stops where the chain leaves the store: a
+    /// Subagent severed from its lineage has no actor left to reach, and the
+    /// caller finds nothing to stop under whatever Session the walk ends on.
+    fn root_of(&self, session_id: SessionId) -> SessionId {
+        let mut root = session_id;
+        while let Some(parent) = self
+            .sessions
+            .get(&root)
+            .and_then(|record| record.snapshot.session.parent)
+        {
+            root = parent;
+        }
+        root
+    }
+
     /// The reading itself, taken off a locked store so both the question that
     /// only looks and the one that acts ask it of the same state.
     fn interrupt_reading(
@@ -419,17 +436,15 @@ impl SessionStoreState {
             .get(&session_id)
             .ok_or(InterruptSessionError::SessionNotFound)?;
         if record.snapshot.session.parent.is_some() {
-            // The walk stops where the chain leaves the store: a Subagent
-            // severed from its lineage has no actor left to reach, and the
-            // caller finds nothing to stop under whatever Session the walk
-            // ends on.
-            let mut root = session_id;
-            while let Some(parent) = self
-                .sessions
-                .get(&root)
-                .and_then(|record| record.snapshot.session.parent)
-            {
-                root = parent;
+            let root = self.root_of(session_id);
+            // A Subagent whose own work has settled, with nothing below it
+            // Working either, can only be Monitoring: its Watches outlive it,
+            // and stopping them — its subtree's, never those of the Sessions
+            // above — is the whole interrupt (ADR 0030). Anything still
+            // Working is that Subagent to stop.
+            let session = &record.snapshot.session;
+            if session.working_since.is_none() && session.monitoring_since.is_some() {
+                return Ok(InterruptReading::Watches { root });
             }
             return Ok(InterruptReading::Subagent { root });
         }
@@ -468,7 +483,7 @@ impl SessionStoreState {
         if record.snapshot.session.monitoring_since.is_some() {
             // Only Watches are left, and nothing a Turn owns: stopping them
             // is the whole interrupt (ADR 0030).
-            return Ok(InterruptReading::Watches);
+            return Ok(InterruptReading::Watches { root: session_id });
         }
         Err(InterruptSessionError::NothingToInterrupt)
     }

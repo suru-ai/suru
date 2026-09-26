@@ -885,6 +885,7 @@ mod aside {
                 session_id: top,
                 title: "Rename the widget".to_owned(),
                 working_since: None,
+                monitoring_since: None,
                 needs_intervention: false,
             },
             subagents: vec![SubagentTreeEntry {
@@ -896,6 +897,7 @@ mod aside {
                 status: ActivityStatus::Active,
                 worked_ms: Some(0),
                 working_since: None,
+                monitoring_since: None,
                 needs_intervention: false,
             }],
         }

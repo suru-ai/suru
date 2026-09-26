@@ -26,6 +26,14 @@ use crate::protocol::{
 
 use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState};
 
+/// The top-level Session of a subscribed tree with its Working and Monitoring
+/// readings, as a commit found them before it landed.
+pub(super) type TreeLiveness = (
+    SessionId,
+    Option<SessionTimestamp>,
+    Option<SessionTimestamp>,
+);
+
 /// A subscription's opening snapshot, with a receiver opened at its revision.
 pub(crate) struct SubagentTreeFeed {
     pub(crate) snapshot: SubagentTreeSnapshot,
@@ -144,15 +152,12 @@ impl SessionStoreState {
         }
     }
 
-    /// Where the tree `session_id` belongs to stands on Working, taken before a
-    /// commit so the commit can tell whether it moved it — a commit anywhere
-    /// in the tree can, through the Working reading rolled up above it. `None`
-    /// when nobody subscribes to that tree, which is what keeps this free for
-    /// every commit to a tree nobody is watching.
-    pub(super) fn subscribed_tree_working(
-        &self,
-        session_id: SessionId,
-    ) -> Option<(SessionId, Option<SessionTimestamp>)> {
+    /// Where the tree `session_id` belongs to stands on Working and
+    /// Monitoring, taken before a commit so the commit can tell whether it
+    /// moved them — a commit anywhere in the tree can, through the readings
+    /// rolled up above it. `None` when nobody subscribes to that tree, which
+    /// is what keeps this free for every commit to a tree nobody is watching.
+    pub(super) fn subscribed_tree_working(&self, session_id: SessionId) -> Option<TreeLiveness> {
         if self.subagent_trees.trees.is_empty() {
             return None;
         }
@@ -160,26 +165,20 @@ impl SessionStoreState {
         if !self.subagent_trees.trees.contains_key(&top_level) {
             return None;
         }
-        let working_since = self
-            .sessions
-            .get(&top_level)?
-            .snapshot
-            .session
-            .working_since;
-        Some((top_level, working_since))
+        let session = &self.sessions.get(&top_level)?.snapshot.session;
+        Some((top_level, session.working_since, session.monitoring_since))
     }
 
-    /// Whether the top-level Session's Working reading has moved from what
-    /// [`Self::subscribed_tree_working`] took before a commit.
-    pub(super) fn moved_tree_working(
-        &self,
-        before: Option<(SessionId, Option<SessionTimestamp>)>,
-    ) -> bool {
-        before.is_some_and(|(top_level, working_since)| {
-            self.sessions
-                .get(&top_level)
-                .map(|record| record.snapshot.session.working_since)
-                != Some(working_since)
+    /// Whether the top-level Session's Working or Monitoring reading has moved
+    /// from what [`Self::subscribed_tree_working`] took before a commit.
+    pub(super) fn moved_tree_working(&self, before: Option<TreeLiveness>) -> bool {
+        before.is_some_and(|(top_level, working_since, monitoring_since)| {
+            self.sessions.get(&top_level).map(|record| {
+                (
+                    record.snapshot.session.working_since,
+                    record.snapshot.session.monitoring_since,
+                )
+            }) != Some((working_since, monitoring_since))
         })
     }
 
@@ -226,6 +225,7 @@ impl SessionStoreState {
                 session_id: top_level,
                 title: record.snapshot.title.clone(),
                 working_since: record.snapshot.session.working_since,
+                monitoring_since: record.snapshot.session.monitoring_since,
                 needs_intervention: needs_intervention(record),
             },
             subagents,
@@ -288,6 +288,11 @@ impl SessionStoreState {
                         status: work.status,
                         worked_ms: work.worked_ms,
                         working_since: work.working_since,
+                        // Its Session's own reading, rolled up over its
+                        // subtree: a settled Subagent whose Watches outlive
+                        // it is Monitoring, and says so in its entry.
+                        monitoring_since: own
+                            .and_then(|record| record.snapshot.session.monitoring_since),
                         needs_intervention: own.is_some_and(needs_intervention),
                     }
                 },
@@ -408,9 +413,12 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
             title: after.top_level.title.clone(),
         });
     }
-    if before.top_level.working_since != after.top_level.working_since {
+    if before.top_level.working_since != after.top_level.working_since
+        || before.top_level.monitoring_since != after.top_level.monitoring_since
+    {
         changes.push(SubagentTreeChange::TopLevelWorkingChanged {
             working_since: after.top_level.working_since,
+            monitoring_since: after.top_level.monitoring_since,
         });
     }
     if before.top_level.needs_intervention != after.top_level.needs_intervention {
@@ -454,12 +462,14 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
         if previous.status != entry.status
             || previous.worked_ms != entry.worked_ms
             || previous.working_since != entry.working_since
+            || previous.monitoring_since != entry.monitoring_since
         {
             changes.push(SubagentTreeChange::SubagentWorkingChanged {
                 session_id: entry.session_id,
                 status: entry.status,
                 worked_ms: entry.worked_ms,
                 working_since: entry.working_since,
+                monitoring_since: entry.monitoring_since,
             });
         }
         if previous.needs_intervention != entry.needs_intervention {
@@ -508,6 +518,7 @@ mod tests {
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: Some(SessionTimestamp(1_000)),
+            monitoring_since: None,
             needs_intervention: false,
         }
     }
@@ -517,6 +528,7 @@ mod tests {
             session_id,
             title: title.to_owned(),
             working_since: Some(SessionTimestamp(500)),
+            monitoring_since: None,
             needs_intervention: false,
         }
     }
@@ -534,10 +546,12 @@ mod tests {
         settled.status = ActivityStatus::Completed;
         settled.worked_ms = Some(12);
         settled.working_since = None;
+        settled.monitoring_since = Some(SessionTimestamp(1_012));
         settled.title = "Mapped the seams".to_owned();
         settled.needs_intervention = true;
         let mut after_top_level = top_level(top, "Delegate the mapping");
         after_top_level.working_since = None;
+        after_top_level.monitoring_since = Some(SessionTimestamp(1_012));
         after_top_level.needs_intervention = true;
         let after = SubagentTree {
             top_level: after_top_level,
@@ -552,6 +566,7 @@ mod tests {
                 },
                 SubagentTreeChange::TopLevelWorkingChanged {
                     working_since: None,
+                    monitoring_since: Some(SessionTimestamp(1_012)),
                 },
                 SubagentTreeChange::NeedsInterventionChanged {
                     session_id: top,
@@ -567,6 +582,7 @@ mod tests {
                     status: ActivityStatus::Completed,
                     worked_ms: Some(12),
                     working_since: None,
+                    monitoring_since: Some(SessionTimestamp(1_012)),
                 },
                 SubagentTreeChange::NeedsInterventionChanged {
                     session_id: child,
@@ -833,6 +849,7 @@ mod tests {
                 status: ActivityStatus::Active,
                 worked_ms: Some(first_ms),
                 working_since: began,
+                monitoring_since: None,
             }),
             "the entry is Working again, counting up from its first Turn's time"
         );
@@ -858,6 +875,7 @@ mod tests {
                 status: ActivityStatus::Completed,
                 worked_ms: Some(first_ms + span(&turns[1])),
                 working_since: None,
+                monitoring_since: None,
             }),
             "settled, it stands at both Turns' time"
         );

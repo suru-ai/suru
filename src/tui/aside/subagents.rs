@@ -28,6 +28,10 @@ use super::{
 
 pub(in crate::tui) struct SubagentsSection;
 
+/// What a settled Subagent's entry says in place of its time while its
+/// Session is Monitoring.
+const MONITORING: &str = "monitoring";
+
 impl Section for SubagentsSection {
     fn name(&self) -> &'static str {
         "Subagents"
@@ -84,8 +88,10 @@ impl Section for SubagentsSection {
             current = Some(rows.len());
         }
         // The top-level entry wears the Working Marker and its elapsed time
-        // only while it is Working, as its Sidebar row does.
-        let top_level_working = top_level.working_since.is_some();
+        // only while it is Working or Monitoring, as its Sidebar row tells
+        // its duration: Monitoring's counted from when Monitoring began.
+        let top_level_since = top_level.working_since.or(top_level.monitoring_since);
+        let top_level_working = top_level_since.is_some();
         animates |= top_level_working;
         rows.push(SectionRow {
             line: entry_line(
@@ -97,9 +103,7 @@ impl Section for SubagentsSection {
                     title: &top_level.title,
                     right: right_slot(
                         top_level.needs_intervention,
-                        top_level
-                            .working_since
-                            .map(|since| ticking(since, context.now)),
+                        top_level_since.map(|since| ticking(since, context.now)),
                         theme,
                     ),
                 },
@@ -140,6 +144,10 @@ impl Section for SubagentsSection {
                         context.now,
                     )
                 })
+            } else if subagent.monitoring_since.is_some() {
+                // A settled Subagent whose Watches outlive it waits on them
+                // to wake it, and says so where its time would stand.
+                Some(MONITORING.to_owned())
             } else {
                 subagent.worked_ms.map(humanized_duration)
             };

@@ -72,7 +72,8 @@ fn command_for_pointer(mouse: MouseEvent) -> Option<CommandId> {
 /// text entry, history, submission, the interrupt Escape would otherwise mean
 /// — reach nothing, which is what keeps Prompt delivery out of the view.
 /// Ctrl+B keeps the Sidebar, so the reader can leave for any Session, and
-/// Ctrl+C still exits.
+/// Ctrl+C still exits. A Subagent's Session that is only Monitoring answers
+/// Escape with [`command_for_monitoring_subagent_view_event`] instead.
 pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<CommandId> {
     match event {
         InputEvent::Mouse(mouse) => command_for_pointer(mouse),
@@ -103,6 +104,22 @@ pub(super) fn command_for_subagent_view_event(event: InputEvent) -> Option<Comma
             }
         }
         _ => None,
+    }
+}
+
+/// A Subagent's Session that is only Monitoring keeps the Subagent view's
+/// keys, except that Escape arms stopping its Watches, as it does in any
+/// Monitoring Session, rather than leaving.
+pub(super) fn command_for_monitoring_subagent_view_event(event: InputEvent) -> Option<CommandId> {
+    match event {
+        InputEvent::Key(key)
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Esc
+                && key.modifiers == KeyModifiers::NONE =>
+        {
+            Some(CommandId::RequestInterrupt)
+        }
+        event => command_for_subagent_view_event(event),
     }
 }
 

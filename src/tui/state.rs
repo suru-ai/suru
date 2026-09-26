@@ -48,13 +48,14 @@ use super::{
         command_for_completion_event, command_for_connect_overlay_event,
         command_for_icon_picker_event, command_for_interrupt_confirmation_event,
         command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
-        command_for_numeric_editor_event, command_for_queued_prompt_event,
-        command_for_serve_overlay_event, command_for_session_picker_event,
-        command_for_settings_panel_event, command_for_sidebar_event,
-        command_for_sidebar_menu_event, command_for_subagent_picker_event,
-        command_for_subagent_view_event, command_for_subagent_view_leader_event,
-        command_for_terminal_event, command_for_theme_picker_event,
-        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
+        command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
+        command_for_queued_prompt_event, command_for_serve_overlay_event,
+        command_for_session_picker_event, command_for_settings_panel_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event,
+        command_for_subagent_picker_event, command_for_subagent_view_event,
+        command_for_subagent_view_leader_event, command_for_terminal_event,
+        command_for_theme_picker_event, command_for_workspace_picker_event,
+        command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -9039,12 +9040,22 @@ impl Application {
         // interrupt, the reading keys stay, and the composer's keys — text,
         // history, submission — reach nothing.
         if self.state.open_subagent_parent().is_some() {
-            // The Leader reaches the Aside — the way around a Subagent's
-            // tree — from inside it, and nothing else.
-            if matches!(self.state.command_mode, CommandMode::Leader) {
-                return command_for_subagent_view_leader_event(event);
-            }
-            return command_for_subagent_view_event(event);
+            // A settled Subagent whose Watches outlive it is still stopped
+            // from its own Session: Escape there arms stopping the Watches in
+            // its subtree and none above it, and leaves the view once there
+            // is nothing left to stop (ADR 0030). Nothing else in this view
+            // is interrupted from here.
+            let monitoring = self.state.interrupt_target() == Some(InterruptTarget::Watches);
+            return match self.state.command_mode {
+                // The Leader reaches the Aside — the way around a Subagent's
+                // tree — from inside it, and nothing else.
+                CommandMode::Leader => command_for_subagent_view_leader_event(event),
+                CommandMode::InterruptConfirmation { .. } if monitoring => {
+                    command_for_interrupt_confirmation_event(event)
+                }
+                _ if monitoring => command_for_monitoring_subagent_view_event(event),
+                _ => command_for_subagent_view_event(event),
+            };
         }
         match self.state.command_mode {
             CommandMode::Composer => {

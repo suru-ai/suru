@@ -4072,7 +4072,8 @@ fn render_session(
         .expect("the rendered Session has its projection and interaction");
     // A Subagent's Session is read rather than conversed with: Escape leaves it
     // instead of interrupting, so its indicator carries elapsed work but no
-    // false gesture.
+    // false gesture — until only its Watches are left, which Escape there
+    // stops as it does anywhere (ADR 0030).
     let subagent_view = snapshot.session.parent.is_some();
     let tail = if let Some(since) = snapshot.working_since() {
         SessionTail::Working {
@@ -4096,7 +4097,7 @@ fn render_session(
         SessionTail::Working {
             state: WorkingIndicatorState::Monitoring,
             working_since: Some(since),
-            interrupt: (!subagent_view).then_some(interrupt),
+            interrupt: Some(interrupt),
             watching: watching_subject(&snapshot.watches),
         }
     } else {
@@ -4477,7 +4478,13 @@ fn render_session_surface(
     let cursor = if subagent_view {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "Subagent Session · Esc returns to the parent",
+                // Escape leaves, unless all that is left in the Subagent's
+                // Session is its Watches, which Escape there stops instead.
+                if snapshot.working_since().is_none() && snapshot.monitoring_since().is_some() {
+                    "Subagent Session · Esc stops its Watches"
+                } else {
+                    "Subagent Session · Esc returns to the parent"
+                },
                 theme.text.subdued,
             )),
             composer_area,

@@ -54,6 +54,7 @@ impl Tree {
                 session_id: self.top,
                 title: "Map every seam".to_owned(),
                 working_since: None,
+                monitoring_since: None,
                 needs_intervention: false,
             },
             subagents: vec![
@@ -104,6 +105,7 @@ fn entry(
         worked_ms,
         // Unknown unless a test says when the working Turn began.
         working_since: None,
+        monitoring_since: None,
         needs_intervention: false,
     }
 }
@@ -362,6 +364,7 @@ fn a_settle_never_moves_an_entry() {
             status: ActivityStatus::Failed,
             worked_ms: Some(3_000),
             working_since: None,
+            monitoring_since: None,
         }),
     );
 
@@ -1350,6 +1353,7 @@ fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_durati
             status: ActivityStatus::Completed,
             worked_ms: Some(95_000),
             working_since: None,
+            monitoring_since: None,
         },
     );
     let settled = aside_row(&application, "Review");
@@ -1403,6 +1407,7 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
             worked_ms: Some(12_000),
             // Begun at the moment the clock now reads.
             working_since: Some(SessionTimestamp(CLOCK_START)),
+            monitoring_since: None,
         },
     );
     let resumed = aside_row(&application, "Explore");
@@ -1432,6 +1437,7 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
             status: ActivityStatus::Failed,
             worked_ms: Some(77_000),
             working_since: None,
+            monitoring_since: None,
         },
     );
     let settled = aside_row(&application, "Explore");
@@ -1461,6 +1467,7 @@ fn a_settled_entry_whose_end_went_unlearned_leaves_its_time_blank() {
             status: ActivityStatus::Failed,
             worked_ms: None,
             working_since: None,
+            monitoring_since: None,
         },
     );
 
@@ -1504,6 +1511,7 @@ fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
         tree.top,
         SubagentTreeChange::TopLevelWorkingChanged {
             working_since: None,
+            monitoring_since: None,
         },
     );
     assert_eq!(
@@ -1519,6 +1527,7 @@ fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
         SubagentTreeChange::TopLevelWorkingChanged {
             // Begun at the moment the clock now reads.
             working_since: Some(SessionTimestamp(CLOCK_START + 3_000)),
+            monitoring_since: None,
         },
     );
     advance_session_clock(&now, 2_000);
@@ -1527,6 +1536,72 @@ fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
         resumed.starts_with("⠋ Map every seam") && resumed.ends_with(" 2s"),
         "and come back, counting afresh, when it Works again: {resumed:?}"
     );
+}
+
+/// A settled Subagent whose Watches outlive it keeps the Marker it settled
+/// with and says **monitoring** where its time would stand, while the
+/// top-level Session Monitoring through it wears the Working Marker and the
+/// time since Monitoring began — both clearing once the Watches settle.
+#[test]
+fn a_monitoring_subagent_says_so_in_its_times_place_and_the_top_level_counts_its_monitoring() {
+    let workspace = workspace_dir();
+    let (mut application, now) = session_clocked_client(workspace.path());
+    let tree = Tree::new();
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    // Nothing in the tree is Working: the settled Explore left a Watch running.
+    snapshot.subagents[1].status = ActivityStatus::Completed;
+    snapshot.subagents[1].worked_ms = Some(3_000);
+    snapshot.subagents[0].monitoring_since = Some(before_start(20_000));
+    snapshot.top_level.monitoring_since = Some(before_start(20_000));
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let explore = aside_row(&application, "Explore");
+    assert!(
+        explore.starts_with("├ ✓ Explore") && explore.ends_with(" monitoring"),
+        "the settled Marker stays, and monitoring stands in its time's place: {explore:?}"
+    );
+    assert!(
+        !aside_row(&application, "Plan").contains("monitoring"),
+        "only the Subagent whose Session is Monitoring says so"
+    );
+    let top_level = aside_rows(&application, WIDTH)[1].clone();
+    assert!(
+        top_level.starts_with("⠋ Map every seam") && top_level.ends_with(" 20s"),
+        "the top-level entry shows Monitoring the way it shows Working: {top_level:?}"
+    );
+    advance_session_clock(&now, 5_000);
+    assert!(aside_rows(&application, WIDTH)[1].ends_with(" 25s"));
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: tree.explore,
+            status: ActivityStatus::Completed,
+            worked_ms: Some(12_000),
+            working_since: None,
+            monitoring_since: None,
+        },
+    );
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::TopLevelWorkingChanged {
+            working_since: None,
+            monitoring_since: None,
+        },
+    );
+    assert!(
+        aside_row(&application, "Explore").ends_with(" 12s"),
+        "once its Watches settle the entry stands at its time again"
+    );
+    assert_eq!(aside_rows(&application, WIDTH)[1], "Map every seam");
+    assert!(!application.wants_spinner());
 }
 
 #[test]
@@ -1777,6 +1852,7 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
             status: ActivityStatus::Failed,
             worked_ms: Some(1_000),
             working_since: None,
+            monitoring_since: None,
         }),
     );
     assert_eq!(
@@ -1863,6 +1939,7 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
             session_id: top,
             title: "Map every seam".to_owned(),
             working_since: None,
+            monitoring_since: None,
             needs_intervention: false,
         },
         subagents: children

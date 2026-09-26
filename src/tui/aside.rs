@@ -911,11 +911,13 @@ impl SubagentTreeReading {
                 status,
                 worked_ms,
                 working_since,
+                monitoring_since,
             } => {
                 if let Some(entry) = self.entry_mut(session_id) {
                     entry.status = status;
                     entry.worked_ms = worked_ms;
                     entry.working_since = working_since;
+                    entry.monitoring_since = monitoring_since;
                 }
             }
             SubagentTreeChange::SubagentRetitled {
@@ -929,8 +931,12 @@ impl SubagentTreeReading {
                 }
             }
             SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
-            SubagentTreeChange::TopLevelWorkingChanged { working_since } => {
+            SubagentTreeChange::TopLevelWorkingChanged {
+                working_since,
+                monitoring_since,
+            } => {
                 self.top_level.working_since = working_since;
+                self.top_level.monitoring_since = monitoring_since;
             }
             SubagentTreeChange::NeedsInterventionChanged {
                 session_id,
@@ -1019,6 +1025,7 @@ mod tests {
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: None,
+            monitoring_since: None,
             needs_intervention: false,
         }
     }
@@ -1049,6 +1056,7 @@ mod tests {
                     session_id: top,
                     title: "Delegate".to_owned(),
                     working_since: None,
+                    monitoring_since: None,
                     needs_intervention: false,
                 },
                 subagents: vec![entry(child, top, 0)],
@@ -1105,6 +1113,7 @@ mod tests {
                 session_id: top,
                 title: "Delegate".to_owned(),
                 working_since: None,
+                monitoring_since: None,
                 needs_intervention: false,
             },
             subagents: vec![entry(child, top, 0)],
@@ -1166,6 +1175,7 @@ mod tests {
                     session_id: top,
                     title: "Delegate".to_owned(),
                     working_since: None,
+                    monitoring_since: None,
                     needs_intervention: false,
                 },
                 subagents: vec![entry(first, top, 0), entry(second, top, 1)],

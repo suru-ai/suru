@@ -257,3 +257,66 @@ fn a_watch_stop_that_fails_offers_the_gesture_again() {
         "a stop that stopped nothing is offered again: {screen}"
     );
 }
+
+/// A settled Subagent whose Watches outlive it is stopped from its own Session: Escape there
+/// arms and then asks the Server to interrupt that Session — which stops only the Watches in its
+/// subtree — and once they have settled, Escape leaves for the parent again.
+#[test]
+fn escape_in_a_monitoring_subagents_session_stops_its_watches_before_it_leaves() {
+    let workspace = workspace_dir();
+    let parent_id = SessionId::new();
+    let mut snapshot = monitoring_snapshot(workspace.path(), seconds_ago(3), &["cargo test"]);
+    snapshot.session.parent = Some(parent_id);
+    let (session_id, revision) = (snapshot.session.id, snapshot.revision);
+    let mut application = attached(workspace.path(), snapshot);
+
+    let monitoring = drawn(&application);
+    assert!(
+        monitoring.contains("s • Esc to stop)") && monitoring.contains("Esc stops its Watches"),
+        "a Subagent's Session that is only Monitoring offers the stop: {monitoring}"
+    );
+    assert!(
+        !monitoring.contains("Esc returns to the parent"),
+        "{monitoring}"
+    );
+
+    assert_eq!(
+        press_escape(&mut application),
+        ApplicationTransition::Continue,
+        "the first Escape arms the stop rather than leaving"
+    );
+    assert!(drawn(&application).contains("s • Esc again to stop)"));
+    let ApplicationTransition::InterruptSession { session } = press_escape(&mut application) else {
+        panic!("the second Escape asks the Server to interrupt the Subagent's Session");
+    };
+    assert_eq!(
+        session.session_id, session_id,
+        "the interrupt names the Subagent's own Session, not its parent"
+    );
+    assert!(drawn(&application).contains("s • stopping…)"));
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![
+                    SessionChange::SessionMonitoringChanged {
+                        monitoring_since: None,
+                    },
+                    SessionChange::SessionWatchesChanged {
+                        watches: Vec::new(),
+                    },
+                ],
+            },
+        )))
+        .expect("the Watches settle over the Session stream");
+    assert!(drawn(&application).contains("Esc returns to the parent"));
+    assert!(
+        matches!(
+            press_escape(&mut application),
+            ApplicationTransition::ViewAndAttachSession(reference) if reference.session_id == parent_id
+        ),
+        "with nothing left to stop, Escape leaves for the parent as before"
+    );
+}

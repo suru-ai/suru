@@ -54,6 +54,7 @@ fn session_with_its_tree(
                     session_id,
                     title: "Map every seam".to_owned(),
                     working_since: None,
+                    monitoring_since: None,
                     needs_intervention: false,
                 },
                 subagents: vec![SubagentTreeEntry {
@@ -65,6 +66,7 @@ fn session_with_its_tree(
                     status: ActivityStatus::Completed,
                     worked_ms: Some(12_000),
                     working_since: None,
+                    monitoring_since: None,
                     needs_intervention: false,
                 }],
             }),

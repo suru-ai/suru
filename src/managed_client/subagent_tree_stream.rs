@@ -268,6 +268,7 @@ mod tests {
                 session_id: SessionId::new(),
                 title: "Delegate".to_owned(),
                 working_since: Some(crate::protocol::SessionTimestamp(500)),
+                monitoring_since: None,
                 needs_intervention: false,
             },
             subagents: Vec::new(),
@@ -282,6 +283,7 @@ mod tests {
                 status: ActivityStatus::Completed,
                 worked_ms: Some(5),
                 working_since: None,
+                monitoring_since: None,
             },
         }
     }
@@ -512,6 +514,7 @@ mod tests {
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: Some(crate::protocol::SessionTimestamp(1_000)),
+            monitoring_since: None,
             needs_intervention: false,
         });
         (tree, subagent)
@@ -561,6 +564,7 @@ mod tests {
                 status: ActivityStatus::Failed,
                 worked_ms: None,
                 working_since: None,
+                monitoring_since: None,
             },
         };
         let server = TreeServer::spawn(vec![

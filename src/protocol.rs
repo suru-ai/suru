@@ -2501,6 +2501,11 @@ pub struct SubagentTreeTopLevel {
     /// in the tree is Working.
     #[serde(default)]
     pub working_since: Option<SessionTimestamp>,
+    /// When the top-level Session began Monitoring — nothing in the tree
+    /// Working, and a Watch live somewhere in it — the reading its Sidebar
+    /// row's Monitoring duration rises from; `None` otherwise.
+    #[serde(default)]
+    pub monitoring_since: Option<SessionTimestamp>,
     /// Whether the top-level Session's own Transcript holds a live Approval
     /// or Questionnaire. Its Subagents' Interventions are theirs to say.
     #[serde(default)]
@@ -2540,6 +2545,12 @@ pub struct SubagentTreeEntry {
     /// [`Self::worked_ms`] from here, as it ticks a Sidebar row's Working
     /// duration from its `working_since`.
     pub working_since: Option<SessionTimestamp>,
+    /// When the Subagent's Session began Monitoring — a Watch live in its
+    /// subtree and nothing there Working — and `None` otherwise. A settled
+    /// Subagent whose Watches outlive it reads Monitoring here, which its
+    /// entry says in place of its time (ADR 0030).
+    #[serde(default)]
+    pub monitoring_since: Option<SessionTimestamp>,
     /// Whether this Subagent's own Session holds a live Approval or
     /// Questionnaire. It is never rolled up: a Subagent whose descendant waits
     /// on an Intervention does not say so itself.
@@ -2557,12 +2568,16 @@ pub enum SubagentTreeChange {
     SubagentSpawned { entry: SubagentTreeEntry },
     /// A Subagent's latest Turn began or Settled — a resume or a Continuation
     /// setting it Working again, or its work settling as completed, failed,
-    /// or interrupted — so its Marker and time moved, carried whole.
+    /// or interrupted — or its Session began or stopped Monitoring, so its
+    /// Marker and time moved, carried whole. A Turn settling with a Watch
+    /// still live moves both at once, in one change.
     SubagentWorkingChanged {
         session_id: SessionId,
         status: ActivityStatus,
         worked_ms: Option<u64>,
         working_since: Option<SessionTimestamp>,
+        #[serde(default)]
+        monitoring_since: Option<SessionTimestamp>,
     },
     /// A Subagent's name or Title changed, carried whole.
     SubagentRetitled {
@@ -2572,10 +2587,13 @@ pub enum SubagentTreeChange {
     },
     /// The top-level Session's Title changed.
     TopLevelRetitled { title: String },
-    /// The top-level Session began Working, or stopped: its new
-    /// `working_since`, carried whole.
+    /// The top-level Session began or stopped Working or Monitoring: its new
+    /// `working_since` and `monitoring_since`, carried whole, so Working
+    /// giving way to Monitoring is one change.
     TopLevelWorkingChanged {
         working_since: Option<SessionTimestamp>,
+        #[serde(default)]
+        monitoring_since: Option<SessionTimestamp>,
     },
     /// Whether one Session of the tree — the top-level Session or any
     /// Subagent's — holds a live Intervention of its own changed.

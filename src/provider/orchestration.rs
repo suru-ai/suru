@@ -1332,7 +1332,9 @@ impl ProviderOrchestrator {
     /// with the Subagents it spawned, or — with no Turn running — the
     /// Subagents alone, or — with nothing Working — the Watches it is
     /// Monitoring. Interrupting a Subagent's own Session stops that one
-    /// Subagent, through the Provider connection its root ancestor owns.
+    /// Subagent — or, once it has settled and its Session is only Monitoring,
+    /// the Watches in its subtree — through the Provider connection its root
+    /// ancestor owns.
     pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
@@ -1402,9 +1404,10 @@ impl ProviderOrchestrator {
             }
             // Settled by the Watches' own settling, which the Provider
             // reports like any other: nothing here settles a Turn or
-            // withdraws a Prompt.
-            InterruptTarget::Watches => {
-                ask_actor_or_find_nothing_running(actor_commands(session_id), |response| {
+            // withdraws a Prompt. A Subagent's Watches run over its root
+            // ancestor's connection, and only its own subtree's are stopped.
+            InterruptTarget::Watches { root } => {
+                ask_actor_or_find_nothing_running(actor_commands(root), |response| {
                     ProviderCommand::StopWatches {
                         target: session_id,
                         response,
@@ -1885,9 +1888,12 @@ async fn run_provider_session(
                 }
                 ProviderCommand::StopWatches { target, response } => {
                     // Interrupting a Session that is only Monitoring, with no
-                    // Turn open: a Watch Outcome still held for the wake the
-                    // interrupt beats begins no Turn to explain (ADR 0030).
-                    subagents.watch_outcomes.drop_all();
+                    // Turn open: a Watch Outcome still held in its subtree for
+                    // the wake the interrupt beats begins no Turn to explain
+                    // (ADR 0030). One held above it still wakes its Agent.
+                    subagents
+                        .watch_outcomes
+                        .drop_for(&sessions.subtree_sessions(target));
                     let _ = response.send(
                         stop_live_watches(
                             provider.as_ref().map(|c| c.session.clone()),
@@ -2645,6 +2651,9 @@ async fn run_provider_session(
             // the Watch's own settling woke the Agent, say — stops the
             // Watches it named and leaves that Turn to run.
             ProviderInput::Command(Some(ProviderCommand::StopWatches { target, response })) => {
+                subagents
+                    .watch_outcomes
+                    .drop_for(&sessions.subtree_sessions(target));
                 let _ = response.send(
                     stop_live_watches(
                         provider.as_ref().map(|c| c.session.clone()),

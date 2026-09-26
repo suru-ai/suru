@@ -3,7 +3,8 @@
 //!
 //! A Watch starting or settling moves no Turn and writes no row: it is kept in
 //! memory beside the Session it belongs to, and the Session's liveness is
-//! re-derived across its ancestry whenever the table changes. Nothing here
+//! re-derived across its ancestry whenever the table changes — and told to the
+//! subscribers of its tree, whose entries say Monitoring too. Nothing here
 //! outlives the process, because no Watch outlives the Provider process that
 //! runs it.
 
@@ -46,6 +47,16 @@ impl SessionStore {
         watches
     }
 
+    /// The Sessions an interrupt of `session_id` reaches when it stops
+    /// Watches: the Session and every Session below it, whose Watch Outcomes
+    /// still held for a wake the stop beats are dropped with them.
+    pub(crate) fn subtree_sessions(&self, session_id: SessionId) -> Vec<SessionId> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .subtree(session_id)
+    }
+
     /// Records a Watch the Session's Agent left running and re-derives the
     /// Session's liveness: once nothing in its tree is Working, the Watch
     /// keeps it Monitoring. A start repeating a live Watch's identity keeps
@@ -76,6 +87,7 @@ impl SessionStore {
                 started_at,
             });
         state.reconcile_liveness(&self.storage, session_id);
+        state.announce_subagent_tree(session_id);
         Ok(())
     }
 
@@ -99,6 +111,7 @@ impl SessionStore {
             .watches
             .remove(watch_id)?;
         state.reconcile_liveness(&self.storage, session_id);
+        state.announce_subagent_tree(session_id);
         Some(settled.description)
     }
 
@@ -127,6 +140,7 @@ impl SessionStore {
             }
             state.reconcile_liveness(&self.storage, current);
         }
+        state.announce_subagent_tree(session_id);
     }
 }
 

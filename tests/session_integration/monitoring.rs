@@ -633,3 +633,219 @@ async fn a_watch_stop_the_provider_refuses_leaves_the_session_monitoring() {
     assert_eq!(still.turns.len(), 1);
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+/// Emits `event` attributed to the Subagent `subagent`, once the actor has
+/// taken it.
+async fn emit_as(fixture: &WorkingTurn, subagent: &str, event: ProviderEvent) {
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new(subagent)),
+            event,
+        )
+        .await;
+}
+
+fn spawned(subagent: &str, description: &str) -> ProviderEvent {
+    ProviderEvent::SubagentStarted {
+        subagent_id: ProviderSubagentId::new(subagent),
+        name: "Explore".to_owned(),
+        description: description.to_owned(),
+        delegation: None,
+    }
+}
+
+fn completed(subagent: &str) -> ProviderEvent {
+    ProviderEvent::SubagentCompleted {
+        subagent_id: ProviderSubagentId::new(subagent),
+        status: ProviderSubagentStatus::Completed,
+    }
+}
+
+/// The child Session the Subagent row reading `description` leads into.
+fn child_of(snapshot: &SessionSnapshot, description: &str) -> SessionId {
+    snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            suru::protocol::Activity::Subagent {
+                session_id,
+                description: row,
+                ..
+            } if row == description => Some(*session_id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a Subagent row reads {description:?}"))
+}
+
+async fn session_of_where(
+    fixture: &WorkingTurn,
+    session_id: SessionId,
+    described: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        session_id,
+        described,
+        predicate,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_grandchilds_watch_makes_each_ancestor_monitoring_unless_a_sibling_keeps_it_working() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "grandchild-watch-rollup-test").await;
+    fixture
+        .provider_session
+        .emit(spawned("task-child", "Map the provider seams"));
+    fixture
+        .provider_session
+        .emit(spawned("task-sibling", "Audit the dependencies"));
+    emit_as(
+        &fixture,
+        "task-child",
+        spawned("task-grandchild", "Tail the deploy log"),
+    )
+    .await;
+    emit_as(
+        &fixture,
+        "task-grandchild",
+        watch_started("grandchild-monitor", "tail -f deploy.log"),
+    )
+    .await;
+    emit_as(&fixture, "task-child", completed("task-grandchild")).await;
+    fixture.provider_session.emit(completed("task-child"));
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let top_level = session_where(&fixture, "the Turn settles", first_turn_settled).await;
+    let child = child_of(&top_level, "Map the provider seams");
+    let child_snapshot = session_of_where(&fixture, child, "the child settles", |snapshot| {
+        snapshot.session.monitoring_since.is_some()
+    })
+    .await;
+    let grandchild = child_of(&child_snapshot, "Tail the deploy log");
+    let grandchild_snapshot =
+        crate::support::read_session(fixture.server.descriptor(), grandchild).await;
+    assert!(
+        grandchild_snapshot.session.monitoring_since.is_some(),
+        "the Session whose Agent left the Watch running is Monitoring"
+    );
+    assert_eq!(child_snapshot.session.working_since, None);
+    assert_eq!(
+        described(&child_snapshot),
+        ["tail -f deploy.log"],
+        "its parent waits on the grandchild's Watch too"
+    );
+    let top_level =
+        crate::support::read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert!(
+        top_level.session.working_since.is_some(),
+        "a Working sibling keeps the top-level Session Working"
+    );
+    assert_eq!(
+        top_level.session.monitoring_since, None,
+        "and Working anywhere in its tree outranks the Watch below it"
+    );
+
+    fixture.provider_session.emit(completed("task-sibling"));
+    let monitoring = session_where(&fixture, "the sibling settles", |snapshot| {
+        snapshot.session.working_since.is_none()
+    })
+    .await;
+    assert!(
+        monitoring.session.monitoring_since.is_some(),
+        "with nothing Working, the grandchild's Watch keeps the top-level Session Monitoring"
+    );
+    assert_eq!(described(&monitoring), ["tail -f deploy.log"]);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn interrupting_a_child_session_stops_only_the_watches_in_its_subtree() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "interrupt-child-watches-test").await;
+    fixture
+        .provider_session
+        .emit(watch_started("top-watch", "cargo test"));
+    fixture
+        .provider_session
+        .emit(spawned("task-child", "Map the provider seams"));
+    emit_as(
+        &fixture,
+        "task-child",
+        watch_started("child-watch", "tail -f deploy.log"),
+    )
+    .await;
+    fixture.provider_session.emit(completed("task-child"));
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let monitoring = session_where(&fixture, "the whole tree stops Working", |snapshot| {
+        first_turn_settled(snapshot) && snapshot.session.monitoring_since.is_some()
+    })
+    .await;
+    assert_eq!(described(&monitoring), ["cargo test", "tail -f deploy.log"]);
+    let child = child_of(&monitoring, "Map the provider seams");
+    let child_monitoring =
+        session_of_where(&fixture, child, "the child reads Monitoring", |snapshot| {
+            snapshot.session.monitoring_since.is_some()
+        })
+        .await;
+    assert_eq!(described(&child_monitoring), ["tail -f deploy.log"]);
+
+    let (response, ()) = tokio::join!(
+        interrupt(&fixture.client, fixture.server.descriptor(), child),
+        async {
+            let stop = timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_watches_stop(),
+            )
+            .await
+            .expect("interrupting the child asks the Provider to stop its Watches");
+            assert_eq!(
+                stop.watches(),
+                ["child-watch"],
+                "only the Watches in the child's subtree, never the top-level Session's"
+            );
+            stop.succeed();
+        }
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "stopping a Subagent's Watches is stopping work"
+    );
+    assert!(
+        fixture.provider_session.try_next_subagent_stop().is_none(),
+        "a settled Subagent has no work of its own left to stop"
+    );
+    emit_as(&fixture, "task-child", watch_stopped("child-watch")).await;
+    let child_idle = session_of_where(&fixture, child, "the child's Watch settles", |snapshot| {
+        snapshot.session.monitoring_since.is_none()
+    })
+    .await;
+    assert!(child_idle.watches.is_empty());
+    assert_eq!(
+        child_idle.turns.len(),
+        1,
+        "stopping its Watches begins no Turn"
+    );
+
+    let top_level = session_where(&fixture, "the top-level reading rolls up", |snapshot| {
+        described(snapshot) == ["cargo test"]
+    })
+    .await;
+    assert!(
+        top_level.session.monitoring_since.is_some(),
+        "the top-level Session's own Watch keeps running, and it stays Monitoring"
+    );
+    assert!(
+        fixture.provider_session.try_next_watches_stop().is_none(),
+        "nothing asked to stop the top-level Session's Watch"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}

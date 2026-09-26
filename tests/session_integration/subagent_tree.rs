@@ -28,6 +28,7 @@ use suru::{
     },
     provider::{
         ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderSubagentStatus,
+        ProviderWatchId, ProviderWatchOutcome,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -387,6 +388,7 @@ async fn spawns_settles_and_updates_arrive_as_changes_and_settled_entries_keep_t
         status,
         worked_ms,
         working_since,
+        ..
     } = next_change(&mut updates, &mut revision).await
     else {
         panic!("a nested settle arrives as a settled entry");
@@ -915,6 +917,132 @@ async fn entries_say_when_their_work_began_and_the_top_level_since_when_it_works
     fixture.server.shutdown().await.expect("shut down server");
 }
 
+/// The Monitoring reading a change carries for the entry `session_id`, or for
+/// the top level where `session_id` is `None`.
+fn monitoring_in(
+    change: &SubagentTreeChange,
+    session_id: Option<SessionId>,
+) -> Option<Option<SessionTimestamp>> {
+    match (change, session_id) {
+        (
+            SubagentTreeChange::TopLevelWorkingChanged {
+                monitoring_since, ..
+            },
+            None,
+        ) => Some(*monitoring_since),
+        (
+            SubagentTreeChange::SubagentWorkingChanged {
+                session_id: changed,
+                monitoring_since,
+                ..
+            },
+            Some(session_id),
+        ) if *changed == session_id => Some(*monitoring_since),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_settled_subagents_watch_reads_monitoring_on_its_entry_and_the_top_level_until_it_settles()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-monitoring-test").await;
+    let provider = &fixture.provider_session;
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    provider
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("task-1")),
+            ProviderEvent::WatchStarted {
+                watch_id: ProviderWatchId::new("child-monitor"),
+                description: "tail -f deploy.log".to_owned(),
+            },
+        )
+        .await;
+    let descriptor = fixture.server.descriptor().clone();
+    let (tree, mut updates) = open_tree(&descriptor, fixture.session_id).await;
+    let mut revision = tree.revision;
+    let explore = named(&tree.subagents, "Explore").session_id;
+    assert_eq!(
+        named(&tree.subagents, "Explore").monitoring_since,
+        None,
+        "a working Subagent is not Monitoring"
+    );
+
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let settled = changes_until(&mut updates, &mut revision, |change| {
+        monitoring_in(change, None).is_some_and(|since| since.is_some())
+    })
+    .await;
+    let entry_monitoring = settled
+        .iter()
+        .rev()
+        .find_map(|change| monitoring_in(change, Some(explore)))
+        .flatten();
+    assert_eq!(
+        entry_monitoring,
+        read_session(&descriptor, explore)
+            .await
+            .session
+            .monitoring_since,
+        "the settled Subagent's entry reads its own Session's Monitoring"
+    );
+    assert!(entry_monitoring.is_some());
+    let Some(SubagentTreeChange::TopLevelWorkingChanged {
+        working_since: None,
+        monitoring_since: top_level_monitoring,
+    }) = settled.last()
+    else {
+        panic!("Working gives way to Monitoring in one top-level change: {settled:?}");
+    };
+    assert_eq!(
+        *top_level_monitoring,
+        read_session(&descriptor, fixture.session_id)
+            .await
+            .session
+            .monitoring_since,
+        "the top-level entry's Monitoring reads what its Sidebar row reads"
+    );
+    let (reopened, _) = open_tree(&descriptor, fixture.session_id).await;
+    assert_eq!(
+        named(&reopened.subagents, "Explore").monitoring_since,
+        entry_monitoring
+    );
+    assert_eq!(reopened.top_level.monitoring_since, *top_level_monitoring);
+
+    provider
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("task-1")),
+            ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("child-monitor"),
+                outcome: ProviderWatchOutcome::Stopped,
+                summary: None,
+                woke_agent: false,
+            },
+        )
+        .await;
+    let idle = changes_until(&mut updates, &mut revision, |change| {
+        monitoring_in(change, Some(explore)) == Some(None)
+    })
+    .await;
+    assert!(
+        idle.iter()
+            .any(|change| monitoring_in(change, None) == Some(None)),
+        "the Watch settling ends the top level's Monitoring and the entry's alike: {idle:?}"
+    );
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -947,7 +1075,8 @@ async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again
     assert_eq!(
         stopped.last(),
         Some(&SubagentTreeChange::TopLevelWorkingChanged {
-            working_since: None
+            working_since: None,
+            monitoring_since: None,
         }),
         "the tree says when its top-level Session stops Working"
     );
@@ -981,6 +1110,7 @@ async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again
     let resumed = changes_until(&mut updates, &mut revision, is_top_level_working_change).await;
     let Some(SubagentTreeChange::TopLevelWorkingChanged {
         working_since: Some(resumed_since),
+        ..
     }) = resumed.last()
     else {
         panic!("a Prompt admitted sets the top-level Session Working again: {resumed:?}");
@@ -1403,6 +1533,7 @@ async fn a_resumed_subagent_works_again_counting_up_from_its_earlier_turns_then_
             status: ActivityStatus::Active,
             worked_ms: Some(first_ms),
             working_since: latest_turn_began(descriptor, explore.session_id).await,
+            monitoring_since: None,
         },
         "resumed, the entry is Working again, counting up from its first Turn's time from \
          the moment the resume's Turn began"
@@ -1424,6 +1555,7 @@ async fn a_resumed_subagent_works_again_counting_up_from_its_earlier_turns_then_
             status: ActivityStatus::Interrupted,
             worked_ms: Some(spans.iter().sum()),
             working_since: None,
+            monitoring_since: None,
         },
         "settled again, it wears the resume's outcome over both Turns' time"
     );

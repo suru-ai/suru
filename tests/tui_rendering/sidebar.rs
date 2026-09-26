@@ -10455,6 +10455,7 @@ impl Family {
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: None,
+            monitoring_since: None,
             needs_intervention: false,
         };
         SubagentTreeSnapshot {
@@ -10463,6 +10464,7 @@ impl Family {
                 session_id: self.top,
                 title: "The delegating work".to_owned(),
                 working_since: Some(SessionTimestamp(seconds_ago(90))),
+                monitoring_since: None,
                 needs_intervention: false,
             },
             subagents: vec![
