@@ -30,6 +30,7 @@ mod respawn;
 mod resume;
 mod skills;
 mod steering;
+mod subagent_steers;
 mod subagents;
 mod support;
 mod turns;
