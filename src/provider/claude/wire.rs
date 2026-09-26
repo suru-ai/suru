@@ -292,20 +292,24 @@ pub(super) struct ResultUsage {
 #[derive(Deserialize)]
 pub(super) struct SystemMessage {
     pub(super) subtype: String,
+    /// The task's own identity, which every lifecycle message names. For a task running an agent
+    /// it is also the agent's: a resume starts the same task again, and a SendMessage addresses
+    /// the agent by it.
     #[serde(default)]
     pub(super) task_id: Option<String>,
-    /// The tool use that spawned the task, on `task_started`. It is the identity every chunk the
-    /// subagent streams carries as `parent_tool_use_id`, which is what makes it the Subagent's. A
-    /// resumed agent's task starts again naming the SendMessage tool use instead, while its chunks
-    /// keep riding under the original spawn's id.
+    /// The tool use that delegated the task, on `task_started`. For a spawn it is the identity
+    /// every chunk the subagent streams carries as `parent_tool_use_id`, which is what makes that
+    /// conversation the Subagent's. A resumed agent's task starts again naming the SendMessage tool
+    /// use instead, while its chunks keep riding under the original spawn's id (verified against
+    /// the live 2.1.280 CLI).
     #[serde(default)]
     pub(super) tool_use_id: Option<String>,
     #[serde(default)]
     pub(super) task_type: Option<String>,
     #[serde(default)]
     pub(super) subagent_type: Option<String>,
-    /// What the task was asked to do, on `task_started`; on `task_progress`, the subagent's latest
-    /// tool activity instead.
+    /// What the task was asked to do, on `task_started` — repeated unchanged when a resume starts
+    /// it again; on `task_progress`, the subagent's latest tool activity instead.
     #[serde(default)]
     pub(super) description: Option<String>,
     /// How the task ended, on `task_notification` — `completed`, or whatever failing or being

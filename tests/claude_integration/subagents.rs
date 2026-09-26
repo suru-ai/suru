@@ -8,12 +8,19 @@
 //! conversation arrives as those snapshots alone — full messages carrying `parent_tool_use_id`,
 //! never chunks.
 
-use crate::support::{
-    CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
-    discovery_arms, interrupt_arm, opened_session, session_where, settled_session, stop_task_arm,
-    user_turn_arm,
+use crate::{
+    server_support::PROGRESS_DEADLINE,
+    support::{
+        CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
+        discovery_arms, interrupt_arm, opened_session, session_where, settled_session,
+        stop_task_arm, user_turn_arm,
+    },
 };
-use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus};
+use suru::{
+    managed_client::SubagentTreeEvent,
+    protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus},
+};
+use tokio::time::timeout;
 
 /// A fan-out running in the foreground of the Turn: the conversation spawns a subagent through
 /// the Task tool, the CLI reports the task starting with the spawning tool use's identity, the
@@ -740,90 +747,442 @@ async fn stopping_one_subagent_by_its_session_leaves_the_other_working() {
         .expect("shut the server down");
 }
 
-/// A background agent resumed through SendMessage, as the live 2.1.280 CLI reports it: the resume
-/// restarts the same task under the SendMessage tool use's identity, yet the resumed agent's
-/// conversation still rides under the original Agent tool use as `parent_tool_use_id`, and the
-/// settle names the SendMessage tool use again. Each resume stands as its own Subagent until
-/// #378 reopens the resumed agent's own Session instead.
+/// The resume of a settled background agent through SendMessage, as the live 2.1.280 CLI reports
+/// it: the loop spawns the agent and its Turn ends once the agent has said HELLO and settled; the
+/// loop wakes on its own to send it more, and that SendMessage starts the same task again, naming
+/// the SendMessage tool use as its `tool_use_id` and repeating the spawn's description, while the
+/// resumed agent's conversation still rides under the original Agent tool use as
+/// `parent_tool_use_id`. The resumed stretch runs on another Model than the first, so each
+/// stretch's Model evidence is told apart.
 const RESUMED_SUBAGENT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Say hello\",\"prompt\":\"Say HELLO.\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent_1","content":"Async agent launched successfully.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"HELLO"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","status":"completed","summary":"Agent \"Say hello\" completed","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Launched.","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"send_1","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"to\":\"a2046dbbe8ecd4a5c\",\"message\":\"Now say GOODBYE.\\nNothing else.\",\"summary\":\"Say goodbye\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"send_1","content":"{\"success\":true,\"message\":\"Resuming agent a2046db\"}","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"GOODBYE"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-resumed","content":[{"type":"text","text":"GOODBYE"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_progress","task_id":"a2046dbbe8ecd4a5c","description":"Saying goodbye","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","status":"completed","summary":"Agent \"Say hello\" completed","session_id":"prov-session"}'
-      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"DONE"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"DONE","session_id":"prov-session"}'
 "#;
 
+/// The Model a Turn's Agent was observed running, if any.
+fn turn_model(turn: &suru::protocol::Turn) -> Option<&str> {
+    turn.agent
+        .as_ref()
+        .map(|agent| agent.selection.model.as_str())
+}
+
 #[tokio::test]
-async fn a_subagent_resumed_through_send_message_lands_its_new_work_in_the_resumes_own_child() {
+async fn a_subagent_resumed_through_send_message_continues_in_its_own_session_as_a_second_turn() {
     let claude = conversation_fixture(RESUMED_SUBAGENT_TURN);
     let opened = opened_session(&claude, "claude-subagent-resumed", "Hello then goodbye").await;
     let session_id = opened.session_id;
     let client = &opened.client;
-    let settled = settled_session(client, session_id, 0).await;
+    let parent = settled_session(client, session_id, 1).await;
 
     let [
         Activity::Subagent {
+            turn_id: spawn_turn,
+            status: spawn_status,
+            description: spawn_description,
+            model: spawn_model,
             session_id: spawn_child,
+            duration_ms: spawn_duration,
             ..
         },
         Activity::Subagent {
-            status,
-            description,
-            model,
+            turn_id: resume_turn,
+            status: resume_status,
+            name: resume_name,
+            description: resume_description,
+            model: resume_model,
             session_id: resume_child,
+            duration_ms: resume_duration,
             ..
         },
-    ] = subagent_rows(&settled)[..]
+    ] = subagent_rows(&parent)[..]
     else {
         panic!(
             "the spawn and the resume each stand as a row, got {:?}",
-            settled.activities
+            parent.activities
         );
     };
-    assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(
-        description, "Say hello",
-        "the resume reads what its task was started to do, not its latest progress tick"
+        parent.turns.len(),
+        2,
+        "the loop woke on its own to resume the agent"
+    );
+    assert_eq!(*spawn_turn, parent.turns[0].id);
+    assert_eq!(
+        *resume_turn, parent.turns[1].id,
+        "the resume row stands in the Turn that delegated the resume"
     );
     assert_eq!(
-        model.as_ref().map(|model| model.as_str()),
+        resume_child, spawn_child,
+        "both rows lead into the Subagent's one Session"
+    );
+    assert_eq!(*spawn_status, ActivityStatus::Completed);
+    assert_eq!(spawn_description, "Say hello");
+    assert_eq!(
+        spawn_model.as_ref().map(|model| model.as_str()),
         Some("claude-haiku-child"),
-        "the resumed conversation's snapshots are the resume's Model evidence"
+        "the spawn's row keeps what its own stretch settled with"
     );
+    assert!(spawn_duration.is_some());
+    assert_eq!(*resume_status, ActivityStatus::Completed);
+    assert_eq!(resume_name, "general-purpose");
+    assert_eq!(
+        resume_description, "Say goodbye",
+        "the resume reads SendMessage's summary, not the spawn's description the start repeats"
+    );
+    assert_eq!(
+        resume_model.as_ref().map(|model| model.as_str()),
+        Some("claude-sonnet-resumed"),
+        "the resumed stretch's snapshots are the resume row's Model evidence"
+    );
+    assert!(resume_duration.is_some());
 
-    let spawned = settled_session(client, *spawn_child, 0).await;
-    let [hello] = agent_messages(&spawned)[..] else {
+    let child = settled_session(client, *spawn_child, 1).await;
+    assert_eq!(
+        child.title, "Say hello",
+        "a resume leaves the Title as it was"
+    );
+    let [first, second] = child.turns.as_slice() else {
         panic!(
-            "the spawn's child holds only the spawn's work, got {:?}",
-            spawned.messages
+            "the resume begins a second Turn in the one child Session, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(first.status, TurnStatus::Completed);
+    assert_eq!(second.status, TurnStatus::Completed);
+    assert_eq!(turn_model(first), Some("claude-haiku-child"));
+    assert_eq!(
+        turn_model(second),
+        Some("claude-sonnet-resumed"),
+        "the resumed stretch's Model evidence belongs to the Turn it began"
+    );
+    let [hello, goodbye] = agent_messages(&child)[..] else {
+        panic!(
+            "the child holds the agent's whole conversation, got {:?}",
+            child.messages
         );
     };
     assert_eq!(hello.content, "HELLO");
+    assert_eq!(hello.turn_id, first.id);
+    assert_eq!(goodbye.content, "GOODBYE");
+    assert_eq!(
+        goodbye.turn_id, second.id,
+        "the resumed work lands in the Turn the resume began"
+    );
 
-    let resumed = settled_session(client, *resume_child, 0).await;
-    assert_eq!(resumed.turns[0].status, TurnStatus::Completed);
-    let [goodbye] = agent_messages(&resumed)[..] else {
+    let mut tree = client.subscribe_subagent_tree(session_id);
+    let Some(SubagentTreeEvent::Snapshot(tree)) = timeout(PROGRESS_DEADLINE, tree.next())
+        .await
+        .expect("the Subagent tree arrives")
+    else {
+        panic!("the Subagent tree subscription opens with its snapshot");
+    };
+    let [entry] = tree.subagents.as_slice() else {
         panic!(
-            "the resumed work lands in the resume's own child, got {:?}",
-            resumed.messages
+            "the resumed agent is one entry in the tree, got {:?}",
+            tree.subagents
         );
     };
-    assert_eq!(goodbye.content, "GOODBYE");
+    assert_eq!(entry.session_id, *spawn_child);
+    assert_eq!(entry.parent_session_id, session_id);
+    assert_eq!(entry.title, "Say hello");
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// The same resume, but the resumed agent is still working when the loop's stretch that sent the
+/// SendMessage ends, and it works on until something stops it.
+const RESUMED_SUBAGENT_STILL_WORKING: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"HELLO"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Launched.","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"send_1","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"to\":\"a2046dbbe8ecd4a5c\",\"message\":\"Keep saying GOODBYE until told to stop.\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"GOODBYE"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":200,"num_turns":1,"result":"Resumed.","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn a_resumed_subagent_keeps_its_parent_working_and_stopping_it_settles_only_its_resumed_turn()
+{
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(RESUMED_SUBAGENT_STILL_WORKING),
+        stop_task_arm(),
+    ));
+    let opened = opened_session(
+        &claude,
+        "claude-stop-resumed-subagent",
+        "Hello then goodbye",
+    )
+    .await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let resumed = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the resumed agent works on past the stretch that resumed it",
+        |snapshot| {
+            snapshot.turns.len() == 2
+                && snapshot.turns[1].status != TurnStatus::Active
+                && matches!(
+                    subagent_rows(snapshot)[..],
+                    [
+                        _,
+                        Activity::Subagent {
+                            status: ActivityStatus::Active,
+                            ..
+                        }
+                    ]
+                )
+        },
+    )
+    .await;
+    assert!(
+        resumed.session.working_since.is_some(),
+        "the resumed Subagent keeps its parent Working once every Turn has settled (ADR 0015)"
+    );
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+        Activity::Subagent {
+            description,
+            session_id: resumed_child,
+            ..
+        },
+    ] = subagent_rows(&resumed)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(resumed_child, child_id);
+    assert_eq!(
+        description, "Keep saying GOODBYE until told to stop.",
+        "a SendMessage with no summary is described by its message's first line"
+    );
+    let child_id = *child_id;
+    let mut child_feed = client
+        .subscribe_session(child_id)
+        .await
+        .expect("subscribe to the child Session");
+    session_where(
+        client,
+        &mut child_feed,
+        child_id,
+        "the resumed work reaches the child's second Turn",
+        |snapshot| agent_messages(snapshot).len() == 2,
+    )
+    .await;
+
+    // Interrupting the Subagent's own Session is the stop its row and the Subagent Picker offer.
+    client
+        .interrupt_session(child_id)
+        .await
+        .expect("the resumed Subagent's Session accepts the stop");
+
+    let stopped = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the resume row settles as stopped and the parent stops Working",
+        |snapshot| {
+            snapshot.session.working_since.is_none()
+                && matches!(
+                    subagent_rows(snapshot)[..],
+                    [
+                        _,
+                        Activity::Subagent {
+                            status: ActivityStatus::Interrupted,
+                            ..
+                        }
+                    ]
+                )
+        },
+    )
+    .await;
+    let [
+        Activity::Subagent {
+            status: spawn_status,
+            ..
+        },
+        Activity::Subagent { duration_ms, .. },
+    ] = subagent_rows(&stopped)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *spawn_status,
+        ActivityStatus::Completed,
+        "the spawn's row stays exactly as it settled"
+    );
+    assert!(
+        duration_ms.is_some(),
+        "the stop settles the resume row's own stretch"
+    );
+    let child = settled_session(client, child_id, 1).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        child.turns[1].status,
+        TurnStatus::Interrupted,
+        "the stop settles the Turn the resume began"
+    );
+
+    assert_eq!(
+        claude
+            .control_subtypes()
+            .into_iter()
+            .filter(|subtype| subtype != "get_context_usage")
+            .collect::<Vec<_>>(),
+        after_probe(["list_models", "stop_task"]),
+    );
+    assert_eq!(
+        request_named(&claude, "stop_task").pointer("/request/task_id"),
+        Some(&"a2046dbbe8ecd4a5c".into()),
+        "the stop names the resumed task, the Subagent's own identity"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A sibling resuming a settled Subagent: the loop spawns a writer and a reviewer, the writer
+/// settles, and the reviewer — whose conversation arrives as snapshots — sends the writer more
+/// work through SendMessage, so the writer's task starts again naming the reviewer's tool use.
+const SIBLING_RESUMES_SUBAGENT: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_writer","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"writer-task","tool_use_id":"agent_writer","description":"Draft the notes","task_type":"local_agent","subagent_type":"Writer","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"agent_reviewer","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"reviewer-task","tool_use_id":"agent_reviewer","description":"Review the notes","task_type":"local_agent","subagent_type":"Reviewer","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Drafted."}]},"parent_tool_use_id":"agent_writer","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"writer-task","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"send_review","name":"SendMessage","input":{"to":"writer-task","message":"Tighten the second paragraph.","summary":"Tighten the notes"}}]},"parent_tool_use_id":"agent_reviewer","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"writer-task","tool_use_id":"send_review","description":"Draft the notes","task_type":"local_agent","subagent_type":"Writer","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Tightened."}]},"parent_tool_use_id":"agent_writer","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"writer-task","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"reviewer-task","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Reviewed.","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn a_sibling_that_resumes_a_subagent_holds_the_resume_row_in_its_own_turn() {
+    let claude = conversation_fixture(SIBLING_RESUMES_SUBAGENT);
+    let opened = opened_session(&claude, "claude-sibling-resumes", "Write then review").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let parent = settled_session(client, session_id, 0).await;
+
+    let [
+        Activity::Subagent {
+            session_id: writer,
+            name: writer_name,
+            ..
+        },
+        Activity::Subagent {
+            session_id: reviewer,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!(
+            "the parent holds only the two spawns, got {:?}",
+            parent.activities
+        );
+    };
+    assert_eq!(writer_name, "Writer");
+    let reviewer_session = settled_session(client, *reviewer, 0).await;
+    let Activity::Subagent {
+        status,
+        name,
+        description,
+        session_id: resumed,
+        turn_id,
+        ..
+    } = the_subagent_row(&reviewer_session)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        resumed, writer,
+        "the reviewer's row leads into the writer's own Session"
+    );
+    assert_eq!(*turn_id, reviewer_session.turns[0].id);
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(name, "Writer");
+    assert_eq!(description, "Tighten the notes");
+
+    let writer_session = settled_session(client, *writer, 1).await;
+    assert_eq!(
+        writer_session.session.parent,
+        Some(session_id),
+        "the writer still hangs where it first spawned"
+    );
+    let [drafted, tightened] = agent_messages(&writer_session)[..] else {
+        panic!(
+            "the writer's Session holds both stretches, got {:?}",
+            writer_session.messages
+        );
+    };
+    assert_eq!(drafted.turn_id, writer_session.turns[0].id);
+    assert_eq!(tightened.content, "Tightened.");
+    assert_eq!(tightened.turn_id, writer_session.turns[1].id);
+
+    let mut tree = client.subscribe_subagent_tree(session_id);
+    let Some(SubagentTreeEvent::Snapshot(tree)) = timeout(PROGRESS_DEADLINE, tree.next())
+        .await
+        .expect("the Subagent tree arrives")
+    else {
+        panic!("the Subagent tree subscription opens with its snapshot");
+    };
+    assert_eq!(
+        tree.subagents
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.parent_session_id))
+            .collect::<Vec<_>>(),
+        [("Writer", session_id), ("Reviewer", session_id)],
+        "the writer is listed once, where it first spawned, not again under the reviewer"
+    );
 
     opened
         .server

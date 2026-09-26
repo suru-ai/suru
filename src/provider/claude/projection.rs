@@ -14,11 +14,13 @@
 //! parent's Transcript.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
-//! `task_started` for an agent task opens the Subagent under the spawning tool use's identity,
-//! `task_updated` revises what it is doing, and `task_notification` settles it.
-//! A settled background agent the loop resumes through SendMessage starts its task again under the
-//! SendMessage tool use's identity, and that resume is a Subagent of its own; the resumed agent's
-//! conversation still rides under the original spawn's id, so it is routed to the resume.
+//! `task_started` for an agent task opens the Subagent — known by its task id — in the
+//! conversation whose tool use spawned it, `task_updated` revises what it is doing, and
+//! `task_notification` settles its stretch of work. A settled agent the loop resumes through
+//! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
+//! Subagent rather than a new one, and since the resumed conversation still rides under the
+//! original spawn's id, the resumed work lands in the Subagent's own Session, in the Turn the
+//! resume begins there (ADR 0031).
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
 //! result is still to come, since the CLI answers every message queued into a running loop with a
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
@@ -64,8 +66,9 @@ const COMMAND_TOOL: &str = "Bash";
 const TASK_TOOL: &str = "Task";
 const AGENT_TOOL: &str = "Agent";
 
-/// The tool that resumes a settled background agent. The CLI restarts the agent's task naming this
-/// tool use as its `tool_use_id`, so the resume opens in the conversation that ran it, like a spawn.
+/// The tool that resumes a settled background agent. The CLI starts the agent's task again naming
+/// this tool use as its `tool_use_id`, so the resume opens in the conversation that ran it, like a
+/// spawn, and the tool's input says what the resume asks.
 const SEND_MESSAGE_TOOL: &str = "SendMessage";
 
 /// The task type the CLI reports for a task running an agent — a Subagent. Every other type
@@ -223,20 +226,6 @@ type ConversationKey = Option<String>;
 /// The loop's own conversation, whose events land in the owning Session.
 const OWNING_CONVERSATION: ConversationKey = None;
 
-/// The attribution one conversation's events land under: the owning Session for the loop's own,
-/// and the Subagent the spawning tool use names for everything streamed on its behalf.
-fn attributed(owner: &ConversationKey, event: ProviderEvent) -> AttributedProviderEvent {
-    AttributedProviderEvent {
-        attribution: match owner {
-            None => ProviderEventAttribution::OwningSession,
-            Some(subagent) => {
-                ProviderEventAttribution::Subagent(ProviderSubagentId::new(subagent.clone()))
-            }
-        },
-        event,
-    }
-}
-
 /// A `tool_use` block between its start and stop: the input streams in `input_json_delta`
 /// increments beside whatever the start already carried.
 struct OpenToolUse {
@@ -276,12 +265,32 @@ struct RunningCommand {
     activity: ProviderActivityId,
 }
 
-/// One task the CLI is running an agent for: the identity its Subagent's events are attributed
-/// by, and the description its row currently reads, kept so updates repeating it unchanged
-/// publish nothing.
-struct SubagentTask {
-    subagent: String,
-    description: String,
+/// A tool use that delegates to an agent, remembered from its block until the task it delegates
+/// starts: the conversation that ran it, whose Turn the Delegation's row stands in, and which kind
+/// of Delegation it is.
+struct DelegationTool {
+    delegator: ConversationKey,
+    kind: DelegationKind,
+}
+
+enum DelegationKind {
+    /// The Agent or Task tool, spawning a new agent. The task's start describes it.
+    Spawn,
+    /// SendMessage, resuming an agent that settled. Its input — read once the block closes, since
+    /// it streams — describes the resume: the loop's `summary` of the message, or else the
+    /// message's own first line.
+    Resume { description: Option<String> },
+}
+
+/// One agent task the CLI has run as a Subagent. Its task id is the Subagent's identity, and it
+/// is remembered for as long as the wire lasts, because a settled agent may be resumed.
+struct AgentTask {
+    /// The `parent_tool_use_id` its conversation rides under: the spawning tool use's id, which a
+    /// resume does not change. `None` where no chunk can be attributed to it.
+    conversation: Option<String>,
+    /// While the agent works, the description the row of its current stretch reads, kept so
+    /// updates repeating it unchanged publish nothing; `None` once that stretch has settled.
+    working: Option<String>,
 }
 
 /// What the projection remembers between conversation messages, across every conversation the
@@ -292,21 +301,19 @@ struct ClaudeProjection {
     /// The commands whose tool results are still to be echoed back, by tool-use id — the CLI's
     /// ids are unique across conversations, so one table serves them all.
     running_commands: BTreeMap<String, RunningCommand>,
-    /// The Task tool uses that have streamed, by tool-use id, each remembering the conversation
-    /// that ran it. A `task_started` naming one of them is a spawn out of that conversation —
-    /// which is how a subagent's own spawns recurse one level down.
-    spawn_tools: BTreeMap<String, ConversationKey>,
-    /// The agent tasks running as Subagents, by the task id the rest of the lifecycle names.
-    subagent_tasks: BTreeMap<String, SubagentTask>,
-    /// Every agent task ever started, by task id, with the `parent_tool_use_id` its conversation
-    /// rides under — the spawning tool use's id, which a resume of the task does not change.
-    task_conversations: BTreeMap<String, String>,
-    /// The resumed conversations, from the `parent_tool_use_id` they still ride under to the
-    /// Subagent the latest resume opened, which is whose work they now are.
-    resumed_conversations: BTreeMap<String, String>,
-    /// Latest assistant-snapshot Model evidence by spawning tool-use id. A
-    /// snapshot can race the task lifecycle, so evidence waits here until the
-    /// Subagent row exists.
+    /// The delegating tool uses that have streamed, by tool-use id. A `task_started` naming one of
+    /// them is a Delegation out of the conversation that ran it — which is how a subagent's own
+    /// spawns recurse one level down, and how a sibling's resume lands in the sibling's Turn.
+    delegation_tools: BTreeMap<String, DelegationTool>,
+    /// Every agent task this wire has started, working or settled, by task id — the identity the
+    /// rest of the lifecycle and a resume name it by.
+    agent_tasks: BTreeMap<String, AgentTask>,
+    /// The subagent conversations, from the `parent_tool_use_id` each rides under to the task id
+    /// of the agent it belongs to — whose Subagent its events are, in whichever stretch.
+    conversation_agents: BTreeMap<String, String>,
+    /// Latest assistant-snapshot Model evidence by conversation, since the stretch it began in.
+    /// A snapshot can race the task lifecycle, so evidence waits here until the stretch's row
+    /// exists, and a settle clears it so a resume reports only its own.
     subagent_models: BTreeMap<String, crate::protocol::ModelId>,
     reporting_lifetime: String,
     latest_reported_cost: Option<Cost>,
@@ -320,17 +327,15 @@ struct ClaudeProjection {
 
 impl ClaudeProjection {
     /// can_use_tool identifies the tool call, while its preceding native
-    /// assistant block names the spawning tool use through parent_tool_use_id.
-    /// agent_id alone is not interchangeable with that spawning tool identity.
+    /// assistant block names the spawning tool use through parent_tool_use_id,
+    /// which resolves to the Subagent the conversation belongs to. agent_id
+    /// alone is not interchangeable with that spawning tool identity.
     fn intervention_attribution(&self, message: &Value) -> Option<ProviderEventAttribution> {
         let request = &message["request"];
         if let Some(tool) = request["tool_use_id"].as_str()
             && let Some(owner) = self.intervention_tools.get(tool)
         {
-            return Some(match owner {
-                None => ProviderEventAttribution::OwningSession,
-                Some(owner) => ProviderEventAttribution::Subagent(ProviderSubagentId::new(owner)),
-            });
+            return Some(self.attribution(owner));
         }
         request["agent_id"]
             .is_null()
@@ -342,10 +347,9 @@ impl ClaudeProjection {
             intervention_tools: BTreeMap::new(),
             conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
-            spawn_tools: BTreeMap::new(),
-            subagent_tasks: BTreeMap::new(),
-            task_conversations: BTreeMap::new(),
-            resumed_conversations: BTreeMap::new(),
+            delegation_tools: BTreeMap::new(),
+            agent_tasks: BTreeMap::new(),
+            conversation_agents: BTreeMap::new(),
             subagent_models: BTreeMap::new(),
             reporting_lifetime: uuid::Uuid::new_v4().to_string(),
             latest_reported_cost: None,
@@ -353,6 +357,28 @@ impl ClaudeProjection {
             reasoning_blocks: 0,
             turn_metering: None,
             turn,
+        }
+    }
+
+    /// The attribution one conversation's events land under: the owning Session for the loop's
+    /// own, and for a subagent's the Subagent its agent task is. A conversation whose task has not
+    /// started yet names no Subagent orchestration holds, so what it carries lands nowhere.
+    fn attribution(&self, owner: &ConversationKey) -> ProviderEventAttribution {
+        match owner {
+            None => ProviderEventAttribution::OwningSession,
+            Some(conversation) => ProviderEventAttribution::Subagent(ProviderSubagentId::new(
+                self.conversation_agents
+                    .get(conversation)
+                    .unwrap_or(conversation)
+                    .clone(),
+            )),
+        }
+    }
+
+    fn attributed(&self, owner: &ConversationKey, event: ProviderEvent) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: self.attribution(owner),
+            event,
         }
     }
 
@@ -373,8 +399,8 @@ impl ClaudeProjection {
     /// start and settle rather than from the roster snapshot the CLI also sends, because that
     /// snapshot covers only work already in the background, and a subagent still running in the
     /// foreground of the Turn is exactly what an interrupt alone would leave behind. A task
-    /// running an agent is more: a Subagent, opened in the conversation that spawned it and
-    /// revised and settled under its own identity.
+    /// running an agent is more: a Subagent, opened in the conversation that spawned it, resumed
+    /// from whichever conversation sent it more, and revised and settled under its task id.
     fn project_task_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
             return Vec::new();
@@ -401,61 +427,93 @@ impl ClaudeProjection {
         };
         self.turn.task_started(task_id.clone());
         if message.task_type.as_deref() != Some(SUBAGENT_TASK_TYPE)
-            || self.subagent_tasks.contains_key(&task_id)
+            || self
+                .agent_tasks
+                .get(&task_id)
+                .is_some_and(|task| task.working.is_some())
         {
             return Vec::new();
         }
-        // The spawning tool use's id is the identity the subagent's every chunk rides under. A
-        // start that names none leaves the task id standing in, so the Subagent's row and settle
-        // still reach the Transcript even though no chunk can ever be attributed to it.
-        let subagent = message.tool_use_id.unwrap_or_else(|| task_id.clone());
-        self.turn
-            .subagent_task_started(task_id.clone(), subagent.clone());
-        // A task started before is a settled agent resumed: its conversation goes on under the
-        // original spawn's id, and from here on is the resume's work.
-        let conversation = self
-            .task_conversations
-            .entry(task_id.clone())
-            .or_insert_with(|| subagent.clone());
-        if *conversation != subagent {
-            self.resumed_conversations
-                .insert(conversation.clone(), subagent.clone());
-        }
-        let spawner = self
-            .spawn_tools
-            .remove(&subagent)
-            .unwrap_or(OWNING_CONVERSATION);
-        let description = message.description.unwrap_or_default();
-        let name = message
-            .subagent_type
-            .unwrap_or_else(|| TASK_TOOL.to_owned());
-        self.subagent_tasks.insert(
-            task_id,
-            SubagentTask {
-                subagent: subagent.clone(),
-                description: description.clone(),
-            },
-        );
-        // The spawn alone is attributed to the spawning conversation, because it is what decides
-        // which Session the child hangs under. The rest of the lifecycle addresses the row by
-        // the Subagent's own identity and rides the owning conversation, so a nested Subagent's
-        // settle still lands after its spawner's own — order the wire does not promise.
-        let mut projected = vec![attributed(
-            &spawner,
-            ProviderEvent::SubagentStarted {
-                subagent_id: ProviderSubagentId::new(subagent.clone()),
-                name,
-                description,
-            },
-        )];
-        if let Some(model) = self.subagent_models.get(&subagent).cloned() {
-            projected.push(attributed(
-                &OWNING_CONVERSATION,
+        self.turn.subagent_task_started(task_id.clone());
+        // The tool use the start names is the Delegation, and the conversation that ran it is the
+        // delegating one. A start naming no tool this projection saw delegates from the loop's own
+        // conversation, which always has a Turn to land in (ADR 0015).
+        let delegation = message
+            .tool_use_id
+            .as_ref()
+            .and_then(|tool| self.delegation_tools.remove(tool));
+        let (delegator, kind) = delegation
+            .map_or((OWNING_CONVERSATION, DelegationKind::Spawn), |tool| {
+                (tool.delegator, tool.kind)
+            });
+        let subagent_id = ProviderSubagentId::new(task_id.clone());
+        let (conversation, event) = match (self.agent_tasks.get_mut(&task_id), kind) {
+            // A task this wire started before is a settled agent resumed: the same Subagent,
+            // continuing the same conversation. The start repeats the spawn's description, so the
+            // resume reads what the SendMessage asked instead.
+            (Some(task), kind) => {
+                let description = resume_description(kind)
+                    .or(message.description)
+                    .unwrap_or_default();
+                task.working = Some(description.clone());
+                (
+                    task.conversation.clone(),
+                    ProviderEvent::SubagentResumed {
+                        subagent_id,
+                        description,
+                    },
+                )
+            }
+            (None, kind) => {
+                // A spawn's tool use is the identity the subagent's every chunk rides under. A
+                // resume of an agent this wire never saw start rides under a spawn it never saw
+                // either, so it opens as a Subagent of its own that no chunk reaches. A start that
+                // names no tool use leaves nothing to attribute chunks by, though the Subagent's
+                // row and settle still reach the Transcript.
+                let resumed = matches!(kind, DelegationKind::Resume { .. });
+                let conversation = message.tool_use_id.filter(|_| !resumed);
+                if let Some(conversation) = &conversation {
+                    self.conversation_agents
+                        .insert(conversation.clone(), task_id.clone());
+                }
+                let description = resume_description(kind)
+                    .or(message.description)
+                    .unwrap_or_default();
+                self.agent_tasks.insert(
+                    task_id.clone(),
+                    AgentTask {
+                        conversation: conversation.clone(),
+                        working: Some(description.clone()),
+                    },
+                );
+                (
+                    conversation,
+                    ProviderEvent::SubagentStarted {
+                        subagent_id,
+                        name: message
+                            .subagent_type
+                            .unwrap_or_else(|| TASK_TOOL.to_owned()),
+                        description,
+                    },
+                )
+            }
+        };
+        // The start alone is attributed to the delegating conversation, because it is what decides
+        // which Session the row stands in. The rest of the lifecycle addresses the row by the
+        // Subagent's own identity and rides the owning conversation, so a nested Subagent's settle
+        // still lands after its spawner's own — order the wire does not promise.
+        let mut projected = vec![self.attributed(&delegator, event)];
+        if let Some(model) = conversation
+            .and_then(|conversation| self.subagent_models.get(&conversation))
+            .cloned()
+        {
+            projected.push(
                 ProviderEvent::SubagentModelChanged {
-                    subagent_id: ProviderSubagentId::new(subagent),
+                    subagent_id: ProviderSubagentId::new(task_id),
                     model,
-                },
-            ));
+                }
+                .into(),
+            );
         }
         projected
     }
@@ -470,20 +528,24 @@ impl ClaudeProjection {
         let Some((task_id, description)) = task_id.zip(description) else {
             return Vec::new();
         };
-        let Some(task) = self.subagent_tasks.get_mut(&task_id) else {
+        let Some(working) = self
+            .agent_tasks
+            .get_mut(&task_id)
+            .and_then(|task| task.working.as_mut())
+        else {
             return Vec::new();
         };
-        if task.description == description {
+        if *working == description {
             return Vec::new();
         }
-        task.description = description.clone();
-        vec![attributed(
-            &OWNING_CONVERSATION,
+        working.clone_from(&description);
+        vec![
             ProviderEvent::SubagentUpdated {
-                subagent_id: ProviderSubagentId::new(task.subagent.clone()),
+                subagent_id: ProviderSubagentId::new(task_id),
                 description,
-            },
-        )]
+            }
+            .into(),
+        ]
     }
 
     fn project_task_settled(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
@@ -491,16 +553,25 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_settled(&task_id);
-        let Some(task) = self.subagent_tasks.remove(&task_id) else {
+        let Some(task) = self
+            .agent_tasks
+            .get_mut(&task_id)
+            .filter(|task| task.working.is_some())
+        else {
             return Vec::new();
         };
-        // The settle is the last of the Subagent's events: whatever its streams leave open, the
-        // settle closes in the child Session, and nothing more of the conversation's can land.
-        self.conversations.remove(&Some(task.subagent.clone()));
-        self.intervention_tools
-            .retain(|_, owner| owner.as_deref() != Some(task.subagent.as_str()));
-        self.running_commands
-            .retain(|_, command| command.owner.as_deref() != Some(task.subagent.as_str()));
+        task.working = None;
+        // The settle is the last of this stretch's events: whatever its streams leave open, the
+        // settle closes in the child Session, and nothing more of the conversation's lands until a
+        // resume begins the next stretch.
+        if let Some(conversation) = task.conversation.clone() {
+            self.conversations.remove(&Some(conversation.clone()));
+            self.intervention_tools
+                .retain(|_, owner| owner.as_deref() != Some(conversation.as_str()));
+            self.running_commands
+                .retain(|_, command| command.owner.as_deref() != Some(conversation.as_str()));
+            self.subagent_models.remove(&conversation);
+        }
         let status = if message
             .status
             .as_deref()
@@ -510,13 +581,13 @@ impl ClaudeProjection {
         } else {
             ProviderSubagentStatus::Failed
         };
-        vec![attributed(
-            &OWNING_CONVERSATION,
+        vec![
             ProviderEvent::SubagentCompleted {
-                subagent_id: ProviderSubagentId::new(task.subagent),
+                subagent_id: ProviderSubagentId::new(task_id),
                 status,
-            },
-        )]
+            }
+            .into(),
+        ]
     }
 
     fn project_stream_event(
@@ -528,7 +599,7 @@ impl ClaudeProjection {
                 "Claude Code CLI sent a malformed stream event: {error}"
             ))
         })?;
-        let owner = self.conversation_owner(message.parent_tool_use_id);
+        let owner: ConversationKey = message.parent_tool_use_id;
         let event = message.event;
         // The conversation steps out of the table while its chunk projects, so the projection's
         // shared state — the commands and spawns other conversations feed too — stays reachable.
@@ -623,9 +694,13 @@ impl ClaudeProjection {
             _ => {}
         }
         self.conversations.insert(owner.clone(), conversation);
+        let attribution = self.attribution(&owner);
         Ok(projected
             .into_iter()
-            .map(|event| attributed(&owner, event))
+            .map(|event| AttributedProviderEvent {
+                attribution: attribution.clone(),
+                event,
+            })
             .collect())
     }
 
@@ -640,16 +715,17 @@ impl ClaudeProjection {
         let Ok(message) = serde_json::from_value::<AssistantMessageSnapshot>(message) else {
             return Vec::new();
         };
-        let owner = self.conversation_owner(message.parent_tool_use_id);
-        let observed_model = owner.as_ref().and_then(|subagent| {
+        let owner: ConversationKey = message.parent_tool_use_id;
+        let observed_model = owner.as_ref().and_then(|conversation| {
             message
                 .message
                 .model
                 .filter(|model| !model.is_empty())
-                .map(|model| (subagent.clone(), crate::protocol::ModelId::new(model)))
+                .map(|model| (conversation.clone(), crate::protocol::ModelId::new(model)))
         });
-        if let Some((subagent, model)) = observed_model.as_ref() {
-            self.subagent_models.insert(subagent.clone(), model.clone());
+        if let Some((conversation, model)) = observed_model.as_ref() {
+            self.subagent_models
+                .insert(conversation.clone(), model.clone());
         }
         let held = self.conversations.remove(&owner);
         let known = held.is_some();
@@ -695,41 +771,33 @@ impl ClaudeProjection {
         if known {
             self.conversations.insert(owner.clone(), conversation);
         }
+        // Evidence reaches the row of the stretch the agent is working in; while none is, it waits
+        // for the start that opens one.
         let mut attributed_events = observed_model
-            .filter(|(subagent, _)| {
-                self.subagent_tasks
-                    .values()
-                    .any(|task| &task.subagent == subagent)
-            })
-            .map(|(subagent, model)| {
-                attributed(
-                    &OWNING_CONVERSATION,
+            .and_then(|(conversation, model)| {
+                let task_id = self.conversation_agents.get(&conversation)?;
+                self.agent_tasks.get(task_id)?.working.as_ref()?;
+                Some(
                     ProviderEvent::SubagentModelChanged {
-                        subagent_id: ProviderSubagentId::new(subagent),
+                        subagent_id: ProviderSubagentId::new(task_id.clone()),
                         model,
-                    },
+                    }
+                    .into(),
                 )
             })
             .into_iter()
             .collect::<Vec<_>>();
-        attributed_events.extend(projected.into_iter().map(|event| attributed(&owner, event)));
+        let attribution = self.attribution(&owner);
+        attributed_events.extend(projected.into_iter().map(|event| AttributedProviderEvent {
+            attribution: attribution.clone(),
+            event,
+        }));
         attributed_events
     }
 
-    /// The conversation a message's `parent_tool_use_id` names: the Subagent it rides under, or
-    /// the latest resume of that Subagent's agent.
-    fn conversation_owner(&self, parent_tool_use_id: Option<String>) -> ConversationKey {
-        parent_tool_use_id.map(|owner| {
-            self.resumed_conversations
-                .get(&owner)
-                .cloned()
-                .unwrap_or(owner)
-        })
-    }
-
-    /// Starts tracking a `tool_use` block whose input is about to stream. A Task tool use is
-    /// remembered as a spawn, and a SendMessage tool use as a possible resume, so the task the CLI
-    /// starts for either opens its Subagent in the conversation that ran the tool.
+    /// Starts tracking a `tool_use` block whose input is about to stream. An Agent or Task tool use
+    /// is remembered as a spawn and a SendMessage tool use as a resume, so the task the CLI starts
+    /// for either opens its row in the conversation that ran the tool.
     fn open_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -741,8 +809,19 @@ impl ClaudeProjection {
             return;
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
-        if name == TASK_TOOL || name == AGENT_TOOL || name == SEND_MESSAGE_TOOL {
-            self.spawn_tools.insert(id.clone(), owner.clone());
+        let kind = match name.as_str() {
+            TASK_TOOL | AGENT_TOOL => Some(DelegationKind::Spawn),
+            SEND_MESSAGE_TOOL => Some(DelegationKind::Resume { description: None }),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.delegation_tools.insert(
+                id.clone(),
+                DelegationTool {
+                    delegator: owner.clone(),
+                    kind,
+                },
+            );
         }
         conversation.open_tools.insert(
             index,
@@ -756,8 +835,9 @@ impl ClaudeProjection {
     }
 
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
-    /// the conversation that ran it, recording the bare command. Any other tool, and input in no
-    /// shape this projection reads, is passed over.
+    /// the conversation that ran it, recording the bare command, and a completed SendMessage leaves
+    /// what it asks for the resume it starts. Any other tool, and input in no shape this
+    /// projection reads, is passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -768,11 +848,21 @@ impl ClaudeProjection {
         let Some(tool) = conversation.open_tools.remove(&index) else {
             return;
         };
-        if tool.name != COMMAND_TOOL {
+        if tool.name != COMMAND_TOOL && tool.name != SEND_MESSAGE_TOOL {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
+        if tool.name == SEND_MESSAGE_TOOL {
+            if let Some(DelegationTool {
+                kind: DelegationKind::Resume { description },
+                ..
+            }) = self.delegation_tools.get_mut(&tool.id)
+            {
+                *description = send_message_description(&input);
+            }
+            return;
+        }
         let Some(command) = input.get("command").and_then(Value::as_str) else {
             return;
         };
@@ -814,7 +904,7 @@ impl ClaudeProjection {
             };
             let output = tool_result_text(&block.content);
             if !output.is_empty() {
-                projected.push(attributed(
+                projected.push(self.attributed(
                     &command.owner,
                     ProviderEvent::CommandOutputDelta {
                         activity_id: command.activity.clone(),
@@ -822,7 +912,7 @@ impl ClaudeProjection {
                     },
                 ));
             }
-            projected.push(attributed(
+            projected.push(self.attributed(
                 &command.owner,
                 ProviderEvent::CommandCompleted {
                     activity_id: command.activity,
@@ -1039,11 +1129,34 @@ impl ClaudeProjection {
         if turn_settled {
             self.turn_metering = None;
         }
-        Ok(projected
-            .into_iter()
-            .map(|event| attributed(&OWNING_CONVERSATION, event))
-            .collect())
+        Ok(projected.into_iter().map(Into::into).collect())
     }
+}
+
+/// What a resume Delegation asks, as its row reads it. Only a SendMessage carries a description of
+/// its own; a start naming anything else is described by the task itself.
+fn resume_description(kind: DelegationKind) -> Option<String> {
+    match kind {
+        DelegationKind::Resume { description } => description,
+        DelegationKind::Spawn => None,
+    }
+}
+
+/// How a SendMessage's input describes the resume it starts: the `summary` the loop gave of its
+/// message, or where it gave none, the message's own first line. A message in some shape other
+/// than text describes nothing.
+fn send_message_description(input: &Value) -> Option<String> {
+    let text = |field: &str| input.get(field).and_then(Value::as_str);
+    text("summary")
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .or_else(|| {
+            text("message")?
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .map(str::to_owned)
 }
 
 /// Reads an integer token count without letting a malformed negative,
@@ -1090,5 +1203,48 @@ fn tool_result_text(content: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::send_message_description;
+
+    #[test]
+    fn a_send_message_is_described_by_its_summary() {
+        assert_eq!(
+            send_message_description(&json!({
+                "to": "a2046dbbe8ecd4a5c",
+                "message": "Now say GOODBYE.\nNothing else.",
+                "summary": "  Say goodbye ",
+            })),
+            Some("Say goodbye".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_send_message_without_a_summary_is_described_by_its_messages_first_line() {
+        assert_eq!(
+            send_message_description(&json!({
+                "to": "a2046dbbe8ecd4a5c",
+                "message": "\n  Tighten the second paragraph.\nThen stop.",
+                "summary": "",
+            })),
+            Some("Tighten the second paragraph.".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_send_message_carrying_no_text_describes_nothing() {
+        assert_eq!(
+            send_message_description(&json!({
+                "to": "a2046dbbe8ecd4a5c",
+                "message": {"type": "shutdown_request"},
+            })),
+            None
+        );
+        assert_eq!(send_message_description(&serde_json::Value::Null), None);
     }
 }
