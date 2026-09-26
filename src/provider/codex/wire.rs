@@ -673,7 +673,10 @@ pub(super) enum NativeItem {
 }
 
 /// The collab tools whose calls Suru reads something from; the rest of the
-/// suite decodes as [`NativeCollabTool::Other`] and is passed over.
+/// suite decodes as [`NativeCollabTool::Other`] and is passed over but for
+/// the lifecycle states every call reports. `resumeAgent` is one of the rest:
+/// it reloads a closed child under its thread id without starting a turn, so
+/// only the `sendInput` after it resumes anything.
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum NativeCollabTool {

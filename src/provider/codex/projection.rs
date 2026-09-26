@@ -8,9 +8,12 @@
 //! under the attribution of the thread that produced it, which is how a child's work lands in its
 //! Subagent's Session rather than the parent's Transcript, and how a child's own spawns recurse.
 //! Subagent lifecycle items are read regardless of the active Turn, because Codex documents a
-//! child's completion arriving after the parent turn's own (ADR 0015). Notifications that belong
-//! to no thread Suru follows are dropped, notifications that contradict the recorded state fail
-//! the Session, and everything else becomes the Provider events a Session consumes.
+//! child's completion arriving after the parent turn's own (ADR 0015). A child's stretch of work
+//! settles at its own native turn's end, or wherever Codex's lifecycle reports say it did first;
+//! a delegation that then starts another native turn on the same thread resumes it (ADR 0031).
+//! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
+//! the recorded state fail the Session, and everything else becomes the Provider events a Session
+//! consumes.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -54,10 +57,12 @@ use crate::{
 /// it, as on the collab shape whose spawn calls carry only a prompt.
 const GENERIC_SUBAGENT_NAME: &str = "Agent";
 
-/// The one measurement a followed child thread's whole run is taken under.
-/// Codex announces no Turn boundary for a child, so naming every reading the
-/// same fixes the child's baseline at nothing the first time and never rebases
-/// it: the Subagent's Turn spans however many native Turns Codex runs.
+/// The one measurement a spawned child thread's first stretch is taken under.
+/// Naming every reading of that stretch the same fixes the child's baseline at
+/// nothing the first time and never rebases it, so the stretch counts whatever
+/// the thread ran before Suru attached, however many native turns it read.
+/// A resumed stretch is measured under the native turn that resumed it
+/// instead, so it rebases onto wherever the thread's total stood.
 const CHILD_THREAD_TURN: &str = "";
 
 /// Everything the projection must remember between notifications for one Codex connection.
@@ -82,12 +87,15 @@ pub(super) struct NativeCorrelation {
     context_native_turn: Option<String>,
     /// The streaming items open on the Session's own thread.
     root: ThreadInFlight,
-    /// The spawned child threads Suru follows, by thread id — the identity
-    /// each one's Subagent is known by.
+    /// The spawned child threads whose current stretch of work is open, by
+    /// thread id — the identity each one's Subagent is known by.
     children: HashMap<String, AttachedChild>,
-    /// Child threads whose Subagents settled. A spawn item repeating one of
-    /// them re-opens nothing, because the settle already closed its Session.
-    settled_children: HashSet<String>,
+    /// Child threads with no stretch open: those whose Subagents settled, and
+    /// those a delegation names that this connection never saw work — a
+    /// child spawned before a restart. Each keeps what a resume measures and
+    /// prices its stretch from. A spawn item repeating one of them re-opens
+    /// nothing; only a resume begins another stretch.
+    settled_children: HashMap<String, AttachedChild>,
     /// Context ordering survives child settlement, independently of output
     /// routing and the cumulative Usage baseline.
     child_context_turns: HashMap<String, ChildContextTurns>,
@@ -127,26 +135,88 @@ struct ThreadInFlight {
     active_reasoning: HashMap<String, ActiveNativeReasoning>,
 }
 
-/// One spawned child thread Suru follows: the items it has open, the
-/// description its row currently reads — kept so a collab call repeating it
-/// unchanged publishes nothing — and the latest native turn its items have
-/// ridden under, which is what a stop must name to `turn/interrupt` the
-/// child. Codex announces no turn boundary for a followed child, so the items
-/// themselves are the only account of it.
+/// One child thread Suru knows: the items it has open, the description its
+/// row currently reads — kept so a collab call repeating it unchanged
+/// publishes nothing — and the latest native turn its items have ridden
+/// under, which is what a stop must name to `turn/interrupt` the child.
+///
+/// A child works in stretches, each one a Turn of its Subagent's Session: the
+/// spawn's, then one per resume. A stretch settles when the native turn it
+/// runs in ends, or when Codex's lifecycle reports say so first; the child
+/// then waits in [`NativeCorrelation::settled_children`] for a delegation to
+/// start another native turn on its thread.
 #[derive(Default)]
 struct AttachedChild {
     in_flight: ThreadInFlight,
     description: String,
     latest_turn_id: Option<String>,
-    /// Codex's running total for this child's own thread. It keeps its opening
-    /// baseline of nothing for the thread's whole life, because a spawned
-    /// thread is opened for the delegation and everything it ever meters is
-    /// the Subagent's Turn — including whatever it ran before Suru attached.
+    /// Codex's running total for this child's own thread, kept across every
+    /// stretch so a resume measures its own Turn from where the thread's total
+    /// stood rather than from nothing.
     metering: ThreadMetering,
     model: Option<ModelId>,
     pricing_baseline: NativeCumulativeUsage,
     unpriced_prefix: bool,
     estimate_blocked: bool,
+    /// The native turn a resume began the open stretch with, which is what
+    /// the stretch is measured under; `None` for the spawn's stretch.
+    resumed_turn: Option<String>,
+    /// The native turns the open stretch has run in.
+    stretch_turns: HashSet<String>,
+    /// The native turns earlier stretches ran in. Anything naming one of them
+    /// is the tail of work already settled, never the start of a resume.
+    past_turns: HashSet<String>,
+    /// Whether a stretch of this child's opened on this connection, which is
+    /// what gives Model evidence for it a row to land on.
+    worked_here: bool,
+    /// A native turn this settled child began that no delegation has claimed.
+    unclaimed_turn: Option<String>,
+    /// The delegation waiting to resume this settled child once it starts a
+    /// native turn.
+    claim: Option<ResumeClaim>,
+}
+
+impl AttachedChild {
+    /// The measurement the open stretch's readings are recorded under.
+    fn stretch_key(&self) -> String {
+        self.resumed_turn
+            .clone()
+            .unwrap_or_else(|| CHILD_THREAD_TURN.to_owned())
+    }
+
+    /// What the open stretch has consumed so far, if it has been measured at
+    /// all. A resumed stretch rebases only at its first reading, so until then
+    /// the baseline still stands where an earlier stretch left it.
+    fn stretch_usage(&self) -> Option<Usage> {
+        (self.resumed_turn.is_none()
+            || self.metering.baseline_turn.as_deref() == self.resumed_turn.as_deref())
+        .then(|| self.metering.latest.since(self.metering.baseline))
+    }
+
+    /// Admits `turn_id` to the open stretch, unless an earlier stretch ran in
+    /// it. Returns whether the turn belongs to the open stretch.
+    fn admit_turn(&mut self, turn_id: &str) -> bool {
+        if self.past_turns.contains(turn_id) {
+            return false;
+        }
+        if !turn_id.is_empty() {
+            self.stretch_turns.insert(turn_id.to_owned());
+        }
+        true
+    }
+}
+
+/// A delegation to a settled child — Codex's `sendInput`, or the V2
+/// `followupTask` it reports as an interaction — waiting for the native turn
+/// it starts. Only that turn makes it a resume: a delegation that starts
+/// none, such as V2's `sendMessage` to an idle agent, which reports the same
+/// interaction, begins nothing. `delegator` is the conversation that ran the
+/// call, which is where the resume's row stands.
+struct ResumeClaim {
+    delegator: ProviderEventAttribution,
+    name: String,
+    description: String,
+    delegation: Option<String>,
 }
 
 /// Codex's latest running total for one followed thread, and the point the
@@ -263,33 +333,64 @@ impl NativeCorrelation {
             context_native_turn: None,
             root: ThreadInFlight::default(),
             children: HashMap::new(),
-            settled_children: HashSet::new(),
+            settled_children: HashMap::new(),
             child_context_turns: HashMap::new(),
             pending_attaches: Vec::new(),
         }
     }
 
-    fn observe_child_model(&mut self, thread_id: &str, model: ModelId) -> Option<Usage> {
-        let child = self.children.get_mut(thread_id)?;
-        match child.model.as_ref() {
+    /// Takes Model evidence for one child thread. A working child's Subagent
+    /// takes it at once, restating the stretch's Usage where a change of Model
+    /// leaves it unpriceable. A settled child keeps it for the Turn its next
+    /// resume begins; only an attach reply, which trails the stretch it was
+    /// requested for, still reaches the row that stretch left behind — and
+    /// only where that stretch ran on this connection.
+    fn observe_child_model(
+        &mut self,
+        thread_id: &str,
+        model: ModelId,
+        from_attach: bool,
+    ) -> Vec<AttributedProviderEvent> {
+        let model_changed = |model: ModelId| AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentModelChanged {
+                subagent_id: ProviderSubagentId::new(thread_id),
+                model,
+            },
+        };
+        if let Some(child) = self.settled_children.get_mut(thread_id) {
+            child.model = Some(model.clone());
+            return if from_attach && child.worked_here {
+                vec![model_changed(model)]
+            } else {
+                Vec::new()
+            };
+        }
+        let Some(child) = self.children.get_mut(thread_id) else {
+            return Vec::new();
+        };
+        let restated = match child.model.as_ref() {
             None => {
                 child.pricing_baseline = child.metering.latest;
-                child.unpriced_prefix = has_billable_usage(
-                    &child
-                        .metering
-                        .latest
-                        .since(NativeCumulativeUsage::default()),
-                );
-                child.model = Some(model);
+                child.unpriced_prefix = child
+                    .stretch_usage()
+                    .is_some_and(|usage| has_billable_usage(&usage));
+                child.model = Some(model.clone());
                 None
             }
             Some(current) if current == &model => None,
             Some(_) => {
-                child.model = Some(model);
+                child.model = Some(model.clone());
                 child.estimate_blocked = true;
-                Some(child.metering.latest.since(child.metering.baseline))
+                child.stretch_usage()
             }
-        }
+        };
+        let mut observed = vec![model_changed(model)];
+        observed.extend(restated.map(|usage| AttributedProviderEvent {
+            attribution: ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+            event: ProviderEvent::Usage { usage, cost: None },
+        }));
+        observed
     }
 
     /// The native Turn whose notifications are currently being projected.
@@ -358,10 +459,12 @@ impl NativeCorrelation {
 
     /// The thread one streamed item's step lands in, with the attribution its
     /// events carry: the Session's own thread while the turn the step names is
-    /// the active one, or a followed child thread under its Subagent's
-    /// identity. A child's steps are not gated on its turn ids, because the
-    /// child's whole run is one Subagent's stream however many native turns
-    /// Codex runs it as. Anything else has nowhere to land and is dropped.
+    /// the active one, or a child thread with a stretch open under its
+    /// Subagent's identity. A child's steps are not gated on the turn its
+    /// stretch began in, because a stretch is one Subagent Turn however many
+    /// native turns Codex runs it as — but a step naming a turn an earlier
+    /// stretch ran in is that stretch's tail, and lands nowhere. Anything else
+    /// has nowhere to land and is dropped.
     fn item_thread(
         &mut self,
         thread_id: &str,
@@ -376,13 +479,15 @@ impl NativeCorrelation {
         if let Some(turns) = self.child_context_turns.get_mut(thread_id) {
             turns.observe(turn_id);
         }
-        self.children.get_mut(thread_id).map(|child| {
-            child.latest_turn_id = Some(turn_id.to_owned());
-            (
-                &mut child.in_flight,
-                ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
-            )
-        })
+        let child = self.children.get_mut(thread_id)?;
+        if !child.admit_turn(turn_id) {
+            return None;
+        }
+        child.latest_turn_id = Some(turn_id.to_owned());
+        Some((
+            &mut child.in_flight,
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+        ))
     }
 
     /// The `turn/interrupt` targets stopping every followed child takes: each
@@ -409,9 +514,11 @@ impl NativeCorrelation {
     }
 
     /// The attribution a Subagent lifecycle item on `thread_id` rides under,
-    /// if that is a thread Suru follows. Deliberately not gated on the active
-    /// Turn: the lifecycle speaks for threads rather than turns, and a child's
-    /// completion may arrive after the turn that spawned it completed.
+    /// if that is a thread Suru follows and it is working — which is also the
+    /// conversation a delegation it sends is attributed to. Deliberately not
+    /// gated on the active Turn: the lifecycle speaks for threads rather than
+    /// turns, and a child's completion may arrive after the turn that spawned
+    /// it completed.
     fn spawner_attribution(&self, thread_id: &str) -> Option<ProviderEventAttribution> {
         if self.thread_id == thread_id {
             Some(ProviderEventAttribution::OwningSession)
@@ -440,7 +547,7 @@ impl NativeCorrelation {
     ) -> Vec<AttributedProviderEvent> {
         if child_thread_id == self.thread_id
             || self.children.contains_key(&child_thread_id)
-            || self.settled_children.contains(&child_thread_id)
+            || self.settled_children.contains_key(&child_thread_id)
         {
             return Vec::new();
         }
@@ -448,6 +555,7 @@ impl NativeCorrelation {
             child_thread_id.clone(),
             AttachedChild {
                 description: description.clone(),
+                worked_here: true,
                 ..AttachedChild::default()
             },
         );
@@ -489,24 +597,30 @@ impl NativeCorrelation {
         }]
     }
 
-    /// Settles one Subagent, dropping its thread from the followed set: the
-    /// settle closes the row and the child Session together. Later output is
-    /// discarded, while Context Fill retains its attribution. Like the spawn's counterparts on the
-    /// other Providers, the settle addresses the row by the Subagent's own
-    /// identity and rides the owning conversation, so a nested Subagent's
-    /// settle still lands after its spawner's own — order the wire does not
-    /// promise.
+    /// Settles one Subagent's open stretch, moving its thread to the settled
+    /// set: the settle closes the row and the child Session's Turn together.
+    /// Later output is discarded until a resume opens another stretch, while
+    /// Context Fill retains its attribution and the thread's running total is
+    /// still followed, for that resume to measure from. Like the spawn's
+    /// counterparts on the other Providers, the settle addresses the row by
+    /// the Subagent's own identity and rides the owning conversation, so a
+    /// nested Subagent's settle still lands after its spawner's own — order
+    /// the wire does not promise.
     fn settle_child(
         &mut self,
         child_thread_id: &str,
         status: ProviderSubagentStatus,
     ) -> Vec<AttributedProviderEvent> {
-        if self.children.remove(child_thread_id).is_none() {
+        let Some(mut child) = self.children.remove(child_thread_id) else {
             return Vec::new();
-        }
+        };
         self.questionnaires.end_thread(child_thread_id);
         self.approvals.end_thread(child_thread_id);
-        self.settled_children.insert(child_thread_id.to_owned());
+        child.in_flight = ThreadInFlight::default();
+        let stretch_turns = std::mem::take(&mut child.stretch_turns);
+        child.past_turns.extend(stretch_turns);
+        self.settled_children
+            .insert(child_thread_id.to_owned(), child);
         vec![AttributedProviderEvent {
             attribution: ProviderEventAttribution::OwningSession,
             event: ProviderEvent::SubagentCompleted {
@@ -514,6 +628,144 @@ impl NativeCorrelation {
                 status,
             },
         }]
+    }
+
+    /// A child thread's native turn ending. For a child with a stretch open,
+    /// that is the stretch's own boundary — the one signal no stale lifecycle
+    /// report can pre-empt — so it settles the stretch on the turn's outcome.
+    /// A turn a settled child began unclaimed ends as nothing but the tail of
+    /// work no resume took.
+    fn finish_child_turn(
+        &mut self,
+        child_thread_id: &str,
+        turn_id: &str,
+        outcome: &NativeTurnOutcome,
+    ) -> Vec<AttributedProviderEvent> {
+        if let Some(child) = self.children.get_mut(child_thread_id) {
+            if !child.admit_turn(turn_id) {
+                return Vec::new();
+            }
+            return self.settle_child(
+                child_thread_id,
+                match outcome {
+                    NativeTurnOutcome::Completed => ProviderSubagentStatus::Completed,
+                    NativeTurnOutcome::Interrupted => ProviderSubagentStatus::Interrupted,
+                    NativeTurnOutcome::Failed { .. } => ProviderSubagentStatus::Failed,
+                },
+            );
+        }
+        if let Some(child) = self.settled_children.get_mut(child_thread_id)
+            && !turn_id.is_empty()
+        {
+            if child.unclaimed_turn.as_deref() == Some(turn_id) {
+                child.unclaimed_turn = None;
+            }
+            child.past_turns.insert(turn_id.to_owned());
+        }
+        Vec::new()
+    }
+
+    /// Records a delegation to a child with no stretch open, as the resume it
+    /// becomes once the child starts a native turn — at once, if the child's
+    /// turn already began. Codex reports the delegation and the turn it starts
+    /// on different threads, in no promised order, so either may come first.
+    /// The child's thread is attached again on the first claim, so the turn it
+    /// runs streams here even when the thread was reloaded since — reopened by
+    /// `resumeAgent`, or spawned before a restart. A delegation to a working
+    /// child resumes nothing.
+    fn claim_resume(
+        &mut self,
+        child_thread_id: &str,
+        claim: ResumeClaim,
+    ) -> Vec<AttributedProviderEvent> {
+        if child_thread_id == self.thread_id || self.children.contains_key(child_thread_id) {
+            return Vec::new();
+        }
+        let child = self
+            .settled_children
+            .entry(child_thread_id.to_owned())
+            .or_default();
+        if child.claim.replace(claim).is_none() {
+            self.pending_attaches.push(child_thread_id.to_owned());
+        }
+        let child = &self.settled_children[child_thread_id];
+        match child.unclaimed_turn.clone() {
+            Some(turn_id) => self.resume_child(child_thread_id, turn_id),
+            None => Vec::new(),
+        }
+    }
+
+    /// A settled child naming a native turn — its `turn/started`, or any item
+    /// the turn streams. A turn no earlier stretch ran in is a new one: where
+    /// a delegation claims it, the child resumes into it; otherwise it waits
+    /// for the claim, and what it streams meanwhile lands nowhere.
+    fn wake_settled_child(
+        &mut self,
+        child_thread_id: &str,
+        turn_id: &str,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(child) = self.settled_children.get_mut(child_thread_id) else {
+            return Vec::new();
+        };
+        if turn_id.is_empty() || child.past_turns.contains(turn_id) {
+            return Vec::new();
+        }
+        if child.claim.is_none() {
+            child.unclaimed_turn = Some(turn_id.to_owned());
+            return Vec::new();
+        }
+        self.resume_child(child_thread_id, turn_id.to_owned())
+    }
+
+    /// Resumes a settled child into the native turn its claim started: the
+    /// thread is followed again, its next stretch measured and priced from
+    /// where its total stands, and the resume announced in the conversation
+    /// that delegated it, carrying what that delegation said. The Model the
+    /// child last ran on follows it into the new Turn until fresher evidence
+    /// arrives.
+    fn resume_child(
+        &mut self,
+        child_thread_id: &str,
+        turn_id: String,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(mut child) = self.settled_children.remove(child_thread_id) else {
+            return Vec::new();
+        };
+        let Some(claim) = child.claim.take() else {
+            self.settled_children
+                .insert(child_thread_id.to_owned(), child);
+            return Vec::new();
+        };
+        child.unclaimed_turn = None;
+        child.stretch_turns = HashSet::from([turn_id.clone()]);
+        child.latest_turn_id = Some(turn_id.clone());
+        child.resumed_turn = Some(turn_id.clone());
+        child.description.clone_from(&claim.description);
+        child.pricing_baseline = NativeCumulativeUsage::default();
+        child.unpriced_prefix = false;
+        child.estimate_blocked = false;
+        child.worked_here = true;
+        let model = child.model.clone();
+        self.children.insert(child_thread_id.to_owned(), child);
+        self.child_context_turns
+            .entry(child_thread_id.to_owned())
+            .or_default()
+            .observe(&turn_id);
+        let subagent_id = ProviderSubagentId::new(child_thread_id);
+        let mut resumed = vec![AttributedProviderEvent {
+            attribution: claim.delegator,
+            event: ProviderEvent::SubagentResumed {
+                subagent_id: subagent_id.clone(),
+                name: claim.name,
+                description: claim.description,
+                delegation: claim.delegation,
+            },
+        }];
+        resumed.extend(model.map(|model| AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentModelChanged { subagent_id, model },
+        }));
+        resumed
     }
 }
 
@@ -644,26 +896,13 @@ async fn next_provider_event(
             native = events.receiver.recv() => native?,
             attached = events.attached_model_results.recv() => {
                 let (thread_id, model) = attached?;
-                let restated_usage = events
+                let observed = events
                     .correlation
                     .lock()
                     .expect("Codex native correlation lock is not poisoned")
-                    .observe_child_model(&thread_id, model.clone());
-                if let Some(usage) = restated_usage {
-                    events.pending.push_back(Ok(AttributedProviderEvent {
-                        attribution: ProviderEventAttribution::Subagent(
-                            ProviderSubagentId::new(thread_id.clone()),
-                        ),
-                        event: ProviderEvent::Usage { usage, cost: None },
-                    }));
-                }
-                return Some((Ok(AttributedProviderEvent {
-                    attribution: ProviderEventAttribution::OwningSession,
-                    event: ProviderEvent::SubagentModelChanged {
-                        subagent_id: ProviderSubagentId::new(thread_id),
-                        model,
-                    },
-                }), events));
+                    .observe_child_model(&thread_id, model, true);
+                events.pending.extend(observed.into_iter().map(Ok));
+                continue;
             }
         };
         match native {
@@ -717,7 +956,8 @@ async fn next_provider_event(
 ///
 /// A Subagent is priced only after its own attach/settings evidence establishes
 /// a Model. Usage already observed before that evidence becomes the pricing
-/// baseline, and an ambiguous later Model change stops further estimates.
+/// baseline, and an ambiguous later Model change stops further estimates until
+/// a resume begins another stretch.
 fn estimate_cost(
     correlation: &mut NativeCorrelation,
     pricing: Option<&PricingSource>,
@@ -740,9 +980,14 @@ fn estimate_cost(
             if child.estimate_blocked {
                 return event;
             }
+            // Priced from whichever came later: the Model becoming known, or
+            // the stretch beginning — a resume's Turn prices only its own.
             (
                 model,
-                child.metering.latest.since(child.pricing_baseline),
+                child
+                    .metering
+                    .latest
+                    .since(child.pricing_baseline.furthest_of(child.metering.baseline)),
                 child.unpriced_prefix,
             )
         }
@@ -771,7 +1016,92 @@ fn has_billable_usage(usage: &Usage) -> bool {
     .any(|count| count > 0)
 }
 
+/// The thread and native turn a streamed step names, for the notifications
+/// that carry the work a turn does. These are what can show a settled child
+/// working again; a running total can not, because attaching a thread replays
+/// the total its last turn reached.
+fn streamed_step_turn(notification: &NativeNotification) -> Option<(&str, &str)> {
+    match notification {
+        NativeNotification::QuestionnaireRequested { params, .. } => {
+            Some((&params.thread_id, &params.turn_id))
+        }
+        NativeNotification::CommandApprovalRequested { params, .. } => {
+            Some((&params.thread_id, &params.turn_id))
+        }
+        NativeNotification::FileChangeApprovalRequested { params, .. } => {
+            Some((&params.thread_id, &params.turn_id))
+        }
+        NativeNotification::PermissionsApprovalRequested { params, .. } => {
+            Some((&params.thread_id, &params.turn_id))
+        }
+        NativeNotification::AgentMessageStarted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::AgentMessageDelta {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::AgentMessageCompleted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::CommandStarted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::CommandOutputDelta {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::CommandCompleted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::FileChangeStarted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::FileChangeUpdated {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::FileChangeCompleted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::ReasoningStarted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::ReasoningDelta {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::ReasoningSectionBreak {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::ReasoningCompleted {
+            thread_id, turn_id, ..
+        } => Some((thread_id, turn_id)),
+        NativeNotification::TurnStarted { .. }
+        | NativeNotification::QuestionnaireResolved { .. }
+        | NativeNotification::SkillsChanged
+        | NativeNotification::AgentSelectionChanged { .. }
+        | NativeNotification::TurnCompleted { .. }
+        | NativeNotification::TokenUsage { .. }
+        | NativeNotification::CollabCallCompleted { .. }
+        | NativeNotification::SubagentActivity { .. } => None,
+    }
+}
+
 fn project_native_notification(
+    correlation: &mut NativeCorrelation,
+    notification: NativeNotification,
+) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+    // A step of a settled child's new native turn resumes it first, when a
+    // delegation claims the turn, so the step lands in the Turn that resume
+    // begins.
+    let mut projected = match streamed_step_turn(&notification) {
+        Some((thread_id, turn_id)) if thread_id != correlation.thread_id => {
+            correlation.wake_settled_child(thread_id, turn_id)
+        }
+        _ => Vec::new(),
+    };
+    projected.extend(project_notification(correlation, notification)?);
+    Ok(projected)
+}
+
+fn project_notification(
     correlation: &mut NativeCorrelation,
     notification: NativeNotification,
 ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
@@ -780,8 +1110,14 @@ fn project_native_notification(
             if let Some(turns) = correlation.child_context_turns.get_mut(&thread_id) {
                 turns.observe(&turn_id);
             }
-            if thread_id != correlation.thread_id
-                || correlation.settled_turns.contains(&turn_id)
+            if thread_id != correlation.thread_id {
+                return Ok(project_child_turn_started(
+                    correlation,
+                    &thread_id,
+                    &turn_id,
+                ));
+            }
+            if correlation.settled_turns.contains(&turn_id)
                 || correlation.active_turn_id.as_deref() == Some(&turn_id)
             {
                 return Ok(Vec::new());
@@ -860,27 +1196,10 @@ fn project_native_notification(
                     service_tier,
                 )
                 .map(owning)
-            } else if model.is_empty() || !correlation.children.contains_key(&thread_id) {
+            } else if model.is_empty() {
                 Ok(Vec::new())
             } else {
-                let model = ModelId::new(model);
-                let restated = correlation.observe_child_model(&thread_id, model.clone());
-                let mut projected = vec![AttributedProviderEvent {
-                    attribution: ProviderEventAttribution::OwningSession,
-                    event: ProviderEvent::SubagentModelChanged {
-                        subagent_id: ProviderSubagentId::new(thread_id.clone()),
-                        model,
-                    },
-                }];
-                if let Some(usage) = restated {
-                    projected.push(AttributedProviderEvent {
-                        attribution: ProviderEventAttribution::Subagent(ProviderSubagentId::new(
-                            thread_id,
-                        )),
-                        event: ProviderEvent::Usage { usage, cost: None },
-                    });
-                }
-                Ok(projected)
+                Ok(correlation.observe_child_model(&thread_id, ModelId::new(model), false))
             }
         }
         NativeNotification::AgentMessageStarted {
@@ -1037,7 +1356,7 @@ fn project_native_notification(
                 )
                 .map(owning)
             } else {
-                Ok(correlation
+                let mut projected = correlation
                     .spawner_attribution(&thread_id)
                     .map(|attribution| {
                         attributed(
@@ -1053,7 +1372,9 @@ fn project_native_notification(
                                 .collect(),
                         )
                     })
-                    .unwrap_or_default())
+                    .unwrap_or_default();
+                projected.extend(correlation.finish_child_turn(&thread_id, &turn_id, &outcome));
+                Ok(projected)
             }
         }
         NativeNotification::CollabCallCompleted {
@@ -1256,11 +1577,31 @@ fn project_permissions_approval(
     ))
 }
 
+/// A child thread's native turn starting. A working child's stretch takes the
+/// turn as its own, so a stop can address it before any item names it; a
+/// settled child's new turn is the one a delegation's resume runs in.
+fn project_child_turn_started(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    turn_id: &str,
+) -> Vec<AttributedProviderEvent> {
+    if let Some(child) = correlation.children.get_mut(thread_id) {
+        if !turn_id.is_empty() && child.admit_turn(turn_id) {
+            child.latest_turn_id = Some(turn_id.to_owned());
+        }
+        return Vec::new();
+    }
+    correlation.wake_settled_child(thread_id, turn_id)
+}
+
 /// One step of a spawned agent's lifecycle, as the spawner's thread reports
 /// it: a start opens the agent's thread as a Subagent, and the terminal kinds
-/// settle it. Interactions revise nothing the row shows. The activity names
-/// only the agent, never what it was handed, so a spawn reported this way
-/// opens its child Turn with no Delegation.
+/// settle its stretch. An interaction with a settled agent — the V2
+/// `followupTask`, and `sendMessage` too, which reports the same — claims the
+/// native turn it may start as a resume; with a working agent it revises
+/// nothing the row shows. The activity names only the agent, never what it
+/// was handed, so a spawn or resume reported this way opens its child Turn
+/// with no Delegation, and a resume's row reads no description of its own.
 fn project_subagent_activity(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1285,16 +1626,33 @@ fn project_subagent_activity(
         NativeSubagentActivityKind::Interrupted => {
             correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Interrupted)
         }
+        NativeSubagentActivityKind::Interacted if agent_thread_id != thread_id => correlation
+            .claim_resume(
+                &agent_thread_id,
+                ResumeClaim {
+                    delegator: spawner,
+                    name: subagent_name_from_path(agent_path),
+                    description: String::new(),
+                    delegation: None,
+                },
+            ),
         NativeSubagentActivityKind::Interacted | NativeSubagentActivityKind::Other => Vec::new(),
     }
 }
 
 /// A collab tool call completing on a followed thread. A completed spawn opens
 /// its receiver threads as Subagents, described by the prompt the call handed
-/// them, which is also the Delegation each child Turn opens with; a completed
-/// send revises what its receivers' rows say they are doing;
-/// and whatever the call was, the terminal lifecycle states it observed settle
-/// the Subagents they name — which is how a wait learns of a child finishing.
+/// them, which is also the Delegation each child Turn opens with. Whatever
+/// the call was, the terminal lifecycle states it observed then settle the
+/// stretches of the Subagents they name — which is how a wait learns of a
+/// child finishing. A completed send comes last: to a receiver with no stretch
+/// open — settled, just settled by the call's own report, or spawned before a
+/// restart — it claims the native turn it starts as a resume, described by
+/// the prompt's first line and opened by the prompt as its Delegation;
+/// to a working receiver it revises what the row says it is doing. Because
+/// the settles come first, a send whose report still carries its receiver's
+/// previous `completed` can never settle the stretch that send resumes. A
+/// completed `resumeAgent` only reloads a closed child, and begins nothing.
 fn project_collab_call_completed(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1307,29 +1665,18 @@ fn project_collab_call_completed(
     let Some(spawner) = correlation.spawner_attribution(thread_id) else {
         return Vec::new();
     };
+    let completed = status == NativeCollabCallStatus::Completed;
     let mut projected = Vec::new();
-    if status == NativeCollabCallStatus::Completed {
-        match tool {
-            NativeCollabTool::SpawnAgent => {
-                let description = prompt.clone().unwrap_or_default();
-                for receiver in &receiver_thread_ids {
-                    projected.extend(correlation.spawn_child(
-                        spawner.clone(),
-                        receiver.clone(),
-                        GENERIC_SUBAGENT_NAME.to_owned(),
-                        description.clone(),
-                        prompt.clone(),
-                    ));
-                }
-            }
-            NativeCollabTool::SendInput => {
-                if let Some(prompt) = prompt.as_ref().filter(|prompt| !prompt.is_empty()) {
-                    for receiver in &receiver_thread_ids {
-                        projected.extend(correlation.revise_child_description(receiver, prompt));
-                    }
-                }
-            }
-            NativeCollabTool::Other => {}
+    if completed && tool == NativeCollabTool::SpawnAgent {
+        let description = prompt.clone().unwrap_or_default();
+        for receiver in &receiver_thread_ids {
+            projected.extend(correlation.spawn_child(
+                spawner.clone(),
+                receiver.clone(),
+                GENERIC_SUBAGENT_NAME.to_owned(),
+                description.clone(),
+                prompt.clone(),
+            ));
         }
     }
     for (child_thread_id, state) in &agents_states {
@@ -1347,7 +1694,40 @@ fn project_collab_call_completed(
         };
         projected.extend(correlation.settle_child(child_thread_id, settled));
     }
+    if completed && tool == NativeCollabTool::SendInput {
+        let prompt = prompt.filter(|prompt| !prompt.trim().is_empty());
+        for receiver in receiver_thread_ids
+            .iter()
+            .filter(|receiver| receiver.as_str() != thread_id)
+        {
+            if correlation.children.contains_key(receiver) {
+                if let Some(prompt) = &prompt {
+                    projected.extend(correlation.revise_child_description(receiver, prompt));
+                }
+                continue;
+            }
+            projected.extend(correlation.claim_resume(
+                receiver,
+                ResumeClaim {
+                    delegator: spawner.clone(),
+                    name: GENERIC_SUBAGENT_NAME.to_owned(),
+                    description: prompt.as_deref().map(first_line).unwrap_or_default(),
+                    delegation: prompt.clone(),
+                },
+            ));
+        }
+    }
     projected
+}
+
+/// A resume's description: the first line of what the delegation said, since
+/// Codex's `sendInput` carries a prompt and no summary of it (ADR 0031).
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The Subagent's name off Codex's agent path — the path's last segment, the
@@ -1576,10 +1956,13 @@ fn reasoning_segment_events(
 /// against. Turn identity decides that rather than arrival order, because a
 /// reading queued before a Turn opened is drained after it.
 ///
-/// A followed child thread has no Turn boundaries of its own: its whole run is
-/// one Subagent's Turn however many native Turns Codex takes over it. The Cost
-/// is left for the Session's rate lookup to fill in, because Codex states no
-/// dollar figure of its own.
+/// A child thread's readings land on its open stretch — one Subagent Turn: the
+/// spawn's counts the thread from its start, however many native turns it
+/// takes, and a resume's counts from where the thread's total stood when it
+/// first read. A settled child's readings belong to nobody, but they still
+/// move the total the next resume measures from. The Cost is left for the
+/// Session's rate lookup to fill in, because Codex states no dollar figure of
+/// its own.
 fn project_token_usage(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1626,19 +2009,27 @@ fn project_token_usage(
                 .collect(),
         );
     }
+    let attribution = ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id));
     let Some(child) = correlation.children.get_mut(thread_id) else {
-        return if correlation.settled_children.contains(thread_id) {
-            attributed(
-                &ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
-                context_event.into_iter().collect(),
-            )
-        } else {
-            Vec::new()
+        return match correlation.settled_children.get_mut(thread_id) {
+            Some(child) => {
+                child.metering.observe(total);
+                attributed(&attribution, context_event.into_iter().collect())
+            }
+            None => Vec::new(),
         };
     };
-    let usage = child.metering.record(total, CHILD_THREAD_TURN);
+    // A resumed stretch claims only readings of the native turns it runs in.
+    // Any other — the total an attach replays against the turn it was reached
+    // in, a settled stretch's straggler — says where the thread stands, which
+    // is where the stretch measures from until its own first reading.
+    if child.resumed_turn.is_some() && !child.stretch_turns.contains(turn_id) {
+        child.metering.observe(total);
+        return attributed(&attribution, context_event.into_iter().collect());
+    }
+    let usage = child.metering.record(total, &child.stretch_key());
     attributed(
-        &ProviderEventAttribution::Subagent(ProviderSubagentId::new(thread_id)),
+        &attribution,
         std::iter::once(ProviderEvent::Usage { usage, cost: None })
             .chain(context_event)
             .collect(),
@@ -2173,9 +2564,10 @@ mod tests {
     };
 
     use super::{
+        NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus, NativeCollabTool,
         NativeCommandStatus, NativeCorrelation, NativeNotification, NativeSubagentActivityKind,
-        NativeTurnFailureKind, ProviderActivityId, ProviderEvent, ProviderEventAttribution,
-        is_native_selection_rejection, project_native_notification,
+        NativeTurnFailureKind, NativeTurnOutcome, ProviderActivityId, ProviderEvent,
+        ProviderEventAttribution, is_native_selection_rejection, project_native_notification,
     };
 
     const THREAD: &str = "thread-fixture";
@@ -2838,6 +3230,540 @@ mod tests {
             Vec::new()
         );
         assert_eq!(correlation.take_pending_attaches(), Vec::<String>::new());
+    }
+
+    const CHILD_TURN: &str = "child-turn-fixture";
+    const RESUMED_TURN: &str = "resumed-turn-fixture";
+
+    /// A collab call the root thread completes, naming the child as its one
+    /// receiver and reporting `state` for it where given.
+    fn collab_call(
+        tool: NativeCollabTool,
+        prompt: Option<&str>,
+        state: Option<NativeCollabAgentStatus>,
+    ) -> NativeNotification {
+        NativeNotification::CollabCallCompleted {
+            thread_id: THREAD.to_owned(),
+            tool,
+            status: NativeCollabCallStatus::Completed,
+            receiver_thread_ids: vec![CHILD_THREAD.to_owned()],
+            prompt: prompt.map(str::to_owned),
+            agents_states: state
+                .map(|status| (CHILD_THREAD.to_owned(), NativeCollabAgentState { status }))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn child_turn_started(turn: &str) -> NativeNotification {
+        NativeNotification::TurnStarted {
+            thread_id: CHILD_THREAD.to_owned(),
+            turn_id: turn.to_owned(),
+        }
+    }
+
+    fn child_turn_completed(turn: &str, outcome: NativeTurnOutcome) -> NativeNotification {
+        NativeNotification::TurnCompleted {
+            thread_id: CHILD_THREAD.to_owned(),
+            turn_id: turn.to_owned(),
+            outcome,
+            final_agent_message: None,
+        }
+    }
+
+    fn child_message_started(turn: &str) -> NativeNotification {
+        NativeNotification::AgentMessageStarted {
+            thread_id: CHILD_THREAD.to_owned(),
+            turn_id: turn.to_owned(),
+            item_id: ITEM.to_owned(),
+        }
+    }
+
+    /// The child thread's running total, read under `turn`, standing at
+    /// `input` fresh input tokens.
+    fn child_reading(turn: &str, input: u64) -> NativeNotification {
+        let usage: super::super::wire::NativeThreadTokenUsage =
+            serde_json::from_value(serde_json::json!({ "total": { "inputTokens": input } }))
+                .expect("decode the fixture reading");
+        NativeNotification::TokenUsage {
+            thread_id: CHILD_THREAD.to_owned(),
+            turn_id: turn.to_owned(),
+            total: usage.into_cumulative(),
+            context_fill: None,
+        }
+    }
+
+    fn on_child(event: ProviderEvent) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: ProviderEventAttribution::Subagent(ProviderSubagentId::new(CHILD_THREAD)),
+            event,
+        }
+    }
+
+    fn child_settled(status: ProviderSubagentStatus) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentCompleted {
+                subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                status,
+            },
+        }
+    }
+
+    fn child_resumed(
+        name: &str,
+        description: &str,
+        delegation: Option<&str>,
+    ) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentResumed {
+                subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                name: name.to_owned(),
+                description: description.to_owned(),
+                delegation: delegation.map(str::to_owned),
+            },
+        }
+    }
+
+    /// The fresh input a projected Usage event carries.
+    fn fresh_input(events: &[AttributedProviderEvent]) -> Option<u64> {
+        match events {
+            [
+                AttributedProviderEvent {
+                    event: ProviderEvent::Usage { usage, .. },
+                    ..
+                },
+            ] => usage.fresh_input_tokens,
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    /// A root Turn that spawned the child through a collab call and saw its
+    /// first stretch settle at the end of the child's own native turn.
+    fn settled_child() -> NativeCorrelation {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            collab_call(
+                NativeCollabTool::SpawnAgent,
+                Some("Map the crate layout"),
+                Some(NativeCollabAgentStatus::Running),
+            ),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "the child's own turn ending settles its stretch"
+        );
+        correlation.take_pending_attaches();
+        correlation
+    }
+
+    #[test]
+    fn a_send_to_a_settled_child_resumes_it_into_the_turn_the_send_starts() {
+        let mut correlation = settled_child();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("\n  List the binaries.  \nKeep it short."),
+                    Some(NativeCollabAgentStatus::Completed),
+                ),
+            ),
+            Vec::new(),
+            "the send resumes nothing until the child starts the turn it asked for, and the \
+             child's previous completion it still reports settles nothing"
+        );
+        assert_eq!(
+            correlation.take_pending_attaches(),
+            [CHILD_THREAD],
+            "the send attaches the child's thread again, so the turn it starts streams here"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_resumed(
+                "Agent",
+                "List the binaries.",
+                Some("\n  List the binaries.  \nKeep it short."),
+            )],
+            "the turn the send started resumes the child in the conversation that sent it, \
+             described by the prompt's first line and opened by the whole prompt"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![on_child(ProviderEvent::AgentMessageStarted)],
+            "the resumed turn's work lands in the Subagent's Session again"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(CHILD_TURN)),
+            Vec::new(),
+            "a step of the settled stretch's turn is its tail, not the resumed stretch's work"
+        );
+        assert_eq!(
+            correlation.child_interrupt_target(CHILD_THREAD),
+            Some((CHILD_THREAD.to_owned(), Some(RESUMED_TURN.to_owned()))),
+            "a stop addresses the turn the resume runs in"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(RESUMED_TURN, NativeTurnOutcome::Interrupted),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Interrupted)],
+            "the resumed turn's own end settles the resumed stretch on its outcome"
+        );
+    }
+
+    #[test]
+    fn a_send_whose_turn_already_began_resumes_at_once_and_its_stale_completion_settles_nothing() {
+        let mut correlation = settled_child();
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            Vec::new(),
+            "a turn no delegation has claimed begins nothing yet"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            Vec::new(),
+            "nor does its work land anywhere before the claim"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("Carry on"),
+                    Some(NativeCollabAgentStatus::Completed),
+                ),
+            ),
+            vec![child_resumed("Agent", "Carry on", Some("Carry on"))],
+            "the send claims the turn already running, and the previous completion its report \
+             still carries does not settle the stretch it just began"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                NativeNotification::ReasoningStarted {
+                    thread_id: CHILD_THREAD.to_owned(),
+                    turn_id: RESUMED_TURN.to_owned(),
+                    item_id: ITEM.to_owned(),
+                },
+            ),
+            vec![on_child(ProviderEvent::ReasoningStarted {
+                activity_id: section_activity_id(0),
+            })],
+            "the stretch works on in the Subagent's Session"
+        );
+    }
+
+    #[test]
+    fn resume_agent_alone_begins_no_turn_until_a_send_follows_it() {
+        let mut correlation = settled_child();
+
+        // `resumeAgent` decodes as a collab tool Suru reads nothing from.
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::Other,
+                    None,
+                    Some(NativeCollabAgentStatus::PendingInit),
+                ),
+            ),
+            Vec::new(),
+            "reloading a closed child resumes nothing"
+        );
+        assert_eq!(
+            correlation.take_pending_attaches(),
+            Vec::<String>::new(),
+            "and attaches nothing"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("Pick the audit back up"),
+                    Some(NativeCollabAgentStatus::PendingInit),
+                ),
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![
+                child_resumed(
+                    "Agent",
+                    "Pick the audit back up",
+                    Some("Pick the audit back up")
+                ),
+                on_child(ProviderEvent::AgentMessageStarted),
+            ],
+            "the send after the reload resumes the child at the first step of the turn it \
+             started, even with that turn's start unseen"
+        );
+    }
+
+    #[test]
+    fn a_followup_waking_an_idle_v2_agent_resumes_it_with_no_delegation_to_open_with() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        project_attributed(
+            &mut correlation,
+            child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_activity(NativeSubagentActivityKind::Completed),
+            ),
+            Vec::new(),
+            "the completion report trailing the child's own turn end settles nothing twice"
+        );
+        correlation.take_pending_attaches();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_activity(NativeSubagentActivityKind::Interacted),
+            ),
+            Vec::new(),
+            "an interaction starts no turn by itself: a queued message reports the same"
+        );
+        assert_eq!(correlation.take_pending_attaches(), [CHILD_THREAD]);
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_resumed("scout", "", None)],
+            "the followup's turn resumes the agent under the name its path gives it, with \
+             nothing the activity says it was handed"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_activity(NativeSubagentActivityKind::Completed),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "the followup's completion settles the resumed stretch"
+        );
+    }
+
+    #[test]
+    fn a_resumed_stretch_is_metered_from_where_the_threads_total_stood() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        assert_eq!(
+            fresh_input(&project_attributed(
+                &mut correlation,
+                child_reading(CHILD_TURN, 100)
+            )),
+            Some(100)
+        );
+        project_attributed(
+            &mut correlation,
+            child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_reading(CHILD_TURN, 120)),
+            Vec::new(),
+            "a reading trailing the settled stretch belongs to nobody"
+        );
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Interacted),
+        );
+        project_attributed(&mut correlation, child_turn_started(RESUMED_TURN));
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_reading(CHILD_TURN, 120)),
+            Vec::new(),
+            "the total the reattach replays against the settled turn is nobody's either"
+        );
+        assert_eq!(
+            fresh_input(&project_attributed(
+                &mut correlation,
+                child_reading(RESUMED_TURN, 170)
+            )),
+            Some(50),
+            "the resumed Turn counts from where the thread stood, not from its start"
+        );
+        assert_eq!(
+            fresh_input(&project_attributed(
+                &mut correlation,
+                child_reading(RESUMED_TURN, 200)
+            )),
+            Some(80),
+            "and keeps measuring from that one place"
+        );
+    }
+
+    #[test]
+    fn a_send_to_a_child_spawned_before_a_restart_resumes_it_under_its_thread_id() {
+        let mut correlation = reasoning_turn();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("Pick up where you left off"),
+                    Some(NativeCollabAgentStatus::Completed),
+                ),
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            correlation.take_pending_attaches(),
+            [CHILD_THREAD],
+            "a thread this connection never followed is attached for the turn the send starts"
+        );
+        assert_eq!(
+            correlation.observe_child_model(CHILD_THREAD, ModelId::new("gpt-child"), true),
+            Vec::new(),
+            "its Model has no stretch here to land in yet"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![
+                child_resumed(
+                    "Agent",
+                    "Pick up where you left off",
+                    Some("Pick up where you left off"),
+                ),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                        model: ModelId::new("gpt-child"),
+                    },
+                },
+                on_child(ProviderEvent::AgentMessageStarted),
+            ],
+            "the resume names the child's thread, which is the identity its Session was \
+             stored under, and the Model the attach reported follows it into the new Turn"
+        );
+    }
+
+    #[test]
+    fn a_send_to_a_working_child_resumes_nothing() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            collab_call(
+                NativeCollabTool::SpawnAgent,
+                Some("Map the crate layout"),
+                Some(NativeCollabAgentStatus::Running),
+            ),
+        );
+        correlation.take_pending_attaches();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("Count the lines too"),
+                    Some(NativeCollabAgentStatus::Running),
+                ),
+            ),
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentUpdated {
+                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                    description: "Count the lines too".to_owned(),
+                },
+            }],
+            "a send into the running turn steers it and begins no stretch"
+        );
+        assert_eq!(correlation.take_pending_attaches(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_send_whose_report_settles_its_working_receiver_resumes_it() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            collab_call(
+                NativeCollabTool::SpawnAgent,
+                Some("Map the crate layout"),
+                Some(NativeCollabAgentStatus::Running),
+            ),
+        );
+        project_attributed(&mut correlation, child_message_started(CHILD_TURN));
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                collab_call(
+                    NativeCollabTool::SendInput,
+                    Some("Now the tests"),
+                    Some(NativeCollabAgentStatus::Completed),
+                ),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "a child Codex reports done was idle, so the send settles its stretch"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_resumed(
+                "Agent",
+                "Now the tests",
+                Some("Now the tests")
+            )],
+            "and the turn the send started resumes it"
+        );
+    }
+
+    #[test]
+    fn model_evidence_for_a_settled_child_waits_for_its_resume_but_a_late_attach_lands() {
+        let mut correlation = settled_child();
+
+        assert_eq!(
+            correlation.observe_child_model(CHILD_THREAD, ModelId::new("gpt-child"), true),
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                    model: ModelId::new("gpt-child"),
+                },
+            }],
+            "the attach reply trailing the spawn's stretch still names its row's Model"
+        );
+        assert_eq!(
+            correlation.observe_child_model(CHILD_THREAD, ModelId::new("gpt-later"), false),
+            Vec::new(),
+            "a settings update between stretches rewrites no settled row"
+        );
+        project_attributed(
+            &mut correlation,
+            collab_call(NativeCollabTool::SendInput, Some("Again"), None),
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![
+                child_resumed("Agent", "Again", Some("Again")),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                        model: ModelId::new("gpt-later"),
+                    },
+                },
+            ],
+            "the resume carries the latest Model into the Turn it begins"
+        );
     }
 
     #[test]

@@ -1,18 +1,19 @@
 //! Codex collab threads as Subagents: a spawn item on the parent thread opens the inline row and
 //! a child Session, Suru attaches the child thread so its own items stream into that Session, a
 //! child completion arriving after the parent's turn completed settles the row rather than
-//! erroring, and a child's own spawns recurse one level down.
+//! erroring, a child's own spawns recurse one level down, and a delegation that starts another
+//! turn on a settled child's thread resumes it in its own Session — across a restart too.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
+    managed_client::{ManagedClient, ManagedClientConfig, SubagentTreeEvent},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, ApprovalOutcome, CreateSessionRequest,
         Decision, Delegator, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionId,
-        SessionSnapshot, TranscriptItem, TurnStatus,
+        SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -1335,4 +1336,1160 @@ async fn stopping_a_child_that_has_named_no_turn_yet_refuses_rather_than_lying()
     );
 
     opened.server.shutdown().await.expect("shut down server");
+}
+
+// Resumes: a delegation that starts another turn on a settled child's thread continues the child
+// in its own Session, as a new Turn opened by the delegation, with a row of its own in the Turn
+// that delegated it.
+
+/// One scripted line printing the notification `method` with `params`.
+fn notify(method: &str, params: Value) -> String {
+    format!(
+        "      printf '%s\\n' '{}'\n",
+        json!({ "method": method, "params": params })
+    )
+}
+
+/// One scripted line sending Suru the server request `method`, under `id`.
+fn server_request(id: &str, method: &str, params: Value) -> String {
+    format!(
+        "      printf '%s\\n' '{}'\n",
+        json!({ "id": id, "method": method, "params": params })
+    )
+}
+
+/// The scripted lines answering the request just read with `result`, under the id it carried —
+/// which depends on how many requests Suru made before it, attaches included.
+fn answer(result: Value) -> String {
+    format!(
+        "      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n      printf '%s\\n' '{{\"id\":'\"$id\"',\"result\":{result}}}'\n"
+    )
+}
+
+/// One arm of a scripted Codex: `body` runs for each line matching `pattern`.
+fn arm(pattern: &str, body: &str) -> String {
+    format!("    {pattern})\n{body}      ;;\n")
+}
+
+/// The arms every Session opens through: the handshake and the root thread.
+fn opening_arms() -> String {
+    [
+        arm(r#"*'"method":"initialize"'*"#, &answer(json!({}))),
+        arm(
+            r#"*'"method":"thread/start"'*"#,
+            &answer(json!({ "thread": { "id": "root-thread" }, "model": "gpt-fixture" })),
+        ),
+    ]
+    .concat()
+}
+
+/// The arm answering each attach of the child's thread: the spawn's with `first`, and every later
+/// one — a resume attaches the thread again — with `later`.
+fn child_attach_arm(first: &str, later: &str) -> String {
+    arm(
+        r#"*'"method":"thread/resume"'*'"threadId":"child-thread"'*"#,
+        &format!(
+            "      attaches=$((attaches + 1))\n      if [ \"$attaches\" -eq 1 ]; then\n{first}      else\n{later}      fi\n"
+        ),
+    )
+}
+
+/// The attach reply for the child's thread, naming the Model it runs on.
+fn child_attached() -> String {
+    answer(json!({
+        "thread": { "id": "child-thread", "parentThreadId": "root-thread" },
+        "model": "gpt-child",
+    }))
+}
+
+fn item(stage: &str, thread: &str, turn: &str, item: Value) -> String {
+    notify(
+        &format!("item/{stage}"),
+        json!({ "threadId": thread, "turnId": turn, "item": item }),
+    )
+}
+
+fn turn_started(thread: &str, turn: &str) -> String {
+    notify(
+        "turn/started",
+        json!({ "threadId": thread, "turn": { "id": turn, "status": "inProgress", "items": [] } }),
+    )
+}
+
+fn turn_completed(thread: &str, turn: &str) -> String {
+    notify(
+        "turn/completed",
+        json!({ "threadId": thread, "turn": { "id": turn, "status": "completed", "items": [] } }),
+    )
+}
+
+fn agent_message(thread: &str, turn: &str, id: &str, text: &str) -> String {
+    [
+        item(
+            "started",
+            thread,
+            turn,
+            json!({ "type": "agentMessage", "id": id, "text": "" }),
+        ),
+        item(
+            "completed",
+            thread,
+            turn,
+            json!({ "type": "agentMessage", "id": id, "text": text }),
+        ),
+    ]
+    .concat()
+}
+
+/// A collab call the root thread's `turn` completes, naming the child as its one receiver in the
+/// lifecycle `state` Codex last knew it in.
+fn collab_call(turn: &str, tool: &str, prompt: Option<&str>, state: &str) -> String {
+    item(
+        "completed",
+        "root-thread",
+        turn,
+        json!({
+            "type": "collabAgentToolCall",
+            "id": format!("call-{tool}"),
+            "tool": tool,
+            "status": "completed",
+            "senderThreadId": "root-thread",
+            "receiverThreadIds": ["child-thread"],
+            "prompt": prompt,
+            "agentsStates": { "child-thread": { "status": state } },
+        }),
+    )
+}
+
+/// One step of the V2 agent `/root/scout`'s lifecycle, as the root thread's `turn` reports it.
+fn agent_activity(turn: &str, kind: &str) -> String {
+    item(
+        "completed",
+        "root-thread",
+        turn,
+        json!({
+            "type": "subAgentActivity",
+            "id": format!("activity-{kind}"),
+            "kind": kind,
+            "agentThreadId": "child-thread",
+            "agentPath": "/root/scout",
+        }),
+    )
+}
+
+/// The child thread's running total, read under `turn`, standing at `input` input tokens.
+fn child_reading(turn: &str, input: u64) -> String {
+    let breakdown = json!({
+        "totalTokens": input,
+        "inputTokens": input,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+    });
+    notify(
+        "thread/tokenUsage/updated",
+        json!({
+            "threadId": "child-thread",
+            "turnId": turn,
+            "tokenUsage": { "total": breakdown, "last": breakdown, "modelContextWindow": 272000 },
+        }),
+    )
+}
+
+/// The lines that make the scripted Codex wait for the test to release it.
+const AWAIT_RELEASE: &str =
+    "      while [ ! -e \"$CODEX_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n";
+
+/// The Subagent rows in `snapshot`, in Transcript order.
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+        .collect()
+}
+
+/// The Messages in `snapshot`, in order: who each is from, what it says, and the Turn it stands in.
+fn messages(snapshot: &SessionSnapshot) -> Vec<(MessageRole, &str, TurnId)> {
+    snapshot
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.role.clone(),
+                message.content.as_str(),
+                message.turn_id,
+            )
+        })
+        .collect()
+}
+
+/// What a Delegation from `session_id`'s Agent is drawn as.
+fn delegation_from(session_id: SessionId) -> MessageRole {
+    MessageRole::Delegation(Delegator {
+        session_id,
+        name: None,
+    })
+}
+
+/// The Model a Turn's Agent was observed running, if any.
+fn turn_model(turn: &Turn) -> Option<&str> {
+    turn.agent
+        .as_ref()
+        .map(|agent| agent.selection.model.as_str())
+}
+
+/// The fresh input tokens a Turn's Usage counts.
+fn fresh_input(turn: &Turn) -> Option<u64> {
+    turn.usage
+        .as_ref()
+        .and_then(|usage| usage.fresh_input_tokens)
+}
+
+/// How many times Suru attached the child's thread.
+fn child_attaches(codex: &ScriptedCodex) -> usize {
+    codex
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["method"] == "thread/resume" && request["params"]["threadId"] == "child-thread"
+        })
+        .count()
+}
+
+/// Asserts the Subagent tree under `session_id` lists the one child `child_id` once, however
+/// many rows lead into it.
+async fn assert_one_tree_entry(client: &ManagedClient, session_id: SessionId, child_id: SessionId) {
+    let mut tree = client.subscribe_subagent_tree(session_id);
+    let Some(SubagentTreeEvent::Snapshot(tree)) = timeout(PROGRESS_DEADLINE, tree.next())
+        .await
+        .expect("the Subagent tree arrives")
+    else {
+        panic!("the Subagent tree subscription opens with its snapshot");
+    };
+    let [entry] = tree.subagents.as_slice() else {
+        panic!(
+            "the resumed child is one entry in the tree, got {:?}",
+            tree.subagents
+        );
+    };
+    assert_eq!(entry.session_id, child_id);
+    assert_eq!(entry.parent_session_id, session_id);
+}
+
+/// A child the spawn's collab call opened, settled at its own turn's end, and sent more work by
+/// the parent's `sendInput`. The send's report still carries the child's previous `completed`, as
+/// Codex's status can lag the turn a send starts. The turn the send started then streams on the
+/// child's own thread, attached again: a command held for Approval, a Message, and a reading of
+/// the thread's running total.
+fn resumed_by_send_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "Two crates, one workspace.",
+        ),
+        child_reading("child-turn-1", 100),
+        turn_completed("child-thread", "child-turn-1"),
+        collab_call("root-turn", "wait", None, "completed"),
+        collab_call(
+            "root-turn",
+            "sendInput",
+            Some("List the binaries.\nKeep it short."),
+            "completed",
+        ),
+        turn_started("child-thread", "child-turn-2"),
+    ]
+    .concat();
+    let resumed_stretch = [
+        child_attached(),
+        item(
+            "started",
+            "child-thread",
+            "child-turn-2",
+            json!({
+                "type": "commandExecution",
+                "id": "child-command",
+                "command": "cargo metadata",
+                "cwd": "/fixture/work",
+                "status": "inProgress",
+            }),
+        ),
+        server_request(
+            "child-approval",
+            "item/commandExecution/requestApproval",
+            json!({
+                "threadId": "child-thread",
+                "turnId": "child-turn-2",
+                "itemId": "child-command",
+                "reason": "read the manifest",
+                "command": "cargo metadata",
+            }),
+        ),
+    ]
+    .concat();
+    let decided = [
+        item(
+            "completed",
+            "child-thread",
+            "child-turn-2",
+            json!({
+                "type": "commandExecution",
+                "id": "child-command",
+                "command": "cargo metadata",
+                "cwd": "/fixture/work",
+                "status": "completed",
+                "aggregatedOutput": "suru\n",
+                "exitCode": 0,
+            }),
+        ),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "One binary: suru.",
+        ),
+        child_reading("child-turn-2", 160),
+        turn_completed("child-thread", "child-turn-2"),
+        agent_message(
+            "root-thread",
+            "root-turn",
+            "root-message",
+            "Two crates, one binary.",
+        ),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                collab_call(
+                    "root-turn",
+                    "spawnAgent",
+                    Some("Map the crate layout"),
+                    "running",
+                ),
+            ]
+            .concat(),
+        ),
+        child_attach_arm(&first_stretch, &resumed_stretch),
+        arm(r#"*'"id":"child-approval","result"'*"#, &decided),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_send_to_a_completed_child_resumes_it_in_its_own_session_as_a_second_turn() {
+    let fixture = ScriptedCodex::new_multiprocess(&resumed_by_send_script());
+    let opened = opened_session(&fixture, "codex-subagent-resumed-by-send", "Map the crates").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let resuming = session_where(
+        client,
+        session_id,
+        "the resume's row opens beside the spawn's",
+        |snapshot| subagent_rows(snapshot).len() == 2,
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = subagent_rows(&resuming)[0]
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    let pending = session_where(
+        client,
+        child_id,
+        "the resumed stretch asks for Approval",
+        |snapshot| snapshot.pending_approvals.len() == 1,
+    )
+    .await;
+    let [first, second] = pending.turns.as_slice() else {
+        panic!(
+            "the resume begins a second Turn in the child's Session, got {:?}",
+            pending.turns
+        );
+    };
+    assert_eq!(first.status, TurnStatus::Completed);
+    assert_eq!(
+        second.status,
+        TurnStatus::Active,
+        "the send's report of the child's previous completion does not settle the Turn it began"
+    );
+    let Some(Activity::Approval {
+        approval, turn_id, ..
+    }) = pending
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Approval { .. }))
+    else {
+        panic!("the child owns its Approval, got {:?}", pending.activities);
+    };
+    assert_eq!(
+        *turn_id, second.id,
+        "the resumed stretch's Intervention stands in the Turn the resume began"
+    );
+    client
+        .submit_decision(child_id, approval.id, Decision::Accept)
+        .await
+        .expect("Codex accepts the resumed child's Decision");
+
+    let parent = session_where(
+        client,
+        session_id,
+        "the parent's Turn settles once the resumed stretch has",
+        |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Completed
+                && subagent_rows(snapshot).iter().all(|row| {
+                    matches!(
+                        row,
+                        Activity::Subagent {
+                            status: ActivityStatus::Completed,
+                            ..
+                        }
+                    )
+                })
+        },
+    )
+    .await;
+    let [
+        Activity::Subagent {
+            turn_id: spawn_turn,
+            description: spawn_description,
+            session_id: spawn_child,
+            ..
+        },
+        Activity::Subagent {
+            turn_id: resume_turn,
+            name: resume_name,
+            description: resume_description,
+            model: resume_model,
+            session_id: resume_child,
+            duration_ms: resume_duration,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!(
+            "the spawn and the resume each stand as a row, got {:?}",
+            parent.activities
+        );
+    };
+    assert_eq!(
+        [*spawn_turn, *resume_turn],
+        [parent.turns[0].id; 2],
+        "the resume row stands in the Turn whose send delegated it"
+    );
+    assert_eq!(
+        (*spawn_child, *resume_child),
+        (child_id, child_id),
+        "both rows lead into the child's one Session"
+    );
+    assert_eq!(spawn_description, "Map the crate layout");
+    assert_eq!(resume_name, "Agent");
+    assert_eq!(
+        resume_description, "List the binaries.",
+        "the resume row reads the send prompt's first line"
+    );
+    assert_eq!(
+        resume_model.as_ref().map(|model| model.as_str()),
+        Some("gpt-child"),
+        "the child's Model evidence follows it into the resume's row"
+    );
+    assert!(resume_duration.is_some());
+    assert_eq!(
+        agent_message_contents(&parent),
+        ["Two crates, one binary."],
+        "none of the child's work reaches the parent's Transcript"
+    );
+
+    let child = settled_session(client, child_id, 1).await;
+    let [first, second] = child.turns.as_slice() else {
+        panic!("the child's Session holds two Turns, got {:?}", child.turns);
+    };
+    assert_eq!(first.status, TurnStatus::Completed);
+    assert_eq!(
+        second.status,
+        TurnStatus::Completed,
+        "the resumed stretch settles at its own turn's end"
+    );
+    assert_eq!(turn_model(second), Some("gpt-child"));
+    assert_eq!(
+        messages(&child),
+        [
+            (
+                delegation_from(session_id),
+                "Map the crate layout",
+                first.id
+            ),
+            (MessageRole::Agent, "Two crates, one workspace.", first.id),
+            (
+                delegation_from(session_id),
+                "List the binaries.\nKeep it short.",
+                second.id,
+            ),
+            (MessageRole::Agent, "One binary: suru.", second.id),
+        ],
+        "the second Turn opens with the send's prompt as a Delegation, and the child's Messages \
+         land in the Turn they were said in"
+    );
+    let [
+        Activity::Command {
+            turn_id: command_turn,
+            status: command_status,
+            output,
+            ..
+        },
+        Activity::Approval {
+            turn_id: approval_turn,
+            outcome,
+            decision,
+            ..
+        },
+    ] = child.activities.as_slice()
+    else {
+        panic!(
+            "the resumed stretch's command and its Approval are the child's Activities, got {:?}",
+            child.activities
+        );
+    };
+    assert_eq!([*command_turn, *approval_turn], [second.id; 2]);
+    assert_eq!(*command_status, ActivityStatus::Completed);
+    assert_eq!(output, "suru\n");
+    assert_eq!(*outcome, ApprovalOutcome::Decided);
+    assert_eq!(*decision, Some(Decision::Accept));
+    assert_eq!(fresh_input(first), Some(100));
+    assert_eq!(
+        fresh_input(second),
+        Some(60),
+        "the resumed Turn meters from where the thread's total stood, not from its start"
+    );
+
+    assert_one_tree_entry(client, session_id, child_id).await;
+    assert_eq!(
+        child_attaches(&fixture),
+        2,
+        "the send attaches the child's thread again for the turn it starts"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// The child's new turn already started when the send that started it completes — Codex reports
+/// the two on different threads, in no promised order — and the send's report still carries the
+/// child's previous `completed`. The resumed stretch works on until its own turn ends.
+fn stale_report_trailing_the_turn_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "Unit tests pass.",
+        ),
+        turn_completed("child-thread", "child-turn-1"),
+        turn_started("child-thread", "child-turn-2"),
+        collab_call(
+            "root-turn",
+            "sendInput",
+            Some("Now the integration tests"),
+            "completed",
+        ),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "Integration tests pass.",
+        ),
+        AWAIT_RELEASE.to_owned(),
+        turn_completed("child-thread", "child-turn-2"),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                collab_call(
+                    "root-turn",
+                    "spawnAgent",
+                    Some("Run the unit tests"),
+                    "running",
+                ),
+            ]
+            .concat(),
+        ),
+        child_attach_arm(&first_stretch, &child_attached()),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_stale_completion_in_the_resuming_send_does_not_settle_the_turn_it_began() {
+    let fixture = ScriptedCodex::new_multiprocess(&stale_report_trailing_the_turn_script());
+    let opened = opened_session(&fixture, "codex-subagent-resume-stale-report", "Test it").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let resuming = session_where(client, session_id, "the resume's row opens", |snapshot| {
+        subagent_rows(snapshot).len() == 2
+    })
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = subagent_rows(&resuming)[1]
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    let working = session_where(
+        client,
+        child_id,
+        "the resumed stretch's Message lands",
+        |snapshot| agent_message_contents(snapshot).len() == 2,
+    )
+    .await;
+    assert_eq!(
+        working.turns[1].status,
+        TurnStatus::Active,
+        "the previous completion the send reported leaves the resumed Turn working"
+    );
+    let parent = client
+        .read_session(session_id)
+        .await
+        .expect("read the parent while the child works");
+    assert!(
+        matches!(
+            subagent_rows(&parent)[1],
+            Activity::Subagent {
+                status: ActivityStatus::Active,
+                ..
+            }
+        ),
+        "and the resume's row with it"
+    );
+
+    fixture.release();
+    let child = settled_session(client, child_id, 1).await;
+    assert_eq!(child.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        messages(&child)[2..],
+        [
+            (
+                delegation_from(session_id),
+                "Now the integration tests",
+                child.turns[1].id,
+            ),
+            (
+                MessageRole::Agent,
+                "Integration tests pass.",
+                child.turns[1].id,
+            ),
+        ]
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A child closed after its first stretch, reloaded by `resumeAgent` — which starts no turn — and
+/// only then sent more work. The script holds after the reload until the test releases it.
+fn resumed_after_reload_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "No advisories.",
+        ),
+        turn_completed("child-thread", "child-turn-1"),
+        collab_call("root-turn", "closeAgent", None, "shutdown"),
+        collab_call("root-turn", "resumeAgent", None, "pendingInit"),
+        agent_message(
+            "root-thread",
+            "root-turn",
+            "root-message-1",
+            "Reopened the auditor.",
+        ),
+        AWAIT_RELEASE.to_owned(),
+        collab_call(
+            "root-turn",
+            "sendInput",
+            Some("Audit the lockfile too"),
+            "pendingInit",
+        ),
+    ]
+    .concat();
+    let resumed_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-2"),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "Lockfile is clean.",
+        ),
+        turn_completed("child-thread", "child-turn-2"),
+        agent_message(
+            "root-thread",
+            "root-turn",
+            "root-message-2",
+            "Both are clean.",
+        ),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                collab_call(
+                    "root-turn",
+                    "spawnAgent",
+                    Some("Audit the crates"),
+                    "running",
+                ),
+            ]
+            .concat(),
+        ),
+        child_attach_arm(&first_stretch, &resumed_stretch),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_send_after_resume_agent_resumes_a_closed_child_while_resume_agent_alone_begins_nothing()
+{
+    let fixture = ScriptedCodex::new_multiprocess(&resumed_after_reload_script());
+    let opened = opened_session(&fixture, "codex-subagent-resumed-after-reload", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let reloaded = session_where(
+        client,
+        session_id,
+        "the parent reports the reload",
+        |snapshot| agent_message_contents(snapshot) == ["Reopened the auditor."],
+    )
+    .await;
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            status,
+            ..
+        },
+    ] = subagent_rows(&reloaded)[..]
+    else {
+        panic!(
+            "the reload adds no row of its own, got {:?}",
+            reloaded.activities
+        );
+    };
+    let child_id = *child_id;
+    assert_eq!(*status, ActivityStatus::Completed);
+    let child = client
+        .read_session(child_id)
+        .await
+        .expect("read the reloaded child");
+    assert_eq!(
+        child.turns.len(),
+        1,
+        "resumeAgent on its own begins no Turn in the child's Session"
+    );
+    assert_eq!(child_attaches(&fixture), 1, "nor attaches its thread again");
+
+    fixture.release();
+    let parent = settled_session(client, session_id, 0).await;
+    let rows = subagent_rows(&parent);
+    let [
+        Activity::Subagent {
+            session_id: spawn_child,
+            ..
+        },
+        Activity::Subagent {
+            session_id: resume_child,
+            description: resume_description,
+            status: resume_status,
+            ..
+        },
+    ] = rows[..]
+    else {
+        panic!("the send after the reload adds the resume's row, got {rows:?}");
+    };
+    assert_eq!((*spawn_child, *resume_child), (child_id, child_id));
+    assert_eq!(resume_description, "Audit the lockfile too");
+    assert_eq!(*resume_status, ActivityStatus::Completed);
+
+    let child = settled_session(client, child_id, 1).await;
+    let [first, second] = child.turns.as_slice() else {
+        panic!(
+            "the send begins the child's second Turn, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(second.status, TurnStatus::Completed);
+    assert_eq!(
+        messages(&child),
+        [
+            (delegation_from(session_id), "Audit the crates", first.id),
+            (MessageRole::Agent, "No advisories.", first.id),
+            (
+                delegation_from(session_id),
+                "Audit the lockfile too",
+                second.id
+            ),
+            (MessageRole::Agent, "Lockfile is clean.", second.id),
+        ]
+    );
+    assert_one_tree_entry(client, session_id, child_id).await;
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A V2 agent spawned through `subAgentActivity`, settled, and woken by a `followupTask`: its new
+/// turn starts before the parent's thread reports the interaction, and the activity names no
+/// prompt. The completion the child's turn end forwards arrives after it.
+fn resumed_by_followup_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "Three advisories found.",
+        ),
+        child_reading("child-turn-1", 100),
+        turn_completed("child-thread", "child-turn-1"),
+        agent_activity("root-turn", "completed"),
+        turn_started("child-thread", "child-turn-2"),
+        agent_activity("root-turn", "interacted"),
+    ]
+    .concat();
+    let resumed_stretch = [
+        child_attached(),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "All three fixed.",
+        ),
+        child_reading("child-turn-2", 130),
+        turn_completed("child-thread", "child-turn-2"),
+        agent_activity("root-turn", "completed"),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                agent_activity("root-turn", "started"),
+            ]
+            .concat(),
+        ),
+        child_attach_arm(&first_stretch, &resumed_stretch),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_followup_task_waking_an_idle_agent_resumes_it_in_its_own_session() {
+    let fixture = ScriptedCodex::new_multiprocess(&resumed_by_followup_script());
+    let opened = opened_session(&fixture, "codex-subagent-resumed-by-followup", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let parent = settled_session(client, session_id, 0).await;
+    let rows = subagent_rows(&parent);
+    let [
+        Activity::Subagent {
+            name: spawn_name,
+            session_id: spawn_child,
+            ..
+        },
+        Activity::Subagent {
+            turn_id: resume_turn,
+            name: resume_name,
+            description: resume_description,
+            session_id: resume_child,
+            ..
+        },
+    ] = rows[..]
+    else {
+        panic!("the spawn and the followup each stand as a row, got {rows:?}");
+    };
+    assert_eq!(spawn_child, resume_child, "both rows lead into one Session");
+    assert_eq!(*resume_turn, parent.turns[0].id);
+    assert_eq!(
+        (spawn_name.as_str(), resume_name.as_str()),
+        ("scout", "scout"),
+        "the resume's row carries the name the agent spawned under"
+    );
+    assert_eq!(
+        resume_description, "",
+        "the interaction names no prompt to describe the resume by"
+    );
+    let child_id = *spawn_child;
+
+    let child = settled_session(client, child_id, 1).await;
+    let [first, second] = child.turns.as_slice() else {
+        panic!(
+            "the followup begins the child's second Turn, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(second.status, TurnStatus::Completed);
+    assert_eq!(
+        messages(&child),
+        [
+            (MessageRole::Agent, "Three advisories found.", first.id),
+            (MessageRole::Agent, "All three fixed.", second.id),
+        ],
+        "the followup's work lands in the Turn it began, which opens with no Delegation the \
+         wire never carried"
+    );
+    assert_eq!(fresh_input(first), Some(100));
+    assert_eq!(fresh_input(second), Some(30));
+    assert_one_tree_entry(client, session_id, child_id).await;
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A Session whose first Turn spawns a child that settles, and whose second Turn — after a Server
+/// restart relaunched the app-server — sends that child more work. The relaunched app-server
+/// never reports the child's spawn: only the send and the child's own thread name it.
+fn resumed_after_restart_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "No advisories.",
+        ),
+        turn_completed("child-thread", "child-turn-1"),
+        agent_message(
+            "root-thread",
+            "root-turn-1",
+            "root-message-1",
+            "The crates are clean.",
+        ),
+        turn_completed("root-thread", "root-turn-1"),
+    ]
+    .concat();
+    let resumed_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-2"),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "Lockfile is clean.",
+        ),
+        turn_completed("child-thread", "child-turn-2"),
+        turn_completed("root-thread", "root-turn-2"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"thread/resume"'*'"threadId":"root-thread"'*"#,
+            &answer(json!({ "thread": { "id": "root-thread" }, "model": "gpt-fixture" })),
+        ),
+        arm(
+            r#"*'"method":"turn/start"'*'Send the auditor back'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn-2" } })),
+                collab_call(
+                    "root-turn-2",
+                    "sendInput",
+                    Some("Audit the lockfile too"),
+                    "completed",
+                ),
+            ]
+            .concat(),
+        ),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn-1" } })),
+                collab_call("root-turn-1", "spawnAgent", Some("Audit the crates"), "running"),
+            ]
+            .concat(),
+        ),
+        // Each app-server the fixture is launched as counts its own attaches, so the one after
+        // the restart is told apart by the launch it belongs to.
+        arm(
+            r#"*'"method":"thread/resume"'*'"threadId":"child-thread"'*"#,
+            &format!(
+                "      if [ \"$attempt\" -eq 1 ]; then\n{first_stretch}      else\n{resumed_stretch}      fi\n"
+            ),
+        ),
+    ]
+    .concat()
+}
+
+/// A server hosting the scripted Codex over `state_dir`, and a client connected past its initial
+/// state, under the client channel `name`.
+async fn hosting(
+    codex: &ScriptedCodex,
+    name: &'static str,
+    state_dir: &std::path::Path,
+) -> (server::RunningServer, ManagedClient) {
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir, name).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir, name).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    (server, client)
+}
+
+#[tokio::test]
+async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into() {
+    let fixture = ScriptedCodex::new_multiprocess(&resumed_after_restart_script());
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "codex-subagent-resumed-after-restart";
+
+    let (original, client) = hosting(&fixture, channel, state_dir.path()).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Delegate the audit".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let before = settled_session(&client, session_id, 0).await;
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+    ] = subagent_rows(&before)[..]
+    else {
+        panic!(
+            "the first Turn spawns the child, got {:?}",
+            before.activities
+        );
+    };
+    let child_id = *child_id;
+    settled_session(&client, child_id, 0).await;
+    drop(client);
+    original.shutdown().await.expect("stop the original server");
+
+    let (replacement, client) = hosting(&fixture, channel, state_dir.path()).await;
+    client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Send the auditor back".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("admit a Prompt to the reopened Session");
+    let parent = settled_session(&client, session_id, 1).await;
+    let rows = subagent_rows(&parent);
+    let [
+        Activity::Subagent {
+            turn_id: spawn_turn,
+            session_id: spawn_child,
+            ..
+        },
+        Activity::Subagent {
+            turn_id: resume_turn,
+            session_id: resume_child,
+            description: resume_description,
+            status: resume_status,
+            ..
+        },
+    ] = rows[..]
+    else {
+        panic!("the spawn and the resume each stand as a row, got {rows:?}");
+    };
+    assert_eq!(
+        [*spawn_turn, *resume_turn],
+        [parent.turns[0].id, parent.turns[1].id],
+        "the resume row stands in the Turn after the restart that delegated it"
+    );
+    assert_eq!(
+        (*spawn_child, *resume_child),
+        (child_id, child_id),
+        "the resume leads into the Session the child spawned into before the restart"
+    );
+    assert_eq!(resume_description, "Audit the lockfile too");
+    assert_eq!(*resume_status, ActivityStatus::Completed);
+
+    let child = settled_session(&client, child_id, 1).await;
+    let [first, second] = child.turns.as_slice() else {
+        panic!(
+            "the resume begins a second Turn in the child's own Session, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(second.status, TurnStatus::Completed);
+    assert_eq!(
+        messages(&child),
+        [
+            (delegation_from(session_id), "Audit the crates", first.id),
+            (MessageRole::Agent, "No advisories.", first.id),
+            (
+                delegation_from(session_id),
+                "Audit the lockfile too",
+                second.id
+            ),
+            (MessageRole::Agent, "Lockfile is clean.", second.id),
+        ],
+        "the child's thread, found by the identity stored with its Session, continues there"
+    );
+    assert_eq!(
+        turn_model(second),
+        Some("gpt-child"),
+        "the reattach reports the resumed child's Model"
+    );
+    assert_one_tree_entry(&client, session_id, child_id).await;
+
+    drop(client);
+    replacement.shutdown().await.expect("shut down server");
 }
