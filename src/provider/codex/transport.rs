@@ -35,7 +35,7 @@ use super::{
         NativeCodexErrorInfo, NativeItem, NativeNotification, NativeTurnFailureKind,
         NativeTurnOutcome, NativeTurnStatus, ReasoningSectionBreakParams,
         ReasoningSummaryDeltaParams, RequestId, ThreadSettingsUpdatedParams,
-        ThreadTokenUsageParams, TurnCompletedParams, TurnStartedParams,
+        ThreadTokenUsageParams, TurnCompletedParams, TurnStartedParams, user_message_text,
     },
 };
 use crate::provider::{
@@ -710,9 +710,22 @@ fn decode_notification(
                         item_id: id,
                     }))
                 }
-                // Collab calls and subagent activity read whole from the
+                NativeItem::CollabAgentToolCall {
+                    id,
+                    tool,
+                    receiver_thread_ids,
+                    prompt,
+                    ..
+                } => Ok(Some(NativeNotification::CollabCallStarted {
+                    thread_id: params.thread_id,
+                    call_id: id,
+                    tool,
+                    receiver_thread_ids,
+                    prompt,
+                })),
+                // Received input and subagent activity read whole from the
                 // completed item, so their starts carry nothing further.
-                NativeItem::CollabAgentToolCall { .. }
+                NativeItem::UserMessage { .. }
                 | NativeItem::SubAgentActivity { .. }
                 | NativeItem::Unknown => Ok(None),
             }
@@ -807,7 +820,13 @@ fn decode_notification(
                         summary,
                     }))
                 }
+                NativeItem::UserMessage { content } => Ok(Some(NativeNotification::UserMessage {
+                    thread_id: params.thread_id,
+                    turn_id: params.turn_id,
+                    text: user_message_text(&content),
+                })),
                 NativeItem::CollabAgentToolCall {
+                    id,
                     tool,
                     status,
                     receiver_thread_ids,
@@ -815,6 +834,7 @@ fn decode_notification(
                     agents_states,
                 } => Ok(Some(NativeNotification::CollabCallCompleted {
                     thread_id: params.thread_id,
+                    call_id: id,
                     tool,
                     status,
                     receiver_thread_ids,
@@ -949,7 +969,7 @@ fn finish_transport(state: &TransportState, error: ProviderError, publish_error:
 mod tests {
     use serde_json::json;
 
-    use super::codex_version_warning;
+    use super::{NativeNotification, codex_version_warning, decode_notification};
 
     fn warning_for(version: &str) -> Option<String> {
         codex_version_warning(&json!({
@@ -973,6 +993,48 @@ mod tests {
         for version in ["0.150.1", "0.150.1+build.7", "0.151.0", "1.0.0"] {
             assert_eq!(warning_for(version), None, "Codex CLI {version}");
         }
+    }
+
+    /// A `userMessage` item as Codex's app-server v2 `ThreadItem::UserMessage`
+    /// serializes it, carrying text beside an image.
+    fn user_message_item(stage: &str) -> Option<NativeNotification> {
+        decode_notification(
+            &format!("item/{stage}"),
+            Some(&json!({
+                "threadId": "child-thread",
+                "turnId": "child-turn",
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-message",
+                    "clientId": null,
+                    "content": [
+                        { "type": "text", "text": "Count the lines too", "text_elements": [] },
+                        { "type": "image", "url": "https://example.test/chart.png" },
+                    ],
+                },
+            })),
+        )
+        .expect("decode the userMessage item")
+    }
+
+    #[test]
+    fn a_completed_user_message_reads_as_codex_previews_the_input_it_carries() {
+        let Some(NativeNotification::UserMessage {
+            thread_id,
+            turn_id,
+            text,
+        }) = user_message_item("completed")
+        else {
+            panic!("the completed item decodes as a UserMessage");
+        };
+        assert_eq!(
+            (thread_id.as_str(), turn_id.as_str(), text.as_str()),
+            ("child-thread", "child-turn", "Count the lines too\n[image]")
+        );
+        assert!(
+            user_message_item("started").is_none(),
+            "the input arrives whole with the completed item, so its start carries nothing"
+        );
     }
 
     #[test]

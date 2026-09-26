@@ -607,6 +607,14 @@ pub(super) struct ItemNotificationParams {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(super) enum NativeItem {
+    /// Input a thread's agent received: on the Session's own thread, the
+    /// user's Prompt; on a child thread, which has no user, a Delegation —
+    /// the one a native turn opens with, and each one a running turn drains
+    /// afterwards, which is how a `sendInput` into that turn steers it.
+    UserMessage {
+        #[serde(default)]
+        content: Vec<NativeUserInput>,
+    },
     AgentMessage {
         id: String,
         #[serde(default)]
@@ -641,6 +649,7 @@ pub(super) enum NativeItem {
     /// threads and Codex's latest view of each receiver's lifecycle.
     #[serde(rename_all = "camelCase")]
     CollabAgentToolCall {
+        id: String,
         tool: NativeCollabTool,
         status: NativeCollabCallStatus,
         #[serde(default)]
@@ -661,6 +670,56 @@ pub(super) enum NativeItem {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// One piece of the input a [`NativeItem::UserMessage`] carries. Only text
+/// reads as itself; every other kind reads as the placeholder Codex's own
+/// `render_input_preview` gives it, which is also the `prompt` a collab call
+/// carries for the same input — so a Delegation reads the same from either.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(super) enum NativeUserInput {
+    Text {
+        text: String,
+    },
+    Image {},
+    LocalImage {
+        path: String,
+    },
+    Audio {},
+    LocalAudio {
+        path: String,
+    },
+    Skill {
+        name: String,
+        path: String,
+    },
+    Mention {
+        name: String,
+        path: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The text a [`NativeItem::UserMessage`] reads as: each piece of its input on
+/// a line of its own, exactly as Codex previews the input a collab call hands
+/// an agent.
+pub(super) fn user_message_text(content: &[NativeUserInput]) -> String {
+    content
+        .iter()
+        .map(|input| match input {
+            NativeUserInput::Text { text } => text.clone(),
+            NativeUserInput::Image {} => "[image]".to_owned(),
+            NativeUserInput::LocalImage { path } => format!("[local_image:{path}]"),
+            NativeUserInput::Audio {} => "[audio]".to_owned(),
+            NativeUserInput::LocalAudio { path } => format!("[local_audio:{path}]"),
+            NativeUserInput::Skill { name, path } => format!("[skill:${name}]({path})"),
+            NativeUserInput::Mention { name, path } => format!("[mention:${name}]({path})"),
+            NativeUserInput::Other => "[input]".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The collab tools whose calls Suru reads something from; the rest of the
@@ -1208,12 +1267,30 @@ pub(super) enum NativeNotification {
         total: NativeCumulativeUsage,
         context_fill: Option<crate::protocol::ContextFill>,
     },
+    /// Input a thread's agent received — on a child thread, a Delegation.
+    /// Only the completed item is decoded, since the input arrives whole.
+    UserMessage {
+        thread_id: String,
+        turn_id: String,
+        text: String,
+    },
+    /// A collab tool call starting on `thread_id`. Only a `sendInput`'s start
+    /// is read: it names what the call is handing its receiver before Codex
+    /// delivers it, so a steer the receiver drains is known by its sender
+    /// even when it arrives ahead of the call's completion.
+    CollabCallStarted {
+        thread_id: String,
+        call_id: String,
+        tool: NativeCollabTool,
+        receiver_thread_ids: Vec<String>,
+        prompt: Option<String>,
+    },
     /// A collab tool call completing on `thread_id` — a spawn naming the child
     /// threads it opened, or any later call carrying Codex's view of the
-    /// spawned agents' lifecycles. The call's own start says nothing Suru
-    /// presents, so only the completion is decoded.
+    /// spawned agents' lifecycles.
     CollabCallCompleted {
         thread_id: String,
+        call_id: String,
         tool: NativeCollabTool,
         status: NativeCollabCallStatus,
         receiver_thread_ids: Vec<String>,

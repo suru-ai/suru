@@ -311,7 +311,8 @@ impl SecretRedactor {
                     self.finish(|stream| stream.thread == *thread_id && stream.turn == *turn_id),
                 );
             }
-            Event::CollabCallCompleted { prompt, .. } => {
+            Event::UserMessage { text, .. } => *text = self.text(text),
+            Event::CollabCallStarted { prompt, .. } | Event::CollabCallCompleted { prompt, .. } => {
                 if let Some(prompt) = prompt {
                     *prompt = self.text(prompt);
                 }
