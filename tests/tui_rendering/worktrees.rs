@@ -189,6 +189,7 @@ fn summary(context: &ResolvedWorkspace, title: &str) -> SessionListItem {
             approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
+            monitoring_since: None,
             parent: None,
         },
         title: title.to_owned(),

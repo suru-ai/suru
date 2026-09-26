@@ -308,6 +308,23 @@ impl ProviderSubagentId {
     }
 }
 
+/// The Provider's own opaque identity for one Watch it runs — Claude's task
+/// id for a background shell or a Monitor. It is unique within the Provider
+/// connection that minted it, and orchestration only ever compares it: a
+/// Watch's settle names the Watch its start did.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderWatchId(String);
+
+impl ProviderWatchId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderError {
     message: String,
@@ -617,6 +634,20 @@ pub enum ProviderSubagentStatus {
     Interrupted,
 }
 
+/// How a Provider reported one of its Watches settling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderWatchOutcome {
+    Completed,
+    Failed,
+    /// The Watch was stopped rather than finishing or failing — by a stop
+    /// Suru asked for, or by one the Provider or its Agent ran on its own.
+    Stopped,
+    /// The Watch died with the Provider process that ran it, which will never
+    /// report it settling: the process was stopped, or replaced by one that
+    /// never heard of it. Its settling wakes nothing.
+    Lost,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
     /// An ordered, Session-local measurement. Streamed reports may bind to the
@@ -750,6 +781,30 @@ pub enum ProviderEvent {
     SubagentCompleted {
         subagent_id: ProviderSubagentId,
         status: ProviderSubagentStatus,
+    },
+    /// The Agent left work running that may wake it into a Continuation — a
+    /// Watch: a background shell or a monitor, whose settling or report the
+    /// Provider delivers to the Agent. It lands in the Session whose Agent
+    /// started it, named by the attribution. A Watch is never output of any
+    /// Turn: the Command that started it already stands in the Transcript, so
+    /// the event only keeps the Session Monitoring once nothing is Working.
+    WatchStarted {
+        watch_id: ProviderWatchId,
+        /// What the Watch is doing, in the words the Provider gives it.
+        description: String,
+    },
+    /// A Watch settled, however it ended. `woke_agent` says whether its
+    /// settling is delivered to the Agent, which then works on in a
+    /// Continuation the Provider begins; a Watch stopped by an interrupt or
+    /// lost with its process wakes nothing. Like its start it is no output of
+    /// any Turn.
+    WatchSettled {
+        watch_id: ProviderWatchId,
+        outcome: ProviderWatchOutcome,
+        /// The Provider's own account of how the Watch settled, where it gave
+        /// one. It is display text, never parsed.
+        summary: Option<String>,
+        woke_agent: bool,
     },
     /// The Provider revised what it needs to carry the owning Session's
     /// conversation across a restart, replacing the Resume State its startup

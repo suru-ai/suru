@@ -27,7 +27,9 @@
 //! roster per process, runs that work in the process group Suru stops as a whole, and announces
 //! nothing it did not start itself. So the Session forgets the roster whenever it stops a child —
 //! for a Selection change as much as at shutdown — and an interrupt afterwards asks the new child
-//! to stop only the work it has reported.
+//! to stop only the work it has reported. The child's output ends behind everything it wrote, and
+//! that end settles every Watch it was running as lost (ADR 0030), so a Session left Monitoring
+//! by the old child's background work stops Monitoring once that work is gone.
 
 use std::{
     collections::BTreeMap,
@@ -298,10 +300,16 @@ impl ClaudeChild {
     /// Stops the process this child runs on, leaving the conversation it ran on the CLI's disk for
     /// the next child to resume. An intended stop like this one publishes no failure of its own,
     /// so the Session's event stream carries on into the child that replaces it.
+    ///
+    /// A stopped process's output is waited out to its end, which the transport delivers behind
+    /// everything the process wrote: the end is where the projection settles the process's Watches
+    /// as lost, so no child spawned afterwards can have its own work mistaken for the old one's.
     async fn stop(&self) -> Result<(), ProviderError> {
         self.process.begin_shutdown();
         self.transport.close().await;
-        self.process.wait_until_stopped().await
+        self.process.wait_until_stopped().await?;
+        self.transport.drained().await;
+        Ok(())
     }
 }
 

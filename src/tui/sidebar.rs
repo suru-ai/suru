@@ -362,6 +362,10 @@ pub(super) enum SidebarShelf<'a> {
         /// running none. It is what the right slot says first, because live
         /// work is what a reader scanning the column is looking for.
         working_since: Option<SessionTimestamp>,
+        /// When this Session began Monitoring, and `None` where it is Working
+        /// or has no live Watch. The right slot counts from it while the
+        /// Standing reads Monitoring.
+        monitoring_since: Option<SessionTimestamp>,
     },
     /// Work set aside as done for now, drawn slim: settled Sessions are
     /// history the reader keeps in view, not work they are choosing between.
@@ -381,6 +385,10 @@ pub(super) enum SessionStanding {
     NeedsIntervention,
     Working,
     Failed,
+    /// Nothing is Working, but a Watch the Agent left running may still wake
+    /// it. It ranks below Failed so an unseen failure is not hidden by the
+    /// waiting it left behind, and gives way to it once the failure is Viewed.
+    Monitoring,
     Done,
 }
 
@@ -390,7 +398,22 @@ struct StandingInputs {
     needs_intervention: bool,
     working: bool,
     failed: bool,
+    monitoring: bool,
     done: bool,
+}
+
+impl StandingInputs {
+    /// The inputs as a row the reader has open reads them. Opening is itself
+    /// this Client's Viewed report, so the outcome readings — Failed and Done
+    /// — clear optimistically while the Server's stamped moment makes its
+    /// round trip; live readings still describe work and stay.
+    const fn viewed(self) -> Self {
+        Self {
+            failed: false,
+            done: false,
+            ..self
+        }
+    }
 }
 
 const fn session_standing(inputs: StandingInputs) -> Option<SessionStanding> {
@@ -400,6 +423,8 @@ const fn session_standing(inputs: StandingInputs) -> Option<SessionStanding> {
         Some(SessionStanding::Working)
     } else if inputs.failed {
         Some(SessionStanding::Failed)
+    } else if inputs.monitoring {
+        Some(SessionStanding::Monitoring)
     } else if inputs.done {
         Some(SessionStanding::Done)
     } else {
@@ -1553,14 +1578,18 @@ impl Sidebar {
     ///
     /// It answers from the listing in hand, which the session-catalog stream
     /// keeps true: a Turn starting or settling anywhere arrives as a working
-    /// change and is taken in place by [`Self::set_working`], so the tick is
+    /// change, and a Watch starting or settling as a Monitoring change, each
+    /// taken in place by [`Self::set_working_origin`] or
+    /// [`Self::set_monitoring_origin`], so the tick is
     /// armed exactly while something listed is live and an idle TUI schedules
     /// zero wakeups (ADR 0007, ADR 0009).
     pub(super) fn shows_live_work(&self) -> bool {
         self.column.is_revealed()
             && self.column.is_on_screen()
             && self.body().into_iter().any(|entry| match entry {
-                BodyEntry::Session(session, _) => session.working_since().is_some(),
+                BodyEntry::Session(session, _) => {
+                    session.working_since().is_some() || session.monitoring_since().is_some()
+                }
                 BodyEntry::Spacer
                 | BodyEntry::Unreachable(_)
                 | BodyEntry::Scope(_)
@@ -1796,6 +1825,19 @@ impl Sidebar {
     ) {
         self.listing
             .set_working_origin(outlook, session_id, working_since);
+    }
+
+    /// Takes a Session the server reports beginning or ending Monitoring into
+    /// the listing in hand, so the row's Monitoring label — and the tick
+    /// [`Self::shows_live_work`] arms off it — is true between listings.
+    pub(super) fn set_monitoring_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        monitoring_since: Option<SessionTimestamp>,
+    ) {
+        self.listing
+            .set_monitoring_origin(outlook, session_id, monitoring_since);
     }
 
     pub(super) fn set_standing_inputs_origin(
@@ -2358,7 +2400,7 @@ impl Sidebar {
                 BodyEntry::Session(session, Standing::Active) => self.row(
                     session,
                     open,
-                    session_standing(StandingInputs {
+                    Some(StandingInputs {
                         needs_intervention: session.readable().is_some_and(|summary| {
                             summary.standing_inputs.pending_questionnaire_count() > 0
                                 || summary.standing_inputs.pending_approval_count() > 0
@@ -2369,6 +2411,7 @@ impl Sidebar {
                                 .standing_inputs
                                 .latest_turn_settled_as(crate::protocol::TurnStatus::Failed)
                         }),
+                        monitoring: session.monitoring_since().is_some(),
                         done: session.readable().is_some_and(|summary| {
                             summary
                                 .standing_inputs
@@ -2390,6 +2433,7 @@ impl Sidebar {
                             .and_then(crate::icon_catalog::glyph),
                         updated_at: session.updated_at(),
                         working_since: session.working_since(),
+                        monitoring_since: session.monitoring_since(),
                     },
                 ),
                 BodyEntry::Session(session, Standing::Settled) => self.row(
@@ -2554,23 +2598,16 @@ impl Sidebar {
         &self,
         session: &'a ListedSession,
         open: Option<&SessionReference>,
-        standing: Option<SessionStanding>,
+        standing: Option<StandingInputs>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         let open = open == Some(session.reference());
-        // Opening is itself this Client's Viewed report. Clear outcome
-        // presentation optimistically while the Server's stamped moment makes
-        // its round trip; Working and the reserved intervention reading still
-        // describe live work and remain visible on the open row.
-        let standing = if open
-            && matches!(
-                standing,
-                Some(SessionStanding::Failed | SessionStanding::Done)
-            ) {
-            None
-        } else {
-            standing
-        };
+        // An open row reads its inputs as Viewed, so a Failed Session still
+        // Monitoring reads Monitoring the moment it is opened rather than
+        // nothing until the Server's Viewed moment arrives.
+        let standing = standing
+            .map(|inputs| if open { inputs.viewed() } else { inputs })
+            .and_then(session_standing);
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
             icon: self
@@ -3094,6 +3131,7 @@ mod tests {
                     needs_intervention: true,
                     working: true,
                     failed: true,
+                    monitoring: true,
                     done: true,
                 },
                 Some(SessionStanding::NeedsIntervention),
@@ -3102,6 +3140,7 @@ mod tests {
                 StandingInputs {
                     working: true,
                     failed: true,
+                    monitoring: true,
                     done: true,
                     ..StandingInputs::default()
                 },
@@ -3114,6 +3153,23 @@ mod tests {
                     ..StandingInputs::default()
                 },
                 Some(SessionStanding::Failed),
+            ),
+            (
+                StandingInputs {
+                    failed: true,
+                    monitoring: true,
+                    done: true,
+                    ..StandingInputs::default()
+                },
+                Some(SessionStanding::Failed),
+            ),
+            (
+                StandingInputs {
+                    monitoring: true,
+                    done: true,
+                    ..StandingInputs::default()
+                },
+                Some(SessionStanding::Monitoring),
             ),
             (
                 StandingInputs {
@@ -4225,6 +4281,26 @@ mod tests {
         );
     }
 
+    /// Monitoring has a duration of its own to be seen rising, so a Watch
+    /// starting arms the tick as a Turn does, and its settling stands it down.
+    #[test]
+    fn a_monitoring_change_arms_the_tick_and_the_watch_settling_drops_it() {
+        let idle = SessionId::new();
+        let mut sidebar = showing(vec![identified(idle, "Quiet", 1)]);
+        assert!(!sidebar.shows_live_work());
+
+        sidebar.set_monitoring_origin(Outlook::Local, idle, Some(SessionTimestamp(5)));
+
+        assert!(
+            sidebar.shows_live_work(),
+            "a Session beginning to Monitor arms the tick its duration rises on"
+        );
+
+        sidebar.set_monitoring_origin(Outlook::Local, idle, None);
+
+        assert!(!sidebar.shows_live_work());
+    }
+
     /// A Sidebar open on the Sessions given, with nothing settling itself, so
     /// the shelf holds what the listing marked settled and no more.
     fn showing(sessions: Vec<SessionListItem>) -> Sidebar {
@@ -4437,6 +4513,7 @@ mod tests {
                 approval_posture: None,
                 status: SessionStatus::Idle,
                 working_since: None,
+                monitoring_since: None,
                 parent: None,
             },
             title: title.to_owned(),

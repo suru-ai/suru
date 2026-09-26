@@ -392,6 +392,20 @@ impl SessionListing {
         }
     }
 
+    /// Takes a Session beginning or ending Monitoring into the listing in
+    /// hand. Like a Working change it moves nothing in the order this listing
+    /// keeps, and unlike one it never moves when the Session was last active.
+    pub(super) fn set_monitoring_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        monitoring_since: Option<SessionTimestamp>,
+    ) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
+            summary.session.monitoring_since = monitoring_since;
+        }
+    }
+
     /// Replaces the server facts from which this Session's Standing is read.
     /// The catalog carries them whole so a row already drawn can change its
     /// Rail and right slot before the catch-up listing arrives.
@@ -1139,6 +1153,7 @@ mod tests {
                 approval_posture: None,
                 status: SessionStatus::Idle,
                 working_since: None,
+                monitoring_since: None,
                 parent: None,
             },
             title: title.to_owned(),

@@ -819,6 +819,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
         approval_posture: None,
         status: SessionStatus::Idle,
         working_since: None,
+        monitoring_since: None,
         parent,
     };
     PersistedSession {

@@ -53,6 +53,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
             approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
+            monitoring_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

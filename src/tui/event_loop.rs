@@ -4577,6 +4577,7 @@ mod tests {
                         approval_posture: None,
                         status: SessionStatus::Idle,
                         working_since: None,
+                        monitoring_since: None,
                         parent: None,
                     },
                     revision: SessionRevision::INITIAL,

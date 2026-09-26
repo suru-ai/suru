@@ -458,6 +458,7 @@ impl SessionStore {
                 approval_posture: None,
                 status: SessionStatus::Active,
                 working_since: Some(timestamp),
+                monitoring_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,
@@ -519,6 +520,7 @@ impl SessionStore {
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
                 subagent_identity: None,
+                watches: HashMap::new(),
             },
         );
         self.storage

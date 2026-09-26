@@ -27,13 +27,13 @@ use suru::{
         AsideVisibility, AutoSettle, EffectiveSettings, LatestTurnStatus, Message, MessageId,
         MessageRole, MessageStatus, Outlook, PromptId, Remote, RemoteStatus, ServerShutdown,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionChange, SessionContentWidth,
-        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionReference,
-        SessionRevision, SessionSettings, SessionSettlementChanged, SessionStandingInputs,
-        SessionStandingInputsChanged, SessionStatus, SessionSummary, SessionTimestamp,
-        SessionTitleChanged, SessionUpdate, SessionWorkingChanged, ShutdownReason, SidebarScope,
-        SidebarSettings, SidebarVisibility, SubagentInterventions, SubagentTreeEntry,
-        SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel, TextSelectionCopy,
-        TurnStatus, UnreadableSessionSummary, Workspace,
+        SessionCreated, SessionDeleted, SessionId, SessionListItem, SessionMonitoringChanged,
+        SessionReference, SessionRevision, SessionSettings, SessionSettlementChanged,
+        SessionStandingInputs, SessionStandingInputsChanged, SessionStatus, SessionSummary,
+        SessionTimestamp, SessionTitleChanged, SessionUpdate, SessionWorkingChanged,
+        ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility, SubagentInterventions,
+        SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel,
+        TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -357,6 +357,174 @@ fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
     let idle_title = u16::try_from(rendered_row(&rows, "Waiting quietly")).expect("screen row");
     for row in idle_title - 1..=idle_title + 1 {
         assert_ne!(buffer.cell((0, row)).expect("idle Rail cell").symbol(), "▎");
+    }
+}
+
+#[test]
+fn the_right_slot_says_monitoring_and_how_long_with_an_info_rail_while_a_watch_is_live() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![monitoring(
+            listed("Tailing the logs", &workspace.path().join("suru"), 1, now()),
+            seconds_ago(3 * 60 + 5),
+        )],
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let title = rendered_row(&rows, "Tailing the logs");
+    let slot = sidebar_column(&rows[title - 1]);
+    assert!(
+        slot.ends_with("Monitoring 3m"),
+        "the right slot says the Session is waiting and how long it has been: {slot:?}"
+    );
+    assert_standing_rail(
+        &buffer,
+        u16::try_from(title).expect("screen row"),
+        Color::LightBlue,
+        Color::Reset,
+    );
+}
+
+#[test]
+fn a_monitoring_rail_holds_steady_while_a_working_rail_shimmers() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            monitoring(
+                listed("Tailing the logs", workspace.path(), 2, now()),
+                seconds_ago(12),
+            ),
+            working(
+                listed("Running a build", workspace.path(), 1, now()),
+                seconds_ago(12),
+            ),
+        ],
+    );
+    assert!(
+        application.wants_spinner(),
+        "a Monitoring duration has to be seen rising, so it arms the tick"
+    );
+    let before = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&before);
+    let waiting = u16::try_from(rendered_row(&rows, "Tailing the logs")).expect("screen row");
+    let working_row = u16::try_from(rendered_row(&rows, "Running a build")).expect("screen row");
+
+    // Two seconds of ticks, where a Working Rail's fade is at its faintest.
+    for _ in 0..62 {
+        application
+            .handle_event(ApplicationEvent::SpinnerTick)
+            .expect("advance the presentation tick");
+    }
+
+    let after = rendered_application_buffer(&application, WIDE, 20);
+    assert_ne!(
+        after.cell((0, working_row)).expect("Rail cell").style(),
+        before.cell((0, working_row)).expect("Rail cell").style(),
+        "a Working Rail shimmers while its Agent works"
+    );
+    assert_standing_rail(&after, waiting, Color::LightBlue, Color::Reset);
+    for row in waiting - 1..=waiting + 1 {
+        assert_eq!(
+            after.cell((0, row)).expect("Rail cell").style(),
+            before.cell((0, row)).expect("Rail cell").style(),
+            "a Monitoring Session's Agent is waiting, so its Rail holds steady"
+        );
+    }
+}
+
+#[test]
+fn failed_stands_ahead_of_monitoring_and_monitoring_ahead_of_done() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            monitoring(
+                latest_turn(
+                    listed("Failed and waiting", workspace.path(), 3, now()),
+                    TurnStatus::Failed,
+                    now(),
+                ),
+                seconds_ago(30),
+            ),
+            monitoring(
+                latest_turn(
+                    listed("Done and waiting", workspace.path(), 2, now()),
+                    TurnStatus::Completed,
+                    now(),
+                ),
+                seconds_ago(30),
+            ),
+            latest_turn(
+                listed("Finished quietly", workspace.path(), 1, now()),
+                TurnStatus::Completed,
+                now(),
+            ),
+        ],
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    let failed = u16::try_from(rendered_row(&rows, "Failed and waiting")).expect("screen row");
+    assert_standing_rail(&buffer, failed, Color::Red, Color::Reset);
+    assert!(
+        sidebar_column(&rows[usize::from(failed - 1)]).ends_with("Failed"),
+        "an unseen failure is not hidden by the waiting it left behind"
+    );
+    let waiting = u16::try_from(rendered_row(&rows, "Done and waiting")).expect("screen row");
+    assert_standing_rail(&buffer, waiting, Color::LightBlue, Color::Reset);
+    assert!(
+        sidebar_column(&rows[usize::from(waiting - 1)]).ends_with("Monitoring 30s"),
+        "a Session still waiting on a Watch is not Done"
+    );
+    let done = u16::try_from(rendered_row(&rows, "Finished quietly")).expect("screen row");
+    assert_standing_rail(&buffer, done, Color::Green, Color::Reset);
+    assert!(sidebar_column(&rows[usize::from(done - 1)]).ends_with("Done"));
+}
+
+#[test]
+fn a_failed_session_still_monitoring_reads_monitoring_once_viewed() {
+    let workspace = workspace_dir();
+    let open = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            viewed(
+                monitoring(
+                    latest_turn(
+                        listed("Viewed elsewhere", workspace.path(), 2, now()),
+                        TurnStatus::Failed,
+                        100,
+                    ),
+                    seconds_ago(30),
+                ),
+                101,
+            ),
+            monitoring(
+                latest_turn(
+                    listed_as(open, "Viewed here", workspace.path(), 1),
+                    TurnStatus::Failed,
+                    100,
+                ),
+                seconds_ago(30),
+            ),
+        ],
+    );
+    open_session(&mut application, workspace.path(), open);
+
+    let buffer = rendered_application_buffer(&application, WIDE, 20);
+    let rows = crate::support::buffer_rows(&buffer);
+    for title in ["Viewed elsewhere", "Viewed here"] {
+        let row = u16::try_from(rendered_row(&rows, title)).expect("screen row");
+        assert_standing_rail(&buffer, row, Color::LightBlue, Color::Reset);
+        let slot = sidebar_column(&rows[usize::from(row - 1)]);
+        assert!(
+            slot.ends_with("Monitoring 30s"),
+            "{title:?}: once the failure is Viewed the Session reads the waiting it is still \
+             doing: {slot:?}"
+        );
     }
 }
 
@@ -701,6 +869,50 @@ fn a_turn_reported_on_the_catalog_stream_moves_the_working_label() {
         !slot.contains("Working"),
         "and the Turn settling clears the label without waiting for a listing: {slot:?}"
     );
+}
+
+/// A Watch starting or settling in any Session arrives on the session-catalog
+/// stream as a Monitoring change, so the right slot's Monitoring label is true
+/// rather than as-of-listing.
+#[test]
+fn a_monitoring_change_reported_on_the_catalog_stream_moves_the_label() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![listed_at(
+            session_id,
+            "Quiet work",
+            workspace.path(),
+            minutes_ago(5),
+        )],
+    );
+    assert!(standing_rail_rows(&application).is_empty());
+
+    monitor_elsewhere(
+        &mut application,
+        session_id,
+        Some(SessionTimestamp(seconds_ago(90))),
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let title = rendered_row(&rows, "Quiet work");
+    let slot = sidebar_column(&rows[title - 1]);
+    assert!(
+        slot.ends_with("Monitoring 1m"),
+        "the Session the stream reported waiting on a Watch reads Monitoring: {slot:?}"
+    );
+    assert_eq!(standing_rail_rows(&application).len(), 3);
+
+    monitor_elsewhere(&mut application, session_id, None);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let slot = sidebar_column(&rows[rendered_row(&rows, "Quiet work") - 1]);
+    assert!(
+        !slot.contains("Monitoring"),
+        "and the Watch settling clears the label without waiting for a listing: {slot:?}"
+    );
+    assert!(standing_rail_rows(&application).is_empty());
 }
 
 #[test]
@@ -4282,6 +4494,23 @@ fn work_elsewhere(
         .expect("take the Turn the catalog stream reported")
 }
 
+/// A Watch starting or settling in some client's Session, arriving on the
+/// session-catalog stream as the Session's new Monitoring reading.
+fn monitor_elsewhere(
+    application: &mut Application,
+    session_id: SessionId,
+    monitoring_since: Option<SessionTimestamp>,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionMonitoringChanged(SessionMonitoringChanged {
+                session_id,
+                monitoring_since,
+            }),
+        ))
+        .expect("take the Monitoring the catalog stream reported")
+}
+
 fn standing_elsewhere(
     application: &mut Application,
     session_id: SessionId,
@@ -4381,6 +4610,16 @@ fn working(session: SessionListItem, working_since: u64) -> SessionListItem {
     };
     summary.session.status = SessionStatus::Active;
     summary.session.working_since = Some(SessionTimestamp(working_since));
+    SessionListItem::Readable(summary)
+}
+
+/// A listed Session with nothing Working and a Watch live since
+/// `monitoring_since`, which is what a listing reports of a Session Monitoring.
+fn monitoring(session: SessionListItem, monitoring_since: u64) -> SessionListItem {
+    let SessionListItem::Readable(mut summary) = session else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.session.monitoring_since = Some(SessionTimestamp(monitoring_since));
     SessionListItem::Readable(summary)
 }
 

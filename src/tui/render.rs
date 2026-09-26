@@ -2660,6 +2660,10 @@ fn paint_standing_rails(
 }
 
 struct StandingRail {
+    /// Where the Rail shimmers: the row of a Working Session, keyed by when
+    /// that work began so the shimmer restarts with it. A Monitoring Rail
+    /// holds steady in the same info color, because the shimmer says the
+    /// Agent is doing something and a Monitoring Session's Agent is waiting.
     working: Option<(crate::protocol::SessionReference, SessionTimestamp)>,
     rows: std::ops::Range<u16>,
     standing: SessionStanding,
@@ -2694,6 +2698,9 @@ impl StandingFeedback {
 #[derive(Clone, Copy)]
 enum StandingSlot {
     WorkingDuration,
+    /// How long the Session has been waiting on its Watches, read the way a
+    /// Working duration is.
+    MonitoringDuration,
     Word(&'static str),
 }
 
@@ -2711,6 +2718,10 @@ impl SessionStanding {
             Self::Failed => StandingPresentation {
                 feedback: StandingFeedback::Error,
                 slot: StandingSlot::Word("Failed"),
+            },
+            Self::Monitoring => StandingPresentation {
+                feedback: StandingFeedback::Info,
+                slot: StandingSlot::MonitoringDuration,
             },
             Self::Done => StandingPresentation {
                 feedback: StandingFeedback::Success,
@@ -2993,13 +3004,22 @@ fn sidebar_entry_lines(
                 workspace,
                 updated_at,
                 working_since,
+                monitoring_since,
                 ..
             } => sidebar_active_row_lines(
                 row,
                 workspace
                     .map(|path| state.workspace_name(&row.reference.origin, path))
                     .unwrap_or_default(),
-                sidebar_active_slot(row.standing, working_since, updated_at, now),
+                sidebar_active_slot(
+                    row.standing,
+                    SidebarLiveness {
+                        working_since,
+                        monitoring_since,
+                    },
+                    updated_at,
+                    now,
+                ),
                 width,
                 driving,
                 theme,
@@ -3371,16 +3391,17 @@ fn sidebar_settled_row_line(
 }
 
 /// What an active row's right slot reads. Working comes first, because live
-/// work is what a reader scanning the column is looking for; under it stands
-/// the compact time since the Session last moved, which is what a row says
-/// when there is nothing louder to say.
+/// work is what a reader scanning the column is looking for, and Monitoring
+/// reads the same way with how long the Session has been waiting; under them
+/// stands the compact time since the Session last moved, which is what a row
+/// says when there is nothing louder to say.
 ///
 /// Viewed suppresses settled outcomes already seen by any Client. Approval and
 /// Input remain tied to the reserved Needs Intervention variant under issue #168
 /// (<https://github.com/jake-tucker/suru/issues/168>).
 fn sidebar_active_slot(
     standing: Option<SessionStanding>,
-    working_since: Option<SessionTimestamp>,
+    liveness: SidebarLiveness,
     updated_at: SessionTimestamp,
     now: u64,
 ) -> String {
@@ -3388,13 +3409,25 @@ fn sidebar_active_slot(
         .map(SessionStanding::presentation)
         .map(|reading| reading.slot)
     {
-        Some(StandingSlot::WorkingDuration) => working_since.map_or_else(
+        Some(StandingSlot::WorkingDuration) => liveness.working_since.map_or_else(
             || relative_update_time_compact(updated_at, now),
             |since| format!("Working {}", working_duration(since, now)),
+        ),
+        Some(StandingSlot::MonitoringDuration) => liveness.monitoring_since.map_or_else(
+            || relative_update_time_compact(updated_at, now),
+            |since| format!("Monitoring {}", working_duration(since, now)),
         ),
         Some(StandingSlot::Word(word)) => word.to_owned(),
         None => relative_update_time_compact(updated_at, now),
     }
+}
+
+/// When a listed Session's live readings began: the durations its right slot
+/// counts from, whichever of them its Standing presents.
+#[derive(Clone, Copy)]
+struct SidebarLiveness {
+    working_since: Option<SessionTimestamp>,
+    monitoring_since: Option<SessionTimestamp>,
 }
 
 /// How long work has been running, read the way t3 reads it: seconds until
@@ -5348,6 +5381,7 @@ mod tests {
                     approval_posture: None,
                     status: SessionStatus::Active,
                     working_since: None,
+                    monitoring_since: None,
                     parent: None,
                 },
                 revision: SessionRevision::INITIAL,
@@ -5607,6 +5641,7 @@ mod tests {
                         approval_posture: None,
                         status: SessionStatus::Active,
                         working_since: Some(SessionTimestamp(1)),
+                        monitoring_since: None,
                         parent: None,
                     },
                     revision: SessionRevision::INITIAL,
@@ -5687,6 +5722,7 @@ mod tests {
                         approval_posture: None,
                         status: SessionStatus::Idle,
                         working_since: None,
+                        monitoring_since: None,
                         parent: None,
                     },
                     revision: SessionRevision::INITIAL,

@@ -19,6 +19,7 @@ mod hydration;
 mod icons;
 mod managed_client;
 mod model_catalog;
+mod monitoring;
 mod multi_provider;
 mod prompts;
 mod provider_enablement;

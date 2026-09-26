@@ -339,6 +339,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(SessionTimestamp(1_755_497_600_100)),
+            monitoring_since: None,
             parent: None,
         },
         title: "Explain this workspace".to_owned(),
@@ -373,6 +374,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "viewed_at": null
         },
         "working_since": 1_755_497_600_100_u64,
+        "monitoring_since": null,
         "total_usage": {
             "fresh_input_tokens": 1_200,
             "cache_read_tokens": 300,
@@ -412,7 +414,9 @@ fn session_summary_round_trips_with_discovery_metadata() {
     // every Session that predates Title derivation. A Session nobody set aside
     // carries no settle moment either, which is every Session that predates the
     // marker. A Session with nothing running carries no working moment, which
-    // is every Session that is not working right now. A Session whose Turns
+    // is every Session that is not working right now, and one waiting on no
+    // Watch carries no Monitoring moment, which is every Session stored at all
+    // since Monitoring is never stored. A Session whose Turns
     // reported nothing carries no total, which is every Session stored before
     // Usage was recorded at all.
     let mut without_optionals = expected;
@@ -422,6 +426,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     fields.remove("icon");
     fields.remove("settled_at");
     fields.remove("working_since");
+    fields.remove("monitoring_since");
     fields.remove("total_usage");
     fields.remove("approval_posture");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
@@ -429,6 +434,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     assert_eq!(decoded.icon, None);
     assert_eq!(decoded.settled_at, None);
     assert_eq!(decoded.session.working_since, None);
+    assert_eq!(decoded.session.monitoring_since, None);
     assert_eq!(decoded.total_usage, None);
 }
 
@@ -462,6 +468,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
+            monitoring_since: None,
             parent: None,
         },
         revision: SessionRevision(7),
@@ -566,6 +573,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "approval_posture": null,
             "status": "idle",
             "working_since": null,
+            "monitoring_since": null,
             "parent": null,
             "context_fill": { "occupied_tokens": 12_400, "capacity_tokens": 200_000 }
         },

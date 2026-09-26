@@ -287,8 +287,9 @@ pub(super) struct ResultUsage {
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task
 /// lifecycle is decoded: the background work the agent spawns is what an interrupt has to stop
-/// before it stops the loop, and a task running an agent is a Subagent, whose start, description
-/// changes, and settle the projection presents.
+/// before it stops the loop, a task running an agent is a Subagent, whose start, description
+/// changes, and settle the projection presents, and a background task whose settling wakes the
+/// loop is a Watch, which keeps its Session Monitoring until it settles.
 #[derive(Deserialize)]
 pub(super) struct SystemMessage {
     pub(super) subtype: String,
@@ -316,10 +317,13 @@ pub(super) struct SystemMessage {
     /// when a late SendMessage restarts a finished agent (verified against the live 2.1.280 CLI).
     #[serde(default)]
     pub(super) prompt: Option<String>,
-    /// How the task ended, on `task_notification` — `completed`, or whatever failing or being
-    /// stopped reads as.
+    /// How the task ended, on `task_notification` — `completed`, `failed`, or `stopped`.
     #[serde(default)]
     pub(super) status: Option<String>,
+    /// How the task ended in the CLI's own words, on `task_notification` — the same account it
+    /// delivers to the agent the settling wakes. Display text, never parsed.
+    #[serde(default)]
+    pub(super) summary: Option<String>,
     /// What changed about a running task, on `task_updated`.
     #[serde(default)]
     pub(super) patch: Option<TaskPatch>,

@@ -123,6 +123,8 @@ impl SessionStore {
                     persisted.summary = record.summary.clone();
                     persisted.snapshot.session.working_since =
                         record.snapshot.session.working_since;
+                    persisted.snapshot.session.monitoring_since =
+                        record.snapshot.session.monitoring_since;
                     persisted.snapshot.subagent_usage = record.snapshot.subagent_usage;
                     persisted.snapshot.total_cost = record.snapshot.total_cost;
 
@@ -428,6 +430,7 @@ pub(super) fn restored_record(
         selection_operations: Default::default(),
         viewed_operations: Default::default(),
         selection_retry_prompt: None,
+        watches: Default::default(),
     }
 }
 

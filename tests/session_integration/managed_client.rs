@@ -908,6 +908,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             approval_posture: None,
             status: SessionStatus::Idle,
             working_since: None,
+            monitoring_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

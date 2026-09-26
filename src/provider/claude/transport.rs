@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{Mutex, Notify, mpsc, oneshot},
+    sync::{Mutex, Notify, mpsc, oneshot, watch},
     time::{Duration, timeout},
 };
 
@@ -40,8 +40,20 @@ use crate::provider::{
 };
 
 /// Where a launched process's conversation messages go: everything the CLI writes that is not a
-/// control response, and the failure that ends the connection when the process is lost.
-pub(super) type ConversationSink = mpsc::UnboundedSender<Result<Value, ProviderError>>;
+/// control response, the failure that ends the connection when the process is lost, and the end
+/// of the process's output once it has all been delivered.
+pub(super) type ConversationSink = mpsc::UnboundedSender<Result<ConversationItem, ProviderError>>;
+
+/// One thing a launched process delivers to its Session's conversation.
+#[derive(Debug)]
+pub(super) enum ConversationItem {
+    /// A message the CLI wrote.
+    Message(Value),
+    /// The process's output has ended, behind everything it wrote: whatever the process was
+    /// running died with it and will never report settling. A Session outlives its processes, so
+    /// this is where one process's work gives way to the next one's.
+    ProcessEnded,
+}
 
 /// Which native filesystem settings a Claude process is allowed to load. User Sessions and Skill
 /// discovery deliberately use Claude's personal and project sources (ADR 0013); probes and Model
@@ -102,6 +114,8 @@ type PendingResponse = oneshot::Sender<Result<Value, ControlFailure>>;
 
 struct TransportState {
     pending: StdMutex<HashMap<String, PendingResponse>>,
+    /// Set once the process's output has been read to its end and delivered.
+    drained: watch::Sender<bool>,
     terminated: AtomicBool,
     conversation: Option<ConversationSink>,
     decision_settlements: Arc<DecisionSettlements>,
@@ -209,6 +223,7 @@ impl StreamJsonTransport {
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
+            drained: watch::Sender::new(false),
             terminated: AtomicBool::new(false),
             conversation,
             decision_settlements: Arc::new(DecisionSettlements::default()),
@@ -300,6 +315,14 @@ impl StreamJsonTransport {
         );
         close_stdin(&self.writer).await;
     }
+
+    /// Waits until everything the process wrote has been delivered to the conversation, its end
+    /// included. Only a process that has stopped is sure to get there: its output ends when the
+    /// last of its process tree lets go of the pipe.
+    pub(super) async fn drained(&self) {
+        let mut drained = self.state.drained.subscribe();
+        let _ = drained.wait_for(|drained| *drained).await;
+    }
 }
 
 /// The process supervisor's handle to the transport running over the process it owns.
@@ -353,6 +376,16 @@ async fn write_json_line<T: serde::Serialize + ?Sized>(
 }
 
 async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
+    read_lines(stdout, &state).await;
+    // However the output ended, nothing more of this process's reaches the conversation, so its
+    // end rides behind everything it wrote.
+    if let Some(conversation) = &state.conversation {
+        let _ = conversation.send(Ok(ConversationItem::ProcessEnded));
+    }
+    state.drained.send_replace(true);
+}
+
+async fn read_lines(stdout: ChildStdout, state: &Arc<TransportState>) {
     let mut lines = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -365,7 +398,7 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
             Ok(_) => {}
             Err(error) => {
                 terminate_transport(
-                    &state,
+                    state,
                     claude_error(format!("could not read Claude Code CLI output: {error}")),
                 );
                 return;
@@ -375,14 +408,14 @@ async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
             Ok(message) => message,
             Err(error) => {
                 terminate_transport(
-                    &state,
+                    state,
                     claude_error(format!("Claude Code CLI sent malformed JSON: {error}")),
                 );
                 return;
             }
         };
-        if let Err(error) = route_message(message, &state).await {
-            terminate_transport(&state, error);
+        if let Err(error) = route_message(message, state).await {
+            terminate_transport(state, error);
             return;
         }
     }
@@ -408,7 +441,7 @@ async fn route_message(message: Value, state: &Arc<TransportState>) -> Result<()
             state.decision_settlements.wait().await;
         }
         if let Some(conversation) = &state.conversation {
-            let _ = conversation.send(Ok(message));
+            let _ = conversation.send(Ok(ConversationItem::Message(message)));
         }
         return Ok(());
     }

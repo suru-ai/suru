@@ -4,17 +4,24 @@ use crate::support::{
     CLAUDE_MODELS, ScriptedClaude, agent_messages, conversation_fixture, discovery_arms,
     interrupt_arm, opened_session, session_where, settled_session, user_turn_arm,
 };
-use suru::protocol::{
-    Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId,
-    TurnStatus,
+use suru::{
+    managed_client::ManagedClient,
+    protocol::{
+        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId,
+        SessionId, SessionSummary, TurnStatus,
+    },
 };
 
+/// A Turn that leaves a background command running and ends its loop, then — once released — the
+/// command's completion waking the loop into a Continuation, which holds at its first message
+/// until the `continuation` gate is released too.
 const BACKGROUND_COMMAND: &str = r#"
       emit '{"type":"system","subtype":"task_started","task_id":"tests","task_type":"local_bash"}'
       emit '{"type":"result","subtype":"success","is_error":false,"result":"Waiting for tests."}'
       while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
-      emit '{"type":"system","subtype":"task_notification","task_id":"tests","status":"completed"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"tests","status":"completed","summary":"Background command \"cargo test\" completed (exit code 0)"}'
       emit '{"type":"stream_event","event":{"type":"message_start"}}'
+      while [ ! -e "$CLAUDE_FIXTURE_RELEASE-continuation" ]; do sleep 0.01; done
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Tests passed."}}}'
@@ -22,13 +29,75 @@ const BACKGROUND_COMMAND: &str = r#"
       emit '{"type":"result","subtype":"success","is_error":false,"result":"Tests passed."}'
 "#;
 
+/// The Session's row in the client's listing.
+async fn listed(client: &ManagedClient, session_id: SessionId) -> SessionSummary {
+    client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .find_map(|item| {
+            item.readable()
+                .filter(|summary| summary.session.id == session_id)
+                .cloned()
+        })
+        .expect("the Session is listed and readable")
+}
+
 #[tokio::test]
 async fn a_background_command_completion_resumes_into_a_visible_continuation() {
     let claude = conversation_fixture(BACKGROUND_COMMAND);
     let opened = opened_session(&claude, "claude-command-continuation", "Run tests").await;
     let first = settled_session(&opened.client, opened.session_id, 0).await;
     assert_eq!(first.turns[0].status, TurnStatus::Completed);
+    assert_eq!(first.session.working_since, None);
+    assert_eq!(
+        first.session.monitoring_since, first.turns[0].settled_at,
+        "the background command left running keeps the Session Monitoring from the Turn's settle"
+    );
+    assert_eq!(
+        listed(&opened.client, opened.session_id)
+            .await
+            .session
+            .monitoring_since,
+        first.turns[0].settled_at,
+        "the listing reads Monitoring as the Session does"
+    );
     claude.release();
+
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let woken = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the command's completion wakes Claude into a Continuation",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+    assert_eq!(woken.turns[1].status, TurnStatus::Active);
+    assert_eq!(
+        woken.session.monitoring_since, None,
+        "the Watch that woke the Agent is settled, and the Session is Working again"
+    );
+    assert_eq!(
+        woken.session.working_since, woken.turns[1].started_at,
+        "Working after the wake counts from the Continuation's start"
+    );
+    assert!(
+        woken.session.working_since > first.turns[0].started_at,
+        "Working does not carry on from the Turn before the wake"
+    );
+    let listed_woken = listed(&opened.client, opened.session_id).await;
+    assert_eq!(listed_woken.session.monitoring_since, None);
+    assert_eq!(
+        listed_woken.session.working_since,
+        woken.turns[1].started_at
+    );
+    claude.release_gate("continuation");
 
     let resumed = settled_session(&opened.client, opened.session_id, 1).await;
     assert_eq!(resumed.turns[1].prompt_id, None);
@@ -38,6 +107,11 @@ async fn a_background_command_completion_resumes_into_a_visible_continuation() {
         Activity::Reasoning { turn_id, status: ActivityStatus::Completed, .. }
             if *turn_id == resumed.turns[1].id
     )));
+    assert_eq!(resumed.session.working_since, None);
+    assert_eq!(
+        resumed.session.monitoring_since, None,
+        "with its only Watch settled, the Session is neither Working nor Monitoring"
+    );
     opened.server.shutdown().await.expect("shut down server");
 }
 

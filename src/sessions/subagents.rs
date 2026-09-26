@@ -111,6 +111,7 @@ impl SessionStore {
                 approval_posture: parent_session.approval_posture,
                 status: SessionStatus::Active,
                 working_since: Some(timestamp),
+                monitoring_since: None,
                 parent: Some(parent_id),
             },
             revision: SessionRevision::INITIAL,
@@ -170,6 +171,7 @@ impl SessionStore {
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
                 subagent_identity: Some(identity.clone()),
+                watches: HashMap::new(),
             },
         );
         self.storage
@@ -178,7 +180,7 @@ impl SessionStore {
         // root's Working reading has to carry. Its total is derived on the
         // same terms, so both readings above it are answered from the same
         // subtree — a child that has consumed nothing yet moves neither.
-        state.reconcile_working(&self.storage, session_id);
+        state.reconcile_liveness(&self.storage, session_id);
         state.reconcile_usage(&self.storage, session_id);
         Ok(SpawnedSubagentSession {
             session_id,

@@ -461,6 +461,7 @@ impl SessionRow {
                 approval_posture,
                 status: decode(&session_id, "Session status", &self.status)?,
                 working_since: None,
+                monitoring_since: None,
                 parent: self
                     .parent_session_id
                     .as_deref()

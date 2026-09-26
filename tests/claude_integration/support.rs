@@ -414,6 +414,15 @@ impl ScriptedClaude {
         std::fs::write(&self.release, b"release").expect("release the scripted Claude timeline");
     }
 
+    /// Lets a fixture holding at `$CLAUDE_FIXTURE_RELEASE-<gate>` carry on — a second hold in a
+    /// timeline that already waited on [`release`](Self::release), so a test can read the Session
+    /// at each of two moments.
+    pub fn release_gate(&self, gate: &str) {
+        let mut path = self.release.clone().into_os_string();
+        path.push(format!("-{gate}"));
+        std::fs::write(path, b"release").expect("release the scripted Claude timeline's gate");
+    }
+
     /// Takes the program off disk, standing in for a Claude Code CLI the user has not installed.
     /// The runtime already holds the path, so [`install`](Self::install) is the user installing it
     /// while Suru runs.

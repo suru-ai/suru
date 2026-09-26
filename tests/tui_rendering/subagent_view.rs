@@ -112,6 +112,7 @@ fn child_session_snapshot(
             approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(SessionTimestamp::now()),
+            monitoring_since: None,
             parent: Some(parent_id),
         },
         revision: SessionRevision::INITIAL,

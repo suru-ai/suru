@@ -73,6 +73,12 @@ const RESPAWNED_TURN_RESUMES_THE_SUBAGENT: &str = r#"      emit '{"type":"stream
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Resumed the audit.","session_id":"prov-session"}'
 "#;
 
+/// A Turn on the respawned child that answers and completes, leaving nothing running.
+const RESPAWNED_TURN_COMPLETES: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Carried on."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":40,"num_turns":1,"result":"Carried on.","session_id":"prov-session"}'
+"#;
+
 /// What the CLI writes once the interrupt has stopped its loop.
 const ABORTED_RESULT: &str = r#"      emit '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"num_turns":1,"result":"","terminal_reason":"aborted_streaming","session_id":"prov-session"}'
@@ -402,6 +408,54 @@ async fn stopping_a_subagent_the_respawned_cli_resumed_by_its_session_stops_its_
         ["agent-task-1"],
         "the Subagent's task runs on the respawned CLI now, which is asked to stop it"
     );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_respawn_for_a_selection_change_ends_monitoring_because_the_old_childs_watches_are_lost()
+{
+    let claude = respawning_fixture(BACKGROUND_COMMAND_LEFT_RUNNING, RESPAWNED_TURN_COMPLETES);
+    let opened = opened_session(
+        &claude,
+        "claude-respawn-loses-watches",
+        "Run the tests in the background",
+    )
+    .await;
+    let (client, session_id) = (&opened.client, opened.session_id);
+    let first = settled_session(client, session_id, 0).await;
+    assert_eq!(
+        first.session.monitoring_since, first.turns[0].settled_at,
+        "`task-old` left running keeps the Session Monitoring once its Turn settles"
+    );
+
+    prompt_the_respawned_child(client, session_id).await;
+    let second = settled_session(client, session_id, 1).await;
+
+    assert_eq!(second.turns[1].status, TurnStatus::Completed);
+    assert_second_child_resumed(&claude);
+    assert_eq!(second.session.working_since, None);
+    assert_eq!(
+        second.session.monitoring_since, None,
+        "`task-old` died with the child that ran it, so it is settled as lost and nothing is \
+         left for the Session to wait on"
+    );
+    let listed = client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .find_map(|item| {
+            item.readable()
+                .filter(|summary| summary.session.id == session_id)
+                .cloned()
+        })
+        .expect("the Session is listed and readable");
+    assert_eq!(listed.session.monitoring_since, None);
 
     opened
         .server

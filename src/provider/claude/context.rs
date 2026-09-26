@@ -107,6 +107,8 @@ impl ContextQueries {
                             | ProviderEvent::AgentSelectionRejected { .. }
                             | ProviderEvent::SubagentUpdated { .. }
                             | ProviderEvent::SubagentCompleted { .. }
+                            | ProviderEvent::WatchStarted { .. }
+                            | ProviderEvent::WatchSettled { .. }
                             | ProviderEvent::ResumeStateChanged { .. }
                     )
             })

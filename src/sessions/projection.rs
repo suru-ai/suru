@@ -34,12 +34,12 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
-    /// Commits `changes` to one Session and then re-derives the Working
-    /// reading above it. Every commit goes through here rather than reaching
-    /// [`SessionRecord::commit`] directly, because a commit anywhere in a
-    /// Subagent subtree — a child's Turn settling, a spawn opening one — can
-    /// flip what the listed root's row says about live work, and only the
-    /// state can see across Sessions.
+    /// Commits `changes` to one Session and then re-derives the Working and
+    /// Monitoring readings above it. Every commit goes through here rather
+    /// than reaching [`SessionRecord::commit`] directly, because a commit
+    /// anywhere in a Subagent subtree — a child's Turn settling, a spawn
+    /// opening one — can flip what the listed root's row says about live work,
+    /// and only the state can see across Sessions.
     pub(super) fn commit(
         &mut self,
         storage: &StorageSink,
@@ -92,9 +92,16 @@ impl SessionStoreState {
         {
             record.turn_start_admissions.insert(prompt_id, updated_at);
         }
-        // Working is a server derivation. Callers can describe the Turn
-        // transition that changes it, but cannot inject a competing clock.
-        changes.retain(|change| !matches!(change, SessionChange::SessionWorkingChanged { .. }));
+        // Working and Monitoring are server derivations. Callers can describe
+        // the Turn transition that changes them, but cannot inject a
+        // competing clock.
+        changes.retain(|change| {
+            !matches!(
+                change,
+                SessionChange::SessionWorkingChanged { .. }
+                    | SessionChange::SessionMonitoringChanged { .. }
+            )
+        });
         stamp_turn_timing(&mut changes, updated_at);
         stamp_cost_measurements(&mut changes, updated_at);
         if let Some(snapshot) = self
@@ -114,10 +121,19 @@ impl SessionStoreState {
             .get(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
             .project(session_id, &changes)?;
-        let working_since = self.subtree_working_since_with(session_id, Some(&projected));
+        let Liveness {
+            working_since,
+            monitoring_since,
+        } = self.subtree_liveness_with(session_id, Some(&projected));
         let working_changed = projected.session.working_since != working_since;
         if working_changed {
             changes.push(SessionChange::SessionWorkingChanged { working_since });
+        }
+        // A Turn settling with a Watch still live begins Monitoring, and a
+        // Continuation beginning ends it, in the revision that moved Working.
+        let monitoring_changed = projected.session.monitoring_since != monitoring_since;
+        if monitoring_changed {
+            changes.push(SessionChange::SessionMonitoringChanged { monitoring_since });
         }
         let record = self
             .sessions
@@ -150,8 +166,14 @@ impl SessionStoreState {
                 working_since,
             });
         }
+        if monitoring_changed && self.ancestry(session_id).announces(session_id) {
+            self.publish_catalog_change(SessionCatalogChange::MonitoringChanged {
+                session_id,
+                monitoring_since,
+            });
+        }
         self.forget_spent_admissions(session_id, working_since);
-        self.reconcile_working(storage, session_id);
+        self.reconcile_liveness(storage, session_id);
         self.reconcile_usage(storage, session_id);
         self.reconcile_interventions(storage, session_id);
         if own_interventions_moved
@@ -278,36 +300,58 @@ impl SessionStoreState {
         }
     }
 
-    /// Re-derives [`crate::protocol::Session::working_since`] for the Session
-    /// and every ancestor up to its listed root, and announces the root's
-    /// reading when it flipped. Each Session carries its whole subtree's
-    /// reading — the latest Turn, or any working Subagent below —
-    /// so a listing keeps saying Working while Subagents outlive the Turn
-    /// that spawned them (ADR 0015). Only the root announces, because a
-    /// Subagent's child Session rides no catalog stream.
-    pub(super) fn reconcile_working(&mut self, storage: &StorageSink, session_id: SessionId) {
+    /// Re-derives [`crate::protocol::Session::working_since`] and
+    /// [`crate::protocol::Session::monitoring_since`] for the Session and
+    /// every ancestor up to its listed root, and announces the root's readings
+    /// where they flipped. Each Session carries its whole subtree's reading —
+    /// the latest Turn, or any working Subagent below — so a listing keeps
+    /// saying Working while Subagents outlive the Turn that spawned them (ADR
+    /// 0015), and Monitoring while a Watch anywhere below is live and nothing
+    /// is Working (ADR 0030). Only the root announces, because a Subagent's
+    /// child Session rides no catalog stream.
+    ///
+    /// A commit calls this for the Session it landed in; a Watch starting or
+    /// settling commits nothing, so the Watch table calls it directly.
+    pub(super) fn reconcile_liveness(&mut self, storage: &StorageSink, session_id: SessionId) {
         let ancestry = self.ancestry(session_id);
         for current in &ancestry.sessions {
-            let reading = self.subtree_working_since(*current);
+            let reading = self.subtree_liveness_with(*current, None);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
             };
-            if record.snapshot.session.working_since == reading {
+            let working_changed = record.snapshot.session.working_since != reading.working_since;
+            let monitoring_changed =
+                record.snapshot.session.monitoring_since != reading.monitoring_since;
+            let mut changes = Vec::new();
+            if working_changed {
+                changes.push(SessionChange::SessionWorkingChanged {
+                    working_since: reading.working_since,
+                });
+            }
+            if monitoring_changed {
+                changes.push(SessionChange::SessionMonitoringChanged {
+                    monitoring_since: reading.monitoring_since,
+                });
+            }
+            if changes.is_empty() {
                 continue;
             }
-            if let Err(error) = record.commit_derived(
-                storage,
-                *current,
-                vec![SessionChange::SessionWorkingChanged {
-                    working_since: reading,
-                }],
-            ) {
-                tracing::warn!(session_id = %current, "Working did not roll up: {error}");
+            if let Err(error) = record.commit_derived(storage, *current, changes) {
+                tracing::warn!(session_id = %current, "Working and Monitoring did not roll up: {error}");
             }
-            if ancestry.announces(*current) {
+            if !ancestry.announces(*current) {
+                continue;
+            }
+            if working_changed {
                 self.publish_catalog_change(SessionCatalogChange::WorkingChanged {
                     session_id: *current,
-                    working_since: reading,
+                    working_since: reading.working_since,
+                });
+            }
+            if monitoring_changed {
+                self.publish_catalog_change(SessionCatalogChange::MonitoringChanged {
+                    session_id: *current,
+                    monitoring_since: reading.monitoring_since,
                 });
             }
         }
@@ -600,20 +644,63 @@ impl SessionStoreState {
     /// overlaps a surviving Subagent keeps anchoring it after the parent
     /// Settles. Only the merged interval that is still open matters.
     pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
-        self.subtree_working_since_with(session_id, None)
+        self.subtree_liveness_with(session_id, None).working_since
     }
 
-    /// The subtree reading with the Session at the head projected through its
-    /// pending commit. This lets the Session's own Working transition ride the
-    /// same revision as the Turn transition that caused it; only ancestors of
-    /// a changed child need a separate derived revision.
-    fn subtree_working_since_with(
+    /// The subtree's Working and Monitoring readings with the Session at the
+    /// head projected through its pending commit. This lets the Session's own
+    /// transitions ride the same revision as the Turn transition that caused
+    /// them; only ancestors of a changed child need a separate derived
+    /// revision.
+    ///
+    /// Monitoring is what is left when nothing is Working and a Watch anywhere
+    /// in the subtree is live. It breaks Working's continuity rather than
+    /// extending it, so it counts from whichever came later: when Working last
+    /// ended, or when the earliest live Watch started. A Watch the Agent
+    /// started mid-Turn therefore reads Monitoring only from that Turn's
+    /// settle, and Working after a Watch wakes the Agent counts afresh from
+    /// the Continuation it begins.
+    fn subtree_liveness_with(
         &self,
         session_id: SessionId,
         projected: Option<&SessionSnapshot>,
-    ) -> Option<SessionTimestamp> {
+    ) -> Liveness {
+        let subtree = self.subtree(session_id);
+        let last_working = self.last_working_component(&subtree, session_id, projected);
+        let working_since = last_working
+            .and_then(|(started_at, settled_at)| settled_at.is_none().then_some(started_at));
+        let earliest_watch = subtree
+            .iter()
+            .filter_map(|current| self.sessions.get(current))
+            .flat_map(|record| record.watches.values())
+            .map(|watch| watch.started_at)
+            .min();
+        let monitoring_since = match (working_since, earliest_watch) {
+            (None, Some(watch_started_at)) => Some(
+                last_working
+                    .and_then(|(_, settled_at)| settled_at)
+                    .map_or(watch_started_at, |ended_at| ended_at.max(watch_started_at)),
+            ),
+            _ => None,
+        };
+        Liveness {
+            working_since,
+            monitoring_since,
+        }
+    }
+
+    /// The last uninterrupted live-work interval across the subtree, as when
+    /// it began and — where it has — when it ended. Turn intervals are merged
+    /// with the intervals admissions open, so the last component's end is
+    /// when Working last ended anywhere below.
+    fn last_working_component(
+        &self,
+        subtree: &[SessionId],
+        session_id: SessionId,
+        projected: Option<&SessionSnapshot>,
+    ) -> Option<(SessionTimestamp, Option<SessionTimestamp>)> {
         let mut intervals = Vec::new();
-        for current in self.subtree(session_id) {
+        for &current in subtree {
             let Some(record) = self.sessions.get(&current) else {
                 continue;
             };
@@ -651,8 +738,16 @@ impl SessionStoreState {
             };
         }
 
-        component.and_then(|(started_at, settled_at)| settled_at.is_none().then_some(started_at))
+        component
     }
+}
+
+/// A Session subtree's two live readings, derived together because Monitoring
+/// is defined by the absence of Working and counts from where Working ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Liveness {
+    working_since: Option<SessionTimestamp>,
+    monitoring_since: Option<SessionTimestamp>,
 }
 
 #[derive(Clone)]
@@ -1029,9 +1124,10 @@ impl SessionRecord {
             self.summary.standing_inputs.pending_questionnaires = pending;
             self.summary.standing_inputs.pending_questionnaires_revision = self.snapshot.revision;
         }
-        // `session.working_since` is deliberately left alone here: it carries
-        // the whole subtree's reading, which only the state can derive, so
-        // [`SessionStoreState::reconcile_working`] maintains it after every
+        // `session.working_since` and `session.monitoring_since` are
+        // deliberately left alone here: they carry the whole subtree's
+        // reading, which only the state can derive, so
+        // [`SessionStoreState::reconcile_liveness`] maintains them after every
         // commit.
         Ok(update)
     }

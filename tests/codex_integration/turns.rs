@@ -476,6 +476,10 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     assert_eq!(identity.agent, AgentId::new("codex"));
     assert_eq!(&identity.selection, selection);
     assert_eq!(completed.session.status, SessionStatus::Idle);
+    assert_eq!(
+        completed.session.monitoring_since, None,
+        "nothing wakes a Codex Agent once its Turn settles, so a Codex Session never Monitors"
+    );
     assert_eq!(completed.prompts[0].status, PromptStatus::Delivered);
     assert_eq!(completed.turns[0].status, TurnStatus::Completed);
     let agent_message = completed

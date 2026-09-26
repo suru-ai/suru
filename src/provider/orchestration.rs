@@ -367,12 +367,13 @@ struct SubagentRoutes {
     /// it had in flight — can trail in afterwards and must read as a late
     /// echo to discard rather than as an event it never spawned.
     stopped: HashSet<ProviderSubagentId>,
-    /// Whether a Subagent has settled since a Turn last began. The output a
-    /// completion provokes can arrive only after the settle — Claude notifies
-    /// a task's end before its loop wakes to deliver the outcome — so every
-    /// settle leaves a Continuation owed to whatever that output turns out to
-    /// be. Any Turn beginning clears it, because from then on such output has
-    /// a Turn to land in.
+    /// Whether a Subagent has settled, or a Watch's settling woke the Agent,
+    /// since a Turn last began. The output a completion provokes can arrive
+    /// only after the settle — Claude notifies a task's end before its loop
+    /// wakes to deliver the outcome — so every such settle leaves a
+    /// Continuation owed to whatever that output turns out to be. Any Turn
+    /// beginning clears it, because from then on such output has a Turn to
+    /// land in.
     late_settle_owes_continuation: bool,
 }
 
@@ -1578,6 +1579,22 @@ async fn run_provider_session(
                             &provider_id,
                             resume_state,
                         ),
+                        // A Watch is no output owed a Continuation, whoever's
+                        // Agent started it.
+                        AttributedProviderEvent {
+                            attribution,
+                            event:
+                                event @ (ProviderEvent::WatchStarted { .. }
+                                | ProviderEvent::WatchSettled { .. }),
+                        } => track_watch(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            &mut subagents,
+                            &attribution,
+                            true,
+                            event,
+                        ),
                         // A Subagent's events land in its own Session whether
                         // or not the owning Session has a Turn open.
                         AttributedProviderEvent {
@@ -1689,7 +1706,13 @@ async fn run_provider_session(
                     continue;
                 }
                 ProviderInput::Event(Some(Err(_)) | None) => {
-                    lose_provider_connection(&mut provider, &mut subagents, &sessions, &updates);
+                    lose_provider_connection(
+                        &mut provider,
+                        &mut subagents,
+                        &sessions,
+                        &updates,
+                        session_id,
+                    );
                     continue;
                 }
             };
@@ -1780,6 +1803,7 @@ async fn run_provider_session(
                                 &mut subagents,
                                 &sessions,
                                 &updates,
+                                session_id,
                             );
                             let _ =
                                 response.send(Err(InterruptSessionError::ProviderFailure(message)));
@@ -2121,7 +2145,13 @@ async fn run_provider_session(
                 let selection_rejected = error.is_selection_rejected();
                 project_turn_start_failure(&sessions, &updates, session_id, turn_id, &error);
                 if session_lost {
-                    lose_provider_connection(&mut provider, &mut subagents, &sessions, &updates);
+                    lose_provider_connection(
+                        &mut provider,
+                        &mut subagents,
+                        &sessions,
+                        &updates,
+                        session_id,
+                    );
                 }
                 if !selection_rejected {
                     defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
@@ -2461,6 +2491,7 @@ async fn run_provider_session(
                                 &mut subagents,
                                 &sessions,
                                 &updates,
+                                session_id,
                             );
                             defer_next_queued_prompt(
                                 &mut deferred_prompt_id,
@@ -2514,6 +2545,7 @@ async fn run_provider_session(
                             &mut subagents,
                             &sessions,
                             &updates,
+                            session_id,
                         );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                         let _ = response.send(Err(InterruptSessionError::ProviderFailure(message)));
@@ -2547,6 +2579,20 @@ async fn run_provider_session(
                         session_id,
                         &provider_id,
                         resume_state,
+                    ),
+                    Some(Ok(AttributedProviderEvent {
+                        attribution,
+                        event:
+                            event @ (ProviderEvent::WatchStarted { .. }
+                            | ProviderEvent::WatchSettled { .. }),
+                    })) => track_watch(
+                        &sessions,
+                        &updates,
+                        session_id,
+                        &mut subagents,
+                        &attribution,
+                        false,
+                        event,
                     ),
                     Some(Ok(AttributedProviderEvent {
                         attribution: ProviderEventAttribution::Subagent(subagent),
@@ -2617,6 +2663,7 @@ async fn run_provider_session(
                             &mut subagents,
                             &sessions,
                             &updates,
+                            session_id,
                         );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
@@ -2636,6 +2683,7 @@ async fn run_provider_session(
                             &mut subagents,
                             &sessions,
                             &updates,
+                            session_id,
                         );
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     }
@@ -2665,6 +2713,9 @@ async fn run_provider_session(
         SUBAGENT_CONNECTION_LOST_MESSAGE,
         OpenInterventions::Abandoned,
     );
+    // The Provider process every Watch ran in stops with the actor, and the
+    // shutdown below reports nothing more, so the Watches are lost here.
+    let _ = updates.apply(|| sessions.lose_watches(session_id));
     drop(questionnaire_deliveries);
     drop(decision_deliveries);
 
@@ -2734,6 +2785,7 @@ fn lose_provider_connection(
     subagents: &mut SubagentRoutes,
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
+    session_id: SessionId,
 ) {
     *provider = None;
     subagents.fail_all(
@@ -2742,6 +2794,64 @@ fn lose_provider_connection(
         SUBAGENT_CONNECTION_LOST_MESSAGE,
         OpenInterventions::TurnEnded,
     );
+    // Every Watch ran in the Provider process the connection spoke to, so
+    // none outlives it; each is lost, which wakes nothing.
+    let _ = updates.apply(|| sessions.lose_watches(session_id));
+}
+
+/// Records a Watch starting or settling in the Session whose Agent started it:
+/// the owning Session, or a Subagent's own for a Watch its Agent left running.
+/// A Watch is no output of any Turn — the Command that started it already
+/// stands in the Transcript — so it never lands in one, and it opens no
+/// Continuation: only the output its settling provokes does. A Watch
+/// attributed to a Subagent the connection never named lands nowhere, like
+/// any other unrouted Subagent event.
+fn track_watch(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    subagents: &mut SubagentRoutes,
+    attribution: &ProviderEventAttribution,
+    idle: bool,
+    event: ProviderEvent,
+) {
+    let owner = match attribution {
+        ProviderEventAttribution::OwningSession => Some(session_id),
+        ProviderEventAttribution::Subagent(subagent) => subagents
+            .identities
+            .get(subagent)
+            .map(|identity| identity.session_id),
+    };
+    let Some(owner) = owner else {
+        return;
+    };
+    match event {
+        ProviderEvent::WatchStarted {
+            watch_id,
+            description,
+        } => {
+            if let Some(Err(error)) =
+                updates.apply(|| sessions.start_watch(owner, watch_id, description))
+            {
+                tracing::warn!(session_id = %owner, "a Watch could not be recorded: {error:#}");
+            }
+        }
+        ProviderEvent::WatchSettled {
+            watch_id,
+            woke_agent,
+            ..
+        } => {
+            let _ = updates.apply(|| sessions.settle_watch(owner, &watch_id));
+            // A Watch that woke the owning Session's Agent while no Turn was
+            // active owes a Continuation to whatever output its settling
+            // provokes, as a Subagent's late settle does. One settling during
+            // a Turn wakes the Agent into that Turn instead.
+            if woke_agent && idle && owner == session_id {
+                subagents.late_settle_owes_continuation = true;
+            }
+        }
+        _ => unreachable!("only Watch events are tracked as Watches"),
+    }
 }
 
 /// Fails the Turn this actor was running, flushing the pending line each of its
@@ -3472,6 +3582,11 @@ fn project_provider_event(
             // The actor stores a revised Resume State for the owning Session
             // before anything projects, so none ever lands in a Turn.
             ProviderEvent::ResumeStateChanged { .. } => Ok(ProviderEventProjection::Continue),
+            // The actor records Watches before anything projects too, because
+            // a Watch is no output of the Turn it outlives.
+            ProviderEvent::WatchStarted { .. } | ProviderEvent::WatchSettled { .. } => {
+                Ok(ProviderEventProjection::Continue)
+            }
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,

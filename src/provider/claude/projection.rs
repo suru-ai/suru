@@ -16,7 +16,10 @@
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent — known by its task id — in the
 //! conversation whose tool use spawned it, `task_updated` revises what it is doing, and
-//! `task_notification` settles its stretch of work. A settled agent the loop resumes through
+//! `task_notification` settles its stretch of work. A background shell or monitor is instead a
+//! Watch (ADR 0030): its start and its notification bracket the time its Session may read
+//! Monitoring, and every Watch still live when the CLI process ends settles as lost. A settled
+//! agent the loop resumes through
 //! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
 //! Subagent rather than a new one, and since the resumed conversation still rides under the
 //! original spawn's id, the resumed work lands in the Subagent's own Session, in the Turn the
@@ -49,6 +52,7 @@ use super::{
     claude_error,
     session::ClaudeResumeState,
     thinking::{ThinkingEvent, ThinkingSplitter},
+    transport::ConversationItem,
     turn_in_flight::TurnInFlight,
     wire::{
         AssistantMessageSnapshot, ContentBlock, EchoedUserContent, EchoedUserMessage,
@@ -59,7 +63,7 @@ use crate::protocol::{Cost, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
-    ProviderSubagentStatus, ReportedTurnMetering,
+    ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome, ReportedTurnMetering,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -76,17 +80,45 @@ const AGENT_TOOL: &str = "Agent";
 /// spawn, and the tool's input says what the resume asks.
 const SEND_MESSAGE_TOOL: &str = "SendMessage";
 
-/// The task type the CLI reports for a task running an agent — a Subagent. Every other type
-/// (`local_bash` above all) is background work with no conversation of its own, already in the
-/// Transcript as the Command Activity that spawned it.
-const SUBAGENT_TASK_TYPE: &str = "local_agent";
+/// What one task the CLI reports is to Suru. Every task joins the roster an interrupt stops, but
+/// only a Subagent has a conversation of its own, and only a Watch may wake the loop once it has
+/// ended its Turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskKind {
+    /// A task running an agent, opened as a Subagent.
+    Subagent,
+    /// Background work whose settling the CLI delivers to the agent, waking its loop into a
+    /// Continuation. Its Command Activity, where it has one, already stands in the Transcript.
+    Watch,
+    /// Work that neither runs an agent Suru presents nor wakes this loop.
+    Unwatched,
+}
+
+impl TaskKind {
+    /// The one table classifying the CLI's `task_type`s (ADR 0030). A background shell and a
+    /// Monitor tool both run as `local_bash`, and a monitor over MCP or a WebSocket is a Watch
+    /// too: each one's settling is delivered to the agent. `local_workflow`, `remote_agent`,
+    /// `in_process_teammate`, `dream`, plan-mode tasks, and any type this build has not heard of
+    /// are none of Suru's to wait on, since the wire grows freely (ADR 0010) and a task wrongly
+    /// read as a Watch would leave a Session Monitoring for nothing.
+    fn of(task_type: Option<&str>) -> Self {
+        match task_type {
+            Some("local_agent") => Self::Subagent,
+            Some("local_bash" | "monitor_mcp" | "monitor_ws") => Self::Watch,
+            _ => Self::Unwatched,
+        }
+    }
+}
 
 /// How a task's `task_notification` reports it finishing well; anything else — failed, stopped —
 /// settles the Subagent as failed.
 const TASK_COMPLETED_STATUS: &str = "completed";
 
+/// How a task's `task_notification` reports it stopped rather than finishing or failing.
+const TASK_STOPPED_STATUS: &str = "stopped";
+
 pub(super) fn provider_events(
-    messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
+    messages: mpsc::UnboundedReceiver<Result<ConversationItem, ProviderError>>,
     projection: ClaudeProjection,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     approvals: Arc<super::approval::ClaudeApprovals>,
@@ -115,7 +147,7 @@ struct EventReceiver {
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     approvals: Arc<super::approval::ClaudeApprovals>,
     execution_directory: std::path::PathBuf,
-    messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
+    messages: mpsc::UnboundedReceiver<Result<ConversationItem, ProviderError>>,
     projection: ClaudeProjection,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
 }
@@ -145,7 +177,11 @@ async fn next_provider_event(
                 events.approvals.clear();
                 return Some((Err(error), events));
             }
-            Ok(message) => {
+            Ok(ConversationItem::ProcessEnded) => {
+                let settled = events.projection.project_process_ended();
+                events.pending.extend(settled.into_iter().map(Ok));
+            }
+            Ok(ConversationItem::Message(message)) => {
                 events.context.observe(&message);
                 let attribution = events.projection.intervention_attribution(&message);
                 match events
@@ -268,6 +304,9 @@ struct ConversationInFlight {
 struct RunningCommand {
     owner: ConversationKey,
     activity: ProviderActivityId,
+    /// The command as its Activity reads it, which describes a background task it starts that
+    /// the CLI gives no description of its own.
+    command: String,
 }
 
 /// A tool use that delegates to an agent, remembered from its block until the task it delegates
@@ -342,6 +381,10 @@ pub(super) struct ClaudeProjection {
     /// Every agent task this wire has started, working or settled, by task id — the identity the
     /// rest of the lifecycle and a resume name it by.
     agent_tasks: BTreeMap<String, AgentTask>,
+    /// The Watches running in the current CLI process, by task id, against the conversation
+    /// whose agent a Watch's settling wakes. They settle on their own notification, or all at
+    /// once as lost when the process ends.
+    watches: BTreeMap<String, ConversationKey>,
     /// The subagent conversations, from the `parent_tool_use_id` each rides under to the task id
     /// of the agent it belongs to — whose Subagent its events are, in whichever stretch.
     conversation_agents: BTreeMap<String, String>,
@@ -411,6 +454,7 @@ impl ClaudeProjection {
             running_commands: BTreeMap::new(),
             delegation_tools: BTreeMap::new(),
             agent_tasks,
+            watches: BTreeMap::new(),
             conversation_agents,
             unplaced_resumes: BTreeSet::new(),
             resume,
@@ -490,8 +534,16 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_started(task_id.clone());
-        if message.task_type.as_deref() != Some(SUBAGENT_TASK_TYPE) {
-            return Vec::new();
+        match TaskKind::of(message.task_type.as_deref()) {
+            TaskKind::Subagent => {}
+            TaskKind::Watch => {
+                return self.project_watch_started(
+                    task_id,
+                    message.description,
+                    message.tool_use_id.as_deref(),
+                );
+            }
+            TaskKind::Unwatched => return Vec::new(),
         }
         // The roster is the running process's, so an agent task joins it on every start — even
         // one whose row is still working, which is what an agent the previous process was running
@@ -628,6 +680,88 @@ impl ClaudeProjection {
         projected
     }
 
+    /// A background task that may wake the loop once its Turn has ended: a Watch, described by
+    /// what the task's start says it does, or else by the command that started it. A start
+    /// repeating a Watch already live announces nothing new.
+    ///
+    /// Every Watch is attributed to the loop's own conversation: which subagent, if any, left a
+    /// task running is not yet read off the wire, so its settling is taken to wake the owning
+    /// Session's agent. The owner is kept with the Watch so its settle lands where its start did.
+    fn project_watch_started(
+        &mut self,
+        task_id: String,
+        description: Option<String>,
+        tool_use_id: Option<&str>,
+    ) -> Vec<AttributedProviderEvent> {
+        if self.watches.contains_key(&task_id) {
+            return Vec::new();
+        }
+        let description = description
+            .filter(|description| !description.trim().is_empty())
+            .or_else(|| {
+                tool_use_id
+                    .and_then(|tool| self.running_commands.get(tool))
+                    .map(|command| command.command.clone())
+            })
+            .unwrap_or_else(|| task_id.clone());
+        let owner = OWNING_CONVERSATION;
+        let event = ProviderEvent::WatchStarted {
+            watch_id: ProviderWatchId::new(task_id.clone()),
+            description,
+        };
+        let started = self.attributed(&owner, event);
+        self.watches.insert(task_id, owner);
+        vec![started]
+    }
+
+    /// A Watch's own notification that it settled, which the CLI delivers to the agent whose
+    /// loop it wakes; the notification's summary is how the Watch settled in the CLI's words.
+    fn project_watch_settled(
+        &mut self,
+        task_id: &str,
+        message: &SystemMessage,
+    ) -> Option<AttributedProviderEvent> {
+        let owner = self.watches.remove(task_id)?;
+        let outcome = match message.status.as_deref() {
+            None | Some(TASK_COMPLETED_STATUS) => ProviderWatchOutcome::Completed,
+            Some(TASK_STOPPED_STATUS) => ProviderWatchOutcome::Stopped,
+            Some(_) => ProviderWatchOutcome::Failed,
+        };
+        let event = ProviderEvent::WatchSettled {
+            watch_id: ProviderWatchId::new(task_id),
+            outcome,
+            summary: message
+                .summary
+                .clone()
+                .filter(|summary| !summary.trim().is_empty()),
+            woke_agent: true,
+        };
+        Some(self.attributed(&owner, event))
+    }
+
+    /// The CLI process this projection was reading has ended — stopped by the Session, or replaced
+    /// by one spawned under another Agent Selection — and everything it wrote before it did has
+    /// projected already. Every task on its roster died with it, so each live Watch settles as
+    /// lost and wakes nothing, and the roster starts empty again for whatever the next process
+    /// reports: output the old process left queued can no longer put its tasks back.
+    fn project_process_ended(&mut self) -> Vec<AttributedProviderEvent> {
+        self.turn.tasks_died_with_process();
+        std::mem::take(&mut self.watches)
+            .into_iter()
+            .map(|(task_id, owner)| {
+                self.attributed(
+                    &owner,
+                    ProviderEvent::WatchSettled {
+                        watch_id: ProviderWatchId::new(task_id),
+                        outcome: ProviderWatchOutcome::Lost,
+                        summary: None,
+                        woke_agent: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// The Resume State as it stands now, for orchestration to store in place of what the
     /// Session's startup reported.
     fn resume_state_changed(&self) -> AttributedProviderEvent {
@@ -692,10 +826,13 @@ impl ClaudeProjection {
     }
 
     fn project_task_settled(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
-        let Some(task_id) = message.task_id else {
+        let Some(task_id) = message.task_id.clone() else {
             return Vec::new();
         };
         self.turn.task_settled(&task_id);
+        if let Some(settled) = self.project_watch_settled(&task_id, &message) {
+            return vec![settled];
+        }
         let Some(task) = self
             .agent_tasks
             .get_mut(&task_id)
@@ -1012,9 +1149,10 @@ impl ClaudeProjection {
             return;
         };
         let activity_id = ProviderActivityId::new(format!("command:{}", tool.id));
+        let command = strip_launcher_wrapper(command.to_owned());
         projected.push(ProviderEvent::CommandStarted {
             activity_id: activity_id.clone(),
-            command: strip_launcher_wrapper(command.to_owned()),
+            command: command.clone(),
             cwd: None,
         });
         self.running_commands.insert(
@@ -1022,6 +1160,7 @@ impl ClaudeProjection {
             RunningCommand {
                 owner: owner.clone(),
                 activity: activity_id,
+                command,
             },
         );
     }
@@ -1369,6 +1508,7 @@ mod tests {
     use super::{ClaudeProjection, ClaudeResumeState, TurnInFlight, send_message_description};
     use crate::provider::{
         AttributedProviderEvent, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
+        ProviderWatchId, ProviderWatchOutcome,
     };
 
     /// The loop's own conversation running SendMessage `tool` to the agent `task`, and the CLI
@@ -1437,6 +1577,181 @@ mod tests {
 
     fn subagent(task: &str) -> ProviderEventAttribution {
         ProviderEventAttribution::Subagent(ProviderSubagentId::new(task))
+    }
+
+    fn task_started(task: &str, task_type: &str, description: Option<&str>) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": task,
+            "task_type": task_type,
+            "description": description,
+        })
+    }
+
+    fn task_notification(task: &str, status: &str, summary: Option<&str>) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": task,
+            "status": status,
+            "summary": summary,
+        })
+    }
+
+    fn fresh_projection() -> ClaudeProjection {
+        ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default())
+    }
+
+    fn owning(event: ProviderEvent) -> AttributedProviderEvent {
+        event.into()
+    }
+
+    #[test]
+    fn a_background_shell_or_monitor_starts_a_watch_and_nothing_else_does() {
+        for (task_type, watched) in [
+            ("local_bash", true),
+            ("monitor_mcp", true),
+            ("monitor_ws", true),
+            ("local_workflow", false),
+            ("remote_agent", false),
+            ("in_process_teammate", false),
+            ("dream", false),
+            ("a_task_type_this_build_has_never_heard_of", false),
+        ] {
+            let mut projection = fresh_projection();
+            let events = project(
+                &mut projection,
+                &[task_started("task-1", task_type, Some("Background work"))],
+            );
+            let expected = if watched {
+                vec![owning(ProviderEvent::WatchStarted {
+                    watch_id: ProviderWatchId::new("task-1"),
+                    description: "Background work".to_owned(),
+                })]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(events, expected, "a `{task_type}` task");
+            assert_eq!(
+                projection.turn.live_tasks(),
+                ["task-1"],
+                "a `{task_type}` task still joins the roster an interrupt stops"
+            );
+        }
+    }
+
+    #[test]
+    fn a_watch_the_cli_gives_no_description_is_described_by_the_command_that_started_it() {
+        let mut projection = fresh_projection();
+        let events = project(
+            &mut projection,
+            &[
+                json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Bash",
+                            "input": {"command": "cargo test", "run_in_background": true},
+                        },
+                    },
+                    "parent_tool_use_id": null,
+                }),
+                json!({
+                    "type": "stream_event",
+                    "event": {"type": "content_block_stop", "index": 0},
+                    "parent_tool_use_id": null,
+                }),
+                json!({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": "task-1",
+                    "tool_use_id": "toolu_1",
+                    "task_type": "local_bash",
+                }),
+                task_started("task-2", "local_bash", None),
+            ],
+        );
+        let described = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ProviderEvent::WatchStarted { description, .. } => Some(description.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            ["cargo test", "task-2"],
+            "a Watch with nothing else to go on is named by its task"
+        );
+    }
+
+    #[test]
+    fn a_watchs_notification_settles_it_with_the_outcome_and_summary_the_cli_gives() {
+        for (status, outcome) in [
+            ("completed", ProviderWatchOutcome::Completed),
+            ("failed", ProviderWatchOutcome::Failed),
+            ("stopped", ProviderWatchOutcome::Stopped),
+        ] {
+            let mut projection = fresh_projection();
+            let events = project(
+                &mut projection,
+                &[
+                    task_started("task-1", "local_bash", Some("cargo test")),
+                    task_notification("task-1", status, Some("cargo test finished")),
+                    task_notification("task-1", status, Some("a repeated notification")),
+                ],
+            );
+            assert_eq!(
+                events[1..],
+                [owning(ProviderEvent::WatchSettled {
+                    watch_id: ProviderWatchId::new("task-1"),
+                    outcome,
+                    summary: Some("cargo test finished".to_owned()),
+                    woke_agent: true,
+                })],
+                "a `{status}` notification settles the Watch once, waking the loop it belongs to"
+            );
+            assert!(projection.turn.live_tasks().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_watches_a_process_was_running_settle_as_lost_when_it_ends() {
+        let mut projection = fresh_projection();
+        project(
+            &mut projection,
+            &[
+                task_started("task-1", "local_bash", Some("cargo test")),
+                task_started("task-2", "monitor_mcp", Some("Watch the queue")),
+                task_notification("task-2", "completed", None),
+            ],
+        );
+
+        let lost = projection.project_process_ended();
+
+        assert_eq!(
+            lost,
+            [owning(ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("task-1"),
+                outcome: ProviderWatchOutcome::Lost,
+                summary: None,
+                woke_agent: false,
+            })],
+            "only the Watch still live is lost, and its loss wakes nothing"
+        );
+        assert!(
+            projection.turn.live_tasks().is_empty(),
+            "the roster starts empty again for the next process"
+        );
+        assert!(
+            projection.project_process_ended().is_empty(),
+            "a Watch is lost once"
+        );
     }
 
     #[test]

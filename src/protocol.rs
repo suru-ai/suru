@@ -2067,6 +2067,15 @@ pub struct Session {
     /// `None` means the whole Session subtree is no longer Working.
     #[serde(default)]
     pub working_since: Option<SessionTimestamp>,
+    /// When this Session began Monitoring: nothing in its subtree is Working,
+    /// but a Watch is still live and may wake its Agent into a Continuation.
+    /// It counts from the later of when Working last ended and when the
+    /// earliest live Watch started, so it never overlaps Working. `None`
+    /// whenever the Session is Working or has no live Watch — and after every
+    /// restart, since no Watch outlives its Provider process and the reading
+    /// is never stored.
+    #[serde(default)]
+    pub monitoring_since: Option<SessionTimestamp>,
     /// The Session whose Turn spawned this one, present exactly when this is a
     /// Subagent's Session. A child is reachable only through its parent: it
     /// joins no Session listing, refuses Prompts, and is deleted along with
@@ -2295,6 +2304,16 @@ impl SessionListItem {
         }
     }
 
+    /// When this Session began Monitoring, and `None` where it is Working or
+    /// has no live Watch. A Session Suru could not read is never Monitoring,
+    /// for the same reason it is never Working.
+    pub const fn monitoring_since(&self) -> Option<SessionTimestamp> {
+        match self {
+            Self::Readable(summary) => summary.session.monitoring_since,
+            Self::Unreadable(_) => None,
+        }
+    }
+
     pub const fn readable(&self) -> Option<&SessionSummary> {
         match self {
             Self::Readable(summary) => Some(summary),
@@ -2376,6 +2395,14 @@ pub enum SessionCatalogChange {
     WorkingChanged {
         session_id: SessionId,
         working_since: Option<SessionTimestamp>,
+    },
+    /// A Session began or stopped Monitoring, so what
+    /// [`Session::monitoring_since`] reads changed. It rides the catalog
+    /// stream beside Working, and for the same reason: a Watch starting or
+    /// settling moves no Turn, so nothing else a listing hears says so.
+    MonitoringChanged {
+        session_id: SessionId,
+        monitoring_since: Option<SessionTimestamp>,
     },
     /// The inputs from which a listed Session's Standing is read changed when
     /// its latest Turn Settled or its live Questionnaires changed. It carries
@@ -3080,6 +3107,12 @@ impl SessionSnapshot {
         self.session.working_since
     }
 
+    /// When this Session began Monitoring, using the server-derived reading
+    /// carried by the Session itself.
+    pub const fn monitoring_since(&self) -> Option<SessionTimestamp> {
+        self.session.monitoring_since
+    }
+
     /// Everything this Session has consumed: its own Turns — failed and
     /// interrupted ones included — and the Subagent subtree rolled up beneath
     /// them. It is the one reading [`SessionSummary::total_usage`] carries,
@@ -3188,6 +3221,12 @@ pub enum SessionChange {
     /// update stream never has to reconstruct work it did not observe begin.
     SessionWorkingChanged {
         working_since: Option<SessionTimestamp>,
+    },
+    /// The whole Monitoring reading derived by the server. Like Working it is
+    /// never a Provider's or a reader's to set, and a Watch starting or
+    /// settling can move it without any Turn moving.
+    SessionMonitoringChanged {
+        monitoring_since: Option<SessionTimestamp>,
     },
     MessageAdded {
         message: Message,
@@ -3642,6 +3681,15 @@ pub struct SessionSettlementChanged {
 pub struct SessionWorkingChanged {
     pub session_id: SessionId,
     pub working_since: Option<SessionTimestamp>,
+}
+
+/// A Session began or stopped Monitoring, carried to a client that may be
+/// listing that Session without having it open.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMonitoringChanged {
+    pub session_id: SessionId,
+    pub monitoring_since: Option<SessionTimestamp>,
 }
 
 /// The owning Server's current reading of one Worktree, carried independently

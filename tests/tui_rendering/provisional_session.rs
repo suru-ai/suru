@@ -39,6 +39,7 @@ pub fn created_session_snapshot(
             approval_posture: None,
             status: SessionStatus::Active,
             working_since: Some(working_since),
+            monitoring_since: None,
             parent: None,
         },
         revision: SessionRevision::INITIAL,

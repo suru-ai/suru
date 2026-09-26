@@ -20,12 +20,12 @@ use crate::{
         ModelCatalog, Outlook, Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest,
         Remote, RemoteHealth, RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor,
         ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionSettlementChanged,
-        SessionSnapshot, SessionStandingInputsChanged, SessionSummary, SessionTitleChanged,
-        SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest,
-        SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
-        ViewSessionRequest, WorkspaceIconChanged, WorkspaceId,
+        SessionDeleted, SessionError, SessionId, SessionListItem, SessionMonitoringChanged,
+        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
+        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
+        SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -209,6 +209,11 @@ pub enum ManagedEvent {
     /// change, and for the same reason: every client lists the Session, and
     /// only some have it open.
     SessionWorkingChanged(SessionWorkingChanged),
+    /// A Session began or stopped Monitoring. It arrives on the same terms as
+    /// a Working change, and for the same reason; unlike one it moves no
+    /// Session's last activity, since a Watch starting or settling is no work
+    /// of the Agent's.
+    SessionMonitoringChanged(SessionMonitoringChanged),
     /// A Session's latest Turn Settled, replacing the facts from which every
     /// client derives its Sidebar Standing.
     SessionStandingInputsChanged(SessionStandingInputsChanged),
@@ -241,8 +246,8 @@ impl ManagedEvent {
     }
 
     /// Whether this event reports the body of work moving: a Session made,
-    /// retitled, deleted, set aside, brought back, worked on, or a whole
-    /// catalog reconciled after a reconnection. A surface listing Sessions is
+    /// retitled, deleted, set aside, brought back, worked on, left Monitoring,
+    /// or a whole catalog reconciled after a reconnection. A surface listing Sessions is
     /// only as truthful as the last such change it was told about, so it asks
     /// the server again for everything the change itself does not say — for a
     /// Turn starting, the last activity the commit moved and the order a
@@ -261,6 +266,7 @@ impl ManagedEvent {
                 | Self::SessionTitleChanged(_)
                 | Self::SessionSettlementChanged(_)
                 | Self::SessionWorkingChanged(_)
+                | Self::SessionMonitoringChanged(_)
                 | Self::SessionStandingInputsChanged(_)
                 | Self::WorkspaceIconChanged(_)
                 | Self::SessionCatalogReconciled(_)

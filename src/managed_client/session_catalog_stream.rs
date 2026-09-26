@@ -15,8 +15,9 @@ use crate::protocol::{
     MODEL_CATALOG_EVENT, ModelCatalog, Outlook, RuntimeDescriptor, SESSION_CATALOG_SNAPSHOT_EVENT,
     SESSION_CATALOG_UPDATED_EVENT, SKILL_CATALOG_UPDATED_EVENT, SessionCatalogChange,
     SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated,
-    SessionDeleted, SessionId, SessionSettlementChanged, SessionStandingInputsChanged,
-    SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SkillCatalog,
+    SessionDeleted, SessionId, SessionMonitoringChanged, SessionSettlementChanged,
+    SessionStandingInputsChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
+    SkillCatalog,
 };
 
 use super::{
@@ -407,6 +408,20 @@ fn apply_update(
                 working_since,
             }))
         }
+        SessionCatalogChange::MonitoringChanged {
+            session_id,
+            monitoring_since,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog reported Monitoring on an unknown Session");
+            }
+            Ok(ManagedEvent::SessionMonitoringChanged(
+                SessionMonitoringChanged {
+                    session_id,
+                    monitoring_since,
+                },
+            ))
+        }
         SessionCatalogChange::StandingInputsChanged { session_id, inputs } => {
             if !known.contains(&session_id) {
                 bail!("Session catalog reported Standing on an unknown Session");
@@ -583,6 +598,47 @@ mod tests {
             .is_err(),
             "work reported on a Session the catalog never listed is a \
              discontinuity, not something to draw"
+        );
+    }
+
+    #[test]
+    fn a_monitoring_change_is_announced_for_a_listed_session_and_refused_for_an_unknown_one() {
+        let listed = SessionId::new();
+        let mut known = None;
+        reconcile_snapshot(
+            &mut known,
+            SessionCatalogSnapshot {
+                workspace_paths: Default::default(),
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: vec![listed],
+                checkout_states: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            apply_update(
+                &mut known,
+                SessionCatalogChange::MonitoringChanged {
+                    session_id: listed,
+                    monitoring_since: Some(SessionTimestamp(9)),
+                },
+            )
+            .expect("announce the Watch another client's Session is waiting on"),
+            ManagedEvent::SessionMonitoringChanged(SessionMonitoringChanged {
+                session_id: listed,
+                monitoring_since: Some(SessionTimestamp(9)),
+            })
+        );
+        assert!(
+            apply_update(
+                &mut known,
+                SessionCatalogChange::MonitoringChanged {
+                    session_id: SessionId::new(),
+                    monitoring_since: None,
+                },
+            )
+            .is_err(),
+            "Monitoring reported on a Session the catalog never listed is a discontinuity"
         );
     }
 }

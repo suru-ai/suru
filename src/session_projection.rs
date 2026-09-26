@@ -241,6 +241,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             SessionChange::SessionWorkingChanged { working_since } => {
                 next.session.working_since = *working_since;
             }
+            SessionChange::SessionMonitoringChanged { monitoring_since } => {
+                next.session.monitoring_since = *monitoring_since;
+            }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
                     bail!("Session update referenced an unknown Turn");
@@ -872,6 +875,7 @@ mod tests {
                 approval_posture: None,
                 status: SessionStatus::Idle,
                 working_since: None,
+                monitoring_since: None,
                 parent: None,
             },
             revision: SessionRevision::INITIAL,

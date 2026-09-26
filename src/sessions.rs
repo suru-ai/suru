@@ -17,7 +17,7 @@ use crate::protocol::{
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, SettingsSnapshot, TurnId,
     ViewSessionOperationId, WorkspaceId,
 };
-use crate::provider::ProviderResumeState;
+use crate::provider::{ProviderResumeState, ProviderWatchId};
 use crate::storage::{
     DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, StoredSubagentIdentity,
     UnreadableStoredSession,
@@ -43,6 +43,7 @@ mod subagent_tree;
 mod subagents;
 mod title;
 mod viewed;
+mod watches;
 mod workspace_icon;
 mod workspaces;
 
@@ -150,6 +151,11 @@ struct SessionRecord {
     /// The Provider's own identity for the Subagent this Session is, on a
     /// Subagent's child Session alone.
     subagent_identity: Option<StoredSubagentIdentity>,
+    /// The Watches this Session's Agent left running, by the Provider's own
+    /// identity for each. They are never stored: every Watch dies with the
+    /// Provider process that runs it, so a Session read back from storage has
+    /// none, and the Monitoring derived from them starts over with it.
+    watches: HashMap<ProviderWatchId, watches::LiveWatch>,
 }
 
 pub(crate) struct SessionFeed {

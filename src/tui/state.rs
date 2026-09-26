@@ -1797,7 +1797,7 @@ impl TuiState {
                     changed.inputs.clone(),
                 );
             }
-            ManagedEvent::SessionWorkingChanged(_) => {}
+            ManagedEvent::SessionWorkingChanged(_) | ManagedEvent::SessionMonitoringChanged(_) => {}
             // Neither listing surface states a Session's total yet — the
             // footer of the Session in view reads its own — so the roll-up
             // the catalog announces moves nothing this client draws.
@@ -1866,6 +1866,13 @@ impl TuiState {
                 working.session_id,
                 working.working_since,
             ),
+            ManagedEvent::SessionMonitoringChanged(monitoring) => {
+                self.sidebar.set_monitoring_origin(
+                    outlook.clone(),
+                    monitoring.session_id,
+                    monitoring.monitoring_since,
+                )
+            }
             ManagedEvent::SessionStandingInputsChanged(changed) => {
                 self.sidebar.set_standing_inputs_origin(
                     outlook.clone(),
@@ -1906,6 +1913,7 @@ impl TuiState {
             | ManagedEvent::CheckoutStateChanged(_)
             | ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionWorkingChanged(_)
+            | ManagedEvent::SessionMonitoringChanged(_)
             | ManagedEvent::SessionUsageChanged(_) => {}
             ManagedEvent::SessionStandingInputsChanged(changed) => {
                 self.session_picker.set_standing_inputs(
@@ -3342,6 +3350,7 @@ impl TuiState {
                 approval_posture: None,
                 status: crate::protocol::SessionStatus::Active,
                 working_since: None,
+                monitoring_since: None,
                 parent: None,
             },
             revision: crate::protocol::SessionRevision::INITIAL,

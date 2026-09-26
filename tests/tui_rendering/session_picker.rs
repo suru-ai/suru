@@ -1692,6 +1692,7 @@ fn session_summary(
             approval_posture: None,
             status,
             working_since: None,
+            monitoring_since: None,
             parent: None,
         },
         title: title.to_owned(),
