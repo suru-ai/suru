@@ -723,6 +723,13 @@ impl NativeCorrelation {
     /// that delegated it, carrying what that delegation said. The Model the
     /// child last ran on follows it into the new Turn until fresher evidence
     /// arrives.
+    ///
+    /// A resume the Session's own thread delegated can begin after that
+    /// thread's turn completed, since the child's turn is reported apart from
+    /// it. The resume then lands in a Continuation, and Codex runs no turn of
+    /// the parent's to end it, so its end is reported with the resume: the
+    /// Continuation holds the row and settles at once, and the child keeps
+    /// the parent Working until it settles too (ADR 0015).
     fn resume_child(
         &mut self,
         child_thread_id: &str,
@@ -751,6 +758,9 @@ impl NativeCorrelation {
             .entry(child_thread_id.to_owned())
             .or_default()
             .observe(&turn_id);
+        let delegated_while_idle = claim.delegator == ProviderEventAttribution::OwningSession
+            && self.active_turn_id.is_none()
+            && !self.turn_starting;
         let subagent_id = ProviderSubagentId::new(child_thread_id);
         let mut resumed = vec![AttributedProviderEvent {
             attribution: claim.delegator,
@@ -765,6 +775,9 @@ impl NativeCorrelation {
             attribution: ProviderEventAttribution::OwningSession,
             event: ProviderEvent::SubagentModelChanged { subagent_id, model },
         }));
+        if delegated_while_idle {
+            resumed.push(ProviderEvent::TurnCompleted.into());
+        }
         resumed
     }
 }
@@ -3606,6 +3619,62 @@ mod tests {
             )),
             Some(80),
             "and keeps measuring from that one place"
+        );
+    }
+
+    #[test]
+    fn a_resume_after_the_parents_turn_completed_ends_the_continuation_it_lands_in() {
+        let mut correlation = settled_child();
+        project_attributed(
+            &mut correlation,
+            collab_call(
+                NativeCollabTool::SendInput,
+                Some("Carry on"),
+                Some(NativeCollabAgentStatus::Completed),
+            ),
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                NativeNotification::TurnCompleted {
+                    thread_id: THREAD.to_owned(),
+                    turn_id: TURN.to_owned(),
+                    outcome: NativeTurnOutcome::Completed,
+                    final_agent_message: None,
+                },
+            ),
+            vec![ProviderEvent::TurnCompleted],
+            "the parent's turn completes before the child's new one starts"
+        );
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![
+                child_resumed("Agent", "Carry on", Some("Carry on")),
+                ProviderEvent::TurnCompleted.into(),
+            ],
+            "the resume lands in a Continuation no Codex turn of the parent's holds open, so \
+             its end comes with it"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![on_child(ProviderEvent::AgentMessageStarted)],
+            "the child works on in its own Session"
+        );
+    }
+
+    #[test]
+    fn a_resume_during_the_parents_turn_leaves_that_turn_to_codex() {
+        let mut correlation = settled_child();
+        project_attributed(
+            &mut correlation,
+            collab_call(NativeCollabTool::SendInput, Some("Carry on"), None),
+        );
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_resumed("Agent", "Carry on", Some("Carry on"))],
+            "the parent's own turn is still running, and ends at Codex's boundary"
         );
     }
 

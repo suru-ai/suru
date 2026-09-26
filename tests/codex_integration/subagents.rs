@@ -2275,6 +2275,177 @@ async fn a_followup_task_waking_an_idle_agent_resumes_it_in_its_own_session() {
     opened.server.shutdown().await.expect("shut down server");
 }
 
+/// A send whose turn starts on the child only after the parent's own turn has completed: Codex
+/// reports the child's thread apart from the parent's, and nothing holds the parent's turn open
+/// for it. The script holds the resumed turn open until the test releases it.
+fn resumed_after_the_parent_settled_script() -> String {
+    let first_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-1"),
+        agent_message(
+            "child-thread",
+            "child-turn-1",
+            "child-message-1",
+            "No advisories.",
+        ),
+        turn_completed("child-thread", "child-turn-1"),
+        collab_call(
+            "root-turn",
+            "sendInput",
+            Some("Audit the lockfile too"),
+            "completed",
+        ),
+        agent_message(
+            "root-thread",
+            "root-turn",
+            "root-message",
+            "Sent the auditor back.",
+        ),
+        turn_completed("root-thread", "root-turn"),
+    ]
+    .concat();
+    let resumed_stretch = [
+        child_attached(),
+        turn_started("child-thread", "child-turn-2"),
+        agent_message(
+            "child-thread",
+            "child-turn-2",
+            "child-message-2",
+            "Lockfile is clean.",
+        ),
+        AWAIT_RELEASE.to_owned(),
+        turn_completed("child-thread", "child-turn-2"),
+    ]
+    .concat();
+    [
+        opening_arms(),
+        arm(
+            r#"*'"method":"turn/start"'*"#,
+            &[
+                answer(json!({ "turn": { "id": "root-turn" } })),
+                collab_call(
+                    "root-turn",
+                    "spawnAgent",
+                    Some("Audit the crates"),
+                    "running",
+                ),
+            ]
+            .concat(),
+        ),
+        child_attach_arm(&first_stretch, &resumed_stretch),
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn a_resume_whose_turn_starts_after_the_parents_turn_completed_lands_in_a_continuation() {
+    let fixture = ScriptedCodex::new_multiprocess(&resumed_after_the_parent_settled_script());
+    let opened = opened_session(&fixture, "codex-subagent-resumed-after-parent", "Audit").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let resumed = session_where(
+        client,
+        session_id,
+        "the late resume adds its row",
+        |snapshot| subagent_rows(snapshot).len() == 2,
+    )
+    .await;
+    let [prompted, continuation] = resumed.turns.as_slice() else {
+        panic!(
+            "the resume begins a Turn of its own after the parent's settled one, got {:?}",
+            resumed.turns
+        );
+    };
+    assert_eq!(prompted.status, TurnStatus::Completed);
+    assert_eq!(
+        continuation.prompt_id, None,
+        "a Continuation, not a Prompt's Turn"
+    );
+    let [
+        Activity::Subagent {
+            turn_id: spawn_turn,
+            session_id: child_id,
+            ..
+        },
+        Activity::Subagent {
+            turn_id: resume_turn,
+            session_id: resume_child,
+            description: resume_description,
+            ..
+        },
+    ] = subagent_rows(&resumed)[..]
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    assert_eq!(*spawn_turn, prompted.id);
+    assert_eq!(
+        *resume_turn, continuation.id,
+        "the resume's row stands in the Continuation it began, not the settled Turn that sent it"
+    );
+    assert_eq!(*resume_child, child_id);
+    assert_eq!(resume_description, "Audit the lockfile too");
+
+    let working = session_where(
+        client,
+        child_id,
+        "the resumed stretch's Message lands",
+        |snapshot| agent_message_contents(snapshot).len() == 2,
+    )
+    .await;
+    assert_eq!(working.turns[1].status, TurnStatus::Active);
+    let parent = client
+        .read_session(session_id)
+        .await
+        .expect("read the parent while the resumed child works");
+    assert!(
+        parent.working_since().is_some(),
+        "the resumed child keeps its parent Working"
+    );
+
+    fixture.release();
+    let parent = session_where(
+        client,
+        session_id,
+        "the parent stops Working once the resumed stretch settles",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(
+        parent.turns[1].status,
+        TurnStatus::Completed,
+        "Codex runs no parent turn to hold the Continuation open"
+    );
+    assert!(subagent_rows(&parent).iter().all(|row| matches!(
+        row,
+        Activity::Subagent {
+            status: ActivityStatus::Completed,
+            ..
+        }
+    )));
+    let child = settled_session(client, child_id, 1).await;
+    assert_eq!(
+        messages(&child),
+        [
+            (
+                delegation_from(session_id),
+                "Audit the crates",
+                child.turns[0].id
+            ),
+            (MessageRole::Agent, "No advisories.", child.turns[0].id),
+            (
+                delegation_from(session_id),
+                "Audit the lockfile too",
+                child.turns[1].id,
+            ),
+            (MessageRole::Agent, "Lockfile is clean.", child.turns[1].id),
+        ]
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
 /// A Session whose first Turn spawns a child that settles, and whose second Turn — after a Server
 /// restart relaunched the app-server — sends that child more work. The relaunched app-server
 /// never reports the child's spawn: only the send and the child's own thread name it.
