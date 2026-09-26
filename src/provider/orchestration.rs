@@ -1640,12 +1640,19 @@ async fn run_provider_session(
                             // follows its settle — it begins a Continuation
                             // (ADR 0015); with nothing owed, stray output —
                             // an interrupted Turn's trailing stream, say — is
-                            // discarded as it always was.
+                            // discarded as it always was. A resume is never
+                            // stray: it begins a stretch of delegated work
+                            // whose row stands in a Continuation when the
+                            // Turn that delegated it has already settled
+                            // (ADR 0031, 0032), and dropping it would leave
+                            // that stretch's work with nowhere to land.
                             event => {
                                 let mut identity = identity.clone();
                                 if let ProviderEvent::ContinuationStarted { selection } = &event {
                                     identity.selection = selection.clone();
-                                } else if !subagents.owes_continuation() {
+                                } else if !subagents.owes_continuation()
+                                    && !matches!(event, ProviderEvent::SubagentResumed { .. })
+                                {
                                     continue;
                                 }
                                 let Some(begun) = updates.apply(|| {

@@ -1995,6 +1995,211 @@ async fn a_resume_after_its_delegating_turn_settled_keeps_the_parent_working_unt
     fixture.server.shutdown().await.expect("shut down server");
 }
 
+/// A resume the Provider reports once the Turn that delegated it has settled
+/// and nothing else is owed a Continuation — a later Turn began and settled
+/// since the Subagent's own settle — as Codex reports one whose child's new
+/// turn starts only after the parent's turn completed. It begins a
+/// Continuation of its own rather than being discarded as stray output, which
+/// would leave the resumed stretch's work nowhere to land.
+#[tokio::test]
+async fn a_resume_arriving_with_no_turn_active_and_nothing_owed_begins_a_continuation() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "subagent-resume-idle-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_and_settled(&fixture, &subagent, "first-model").await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    // A later Turn begins and settles, so nothing the Subagent's settle
+    // provoked is owed any more.
+    fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            fixture.server.descriptor().base_url,
+            fixture.session_id,
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Summarise the map".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("admit a second Prompt")
+        .error_for_status()
+        .expect("the idle Session takes a Prompt");
+    timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the second Prompt reaches the Provider")
+        .succeed();
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the second Turn settles with nothing left working",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.working_since().is_none(),
+    )
+    .await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the tests too".to_owned(),
+            delegation: Some("Now map the tests too.".to_owned()),
+        })
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resume adds its row",
+        |snapshot| subagent_rows(snapshot).len() == 2,
+    )
+    .await;
+    let [_, _, continuation] = parent.turns.as_slice() else {
+        panic!(
+            "the resume begins a Turn of its own in the parent, got {:?}",
+            parent.turns
+        );
+    };
+    assert_eq!(continuation.prompt_id, None, "no Prompt began it");
+    assert_eq!(continuation.status, TurnStatus::Active);
+    let [
+        _,
+        Activity::Subagent {
+            turn_id,
+            status,
+            description,
+            session_id,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, continuation.id,
+        "the resume's row stands in the Continuation it began"
+    );
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(description, "Map the tests too");
+    assert_eq!(*session_id, child_id, "the row leads into the one Session");
+    assert!(
+        parent.working_since().is_some(),
+        "the parent is Working again"
+    );
+
+    let child = read_session(fixture.server.descriptor(), child_id).await;
+    let [_, resumed] = child.turns.as_slice() else {
+        panic!(
+            "the resume begins the child's second Turn, got {:?}",
+            child.turns
+        );
+    };
+    assert_eq!(resumed.status, TurnStatus::Active);
+    assert_eq!(
+        delegations(&child),
+        [(
+            resumed.id,
+            Delegator {
+                session_id: fixture.session_id,
+                name: None,
+            },
+            "Now map the tests too.",
+        )],
+        "the resumed Turn opens with the resume's Delegation"
+    );
+    let resumed_turn = resumed.id;
+
+    emit_for(&fixture, &subagent, agent_message("Mapped the tests.")).await;
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the resumed stretch's Message reaches the child",
+        |snapshot| {
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.content == "Mapped the tests.")
+        },
+    )
+    .await;
+    let resumed_work = child
+        .messages
+        .iter()
+        .find(|message| message.content == "Mapped the tests.")
+        .expect("the Message is in the child");
+    assert_eq!(
+        resumed_work.turn_id, resumed_turn,
+        "the resumed work lands in the Turn the resume began"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resume's row settles",
+        |snapshot| {
+            matches!(
+                subagent_rows(snapshot)[..],
+                [
+                    _,
+                    Activity::Subagent {
+                        status: ActivityStatus::Completed,
+                        ..
+                    }
+                ]
+            )
+        },
+    )
+    .await;
+    assert_eq!(parent.turns[2].status, TurnStatus::Active);
+    assert!(
+        parent.working_since().is_some(),
+        "the parent works on until the Provider settles the Continuation"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Continuation settles and the parent stops Working",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(parent.turns[2].status, TurnStatus::Completed);
+    let child = read_session(fixture.server.descriptor(), child_id).await;
+    assert_eq!(child.turns[1].status, TurnStatus::Completed);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
 /// A resume Suru cannot place — no Session it holds carries the identity, as
 /// for a Subagent spawned before identities were stored — is recorded as a
 /// new Subagent of its own rather than dropped or failing the Turn.
