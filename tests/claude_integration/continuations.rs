@@ -8,26 +8,75 @@ use suru::{
     managed_client::ManagedClient,
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId,
-        SessionId, SessionSummary, TurnStatus,
+        SessionId, SessionSnapshot, SessionSummary, TranscriptItem, TurnId, TurnStatus,
+        WatchOutcomeStatus,
     },
 };
 
 /// A Turn that leaves a background command running and ends its loop, then — once released — the
-/// command's completion waking the loop into a Continuation, which holds at its first message
-/// until the `continuation` gate is released too.
-const BACKGROUND_COMMAND: &str = r#"
-      emit '{"type":"system","subtype":"task_started","task_id":"tests","task_type":"local_bash"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"result":"Waiting for tests."}'
+/// command settling as `status` with `summary` and waking the loop into a Continuation, which
+/// holds at its first message until the `continuation` gate is released too.
+fn background_command(status: &str, summary: &str) -> String {
+    format!(
+        r#"
+      emit '{{"type":"system","subtype":"task_started","task_id":"tests","task_type":"local_bash","description":"Run cargo test"}}'
+      emit '{{"type":"result","subtype":"success","is_error":false,"result":"Waiting for tests."}}'
       while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
-      emit '{"type":"system","subtype":"task_notification","task_id":"tests","status":"completed","summary":"Background command \"cargo test\" completed (exit code 0)"}'
-      emit '{"type":"stream_event","event":{"type":"message_start"}}'
+      emit '{{"type":"system","subtype":"task_notification","task_id":"tests","status":"{status}","summary":"{summary}"}}'
+      emit '{{"type":"stream_event","event":{{"type":"message_start"}}}}'
       while [ ! -e "$CLAUDE_FIXTURE_RELEASE-continuation" ]; do sleep 0.01; done
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
-      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Tests passed."}}}'
-      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}'
-      emit '{"type":"result","subtype":"success","is_error":false,"result":"Tests passed."}'
-"#;
+      emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":""}}}}}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":1,"content_block":{{"type":"text","text":"Tests ran."}}}}}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":1}}}}'
+      emit '{{"type":"result","subtype":"success","is_error":false,"result":"Tests ran."}}'
+"#
+    )
+}
+
+/// The background command's completion as the CLI summarizes it.
+const COMPLETED_SUMMARY: &str = r#"Background command \"cargo test\" completed (exit code 0)"#;
+
+/// The Transcript entries of one Turn in presentation order: the Activity at the head of a
+/// Continuation is the first entry the reader meets in it.
+fn turn_entries(snapshot: &SessionSnapshot, turn_id: TurnId) -> Vec<TranscriptItem> {
+    snapshot
+        .transcript
+        .iter()
+        .copied()
+        .filter(|item| match item {
+            TranscriptItem::Message { message_id } => snapshot
+                .messages
+                .iter()
+                .any(|message| message.id == *message_id && message.turn_id == turn_id),
+            TranscriptItem::Activity { activity_id } => snapshot
+                .activities
+                .iter()
+                .any(|activity| activity.id() == *activity_id && activity.turn_id() == turn_id),
+        })
+        .collect()
+}
+
+/// The Watch Outcome heading the Continuation at `turn_index`, which must be the Turn's first
+/// Transcript entry.
+fn heading_watch_outcome(snapshot: &SessionSnapshot, turn_index: usize) -> &Activity {
+    let turn_id = snapshot.turns[turn_index].id;
+    let Some(TranscriptItem::Activity { activity_id }) =
+        turn_entries(snapshot, turn_id).first().copied()
+    else {
+        panic!("the Continuation begins with an Activity: {snapshot:#?}");
+    };
+    let activity = snapshot
+        .activities
+        .iter()
+        .find(|activity| activity.id() == activity_id)
+        .expect("the heading Activity is in the Session");
+    assert!(
+        matches!(activity, Activity::WatchOutcome { .. }),
+        "the Continuation begins with a Watch Outcome, not {activity:?}"
+    );
+    activity
+}
 
 /// The Session's row in the client's listing.
 async fn listed(client: &ManagedClient, session_id: SessionId) -> SessionSummary {
@@ -46,7 +95,7 @@ async fn listed(client: &ManagedClient, session_id: SessionId) -> SessionSummary
 
 #[tokio::test]
 async fn a_background_command_completion_resumes_into_a_visible_continuation() {
-    let claude = conversation_fixture(BACKGROUND_COMMAND);
+    let claude = conversation_fixture(&background_command("completed", COMPLETED_SUMMARY));
     let opened = opened_session(&claude, "claude-command-continuation", "Run tests").await;
     let first = settled_session(&opened.client, opened.session_id, 0).await;
     assert_eq!(first.turns[0].status, TurnStatus::Completed);
@@ -80,6 +129,17 @@ async fn a_background_command_completion_resumes_into_a_visible_continuation() {
     .await;
     assert_eq!(woken.turns[1].status, TurnStatus::Active);
     assert_eq!(
+        heading_watch_outcome(&woken, 1),
+        &Activity::WatchOutcome {
+            id: heading_watch_outcome(&woken, 1).id(),
+            turn_id: woken.turns[1].id,
+            status: WatchOutcomeStatus::Completed,
+            description: "Run cargo test".to_owned(),
+            summary: Some(r#"Background command "cargo test" completed (exit code 0)"#.to_owned()),
+        },
+        "the Continuation the wake began opens with how the Watch settled, in Claude's words"
+    );
+    assert_eq!(
         woken.session.monitoring_since, None,
         "the Watch that woke the Agent is settled, and the Session is Working again"
     );
@@ -102,15 +162,75 @@ async fn a_background_command_completion_resumes_into_a_visible_continuation() {
     let resumed = settled_session(&opened.client, opened.session_id, 1).await;
     assert_eq!(resumed.turns[1].prompt_id, None);
     assert_eq!(resumed.turns[1].status, TurnStatus::Completed);
-    assert_eq!(agent_messages(&resumed)[0].content, "Tests passed.");
+    assert_eq!(agent_messages(&resumed)[0].content, "Tests ran.");
     assert!(resumed.activities.iter().any(|activity| matches!(activity,
         Activity::Reasoning { turn_id, status: ActivityStatus::Completed, .. }
             if *turn_id == resumed.turns[1].id
     )));
+    let outcome = heading_watch_outcome(&resumed, 1).id();
+    let continuation = turn_entries(&resumed, resumed.turns[1].id);
+    assert!(
+        continuation.len() > 2,
+        "the Continuation's Reasoning and Message follow its Watch Outcome: {continuation:?}"
+    );
+    assert_eq!(
+        resumed
+            .activities
+            .iter()
+            .filter(|activity| matches!(activity, Activity::WatchOutcome { .. }))
+            .map(Activity::id)
+            .collect::<Vec<_>>(),
+        vec![outcome],
+        "the one Watch that woke the Agent records one Watch Outcome"
+    );
     assert_eq!(resumed.session.working_since, None);
     assert_eq!(
         resumed.session.monitoring_since, None,
         "with its only Watch settled, the Session is neither Working nor Monitoring"
+    );
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_failed_background_command_heads_its_continuation_with_a_failed_watch_outcome() {
+    let claude = conversation_fixture(&background_command(
+        "failed",
+        r#"Background command \"cargo test\" failed with exit code 1"#,
+    ));
+    let opened = opened_session(&claude, "claude-failed-watch-outcome", "Run tests").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    claude.release();
+    claude.release_gate("continuation");
+
+    let resumed = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(resumed.turns[1].prompt_id, None);
+    let Activity::WatchOutcome {
+        turn_id,
+        status,
+        description,
+        summary,
+        ..
+    } = heading_watch_outcome(&resumed, 1)
+    else {
+        unreachable!("the heading Activity is a Watch Outcome");
+    };
+    assert_eq!(*turn_id, resumed.turns[1].id);
+    assert_eq!(
+        *status,
+        WatchOutcomeStatus::Failed,
+        "the failed command's Watch Outcome shows it failed"
+    );
+    assert_eq!(description, "Run cargo test");
+    assert_eq!(
+        summary.as_deref(),
+        Some(r#"Background command "cargo test" failed with exit code 1"#)
+    );
+    assert!(
+        !resumed.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::WatchOutcome { turn_id, .. } if *turn_id == resumed.turns[0].id
+        )),
+        "the Turn that left the command running settled before it failed"
     );
     opened.server.shutdown().await.expect("shut down server");
 }

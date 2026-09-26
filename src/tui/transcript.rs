@@ -2832,6 +2832,16 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             description.hash(&mut hasher);
             duration_ms.hash(&mut hasher);
         }
+        Activity::WatchOutcome {
+            status,
+            description,
+            summary,
+            ..
+        } => {
+            (*status as u8).hash(&mut hasher);
+            description.hash(&mut hasher);
+            summary.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -3181,6 +3191,21 @@ fn render_activity(
             *duration_ms,
             theme,
         )),
+        Activity::WatchOutcome {
+            status,
+            description,
+            summary,
+            ..
+        } => {
+            push_watch_outcome_activity(
+                projection.lines,
+                *status,
+                description,
+                summary.as_deref(),
+                theme,
+            );
+            None
+        }
     }
 }
 
@@ -4127,6 +4152,36 @@ fn push_subagent_activity(
     // The row hides nothing — it is the way into the child Session, so the
     // anchor exists to make its whole extent a press target.
     UnitAnchor::binary(lines.len() - start, false)
+}
+
+/// Projects a Watch Outcome: why the Agent started working again, told in the
+/// Provider's own words where it gave some. Its Marker is the outcome glyph a
+/// settled Subagent wears for the same result, and like a Status it is already
+/// the whole of what it says, so there is nothing to fold. A Provider that gave
+/// no summary still leaves the reader the Watch's description and how it
+/// ended, rather than a Marker with nothing beside it.
+fn push_watch_outcome_activity(
+    lines: &mut Vec<StyledLine>,
+    status: crate::protocol::WatchOutcomeStatus,
+    description: &str,
+    summary: Option<&str>,
+    theme: &Theme,
+) {
+    use crate::protocol::{ActivityStatus, WatchOutcomeStatus};
+
+    let (settled, ended) = match status {
+        WatchOutcomeStatus::Completed => (ActivityStatus::Completed, "completed"),
+        WatchOutcomeStatus::Failed => (ActivityStatus::Failed, "failed"),
+        WatchOutcomeStatus::Stopped => (ActivityStatus::Interrupted, "stopped"),
+    };
+    let (marker, style) = subagent_marker(settled, theme);
+    let summary = summary.filter(|summary| !summary.trim().is_empty());
+    let text = match (summary, description.trim()) {
+        (Some(summary), _) => summary.to_owned(),
+        (None, "") => format!("Watch {ended}"),
+        (None, description) => format!("\"{description}\" {ended}"),
+    };
+    push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
 }
 
 /// The Marker a Subagent wears wherever it is listed — its Transcript row and
@@ -5931,7 +5986,8 @@ mod tests {
             | Activity::Command { turn_id: id, .. }
             | Activity::FileChange { turn_id: id, .. }
             | Activity::Reasoning { turn_id: id, .. }
-            | Activity::Subagent { turn_id: id, .. } => *id = turn_id,
+            | Activity::Subagent { turn_id: id, .. }
+            | Activity::WatchOutcome { turn_id: id, .. } => *id = turn_id,
         }
     }
 

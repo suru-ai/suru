@@ -1855,11 +1855,23 @@ pub enum ActivityStatus {
     Active,
     Completed,
     Failed,
-    /// Settled because the user asked the work to stop — an interrupted
-    /// Session or a Subagent stopped on its own — rather than because it
-    /// finished or went wrong. Only Subagent Activities settle this way:
-    /// every other kind is closed by its Turn's own settle.
+    /// Settled because the work was asked to stop — an interrupted Session,
+    /// a Subagent stopped on its own, or a Watch stopped before it finished —
+    /// rather than because it finished or went wrong. Only Subagent and Watch
+    /// Outcome Activities settle this way: every other kind is closed by its
+    /// Turn's own settle.
     Interrupted,
+}
+
+/// How a Watch settled, as recorded by its Watch Outcome. A Watch lost with
+/// its Provider process wakes nothing and so records no outcome, which is why
+/// there is no lost status here.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchOutcomeStatus {
+    Completed,
+    Failed,
+    Stopped,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1976,6 +1988,21 @@ pub enum Activity {
         /// connection closed, there being no moment the work truly ended.
         duration_ms: Option<u64>,
     },
+    /// How a Watch settled, recorded because its settling woke the Agent: it
+    /// heads the Turn the Agent woke into, or stands in the Turn that was
+    /// active when it arrived, so the reader can see why the Agent worked on.
+    /// It is settled from the moment it is recorded, and it is no Command:
+    /// the Command that started the Watch already stands where it ran.
+    WatchOutcome {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: WatchOutcomeStatus,
+        /// What the Watch was doing, in the words its Provider gave it.
+        description: String,
+        /// The Provider's own account of how the Watch settled, where it gave
+        /// one: display text, never parsed.
+        summary: Option<String>,
+    },
 }
 
 impl Activity {
@@ -1988,7 +2015,8 @@ impl Activity {
             | Self::Command { id, .. }
             | Self::FileChange { id, .. }
             | Self::Reasoning { id, .. }
-            | Self::Subagent { id, .. } => *id,
+            | Self::Subagent { id, .. }
+            | Self::WatchOutcome { id, .. } => *id,
         }
     }
 
@@ -2001,7 +2029,8 @@ impl Activity {
             | Self::Command { turn_id, .. }
             | Self::FileChange { turn_id, .. }
             | Self::Reasoning { turn_id, .. }
-            | Self::Subagent { turn_id, .. } => *turn_id,
+            | Self::Subagent { turn_id, .. }
+            | Self::WatchOutcome { turn_id, .. } => *turn_id,
         }
     }
 
@@ -2030,6 +2059,11 @@ impl Activity {
             | Self::FileChange { status, .. }
             | Self::Reasoning { status, .. }
             | Self::Subagent { status, .. } => Some(*status),
+            Self::WatchOutcome { status, .. } => Some(match status {
+                WatchOutcomeStatus::Completed => ActivityStatus::Completed,
+                WatchOutcomeStatus::Failed => ActivityStatus::Failed,
+                WatchOutcomeStatus::Stopped => ActivityStatus::Interrupted,
+            }),
         }
     }
 }

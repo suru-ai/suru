@@ -35,7 +35,7 @@ use suru::{
         Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery,
         PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId,
         SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot,
-        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage,
+        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage, WatchOutcomeStatus,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -3280,6 +3280,93 @@ fn subagent_rows_render_working_settled_failed_and_stopped_states() {
     }
 }
 
+/// A Session whose single Activity is a Watch Outcome, heading the Turn its
+/// Watch woke the Agent into.
+fn watch_outcome_session(
+    workspace: &std::path::Path,
+    status: WatchOutcomeStatus,
+    description: &str,
+    summary: Option<&str>,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Run the tests in the background",
+        workspace,
+    );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    snapshot.activities[0] = Activity::WatchOutcome {
+        id: snapshot.activities[0].id(),
+        turn_id,
+        status,
+        description: description.to_owned(),
+        summary: summary.map(ToOwned::to_owned),
+    };
+    snapshot
+}
+
+#[test]
+fn watch_outcome_rows_wear_the_outcome_marker_for_each_status_beside_the_providers_summary() {
+    let workspace = workspace_dir();
+    let cases = [
+        (
+            WatchOutcomeStatus::Completed,
+            "cargo test",
+            Some(r#"Background command "cargo test" completed (exit code 0)"#),
+            r#"    ✓ Background command "cargo test" completed (exit code 0)"#,
+            Color::DarkGray,
+        ),
+        (
+            WatchOutcomeStatus::Failed,
+            "cargo test",
+            Some(r#"Background command "cargo test" failed with exit code 1"#),
+            r#"    × Background command "cargo test" failed with exit code 1"#,
+            Color::Red,
+        ),
+        // Stopped wears the face a stopped Subagent does, so a stop reads as
+        // a stop rather than as the Watch going wrong.
+        (
+            WatchOutcomeStatus::Stopped,
+            "tail logs",
+            Some(r#"Monitor "tail logs" stopped"#),
+            r#"    × Monitor "tail logs" stopped"#,
+            Color::Yellow,
+        ),
+        // A Provider that gave no summary still says which Watch it was and
+        // how it ended.
+        (
+            WatchOutcomeStatus::Completed,
+            "cargo test",
+            None,
+            r#"    ✓ "cargo test" completed"#,
+            Color::DarkGray,
+        ),
+    ];
+
+    for (status, description, summary, row, color) in cases {
+        let snapshot = watch_outcome_session(workspace.path(), status, description, summary);
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with a Watch Outcome");
+
+        let buffer = rendered_application_buffer(&application, 80, 22);
+        let rows = buffer_rows(&buffer);
+        let text = rows.join("\n");
+        let found = rows
+            .iter()
+            .find(|rendered| rendered.trim_end() == row)
+            .unwrap_or_else(|| panic!("the Watch Outcome row reads {row:?}:\n{text}"));
+        let marker = row.trim_start();
+        assert_eq!(
+            text_cell(&buffer, marker).fg,
+            color,
+            "the {status:?} Marker is drawn in its outcome's style: {found}"
+        );
+    }
+}
+
 #[test]
 fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let workspace = workspace_dir();
@@ -3985,6 +4072,8 @@ enum RunEntry {
     FileChange,
     Status(&'static str),
     Error(&'static str),
+    /// A completed Watch's outcome, in the words of its summary.
+    WatchOutcome(&'static str),
 }
 
 /// One Reasoning block a run fixture holds. Every property is spelled out
@@ -4166,6 +4255,13 @@ fn command_run_snapshot(
                 turn_id,
                 text: (*text).to_owned(),
             },
+            RunEntry::WatchOutcome(summary) => Activity::WatchOutcome {
+                id: ActivityId::new(),
+                turn_id,
+                status: WatchOutcomeStatus::Completed,
+                description: "cargo test".to_owned(),
+                summary: Some((*summary).to_owned()),
+            },
         };
         snapshot.transcript.push(TranscriptItem::Activity {
             activity_id: activity.id(),
@@ -4294,7 +4390,7 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
 #[test]
 fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
     let workspace = workspace_dir();
-    let breakers: [(RunEntry, &str); 7] = [
+    let breakers: [(RunEntry, &str); 8] = [
         (
             RunEntry::AgentMessage("A breaking message"),
             "A breaking message",
@@ -4317,6 +4413,11 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
             "Agent Selection changed",
         ),
         (RunEntry::Error("Provider failed"), "Error: Provider failed"),
+        // A Watch Outcome is no Command, however its Watch began.
+        (
+            RunEntry::WatchOutcome("Background command \"cargo test\" completed"),
+            "✓ Background command \"cargo test\" completed",
+        ),
         (
             RunEntry::Command(ActivityStatus::Failed, Some(2)),
             "× command 3 (exit 2)",

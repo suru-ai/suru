@@ -1072,6 +1072,52 @@ fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
 }
 
 #[test]
+fn a_watch_outcome_is_added_already_settled_with_its_status_description_and_summary() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let update = SessionUpdate {
+        session_id,
+        revision: SessionRevision(8),
+        changes: vec![SessionChange::ActivityAdded {
+            activity: Activity::WatchOutcome {
+                id: activity_id,
+                turn_id,
+                status: suru::protocol::WatchOutcomeStatus::Failed,
+                description: "cargo test".to_owned(),
+                summary: Some(
+                    r#"Background command "cargo test" failed with exit code 1"#.to_owned(),
+                ),
+            },
+        }],
+    };
+    let expected = json!({
+        "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "revision": 8,
+        "changes": [{
+            "type": "activity_added",
+            "activity": {
+                "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                "kind": "watch_outcome",
+                "status": "failed",
+                "description": "cargo test",
+                "summary": "Background command \"cargo test\" failed with exit code 1"
+            }
+        }]
+    });
+
+    assert_eq!(
+        serde_json::to_value(&update).expect("encode a Watch Outcome"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionUpdate>(expected).expect("decode a Watch Outcome"),
+        update
+    );
+}
+
+#[test]
 fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));

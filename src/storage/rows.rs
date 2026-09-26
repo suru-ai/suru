@@ -969,6 +969,11 @@ enum StoredActivityPayload {
         session_id: SessionId,
         duration_ms: Option<u64>,
     },
+    WatchOutcome {
+        status: crate::protocol::WatchOutcomeStatus,
+        description: String,
+        summary: Option<String>,
+    },
 }
 
 impl StoredActivityPayload {
@@ -1059,6 +1064,17 @@ impl StoredActivityPayload {
                 session_id,
                 duration_ms,
             },
+            Self::WatchOutcome {
+                status,
+                description,
+                summary,
+            } => Activity::WatchOutcome {
+                id,
+                turn_id,
+                status,
+                description,
+                summary,
+            },
         }
     }
 }
@@ -1145,6 +1161,16 @@ impl From<Activity> for StoredActivityPayload {
                 model,
                 session_id,
                 duration_ms,
+            },
+            Activity::WatchOutcome {
+                status,
+                description,
+                summary,
+                ..
+            } => Self::WatchOutcome {
+                status,
+                description,
+                summary,
             },
         }
     }

@@ -17,11 +17,8 @@ use super::SessionStore;
 /// One Watch still live in a Session.
 #[derive(Debug)]
 pub(super) struct LiveWatch {
-    /// What the Watch is doing, in the words its Provider gave it.
-    #[expect(
-        dead_code,
-        reason = "kept for the Working Indicator to name the Watch it waits on (#382)"
-    )]
+    /// What the Watch is doing, in the words its Provider gave it — read back
+    /// when it settles, for the Watch Outcome that tells of it.
     pub(super) description: String,
     /// When the Server heard the Watch start, on the Session store's clock, so
     /// it orders against the Turn moments Monitoring is derived beside.
@@ -63,19 +60,26 @@ impl SessionStore {
     }
 
     /// Forgets a Watch that settled, however it ended, and re-derives the
-    /// Session's liveness. A Watch the Session never recorded — or one
-    /// already forgotten — leaves everything as it was.
-    pub(crate) fn settle_watch(&self, session_id: SessionId, watch_id: &ProviderWatchId) {
+    /// Session's liveness, answering with the Watch's description so its
+    /// Watch Outcome can say which Watch it was. A Watch the Session never
+    /// recorded — or one already forgotten — leaves everything as it was and
+    /// has no description to give.
+    pub(crate) fn settle_watch(
+        &self,
+        session_id: SessionId,
+        watch_id: &ProviderWatchId,
+    ) -> Option<String> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let Some(record) = state.sessions.get_mut(&session_id) else {
-            return;
-        };
-        if record.watches.remove(watch_id).is_some() {
-            state.reconcile_liveness(&self.storage, session_id);
-        }
+        let settled = state
+            .sessions
+            .get_mut(&session_id)?
+            .watches
+            .remove(watch_id)?;
+        state.reconcile_liveness(&self.storage, session_id);
+        Some(settled.description)
     }
 
     /// Forgets every Watch in the Session's subtree, because the Provider

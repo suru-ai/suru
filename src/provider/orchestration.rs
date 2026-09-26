@@ -1,8 +1,10 @@
 mod approvals;
 mod questionnaires;
+mod watch_outcomes;
 
 use approvals::{DecisionDeliveries, LiveApprovals};
 use questionnaires::{LiveQuestionnaires, QuestionnaireDeliveries};
+use watch_outcomes::{HeldWatchOutcomes, WatchOutcome};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -375,6 +377,12 @@ struct SubagentRoutes {
     /// beginning clears it, because from then on such output has a Turn to
     /// land in.
     late_settle_owes_continuation: bool,
+    /// The Watch Outcomes waiting for the next Turn of the Session whose
+    /// Agent their Watches woke. They sit beside the owed Continuation because
+    /// they wait on the same wake, and beside the routes because a woken
+    /// Subagent's Turn opens here and because they die with the connection
+    /// too: a wake it never delivered begins no Turn to explain.
+    watch_outcomes: HeldWatchOutcomes,
 }
 
 struct SubagentRoute {
@@ -430,6 +438,7 @@ impl SubagentRoutes {
             identities: HashMap::new(),
             stopped: HashSet::new(),
             late_settle_owes_continuation: false,
+            watch_outcomes: HeldWatchOutcomes::default(),
         }
     }
 
@@ -522,6 +531,7 @@ impl SubagentRoutes {
         interventions: OpenInterventions,
     ) {
         self.context_routes.clear();
+        self.watch_outcomes.drop_all();
         for (_, mut route) in self.routes.drain() {
             fail_active_turn(
                 sessions,
@@ -625,13 +635,15 @@ impl SubagentRoutes {
     /// Settles every working Subagent as stopped, for the interrupt that
     /// reaches them all. Whatever output a settle was still owed is owed no
     /// longer — an interrupted stream's trailing output is discarded, as it
-    /// always was — so this also stands down the Continuation.
+    /// always was — so this also stands down the Continuation, and the Watch
+    /// Outcomes held for it with it.
     fn stop_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate) {
         let working = self.rows.keys().cloned().collect::<Vec<_>>();
         for subagent in working {
             self.settle_stopped(sessions, updates, &subagent);
         }
         self.late_settle_owes_continuation = false;
+        self.watch_outcomes.drop_all();
     }
 
     /// Applies a Provider's description update to the row it names, or `None`
@@ -798,6 +810,11 @@ impl SubagentRoutes {
                     text,
                 }),
         )?;
+        // A Watch that woke the settled Subagent heads the Turn it next works
+        // in, whatever began it.
+        if let Err(error) = self.watch_outcomes.release(sessions, session_id, turn_id) {
+            tracing::warn!(%session_id, "a Watch Outcome could not be recorded: {error:#}");
+        }
         let activity_id = add_subagent_row(
             sessions,
             delegating,
@@ -1592,7 +1609,7 @@ async fn run_provider_session(
                             session_id,
                             &mut subagents,
                             &attribution,
-                            true,
+                            None,
                             event,
                         ),
                         // A Subagent's events land in its own Session whether
@@ -1685,6 +1702,15 @@ async fn run_provider_session(
                                 let Ok(turn_id) = begun else {
                                     continue;
                                 };
+                                // The Continuation a Watch woke the Agent
+                                // into begins with how that Watch settled.
+                                release_watch_outcomes(
+                                    &sessions,
+                                    &updates,
+                                    &mut subagents,
+                                    session_id,
+                                    turn_id,
+                                );
                                 let mut continuation =
                                     ActiveProviderTurn::new_continuation(turn_id);
                                 let projection = project_provider_event(
@@ -1768,6 +1794,8 @@ async fn run_provider_session(
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
                 ProviderCommand::InterruptSession { response } => {
+                    // A wake the interrupt beats begins no Turn to explain.
+                    subagents.watch_outcomes.drop_all();
                     // With no Turn active, the interrupt reaches the
                     // Subagents that outlived it (ADR 0015). Nothing still
                     // working answers success, because the work the caller
@@ -2166,6 +2194,9 @@ async fn run_provider_session(
             }
             active = Some(ActiveProviderTurn::new(turn_id));
             subagents.late_settle_owes_continuation = false;
+            // A Prompt that won the race to a Watch's wake begins the Turn
+            // in which the Agent hears of it.
+            release_watch_outcomes(&sessions, &updates, &mut subagents, session_id, turn_id);
             continue;
         }
 
@@ -2591,7 +2622,7 @@ async fn run_provider_session(
                         session_id,
                         &mut subagents,
                         &attribution,
-                        false,
+                        Some(current.turn_id),
                         event,
                     ),
                     Some(Ok(AttributedProviderEvent {
@@ -2802,17 +2833,20 @@ fn lose_provider_connection(
 /// Records a Watch starting or settling in the Session whose Agent started it:
 /// the owning Session, or a Subagent's own for a Watch its Agent left running.
 /// A Watch is no output of any Turn — the Command that started it already
-/// stands in the Transcript — so it never lands in one, and it opens no
-/// Continuation: only the output its settling provokes does. A Watch
-/// attributed to a Subagent the connection never named lands nowhere, like
-/// any other unrouted Subagent event.
+/// stands in the Transcript — so it opens no Continuation: only the output
+/// its settling provokes does. What a settling that woke the Agent does leave
+/// is its Watch Outcome: in the Turn active in the Watch's Session — the
+/// owning Session's `active_turn`, or a working Subagent's — or else held for
+/// the next Turn to open there. A Watch attributed to a Subagent the
+/// connection never named lands nowhere, like any other unrouted Subagent
+/// event.
 fn track_watch(
     sessions: &SessionStore,
     updates: &ProviderUpdateGate,
     session_id: SessionId,
     subagents: &mut SubagentRoutes,
     attribution: &ProviderEventAttribution,
-    idle: bool,
+    active_turn: Option<TurnId>,
     event: ProviderEvent,
 ) {
     let owner = match attribution {
@@ -2838,19 +2872,71 @@ fn track_watch(
         }
         ProviderEvent::WatchSettled {
             watch_id,
+            outcome,
+            summary,
             woke_agent,
-            ..
         } => {
-            let _ = updates.apply(|| sessions.settle_watch(owner, &watch_id));
+            let Some(description) = updates.apply(|| sessions.settle_watch(owner, &watch_id))
+            else {
+                return;
+            };
             // A Watch that woke the owning Session's Agent while no Turn was
             // active owes a Continuation to whatever output its settling
             // provokes, as a Subagent's late settle does. One settling during
             // a Turn wakes the Agent into that Turn instead.
-            if woke_agent && idle && owner == session_id {
+            if woke_agent && active_turn.is_none() && owner == session_id {
                 subagents.late_settle_owes_continuation = true;
+            }
+            let Some(outcome) = WatchOutcome::of(
+                outcome,
+                woke_agent,
+                description.as_deref().unwrap_or_default(),
+                summary.as_deref(),
+            ) else {
+                return;
+            };
+            let owner_turn = if owner == session_id {
+                active_turn
+            } else {
+                subagents
+                    .routes
+                    .values()
+                    .find(|route| route.session_id == owner)
+                    .map(|route| route.turn.turn_id)
+            };
+            match owner_turn {
+                Some(turn_id) => {
+                    if let Some(Err(error)) =
+                        updates.apply(|| outcome.record(sessions, owner, turn_id))
+                    {
+                        tracing::warn!(
+                            session_id = %owner,
+                            "a Watch Outcome could not be recorded: {error:#}"
+                        );
+                    }
+                }
+                None => subagents.watch_outcomes.hold(owner, outcome),
             }
         }
         _ => unreachable!("only Watch events are tracked as Watches"),
+    }
+}
+
+/// Records the Watch Outcomes held for `session_id` at the head of the Turn
+/// that just opened there, before anything else lands in it.
+fn release_watch_outcomes(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    subagents: &mut SubagentRoutes,
+    session_id: SessionId,
+    turn_id: TurnId,
+) {
+    if let Some(Err(error)) = updates.apply(|| {
+        subagents
+            .watch_outcomes
+            .release(sessions, session_id, turn_id)
+    }) {
+        tracing::warn!(%session_id, "a Watch Outcome could not be recorded: {error:#}");
     }
 }
 
