@@ -211,8 +211,8 @@ fn an_open_intervention_panel_outranks_an_aside_holding_the_keys_until_it_closes
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         focused_aside_rows(&application),
-        [2],
-        "and they walk its entries"
+        [2, 3],
+        "and they walk its entries, a Subagent's two lines painted as one"
     );
 }
 

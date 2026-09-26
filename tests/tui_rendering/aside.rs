@@ -249,27 +249,33 @@ fn the_aside_stands_beside_an_open_session_and_is_absent_on_the_landing() {
 }
 
 #[test]
-fn entries_run_depth_first_with_guides_marker_name_title_and_a_final_or_blank_duration() {
+fn entries_run_depth_first_over_two_lines_with_guides_marker_title_name_and_a_final_or_blank_duration()
+ {
     let workspace = workspace_dir();
     let (application, _) = tree_open_at_top(workspace.path());
 
     let rows = aside_rows(&application, WIDTH);
     assert_eq!(
-        rows[..5],
+        rows[..8],
         [
             "Subagents 3",
             "Map every seam",
-            "├ ✓ Explore Map the prov… 12s",
-            "│ └ ⠋ Review Check the mappe…",
-            "└ ✓ Plan Weigh the options",
+            "├ ✓ Map the provider seams",
+            "│ │ Explore               12s",
+            "│ └ ⠋ Check the mapped seams",
+            "│     Review",
+            "└ ✓ Weigh the options",
+            "    Plan",
         ],
-        "the top-level Session heads the tree, each Subagent follows its spawner in \
-         spawn order, and a settle with no known duration leaves the time blank: {rows:#?}"
+        "the top-level Session heads the tree; each Subagent follows its spawner in \
+         spawn order over two lines, its Marker and Title first and its name and time \
+         beneath, the guides running on through the second line to the entries it \
+         spawned; and a settle with no known duration leaves the time blank: {rows:#?}"
     );
 }
 
 #[test]
-fn the_title_truncates_before_the_name() {
+fn the_title_has_the_first_line_and_the_name_and_time_the_second() {
     let workspace = workspace_dir();
     let tree = Tree::new();
     let mut application = client(workspace.path());
@@ -286,8 +292,13 @@ fn the_title_truncates_before_the_name() {
 
     let rows = aside_rows(&application, WIDTH);
     assert_eq!(
-        rows[2], "└ ✓ Cartographer Chart e… 12s",
-        "the name stands whole while the Title gives way: {rows:#?}"
+        rows[2..4],
+        [
+            "└ ✓ Chart every Provider sea…",
+            "    Cartographer          12s",
+        ],
+        "the Title has the whole of its line, and the name stands whole beneath it \
+         beside the time: {rows:#?}"
     );
 }
 
@@ -370,13 +381,17 @@ fn a_settle_never_moves_an_entry() {
 
     let rows = aside_rows(&application, WIDTH);
     assert_eq!(
-        rows[2..5],
+        rows[2..8],
         [
-            "├ ✓ Explore Map the prov… 12s",
-            "│ └ × Review Check the ma… 3s",
-            "└ ✓ Plan Weigh the options",
+            "├ ✓ Map the provider seams",
+            "│ │ Explore               12s",
+            "│ └ × Check the mapped seams",
+            "│     Review · Failed      3s",
+            "└ ✓ Weigh the options",
+            "    Plan",
         ],
-        "the settled entry wears its outcome and final time where it stood: {rows:#?}"
+        "the settled entry wears its outcome — named beside its name, since a stop \
+         wears the same glyph — and final time where it stood: {rows:#?}"
     );
 }
 
@@ -403,11 +418,14 @@ fn a_late_spawn_stands_beneath_its_spawner() {
     let rows = aside_rows(&application, WIDTH);
     assert_eq!(rows[0], "Subagents 4");
     assert_eq!(
-        rows[3..6],
+        rows[4..10],
         [
-            "│ ├ ⠋ Review Check the mappe…",
-            "│ └ ⠋ Probe Probe a seam",
-            "└ ✓ Plan Weigh the options",
+            "│ ├ ⠋ Check the mapped seams",
+            "│ │   Review",
+            "│ └ ⠋ Probe a seam",
+            "│     Probe",
+            "└ ✓ Weigh the options",
+            "    Plan",
         ],
         "{rows:#?}"
     );
@@ -1295,6 +1313,17 @@ fn aside_row(application: &Application, needle: &str) -> String {
         .clone()
 }
 
+/// The two lines of the Subagent entry named `name`: its Marker and Title
+/// line, and the name-and-time line beneath it.
+fn entry_lines(application: &Application, name: &str) -> [String; 2] {
+    let rows = aside_rows(application, WIDTH);
+    let detail = rows
+        .iter()
+        .position(|row| row.contains(name))
+        .unwrap_or_else(|| panic!("the Aside draws {name:?}: {rows:#?}"));
+    [rows[detail - 1].clone(), rows[detail].clone()]
+}
+
 /// The colour "Needs Intervention" is drawn in on the Aside row at `row`.
 fn needs_intervention_colour(application: &Application, row: usize) -> Option<Color> {
     let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
@@ -1356,14 +1385,14 @@ fn a_working_entry_ticks_from_when_its_work_began_and_stands_at_its_final_durati
             monitoring_since: None,
         },
     );
-    let settled = aside_row(&application, "Review");
+    let settled = entry_lines(&application, "Review");
     assert!(
-        settled.ends_with(" 1m 35s") && settled.contains('✓'),
+        settled[1].ends_with(" 1m 35s") && settled[0].contains('✓'),
         "a settle stands the entry at the duration its work took: {settled:?}"
     );
     advance_session_clock(&now, 60_000);
     assert_eq!(
-        aside_row(&application, "Review"),
+        entry_lines(&application, "Review"),
         settled,
         "and the time no longer moves"
     );
@@ -1393,8 +1422,11 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
         SubagentTreeEvent::Snapshot(snapshot),
     );
     assert_eq!(
-        aside_row(&application, "Explore"),
-        "├ ✓ Explore Map the prov… 12s"
+        entry_lines(&application, "Explore"),
+        [
+            "├ ✓ Map the provider seams",
+            "│ │ Explore               12s"
+        ]
     );
     assert!(!application.wants_spinner());
 
@@ -1410,9 +1442,9 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
             monitoring_since: None,
         },
     );
-    let resumed = aside_row(&application, "Explore");
+    let resumed = entry_lines(&application, "Explore");
     assert!(
-        resumed.starts_with("├ ⠋ Explore") && resumed.ends_with(" 12s"),
+        resumed[0].starts_with("├ ⠋ ") && resumed[1].ends_with(" 12s"),
         "working again, the entry wears the Working Marker and counts up from its earlier \
          Turns' time: {resumed:?}"
     );
@@ -1440,15 +1472,18 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
             monitoring_since: None,
         },
     );
-    let settled = aside_row(&application, "Explore");
-    assert!(
-        settled.starts_with("├ × Explore") && settled.ends_with(" 1m 17s"),
-        "settled again, it wears the latest Turn's outcome over all its Turns' time: \
-         {settled:?}"
+    let settled = entry_lines(&application, "Explore");
+    assert_eq!(
+        settled,
+        [
+            "├ × Map the provider seams",
+            "│ │ Explore · Failed   1m 17s"
+        ],
+        "settled again, it wears the latest Turn's outcome over all its Turns' time"
     );
     advance_session_clock(&now, 60_000);
     assert_eq!(
-        aside_row(&application, "Explore"),
+        entry_lines(&application, "Explore"),
         settled,
         "and the time no longer moves"
     );
@@ -1472,8 +1507,8 @@ fn a_settled_entry_whose_end_went_unlearned_leaves_its_time_blank() {
     );
 
     assert_eq!(
-        aside_rows(&application, WIDTH)[3],
-        "│ └ × Review Check the mappe…",
+        aside_rows(&application, WIDTH)[4..6],
+        ["│ └ × Check the mapped seams", "│     Review · Failed"],
         "no time stands beside it, the Marker saying enough"
     );
 }
@@ -1560,9 +1595,9 @@ fn a_monitoring_subagent_says_so_in_its_times_place_and_the_top_level_counts_its
         SubagentTreeEvent::Snapshot(snapshot),
     );
 
-    let explore = aside_row(&application, "Explore");
+    let explore = entry_lines(&application, "Explore");
     assert!(
-        explore.starts_with("├ ✓ Explore") && explore.ends_with(" monitoring"),
+        explore[0].starts_with("├ ✓ ") && explore[1].ends_with(" monitoring"),
         "the settled Marker stays, and monitoring stands in its time's place: {explore:?}"
     );
     assert!(
@@ -1622,15 +1657,16 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
 
     let rows = aside_rows(&application, WIDTH);
     assert!(
-        rows[3].starts_with("│ └ ⠋ ") && rows[3].ends_with(" Needs Intervention"),
-        "the nested Subagent whose own Session waits says so in its time's place: {rows:#?}"
+        rows[4].starts_with("│ └ ⠋ ") && rows[5] == "│     Rev… Needs Intervention",
+        "the nested Subagent whose own Session waits says so in its time's place, its \
+         name giving way: {rows:#?}"
     );
     assert_eq!(
-        needs_intervention_colour(&application, 3),
+        needs_intervention_colour(&application, 5),
         Some(Color::Yellow)
     );
     assert!(
-        rows[2].ends_with(" 12s") && rows[1].ends_with(" 30s"),
+        rows[3].ends_with(" 12s") && rows[1].ends_with(" 30s"),
         "while neither its spawner nor the top-level Session repeats it: {rows:#?}"
     );
 
@@ -1644,7 +1680,7 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
     );
     let answered = aside_rows(&application, WIDTH);
     assert!(
-        answered[3].contains("Review") && answered[3].ends_with(" 5s"),
+        answered[5].contains("Review") && answered[5].ends_with(" 5s"),
         "answered, the entry has its time back: {answered:#?}"
     );
     assert!(!answered.join("\n").contains("Needs Intervention"));
@@ -1730,14 +1766,15 @@ fn row_focus_begins_on_the_open_entry_and_walks_with_the_arrows_and_ctrl_p_n() {
         driving_the_aside(|tree| (tree.review, Some(tree.explore)));
     assert_eq!(
         focused_aside_rows(&application),
-        ["│ └ ⠋ Review Check the mappe…"],
-        "focus begins on the open Session's entry"
+        ["│ └ ⠋ Check the mapped seams", "│     Review"],
+        "focus begins on the open Session's entry, and paints both its lines"
     );
 
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ ✓ Plan Weigh the options"]
+        ["└ ✓ Weigh the options", "    Plan"],
+        "a step walks a whole entry"
     );
     press(&mut application, KeyCode::Char('n'), KeyModifiers::CONTROL);
     assert_eq!(
@@ -1748,13 +1785,13 @@ fn row_focus_begins_on_the_open_entry_and_walks_with_the_arrows_and_ctrl_p_n() {
     press(&mut application, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ ✓ Plan Weigh the options"],
+        ["└ ✓ Weigh the options", "    Plan"],
         "Up wraps back past the top"
     );
     press(&mut application, KeyCode::Char('p'), KeyModifiers::CONTROL);
     assert_eq!(
         focused_aside_rows(&application),
-        ["│ └ ⠋ Review Check the mappe…"]
+        ["│ └ ⠋ Check the mapped seams", "│     Review"]
     );
 }
 
@@ -1778,7 +1815,13 @@ fn enter_opens_the_focused_entry_and_does_nothing_on_the_open_one() {
 fn esc_hands_the_keys_back_and_focus_begins_again_on_the_open_entry() {
     let (mut application, _, _workspace) = driving_the_aside(|tree| (tree.top, None));
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    assert_eq!(focused_aside_rows(&application).len(), 1);
+    assert_eq!(
+        focused_aside_rows(&application),
+        [
+            "├ ✓ Map the provider seams",
+            "│ │ Explore               12s"
+        ]
+    );
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     assert!(
@@ -1807,7 +1850,7 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     press(&mut application, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ ✓ Plan Weigh the options"]
+        ["└ ✓ Weigh the options", "    Plan"]
     );
 
     let before = SessionId::new();
@@ -1827,7 +1870,7 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ ✓ Plan Weigh the options"],
+        ["└ ✓ Weigh the options", "    Plan"],
         "a spawn drawn above the focused entry does not move focus off it"
     );
     deliver_tree(
@@ -1857,8 +1900,9 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ × Plan Weigh the options 1s"],
-        "nor does a spawn below it, or its own settle"
+        ["└ × Weigh the options", "  │ Plan · Failed          1s"],
+        "nor does a spawn below it, or its own settle, whose spawn now hangs from \
+         the rule its second line carries"
     );
 
     // A fresh tree without the focused entry hands focus to the nearest
@@ -1874,7 +1918,7 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["  └ ⠋ Review Check the mappe…"],
+        ["  └ ⠋ Check the mapped seams", "      Review"],
         "the last entry left, standing nearest where Plan stood"
     );
 }
@@ -1960,16 +2004,21 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
     (snapshot, children)
 }
 
-/// The first and last entries the Aside's window shows, below its header.
-fn window(application: &Application) -> (String, String) {
-    let rows = aside_rows(application, WIDTH);
-    let body = rows[1..]
+/// The lines the Aside's window shows, below its header.
+fn window(application: &Application) -> Vec<String> {
+    aside_rows(application, WIDTH)[1..]
         .iter()
         .filter(|row| !row.is_empty())
-        .collect::<Vec<_>>();
+        .cloned()
+        .collect()
+}
+
+/// The first and last lines the Aside's window shows, below its header.
+fn window_edges(application: &Application) -> (String, String) {
+    let body = window(application);
     (
-        (*body.first().expect("a first row")).clone(),
-        (*body.last().expect("a last row")).clone(),
+        body.first().expect("a first row").clone(),
+        body.last().expect("a last row").clone(),
     )
 }
 
@@ -1992,26 +2041,38 @@ fn a_tall_tree_scrolls_to_keep_the_open_then_the_focused_entry_in_view() {
         aside_rows(&application, WIDTH)
     );
     assert_eq!(
-        window(&application).1,
-        "├ ✓ Agent Task 30",
-        "the window scrolls just far enough to show the open entry"
+        window_edges(&application).1,
+        "│   Agent",
+        "the window scrolls just far enough to show the whole of the open entry, \
+         and never cuts a row: {:#?}",
+        window(&application)
+    );
+    assert!(
+        window(&application).contains(&"├ ✓ Task 30".to_owned())
+            && !window(&application).contains(&"├ ✓ Task 31".to_owned()),
+        "{:#?}",
+        window(&application)
     );
 
     invoke(&mut application, SemanticCommandId::AsideToggle);
     for _ in 0..5 {
         press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     }
-    assert_eq!(focused_aside_rows(&application), ["├ ✓ Agent Task 35"]);
     assert_eq!(
-        window(&application).1,
-        "├ ✓ Agent Task 35",
-        "the window follows row focus"
+        focused_aside_rows(&application),
+        ["├ ✓ Task 35", "│   Agent"]
+    );
+    assert!(
+        window(&application).contains(&"├ ✓ Task 35".to_owned())
+            && !window(&application).contains(&"├ ✓ Task 36".to_owned()),
+        "the window follows row focus: {:#?}",
+        window(&application)
     );
     for _ in 0..36 {
         press(&mut application, KeyCode::Up, KeyModifiers::NONE);
     }
     assert_eq!(focused_aside_rows(&application), ["Map every seam"]);
-    assert_eq!(window(&application).0, "Map every seam");
+    assert_eq!(window_edges(&application).0, "Map every seam");
 }
 
 fn wheel(application: &mut Application, kind: MouseEventKind) {
@@ -2033,29 +2094,40 @@ fn the_wheel_scrolls_the_aside_without_taking_the_keys() {
     open(&mut application, workspace.path(), top, None);
     let (snapshot, _) = tall_tree(top);
     deliver_tree(&mut application, top, SubagentTreeEvent::Snapshot(snapshot));
-    assert_eq!(window(&application).0, "Map every seam");
+    assert_eq!(window_edges(&application).0, "Map every seam");
 
     wheel(&mut application, MouseEventKind::ScrollDown);
     assert_eq!(
-        window(&application).0,
-        "├ ✓ Agent Task 02",
-        "a tick moves the window three rows"
+        window_edges(&application).0,
+        "├ ✓ Task 02",
+        "a tick moves the window three entries, however many lines each takes"
     );
     assert_eq!(
-        window(&application).0,
-        "├ ✓ Agent Task 02",
+        window_edges(&application).0,
+        "├ ✓ Task 02",
         "and it holds there, though the open entry is out of view"
     );
     for _ in 0..20 {
         wheel(&mut application, MouseEventKind::ScrollDown);
     }
+    let end = window(&application);
     assert_eq!(
-        window(&application).1,
-        "└ ✓ Agent Task 39",
-        "the wheel stops at the end of the tree"
+        end[end.len() - 2..],
+        ["└ ✓ Task 39", "    Agent"],
+        "the wheel stops at the end of the tree, the last entry whole: {end:#?}"
     );
+    let heads = |line: &str| -> usize {
+        let task = line.trim_start_matches("├ ✓ Task ");
+        task.parse()
+            .unwrap_or_else(|_| panic!("a Task heads the window: {line:?}"))
+    };
+    let at_end = heads(&window_edges(&application).0);
     wheel(&mut application, MouseEventKind::ScrollUp);
-    assert_eq!(window(&application).1, "├ ✓ Agent Task 36");
+    assert_eq!(
+        heads(&window_edges(&application).0),
+        at_end - 3,
+        "a tick back moves the window three entries up"
+    );
     assert!(
         focused_aside_rows(&application).is_empty(),
         "wheeling is looking, not taking the keys"
@@ -2063,7 +2135,7 @@ fn the_wheel_scrolls_the_aside_without_taking_the_keys() {
 
     invoke(&mut application, SemanticCommandId::AsideToggle);
     assert_eq!(
-        window(&application).0,
+        window_edges(&application).0,
         "Map every seam",
         "taking the keys brings the focused entry back into view"
     );

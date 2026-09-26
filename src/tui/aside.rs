@@ -104,8 +104,9 @@ struct DrawnSection {
     name: &'static str,
     /// The screen rows the Section's window was drawn across.
     rows: Range<u16>,
-    row_count: usize,
-    room: usize,
+    /// The furthest row the window can begin at: the first from which the
+    /// rest of the Section fits the window's lines.
+    furthest: usize,
     anchor: Option<SectionRowKey>,
 }
 
@@ -354,10 +355,11 @@ impl Aside {
     }
 
     /// Moves the window of the Section under the pointer by the wheel's
-    /// step, answering whether the pointer stood over the Aside at all —
-    /// wheeling over it never reaches the Transcript. It takes neither the
-    /// keys nor row focus.
-    pub(super) fn wheel_at(&self, position: Position, scrolling_down: bool, lines: usize) -> bool {
+    /// step of `rows` — whole entries, however many lines each takes —
+    /// answering whether the pointer stood over the Aside at all: wheeling
+    /// over it never reaches the Transcript. It takes neither the keys nor
+    /// row focus.
+    pub(super) fn wheel_at(&self, position: Position, scrolling_down: bool, rows: usize) -> bool {
         let Some(area) = self.column.drawn_area() else {
             return false;
         };
@@ -374,11 +376,10 @@ impl Aside {
         };
         let mut scrolls = self.scrolls.borrow_mut();
         let scroll = scrolls.entry(section.name).or_default();
-        let furthest = section.row_count.saturating_sub(section.room);
         let offset = if scrolling_down {
-            scroll.offset.saturating_add(lines).min(furthest)
+            scroll.offset.saturating_add(rows).min(section.furthest)
         } else {
-            scroll.offset.saturating_sub(lines)
+            scroll.offset.saturating_sub(rows)
         };
         if offset != scroll.offset {
             scroll.offset = offset;
@@ -667,7 +668,9 @@ impl Aside {
             lines.push(header_line(header.name, header.count, content.width, theme));
             // The window keeps its anchor in view: the focused entry while
             // the keys stand on one here, the open Session's entry otherwise.
+            // It scrolls a row at a time, however many lines a row takes.
             let room = usize::from(content.height).saturating_sub(lines.len());
+            let heights = rows.iter().map(|row| row.lines.len()).collect::<Vec<_>>();
             let anchor_index = focused
                 .as_ref()
                 .filter(|(focused_section, _)| *focused_section == section.name())
@@ -675,14 +678,20 @@ impl Aside {
                 .or(current);
             let anchor = anchor_index.and_then(|index| rows[index].key.clone());
             let scroll = scrolls.entry(section.name()).or_default();
-            let mut offset = scroll.offset.min(rows.len().saturating_sub(room));
+            let furthest = furthest_offset(&heights, room);
+            let mut offset = scroll.offset.min(furthest);
             if scroll.wheeled_from.as_ref() != Some(&anchor) {
                 scroll.wheeled_from = None;
                 if let Some(index) = anchor_index {
                     if index < offset {
                         offset = index;
-                    } else if room > 0 && index >= offset + room {
-                        offset = index + 1 - room;
+                    } else {
+                        // Forward until the whole of the anchor's row is in
+                        // the window, or it heads the window.
+                        while offset < index && heights[offset..=index].iter().sum::<usize>() > room
+                        {
+                            offset += 1;
+                        }
                     }
                 }
             }
@@ -690,24 +699,32 @@ impl Aside {
             let first_row = content
                 .y
                 .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-            let row_count = rows.len();
-            for row in rows.into_iter().skip(offset).take(room) {
-                let y = content
-                    .y
-                    .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-                hits.push(AsideRowHit {
-                    row: y,
-                    columns: inside.x..inside.right(),
-                    invocation: row.invocation,
-                });
+            let mut left = room;
+            for (index, row) in rows.into_iter().enumerate().skip(offset) {
+                // A row is never cut, as the Sidebar never cuts one, unless
+                // it heads the window and the window is shorter than it.
+                if left == 0 || (row.lines.len() > left && index > offset) {
+                    break;
+                }
                 let is_focused = focused.as_ref().is_some_and(|(focused_section, key)| {
                     *focused_section == section.name() && row.key.as_ref() == Some(key)
                 });
-                lines.push(if is_focused {
-                    focus_painted(row.line, content.width, theme)
-                } else {
-                    row.line
-                });
+                for line in row.lines.into_iter().take(left) {
+                    let y = content
+                        .y
+                        .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+                    hits.push(AsideRowHit {
+                        row: y,
+                        columns: inside.x..inside.right(),
+                        invocation: row.invocation.clone(),
+                    });
+                    lines.push(if is_focused {
+                        focus_painted(line, content.width, theme)
+                    } else {
+                        line
+                    });
+                    left -= 1;
+                }
             }
             let last_row = content
                 .y
@@ -715,8 +732,7 @@ impl Aside {
             drawn_sections.push(DrawnSection {
                 name: section.name(),
                 rows: first_row..last_row.max(first_row.saturating_add(1)),
-                row_count,
-                room,
+                furthest,
                 anchor,
             });
         }
@@ -773,6 +789,21 @@ fn focus_painted(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static
         spans.push(Span::styled(" ".repeat(gap), focused));
     }
     Line::from(spans)
+}
+
+/// The furthest row a window of `room` lines can begin at: the first row from
+/// which the rows to the end all fit, so the window never scrolls past the
+/// last row into blank lines — or the last row itself, where even that one
+/// alone is taller than the window.
+fn furthest_offset(heights: &[usize], room: usize) -> usize {
+    let mut taken = 0;
+    for (index, height) in heights.iter().enumerate().rev() {
+        taken += height;
+        if taken > room {
+            return (index + 1).min(heights.len().saturating_sub(1));
+        }
+    }
+    0
 }
 
 /// A Section's header: its name, and its count beside it where it knows one.
@@ -851,17 +882,34 @@ pub(super) struct TreeEntry<'a> {
     continues: Vec<bool>,
     /// Whether this entry is the last its spawner spawned.
     last: bool,
+    /// Whether this entry spawned Subagents of its own, which hang beneath
+    /// its lines.
+    spawned: bool,
 }
 
 impl TreeEntry<'_> {
-    /// The guides leading this entry's line: a rule for each level above it
-    /// with more to come, and its own branch.
+    /// The guides leading this entry's first line: a rule for each level
+    /// above it with more to come, and its own branch.
     pub(super) fn guides(&self) -> String {
         let mut guides = String::new();
         for continues in &self.continues {
             guides.push_str(if *continues { "│ " } else { "  " });
         }
         guides.push_str(if self.last { "└ " } else { "├ " });
+        guides
+    }
+
+    /// The guides leading the lines beneath the entry's first: the rules
+    /// above it as its first line draws them, its own branch's rule carried
+    /// on to the sibling that follows it, and — in the column its Marker
+    /// took — the rule its own Subagents hang from, where it spawned any.
+    pub(super) fn continuation_guides(&self) -> String {
+        let mut guides = String::new();
+        for continues in &self.continues {
+            guides.push_str(if *continues { "│ " } else { "  " });
+        }
+        guides.push_str(if self.last { "  " } else { "│ " });
+        guides.push_str(if self.spawned { "│ " } else { "  " });
         guides
     }
 }
@@ -997,6 +1045,7 @@ impl SubagentTreeReading {
                 entry,
                 continues: continues.clone(),
                 last,
+                spawned: children.contains_key(&entry.session_id),
             });
             if visited.insert(entry.session_id)
                 && let Some(below) = children.remove(&entry.session_id)
@@ -1162,6 +1211,32 @@ mod tests {
     }
 
     #[test]
+    fn the_furthest_offset_is_the_first_row_the_rest_fit_beneath_and_never_past_the_last() {
+        assert_eq!(furthest_offset(&[1, 2, 2, 2], 7), 0, "all of it fits");
+        assert_eq!(
+            furthest_offset(&[1, 2, 2, 2], 6),
+            1,
+            "the top-level line alone spills"
+        );
+        assert_eq!(
+            furthest_offset(&[1, 2, 2, 2], 4),
+            2,
+            "two entries fit whole"
+        );
+        assert_eq!(
+            furthest_offset(&[1, 2, 2, 2], 3),
+            3,
+            "one entry fits, and its neighbour's line is not cut"
+        );
+        assert_eq!(
+            furthest_offset(&[1, 2, 2, 2], 1),
+            3,
+            "a window shorter than the last row still begins at that row rather than past it"
+        );
+        assert_eq!(furthest_offset(&[], 3), 0);
+    }
+
+    #[test]
     fn a_late_nested_spawn_stands_beneath_its_spawner_with_guides_that_say_so() {
         let top = SessionId::new();
         let first = SessionId::new();
@@ -1196,6 +1271,15 @@ mod tests {
                 (nested, "│ └ ".to_owned()),
                 (second, "└ ".to_owned()),
             ]
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|entry| entry.continuation_guides())
+                .collect::<Vec<_>>(),
+            vec!["│ │ ".to_owned(), "│     ".to_owned(), "    ".to_owned()],
+            "beneath its first line an entry carries its branch's rule on to the sibling \
+             after it, and hangs the rule its own spawns branch from where its Marker stood"
         );
     }
 }

@@ -94,12 +94,11 @@ impl Section for SubagentsSection {
         let top_level_working = top_level_since.is_some();
         animates |= top_level_working;
         rows.push(SectionRow {
-            line: entry_line(
-                EntryParts {
+            lines: vec![title_line(
+                TitleParts {
                     guides: String::new(),
                     marker: top_level_working
                         .then(|| (spinner::MARKER.to_owned(), theme.accent.primary)),
-                    name: None,
                     title: &top_level.title,
                     right: right_slot(
                         top_level.needs_intervention,
@@ -110,16 +109,12 @@ impl Section for SubagentsSection {
                 open_top_level,
                 width,
                 context,
-            ),
+            )],
             invocation: open_invocation(tree, top_level.session_id, context.open),
             key: Some(entry_key(tree, top_level.session_id)),
         });
         if top_level_working && let Some(row) = rows.last_mut() {
-            spinner::overlay_frame(
-                std::slice::from_mut(&mut row.line),
-                &[0],
-                context.spinner_frame / 3,
-            );
+            spinner::overlay_frame(&mut row.lines, &[0], context.spinner_frame / 3);
         }
         for entry in tree.depth_first() {
             let subagent = entry.entry;
@@ -151,29 +146,40 @@ impl Section for SubagentsSection {
             } else {
                 subagent.worked_ms.map(humanized_duration)
             };
+            // A Subagent's entry takes two lines: its Marker and Title, then
+            // its name and time beneath, so the Title has the width to say
+            // what the Subagent was asked and the name still says which kind
+            // of agent it was.
             rows.push(SectionRow {
-                line: entry_line(
-                    EntryParts {
-                        guides: entry.guides(),
-                        marker: Some((marker.to_owned(), marker_style)),
-                        name: Some(&subagent.name),
-                        title: &subagent.title,
-                        right: right_slot(subagent.needs_intervention, time, theme),
-                    },
-                    open,
-                    width,
-                    context,
-                ),
+                lines: vec![
+                    title_line(
+                        TitleParts {
+                            guides: entry.guides(),
+                            marker: Some((marker.to_owned(), marker_style)),
+                            title: &subagent.title,
+                            right: None,
+                        },
+                        open,
+                        width,
+                        context,
+                    ),
+                    detail_line(
+                        DetailParts {
+                            guides: entry.continuation_guides(),
+                            name: &subagent.name,
+                            outcome: outcome_word(subagent.status).map(|word| (word, marker_style)),
+                            right: right_slot(subagent.needs_intervention, time, theme),
+                        },
+                        width,
+                        context,
+                    ),
+                ],
                 invocation: open_invocation(tree, subagent.session_id, context.open),
                 key: Some(entry_key(tree, subagent.session_id)),
             });
             if working && let Some(row) = rows.last_mut() {
                 // The Spinner turns at the pace the Transcript row's does.
-                spinner::overlay_frame(
-                    std::slice::from_mut(&mut row.line),
-                    &[0],
-                    context.spinner_frame / 3,
-                );
+                spinner::overlay_frame(&mut row.lines, &[0], context.spinner_frame / 3);
             }
         }
         Ok(SectionView {
@@ -190,11 +196,10 @@ impl Section for SubagentsSection {
 
 impl SubagentsSection {
     fn stand_in(&self, title: &str, working: bool, context: &SectionContext<'_>) -> SectionView {
-        let mut line = entry_line(
-            EntryParts {
+        let mut line = title_line(
+            TitleParts {
                 guides: String::new(),
                 marker: working.then(|| (spinner::MARKER.to_owned(), context.theme.accent.primary)),
-                name: None,
                 title,
                 right: None,
             },
@@ -237,7 +242,7 @@ impl SubagentsSection {
 
 fn unpointable(line: Line<'static>) -> SectionRow {
     SectionRow {
-        line,
+        lines: vec![line],
         invocation: None,
         key: None,
     }
@@ -295,12 +300,22 @@ fn open_invocation(
     (reference != *open).then(|| SemanticCommandId::SubagentOpen.on_session(reference))
 }
 
-struct EntryParts<'a> {
+struct TitleParts<'a> {
     guides: String,
     marker: Option<(String, Style)>,
-    name: Option<&'a str>,
     title: &'a str,
-    /// What the entry's right-aligned slot says, in its style.
+    /// What the line's right-aligned slot says, in its style.
+    right: Option<(String, Style)>,
+}
+
+struct DetailParts<'a> {
+    guides: String,
+    /// Which kind of agent the Subagent was.
+    name: &'a str,
+    /// How the Subagent's work ended where its Marker alone would not say —
+    /// failed and stopped share a glyph — in the Marker's style.
+    outcome: Option<(&'static str, Style)>,
+    /// What the line's right-aligned slot says, in its style.
     right: Option<(String, Style)>,
 }
 
@@ -310,25 +325,36 @@ fn ticking(since: SessionTimestamp, now: SessionTimestamp) -> String {
     working_duration(since, now.0)
 }
 
-/// An entry's right slot: its time, unless its own Session waits on an
-/// Intervention, which it then says in the time's place.
+/// An entry's right slot, the space that holds it off the text before it
+/// included: its time, unless its own Session waits on an Intervention,
+/// which it then says in the time's place.
 fn right_slot(
     needs_intervention: bool,
     time: Option<String>,
     theme: &Theme,
 ) -> Option<(String, Style)> {
     if needs_intervention {
-        Some(("Needs Intervention".to_owned(), theme.feedback.warning))
+        Some((" Needs Intervention".to_owned(), theme.feedback.warning))
     } else {
-        time.map(|time| (time, theme.text.subdued))
+        time.map(|time| (format!(" {time}"), theme.text.subdued))
     }
 }
 
-/// One entry's line: tree guides, the Marker, the name dimmed, then the
-/// Title, with the time right-aligned. Space runs out on the Title first, so
-/// the name — which kind of agent it was — stays readable longest.
-fn entry_line(
-    parts: EntryParts<'_>,
+/// The word a settled Subagent's detail line adds to its Marker, where the
+/// Marker's glyph alone would not tell its outcome apart.
+const fn outcome_word(status: ActivityStatus) -> Option<&'static str> {
+    match status {
+        ActivityStatus::Active | ActivityStatus::Completed => None,
+        ActivityStatus::Failed => Some("Failed"),
+        ActivityStatus::Interrupted => Some("Stopped"),
+    }
+}
+
+/// An entry's first line: tree guides, the Marker, then the Title, with the
+/// right slot right-aligned where there is one. The Title gives way to the
+/// slot.
+fn title_line(
+    parts: TitleParts<'_>,
     open: bool,
     width: usize,
     context: &SectionContext<'_>,
@@ -339,37 +365,37 @@ fn entry_line(
     if let Some((marker, style)) = parts.marker {
         line.push(marker, style);
     }
-    let (right, right_style) = parts.right.map_or_else(
-        || (String::new(), theme.text.subdued),
-        |(text, style)| (format!(" {text}"), style),
-    );
-    let mut room = width
-        .saturating_sub(line.used)
-        .saturating_sub(right.width());
-    if let Some(name) = parts.name {
-        let name = truncate_to_width(name, room);
-        room = room.saturating_sub(name.width());
-        line.push(name, theme.text.subdued);
-        if room > 1 && !parts.title.is_empty() {
-            line.push(" ".to_owned(), theme.text.subdued);
-            room -= 1;
-        } else {
-            room = 0;
-        }
-    }
     let title_style = if open {
         theme.text.primary.patch(theme.selection.open_title)
     } else {
         theme.text.primary
     };
+    let room = line.room_beside(width, &[&parts.right]);
     line.push(truncate_to_width(parts.title, room), title_style);
-    if !right.is_empty() {
-        let gap = width
-            .saturating_sub(line.used)
-            .saturating_sub(right.width());
-        line.push(" ".repeat(gap), theme.text.subdued);
-        line.push(right, right_style);
+    line.finish_with(parts.right, width, theme);
+    Line::from(line.spans)
+}
+
+/// A Subagent entry's second line: the guides carried on beneath its first,
+/// the name dimmed, its outcome where its Marker does not say it, and the
+/// right slot right-aligned. The name gives way to the slot.
+fn detail_line(
+    parts: DetailParts<'_>,
+    width: usize,
+    context: &SectionContext<'_>,
+) -> Line<'static> {
+    let theme = context.theme;
+    let mut line = Pieces::default();
+    line.push(parts.guides, theme.text.subdued);
+    let outcome = parts
+        .outcome
+        .map(|(word, style)| (format!(" · {word}"), style));
+    let room = line.room_beside(width, &[&outcome, &parts.right]);
+    line.push(truncate_to_width(parts.name, room), theme.text.subdued);
+    if let Some((word, style)) = outcome {
+        line.push(word, style);
     }
+    line.finish_with(parts.right, width, theme);
     Line::from(line.spans)
 }
 
@@ -387,5 +413,25 @@ impl Pieces {
         }
         self.used += text.width();
         self.spans.push(Span::styled(text, style));
+    }
+
+    /// The columns left of `width` for the text that comes next, once the
+    /// pieces still to follow it are set aside.
+    fn room_beside(&self, width: usize, following: &[&Option<(String, Style)>]) -> usize {
+        following
+            .iter()
+            .filter_map(|piece| piece.as_ref())
+            .fold(width.saturating_sub(self.used), |room, (text, _)| {
+                room.saturating_sub(text.width())
+            })
+    }
+
+    /// Ends the line with `right` against its right edge, where there is one.
+    fn finish_with(&mut self, right: Option<(String, Style)>, width: usize, theme: &Theme) {
+        if let Some((text, style)) = right {
+            let gap = width.saturating_sub(self.used).saturating_sub(text.width());
+            self.push(" ".repeat(gap), theme.text.subdued);
+            self.push(text, style);
+        }
     }
 }

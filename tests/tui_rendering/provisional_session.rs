@@ -963,11 +963,12 @@ mod aside {
             .expect("take the Session's tree");
 
         assert_eq!(
-            aside_rows(&application)[..3],
+            aside_rows(&application)[..4],
             [
                 "Subagents 1",
                 "Rename the widget",
-                "└ ⠋ Explore Find the widget"
+                "└ ⠋ Find the widget",
+                "    Explore",
             ],
             "the tree replaces the entry in place"
         );

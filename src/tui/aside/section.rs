@@ -64,12 +64,13 @@ pub(in crate::tui) struct SectionHeader {
     pub(in crate::tui) count: Option<usize>,
 }
 
-/// One drawn row, and what choosing it does. A row that stands for nothing —
-/// the open Session's own entry, whose choosing would change nothing — carries
-/// no invocation.
+/// One drawn row, and what choosing it does. A row is one entry however many
+/// lines it takes: every line is pressed, focused, and scrolled as the one
+/// entry. A row that stands for nothing — the open Session's own entry, whose
+/// choosing would change nothing — carries no invocation.
 #[derive(Clone, Debug)]
 pub(in crate::tui) struct SectionRow {
-    pub(in crate::tui) line: Line<'static>,
+    pub(in crate::tui) lines: Vec<Line<'static>>,
     pub(in crate::tui) invocation: Option<SemanticInvocation>,
     /// What the row is an entry for, so row focus and the scroll anchor can
     /// follow it however the rows around it move. A row with no key — a
