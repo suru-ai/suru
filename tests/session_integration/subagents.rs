@@ -2631,6 +2631,78 @@ async fn a_resume_after_a_restart_lands_in_the_subagents_original_session() {
     restarted.shutdown().await.expect("shut down server");
 }
 
+/// A Provider revises what it needs to carry its conversation across a
+/// restart as the conversation goes — Claude records each agent it spawns —
+/// and the revision is what the next process hands the Provider back. It is
+/// no output of any Turn, so arriving with none active begins no Continuation.
+#[tokio::test]
+async fn a_resume_state_revised_mid_connection_is_what_the_next_start_resumes_from() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let instance = "revised-resume-state-test";
+    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
+    let fixture = working_turn(state_dir.path(), instance).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let revised = suru::provider::ProviderResumeState::new(serde_json::json!({
+        "conversation": "revised",
+    }));
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ResumeStateChanged {
+            resume_state: revised.clone(),
+        })
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(
+        parent.turns.len(),
+        1,
+        "a Resume State revision begins no Continuation"
+    );
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    let (runtime, mut provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, runtime)
+        .await
+        .expect("respawn server");
+    fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/prompts",
+            restarted.descriptor().base_url,
+            fixture.session_id,
+        ))
+        .bearer_auth(&restarted.descriptor().token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Carry on".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("admit a Prompt after the restart")
+        .error_for_status()
+        .expect("the restored Session takes a Prompt");
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("the Provider connection resumes");
+    assert_eq!(start.resume_state(), Some(&revised));
+    drop(start);
+    restarted.shutdown().await.expect("shut down server");
+}
+
 fn provider_agent() -> suru::protocol::AgentIdentity {
     suru::protocol::AgentIdentity {
         agent: suru::protocol::AgentId::new("controlled-agent"),

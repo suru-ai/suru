@@ -748,6 +748,14 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         status: ProviderSubagentStatus,
     },
+    /// The Provider revised what it needs to carry the owning Session's
+    /// conversation across a restart, replacing the Resume State its startup
+    /// reported. Only the Provider reads the payload back, at the next start;
+    /// orchestration stores it for the owning Session whatever the event's
+    /// attribution, and it is no output of any Turn.
+    ResumeStateChanged {
+        resume_state: ProviderResumeState,
+    },
     /// The Provider's latest complete reading of the active Turn. Each absent
     /// field remains absent through the protocol, and the Cost beside them is
     /// frozen by the Session store on the Basis the event names.

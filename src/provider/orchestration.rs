@@ -22,9 +22,9 @@ use tokio::{
 use super::{
     AttributedProviderEvent, MeteredCost, ProviderCommandStatus, ProviderError, ProviderEvent,
     ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
-    ProviderPostureApplication, ProviderPrompt, ProviderRuntime, ProviderSession,
-    ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderSubagentStatus,
-    ProviderTurnInput,
+    ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
+    ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+    ProviderSubagentStatus, ProviderTurnInput,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
@@ -1561,6 +1561,18 @@ async fn run_provider_session(
                         .identity
                         .clone();
                     match attributed {
+                        // Resume State is the owning Session's, whatever the
+                        // attribution, and no output owed a Continuation.
+                        AttributedProviderEvent {
+                            event: ProviderEvent::ResumeStateChanged { resume_state },
+                            ..
+                        } => save_revised_resume_state(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            &provider_id,
+                            resume_state,
+                        ),
                         // A Subagent's events land in its own Session whether
                         // or not the owning Session has a Turn open.
                         AttributedProviderEvent {
@@ -2515,6 +2527,16 @@ async fn run_provider_session(
                 };
                 match event {
                     Some(Ok(AttributedProviderEvent {
+                        event: ProviderEvent::ResumeStateChanged { resume_state },
+                        ..
+                    })) => save_revised_resume_state(
+                        &sessions,
+                        &updates,
+                        session_id,
+                        &provider_id,
+                        resume_state,
+                    ),
+                    Some(Ok(AttributedProviderEvent {
                         attribution: ProviderEventAttribution::Subagent(subagent),
                         event,
                     })) => {
@@ -3435,6 +3457,9 @@ fn project_provider_event(
             ProviderEvent::ContextFill { report } => sessions
                 .report_context_fill(session_id, active.turn_id, report)
                 .map(|()| ProviderEventProjection::Continue),
+            // The actor stores a revised Resume State for the owning Session
+            // before anything projects, so none ever lands in a Turn.
+            ProviderEvent::ResumeStateChanged { .. } => Ok(ProviderEventProjection::Continue),
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,
@@ -3528,6 +3553,24 @@ fn delegation_text(text: &str) -> Option<NormalizedText> {
         return None;
     }
     Some(ProviderTextNormalizer::with_max_chars(MAX_STORED_MESSAGE_CHARS).push(text))
+}
+
+/// Stores the Resume State a Provider revised mid-connection for the Session
+/// that owns the connection. A write that fails costs only what the revision
+/// added — the next start resumes from the state stored before it — so it is
+/// logged rather than failing whatever the connection is doing.
+fn save_revised_resume_state(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    provider_id: &ProviderId,
+    resume_state: ProviderResumeState,
+) {
+    if let Some(Err(error)) =
+        updates.apply(|| sessions.save_resume_state(session_id, provider_id.clone(), resume_state))
+    {
+        tracing::warn!(%session_id, "a revised Resume State could not be saved: {error:#}");
+    }
 }
 
 /// Adds the row one stretch of a Subagent's work stands as to the delegating
