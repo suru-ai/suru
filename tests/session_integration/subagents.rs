@@ -12,10 +12,11 @@ use crate::{
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, ModelId,
-        PromptDelivery, PromptId, SessionCatalogChange, SessionChange, SessionError,
+        Activity, ActivityStatus, AdmitPromptRequest, Delegator, InitialPrompt, MessageRole,
+        ModelId, PromptDelivery, PromptId, SessionCatalogChange, SessionChange, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
-        SessionStatus, TurnStatus, ViewSessionOperationId, ViewSessionRequest,
+        SessionStatus, TranscriptItem, TurnId, TurnStatus, ViewSessionOperationId,
+        ViewSessionRequest,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -36,6 +37,7 @@ async fn a_subagents_confirmed_model_updates_its_session_and_parent_projection()
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
@@ -111,6 +113,7 @@ async fn a_spawn_opens_a_subagent_row_in_the_parent_and_a_child_session_with_a_p
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
 
@@ -191,6 +194,7 @@ async fn viewing_a_subagent_session_is_refused_without_changing_its_parent() {
             subagent_id: ProviderSubagentId::new("viewed-child"),
             name: "Reader".to_owned(),
             description: "Inspect the child".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -271,6 +275,7 @@ async fn subagent_attributed_content_fills_the_child_session_and_never_the_paren
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -362,6 +367,7 @@ async fn a_settle_closes_the_row_with_its_outcome_and_duration_and_settles_the_c
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -446,6 +452,7 @@ async fn a_failed_settle_fails_the_row_and_the_childs_turn_says_why() {
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -516,6 +523,7 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
 
@@ -618,6 +626,7 @@ async fn working_duration_stays_continuous_when_only_subagents_remain() {
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -698,6 +707,7 @@ async fn a_stop_settles_the_subagents_no_process_will_finish() {
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -816,6 +826,7 @@ async fn a_restart_settles_the_turns_the_last_process_left_open() {
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let spawned = read_session(fixture.server.descriptor(), fixture.session_id).await;
@@ -980,6 +991,7 @@ async fn a_child_session_refuses_prompts() {
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -1059,6 +1071,7 @@ async fn a_nested_spawn_records_its_row_in_the_childs_own_transcript_one_level_d
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -1085,6 +1098,7 @@ async fn a_nested_spawn_records_its_row_in_the_childs_own_transcript_one_level_d
                 subagent_id: nested.clone(),
                 name: "Plan".to_owned(),
                 description: "Weigh the seam options".to_owned(),
+                delegation: None,
             },
         )
         .await;
@@ -1199,6 +1213,7 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -1209,6 +1224,7 @@ async fn deleting_a_session_deletes_its_subagent_subtree_for_good() {
                 subagent_id: ProviderSubagentId::new("task-2"),
                 name: "Plan".to_owned(),
                 description: "Weigh the seam options".to_owned(),
+                delegation: None,
             },
         )
         .await;
@@ -1372,6 +1388,7 @@ async fn a_child_session_cannot_be_deleted_out_from_under_its_parents_row() {
             subagent_id: ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_at_least_revision(
@@ -1438,6 +1455,7 @@ async fn a_restart_restores_child_sessions_and_the_rows_that_reach_them() {
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -1584,6 +1602,7 @@ async fn a_provider_status_update_revises_what_the_row_says_the_subagent_is_doin
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -1665,6 +1684,7 @@ async fn spawned_and_settled(
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     emit_for(fixture, subagent, agent_message("Mapped the seams.")).await;
@@ -1718,6 +1738,7 @@ async fn a_resume_begins_the_next_turn_in_the_subagents_own_session_and_a_row_of
         .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
             subagent_id: subagent.clone(),
             description: "Map the tests too".to_owned(),
+            delegation: None,
         })
         .await;
 
@@ -1914,6 +1935,7 @@ async fn a_resume_after_its_delegating_turn_settled_keeps_the_parent_working_unt
         .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
             subagent_id: subagent.clone(),
             description: "Map the tests too".to_owned(),
+            delegation: None,
         })
         .await;
     fixture
@@ -1979,6 +2001,7 @@ async fn a_resume_naming_no_subagent_the_connection_spawned_opens_nothing() {
         .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
             subagent_id: ProviderSubagentId::new("never-spawned"),
             description: "Carry on".to_owned(),
+            delegation: None,
         })
         .await;
 
@@ -1998,4 +2021,200 @@ async fn a_resume_naming_no_subagent_the_connection_spawned_opens_nothing() {
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// The Delegations in `snapshot`, in Transcript order: each one's Turn, its
+/// sender, and what it asked.
+fn delegations(snapshot: &SessionSnapshot) -> Vec<(TurnId, Delegator, &str)> {
+    snapshot
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Message { message_id } => snapshot
+                .messages
+                .iter()
+                .find(|message| message.id == *message_id),
+            TranscriptItem::Activity { .. } => None,
+        })
+        .filter_map(|message| {
+            message
+                .role
+                .delegator()
+                .map(|delegator| (message.turn_id, delegator.clone(), message.content.as_str()))
+        })
+        .collect()
+}
+
+/// Each Turn a Delegation begins opens with it, as a Message from the Agent
+/// that delegated — the spawn's in the child's first Turn, the resume's in
+/// the Turn the resume began — and it is stored like any other Message, so a
+/// restarted server reads it back. A Subagent's own spawn names that
+/// Subagent as the grandchild's delegating Agent.
+#[tokio::test]
+async fn each_turn_a_delegation_begins_opens_with_it_as_a_message_from_the_delegating_agent() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let instance = "subagent-delegation-test";
+    let config = ServerConfig::new(state_dir.path(), instance).expect("configure server");
+    let fixture = working_turn(state_dir.path(), instance).await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let grandchild = ProviderSubagentId::new("task-2");
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: Some("Map where each Provider plugs in.\nList the files.".to_owned()),
+        })
+        .await;
+    emit_for(&fixture, &subagent, agent_message("Mapped the seams.")).await;
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(subagent.clone()),
+            ProviderEvent::SubagentStarted {
+                subagent_id: grandchild.clone(),
+                name: "Scout".to_owned(),
+                description: "Read the Claude seam".to_owned(),
+                delegation: Some("Read src/provider/claude.rs.".to_owned()),
+            },
+        )
+        .await;
+    for event in [
+        ProviderEvent::SubagentCompleted {
+            subagent_id: grandchild,
+            status: ProviderSubagentStatus::Completed,
+        },
+        ProviderEvent::SubagentCompleted {
+            subagent_id: subagent.clone(),
+            status: ProviderSubagentStatus::Completed,
+        },
+        ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            description: "Map the tests too".to_owned(),
+            delegation: Some("Now map the tests.".to_owned()),
+        },
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    emit_for(&fixture, &subagent, agent_message("Mapped the tests.")).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resumed stretch settles",
+        |snapshot| {
+            matches!(
+                subagent_rows(snapshot)[..],
+                [
+                    _,
+                    Activity::Subagent {
+                        status: ActivityStatus::Completed,
+                        ..
+                    }
+                ]
+            )
+        },
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = subagent_rows(&parent)[0]
+    else {
+        unreachable!()
+    };
+    let child_id = *child_id;
+    let child = read_session(fixture.server.descriptor(), child_id).await;
+    let from_parent = Delegator {
+        session_id: fixture.session_id,
+        name: None,
+    };
+    assert_eq!(
+        delegations(&child),
+        [
+            (
+                child.turns[0].id,
+                from_parent.clone(),
+                "Map where each Provider plugs in.\nList the files."
+            ),
+            (child.turns[1].id, from_parent, "Now map the tests."),
+        ],
+        "the spawn's and the resume's Delegations each open the Turn they began, from the \
+         parent's Agent"
+    );
+    let opening = |turn_id: TurnId| {
+        child
+            .transcript
+            .iter()
+            .find_map(|item| match item {
+                TranscriptItem::Message { message_id } => child
+                    .messages
+                    .iter()
+                    .find(|message| message.id == *message_id && message.turn_id == turn_id),
+                TranscriptItem::Activity { .. } => None,
+            })
+            .expect("the Turn has a Message")
+    };
+    for turn in &child.turns {
+        let opening = opening(turn.id);
+        assert!(
+            matches!(opening.role, MessageRole::Delegation(_)),
+            "each Turn opens with its Delegation, ahead of the Subagent's own work: {opening:?}"
+        );
+        assert_eq!(opening.status, suru::protocol::MessageStatus::Completed);
+        assert!(!opening.truncated);
+    }
+    let Some(Activity::Subagent {
+        session_id: grandchild_id,
+        ..
+    }) = child
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+    else {
+        panic!("the Subagent's own spawn stands in its Transcript");
+    };
+    let grandchild_id = *grandchild_id;
+    let grandchild = read_session(fixture.server.descriptor(), grandchild_id).await;
+    assert_eq!(
+        delegations(&grandchild),
+        [(
+            grandchild.turns[0].id,
+            Delegator {
+                session_id: child_id,
+                name: Some("Explore".to_owned()),
+            },
+            "Read src/provider/claude.rs."
+        )],
+        "a Subagent's own spawn names that Subagent, by its Session and its name, as the \
+         delegating Agent"
+    );
+
+    fixture.server.shutdown().await.expect("shut down server");
+    drop(fixture.provider_session);
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("respawn server");
+    let restored = read_session(restarted.descriptor(), child_id).await;
+    assert_eq!(
+        delegations(&restored),
+        delegations(&child),
+        "a Delegation is stored like any other Message"
+    );
+    let restored_grandchild = read_session(restarted.descriptor(), grandchild_id).await;
+    assert_eq!(delegations(&restored_grandchild), delegations(&grandchild));
+    restarted.shutdown().await.expect("stop restarted server");
 }

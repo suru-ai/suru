@@ -739,6 +739,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
             subagent_id: ProviderSubagentId::new("child"),
             name: "Child".into(),
             description: "Inherited posture".into(),
+            delegation: None,
         })
         .await;
     let parent = client.read_session(created.session.id).await.unwrap();

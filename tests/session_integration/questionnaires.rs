@@ -782,6 +782,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
                     subagent_id: ProviderSubagentId::new(name),
                     name: name.into(),
                     description: name.into(),
+                    delegation: None,
                 },
             )
             .await;

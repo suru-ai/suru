@@ -354,6 +354,7 @@ async fn removal_waits_for_native_startup_and_force_cannot_remove_surviving_suba
             subagent_id: child.clone(),
             name: "Explore".into(),
             description: "Keep working".into(),
+            delegation: None,
         })
         .await;
     connection

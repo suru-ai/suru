@@ -458,6 +458,7 @@ impl NativeCorrelation {
                 subagent_id: ProviderSubagentId::new(child_thread_id),
                 name,
                 description,
+                delegation: None,
             },
         }]
     }
@@ -2741,6 +2742,7 @@ mod tests {
                     subagent_id: ProviderSubagentId::new(CHILD_THREAD),
                     name: "scout".to_owned(),
                     description: String::new(),
+                    delegation: None,
                 },
             }],
             "the spawn rides the spawning conversation, named off the agent path"

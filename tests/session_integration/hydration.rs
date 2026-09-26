@@ -377,6 +377,7 @@ async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_
             subagent_id: child.clone(),
             name: "Explore".to_owned(),
             description: "Read the workspace".to_owned(),
+            delegation: None,
         })
         .await;
     fixture

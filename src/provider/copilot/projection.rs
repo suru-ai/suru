@@ -845,6 +845,7 @@ impl CopilotCorrelation {
                 subagent_id: ProviderSubagentId::new(subagent.clone()),
                 name,
                 description: started.agent_description,
+                delegation: None,
             },
         )];
         if let Some(model) = model {
@@ -1963,6 +1964,7 @@ mod tests {
                     subagent_id: ProviderSubagentId::new("agent-1"),
                     name: "Researcher".to_owned(),
                     description: "Scout the workspace".to_owned(),
+                    delegation: None,
                 },
             }]
         );

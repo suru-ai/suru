@@ -294,6 +294,7 @@ async fn nested_subagent_approvals_roll_up_with_questions_survive_parent_settlem
                     subagent_id: ProviderSubagentId::new(name),
                     name: name.into(),
                     description: name.into(),
+                    delegation: None,
                 },
             )
             .await;

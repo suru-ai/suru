@@ -1047,6 +1047,7 @@ async fn candidate_admission_leaving_a_surviving_subagent_is_rechecked_before_re
             subagent_id: child,
             name: "Protect checkout".into(),
             description: "Survive the parent Turn".into(),
+            delegation: None,
         })
         .await;
     connection
@@ -1336,6 +1337,7 @@ async fn a_working_subagent_refuses_delete_before_eager_reclaim_or_provider_shut
             subagent_id: child.clone(),
             name: "Protect checkout".into(),
             description: "Survive the parent Turn".into(),
+            delegation: None,
         })
         .await;
     connection

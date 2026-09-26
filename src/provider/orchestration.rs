@@ -26,7 +26,7 @@ use super::{
     ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderSubagentStatus,
     ProviderTurnInput,
 };
-use crate::ansi::{ProviderTextNormalizer, normalize_provider_text};
+use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, InterruptOutcome, Message, MessageId,
     MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
@@ -34,9 +34,9 @@ use crate::protocol::{
 };
 use crate::sessions::{
     ApprovalPostureUpdate, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
-    InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore, TrailingCommandOutput,
-    command_output_changes, earliest_pending_prompt, message_content_changes,
-    reasoning_content_changes,
+    InterruptTarget, OpenInterventions, OpeningDelegation, ProviderTurnOutcome, SessionStore,
+    TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
+    message_content_changes, reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 
@@ -652,8 +652,8 @@ impl SubagentRoutes {
     }
 
     /// Opens a Subagent the Provider spawned: its own Session, titled from
-    /// the spawn, and the row that stands for its first stretch of work in
-    /// the delegating Turn.
+    /// the spawn and opened by the spawn's Delegation, and the row that
+    /// stands for its first stretch of work in the delegating Turn.
     fn spawn(
         &mut self,
         sessions: &SessionStore,
@@ -661,6 +661,7 @@ impl SubagentRoutes {
         subagent: ProviderSubagentId,
         name: &str,
         description: &str,
+        delegation: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.rows.contains_key(&subagent) || self.routes.contains_key(&subagent) {
             return Err(anyhow::anyhow!(
@@ -669,7 +670,12 @@ impl SubagentRoutes {
         }
         let name = normalize_provider_text(name);
         let description = normalize_provider_text(description);
-        let spawned = sessions.create_subagent(delegating.0, &name, &description)?;
+        let spawned = sessions.create_subagent(
+            delegating.0,
+            &name,
+            &description,
+            delegation.and_then(delegation_text),
+        )?;
         let activity_id =
             add_subagent_row(sessions, delegating, &name, description, spawned.session_id)?;
         self.open_stretch(
@@ -686,17 +692,19 @@ impl SubagentRoutes {
     }
 
     /// Resumes a settled Subagent the Provider names again: the next Turn in
-    /// the Subagent's own Session, and a new row in the delegating Turn
-    /// leading into that same Session (ADR 0031). The rows before it stay as
-    /// they settled, and the Session keeps its Title. A Continuation still
-    /// open in the Subagent's Session settles first, with the output this
-    /// actor still held for it, because the resume begins a Turn of its own.
+    /// the Subagent's own Session, opened by the resume's Delegation, and a
+    /// new row in the delegating Turn leading into that same Session (ADR
+    /// 0031). The rows before it stay as they settled, and the Session keeps
+    /// its Title. A Continuation still open in the Subagent's Session settles
+    /// first, with the output this actor still held for it, because the
+    /// resume begins a Turn of its own.
     fn resume(
         &mut self,
         sessions: &SessionStore,
         delegating: (SessionId, TurnId),
         subagent: ProviderSubagentId,
         description: &str,
+        delegation: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.rows.contains_key(&subagent) {
             return Err(anyhow::anyhow!(
@@ -718,7 +726,15 @@ impl SubagentRoutes {
                 ProviderTurnOutcome::Completed { trailing_output },
             )?;
         }
-        let turn_id = sessions.begin_subagent_turn(session_id)?;
+        let turn_id = sessions.begin_subagent_turn(
+            session_id,
+            delegation
+                .and_then(delegation_text)
+                .map(|text| OpeningDelegation {
+                    delegating_session: delegating.0,
+                    text,
+                }),
+        )?;
         let activity_id = add_subagent_row(
             sessions,
             delegating,
@@ -3274,6 +3290,7 @@ fn project_provider_event(
                 subagent_id,
                 name,
                 description,
+                delegation,
             } => subagents
                 .spawn(
                     sessions,
@@ -3281,17 +3298,20 @@ fn project_provider_event(
                     subagent_id,
                     &name,
                     &description,
+                    delegation.as_deref(),
                 )
                 .map(|()| ProviderEventProjection::Continue),
             ProviderEvent::SubagentResumed {
                 subagent_id,
                 description,
+                delegation,
             } => subagents
                 .resume(
                     sessions,
                     (session_id, active.turn_id),
                     subagent_id,
                     &description,
+                    delegation.as_deref(),
                 )
                 .map(|()| ProviderEventProjection::Continue),
             ProviderEvent::SubagentUpdated {
@@ -3436,6 +3456,16 @@ fn project_provider_event(
     projected
 }
 
+/// A Delegation's text as the Subagent's Transcript stores it: normalized
+/// and capped on the same terms as an Agent Message, since it is prose one
+/// Agent wrote for another. Text with nothing to read stands as no Message.
+fn delegation_text(text: &str) -> Option<NormalizedText> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(ProviderTextNormalizer::with_max_chars(MAX_STORED_MESSAGE_CHARS).push(text))
+}
+
 /// Adds the row one stretch of a Subagent's work stands as to the delegating
 /// Turn's Transcript, leading into the Subagent's own Session, and answers
 /// the row's identity.
@@ -3529,7 +3559,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
-        ModelId, SessionSnapshot, TurnStatus,
+        ModelId, SessionSnapshot, TranscriptItem, TurnStatus,
     };
     use crate::sessions::StoreOutcome;
     use crate::storage::{StorageRepository, StorageWriter};
@@ -3928,6 +3958,7 @@ running 1 test",
                 subagent.clone(),
                 "Explore",
                 "Map the seams",
+                Some("Map the provider seams."),
             )
             .expect("spawn the Subagent");
         let child = routes.identities[&subagent].session_id;
@@ -3971,6 +4002,7 @@ running 1 test",
                 delegating,
                 subagent.clone(),
                 "Map the tests too",
+                Some("Now map the tests too."),
             )
             .expect("resume the Subagent");
 
@@ -4002,6 +4034,27 @@ running 1 test",
         };
         assert_ne!(*status, ActivityStatus::Active);
         assert_eq!(output, "running 1 test");
+        let delegations = child
+            .messages
+            .iter()
+            .filter(|message| message.role.delegator().is_some())
+            .map(|message| (message.turn_id, message.content.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delegations,
+            [
+                (child.turns[0].id, "Map the provider seams."),
+                (child.turns[2].id, "Now map the tests too."),
+            ],
+            "the spawn's and the resume's Delegations each open the Turn they began"
+        );
+        let Some(TranscriptItem::Message { message_id }) = child.transcript.last() else {
+            panic!("the resume's Delegation stands after the Continuation's work");
+        };
+        assert_eq!(
+            child.messages.last().map(|message| message.id),
+            Some(*message_id)
+        );
         let route = &routes.routes[&subagent];
         assert_eq!(route.session_id, child.session.id);
         assert_eq!(

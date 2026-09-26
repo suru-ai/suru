@@ -4568,6 +4568,7 @@ async fn the_subagent_tree_streams_through_a_remote_outlook() {
             subagent_id: suru::provider::ProviderSubagentId::new("task-1"),
             name: "Explore".to_owned(),
             description: "Map the Remote's seams".to_owned(),
+            delegation: None,
         })
         .await;
     let suru::managed_client::SubagentTreeEvent::Changed(

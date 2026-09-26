@@ -1,15 +1,17 @@
 //! Opening a Subagent's child Session — the one Session creation a Prompt does
 //! not drive — and beginning each later Turn a resume of the Subagent begins
-//! in it.
+//! in it, each opened by the Delegation that began it.
 
 use std::collections::HashMap;
 
 use anyhow::anyhow;
 use tokio::sync::broadcast;
 
+use crate::ansi::NormalizedText;
 use crate::protocol::{
-    PromptOrder, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStandingInputs, SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
+    Activity, Delegator, Message, MessageId, MessageRole, MessageStatus, PromptOrder, Session,
+    SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
+    SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 
 use super::{
@@ -26,17 +28,30 @@ pub(crate) struct SpawnedSubagentSession {
     pub(crate) turn_id: TurnId,
 }
 
+/// The Delegation a resume's Turn opens with: what the delegating Agent
+/// asked, already normalized and capped the way an Agent Message's content
+/// is, and the Session whose Agent sent it — the Subagent's parent, or a
+/// sibling Subagent's.
+pub(crate) struct OpeningDelegation {
+    pub(crate) delegating_session: SessionId,
+    pub(crate) text: NormalizedText,
+}
+
 impl SessionStore {
     /// Creates the child Session a Subagent runs in: parented to its spawner,
     /// titled from the spawn description — never an Errand — and opened with
-    /// the one prompt-less Turn its attributed events land in. The child joins
-    /// no listing and rides no catalog stream, so nothing is announced; it is
-    /// reachable only through the row its spawner's Transcript shows.
+    /// the one prompt-less Turn its attributed events land in. The spawn's
+    /// Delegation, where the Provider reported its text, opens that Turn as a
+    /// Message from the spawner's Agent, ahead of anything the Subagent does.
+    /// The child joins no listing and rides no catalog stream, so nothing is
+    /// announced; it is reachable only through the row its spawner's
+    /// Transcript shows.
     pub(crate) fn create_subagent(
         &self,
         parent_id: SessionId,
         name: &str,
         description: &str,
+        delegation: Option<NormalizedText>,
     ) -> anyhow::Result<SpawnedSubagentSession> {
         let mut state = self
             .state
@@ -57,6 +72,14 @@ impl SessionStore {
             "" => name.trim().to_owned(),
             described => described.to_owned(),
         };
+        let delegation = delegation
+            .map(|text| delegation_message(turn_id, delegator(&state.sessions, parent_id), text));
+        let transcript = delegation
+            .iter()
+            .map(|message| TranscriptItem::Message {
+                message_id: message.id,
+            })
+            .collect();
         let snapshot = SessionSnapshot {
             title: title.clone(),
             icon: None,
@@ -90,9 +113,9 @@ impl SessionStore {
                 cost_basis: None,
                 cost_details: None,
             }],
-            messages: Vec::new(),
+            messages: delegation.into_iter().collect(),
             activities: Vec::new(),
-            transcript: Vec::new(),
+            transcript,
             subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
@@ -150,14 +173,20 @@ impl SessionStore {
     /// is a Turn of its own there rather than a Subagent of its own, and the
     /// Session keeps the Title its spawn gave it. Like the spawn's, the Turn
     /// begins without a Prompt, and without an Agent until the Provider
-    /// reports the Model running this stretch.
+    /// reports the Model running this stretch. The resume's Delegation, where
+    /// the Provider reported its text, opens the Turn in the same commit, so
+    /// it stands ahead of anything the resumed Subagent does.
     ///
     /// A Turn still open in the Session — a Continuation the Subagent's own
     /// work began — Settles first, as worked: a Delegation delivered to begin
     /// a Turn settles such a Continuation rather than steering it, as a
     /// Prompt does (CONTEXT.md: Continuation). Both land in one commit, so no
     /// reader sees the Session between them.
-    pub(crate) fn begin_subagent_turn(&self, session_id: SessionId) -> anyhow::Result<TurnId> {
+    pub(crate) fn begin_subagent_turn(
+        &self,
+        session_id: SessionId,
+        delegation: Option<OpeningDelegation>,
+    ) -> anyhow::Result<TurnId> {
         let mut state = self
             .state
             .lock()
@@ -202,7 +231,55 @@ impl SessionStore {
                 cost_details: None,
             },
         });
+        if let Some(delegation) = delegation {
+            changes.push(SessionChange::MessageAdded {
+                message: delegation_message(
+                    turn_id,
+                    delegator(&state.sessions, delegation.delegating_session),
+                    delegation.text,
+                ),
+            });
+        }
         state.commit(&self.storage, session_id, changes)?;
         Ok(turn_id)
+    }
+}
+
+/// Names the Agent of `session_id` the way a Delegation it sent names it: by
+/// its Session, and — when that is a Subagent's — by the name the Subagent's
+/// rows carry in its spawner's Transcript.
+fn delegator(sessions: &HashMap<SessionId, SessionRecord>, session_id: SessionId) -> Delegator {
+    let name = sessions
+        .get(&session_id)
+        .and_then(|record| record.snapshot.session.parent)
+        .and_then(|spawner| sessions.get(&spawner))
+        .and_then(|spawner| {
+            spawner
+                .snapshot
+                .activities
+                .iter()
+                .find_map(|activity| match activity {
+                    Activity::Subagent {
+                        session_id: child,
+                        name,
+                        ..
+                    } if *child == session_id => Some(name.clone()),
+                    _ => None,
+                })
+        });
+    Delegator { session_id, name }
+}
+
+/// The Message a Delegation stands as in the Turn it opens. It arrives whole,
+/// so it is complete from the start.
+fn delegation_message(turn_id: TurnId, delegator: Delegator, text: NormalizedText) -> Message {
+    Message {
+        id: MessageId::new(),
+        turn_id,
+        role: MessageRole::Delegation(delegator),
+        status: MessageStatus::Completed,
+        content: text.content,
+        skill_invocations: Vec::new(),
+        truncated: text.truncated,
     }
 }

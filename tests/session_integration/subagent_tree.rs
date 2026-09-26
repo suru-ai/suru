@@ -112,6 +112,7 @@ async fn spawn(
                 subagent_id: ProviderSubagentId::new(subagent),
                 name: name.to_owned(),
                 description: description.to_owned(),
+                delegation: None,
             },
         )
         .await;
@@ -150,6 +151,7 @@ async fn resume(
             ProviderEvent::SubagentResumed {
                 subagent_id: ProviderSubagentId::new(subagent),
                 description: description.to_owned(),
+                delegation: None,
             },
         )
         .await;

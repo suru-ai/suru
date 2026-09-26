@@ -31,6 +31,7 @@ async fn spawn_subagent(fixture: &WorkingTurn, subagent: &ProviderSubagentId) ->
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_until(
@@ -261,6 +262,7 @@ async fn stopping_a_subagent_stops_whatever_it_delegated_in_turn() {
                 subagent_id: inner.clone(),
                 name: "Scout".to_owned(),
                 description: "Map the callers".to_owned(),
+                delegation: None,
             },
         )
         .await;
@@ -631,6 +633,7 @@ async fn stopping_a_resumed_subagent_settles_only_its_resumed_stretch() {
         ProviderEvent::SubagentResumed {
             subagent_id: subagent.clone(),
             description: "Map the tests too".to_owned(),
+            delegation: None,
         },
         ProviderEvent::TurnCompleted,
     ] {
@@ -730,6 +733,7 @@ async fn stopping_a_subagent_leaves_working_a_subagent_it_only_resumed() {
             ProviderEvent::SubagentResumed {
                 subagent_id: writer,
                 description: "Tighten the notes".to_owned(),
+                delegation: None,
             },
         )
         .await;

@@ -461,6 +461,7 @@ impl ClaudeProjection {
                     ProviderEvent::SubagentResumed {
                         subagent_id,
                         description,
+                        delegation: None,
                     },
                 )
             }
@@ -494,6 +495,7 @@ impl ClaudeProjection {
                             .subagent_type
                             .unwrap_or_else(|| TASK_TOOL.to_owned()),
                         description,
+                        delegation: None,
                     },
                 )
             }

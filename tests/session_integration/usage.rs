@@ -66,6 +66,7 @@ async fn spawn_subagent(
                 subagent_id: subagent.clone(),
                 name: name.to_owned(),
                 description: format!("{name} the provider seams"),
+                delegation: None,
             },
         )
         .await;

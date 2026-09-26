@@ -29,6 +29,7 @@ async fn spawn_subagent(
             subagent_id: subagent.clone(),
             name: "Explore".to_owned(),
             description: "Map the provider seams".to_owned(),
+            delegation: None,
         })
         .await;
     let parent = read_session_until(

@@ -703,6 +703,10 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         name: String,
         description: String,
+        /// The spawn's Delegation: the text the spawner's Agent handed the
+        /// Subagent, where the Provider reports it. It opens the child
+        /// Session's first Turn as a Message from the spawner's Agent.
+        delegation: Option<String>,
     },
     /// The Turn's Agent resumed a settled Subagent: the same agent, named by
     /// the identity its spawn carried, continuing the same conversation. Like
@@ -715,6 +719,10 @@ pub enum ProviderEvent {
     SubagentResumed {
         subagent_id: ProviderSubagentId,
         description: String,
+        /// The resume's Delegation: the text the delegating Agent sent the
+        /// Subagent, where the Provider reports it. It opens the Turn the
+        /// resume begins as a Message from the delegating Agent.
+        delegation: Option<String>,
     },
     /// The Provider revised what a working Subagent is doing.
     SubagentUpdated {

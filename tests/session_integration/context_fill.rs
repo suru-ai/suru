@@ -139,6 +139,7 @@ async fn child_context_is_independent_and_can_refresh_after_child_settlement() {
             subagent_id: child.clone(),
             name: "Reader".into(),
             description: "Read".into(),
+            delegation: None,
         })
         .await;
     let parent = read_session_until(
