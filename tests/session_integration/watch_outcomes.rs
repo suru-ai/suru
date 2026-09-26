@@ -10,12 +10,13 @@ use crate::support::{
 };
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId, RuntimeDescriptor,
-        SessionId, SessionSnapshot, TranscriptItem, TurnId, TurnStatus, WatchOutcomeStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId,
+        RuntimeDescriptor, SessionId, SessionSnapshot, TranscriptItem, TurnId, TurnStatus,
+        WatchOutcomeStatus,
     },
     provider::{
-        ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderWatchId,
-        ProviderWatchOutcome,
+        ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderSubagentStatus,
+        ProviderWatchId, ProviderWatchOutcome,
     },
     server::{self, ServerConfig},
 };
@@ -496,6 +497,186 @@ async fn a_watch_owned_by_a_working_subagent_records_its_outcome_in_the_subagent
         outcomes[0].turn_id(),
         child.turns[0].id,
         "the outcome lands in the Turn the Subagent is working in"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// The Subagent rows in `snapshot`'s Transcript, as (status, the Session each
+/// leads into).
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, SessionId)> {
+    snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Subagent {
+                status, session_id, ..
+            } => Some((*status, *session_id)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_settled_subagent_woken_by_its_own_watch_works_on_in_a_continuation_of_its_own_session() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "watch-wakes-settled-subagent-test").await;
+    let provider = &fixture.provider_session;
+    let subagent = ProviderSubagentId::new("task-1");
+    let as_subagent = || ProviderEventAttribution::Subagent(subagent.clone());
+    provider.emit(ProviderEvent::SubagentStarted {
+        subagent_id: subagent.clone(),
+        name: "Test".to_owned(),
+        description: "Run the suite".to_owned(),
+        delegation: Some("Run the suite in the background.".to_owned()),
+    });
+    provider
+        .emit_attributed_and_wait_until_observed(
+            as_subagent(),
+            watch_started("task-tests", "cargo test"),
+        )
+        .await;
+    provider.emit(ProviderEvent::SubagentCompleted {
+        subagent_id: subagent.clone(),
+        status: ProviderSubagentStatus::Completed,
+    });
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let settled = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let [(ActivityStatus::Completed, child)] = subagent_rows(&settled)[..] else {
+        panic!("the spawn's stretch settled: {:?}", settled.activities);
+    };
+
+    provider
+        .emit_attributed_and_wait_until_observed(
+            as_subagent(),
+            watch_woke_agent(
+                "task-tests",
+                ProviderWatchOutcome::Completed,
+                Some(r#"Background command "cargo test" completed (exit code 0)"#),
+            ),
+        )
+        .await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentWoken {
+            subagent_id: subagent.clone(),
+        })
+        .await;
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: "The suite passed.".to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+    ] {
+        provider
+            .emit_attributed_and_wait_until_observed(as_subagent(), event)
+            .await;
+    }
+    let woken = read_session(fixture.server.descriptor(), child).await;
+    assert_eq!(woken.turns.len(), 2, "the wake began a second Turn");
+    let continuation = &woken.turns[1];
+    assert_eq!(continuation.status, TurnStatus::Active);
+    assert_eq!(continuation.prompt_id, None);
+    assert!(
+        !woken
+            .messages
+            .iter()
+            .any(|message| message.turn_id == continuation.id && message.role.delegator().is_some()),
+        "no Delegation opens it, so it is a Continuation: {:?}",
+        woken.messages
+    );
+    let outcome = first_activity_of_turn(&woken, continuation.id)
+        .expect("the Continuation holds the Watch Outcome");
+    assert!(
+        matches!(
+            outcome,
+            Activity::WatchOutcome {
+                status: WatchOutcomeStatus::Completed,
+                summary: Some(summary),
+                ..
+            } if summary == r#"Background command "cargo test" completed (exit code 0)"#
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        head_of_turn(&woken, continuation.id),
+        Some(TranscriptItem::Activity {
+            activity_id: outcome.id()
+        }),
+        "the Watch Outcome heads the Continuation it woke the Subagent into"
+    );
+    assert!(
+        woken
+            .messages
+            .iter()
+            .any(|message| message.turn_id == continuation.id
+                && message.content == "The suite passed."),
+        "the woken Subagent's work lands in that Continuation"
+    );
+    let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        parent.turns.len(),
+        1,
+        "nothing in the parent's conversation began a Turn there"
+    );
+    assert_eq!(
+        subagent_rows(&parent),
+        [(ActivityStatus::Completed, child)],
+        "the wake adds no row, and the spawn's stays as it settled"
+    );
+    assert!(
+        parent.session.working_since.is_some(),
+        "the woken Subagent keeps its parent Working"
+    );
+
+    provider.emit(ProviderEvent::SubagentCompleted {
+        subagent_id: subagent.clone(),
+        status: ProviderSubagentStatus::Completed,
+    });
+    provider.emit(ProviderEvent::AgentMessageStarted);
+    provider.emit(ProviderEvent::AgentMessageDelta {
+        content: "The Subagent says the suite passed.".to_owned(),
+    });
+    provider.emit(ProviderEvent::AgentMessageCompleted);
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let followed_up = session_where(
+        &fixture,
+        "the parent's follow-up settles in a Continuation of its own",
+        |snapshot| turn_settled(snapshot, 1),
+    )
+    .await;
+    assert_eq!(followed_up.turns[1].prompt_id, None);
+    assert!(
+        followed_up
+            .messages
+            .iter()
+            .any(|message| message.turn_id == followed_up.turns[1].id
+                && message.content == "The Subagent says the suite passed.")
+    );
+    assert_eq!(
+        subagent_rows(&followed_up),
+        [(ActivityStatus::Completed, child)],
+        "the woken stretch's settle publishes nothing on the parent's row"
+    );
+    assert_eq!(
+        (
+            followed_up.session.working_since,
+            followed_up.session.monitoring_since
+        ),
+        (None, None)
+    );
+    let child = read_session(fixture.server.descriptor(), child).await;
+    assert_eq!(
+        child
+            .turns
+            .iter()
+            .map(|turn| turn.status)
+            .collect::<Vec<_>>(),
+        [TurnStatus::Completed, TurnStatus::Completed],
+        "the Subagent's settle closes its Continuation"
     );
     fixture.server.shutdown().await.expect("shut down server");
 }

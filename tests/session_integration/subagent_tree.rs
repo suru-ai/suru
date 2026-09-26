@@ -1044,6 +1044,130 @@ async fn a_settled_subagents_watch_reads_monitoring_on_its_entry_and_the_top_lev
 }
 
 #[tokio::test]
+async fn a_subagent_woken_by_its_own_watch_stays_one_entry_that_works_again_then_settles() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-watch-wake-test").await;
+    let provider = &fixture.provider_session;
+    let descriptor = fixture.server.descriptor().clone();
+    let as_explore = || ProviderEventAttribution::Subagent(ProviderSubagentId::new("task-1"));
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    provider
+        .emit_attributed_and_wait_until_observed(
+            as_explore(),
+            ProviderEvent::WatchStarted {
+                watch_id: ProviderWatchId::new("child-tests"),
+                description: "cargo test".to_owned(),
+            },
+        )
+        .await;
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let (before, mut updates) = open_tree(&descriptor, fixture.session_id).await;
+    let mut revision = before.revision;
+    assert_eq!(before.subagents.len(), 1);
+    let explore = named(&before.subagents, "Explore").clone();
+    assert_eq!(explore.status, ActivityStatus::Completed);
+    assert_eq!(before.top_level.working_since, None);
+
+    provider
+        .emit_attributed_and_wait_until_observed(
+            as_explore(),
+            ProviderEvent::WatchSettled {
+                watch_id: ProviderWatchId::new("child-tests"),
+                outcome: ProviderWatchOutcome::Completed,
+                summary: Some("cargo test passed".to_owned()),
+                woke_agent: true,
+            },
+        )
+        .await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentWoken {
+            subagent_id: ProviderSubagentId::new("task-1"),
+        })
+        .await;
+    let woken = changes_until(&mut updates, &mut revision, |change| {
+        matches!(
+            change,
+            SubagentTreeChange::SubagentWorkingChanged {
+                status: ActivityStatus::Active,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        !woken
+            .iter()
+            .any(|change| matches!(change, SubagentTreeChange::SubagentSpawned { .. })),
+        "the wake spawns no entry: {woken:?}"
+    );
+    let Some(SubagentTreeChange::SubagentWorkingChanged {
+        session_id,
+        working_since,
+        ..
+    }) = woken.last()
+    else {
+        unreachable!()
+    };
+    assert_eq!(*session_id, explore.session_id);
+    assert_eq!(
+        *working_since,
+        latest_turn_began(&descriptor, explore.session_id).await,
+        "the entry works since its woken Turn began"
+    );
+    let (during, _) = open_tree(&descriptor, fixture.session_id).await;
+    assert_eq!(during.subagents.len(), 1, "still one entry: {during:?}");
+    assert_eq!(
+        named(&during.subagents, "Explore").status,
+        ActivityStatus::Active
+    );
+    assert!(
+        during.top_level.working_since.is_some(),
+        "the woken Subagent keeps the top level Working"
+    );
+    assert_eq!(during.top_level.monitoring_since, None);
+
+    settle(provider, None, "task-1", ProviderSubagentStatus::Completed).await;
+    let settled = changes_until(&mut updates, &mut revision, |change| {
+        matches!(
+            change,
+            SubagentTreeChange::SubagentWorkingChanged {
+                status: ActivityStatus::Completed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        !settled
+            .iter()
+            .any(|change| matches!(change, SubagentTreeChange::SubagentSpawned { .. })),
+        "{settled:?}"
+    );
+    let (after, _) = open_tree(&descriptor, fixture.session_id).await;
+    assert_eq!(
+        shape(&after),
+        owned(&[("Explore", "top-level", 0)]),
+        "one entry, where it first spawned"
+    );
+    assert_eq!(
+        named(&after.subagents, "Explore").status,
+        ActivityStatus::Completed
+    );
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut fixture = working_turn(state_dir.path(), "subagent-tree-working-test").await;

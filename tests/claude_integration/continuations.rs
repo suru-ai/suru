@@ -59,7 +59,7 @@ fn turn_entries(snapshot: &SessionSnapshot, turn_id: TurnId) -> Vec<TranscriptIt
 
 /// The Watch Outcome heading the Continuation at `turn_index`, which must be the Turn's first
 /// Transcript entry.
-fn heading_watch_outcome(snapshot: &SessionSnapshot, turn_index: usize) -> &Activity {
+pub(crate) fn heading_watch_outcome(snapshot: &SessionSnapshot, turn_index: usize) -> &Activity {
     let turn_id = snapshot.turns[turn_index].id;
     let Some(TranscriptItem::Activity { activity_id }) =
         turn_entries(snapshot, turn_id).first().copied()

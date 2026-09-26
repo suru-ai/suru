@@ -763,6 +763,19 @@ pub enum ProviderEvent {
         /// resume begins as a Message from the delegating Agent.
         delegation: Option<String>,
     },
+    /// A settled Subagent's own Watch woke it: the same agent works on in the
+    /// same conversation, though no Agent delegated anything to it. So it is
+    /// no resume (ADR 0031) and gains no row in any Transcript: its work lands
+    /// in a Continuation of the Subagent's own Session, headed by the Watch
+    /// Outcome that woke it, and its Session Works again — and with it every
+    /// Session above it. The Provider's next `SubagentCompleted` for it settles
+    /// that Continuation as it settles any stretch. Like the rest of a
+    /// Subagent's lifecycle it names the Subagent by `subagent_id` whatever its
+    /// attribution, and it is no output of any Turn of the delegating
+    /// Session's: nothing there caused it.
+    SubagentWoken {
+        subagent_id: ProviderSubagentId,
+    },
     /// The Provider revised what a working Subagent is doing.
     SubagentUpdated {
         subagent_id: ProviderSubagentId,

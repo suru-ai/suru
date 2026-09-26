@@ -563,6 +563,32 @@ impl ClaudeProjection {
         {
             return Vec::new();
         }
+        // Every Delegation starts its task from the tool use that sent it — a SendMessage resume
+        // names the SendMessage — so a settled agent started again naming no tool use at all was
+        // sent nothing: its own Watch settled, and the CLI woke it to hear how.
+        if message.tool_use_id.is_none()
+            && let Some(task) = self.agent_tasks.get_mut(&task_id)
+        {
+            task.working = Some(message.description.unwrap_or_default());
+            let conversation = task.conversation.clone();
+            if conversation.is_none() {
+                self.unplaced_resumes.insert(task_id.clone());
+            }
+            let subagent_id = ProviderSubagentId::new(task_id);
+            let model = conversation
+                .and_then(|conversation| self.subagent_models.get(&conversation))
+                .cloned()
+                .map(|model| {
+                    ProviderEvent::SubagentModelChanged {
+                        subagent_id: subagent_id.clone(),
+                        model,
+                    }
+                    .into()
+                });
+            return std::iter::once(ProviderEvent::SubagentWoken { subagent_id }.into())
+                .chain(model)
+                .collect();
+        }
         // The tool use the start names is the Delegation, and the conversation that ran it is the
         // delegating one. A start naming no tool this projection saw delegates from the loop's own
         // conversation, which always has a Turn to land in (ADR 0015).
@@ -2025,6 +2051,73 @@ mod tests {
         assert_eq!(
             attribution_of(&events, "GOODBYE"),
             subagent("a2046dbbe8ecd4a5c")
+        );
+    }
+
+    #[test]
+    fn a_settled_agent_started_again_naming_no_tool_use_is_woken_rather_than_resumed() {
+        let mut projection = ClaudeProjection::new(
+            TurnInFlight::new(),
+            ClaudeResumeState {
+                session_id: "provider-session".to_owned(),
+                agents: [("agent-task".to_owned(), "agent_1".to_owned())].into(),
+            },
+        );
+
+        let mut events = project(
+            &mut projection,
+            &[json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "agent-task",
+                "description": "Run the suite",
+                "task_type": "local_agent",
+                "subagent_type": "general-purpose",
+            })],
+        );
+        assert_eq!(
+            projection.turn.subagent_task("agent-task").as_deref(),
+            Some("agent-task"),
+            "the woken agent is back on the roster, so stopping its Subagent still finds it"
+        );
+        events.extend(project(
+            &mut projection,
+            &[
+                said_under("agent_1", "The suite passed."),
+                task_notification("agent-task", "completed", Some("Reported the suite")),
+            ],
+        ));
+
+        let lifecycle = events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event.event,
+                    ProviderEvent::AgentMessageStarted
+                        | ProviderEvent::AgentMessageDelta { .. }
+                        | ProviderEvent::AgentMessageCompleted
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle,
+            [
+                owning(ProviderEvent::SubagentWoken {
+                    subagent_id: ProviderSubagentId::new("agent-task"),
+                }),
+                owning(ProviderEvent::SubagentCompleted {
+                    subagent_id: ProviderSubagentId::new("agent-task"),
+                    status: crate::provider::ProviderSubagentStatus::Completed,
+                }),
+            ],
+            "nothing delegated the stretch, so it is a wake and no resume, and it settles as \
+             any stretch does"
+        );
+        assert_eq!(
+            attribution_of(&events, "The suite passed."),
+            subagent("agent-task"),
+            "the woken agent's conversation rides under its spawn as before"
         );
     }
 

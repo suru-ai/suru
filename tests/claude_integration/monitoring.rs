@@ -6,12 +6,14 @@
 //! A task a subagent launched is that Subagent's Watch, which outlives it and keeps its own Session
 //! Monitoring as well as the Sessions above it; interrupting that Session stops its Watches alone.
 
+use crate::continuations::heading_watch_outcome;
 use crate::support::{
-    CLAUDE_MODELS, ScriptedClaude, after_probe, conversation_fixture, discovery_arms,
-    opened_session, session_where, settled_session, stop_task_arm, user_turn_arm,
+    CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
+    discovery_arms, opened_session, session_where, settled_session, stop_task_arm, user_turn_arm,
 };
 use suru::protocol::{
-    Activity, InterruptOutcome, SessionId, SessionSnapshot, SessionStatus, TurnStatus,
+    Activity, ActivityStatus, InterruptOutcome, SessionId, SessionSnapshot, SessionStatus,
+    TurnStatus, WatchOutcomeStatus,
 };
 
 /// A Turn that starts one task of `task_type` in the background and ends its loop, leaving the
@@ -411,5 +413,174 @@ async fn escape_in_a_subagents_session_stops_only_that_subagents_watches() {
         })
         .collect::<Vec<_>>();
     assert_eq!(stopped, ["task-sub-tests"]);
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// The background Subagent's shell settling once released, after both the Subagent and the loop
+/// have settled: the CLI notifies the shell's end, then — with no Delegation, so naming no tool
+/// use — starts the agent's own task again to hear it. The woken agent's work rides under its
+/// spawn's conversation and holds at the `settle` gate before the agent settles again, and the
+/// loop then wakes to hear from it in a native Continuation of its own.
+const SUBAGENT_WOKEN_BY_ITS_SHELL: &str = r#"      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      emit '{"type":"system","subtype":"task_notification","task_id":"task-sub-tests","tool_use_id":"toolu_sub_tests","status":"completed","summary":"Background command \"cargo test\" completed (exit code 0)","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-bg","description":"Run the suite","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The suite passed."}]},"parent_tool_use_id":"agent_bg","session_id":"prov-session"}'
+      while [ ! -e "$CLAUDE_FIXTURE_RELEASE-settle" ]; do sleep 0.01; done
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-bg","status":"completed","summary":"Reported the suite","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"The suite passed, the Subagent says."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":20,"num_turns":1,"result":"The suite passed, the Subagent says.","session_id":"prov-session"}'
+"#;
+
+/// The Subagent rows in `snapshot`'s Transcript.
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_settled_subagent_woken_by_its_own_shell_works_on_in_a_continuation_of_its_own_session() {
+    let claude = conversation_fixture(&format!(
+        "{}{SUBAGENT_WOKEN_BY_ITS_SHELL}",
+        subagent_leaves_a_shell_running("")
+    ));
+    let opened = opened_session(&claude, "claude-subagent-watch-wake", "Run the suite").await;
+    let (client, session_id) = (&opened.client, opened.session_id);
+    let settled = settled_session(client, session_id, 0).await;
+    assert!(
+        settled.session.monitoring_since.is_some(),
+        "the Subagent and the loop have both settled, leaving the shell to Monitor"
+    );
+    let child_id = subagent_session(&settled);
+    let spawned = settled_session(client, child_id, 0).await;
+    assert_eq!(spawned.turns.len(), 1);
+
+    claude.release();
+    let mut child_feed = client
+        .subscribe_session(child_id)
+        .await
+        .expect("subscribe to the Subagent's Session");
+    let woken = session_where(
+        client,
+        &mut child_feed,
+        child_id,
+        "the shell's settling wakes the Subagent into a second Turn of its own Session",
+        |snapshot| {
+            snapshot.turns.len() == 2
+                && agent_messages(snapshot)
+                    .iter()
+                    .any(|message| message.content == "The suite passed.")
+        },
+    )
+    .await;
+    let continuation = &woken.turns[1];
+    assert_eq!(continuation.status, TurnStatus::Active);
+    assert_eq!(
+        continuation.prompt_id, None,
+        "no Prompt began the woken Turn"
+    );
+    assert!(
+        !woken
+            .messages
+            .iter()
+            .any(|message| message.turn_id == continuation.id && message.role.delegator().is_some()),
+        "and no Delegation did either, so it is a Continuation: {:?}",
+        woken.messages
+    );
+    assert_eq!(
+        heading_watch_outcome(&woken, 1),
+        &Activity::WatchOutcome {
+            id: heading_watch_outcome(&woken, 1).id(),
+            turn_id: continuation.id,
+            status: WatchOutcomeStatus::Completed,
+            description: "cargo test".to_owned(),
+            summary: Some(r#"Background command "cargo test" completed (exit code 0)"#.to_owned()),
+        },
+        "the Continuation opens with how the Subagent's shell settled"
+    );
+    let working = client
+        .read_session(session_id)
+        .await
+        .expect("read the top-level Session");
+    assert!(
+        working.session.working_since.is_some(),
+        "the woken Subagent Working keeps the top-level Session Working"
+    );
+    assert_eq!(working.session.monitoring_since, None);
+    assert_eq!(
+        working.turns.len(),
+        1,
+        "nothing in the top-level Session's conversation began a Turn there"
+    );
+    assert_eq!(
+        subagent_rows(&working).len(),
+        1,
+        "and the wake adds no row to its Transcript"
+    );
+
+    claude.release_gate("settle");
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to the top-level Session");
+    let followed_up = session_where(
+        client,
+        &mut feed,
+        session_id,
+        "the loop hears from the Subagent in a Continuation of its own that settles",
+        |snapshot| {
+            snapshot.turns.len() == 2
+                && snapshot.turns[1].status == TurnStatus::Completed
+                && snapshot.session.working_since.is_none()
+        },
+    )
+    .await;
+    assert_eq!(
+        followed_up.turns[1].prompt_id, None,
+        "the top-level Session's follow-up is a Continuation"
+    );
+    assert!(
+        agent_messages(&followed_up)
+            .iter()
+            .any(|message| message.turn_id == followed_up.turns[1].id
+                && message.content == "The suite passed, the Subagent says."),
+        "holding the loop's own follow-up: {:?}",
+        followed_up.messages
+    );
+    let rows = subagent_rows(&followed_up);
+    assert_eq!(rows.len(), 1, "still the one row: {rows:?}");
+    assert!(
+        matches!(
+            rows[0],
+            Activity::Subagent { status: ActivityStatus::Completed, session_id, .. }
+                if *session_id == child_id
+        ),
+        "which stays as the spawn's stretch settled: {rows:?}"
+    );
+    assert_eq!(
+        followed_up.session.monitoring_since, None,
+        "with every Watch settled and nothing Working, the Session reads neither"
+    );
+    let child = client
+        .read_session(child_id)
+        .await
+        .expect("read the Subagent's Session");
+    assert_eq!(
+        child
+            .turns
+            .iter()
+            .map(|turn| turn.status)
+            .collect::<Vec<_>>(),
+        [TurnStatus::Completed, TurnStatus::Completed],
+        "the agent's second settle closes its Continuation"
+    );
+    assert_eq!(
+        (child.session.working_since, child.session.monitoring_since),
+        (None, None)
+    );
     opened.server.shutdown().await.expect("shut down server");
 }

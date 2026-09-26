@@ -345,16 +345,16 @@ impl ActiveProviderTurn {
 /// Where the connection's Subagent-attributed events land: for each Subagent
 /// the Provider has named, the Session that is that Subagent's own and the
 /// Turn state its stream projects into. Each stretch of a Subagent's work —
-/// its spawn, and each resume after it settled — establishes a route into the
-/// Turn that stretch works in, and the stretch's settle drops it. Routes live
-/// and die with the Provider connection, because the identities are the
-/// connection's to mint. An event attributed to a Subagent with no route
-/// lands nowhere.
+/// its spawn, each resume after it settled, and each wake by its own Watch —
+/// establishes a route into the Turn that stretch works in, and the stretch's
+/// settle drops it. Routes live and die with the Provider connection, because
+/// the identities are the connection's to mint. An event attributed to a
+/// Subagent with no route lands nowhere.
 ///
-/// The rows live beside the routes rather than inside any Turn's state,
-/// because a Subagent may outlive the Turn that delegated to it (ADR 0015):
-/// its row must still be reachable when the Provider settles it after that
-/// Turn has.
+/// The working stretches and their rows live beside the routes rather than
+/// inside any Turn's state, because a Subagent may outlive the Turn that
+/// delegated to it (ADR 0015): its row must still be reachable when the
+/// Provider settles it after that Turn has.
 struct SubagentRoutes {
     /// The Provider whose connection mints every identity here, stored with
     /// each Subagent's Session so only that Provider's resume can find it.
@@ -362,8 +362,8 @@ struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
     /// Context measurements can arrive after the child's output route settles.
     context_routes: HashMap<ProviderSubagentId, (SessionId, TurnId)>,
-    /// The row each working Subagent's current stretch stands as.
-    rows: HashMap<ProviderSubagentId, SubagentRow>,
+    /// Each working Subagent's current stretch, and the row it stands as.
+    working: HashMap<ProviderSubagentId, WorkingStretch>,
     /// Every Subagent the connection has named, retained for its lifetime —
     /// and, since each identity is stored with its Subagent's Session, every
     /// one it named before a restart, relearned when the connection resumes:
@@ -374,7 +374,9 @@ struct SubagentRoutes {
     /// routes are gone, but the Provider was not the one to close them, so
     /// its own account of their end — the settle it still owes, the progress
     /// it had in flight — can trail in afterwards and must read as a late
-    /// echo to discard rather than as an event it never spawned.
+    /// echo to discard rather than as an event it never spawned. A Subagent
+    /// woken while Suru held no Session for it joins them, because its
+    /// stretch is one Suru never opened and so has nothing to settle.
     stopped: HashSet<ProviderSubagentId>,
     /// Whether a Subagent has settled, or a Watch's settling woke the Agent,
     /// since a Turn last began. The output a completion provokes can arrive
@@ -397,18 +399,29 @@ struct SubagentRoute {
     turn: ActiveProviderTurn,
 }
 
-/// One stretch of a Subagent's work as its row in the delegating Transcript.
-/// Suru times the stretch itself, the way it times a Reasoning block:
-/// `started` is the moment the spawn or resume was admitted, and the elapsed
-/// time it yields is the duration the settled row reports — this stretch's
-/// alone, however long the Subagent worked before it.
+/// One stretch of a Subagent's work still going. Suru times the stretch
+/// itself, the way it times a Reasoning block: `started` is the moment the
+/// spawn, resume or wake was admitted, and the elapsed time it yields is the
+/// duration the settled row reports — this stretch's alone, however long the
+/// Subagent worked before it.
+struct WorkingStretch {
+    /// The row the stretch stands as in the delegating Transcript. A stretch
+    /// its own Watch woke the Subagent into has none, because nothing
+    /// delegated it: its work is a Continuation of the Subagent's own Session
+    /// alone, and its settle has no row to close.
+    row: Option<SubagentRow>,
+    started: Instant,
+}
+
+/// Where one stretch of a Subagent's work stands as a row in the delegating
+/// Transcript.
+#[derive(Clone, Copy)]
 struct SubagentRow {
     /// The Session whose Transcript holds the row — the one whose Turn
     /// delegated the stretch: the Subagent's spawner, or for a resume
     /// whichever Agent sent it, a sibling Subagent's included.
     owner_session_id: SessionId,
     activity_id: ActivityId,
-    started: Instant,
 }
 
 /// What the connection knows of one Subagent, working or not: the Session
@@ -425,14 +438,14 @@ struct SubagentIdentity {
 }
 
 /// Where one stretch of a Subagent's work stands: the Turn it works in within
-/// the Subagent's own Session, and its row in the delegating Session. A
-/// resume moves a Subagent onto a new stretch, and its Model evidence follows
-/// — the spawn's Turn and row keep what they settled with.
+/// the Subagent's own Session, and its row in the delegating Session, where
+/// something delegated it. A resume or a wake moves a Subagent onto a new
+/// stretch, and its Model evidence follows — the spawn's Turn and row keep
+/// what they settled with.
 #[derive(Clone, Copy)]
 struct SubagentStretch {
     turn_id: TurnId,
-    owner_session_id: SessionId,
-    activity_id: ActivityId,
+    row: Option<SubagentRow>,
 }
 
 impl SubagentRoutes {
@@ -441,7 +454,7 @@ impl SubagentRoutes {
             provider,
             routes: HashMap::new(),
             context_routes: HashMap::new(),
-            rows: HashMap::new(),
+            working: HashMap::new(),
             identities: HashMap::new(),
             stopped: HashSet::new(),
             late_settle_owes_continuation: false,
@@ -485,7 +498,7 @@ impl SubagentRoutes {
     /// rather than being stray: some Subagent is still working, or one just
     /// settled and its provoked output is still to come.
     fn owes_continuation(&self) -> bool {
-        self.late_settle_owes_continuation || !self.rows.is_empty() || !self.routes.is_empty()
+        self.late_settle_owes_continuation || !self.working.is_empty() || !self.routes.is_empty()
     }
 
     /// Projects one Subagent-attributed event into the Session its route
@@ -549,7 +562,7 @@ impl SubagentRoutes {
                 interventions,
             );
         }
-        for (_, row) in self.rows.drain() {
+        for row in self.working.drain().filter_map(|(_, stretch)| stretch.row) {
             let _ = updates.apply(|| {
                 sessions.publish_agent_output(
                     row.owner_session_id,
@@ -597,7 +610,7 @@ impl SubagentRoutes {
     ) {
         let mut targets = vec![subagent.clone()];
         while let Some(subagent) = targets.pop() {
-            let Some(row) = self.rows.remove(&subagent) else {
+            let Some(stretch) = self.working.remove(&subagent) else {
                 continue;
             };
             let route = self.routes.remove(&subagent);
@@ -607,7 +620,7 @@ impl SubagentRoutes {
                 // resumed stands elsewhere in the tree, so its row here does
                 // not make it one of them.
                 targets.extend(
-                    self.rows
+                    self.working
                         .keys()
                         .filter(|working| {
                             self.identities
@@ -625,7 +638,10 @@ impl SubagentRoutes {
                     )
                 });
             }
-            let duration_ms = u64::try_from(row.started.elapsed().as_millis()).ok();
+            let Some(row) = stretch.row else {
+                continue;
+            };
+            let duration_ms = u64::try_from(stretch.started.elapsed().as_millis()).ok();
             let _ = updates.apply(|| {
                 sessions.publish_agent_output(
                     row.owner_session_id,
@@ -645,7 +661,7 @@ impl SubagentRoutes {
     /// always was — so this also stands down the Continuation, and the Watch
     /// Outcomes held for it with it.
     fn stop_all(&mut self, sessions: &SessionStore, updates: &ProviderUpdateGate) {
-        let working = self.rows.keys().cloned().collect::<Vec<_>>();
+        let working = self.working.keys().cloned().collect::<Vec<_>>();
         for subagent in working {
             self.settle_stopped(sessions, updates, &subagent);
         }
@@ -654,15 +670,18 @@ impl SubagentRoutes {
     }
 
     /// Applies a Provider's description update to the row it names, or `None`
-    /// when no open row carries the identity — the caller decides whether an
-    /// unknown identity is an invalid event or a late echo to discard.
+    /// when the identity names no working stretch — the caller decides whether
+    /// an unknown identity is an invalid event or a late echo to discard. A
+    /// stretch its Watch woke the Subagent into has no row to revise.
     fn update_row(
         &self,
         sessions: &SessionStore,
         subagent: &ProviderSubagentId,
         description: &str,
     ) -> Option<anyhow::Result<()>> {
-        let row = self.rows.get(subagent)?;
+        let Some(row) = self.working.get(subagent)?.row else {
+            return Some(Ok(()));
+        };
         Some(
             sessions
                 .publish_agent_output(
@@ -700,13 +719,15 @@ impl SubagentRoutes {
                     agent,
                 }],
             )?;
-            sessions.publish(
-                stretch.owner_session_id,
-                vec![SessionChange::SubagentModelChanged {
-                    activity_id: stretch.activity_id,
-                    model,
-                }],
-            )?;
+            if let Some(row) = stretch.row {
+                sessions.publish(
+                    row.owner_session_id,
+                    vec![SessionChange::SubagentModelChanged {
+                        activity_id: row.activity_id,
+                        model,
+                    }],
+                )?;
+            }
             Ok(())
         })())
     }
@@ -724,7 +745,7 @@ impl SubagentRoutes {
         description: &str,
         delegation: Option<&str>,
     ) -> anyhow::Result<()> {
-        if self.rows.contains_key(&subagent) || self.routes.contains_key(&subagent) {
+        if self.working.contains_key(&subagent) || self.routes.contains_key(&subagent) {
             return Err(anyhow::anyhow!(
                 "Provider reused an active Subagent identity"
             ));
@@ -750,8 +771,10 @@ impl SubagentRoutes {
             name,
             SubagentStretch {
                 turn_id: spawned.turn_id,
-                owner_session_id: delegating.0,
-                activity_id,
+                row: Some(SubagentRow {
+                    owner_session_id: delegating.0,
+                    activity_id,
+                }),
             },
         );
         Ok(())
@@ -762,8 +785,9 @@ impl SubagentRoutes {
     /// new row in the delegating Turn leading into that same Session (ADR
     /// 0031). The rows before it stay as they settled, and the Session keeps
     /// its Title and the name its spawn gave it. A Continuation still open in
-    /// the Subagent's Session settles first, with the output this actor still
-    /// held for it, because the resume begins a Turn of its own.
+    /// the Subagent's Session — its own Watch woke it — settles first, with
+    /// the output this actor still held for it, because the resume begins a
+    /// Turn of its own.
     ///
     /// A resume naming a Subagent neither this connection nor the store knows
     /// — spawned before its identity was stored, say — is recorded as a new
@@ -779,7 +803,11 @@ impl SubagentRoutes {
         description: &str,
         delegation: Option<&str>,
     ) -> anyhow::Result<()> {
-        if self.rows.contains_key(&subagent) {
+        if self
+            .working
+            .get(&subagent)
+            .is_some_and(|stretch| stretch.row.is_some())
+        {
             return Err(anyhow::anyhow!(
                 "Provider resumed a Subagent that is still working"
             ));
@@ -800,6 +828,7 @@ impl SubagentRoutes {
         };
         let (session_id, spawner, name) =
             (identity.session_id, identity.spawner, identity.name.clone());
+        self.working.remove(&subagent);
         if let Some(mut continuation) = self.routes.remove(&subagent) {
             let trailing_output = continuation.turn.take_trailing_output();
             sessions.finish_provider_turn(
@@ -835,9 +864,57 @@ impl SubagentRoutes {
             name,
             SubagentStretch {
                 turn_id,
-                owner_session_id: delegating.0,
-                activity_id,
+                row: Some(SubagentRow {
+                    owner_session_id: delegating.0,
+                    activity_id,
+                }),
             },
+        );
+        Ok(())
+    }
+
+    /// Wakes a settled Subagent its own Watch woke (ADR 0030): the next Turn
+    /// in the Subagent's own Session, begun by no Delegation and so a
+    /// Continuation, headed by the Watch Outcomes held for it and routed so
+    /// the Subagent's work lands there. Nothing delegated the stretch, so no
+    /// Transcript gains a row for it and the rows before it stay as they
+    /// settled; the Subagent's Session Working again is what the Sessions
+    /// above it read.
+    ///
+    /// A Subagent still working has no wake to begin: its Watch reported into
+    /// the Turn it works in. One neither this connection nor the store knows
+    /// is not recorded as a new Subagent, as a resume would be: nothing in any
+    /// Transcript delegated it, so there is no Turn a new row could stand in,
+    /// and it held no Watch Suru saw settle. Its work lands nowhere, like any
+    /// unrouted Subagent's, and its settle is discarded as a late echo rather
+    /// than read as a Subagent the Provider never spawned.
+    fn wake(
+        &mut self,
+        sessions: &SessionStore,
+        subagent: ProviderSubagentId,
+    ) -> anyhow::Result<()> {
+        if self.working.contains_key(&subagent) {
+            return Ok(());
+        }
+        let Some(identity) = self.identities.get(&subagent) else {
+            tracing::info!(
+                subagent = subagent.as_str(),
+                "ignoring the wake of a Subagent Suru holds no Session for"
+            );
+            self.stopped.insert(subagent);
+            return Ok(());
+        };
+        let (session_id, spawner, name) =
+            (identity.session_id, identity.spawner, identity.name.clone());
+        let turn_id = sessions.begin_subagent_turn(session_id, None)?;
+        if let Err(error) = self.watch_outcomes.release(sessions, session_id, turn_id) {
+            tracing::warn!(%session_id, "a Watch Outcome could not be recorded: {error:#}");
+        }
+        self.open_stretch(
+            subagent,
+            (session_id, spawner),
+            name,
+            SubagentStretch { turn_id, row: None },
         );
         Ok(())
     }
@@ -854,11 +931,10 @@ impl SubagentRoutes {
         name: String,
         stretch: SubagentStretch,
     ) {
-        self.rows.insert(
+        self.working.insert(
             subagent.clone(),
-            SubagentRow {
-                owner_session_id: stretch.owner_session_id,
-                activity_id: stretch.activity_id,
+            WorkingStretch {
+                row: stretch.row,
                 started: Instant::now(),
             },
         );
@@ -884,18 +960,18 @@ impl SubagentRoutes {
     }
 
     /// Settles one Subagent's current stretch on the Provider's own settle
-    /// signal: the Turn it worked in closes along with its row, because the
-    /// Provider's boundary for the stretch is one signal and no further event
-    /// of the child's is owed once it has passed — until a resume begins the
-    /// next. Returns `None` when no open row carries the identity, on the
-    /// same terms as [`Self::update_row`].
+    /// signal: the Turn it worked in closes along with its row, where it has
+    /// one, because the Provider's boundary for the stretch is one signal and
+    /// no further event of the child's is owed once it has passed — until a
+    /// resume or a wake begins the next. Returns `None` when the identity
+    /// names no working stretch, on the same terms as [`Self::update_row`].
     fn settle_subagent(
         &mut self,
         sessions: &SessionStore,
         subagent: &ProviderSubagentId,
         status: ProviderSubagentStatus,
     ) -> Option<anyhow::Result<()>> {
-        let row = self.rows.remove(subagent)?;
+        let stretch = self.working.remove(subagent)?;
         let route = self.routes.remove(subagent);
         self.late_settle_owes_continuation = true;
         Some((|| {
@@ -914,7 +990,10 @@ impl SubagentRoutes {
                 };
                 sessions.finish_provider_turn(route.session_id, route.turn.turn_id, outcome)?;
             }
-            let duration_ms = u64::try_from(row.started.elapsed().as_millis()).ok();
+            let Some(row) = stretch.row else {
+                return Ok(());
+            };
+            let duration_ms = u64::try_from(stretch.started.elapsed().as_millis()).ok();
             sessions.publish_agent_output(
                 row.owner_session_id,
                 SessionChange::SubagentStatusChanged {
@@ -1635,6 +1714,12 @@ async fn run_provider_session(
                             None,
                             event,
                         ),
+                        // Nor is a Subagent its own Watch woke: nothing in
+                        // the owning Session caused its work.
+                        AttributedProviderEvent {
+                            event: ProviderEvent::SubagentWoken { subagent_id },
+                            ..
+                        } => wake_subagent(&sessions, &updates, &mut subagents, subagent_id),
                         // A Subagent's events land in its own Session whether
                         // or not the owning Session has a Turn open.
                         AttributedProviderEvent {
@@ -1833,7 +1918,7 @@ async fn run_provider_session(
                         session_id,
                     )
                     .await;
-                    if subagents.routes.is_empty() && subagents.rows.is_empty() {
+                    if subagents.routes.is_empty() && subagents.working.is_empty() {
                         let _ = response.send(watches_stopped);
                         continue;
                     }
@@ -1918,7 +2003,7 @@ async fn run_provider_session(
                             ),
                             updated = connected.session.update_approval_posture(
                                 update.value,
-                                !subagents.routes.is_empty() || !subagents.rows.is_empty(),
+                                !subagents.routes.is_empty() || !subagents.working.is_empty(),
                             ) => updated.map_err(|error| {
                                 failure_message("Approval Posture update failed", &error)
                             }),
@@ -1974,7 +2059,7 @@ async fn run_provider_session(
             let reconnect = provider
                 .as_ref()
                 .is_some_and(|p| p.incarnation != lease.incarnation);
-            if reconnect && (!subagents.routes.is_empty() || !subagents.rows.is_empty()) {
+            if reconnect && (!subagents.routes.is_empty() || !subagents.working.is_empty()) {
                 let _ = updates.apply(|| sessions.deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Failed { message: "The Worktree was recreated while Subagents still use the previous working copy; wait for their work to finish before retrying".to_owned() }));
                 defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                 continue;
@@ -2692,6 +2777,12 @@ async fn run_provider_session(
                         Some(current.turn_id),
                         event,
                     ),
+                    // A Subagent its own Watch woke works in its own Session,
+                    // outside whatever Turn is active here.
+                    Some(Ok(AttributedProviderEvent {
+                        event: ProviderEvent::SubagentWoken { subagent_id },
+                        ..
+                    })) => wake_subagent(&sessions, &updates, &mut subagents, subagent_id),
                     Some(Ok(AttributedProviderEvent {
                         attribution: ProviderEventAttribution::Subagent(subagent),
                         event,
@@ -3017,6 +3108,24 @@ fn track_watch(
             }
         }
         _ => unreachable!("only Watch events are tracked as Watches"),
+    }
+}
+
+/// Wakes the settled Subagent its own Watch woke into a Continuation of its
+/// own Session (see [`SubagentRoutes::wake`]). A wake that cannot be recorded
+/// is logged rather than failing the owning Session's Turn, which it was never
+/// part of.
+fn wake_subagent(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    subagents: &mut SubagentRoutes,
+    subagent: ProviderSubagentId,
+) {
+    if let Some(Err(error)) = updates.apply(|| subagents.wake(sessions, subagent.clone())) {
+        tracing::warn!(
+            subagent = subagent.as_str(),
+            "a woken Subagent's Continuation could not begin: {error:#}"
+        );
     }
 }
 
@@ -3767,10 +3876,11 @@ fn project_provider_event(
             // before anything projects, so none ever lands in a Turn.
             ProviderEvent::ResumeStateChanged { .. } => Ok(ProviderEventProjection::Continue),
             // The actor records Watches before anything projects too, because
-            // a Watch is no output of the Turn it outlives.
-            ProviderEvent::WatchStarted { .. } | ProviderEvent::WatchSettled { .. } => {
-                Ok(ProviderEventProjection::Continue)
-            }
+            // a Watch is no output of the Turn it outlives, and wakes the
+            // Subagents they woke, because that work is no output of it either.
+            ProviderEvent::WatchStarted { .. }
+            | ProviderEvent::WatchSettled { .. }
+            | ProviderEvent::SubagentWoken { .. } => Ok(ProviderEventProjection::Continue),
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,
@@ -4392,17 +4502,10 @@ running 1 test",
             )
             .expect("the spawn's row is open")
             .expect("settle the spawn's stretch");
-        let continuation = fixture
-            .sessions
-            .begin_continuation(child, identity.clone())
-            .expect("the Subagent's own work begins a Continuation");
-        routes.routes.insert(
-            subagent.clone(),
-            SubagentRoute {
-                session_id: child,
-                turn: ActiveProviderTurn::new_continuation(continuation),
-            },
-        );
+        routes
+            .wake(&fixture.sessions, subagent.clone())
+            .expect("the Subagent's own Watch wakes it into a Continuation");
+        let continuation = routes.routes[&subagent].turn.turn_id;
         let command = super::super::ProviderActivityId::new("exec-1");
         for event in [
             ProviderEvent::CommandStarted {
@@ -4485,6 +4588,15 @@ running 1 test",
             "the Subagent's events now land in the resume's Turn"
         );
         assert!(route.turn.continuation.is_none());
+        let delegating = fixture
+            .sessions
+            .snapshot(fixture.routed)
+            .expect("the delegating Session exists");
+        assert_eq!(
+            subagent_rows(&delegating),
+            [("Explore", child.session.id), ("Explore", child.session.id)],
+            "the spawn and the resume each stand as a row, and the wake as none"
+        );
     }
 
     /// A delivered Prompt's Turn in a fresh Session, for a Subagent to be
