@@ -26,7 +26,7 @@ use suru::{
 const BACKGROUND_COMMAND_LEFT_RUNNING: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_old","name":"Bash","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cargo test\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-old","tool_use_id":"toolu_old","description":"cargo test","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-old","tool_use_id":"toolu_old","description":"cargo test","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_old","content":"Command running in background with ID: task-old","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":40,"num_turns":1,"result":"Tests are running.","session_id":"prov-session"}'
 "#;
@@ -40,7 +40,7 @@ const STREAMING_WITH_NOTHING_IN_THE_BACKGROUND: &str = r#"      emit '{"type":"s
 const STREAMING_WITH_NEW_WORK_IN_THE_BACKGROUND: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_new","name":"Bash","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"sleep 600\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-new","tool_use_id":"toolu_new","description":"sleep 600","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-new","tool_use_id":"toolu_new","description":"sleep 600","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Halfway"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
 "#;
 

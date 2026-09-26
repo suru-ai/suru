@@ -22,7 +22,7 @@ const WORK_IN_FLIGHT: &str = r#"      emit '{"type":"stream_event","event":{"typ
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"sleep 600\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"task-live","task_type":"local_bash","description":"sleep 600"}],"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-live","tool_use_id":"toolu_1","description":"sleep 600","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-live","tool_use_id":"toolu_1","description":"sleep 600","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Halfway"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
 "#;
 

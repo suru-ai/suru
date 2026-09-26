@@ -18,8 +18,9 @@
 //! conversation whose tool use spawned it, `task_updated` revises what it is doing, and
 //! `task_notification` settles its stretch of work. A background shell or monitor is instead a
 //! Watch (ADR 0030): its start and its notification bracket the time its Session may read
-//! Monitoring, and every Watch still live when the CLI process ends settles as lost. A Watch
-//! belongs to the conversation whose tool use launched it — a subagent's own, even after that
+//! Monitoring, and every Watch still live when the CLI process ends settles as lost. A shell the
+//! agent waits on in the foreground of its Turn is never a Watch, though a long one reports a task
+//! lifecycle too, unless the CLI later moves it to the background. A Watch belongs to the conversation whose tool use launched it — a subagent's own, even after that
 //! subagent settles, since its Watches outlive it and wake it. A settled
 //! agent the loop resumes through
 //! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
@@ -92,24 +93,42 @@ enum TaskKind {
     /// Background work whose settling the CLI delivers to the agent, waking its loop into a
     /// Continuation. Its Command Activity, where it has one, already stands in the Transcript.
     Watch,
+    /// A shell the agent is waiting on inside its Turn. Its Command Activity is all it is, and
+    /// its tool result, not its settling, is what the agent reads — unless the CLI moves it to the
+    /// background, which makes it a Watch from then on.
+    Foreground,
     /// Work that neither runs an agent Suru presents nor wakes this loop.
     Unwatched,
 }
 
 impl TaskKind {
-    /// The one table classifying the CLI's `task_type`s (ADR 0030). A background shell and a
-    /// Monitor tool both run as `local_bash`, and a monitor over MCP or a WebSocket is a Watch
-    /// too: each one's settling is delivered to the agent. `local_workflow`, `remote_agent`,
-    /// `in_process_teammate`, `dream`, plan-mode tasks, and any type this build has not heard of
-    /// are none of Suru's to wait on, since the wire grows freely (ADR 0010) and a task wrongly
-    /// read as a Watch would leave a Session Monitoring for nothing.
-    fn of(task_type: Option<&str>) -> Self {
-        match task_type {
-            Some("local_agent") => Self::Subagent,
-            Some("local_bash" | "monitor_mcp" | "monitor_ws") => Self::Watch,
+    /// The one table classifying the CLI's tasks by `task_type` and `is_backgrounded` (ADR 0030).
+    /// A background shell and a Monitor tool both run as `local_bash`, and a monitor over MCP or
+    /// a WebSocket is a Watch too: each one's settling is delivered to the agent. A `local_bash`
+    /// the CLI says is not backgrounded is a foreground Bash call, which is never a Watch —
+    /// verified against Claude Code CLI 2.1.280: a short foreground Bash emits no task lifecycle
+    /// at all; a long one emits `task_started` with `is_backgrounded: false` and its
+    /// `task_notification` inside the Turn; a backgrounded one emits `is_backgrounded: true`. A
+    /// start that does not say keeps reading as a Watch, as a monitor's start does.
+    /// `local_workflow`, `remote_agent`, `in_process_teammate`, `dream`, plan-mode tasks, and any
+    /// type this build has not heard of are none of Suru's to wait on, since the wire grows freely
+    /// (ADR 0010) and a task wrongly read as a Watch would leave a Session Monitoring for nothing.
+    fn of(task_type: Option<&str>, is_backgrounded: Option<bool>) -> Self {
+        match (task_type, is_backgrounded) {
+            (Some("local_agent"), _) => Self::Subagent,
+            (Some("local_bash"), Some(false)) => Self::Foreground,
+            (Some("local_bash" | "monitor_mcp" | "monitor_ws"), _) => Self::Watch,
             _ => Self::Unwatched,
         }
     }
+}
+
+/// A foreground task still running, kept with what its start said so that, moved to the
+/// background, it becomes the Watch it would have been had it started there.
+struct ForegroundTask {
+    description: Option<String>,
+    tool_use_id: Option<String>,
+    owned_by_subagent: Option<bool>,
 }
 
 /// How a task's `task_notification` reports it finishing well; anything else — failed, stopped —
@@ -391,6 +410,9 @@ pub(super) struct ClaudeProjection {
     /// whose agent a Watch's settling wakes. They settle on their own notification, or all at
     /// once as lost when the process ends.
     watches: BTreeMap<String, ConversationKey>,
+    /// The foreground tasks running in the current CLI process, by task id. Their notifications
+    /// settle nothing a Session shows, and a move to the background promotes one to a Watch.
+    foreground_tasks: BTreeMap<String, ForegroundTask>,
     /// The subagent conversations, from the `parent_tool_use_id` each rides under to the task id
     /// of the agent it belongs to — whose Subagent its events are, in whichever stretch.
     conversation_agents: BTreeMap<String, String>,
@@ -461,6 +483,7 @@ impl ClaudeProjection {
             delegation_tools: BTreeMap::new(),
             agent_tasks,
             watches: BTreeMap::new(),
+            foreground_tasks: BTreeMap::new(),
             conversation_agents,
             unplaced_resumes: BTreeSet::new(),
             resume,
@@ -524,10 +547,17 @@ impl ClaudeProjection {
             // A progress tick's description is the subagent's latest tool activity ("Running
             // cargo test"), not what it was asked to do, so it revises nothing.
             "task_progress" => Vec::new(),
-            "task_updated" => self.project_task_description(
-                message.task_id,
-                message.patch.and_then(|patch| patch.description),
-            ),
+            "task_updated" => {
+                let (description, backgrounded) = message.patch.map_or((None, None), |patch| {
+                    (patch.description, patch.is_backgrounded)
+                });
+                let mut projected = match (&message.task_id, backgrounded) {
+                    (Some(task_id), Some(true)) => self.project_task_backgrounded(task_id),
+                    _ => Vec::new(),
+                };
+                projected.extend(self.project_task_description(message.task_id, description));
+                projected
+            }
             // However a task ends — finished, failed, or stopped — the CLI notifies, so the
             // notification alone is enough to settle it.
             "task_notification" => self.project_task_settled(message),
@@ -540,9 +570,23 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_started(task_id.clone());
-        match TaskKind::of(message.task_type.as_deref()) {
+        match TaskKind::of(message.task_type.as_deref(), message.is_backgrounded) {
             TaskKind::Subagent => {}
+            // The agent reads a foreground task's outcome from its tool result inside the Turn,
+            // so there is nothing to wait on past the Turn and no Watch to start.
+            TaskKind::Foreground => {
+                self.foreground_tasks.insert(
+                    task_id,
+                    ForegroundTask {
+                        description: message.description,
+                        tool_use_id: message.tool_use_id,
+                        owned_by_subagent: message.owned_by_subagent,
+                    },
+                );
+                return Vec::new();
+            }
             TaskKind::Watch => {
+                self.foreground_tasks.remove(&task_id);
                 return self.project_watch_started(
                     task_id,
                     message.description,
@@ -745,6 +789,22 @@ impl ClaudeProjection {
         vec![started]
     }
 
+    /// A foreground task the CLI moved to the background, so the agent stopped waiting on it and
+    /// its settling will wake the loop: a Watch from here on, described and owned as its start
+    /// would have made it. A task not running in the foreground has nothing to promote. No live
+    /// CLI has been captured announcing this; the patch is read on the word of the wire's shape.
+    fn project_task_backgrounded(&mut self, task_id: &str) -> Vec<AttributedProviderEvent> {
+        let Some(task) = self.foreground_tasks.remove(task_id) else {
+            return Vec::new();
+        };
+        self.project_watch_started(
+            task_id.to_owned(),
+            task.description,
+            task.tool_use_id.as_deref(),
+            task.owned_by_subagent,
+        )
+    }
+
     /// The conversation whose agent left a Watch running, and so the one its settling wakes: the
     /// conversation that ran the tool use launching it, the way a spawn's delegating conversation
     /// is found (ADR 0030). A background Subagent's Watch stays its own after the Subagent settles,
@@ -812,6 +872,8 @@ impl ClaudeProjection {
         tasks
             .iter()
             .filter_map(|task_id| {
+                // A stopped foreground task was never a Watch, so its stop settles nothing.
+                self.foreground_tasks.remove(task_id);
                 let owner = self.watches.remove(task_id)?;
                 Some(self.attributed(
                     &owner,
@@ -833,6 +895,8 @@ impl ClaudeProjection {
     /// reports: output the old process left queued can no longer put its tasks back.
     fn project_process_ended(&mut self) -> Vec<AttributedProviderEvent> {
         self.turn.tasks_died_with_process();
+        // A foreground task that died with the process was never a Watch, so none is lost.
+        self.foreground_tasks.clear();
         std::mem::take(&mut self.watches)
             .into_iter()
             .map(|(task_id, owner)| {
@@ -917,6 +981,11 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_settled(&task_id);
+        // A foreground task's notification comes inside the Turn that waited on it, whose tool
+        // result already told the agent how it went: it wakes nothing and settles no Watch.
+        if self.foreground_tasks.remove(&task_id).is_some() {
+            return Vec::new();
+        }
         if let Some(settled) = self.project_watch_settled(&task_id, &message) {
             return vec![settled];
         }
@@ -1839,6 +1908,125 @@ mod tests {
         assert!(
             projection.project_process_ended().is_empty(),
             "a Watch is lost once"
+        );
+    }
+
+    /// A `local_bash` start saying whether the CLI backgrounded it, named by its tool use as a
+    /// live CLI's is.
+    fn shell_started(task: &str, is_backgrounded: bool) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": task,
+            "tool_use_id": "toolu_1",
+            "task_type": "local_bash",
+            "description": "sleep 12 && echo hello-slow",
+            "is_backgrounded": is_backgrounded,
+        })
+    }
+
+    fn slow_shell_started_as_a_watch(task: &str) -> AttributedProviderEvent {
+        owning(ProviderEvent::WatchStarted {
+            watch_id: ProviderWatchId::new(task),
+            description: "sleep 12 && echo hello-slow".to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_foreground_shell_joins_the_roster_but_starts_and_settles_no_watch() {
+        let mut projection = fresh_projection();
+        let started = project(&mut projection, &[shell_started("task-1", false)]);
+        assert!(started.is_empty(), "{started:?}");
+        assert_eq!(
+            projection.turn.live_tasks(),
+            ["task-1"],
+            "an interrupt still stops a foreground shell"
+        );
+
+        let settled = project(
+            &mut projection,
+            &[task_notification(
+                "task-1",
+                "completed",
+                Some("sleep 12 && echo hello-slow"),
+            )],
+        );
+
+        assert!(
+            settled.is_empty(),
+            "a foreground shell's notification wakes nothing: {settled:?}"
+        );
+        assert!(projection.turn.live_tasks().is_empty());
+    }
+
+    #[test]
+    fn a_shell_the_cli_backgrounds_or_does_not_say_about_starts_a_watch() {
+        let unsaid = json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "task-1",
+            "tool_use_id": "toolu_1",
+            "task_type": "local_bash",
+            "description": "sleep 12 && echo hello-slow",
+        });
+        for start in [shell_started("task-1", true), unsaid] {
+            let mut projection = fresh_projection();
+            let events = project(&mut projection, std::slice::from_ref(&start));
+            assert_eq!(events, [slow_shell_started_as_a_watch("task-1")], "{start}");
+        }
+    }
+
+    #[test]
+    fn a_foreground_shell_moved_to_the_background_becomes_a_watch_its_notification_settles() {
+        let mut projection = fresh_projection();
+        let events = project(
+            &mut projection,
+            &[
+                shell_started("task-1", false),
+                json!({
+                    "type": "system",
+                    "subtype": "task_updated",
+                    "task_id": "task-1",
+                    "patch": {"is_backgrounded": true},
+                }),
+                task_notification("task-1", "completed", Some("Background command completed")),
+            ],
+        );
+
+        assert_eq!(
+            events,
+            [
+                slow_shell_started_as_a_watch("task-1"),
+                owning(ProviderEvent::WatchSettled {
+                    watch_id: ProviderWatchId::new("task-1"),
+                    outcome: ProviderWatchOutcome::Completed,
+                    summary: Some("Background command completed".to_owned()),
+                    woke_agent: true,
+                }),
+            ],
+            "the move to the background starts the Watch the start would have"
+        );
+    }
+
+    #[test]
+    fn a_foreground_shell_running_when_the_process_ends_is_no_lost_watch() {
+        let mut projection = fresh_projection();
+        project(&mut projection, &[shell_started("task-1", false)]);
+
+        assert!(projection.project_process_ended().is_empty());
+        assert!(projection.turn.live_tasks().is_empty());
+        let moved = project(
+            &mut projection,
+            &[json!({
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "task-1",
+                "patch": {"is_backgrounded": true},
+            })],
+        );
+        assert!(
+            moved.is_empty(),
+            "a shell that died with its process has nothing left to promote: {moved:?}"
         );
     }
 

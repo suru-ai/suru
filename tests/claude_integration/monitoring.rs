@@ -5,6 +5,8 @@
 //! only Monitoring stops those tasks one by one, and never interrupts a loop that is not running.
 //! A task a subagent launched is that Subagent's Watch, which outlives it and keeps its own Session
 //! Monitoring as well as the Sessions above it; interrupting that Session stops its Watches alone.
+//! A Bash call the agent waits on in the foreground is never a Watch, even when it runs long
+//! enough for the CLI to report it as a task.
 
 use crate::continuations::heading_watch_outcome;
 use crate::support::{
@@ -133,9 +135,9 @@ async fn a_task_that_cannot_wake_the_agent_leaves_its_session_neither_working_no
 const TWO_WATCHES_LEFT_RUNNING: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_tests","name":"Bash","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cargo test\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-tests","tool_use_id":"toolu_tests","description":"cargo test","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-tests","tool_use_id":"toolu_tests","description":"cargo test","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_tests","content":"Command running in background with ID: task-tests"}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-log","description":"tail -f server.log","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-log","description":"tail -f server.log","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":30,"num_turns":1,"result":"Left them running.","session_id":"prov-session"}'
 "#;
 
@@ -273,7 +275,7 @@ fn subagent_leaves_a_shell_running(before_result: &str) -> String {
       emit '{{"type":"system","subtype":"task_started","task_id":"agent-task-bg","tool_use_id":"agent_bg","description":"Run the suite","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}}'
       emit '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_sub_tests","name":"Bash","input":{{"command":"cargo test","run_in_background":true}}}}]}},"parent_tool_use_id":"agent_bg","session_id":"prov-session"}}'
       emit '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_sub_tests","content":"Command running in background with ID: task-sub-tests"}}]}},"parent_tool_use_id":"agent_bg","session_id":"prov-session"}}'
-      emit '{{"type":"system","subtype":"task_started","task_id":"task-sub-tests","tool_use_id":"toolu_sub_tests","description":"cargo test","task_type":"local_bash","owned_by_subagent":true,"session_id":"prov-session"}}'
+      emit '{{"type":"system","subtype":"task_started","task_id":"task-sub-tests","tool_use_id":"toolu_sub_tests","description":"cargo test","is_backgrounded":true,"task_type":"local_bash","owned_by_subagent":true,"session_id":"prov-session"}}'
       emit '{{"type":"system","subtype":"task_notification","task_id":"agent-task-bg","status":"completed","summary":"Started the suite","session_id":"prov-session"}}'
 {before_result}      emit '{{"type":"result","subtype":"success","is_error":false,"duration_ms":30,"num_turns":1,"result":"The suite is running.","session_id":"prov-session"}}'
 "#
@@ -337,7 +339,7 @@ async fn escape_in_a_subagents_session_stops_only_that_subagents_watches() {
     let top_level_shell = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_log","name":"Bash","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"tail -f server.log\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"task-log","tool_use_id":"toolu_log","description":"tail -f server.log","task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"task-log","tool_use_id":"toolu_log","description":"tail -f server.log","is_backgrounded":true,"task_type":"local_bash","session_id":"prov-session"}'
 "#;
     let claude = ScriptedClaude::new(&format!(
         "{}{}{}",
@@ -583,4 +585,57 @@ async fn a_settled_subagent_woken_by_its_own_shell_works_on_in_a_continuation_of
         (None, None)
     );
     opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A Turn whose agent runs a slow Bash command in the foreground and waits on it, the way a live
+/// 2.1.280 CLI reports one: the tool use, then — because the command ran long enough to become a
+/// task — its start saying it is not backgrounded, and its notification, both inside the Turn and
+/// just before the tool result the agent reads, then the agent's answer and the result.
+const SLOW_FOREGROUND_COMMAND: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_slow","name":"Bash","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"sleep 12 && echo hello-slow\",\"run_in_background\":false}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"bka4krjos","tool_use_id":"toolu_slow","description":"sleep 12 && echo hello-slow","is_backgrounded":false,"task_type":"local_bash","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"bka4krjos","tool_use_id":"toolu_slow","status":"completed","output_file":"","summary":"sleep 12 && echo hello-slow","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_slow","type":"tool_result","content":"hello-slow","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"It printed hello-slow."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":12040,"num_turns":1,"result":"It printed hello-slow.","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn a_slow_foreground_command_is_never_a_watch_and_records_no_watch_outcome() {
+    let settled = settled_after(SLOW_FOREGROUND_COMMAND, "claude-slow-foreground-command").await;
+
+    assert_eq!(settled.turns.len(), 1, "the command wakes no Continuation");
+    assert_eq!(settled.session.working_since, None);
+    assert_eq!(
+        settled.session.monitoring_since, None,
+        "a command the agent waited on leaves nothing to Monitor"
+    );
+    assert!(settled.watches.is_empty(), "{:?}", settled.watches);
+    let [command] = settled.activities.as_slice() else {
+        panic!(
+            "the foreground command is the Turn's one Activity, with no Watch Outcome beside it: {:?}",
+            settled.activities
+        );
+    };
+    let Activity::Command {
+        status,
+        command,
+        output,
+        ..
+    } = command
+    else {
+        panic!("the foreground command is a Command Activity, got {command:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(command, "sleep 12 && echo hello-slow");
+    assert_eq!(output, "hello-slow");
+    assert_eq!(
+        agent_messages(&settled)
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["It printed hello-slow."]
+    );
 }

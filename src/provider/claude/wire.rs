@@ -333,15 +333,25 @@ pub(super) struct SystemMessage {
     /// launching tool use already names, and never names one by itself.
     #[serde(default)]
     pub(super) owned_by_subagent: Option<bool>,
+    /// Whether the task runs past the tool call that started it, on `task_started`. A Bash call
+    /// the agent waits on reports `false` when it runs long enough to become a task at all; a
+    /// backgrounded one reports `true` (verified against the live 2.1.280 CLI). Absent on
+    /// builds and task types that never say.
+    #[serde(default)]
+    pub(super) is_backgrounded: Option<bool>,
 }
 
-/// The revision a `task_updated` carries. Only the description is decoded: every way a task ends
-/// arrives as its own `task_notification`, so status transitions carry nothing the projection
-/// presents.
+/// The revision a `task_updated` carries. Only the description and a move into the background
+/// are decoded: every way a task ends arrives as its own `task_notification`, so status
+/// transitions carry nothing the projection presents.
 #[derive(Deserialize)]
 pub(super) struct TaskPatch {
     #[serde(default)]
     pub(super) description: Option<String>,
+    /// `true` when a task that started in the foreground of the Turn has been moved to the
+    /// background, from where its settling wakes the loop like any other background task's.
+    #[serde(default)]
+    pub(super) is_backgrounded: Option<bool>,
 }
 
 /// The CLI's answer to one control request, correlated back by `request_id`.
