@@ -40,7 +40,7 @@ use super::{
     CLAUDE_AGENT_ID,
     availability::ClaudeAvailability,
     claude_error, claude_error_context,
-    projection::provider_events,
+    projection::{ClaudeProjection, provider_events},
     runtime::usable_claude_models,
     skills::ClaudeSkills,
     transport::{ClaudeConnection, ClaudeSettingSources, ConversationSink, StreamJsonTransport},
@@ -166,13 +166,12 @@ pub(super) async fn start_claude_session(
     let (context, reports) = super::context::ContextQueries::new(timings.context_request);
     let events = provider_events(
         messages,
-        turn.clone(),
+        ClaudeProjection::new(turn.clone(), resume),
         questionnaires.clone(),
         approvals.clone(),
         request.execution_directory.clone(),
         context.clone(),
         reports,
-        resume,
     );
     let session = Arc::new(ClaudeSession {
         context,

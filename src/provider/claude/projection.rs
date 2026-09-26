@@ -87,13 +87,12 @@ const TASK_COMPLETED_STATUS: &str = "completed";
 
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<Value, ProviderError>>,
-    turn: Arc<TurnInFlight>,
+    projection: ClaudeProjection,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     approvals: Arc<super::approval::ClaudeApprovals>,
     execution_directory: std::path::PathBuf,
     context: Arc<super::context::ContextQueries>,
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
-    resume: ClaudeResumeState,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         EventReceiver {
@@ -103,7 +102,7 @@ pub(super) fn provider_events(
             approvals,
             execution_directory,
             messages,
-            projection: ClaudeProjection::new(turn, resume),
+            projection,
             pending: VecDeque::new(),
         },
         next_provider_event,
@@ -330,7 +329,7 @@ struct AgentTask {
 
 /// What the projection remembers between conversation messages, across every conversation the
 /// wire carries at once.
-struct ClaudeProjection {
+pub(super) struct ClaudeProjection {
     intervention_tools: BTreeMap<String, ConversationKey>,
     conversations: BTreeMap<ConversationKey, ConversationInFlight>,
     /// The commands whose tool results are still to be echoed back, by tool-use id — the CLI's
@@ -387,7 +386,7 @@ impl ClaudeProjection {
     /// A projection for a Session whose conversation `resume` restores: every agent it records
     /// spawning is a settled Subagent a resume may name, riding under the conversation recorded
     /// for it.
-    fn new(turn: Arc<TurnInFlight>, resume: ClaudeResumeState) -> Self {
+    pub(super) fn new(turn: Arc<TurnInFlight>, resume: ClaudeResumeState) -> Self {
         let agent_tasks = resume
             .agents
             .iter()
