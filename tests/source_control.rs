@@ -167,7 +167,7 @@ async fn same_named_tag_cannot_hide_an_unmerged_local_source_branch() {
     let main = root.join("main");
     init(&main);
     commit(&main);
-    git(&main, &["tag", "main"]);
+    git(&main, &["-c", "tag.gpgsign=false", "tag", "main"]);
     let adapter = GitSourceControl::default();
     let source = adapter.discover(&main).await;
     let plan = adapter
