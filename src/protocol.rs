@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 59;
+pub const PROTOCOL_VERSION: u32 = 60;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1796,11 +1796,47 @@ impl TurnStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Who a Message is from: the user, the Session's own Agent, or — for a
+/// Delegation — the Agent that delegated to this Subagent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
     Agent,
+    /// A Delegation standing in a Subagent's Transcript: the instruction its
+    /// delegating Agent gave it through the Provider, from that Agent rather
+    /// than from the user. One opens each Turn a spawn or a resume begins, as
+    /// a user Message opens the Turn a Prompt begins. It arrives whole, so it
+    /// never streams.
+    Delegation(Delegator),
+}
+
+impl MessageRole {
+    /// The Agent that sent a Delegation; `None` for every other Message.
+    pub const fn delegator(&self) -> Option<&Delegator> {
+        match self {
+            Self::Delegation(delegator) => Some(delegator),
+            Self::User | Self::Agent => None,
+        }
+    }
+}
+
+/// The Agent a Delegation is from, as the Delegation names it wherever it
+/// stands: the Subagent's parent, or a sibling Subagent that sent it more.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delegator {
+    /// The delegating Agent's own Session: the Subagent's parent, or another
+    /// Subagent's Session when a sibling delegated. A client tells the two
+    /// apart against the Subagent's own `parent`, and reaches the delegating
+    /// Agent through it.
+    pub session_id: SessionId,
+    /// The delegating Agent's name as the reader meets it on its Subagent
+    /// rows — which kind of agent the Provider ran — when it is a Subagent;
+    /// absent for a top-level Session's own Agent, which is named by nothing
+    /// but its Session.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2928,7 +2964,7 @@ pub struct Message {
     pub status: MessageStatus,
     pub content: String,
     /// Safe invocation records captured with a user Message. Agent Messages
-    /// always carry an empty list.
+    /// and Delegations always carry an empty list.
     pub skill_invocations: Vec<SkillInvocation>,
     /// Whether Suru's cap cut the stored content short of what the Provider
     /// sent, so a client can say so without reading it out of `content`.

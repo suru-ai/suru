@@ -44,9 +44,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, FileChange, FoldPosture, InitialPrompt, Message, MessageId,
-        MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot,
-        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, skill_marker_matches,
+        Activity, ActivityId, Delegator, FileChange, FoldPosture, InitialPrompt, Message,
+        MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision,
+        SessionSnapshot, SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
+        skill_marker_matches,
     },
     theme::Theme,
 };
@@ -91,6 +92,11 @@ const USER_MESSAGE_GUTTER: &str = "┃ ";
 /// Columns of air a user Message keeps at its right edge, so its text ends
 /// short of the surface it is drawn on.
 const USER_MESSAGE_RIGHT_MARGIN: usize = 1;
+
+/// The bar and space every row of a Delegation opens with. It is drawn on the
+/// same surface as a user Message's, since both are what an Agent was asked,
+/// but lighter and in another role, so a Delegation never reads as the user's.
+const DELEGATION_GUTTER: &str = "│ ";
 
 /// Paths a folded FileChange Activity lists before its fold marker.
 const FOLDED_FILE_CHANGE_PATHS: usize = 4;
@@ -1389,7 +1395,9 @@ fn hyperlink_ranges(
 /// for all three itself, so rendering, memoization, and hit-testing address
 /// the unit rather than what it holds.
 enum RenderUnit<'a> {
-    Message(&'a Message),
+    /// A Message, with the parent of the Session whose Transcript holds it:
+    /// a Delegation names its sender to the reader against that parent.
+    Message(&'a Message, Option<SessionId>),
     Activity(&'a Activity),
     /// A Group: a run of two or more adjacent Activities of one groupable
     /// kind. Collapsed it is the run's single row; expanded it is the header
@@ -1425,7 +1433,7 @@ enum RenderUnit<'a> {
 impl RenderUnit<'_> {
     fn key(&self) -> UnitKey {
         match self {
-            Self::Message(message) => UnitKey::Message(message.id),
+            Self::Message(message, _) => UnitKey::Message(message.id),
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 Self::activity_unit_key(activity)
             }
@@ -1450,7 +1458,7 @@ impl RenderUnit<'_> {
     /// any entry it holds changes and reuses its lines when none did.
     fn fingerprint(&self, folds: &TranscriptFolds) -> u64 {
         match self {
-            Self::Message(message) => message_fingerprint(message),
+            Self::Message(message, _) => message_fingerprint(message),
             Self::Activity(activity) => {
                 activity_fingerprint(activity, resolved_fold_step(folds, activity))
             }
@@ -1508,7 +1516,7 @@ impl RenderUnit<'_> {
                 kind.header_spinner_line(members).into_iter().collect()
             }
             Self::TurnMember(unit) => unit.spinner_lines(folds),
-            Self::Message(_) | Self::TurnFold(_) | Self::Provisional(_) => Vec::new(),
+            Self::Message(..) | Self::TurnFold(_) | Self::Provisional(_) => Vec::new(),
         }
     }
 
@@ -1516,7 +1524,7 @@ impl RenderUnit<'_> {
     /// Anchoring tracks conversation, so only a unit holding one answers.
     fn message_id(&self) -> Option<MessageId> {
         match self {
-            Self::Message(message) => Some(message.id),
+            Self::Message(message, _) => Some(message.id),
             Self::TurnMember(unit) => unit.message_id(),
             Self::Activity(_)
             | Self::Group { .. }
@@ -1529,7 +1537,7 @@ impl RenderUnit<'_> {
     fn spacing_kind(&self) -> SpacingKind {
         match self {
             Self::TurnMember(unit) => unit.spacing_kind(),
-            Self::Message(_) | Self::Provisional(_) => SpacingKind::Message,
+            Self::Message(..) | Self::Provisional(_) => SpacingKind::Message,
             Self::Activity(activity) | Self::GroupMember(activity) => match activity {
                 Activity::Error { .. } => SpacingKind::Error,
                 _ => SpacingKind::Activity,
@@ -1562,8 +1570,8 @@ impl RenderUnit<'_> {
         workspace: &Path,
     ) -> Option<UnitAnchor> {
         match self {
-            Self::Message(message) => {
-                render_message(lines, message, theme, width, hyperlinks);
+            Self::Message(message, parent) => {
+                render_message(lines, message, *parent, theme, width, hyperlinks);
                 None
             }
             Self::Activity(activity) => render_activity(
@@ -1795,6 +1803,11 @@ enum TurnEntryRole {
     /// Every one of them stays outside the fold, because a fold that hid what
     /// the reader asked for would hide the question its marker answers.
     UserMessage,
+    /// A Delegation: what the delegating Agent asked of a Subagent, which
+    /// opens the Turn its spawn or resume began. It stays outside the fold on
+    /// the same terms as a user Message, because it is the question that
+    /// Turn's marker answers.
+    Delegation,
     /// A Message the agent authored. Only the Turn's last one survives its
     /// fold: that is the answer the Turn arrived at, and the ones before it
     /// are work.
@@ -1943,6 +1956,7 @@ impl TranscriptEntry<'_> {
                 role: match message.role {
                     MessageRole::User => TurnEntryRole::UserMessage,
                     MessageRole::Agent => TurnEntryRole::AgentMessage,
+                    MessageRole::Delegation(_) => TurnEntryRole::Delegation,
                 },
             },
             Self::Activity(activity) => TurnEntry {
@@ -2041,8 +2055,10 @@ impl TurnFolding {
                 .flatten();
             let mut marker = None;
             for position in positions {
-                if role_at(position) == Some(TurnEntryRole::UserMessage)
-                    || Some(position) == final_agent_message
+                if matches!(
+                    role_at(position),
+                    Some(TurnEntryRole::UserMessage | TurnEntryRole::Delegation)
+                ) || Some(position) == final_agent_message
                     || Some(position) == terminal_error
                 {
                     continue;
@@ -2257,7 +2273,10 @@ fn plan_units<'a>(
         match entry {
             TranscriptEntry::Message(message) => {
                 close_run(&mut units, &mut run, groups);
-                units.push(in_turn_gutter(RenderUnit::Message(message), disclosed));
+                units.push(in_turn_gutter(
+                    RenderUnit::Message(message, snapshot.session.parent),
+                    disclosed,
+                ));
             }
             TranscriptEntry::Activity(activity) => match GroupableKind::joined_by(activity) {
                 Some(kind) => {
@@ -2882,14 +2901,17 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Projects one Message. `parent` is the parent of the Session whose
+/// Transcript holds it, which is what a Delegation names its sender against.
 fn render_message(
     lines: &mut Vec<StyledLine>,
     message: &Message,
+    parent: Option<SessionId>,
     theme: &Theme,
     width: u16,
     hyperlinks: bool,
 ) {
-    match message.role {
+    match &message.role {
         MessageRole::User => push_user_message(
             lines,
             &message.content,
@@ -2905,6 +2927,29 @@ fn render_message(
             width,
             hyperlinks,
         ),
+        MessageRole::Delegation(delegator) => push_delegation(
+            lines,
+            &message.content,
+            message.truncated,
+            &delegation_sender(delegator, parent),
+            theme,
+            width,
+        ),
+    }
+}
+
+/// How a Delegation names the Agent that sent it to the reader of the
+/// Subagent's Transcript: as its parent when the parent delegated, and by the
+/// name its own Subagent rows carry wherever it has one. A sender that is
+/// neither the parent nor a Subagent can only be a top-level Session's Agent
+/// delegating to a Subagent it did not spawn.
+fn delegation_sender(delegator: &Delegator, parent: Option<SessionId>) -> String {
+    let from_parent = parent == Some(delegator.session_id);
+    match (delegator.name.as_deref(), from_parent) {
+        (Some(name), true) => format!("{name} (parent)"),
+        (Some(name), false) => name.to_owned(),
+        (None, true) => "parent".to_owned(),
+        (None, false) => "the top-level Agent".to_owned(),
     }
 }
 
@@ -4136,30 +4181,100 @@ fn push_user_message(
     let skill_ranges = matches!(&content, std::borrow::Cow::Borrowed(_))
         .then(|| recognized_skill_ranges(&content, skill_invocations))
         .unwrap_or_default();
+    push_message_block(
+        lines,
+        &content,
+        MessageBlock {
+            gutter: USER_MESSAGE_GUTTER,
+            gutter_style: accent,
+            surface,
+        },
+        |byte| {
+            if skill_ranges.iter().any(|range| range.contains(&byte)) {
+                accent
+            } else {
+                surface
+            }
+        },
+        usize::from(available_width),
+    );
+}
+
+/// Projects a Delegation: the instruction an Agent gave the Subagent whose
+/// Transcript this is. It sits on the surface a user Message does, being
+/// likewise what the Agent was asked, but it opens with a row naming its
+/// sender and runs down a lighter bar, so it is never mistaken for something
+/// the user said. It arrives whole, so a Delegation the cap cut short ends
+/// with the same marker a capped agent Message does.
+fn push_delegation(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    truncated: bool,
+    sender: &str,
+    theme: &Theme,
+    available_width: u16,
+) {
+    let content = sanitize_content(content);
+    let surface = theme.surface.elevated.patch(theme.text.primary);
+    let subdued = theme.surface.elevated.patch(theme.text.subdued);
+    let block = MessageBlock {
+        gutter: DELEGATION_GUTTER,
+        gutter_style: subdued,
+        surface,
+    };
     let available_width = usize::from(available_width);
+    let heading = sanitize_content(sender);
+    push_message_block(
+        lines,
+        &format!("Delegated by {heading}"),
+        block,
+        |_| subdued,
+        available_width,
+    );
+    push_message_block(lines, &content, block, |_| surface, available_width);
+    if truncated {
+        push_truncation_marker(lines, CappedStream::Message, "  ", theme);
+    }
+}
+
+/// What a block of Message rows is drawn with: the bar every row opens with,
+/// the style that bar is drawn in, and the surface the rows fill.
+#[derive(Clone, Copy)]
+struct MessageBlock {
+    gutter: &'static str,
+    gutter_style: Style,
+    surface: Style,
+}
+
+/// Wraps `content` into rows of a Message block — the shape a user Message
+/// and a Delegation share — styling each character by its byte offset, and
+/// marking each row that wraps a written line rather than starting one, so a
+/// copy joins what wrapping split.
+fn push_message_block(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    block: MessageBlock,
+    style_at: impl Fn(usize) -> Style,
+    available_width: usize,
+) {
     // The gutter takes two columns and the air at the right edge one, so what
     // is left is what a row of the Message is wrapped to.
     let content_width = available_width
-        .saturating_sub(USER_MESSAGE_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
+        .saturating_sub(block.gutter.width() + USER_MESSAGE_RIGHT_MARGIN)
         .max(1);
-    let layout = TextLayout::new(&content, u16::try_from(content_width).unwrap_or(u16::MAX));
+    let layout = TextLayout::new(content, u16::try_from(content_width).unwrap_or(u16::MAX));
     let mut previous_end = 0;
     for row in layout.rows() {
         let mut segments = Vec::<(Style, String)>::new();
         for (offset, character) in row.text.char_indices() {
-            let byte = row.start + offset;
-            let style = if skill_ranges.iter().any(|range| range.contains(&byte)) {
-                accent
-            } else {
-                surface
-            };
+            let style = style_at(row.start + offset);
             match segments.last_mut() {
                 Some((last_style, text)) if *last_style == style => text.push(character),
                 _ => segments.push((style, character.to_string())),
             }
         }
-        push_user_message_row(lines, segments, row.width, available_width, surface, accent);
-        let projected = lines.last_mut().expect("the user row was just pushed");
+        push_message_block_row(lines, segments, row.width, available_width, block);
+        let projected = lines.last_mut().expect("the Message row was just pushed");
         projected.continuation = row.start > 0 && content.as_bytes()[row.start - 1] != b'\n';
         if projected.continuation {
             projected.omitted_prefix = content[previous_end..row.start].to_owned();
@@ -4182,26 +4297,25 @@ fn recognized_skill_ranges(
         .collect()
 }
 
-fn push_user_message_row(
+fn push_message_block_row(
     lines: &mut Vec<StyledLine>,
     segments: Vec<(Style, String)>,
     row_width: usize,
     available_width: usize,
-    surface: Style,
-    accent: Style,
+    block: MessageBlock,
 ) {
-    let padding = available_width.saturating_sub(USER_MESSAGE_GUTTER.width() + row_width);
+    let padding = available_width.saturating_sub(block.gutter.width() + row_width);
     let mut spans = Vec::with_capacity(segments.len() + 2);
-    spans.push(StyledSpan::chrome(USER_MESSAGE_GUTTER, accent));
+    spans.push(StyledSpan::chrome(block.gutter, block.gutter_style));
     if segments.is_empty() {
-        spans.push(StyledSpan::text("", surface));
+        spans.push(StyledSpan::text("", block.surface));
     }
     spans.extend(
         segments
             .into_iter()
             .map(|(style, text)| StyledSpan::text(text, style)),
     );
-    spans.push(StyledSpan::chrome(" ".repeat(padding), surface));
+    spans.push(StyledSpan::chrome(" ".repeat(padding), block.surface));
     lines.push(StyledLine::from(spans));
 }
 
@@ -5305,7 +5419,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, &theme, 80, false);
+        render_message(&mut lines, &message, None, &theme, 80, false);
 
         let marker = lines
             .iter()
@@ -5386,7 +5500,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, &theme, 80, false);
+        render_message(&mut lines, &message, None, &theme, 80, false);
 
         let marker_lines = lines
             .iter()
@@ -7058,10 +7172,76 @@ mod tests {
     }
 
     #[test]
+    fn a_delegation_names_its_sender_against_the_subagents_parent() {
+        let theme = Theme::system();
+        let parent = crate::protocol::SessionId::new();
+        let sibling = crate::protocol::SessionId::new();
+        let heading = |sender: crate::protocol::SessionId, name: Option<&str>| {
+            let message = Message {
+                role: MessageRole::Delegation(crate::protocol::Delegator {
+                    session_id: sender,
+                    name: name.map(str::to_owned),
+                }),
+                ..user_message("Map the seams.")
+            };
+            let mut lines = Vec::new();
+            render_message(&mut lines, &message, Some(parent), &theme, 40, false);
+            assert_eq!(
+                span_marks(&lines[1])[..2],
+                [(true, "│ "), (false, "Map the seams.")],
+                "the Delegation's bar is chrome and what it asked is text"
+            );
+            projected_text(&lines[0]).trim_end().to_owned()
+        };
+
+        assert_eq!(heading(parent, None), "│ Delegated by parent");
+        assert_eq!(
+            heading(parent, Some("Explore")),
+            "│ Delegated by Explore (parent)"
+        );
+        assert_eq!(
+            heading(sibling, Some("Reviewer")),
+            "│ Delegated by Reviewer"
+        );
+        assert_eq!(
+            heading(sibling, None),
+            "│ Delegated by the top-level Agent",
+            "an unnamed sender that is not the parent can only be a top-level Session's Agent"
+        );
+    }
+
+    #[test]
+    fn a_delegation_the_cap_cut_short_ends_with_the_message_truncation_marker() {
+        let message = Message {
+            role: MessageRole::Delegation(crate::protocol::Delegator {
+                session_id: crate::protocol::SessionId::new(),
+                name: None,
+            }),
+            truncated: true,
+            ..user_message("Map the seams")
+        };
+        let mut lines = Vec::new();
+
+        render_message(&mut lines, &message, None, &Theme::system(), 40, false);
+
+        assert_eq!(
+            lines.last().map(projected_text).as_deref(),
+            Some("  [Message truncated]")
+        );
+    }
+
+    #[test]
     fn message_gutters_and_padding_are_chrome_and_prose_is_text() {
         let theme = Theme::system();
         let mut lines = Vec::new();
-        render_message(&mut lines, &user_message("hello there"), &theme, 20, false);
+        render_message(
+            &mut lines,
+            &user_message("hello there"),
+            None,
+            &theme,
+            20,
+            false,
+        );
         assert_eq!(
             span_marks(&lines[0]),
             [(true, "┃ "), (false, "hello there"), (true, "       ")],
@@ -7072,6 +7252,7 @@ mod tests {
         render_message(
             &mut lines,
             &agent_message("- item one\n\n```rust\nlet x = 1;\n```"),
+            None,
             &theme,
             40,
             false,
@@ -7100,7 +7281,14 @@ mod tests {
         let table = "| Name | Value |\n| --- | --- |\n| alpha beta gamma | delta |";
 
         let mut agent_lines = Vec::new();
-        render_message(&mut agent_lines, &agent_message(table), &theme, 24, false);
+        render_message(
+            &mut agent_lines,
+            &agent_message(table),
+            None,
+            &theme,
+            24,
+            false,
+        );
         assert!(agent_lines.iter().all(|line| line.width() <= 24));
         assert_eq!(projected_text(&agent_lines[0]), "  ┌────────────┬───────┐");
 

@@ -4,7 +4,7 @@ use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, ApprovalSubject, Cost, CostBasis,
-    CreateSessionRequest, FileChange, InitialPrompt, Message, MessageId, MessageRole,
+    CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole,
     MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
     ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
     ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
@@ -675,6 +675,73 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             .and_then(|total| total.blended_tokens()),
         Some(2_100),
         "a Session with nothing delegated totals its own Turns alone"
+    );
+}
+
+#[test]
+fn a_delegation_message_names_its_delegating_agent_apart_from_user_and_agent_messages() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let sibling_id = SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let message_id = MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81"));
+    let delegation = |delegator: Delegator| Message {
+        id: message_id,
+        turn_id,
+        role: MessageRole::Delegation(delegator),
+        status: MessageStatus::Completed,
+        content: "Tighten the second paragraph.".to_owned(),
+        skill_invocations: Vec::new(),
+        truncated: false,
+    };
+    let from_sibling = delegation(Delegator {
+        session_id: sibling_id,
+        name: Some("Reviewer".to_owned()),
+    });
+    let expected = json!({
+        "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
+        "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+        "role": {
+            "delegation": {
+                "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+                "name": "Reviewer"
+            }
+        },
+        "status": "completed",
+        "content": "Tighten the second paragraph.",
+        "skill_invocations": [],
+        "truncated": false
+    });
+    assert_eq!(
+        serde_json::to_value(&from_sibling).expect("encode a Delegation"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<Message>(expected).expect("decode a Delegation"),
+        from_sibling
+    );
+
+    let from_top_level = delegation(Delegator {
+        session_id,
+        name: None,
+    });
+    let encoded = serde_json::to_value(&from_top_level).expect("encode a top-level Delegation");
+    assert_eq!(
+        encoded["role"],
+        json!({"delegation": {"session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f", "name": null}}),
+        "a top-level Session's Agent is named by its Session alone"
+    );
+    assert_eq!(
+        from_top_level
+            .role
+            .delegator()
+            .map(|delegator| delegator.session_id),
+        Some(session_id)
+    );
+    assert_eq!(MessageRole::User.delegator(), None);
+    assert_eq!(
+        serde_json::to_value(MessageRole::User).expect("encode a user role"),
+        json!("user"),
+        "user and agent roles keep their plain wire form"
     );
 }
 

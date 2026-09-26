@@ -1,7 +1,8 @@
 //! The way into a Subagent's Session and back: pressing its Transcript row
 //! opens the child in the Session Content Column, and Escape returns to the
 //! parent exactly where the reader left it. The child view offers no path to
-//! delivering a Prompt.
+//! delivering a Prompt, and draws each Delegation that opened one of its Turns
+//! apart from a user Message.
 
 use crate::support::{
     buffer_rows, connected_application, failed_session_snapshot, navigable_session_snapshot,
@@ -14,11 +15,11 @@ use crossterm::event::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Activity, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost, CostBasis, Message,
-        MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId, PromptId, ProviderId,
-        Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus, Usage,
-        UsageTotal, Workspace,
+        Activity, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost, CostBasis,
+        Delegator, Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId,
+        PromptId, ProviderId, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+        SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
+        Usage, UsageTotal, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -756,4 +757,228 @@ fn subagent_view_follows_latest_on_control_end_and_has_no_composer_line_motion()
             command,
         );
     }
+}
+
+/// A Delegation opening `turn_id`: what the Agent of `sender` — named
+/// `name` when it is a Subagent — asked of the Subagent.
+fn delegation(turn_id: TurnId, sender: SessionId, name: Option<&str>, content: &str) -> Message {
+    Message {
+        id: MessageId::new(),
+        turn_id,
+        role: MessageRole::Delegation(Delegator {
+            session_id: sender,
+            name: name.map(str::to_owned),
+        }),
+        status: MessageStatus::Completed,
+        content: content.to_owned(),
+        truncated: false,
+        skill_invocations: Vec::new(),
+    }
+}
+
+/// A Subagent's Session whose spawn Delegation opened its first Turn, now
+/// settled, and whose second Turn a sibling's resume opened and is working.
+fn delegated_child_snapshot(
+    parent_id: SessionId,
+    sibling_id: SessionId,
+    workspace: &std::path::Path,
+) -> SessionSnapshot {
+    let mut child = child_session_snapshot(SessionId::new(), parent_id, workspace);
+    let first = child.turns[0].id;
+    child.turns[0].status = TurnStatus::Completed;
+    child.turns[0].started_at = Some(SessionTimestamp(1_755_000_000_000));
+    child.turns[0].settled_at = Some(SessionTimestamp(1_755_000_004_000));
+    let spawn = delegation(first, parent_id, None, "Map the provider seams.");
+    child.transcript.insert(
+        0,
+        TranscriptItem::Message {
+            message_id: spawn.id,
+        },
+    );
+    child.messages.insert(0, spawn);
+    let second = TurnId::new();
+    let mut resumed = child.turns[0].clone();
+    resumed.id = second;
+    resumed.status = TurnStatus::Active;
+    resumed.started_at = None;
+    resumed.settled_at = None;
+    child.turns.push(resumed);
+    let resume = delegation(
+        second,
+        sibling_id,
+        Some("Reviewer"),
+        "Tighten the second paragraph.",
+    );
+    child.transcript.push(TranscriptItem::Message {
+        message_id: resume.id,
+    });
+    child.messages.push(resume);
+    child
+}
+
+#[test]
+fn a_delegation_is_drawn_apart_from_a_user_message_naming_the_agent_that_sent_it() {
+    let workspace = workspace_dir();
+    let parent = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Please map the seams",
+        workspace.path(),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(parent.clone()))
+        .expect("attach the delegating Session");
+    let delegating = rendered_application_buffer(&application, 80, 22);
+    let (user_bar, user_row) = text_position(&delegating, "┃ Please map the seams");
+
+    let child = delegated_child_snapshot(parent.session.id, SessionId::new(), workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach the Subagent's Session");
+    let delegated = rendered_application_buffer(&application, 80, 22);
+    let text = buffer_rows(&delegated).join("\n");
+
+    for (sender, asked) in [
+        ("Delegated by parent", "│ Map the provider seams."),
+        ("Delegated by Reviewer", "│ Tighten the second paragraph."),
+    ] {
+        assert!(
+            text.contains(&format!("│ {sender}")),
+            "a Delegation names the Agent that sent it, {sender:?}: {text}"
+        );
+        assert!(
+            text.contains(asked),
+            "and says what it asked, down a bar of its own: {text}"
+        );
+    }
+    assert!(
+        !text.contains("┃ Map the provider seams.") && !text.contains("┃ Delegated by"),
+        "a Delegation never wears a user Message's bar: {text}"
+    );
+    let (delegation_bar, delegation_row) = text_position(&delegated, "│ Map the provider seams.");
+    assert_ne!(
+        delegated[(delegation_bar, delegation_row)].fg,
+        delegating[(user_bar, user_row)].fg,
+        "a Delegation's bar is drawn in another role than a user Message's"
+    );
+    assert_eq!(
+        delegated[(delegation_bar + 2, delegation_row)].bg,
+        delegating[(user_bar + 2, user_row)].bg,
+        "though both sit on the surface of what an Agent was asked"
+    );
+}
+
+#[test]
+fn a_folded_turn_in_a_subagent_session_keeps_its_delegation_visible() {
+    let workspace = workspace_dir();
+    let parent_id = SessionId::new();
+    let mut child = child_session_snapshot(SessionId::new(), parent_id, workspace.path());
+    child.session.status = SessionStatus::Idle;
+    child.session.working_since = None;
+    let turn_id = child.turns[0].id;
+    child.turns[0].status = TurnStatus::Completed;
+    child.turns[0].started_at = Some(SessionTimestamp(1_755_000_000_000));
+    child.turns[0].settled_at = Some(SessionTimestamp(1_755_000_012_000));
+    let spawn = delegation(turn_id, parent_id, None, "Map the provider seams.");
+    let command_id = suru::protocol::ActivityId::new();
+    let answer = Message {
+        id: MessageId::new(),
+        turn_id,
+        role: MessageRole::Agent,
+        status: MessageStatus::Completed,
+        content: "Two seams: the runtime and the projection.".to_owned(),
+        truncated: false,
+        skill_invocations: Vec::new(),
+    };
+    child.transcript = vec![
+        TranscriptItem::Message {
+            message_id: spawn.id,
+        },
+        child.transcript[0],
+        TranscriptItem::Activity {
+            activity_id: command_id,
+        },
+        TranscriptItem::Message {
+            message_id: answer.id,
+        },
+    ];
+    child.messages.insert(0, spawn);
+    child.messages.push(answer);
+    child.activities.push(Activity::Command {
+        id: command_id,
+        turn_id,
+        status: ActivityStatus::Completed,
+        command: "rg -l ProviderRuntime".to_owned(),
+        cwd: None,
+        output: "src/provider.rs\n".to_owned(),
+        output_truncated: false,
+        exit_status: Some(0),
+    });
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach a Subagent's Session whose Turn settled");
+
+    let rows = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        rows.contains("✓ Worked for 12s"),
+        "the settled Turn stands as its marker: {rows}"
+    );
+    for hidden in ["rg -l ProviderRuntime", "Mapping the provider seams"] {
+        assert!(
+            !rows.contains(hidden),
+            "the Turn Fold hides the work it stands for, but {hidden:?} rendered: {rows}"
+        );
+    }
+    for kept in [
+        "Delegated by parent",
+        "Map the provider seams.",
+        "Two seams: the runtime and the projection.",
+    ] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Delegation and its answer stay outside the fold, but {kept:?} is \
+             missing: {rows}"
+        );
+    }
+    let delegation_row = rows
+        .lines()
+        .position(|row| row.contains("Map the provider seams."))
+        .expect("the Delegation renders");
+    let marker_row = rows
+        .lines()
+        .position(|row| row.contains("✓ Worked"))
+        .expect("the marker renders");
+    assert!(
+        delegation_row < marker_row,
+        "the Delegation opens the Turn its marker answers: {rows}"
+    );
+}
+
+#[test]
+fn a_subagent_session_opened_by_delegations_still_offers_no_prompt_composer() {
+    let workspace = workspace_dir();
+    let child = delegated_child_snapshot(SessionId::new(), SessionId::new(), workspace.path());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach a Subagent's Session");
+    rendered_application_rows_at(&application, 80, 22);
+
+    type_terminal_text(&mut application, "hello agent");
+    assert_eq!(
+        press_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "Enter delivers nothing from a Subagent's Session, whoever delegated to it"
+    );
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        !text.contains("hello agent"),
+        "typed text lands nowhere — there is no composer to hold it: {text}"
+    );
+    assert!(
+        text.contains("Esc returns to the parent"),
+        "the view says how to leave instead of offering a composer: {text}"
+    );
 }

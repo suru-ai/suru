@@ -252,10 +252,14 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update reused a Message identity");
                 }
-                if message.role == MessageRole::User && message.status != MessageStatus::Completed {
-                    bail!("User Messages cannot stream");
+                if message.role != MessageRole::Agent && message.status != MessageStatus::Completed
+                {
+                    bail!("Only Agent Messages stream");
                 }
-                if message.truncated {
+                // A Delegation arrives whole, so it is added in its final
+                // state, which may already be cut short by Suru's cap. Every
+                // other Message is added before any content reaches it.
+                if message.truncated && message.role.delegator().is_none() {
                     bail!("Session update added a Message outside its initial state");
                 }
                 next.messages.push(message.clone());

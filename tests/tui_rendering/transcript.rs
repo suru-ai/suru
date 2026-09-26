@@ -6130,7 +6130,7 @@ fn append_settled_turn(
             skill_invocations: Vec::new(),
             truncated: false,
         };
-        if role == MessageRole::Agent {
+        if message.role == MessageRole::Agent {
             let activity = Activity::Reasoning {
                 id: ActivityId::new(),
                 turn_id,
