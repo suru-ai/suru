@@ -20,9 +20,9 @@
 //! Watch (ADR 0030): its start and its notification bracket the time its Session may read
 //! Monitoring, and every Watch still live when the CLI process ends settles as lost. A shell the
 //! agent waits on in the foreground of its Turn is never a Watch, though a long one reports a task
-//! lifecycle too, unless the CLI later moves it to the background. A Watch belongs to the conversation whose tool use launched it — a subagent's own, even after that
-//! subagent settles, since its Watches outlive it and wake it. A settled
-//! agent the loop resumes through
+//! lifecycle too, unless the CLI later moves it to the background. A Watch belongs to the
+//! conversation whose tool use launched it — a subagent's own, even after that subagent settles,
+//! since its Watches outlive it and wake it. A settled agent the loop resumes through
 //! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
 //! Subagent rather than a new one, and since the resumed conversation still rides under the
 //! original spawn's id, the resumed work lands in the Subagent's own Session, in the Turn the
@@ -791,8 +791,10 @@ impl ClaudeProjection {
 
     /// A foreground task the CLI moved to the background, so the agent stopped waiting on it and
     /// its settling will wake the loop: a Watch from here on, described and owned as its start
-    /// would have made it. A task not running in the foreground has nothing to promote. No live
-    /// CLI has been captured announcing this; the patch is read on the word of the wire's shape.
+    /// would have made it. A task not running in the foreground has nothing to promote. The move
+    /// has not been captured live, but the 2.1.280 CLI's own schema says a later move to the
+    /// background arrives as `task_updated` with `patch.is_backgrounded`, and it arms a foreground
+    /// shell to be backgrounded on its own once it runs long enough.
     fn project_task_backgrounded(&mut self, task_id: &str) -> Vec<AttributedProviderEvent> {
         let Some(task) = self.foreground_tasks.remove(task_id) else {
             return Vec::new();
