@@ -312,6 +312,10 @@ pub(super) struct SystemMessage {
     /// it again; on `task_progress`, the subagent's latest tool activity instead.
     #[serde(default)]
     pub(super) description: Option<String>,
+    /// The text the agent was handed, on `task_started`: a spawn's prompt, and the raw message
+    /// when a late SendMessage restarts a finished agent (verified against the live 2.1.280 CLI).
+    #[serde(default)]
+    pub(super) prompt: Option<String>,
     /// How the task ended, on `task_notification` — `completed`, or whatever failing or being
     /// stopped reads as.
     #[serde(default)]

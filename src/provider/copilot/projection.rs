@@ -181,6 +181,10 @@ struct ActiveCommand {
     /// answering for it, so the withheld Command surfaces when the execution settles or the
     /// conversation stops — a failed delegation stays visible.
     withheld_spawn: Option<String>,
+    /// What a [`SPAWN_TOOL`] execution hands the Subagent it spawns — the tool's `prompt`
+    /// argument — kept for the `subagent.started` that opens it, which names the spawning tool
+    /// call but never carries the prompt itself.
+    spawn_prompt: Option<String>,
 }
 
 /// A Reasoning block Copilot still has open: the text it has streamed so far — against
@@ -808,6 +812,9 @@ impl CopilotCorrelation {
     /// envelope's instance identity is what the Subagent's every event is attributed with; a
     /// started that carries none leaves the spawning tool call standing in, so the Subagent's row
     /// and settle still reach the Transcript even though no work can ever be attributed to it.
+    /// The spawn's Delegation is the prompt its tool call's execution carried, where that
+    /// execution started first; the runtime's own delegation, which never surfaces as one, opens
+    /// with none.
     fn project_subagent_started(&mut self, event: &SessionEvent) -> Vec<AttributedProviderEvent> {
         let Some(started) = reported::<SubagentStartedData>(event) else {
             return Vec::new();
@@ -839,13 +846,14 @@ impl CopilotCorrelation {
             started.agent_display_name
         };
         let model = started.model.filter(|model| !model.is_empty());
+        let delegation = self.spawn_prompt(spawner.as_deref(), &started.tool_call_id);
         let mut projected = vec![attributed(
             spawner.as_deref(),
             ProviderEvent::SubagentStarted {
                 subagent_id: ProviderSubagentId::new(subagent.clone()),
                 name,
                 description: started.agent_description,
-                delegation: None,
+                delegation,
             },
         )];
         if let Some(model) = model {
@@ -858,6 +866,16 @@ impl CopilotCorrelation {
             ));
         }
         projected
+    }
+
+    /// The prompt the spawning tool call handed its Subagent, read off its withheld execution in
+    /// the conversation that ran it — a Subagent's own, or the main agent's.
+    fn spawn_prompt(&self, spawner: Option<&str>, tool_call_id: &str) -> Option<String> {
+        let streams = match spawner {
+            Some(subagent) => self.subagents.get(subagent)?,
+            None => &self.turn.as_ref()?.streams,
+        };
+        streams.commands.get(tool_call_id)?.spawn_prompt.clone()
     }
 
     /// The Subagent whose conversation ran `tool_call_id`, or `None` for the main agent's own —
@@ -1051,10 +1069,18 @@ fn project_command_started(
     }
     let command = command_text(started);
     if started.tool_name == SPAWN_TOOL {
+        let spawn_prompt = started
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("prompt"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .map(str::to_owned);
         streams.commands.insert(
             started.tool_call_id.clone(),
             ActiveCommand {
                 withheld_spawn: Some(command),
+                spawn_prompt,
                 ..ActiveCommand::default()
             },
         );
@@ -1966,12 +1992,72 @@ mod tests {
                     description: "Scout the workspace".to_owned(),
                     delegation: None,
                 },
-            }]
+            }],
+            "a spawn whose tool call never surfaced as an execution carries no Delegation"
         );
         assert!(
             project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn")).is_empty(),
             "a repeated started opens nothing twice"
         );
+    }
+
+    #[test]
+    fn a_subagent_started_carries_the_prompt_its_spawning_tool_call_handed_it() {
+        let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            json!({
+                "toolCallId": "t-spawn",
+                "toolName": "task",
+                "arguments": {
+                    "agent_type": "explore",
+                    "description": "Scout the workspace",
+                    "prompt": "Find every TODO marker and report the files.",
+                },
+            }),
+        );
+        let projected = project_attributed(&mut correlation, spawn_started("agent-1", "t-spawn"));
+        let [
+            AttributedProviderEvent {
+                event: ProviderEvent::SubagentStarted { delegation, .. },
+                ..
+            },
+        ] = projected.as_slice()
+        else {
+            panic!("the spawn opens one Subagent, got {projected:?}");
+        };
+        assert_eq!(
+            delegation.as_deref(),
+            Some("Find every TODO marker and report the files."),
+            "the task tool's prompt is the spawn's Delegation"
+        );
+
+        // A spawn out of a Subagent's own tool call reads the prompt from that Subagent's
+        // conversation.
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "t-nested",
+                    "toolName": "task",
+                    "arguments": { "prompt": "Read the TODO in src/main.rs." },
+                }),
+            ),
+        );
+        let nested = project_attributed(&mut correlation, spawn_started("agent-2", "t-nested"));
+        let [
+            AttributedProviderEvent {
+                event: ProviderEvent::SubagentStarted { delegation, .. },
+                ..
+            },
+        ] = nested.as_slice()
+        else {
+            panic!("the nested spawn opens one Subagent, got {nested:?}");
+        };
+        assert_eq!(delegation.as_deref(), Some("Read the TODO in src/main.rs."));
     }
 
     #[test]

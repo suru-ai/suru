@@ -12,8 +12,8 @@ use crate::support::{
 use suru::{
     managed_client::ManagedClient,
     protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, SessionId,
-        SessionSnapshot, TurnStatus,
+        Activity, ActivityStatus, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
+        PromptId, SessionId, SessionSnapshot, TranscriptItem, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -205,6 +205,80 @@ async fn attributed_events_land_in_the_child_session_while_the_parents_transcrip
     assert_eq!(*status, ActivityStatus::Completed);
     assert_eq!(command, "rg -l TODO");
     assert_eq!(output, "src/main.rs\n");
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A delegation made through the task tool, as the SDK's own captures show it: the main agent's
+/// `task` execution starts carrying the prompt it hands the sub-agent, `subagent.started` names
+/// that tool call — but never the prompt — and the sub-agent answers before the execution settles.
+const TASK_TOOL_SPAWN_TURN: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t-spawn","toolName":"task","arguments":{"agent_type":"explore","name":"read-file","description":"Reading notes.txt","prompt":"Read notes.txt and report its contents."}}'
+      agent_event e2 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"explore","agentDisplayName":"Explore","agentDescription":"Reading notes.txt"}'
+      agent_event e3 agent-1 assistant.message '{"messageId":"sub-m1","content":"The notes say hello."}'
+      agent_event e4 agent-1 subagent.completed '{"toolCallId":"t-spawn","agentName":"explore","agentDisplayName":"Explore"}'
+      event e5 tool.execution_complete '{"toolCallId":"t-spawn","success":true,"result":{"content":"The notes say hello."}}'
+      event e6 assistant.message '{"messageId":"m1","content":"The notes say hello."}'
+      event e7 session.idle '{}'
+"#;
+
+#[tokio::test]
+async fn a_task_tool_spawn_opens_its_child_turn_with_the_prompt_as_a_delegation() {
+    let copilot = conversation_fixture(TASK_TOOL_SPAWN_TURN);
+    let opened = opened_session(&copilot, "copilot-subagent-delegation", "Read the notes").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let settled = settled_session(client, session_id, 0).await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+
+    let child = settled_session(client, *child_id, 0).await;
+    let messages = child
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Message { message_id } => child
+                .messages
+                .iter()
+                .find(|message| message.id == *message_id),
+            TranscriptItem::Activity { .. } => None,
+        })
+        .map(|message| (message.turn_id, &message.role, message.content.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            (
+                child.turns[0].id,
+                &MessageRole::Delegation(Delegator {
+                    session_id,
+                    name: None,
+                }),
+                "Read notes.txt and report its contents."
+            ),
+            (
+                child.turns[0].id,
+                &MessageRole::Agent,
+                "The notes say hello."
+            ),
+        ],
+        "the task tool's prompt opens the child's Turn as a Delegation from the main agent"
+    );
+    assert!(
+        settled
+            .messages
+            .iter()
+            .all(|message| message.role.delegator().is_none()),
+        "the Delegation stands in the Subagent's Transcript alone"
+    );
 
     opened
         .server

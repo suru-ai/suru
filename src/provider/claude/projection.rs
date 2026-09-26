@@ -20,7 +20,8 @@
 //! SendMessage starts the same task again, naming the SendMessage tool use: that is a resume of the
 //! Subagent rather than a new one, and since the resumed conversation still rides under the
 //! original spawn's id, the resumed work lands in the Subagent's own Session, in the Turn the
-//! resume begins there (ADR 0031).
+//! resume begins there (ADR 0031). What the delegating tool handed the agent — the Agent tool's
+//! `prompt`, SendMessage's `message` — is the Delegation that opens that Turn.
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
 //! result is still to come, since the CLI answers every message queued into a running loop with a
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
@@ -267,19 +268,48 @@ struct RunningCommand {
 
 /// A tool use that delegates to an agent, remembered from its block until the task it delegates
 /// starts: the conversation that ran it, whose Turn the Delegation's row stands in, and which kind
-/// of Delegation it is.
+/// of Delegation it is. Its input is read once the block closes, since it streams.
 struct DelegationTool {
     delegator: ConversationKey,
     kind: DelegationKind,
 }
 
 enum DelegationKind {
-    /// The Agent or Task tool, spawning a new agent. The task's start describes it.
-    Spawn,
-    /// SendMessage, resuming an agent that settled. Its input — read once the block closes, since
-    /// it streams — describes the resume: the loop's `summary` of the message, or else the
-    /// message's own first line.
-    Resume { description: Option<String> },
+    /// The Agent or Task tool, spawning a new agent. The task's start describes it, and the tool's
+    /// `prompt` is the Delegation's text.
+    Spawn { prompt: Option<String> },
+    /// SendMessage, resuming an agent that settled. Its input describes the resume — the loop's
+    /// `summary` of the message, or else the message's own first line — and its `message` is the
+    /// Delegation's text.
+    Resume {
+        description: Option<String>,
+        message: Option<String>,
+    },
+}
+
+impl DelegationKind {
+    /// Reads what the tool's completed input says of the Delegation. Input in no shape this reads
+    /// leaves the Delegation to be described by the task's start instead.
+    fn read_input(&mut self, input: &Value) {
+        match self {
+            Self::Spawn { prompt } => *prompt = input_text(input, "prompt"),
+            Self::Resume {
+                description,
+                message,
+            } => {
+                *description = send_message_description(input);
+                *message = input_text(input, "message");
+            }
+        }
+    }
+
+    /// The Delegation's text, as the tool's input gave it.
+    fn text(&mut self) -> Option<String> {
+        match self {
+            Self::Spawn { prompt } => prompt.take(),
+            Self::Resume { message, .. } => message.take(),
+        }
+    }
 }
 
 /// One agent task the CLI has run as a Subagent. Its task id is the Subagent's identity, and it
@@ -442,10 +472,13 @@ impl ClaudeProjection {
             .tool_use_id
             .as_ref()
             .and_then(|tool| self.delegation_tools.remove(tool));
-        let (delegator, kind) = delegation
-            .map_or((OWNING_CONVERSATION, DelegationKind::Spawn), |tool| {
-                (tool.delegator, tool.kind)
-            });
+        let (delegator, mut kind) = delegation.map_or(
+            (OWNING_CONVERSATION, DelegationKind::Spawn { prompt: None }),
+            |tool| (tool.delegator, tool.kind),
+        );
+        // What the agent was handed is the delegating tool's own input, or where that never
+        // streamed, the text the start carries.
+        let delegation = kind.text().or(message.prompt);
         let subagent_id = ProviderSubagentId::new(task_id.clone());
         let (conversation, event) = match (self.agent_tasks.get_mut(&task_id), kind) {
             // A task this wire started before is a settled agent resumed: the same Subagent,
@@ -461,7 +494,7 @@ impl ClaudeProjection {
                     ProviderEvent::SubagentResumed {
                         subagent_id,
                         description,
-                        delegation: None,
+                        delegation,
                     },
                 )
             }
@@ -495,7 +528,7 @@ impl ClaudeProjection {
                             .subagent_type
                             .unwrap_or_else(|| TASK_TOOL.to_owned()),
                         description,
-                        delegation: None,
+                        delegation,
                     },
                 )
             }
@@ -812,8 +845,11 @@ impl ClaudeProjection {
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
         let kind = match name.as_str() {
-            TASK_TOOL | AGENT_TOOL => Some(DelegationKind::Spawn),
-            SEND_MESSAGE_TOOL => Some(DelegationKind::Resume { description: None }),
+            TASK_TOOL | AGENT_TOOL => Some(DelegationKind::Spawn { prompt: None }),
+            SEND_MESSAGE_TOOL => Some(DelegationKind::Resume {
+                description: None,
+                message: None,
+            }),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -837,9 +873,9 @@ impl ClaudeProjection {
     }
 
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
-    /// the conversation that ran it, recording the bare command, and a completed SendMessage leaves
-    /// what it asks for the resume it starts. Any other tool, and input in no shape this
-    /// projection reads, is passed over.
+    /// the conversation that ran it, recording the bare command, and a completed delegating tool
+    /// use leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
+    /// shape this projection reads, is passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -850,19 +886,14 @@ impl ClaudeProjection {
         let Some(tool) = conversation.open_tools.remove(&index) else {
             return;
         };
-        if tool.name != COMMAND_TOOL && tool.name != SEND_MESSAGE_TOOL {
+        let delegation = self.delegation_tools.get_mut(&tool.id);
+        if tool.name != COMMAND_TOOL && delegation.is_none() {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
-        if tool.name == SEND_MESSAGE_TOOL {
-            if let Some(DelegationTool {
-                kind: DelegationKind::Resume { description },
-                ..
-            }) = self.delegation_tools.get_mut(&tool.id)
-            {
-                *description = send_message_description(&input);
-            }
+        if let Some(delegation) = delegation {
+            delegation.kind.read_input(&input);
             return;
         }
         let Some(command) = input.get("command").and_then(Value::as_str) else {
@@ -1139,9 +1170,20 @@ impl ClaudeProjection {
 /// its own; a start naming anything else is described by the task itself.
 fn resume_description(kind: DelegationKind) -> Option<String> {
     match kind {
-        DelegationKind::Resume { description } => description,
-        DelegationKind::Spawn => None,
+        DelegationKind::Resume { description, .. } => description,
+        DelegationKind::Spawn { .. } => None,
     }
+}
+
+/// One text field of a delegating tool's input, where it holds text with something to read. A
+/// field in any other shape — SendMessage's structured protocol messages among them — holds no
+/// Delegation text.
+fn input_text(input: &Value, field: &str) -> Option<String> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// How a SendMessage's input describes the resume it starts: the `summary` the loop gave of its

@@ -427,14 +427,16 @@ impl NativeCorrelation {
     /// Opens one spawned child thread as a Subagent: follows the thread,
     /// queues its attach, and announces the spawn in the conversation that ran
     /// it — which is what decides the Session its child hangs under, and how a
-    /// child's own spawns recurse one level down. A spawn repeating a thread
-    /// already followed or already settled opens nothing.
+    /// child's own spawns recurse one level down — carrying the spawn's
+    /// Delegation where the wire reported what the child was handed. A spawn
+    /// repeating a thread already followed or already settled opens nothing.
     fn spawn_child(
         &mut self,
         spawner: ProviderEventAttribution,
         child_thread_id: String,
         name: String,
         description: String,
+        delegation: Option<String>,
     ) -> Vec<AttributedProviderEvent> {
         if child_thread_id == self.thread_id
             || self.children.contains_key(&child_thread_id)
@@ -458,7 +460,7 @@ impl NativeCorrelation {
                 subagent_id: ProviderSubagentId::new(child_thread_id),
                 name,
                 description,
-                delegation: None,
+                delegation,
             },
         }]
     }
@@ -1256,7 +1258,9 @@ fn project_permissions_approval(
 
 /// One step of a spawned agent's lifecycle, as the spawner's thread reports
 /// it: a start opens the agent's thread as a Subagent, and the terminal kinds
-/// settle it. Interactions revise nothing the row shows.
+/// settle it. Interactions revise nothing the row shows. The activity names
+/// only the agent, never what it was handed, so a spawn reported this way
+/// opens its child Turn with no Delegation.
 fn project_subagent_activity(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1273,6 +1277,7 @@ fn project_subagent_activity(
             agent_thread_id,
             subagent_name_from_path(agent_path),
             String::new(),
+            None,
         ),
         NativeSubagentActivityKind::Completed => {
             correlation.settle_child(&agent_thread_id, ProviderSubagentStatus::Completed)
@@ -1286,7 +1291,8 @@ fn project_subagent_activity(
 
 /// A collab tool call completing on a followed thread. A completed spawn opens
 /// its receiver threads as Subagents, described by the prompt the call handed
-/// them; a completed send revises what its receivers' rows say they are doing;
+/// them, which is also the Delegation each child Turn opens with; a completed
+/// send revises what its receivers' rows say they are doing;
 /// and whatever the call was, the terminal lifecycle states it observed settle
 /// the Subagents they name — which is how a wait learns of a child finishing.
 fn project_collab_call_completed(
@@ -1312,6 +1318,7 @@ fn project_collab_call_completed(
                         receiver.clone(),
                         GENERIC_SUBAGENT_NAME.to_owned(),
                         description.clone(),
+                        prompt.clone(),
                     ));
                 }
             }
@@ -2745,7 +2752,8 @@ mod tests {
                     delegation: None,
                 },
             }],
-            "the spawn rides the spawning conversation, named off the agent path"
+            "the spawn rides the spawning conversation, named off the agent path, and carries \
+             no Delegation because the activity never says what the child was handed"
         );
         assert_eq!(
             correlation.take_pending_attaches(),

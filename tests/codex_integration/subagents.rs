@@ -11,8 +11,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, ApprovalOutcome, CreateSessionRequest,
-        Decision, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionId, SessionSnapshot,
-        TurnStatus,
+        Decision, Delegator, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionId,
+        SessionSnapshot, TranscriptItem, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -389,6 +389,30 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
         agent_message_contents(&child),
         ["Two crates, one workspace."],
         "the child thread's own items fill the child Session"
+    );
+    let Some(TranscriptItem::Message { message_id }) = child.transcript.first() else {
+        panic!(
+            "the child's Turn opens with a Message, got {:?}",
+            child.transcript
+        );
+    };
+    let opening = child
+        .messages
+        .iter()
+        .find(|message| message.id == *message_id)
+        .expect("the opening Message is in the snapshot");
+    assert_eq!(
+        opening.role,
+        MessageRole::Delegation(Delegator {
+            session_id,
+            name: None,
+        }),
+        "the spawn call's prompt is a Delegation from the parent's Agent, not a user Message"
+    );
+    assert_eq!(opening.content, "Map the crate layout");
+    assert_eq!(
+        opening.turn_id, child.turns[0].id,
+        "the spawn's Delegation opens the child's first Turn"
     );
 
     let resumed = fixture

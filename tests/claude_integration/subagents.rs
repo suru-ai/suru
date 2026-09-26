@@ -18,7 +18,10 @@ use crate::{
 };
 use suru::{
     managed_client::SubagentTreeEvent,
-    protocol::{Activity, ActivityStatus, SessionSnapshot, TurnStatus},
+    protocol::{
+        Activity, ActivityStatus, Delegator, MessageRole, SessionSnapshot, TranscriptItem, TurnId,
+        TurnStatus,
+    },
 };
 use tokio::time::timeout;
 
@@ -913,6 +916,85 @@ async fn a_subagent_resumed_through_send_message_continues_in_its_own_session_as
         .expect("shut the server down");
 }
 
+/// The Messages in `snapshot`'s Transcript, in order: each one's Turn, who it is from — the user,
+/// the Agent, or the Agent a Delegation names — and what it says.
+fn transcript_messages(snapshot: &SessionSnapshot) -> Vec<(TurnId, &MessageRole, &str)> {
+    snapshot
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Message { message_id } => snapshot
+                .messages
+                .iter()
+                .find(|message| message.id == *message_id),
+            TranscriptItem::Activity { .. } => None,
+        })
+        .map(|message| (message.turn_id, &message.role, message.content.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_spawn_and_the_resume_each_open_their_turn_in_the_child_with_their_delegation() {
+    let claude = conversation_fixture(RESUMED_SUBAGENT_TURN);
+    let opened = opened_session(&claude, "claude-subagent-delegations", "Hello then goodbye").await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+    let parent = settled_session(client, session_id, 1).await;
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+        _,
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!(
+            "the spawn and the resume each stand as a row, got {:?}",
+            parent.activities
+        );
+    };
+    let child = settled_session(client, *child_id, 1).await;
+    let [first, second] = child.turns.as_slice() else {
+        panic!("the resume begins a second Turn, got {:?}", child.turns);
+    };
+    let from_parent = MessageRole::Delegation(Delegator {
+        session_id,
+        name: None,
+    });
+    assert_eq!(
+        transcript_messages(&child),
+        [
+            (first.id, &from_parent, "Say HELLO."),
+            (first.id, &MessageRole::Agent, "HELLO"),
+            (second.id, &from_parent, "Now say GOODBYE.\nNothing else."),
+            (second.id, &MessageRole::Agent, "GOODBYE"),
+        ],
+        "the first Turn opens with the Agent tool's prompt and the second with SendMessage's \
+         message, each a Delegation from the parent's Agent ahead of the work it began"
+    );
+    assert!(
+        child
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::User),
+        "a Delegation is never a user Message: {:?}",
+        child.messages
+    );
+    assert!(
+        parent
+            .messages
+            .iter()
+            .all(|message| message.role.delegator().is_none()),
+        "the Delegations stand in the Subagent's Transcript alone"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
 /// The same resume, but the resumed agent is still working when the loop's stretch that sent the
 /// SendMessage ends, and it works on until something stops it.
 const RESUMED_SUBAGENT_STILL_WORKING: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -1089,9 +1171,10 @@ async fn a_resumed_subagent_keeps_its_parent_working_and_stopping_it_settles_onl
 /// A sibling resuming a settled Subagent: the loop spawns a writer and a reviewer, the writer
 /// settles, and the reviewer — whose conversation arrives as snapshots — sends the writer more
 /// work through SendMessage, so the writer's task starts again naming the reviewer's tool use.
+/// The writer's Agent tool input never streams, so only its task's start says what it was asked.
 const SIBLING_RESUMES_SUBAGENT: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_writer","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"system","subtype":"task_started","task_id":"writer-task","tool_use_id":"agent_writer","description":"Draft the notes","task_type":"local_agent","subagent_type":"Writer","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"writer-task","tool_use_id":"agent_writer","description":"Draft the notes","prompt":"Draft the release notes.","task_type":"local_agent","subagent_type":"Writer","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"agent_reviewer","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"reviewer-task","tool_use_id":"agent_reviewer","description":"Review the notes","task_type":"local_agent","subagent_type":"Reviewer","session_id":"prov-session"}'
@@ -1167,6 +1250,33 @@ async fn a_sibling_that_resumes_a_subagent_holds_the_resume_row_in_its_own_turn(
     assert_eq!(drafted.turn_id, writer_session.turns[0].id);
     assert_eq!(tightened.content, "Tightened.");
     assert_eq!(tightened.turn_id, writer_session.turns[1].id);
+    let delegations = transcript_messages(&writer_session)
+        .into_iter()
+        .filter(|(_, role, _)| role.delegator().is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delegations,
+        [
+            (
+                writer_session.turns[0].id,
+                &MessageRole::Delegation(Delegator {
+                    session_id,
+                    name: None,
+                }),
+                "Draft the release notes."
+            ),
+            (
+                writer_session.turns[1].id,
+                &MessageRole::Delegation(Delegator {
+                    session_id: *reviewer,
+                    name: Some("Reviewer".to_owned()),
+                }),
+                "Tighten the second paragraph."
+            ),
+        ],
+        "the spawn's Delegation falls back to the prompt its task's start carries, and the \
+         sibling's resume is attributed to the sibling that sent it"
+    );
 
     let mut tree = client.subscribe_subagent_tree(session_id);
     let Some(SubagentTreeEvent::Snapshot(tree)) = timeout(PROGRESS_DEADLINE, tree.next())
