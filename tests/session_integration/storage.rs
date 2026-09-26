@@ -1249,6 +1249,95 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .expect("stop replacement server");
 }
 
+/// Session metadata stores its Workspace whole, Repository capabilities
+/// included, so a capability added later must not strand every Session
+/// stored before it as unreadable.
+#[tokio::test]
+async fn a_session_stored_before_a_repository_capability_existed_stays_readable() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create Repository Workspace");
+    crate::repositories::git(workspace.path(), &["init", "-b", "main"]);
+    let config = ServerConfig::new(state_dir.path(), "capability-storage-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, _original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let created = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Persist inside a Repository".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+    original.shutdown().await.expect("stop original server");
+
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("fixture database path is valid UTF-8"),
+    )
+    .expect("open persisted Session fixture");
+    let capability = "$.workspace.repository.capabilities.rename_branch";
+    let aged = {
+        use diesel::RunQueryDsl;
+        diesel::sql_query(format!(
+            "UPDATE sessions SET workspace = json_remove(workspace, '{capability}') \
+             WHERE json_type(workspace, '{capability}') IS NOT NULL"
+        ))
+        .execute(&mut database)
+        .expect("age the stored Workspace back to before the capability existed")
+    };
+    assert_eq!(aged, 1, "the stored Workspace recorded the capability");
+    drop(database);
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let listing = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", replacement.descriptor().base_url))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions after restart")
+        .error_for_status()
+        .expect("restored listing succeeds")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode restored listing");
+    assert_eq!(
+        readable_session_summaries(listing)[0].session.id,
+        created.session.id
+    );
+    read_persisted_session(replacement.descriptor(), created.session.id).await;
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
 #[tokio::test]
 async fn turn_usage_survives_a_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

@@ -193,6 +193,24 @@ fn workspace_round_trips_its_icon_and_tolerates_its_absence() {
     );
 }
 
+/// Repository capabilities predating issue #376 carry no `rename_branch`.
+/// Session metadata persists the Workspace whole, so refusing them would turn
+/// every Session stored before then unreadable; they decode as unsupported.
+#[test]
+fn source_control_capabilities_predating_rename_branch_decode_as_unsupported() {
+    let capabilities = serde_json::from_value::<suru::protocol::SourceControlCapabilities>(json!({
+        "list_checkouts": { "status": "available" },
+        "create_checkout": { "status": "available" },
+        "recover_checkout": { "status": "available" },
+        "remove_checkout": { "status": "available" },
+    }))
+    .expect("decode capabilities with no rename_branch field at all");
+    assert!(matches!(
+        capabilities.rename_branch,
+        suru::protocol::SourceControlCapability::Unsupported { .. }
+    ));
+}
+
 #[test]
 fn skill_catalog_request_round_trips_provider_and_workspace_context() {
     let request = SkillCatalogRequest {

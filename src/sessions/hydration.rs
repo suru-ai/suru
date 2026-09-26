@@ -134,6 +134,11 @@ impl SessionStore {
                         .remove(&id);
                 }
                 Ok(None) | Err(StorageError::InvalidSession { .. }) => {
+                    let reason = loaded
+                        .as_ref()
+                        .err()
+                        .map_or_else(|| "missing from storage".to_owned(), ToString::to_string);
+                    tracing::warn!(session_id = %id, %reason, "invalidating unreadable persisted Session");
                     let mut unreadable = state
                         .deferred
                         .as_mut()

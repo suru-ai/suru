@@ -67,20 +67,26 @@ pub struct SourceControlCapabilities {
     pub remove_checkout: SourceControlCapability,
     /// Renaming the branch Suru created for a Managed Worktree to the one a
     /// Title derivation proposed. Only systems with branches offer it.
+    #[serde(default = "SourceControlCapability::unsupported")]
     pub rename_branch: SourceControlCapability,
+}
+
+impl SourceControlCapability {
+    fn unsupported() -> Self {
+        Self::Unsupported {
+            reason: "This source control operation is not implemented".to_owned(),
+        }
+    }
 }
 
 impl SourceControlCapabilities {
     pub fn discovery_only() -> Self {
-        let unsupported = || SourceControlCapability::Unsupported {
-            reason: "This source control operation is not implemented".to_owned(),
-        };
         Self {
             list_checkouts: SourceControlCapability::Available,
-            create_checkout: unsupported(),
-            recover_checkout: unsupported(),
-            remove_checkout: unsupported(),
-            rename_branch: unsupported(),
+            create_checkout: SourceControlCapability::unsupported(),
+            recover_checkout: SourceControlCapability::unsupported(),
+            remove_checkout: SourceControlCapability::unsupported(),
+            rename_branch: SourceControlCapability::unsupported(),
         }
     }
 }

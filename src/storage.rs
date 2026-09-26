@@ -612,7 +612,10 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                     .insert(unreadable.summary.id, unreadable.summary);
                 restored.readable.push(session);
             }
-            Err(StorageError::InvalidSession { .. }) => restored.unreadable.push(unreadable),
+            Err(error @ StorageError::InvalidSession { .. }) => {
+                tracing::warn!(%error, "listing persisted Session as unreadable");
+                restored.unreadable.push(unreadable);
+            }
             Err(error) => return Err(error),
         }
     }
