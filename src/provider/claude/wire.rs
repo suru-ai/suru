@@ -317,7 +317,8 @@ pub(super) struct SystemMessage {
     /// when a late SendMessage restarts a finished agent (verified against the live 2.1.280 CLI).
     #[serde(default)]
     pub(super) prompt: Option<String>,
-    /// How the task ended, on `task_notification` — `completed`, `failed`, or `stopped`.
+    /// How the task ended, on `task_notification` — `completed`, `failed`, `stopped`, or whatever
+    /// else failing or being stopped reads as (an agent task has been seen reporting `killed`).
     #[serde(default)]
     pub(super) status: Option<String>,
     /// How the task ended in the CLI's own words, on `task_notification` — the same account it

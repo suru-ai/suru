@@ -24,6 +24,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
     sync::{Mutex, Notify, mpsc, oneshot, watch},
+    task::AbortHandle,
     time::{Duration, timeout},
 };
 
@@ -189,6 +190,8 @@ pub(super) struct ClaudeConnection {
 pub(super) struct StreamJsonTransport {
     writer: Arc<Mutex<Option<ChildStdin>>>,
     state: Arc<TransportState>,
+    /// The task reading the process's output, which a drain that outlasts its budget cancels.
+    reader: AbortHandle,
     next_id: Arc<AtomicI64>,
     _process: Arc<ProcessGuard>,
 }
@@ -234,11 +237,12 @@ impl StreamJsonTransport {
             state: state.clone(),
         };
         let (process, _exit) = supervise_harness_process(process, processes, link).await?;
-        tokio::spawn(read_stdout(stdout, state.clone()));
+        let reader = tokio::spawn(read_stdout(stdout, state.clone())).abort_handle();
 
         let transport = Self {
             writer,
             state,
+            reader,
             next_id: Arc::new(AtomicI64::new(1)),
             _process: process.clone(),
         };
@@ -317,11 +321,13 @@ impl StreamJsonTransport {
     }
 
     /// Waits until everything the process wrote has been delivered to the conversation, its end
-    /// included. Only a process that has stopped is sure to get there: its output ends when the
-    /// last of its process tree lets go of the pipe.
-    pub(super) async fn drained(&self) {
-        let mut drained = self.state.drained.subscribe();
-        let _ = drained.wait_for(|drained| *drained).await;
+    /// included, for at most `budget`. A stopped process's output ends once the last of its
+    /// process tree lets go of the pipe; one that has not let go by then — a process that would
+    /// not stop, or a descendant that escaped its process group holding the pipe — is read no
+    /// further. Either way the end is delivered exactly once, behind everything read before it,
+    /// and has been by the time this returns, so nothing a later process writes can overtake it.
+    pub(super) async fn drain_within(&self, budget: Duration) {
+        drain_output(&self.state, &self.reader, budget).await;
     }
 }
 
@@ -376,13 +382,36 @@ async fn write_json_line<T: serde::Serialize + ?Sized>(
 }
 
 async fn read_stdout(stdout: ChildStdout, state: Arc<TransportState>) {
+    let _ended = OutputEnded(state.clone());
     read_lines(stdout, &state).await;
-    // However the output ended, nothing more of this process's reaches the conversation, so its
-    // end rides behind everything it wrote.
-    if let Some(conversation) = &state.conversation {
-        let _ = conversation.send(Ok(ConversationItem::ProcessEnded));
+}
+
+/// Waits up to `budget` for the reader to deliver the end of the process's output, then cancels
+/// it and waits for the end its cancellation delivers instead.
+async fn drain_output(state: &TransportState, reader: &AbortHandle, budget: Duration) {
+    let mut drained = state.drained.subscribe();
+    if timeout(budget, drained.wait_for(|drained| *drained))
+        .await
+        .is_err()
+    {
+        reader.abort();
+        let _ = drained.wait_for(|drained| *drained).await;
     }
-    state.drained.send_replace(true);
+}
+
+/// Delivers the end of a process's output when the task reading it finishes — however it
+/// finishes: at the end of the pipe, on a read that failed, or cancelled by a drain that ran out
+/// of budget. Nothing more of the process's reaches the conversation after it, so its end rides
+/// behind everything it wrote, and it is delivered once.
+struct OutputEnded(Arc<TransportState>);
+
+impl Drop for OutputEnded {
+    fn drop(&mut self) {
+        if let Some(conversation) = &self.0.conversation {
+            let _ = conversation.send(Ok(ConversationItem::ProcessEnded));
+        }
+        self.0.drained.send_replace(true);
+    }
 }
 
 async fn read_lines(stdout: ChildStdout, state: &Arc<TransportState>) {
@@ -520,5 +549,56 @@ fn finish_transport(state: &TransportState, error: ProviderError, conversation_l
     // is the conversation's failure, told exactly once.
     if conversation_lost && let Some(conversation) = &state.conversation {
         let _ = conversation.send(Err(error));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
+    };
+
+    use tokio::{
+        sync::{mpsc, watch},
+        time::Duration,
+    };
+
+    use super::{ConversationItem, OutputEnded, TransportState, drain_output};
+
+    #[tokio::test]
+    async fn a_reader_still_reading_when_the_drain_runs_out_delivers_the_end_of_output_once() {
+        let (sink, mut conversation) = mpsc::unbounded_channel();
+        let state = Arc::new(TransportState {
+            pending: StdMutex::new(HashMap::new()),
+            drained: watch::Sender::new(false),
+            terminated: AtomicBool::new(true),
+            conversation: Some(sink),
+            decision_settlements: Default::default(),
+        });
+        // A reader whose pipe never ends — the output of a process tree that would not let go.
+        let reader = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let _ended = OutputEnded(state);
+                std::future::pending::<()>().await;
+            }
+        })
+        .abort_handle();
+
+        drain_output(&state, &reader, Duration::from_millis(10)).await;
+
+        assert!(
+            *state.drained.borrow(),
+            "the drain returns only once the end is delivered"
+        );
+        assert!(matches!(
+            conversation.try_recv(),
+            Ok(Ok(ConversationItem::ProcessEnded))
+        ));
+        assert!(
+            conversation.try_recv().is_err(),
+            "the end is delivered once, so nothing after it can be mistaken for this process's"
+        );
     }
 }

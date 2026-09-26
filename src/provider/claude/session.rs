@@ -304,12 +304,16 @@ impl ClaudeChild {
     /// A stopped process's output is waited out to its end, which the transport delivers behind
     /// everything the process wrote: the end is where the projection settles the process's Watches
     /// as lost, so no child spawned afterwards can have its own work mistaken for the old one's.
+    /// The wait is bounded by the process's own stop budget, and is made whether or not the stop
+    /// succeeded, because a child the Session gives up on is never stopped again.
     async fn stop(&self) -> Result<(), ProviderError> {
         self.process.begin_shutdown();
         self.transport.close().await;
-        self.process.wait_until_stopped().await?;
-        self.transport.drained().await;
-        Ok(())
+        let stopped = self.process.wait_until_stopped().await;
+        self.transport
+            .drain_within(self.process.wait_budget())
+            .await;
+        stopped
     }
 }
 
@@ -317,6 +321,10 @@ impl ClaudeSession {
     /// Stops `child`, and with it every background task it was running: they share its process
     /// group, and none of them will ever report settling. The roster forgets them however the stop
     /// went, because the child is no longer the one this Session's interrupts reach.
+    ///
+    /// The projection empties the roster again when it reaches the child's end of output (see
+    /// `ClaudeProjection::project_process_ended`); clearing it here as well means an interrupt
+    /// arriving before the projection gets there already asks the old child for nothing.
     async fn stop_child(&self, child: &ClaudeChild) -> Result<(), ProviderError> {
         let stopped = child.stop().await;
         self.turn.tasks_died_with_process();

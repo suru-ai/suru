@@ -986,7 +986,8 @@ impl SessionRecord {
     }
 
     /// Commits changes the server derived rather than a Provider or a reader
-    /// drove — the Subagent roll-up and Title derivation. It moves the revision
+    /// drove — the Subagent roll-up, the Working and Monitoring roll-up, and
+    /// Title derivation. It moves the revision
     /// and persists like any commit, but leaves `updated_at` alone: a Session's
     /// own moment of last movement is about its own work. A client holding the
     /// change holds the whole of it.

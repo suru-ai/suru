@@ -218,6 +218,13 @@ impl ProcessGuard {
     pub(crate) async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
         self.control.wait_until_stopped().await
     }
+
+    /// The longest a stop of this process may take — its exit grace, the forced kill after it,
+    /// and a margin — which is what [`Self::wait_until_stopped`] waits at most. A caller waiting
+    /// on something the process's end should bring about bounds that wait by the same budget.
+    pub(crate) fn wait_budget(&self) -> Duration {
+        self.control.wait_budget
+    }
 }
 
 impl Drop for ProcessGuard {

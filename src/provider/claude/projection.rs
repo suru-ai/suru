@@ -715,7 +715,10 @@ impl ClaudeProjection {
     }
 
     /// A Watch's own notification that it settled, which the CLI delivers to the agent whose
-    /// loop it wakes; the notification's summary is how the Watch settled in the CLI's words.
+    /// loop it wakes; the notification's summary is how the Watch settled in the CLI's words. A
+    /// stopped Watch wakes nothing: the agent stopped it itself mid-Turn, or Suru stopped it on
+    /// the way to interrupting the loop, and neither begins a Continuation. Any status this build
+    /// does not know reads as failed, as it does for a Subagent.
     fn project_watch_settled(
         &mut self,
         task_id: &str,
@@ -734,7 +737,7 @@ impl ClaudeProjection {
                 .summary
                 .clone()
                 .filter(|summary| !summary.trim().is_empty()),
-            woke_agent: true,
+            woke_agent: outcome != ProviderWatchOutcome::Stopped,
         };
         Some(self.attributed(&owner, event))
     }
@@ -1692,10 +1695,11 @@ mod tests {
 
     #[test]
     fn a_watchs_notification_settles_it_with_the_outcome_and_summary_the_cli_gives() {
-        for (status, outcome) in [
-            ("completed", ProviderWatchOutcome::Completed),
-            ("failed", ProviderWatchOutcome::Failed),
-            ("stopped", ProviderWatchOutcome::Stopped),
+        for (status, outcome, woke_agent) in [
+            ("completed", ProviderWatchOutcome::Completed, true),
+            ("failed", ProviderWatchOutcome::Failed, true),
+            ("stopped", ProviderWatchOutcome::Stopped, false),
+            ("killed", ProviderWatchOutcome::Failed, true),
         ] {
             let mut projection = fresh_projection();
             let events = project(
@@ -1712,9 +1716,9 @@ mod tests {
                     watch_id: ProviderWatchId::new("task-1"),
                     outcome,
                     summary: Some("cargo test finished".to_owned()),
-                    woke_agent: true,
+                    woke_agent,
                 })],
-                "a `{status}` notification settles the Watch once, waking the loop it belongs to"
+                "a `{status}` notification settles the Watch once, and only a stop wakes nothing"
             );
             assert!(projection.turn.live_tasks().is_empty());
         }
