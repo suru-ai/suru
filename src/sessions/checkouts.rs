@@ -10,11 +10,23 @@ use std::{collections::HashMap, time::Duration};
 pub(crate) struct CheckoutActivity {
     pub(crate) affected: usize,
     pub(crate) working: usize,
+    /// Sessions not Working but waiting on a live Watch. Explicit removal
+    /// asks only after Working, but Reclaim counts these too: a Watch may be
+    /// a process still running in the Worktree, and its Session is not done.
+    pub(crate) monitoring: usize,
     pub(crate) latest_updated_at: Option<SessionTimestamp>,
     /// A Session whose history cannot be read still owns its possible
     /// checkout. Automatic removal cannot safely rewrite its recovery facts,
     /// so it protects that checkout until explicitly deleted.
     pub(crate) unreadable: usize,
+}
+
+impl CheckoutActivity {
+    /// Whether any Session referencing the checkout is still at work, Working
+    /// or Monitoring, which is what keeps housekeeping away from it.
+    pub(crate) const fn unfinished(&self) -> bool {
+        self.working != 0 || self.monitoring != 0
+    }
 }
 
 impl SessionStore {
@@ -27,6 +39,7 @@ impl SessionStore {
         let state = self.state.lock().unwrap();
         let mut affected = 0;
         let mut working = 0;
+        let mut monitoring = 0;
         let mut latest_updated_at = None;
         for record in state.sessions.values() {
             let session = &record.summary.session;
@@ -37,6 +50,7 @@ impl SessionStore {
             {
                 affected += 1;
                 working += usize::from(session.working_since.is_some());
+                monitoring += usize::from(session.monitoring_since.is_some());
                 latest_updated_at = Some(
                     latest_updated_at
                         .map_or(record.summary.updated_at, |latest: SessionTimestamp| {
@@ -72,6 +86,7 @@ impl SessionStore {
         CheckoutActivity {
             affected,
             working,
+            monitoring,
             latest_updated_at,
             unreadable,
         }

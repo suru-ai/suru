@@ -2908,13 +2908,20 @@ impl Settlement {
     /// after work there was: a Session nothing has moved since it was made has
     /// set nothing aside — the reader made it and it is theirs to prompt — and
     /// a Session Suru could not read has no activity it can see, which is the
-    /// same reason it is never settled by the marker either.
+    /// same reason it is never settled by the marker either. A Session Working
+    /// or Monitoring is not done however long ago it last moved — a long Turn
+    /// or a Watch can outlast the threshold without any output — so it is
+    /// never left alone.
     fn left_alone(&self, session: &SessionListItem) -> bool {
         let Some(idle) = self.auto.idle_millis() else {
             return false;
         };
         let last_activity = session.updated_at();
-        if session.readable().is_none() || last_activity == session.created_at() {
+        if session.readable().is_none()
+            || last_activity == session.created_at()
+            || session.working_since().is_some()
+            || session.monitoring_since().is_some()
+        {
             return false;
         }
         self.now.0.saturating_sub(last_activity.0) >= idle

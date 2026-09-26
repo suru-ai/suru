@@ -4300,6 +4300,79 @@ fn a_session_suru_cannot_read_never_settles_however_long_it_has_sat() {
     );
 }
 
+/// A Session waiting on a Watch is not done, however long ago it last moved:
+/// a Watch starting or settling moves no Turn, so a Session can sit Monitoring
+/// well past the threshold. Once the Watch settles without waking the Agent,
+/// nothing is left to keep it active and the same idle settles it.
+#[test]
+fn a_monitoring_session_left_alone_past_the_threshold_stays_active_until_its_watch_settles() {
+    let workspace = workspace_dir();
+    let watching = SessionId::new();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            monitoring(
+                listed_at(
+                    watching,
+                    "Waiting on a Watch",
+                    workspace.path(),
+                    days_ago(5),
+                ),
+                days_ago(5),
+            ),
+            listed("Left alone", workspace.path(), 1, days_ago(5)),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        rendered_row(&rows, "Waiting on a Watch") < divider,
+        "a Session Monitoring past the three-day default stays with the active Sessions: {rows:?}"
+    );
+    assert!(
+        divider < rendered_row(&rows, "Left alone"),
+        "while one idle just as long settles on its own: {rows:?}"
+    );
+
+    monitor_elsewhere(&mut application, watching, None);
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        sidebar_divider(&rows) < rendered_row(&rows, "Waiting on a Watch"),
+        "the Watch settling leaves the idle to settle it as usual: {rows:?}"
+    );
+}
+
+/// A Turn can run silent past the threshold — one long tool call is enough —
+/// and a Session still Working is not done, so the idle its last activity
+/// reads settles nothing.
+#[test]
+fn a_working_session_whose_last_activity_is_past_the_threshold_stays_active() {
+    let workspace = workspace_dir();
+    let application = sidebar_showing(
+        workspace.path(),
+        vec![
+            working(
+                listed("Long silent Turn", workspace.path(), 1, days_ago(5)),
+                days_ago(5),
+            ),
+            listed("Left alone", workspace.path(), 2, days_ago(5)),
+        ],
+    );
+
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let divider = sidebar_divider(&rows);
+    assert!(
+        rendered_row(&rows, "Long silent Turn") < divider,
+        "a Session still Working stays with the active Sessions: {rows:?}"
+    );
+    assert!(
+        divider < rendered_row(&rows, "Left alone"),
+        "while one idle just as long settles on its own: {rows:?}"
+    );
+}
+
 #[test]
 fn the_arrows_walk_across_the_divider_onto_the_settled_shelf() {
     let workspace = workspace_dir();

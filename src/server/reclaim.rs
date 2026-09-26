@@ -49,6 +49,7 @@ pub(super) fn spawn(
             source_control,
             preparations,
             settings,
+            day: timings.worktree_reclaim_day,
         };
         if run_pass_or_shutdown(&reclaimer, &mut shutdown).await {
             return;
@@ -78,6 +79,7 @@ pub(super) fn spawn_orphans(
     preparations: PreparationStore,
     settings: watch::Receiver<crate::protocol::SettingsSnapshot>,
     mut shutdown: watch::Receiver<bool>,
+    day: Duration,
 ) {
     tokio::spawn(async move {
         if *shutdown.borrow() {
@@ -88,6 +90,7 @@ pub(super) fn spawn_orphans(
             source_control,
             preparations,
             settings,
+            day,
         };
         tokio::select! {
             biased;
@@ -124,9 +127,18 @@ struct Reclaimer {
     source_control: SourceControlService,
     preparations: PreparationStore,
     settings: watch::Receiver<crate::protocol::SettingsSnapshot>,
+    /// How long one day of the Reclaim threshold lasts. See
+    /// [`ServerTimings::worktree_reclaim_day`].
+    day: Duration,
 }
 
 impl Reclaimer {
+    /// The Reclaim threshold of `days`, in milliseconds.
+    fn threshold(&self, days: u64) -> u64 {
+        let day = u64::try_from(self.day.as_millis()).unwrap_or(u64::MAX);
+        days.saturating_mul(day)
+    }
+
     async fn pass(&self) {
         let AutoReclaim::AfterDays(days) = self.settings.borrow().settings.worktree.auto_reclaim
         else {
@@ -229,7 +241,9 @@ impl Reclaimer {
             let activity = self.sessions.checkout_activity(&checkout);
             let rule = if !unfinished.is_empty() {
                 if population == ReclaimPopulation::All
-                    && unfinished.iter().all(|plan| old(plan, days))
+                    && unfinished
+                        .iter()
+                        .all(|plan| old(plan, self.threshold(days)))
                 {
                     ReclaimRule::FailedPreparation { days }
                 } else {
@@ -237,7 +251,7 @@ impl Reclaimer {
                 }
             } else if activity.affected == 0 {
                 ReclaimRule::Orphaned
-            } else if population == ReclaimPopulation::All && idle(activity, days) {
+            } else if population == ReclaimPopulation::All && idle(activity, self.threshold(days)) {
                 ReclaimRule::Idle { days }
             } else {
                 continue;
@@ -249,7 +263,7 @@ impl Reclaimer {
         }
         for preparation in preparations.iter().filter(|plan| {
             plan.admitted_session.is_none()
-                && old(plan, days)
+                && old(plan, self.threshold(days))
                 && !listed.contains(&plan.destination.path)
                 && !plan.destination.path.exists()
         }) {
@@ -280,7 +294,10 @@ impl Reclaimer {
         let Some(_guard) = self.source_control.try_mutation_guard(&repository.id) else {
             return;
         };
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
+        if !rule.qualifies(
+            self.sessions.checkout_activity(&checkout),
+            self.threshold(rule.days()),
+        ) {
             return;
         }
         let mut preparations = match self.preparations.for_destination(&checkout.root) {
@@ -292,9 +309,9 @@ impl Reclaimer {
         };
         if rule.is_failed_preparation() {
             if preparations.is_empty()
-                || preparations
-                    .iter()
-                    .any(|plan| plan.admitted_session.is_some() || !old(plan, rule.days()))
+                || preparations.iter().any(|plan| {
+                    plan.admitted_session.is_some() || !old(plan, self.threshold(rule.days()))
+                })
             {
                 return;
             }
@@ -367,7 +384,10 @@ impl Reclaimer {
         };
         // Last possible catalog check: inspection and branch analysis may have
         // taken time, and even an idle newly admitted Session blocks orphaning.
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
+        if !rule.qualifies(
+            self.sessions.checkout_activity(&checkout),
+            self.threshold(rule.days()),
+        ) {
             return;
         }
         let recovery = match recovery_for_branch_outcome(&inspection.checkout, intended_outcome) {
@@ -385,7 +405,10 @@ impl Reclaimer {
             );
             return;
         }
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
+        if !rule.qualifies(
+            self.sessions.checkout_activity(&checkout),
+            self.threshold(rule.days()),
+        ) {
             return;
         }
         let removing = CheckoutReclaim {
@@ -404,7 +427,10 @@ impl Reclaimer {
             );
             return;
         }
-        if !rule.qualifies(self.sessions.checkout_activity(&checkout)) {
+        if !rule.qualifies(
+            self.sessions.checkout_activity(&checkout),
+            self.threshold(rule.days()),
+        ) {
             let _ = self
                 .sessions
                 .record_execution_checkout(inspection.checkout.clone());
@@ -528,7 +554,7 @@ impl Reclaimer {
             }
         };
         if current.admitted_session.is_some()
-            || !old(&current, days)
+            || !old(&current, self.threshold(days))
             || current.destination.path.exists()
             || current.repository.id != repository.id
         {
@@ -562,7 +588,7 @@ impl Reclaimer {
             reclaim: None,
         };
         let activity = self.sessions.checkout_activity(&checkout);
-        if activity.working != 0 || activity.unreadable != 0 {
+        if activity.unfinished() || activity.unreadable != 0 {
             return;
         }
         let rule = ReclaimRule::FailedPreparation { days };
@@ -605,14 +631,16 @@ enum ReclaimRule {
 }
 
 impl ReclaimRule {
-    fn qualifies(self, activity: crate::sessions::CheckoutActivity) -> bool {
+    /// Whether the checkout still qualifies under this rule, where
+    /// `threshold` is the rule's age in milliseconds.
+    fn qualifies(self, activity: crate::sessions::CheckoutActivity, threshold: u64) -> bool {
         if activity.unreadable != 0 {
             return false;
         }
         match self {
             Self::Orphaned => activity.affected == 0,
-            Self::Idle { days } => idle(activity, days),
-            Self::FailedPreparation { .. } => activity.working == 0,
+            Self::Idle { .. } => idle(activity, threshold),
+            Self::FailedPreparation { .. } => !activity.unfinished(),
         }
     }
 
@@ -646,19 +674,24 @@ impl ReclaimRule {
     }
 }
 
-fn old(preparation: &crate::protocol::PreparedCheckout, days: u64) -> bool {
+/// Whether the preparation was persisted more than `threshold` milliseconds
+/// ago.
+fn old(preparation: &crate::protocol::PreparedCheckout, threshold: u64) -> bool {
     let Some(persisted_at) = preparation.persisted_at else {
         return true;
     };
-    let threshold = days.saturating_mul(24 * 60 * 60 * 1_000);
     persisted_at.0
         < crate::protocol::SessionTimestamp::now()
             .0
             .saturating_sub(threshold)
 }
 
-fn idle(activity: crate::sessions::CheckoutActivity, days: u64) -> bool {
-    if activity.affected == 0 || activity.working != 0 {
+/// Whether every Session referencing the checkout has been left alone for
+/// more than `threshold` milliseconds. A Session waiting on a Watch is not
+/// left alone however long ago it last moved: the Watch may be a process still
+/// running in the Worktree, and settling it may wake the Agent there.
+fn idle(activity: crate::sessions::CheckoutActivity, threshold: u64) -> bool {
+    if activity.affected == 0 || activity.unfinished() {
         return false;
     }
     let now = SystemTime::now()
@@ -666,7 +699,6 @@ fn idle(activity: crate::sessions::CheckoutActivity, days: u64) -> bool {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    let threshold = days.saturating_mul(24 * 60 * 60 * 1_000);
     activity
         .latest_updated_at
         .is_some_and(|updated| updated.0 < now.saturating_sub(threshold))

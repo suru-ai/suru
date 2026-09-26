@@ -1096,6 +1096,83 @@ async fn candidate_admission_leaving_a_surviving_subagent_is_rechecked_before_re
     running.shutdown().await.unwrap();
 }
 
+/// A Session waiting on a Watch is not done: the Watch may be a process still
+/// running in its Worktree. A Watch starting or settling outside a Turn moves
+/// nothing about the Session's last activity, so the Session goes on ageing
+/// past the threshold while it waits, and only the Watch keeps its Worktree.
+/// No Watch outlives a restart, so the threshold's day is shortened rather
+/// than the Session backdated.
+#[tokio::test]
+async fn a_monitoring_session_idle_past_the_threshold_keeps_its_worktree_until_the_watch_settles() {
+    const DAY: Duration = Duration::from_millis(100);
+    let layout = ReclaimLayout::new("monitoring");
+    layout.pin(r#""off""#);
+    let config = layout.server_config("reclaim-monitoring");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(
+        config,
+        runtime,
+        timings().with_worktree_reclaim_day(DAY),
+    )
+    .await
+    .unwrap();
+    let (session, connection) = open(&server, &mut provider, &layout.managed).await;
+    let watch_id = suru::provider::ProviderWatchId::new("reclaim-monitoring-watch");
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::WatchStarted {
+            watch_id: watch_id.clone(),
+            description: "cargo test".into(),
+        })
+        .await;
+    support::read_session_until(
+        &reqwest::Client::new(),
+        server.descriptor(),
+        session.session.id,
+        "the Watch left running keeps the Session Monitoring",
+        |snapshot| snapshot.session.monitoring_since.is_some(),
+    )
+    .await;
+    let waiting = listed_session(server.descriptor(), session.session.id).await;
+    assert!(waiting.monitoring_since().is_some());
+    // Past the threshold before Reclaim is turned on, so the first pass
+    // already finds the Session left alone as long as the rule asks.
+    tokio::time::sleep(DAY * 2).await;
+    reqwest::Client::new()
+        .post(format!("{}/v1/settings", server.descriptor().base_url))
+        .bearer_auth(&server.descriptor().token)
+        .json(&SettingMutation::WorktreeAutoReclaim {
+            value: Some(AutoReclaim::AfterDays(1)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    tokio::time::sleep(RECLAIM_INTERVAL * 4).await;
+    assert!(
+        layout.managed.is_dir(),
+        "a Managed Worktree whose Session is Monitoring is never Reclaimable"
+    );
+    assert_eq!(
+        listed_session(server.descriptor(), session.session.id)
+            .await
+            .updated_at(),
+        waiting.updated_at(),
+        "waiting on the Watch moved nothing about the Session's last activity"
+    );
+
+    connection
+        .emit_and_wait_until_observed(ProviderEvent::WatchSettled {
+            watch_id,
+            outcome: suru::provider::ProviderWatchOutcome::Completed,
+            summary: None,
+            woke_agent: false,
+        })
+        .await;
+    wait_for_path(&layout.managed, false).await;
+    server.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn deleting_the_last_session_starts_reclaim_without_delaying_the_response() {
     let layout = ReclaimLayout::new("eager-last-session");
