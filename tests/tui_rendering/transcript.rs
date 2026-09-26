@@ -3324,6 +3324,83 @@ fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     );
 }
 
+/// A resumed Subagent has a row for each stretch of its work, all leading into
+/// its one Session: each row reads and settles as its own stretch did.
+#[test]
+fn each_row_of_a_resumed_subagent_reads_and_settles_as_its_own_stretch() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) = subagent_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        "Say hello",
+        Some(8_000),
+    );
+    let Activity::Subagent {
+        turn_id,
+        session_id: child,
+        ..
+    } = snapshot.activities[0].clone()
+    else {
+        unreachable!()
+    };
+    let resume_id = ActivityId::new();
+    snapshot.activities.push(Activity::Subagent {
+        id: resume_id,
+        turn_id,
+        status: ActivityStatus::Active,
+        name: "Explore".to_owned(),
+        description: "Say goodbye".to_owned(),
+        model: None,
+        session_id: child,
+        duration_ms: None,
+    });
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: resume_id,
+    });
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a resumed Subagent");
+
+    let rows = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        rows[rendered_row(&rows, "Explore: Say hello")].trim_end(),
+        "    ✓ Subagent: Explore: Say hello · 8s"
+    );
+    assert_eq!(
+        rows[rendered_row(&rows, "Explore: Say goodbye")].trim_end(),
+        "    ⠋ Subagent: Explore: Say goodbye"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::SubagentStatusChanged {
+                    activity_id: resume_id,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(3_000),
+                }],
+            },
+        )))
+        .expect("settle the resumed stretch");
+
+    let rows = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        rows[rendered_row(&rows, "Explore: Say hello")].trim_end(),
+        "    ✓ Subagent: Explore: Say hello · 8s",
+        "the spawn's row stays as it settled"
+    );
+    assert_eq!(
+        rows[rendered_row(&rows, "Explore: Say goodbye")].trim_end(),
+        "    ✓ Subagent: Explore: Say goodbye · 3s",
+        "the resume's row states its own stretch's duration"
+    );
+}
+
 #[test]
 fn a_subagent_asked_without_a_description_heads_with_its_prefixed_name() {
     let workspace = workspace_dir();

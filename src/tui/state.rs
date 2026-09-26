@@ -2678,7 +2678,7 @@ impl TuiState {
             }
             // The whole row is the way into the child Session it names, so any
             // press on it resolves to the open command rather than to a Fold.
-            UnitKey::Subagent(session_id) => {
+            UnitKey::Subagent { session_id, .. } => {
                 return self
                     .reference_in_current_origin(session_id)
                     .map(|session| SemanticCommandId::SubagentOpen.on_session(session));

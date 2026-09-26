@@ -1,5 +1,6 @@
-//! Opening a Subagent's child Session: the one Session creation a Prompt does
-//! not drive.
+//! Opening a Subagent's child Session — the one Session creation a Prompt does
+//! not drive — and beginning each later Turn a resume of the Subagent begins
+//! in it.
 
 use std::collections::HashMap;
 
@@ -7,11 +8,15 @@ use anyhow::anyhow;
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    PromptOrder, Session, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
-    SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
+    PromptOrder, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStandingInputs, SessionStatus, SessionSummary, Turn, TurnId, TurnStatus,
 };
 
-use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore};
+use super::{
+    SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore,
+    projection::active_turn_id,
+    settlement::{OpenInterventions, TrailingCommandOutput, settle_in_flight_changes},
+};
 
 /// The child Session a spawn opened, named by what orchestration needs to
 /// route the Subagent's stream: the Session itself, and the prompt-less Turn
@@ -137,5 +142,67 @@ impl SessionStore {
             session_id,
             turn_id,
         })
+    }
+
+    /// Begins the next Turn in a Subagent's existing Session, for a resume:
+    /// the counterpart of [`Self::create_subagent`], which opened its first.
+    /// The Session holds the agent's whole conversation, so the resumed work
+    /// is a Turn of its own there rather than a Subagent of its own, and the
+    /// Session keeps the Title its spawn gave it. Like the spawn's, the Turn
+    /// begins without a Prompt, and without an Agent until the Provider
+    /// reports the Model running this stretch.
+    ///
+    /// A Turn still open in the Session — a Continuation the Subagent's own
+    /// work began — Settles first, as worked: a Delegation delivered to begin
+    /// a Turn settles such a Continuation rather than steering it, as a
+    /// Prompt does (CONTEXT.md: Continuation). Both land in one commit, so no
+    /// reader sees the Session between them.
+    pub(crate) fn begin_subagent_turn(&self, session_id: SessionId) -> anyhow::Result<TurnId> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        if !record.snapshot.session.is_subagent() {
+            return Err(anyhow!(
+                "Only a Subagent's Session begins a Turn on a resume"
+            ));
+        }
+        let mut changes = Vec::new();
+        if let Some(open) = active_turn_id(&record.snapshot)? {
+            changes.extend(settle_in_flight_changes(
+                &record.snapshot,
+                open,
+                TrailingCommandOutput::new(),
+                OpenInterventions::TurnEnded,
+            ));
+            changes.push(SessionChange::TurnStatusChanged {
+                turn_id: open,
+                status: TurnStatus::Completed,
+                settled_at: None,
+            });
+        }
+        let turn_id = TurnId::new();
+        changes.push(SessionChange::TurnAdded {
+            turn: Turn {
+                id: turn_id,
+                prompt_id: None,
+                agent: None,
+                status: TurnStatus::Active,
+                // The commit that lands this Turn stamps when it began.
+                started_at: None,
+                settled_at: None,
+                last_output_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
+                cost_details: None,
+            },
+        });
+        state.commit(&self.storage, session_id, changes)?;
+        Ok(turn_id)
     }
 }

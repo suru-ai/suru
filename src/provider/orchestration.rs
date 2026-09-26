@@ -330,25 +330,28 @@ impl ActiveProviderTurn {
 
 /// Where the connection's Subagent-attributed events land: for each Subagent
 /// the Provider has named, the Session that is that Subagent's own and the
-/// Turn state its stream projects into. A spawn establishes a route along
-/// with the child Session it opens, and the Subagent's settle drops it.
-/// Routes live and die with the Provider connection, because the identities
-/// are the connection's to mint. An event attributed to a Subagent with no
-/// route lands nowhere.
+/// Turn state its stream projects into. Each stretch of a Subagent's work —
+/// its spawn, and each resume after it settled — establishes a route into the
+/// Turn that stretch works in, and the stretch's settle drops it. Routes live
+/// and die with the Provider connection, because the identities are the
+/// connection's to mint. An event attributed to a Subagent with no route
+/// lands nowhere.
 ///
 /// The rows live beside the routes rather than inside any Turn's state,
-/// because a Subagent may outlive the Turn that spawned it (ADR 0015): its
-/// row must still be reachable when the Provider settles it after that Turn
-/// has.
+/// because a Subagent may outlive the Turn that delegated to it (ADR 0015):
+/// its row must still be reachable when the Provider settles it after that
+/// Turn has.
 #[derive(Default)]
 struct SubagentRoutes {
     routes: HashMap<ProviderSubagentId, SubagentRoute>,
     /// Context measurements can arrive after the child's output route settles.
     context_routes: HashMap<ProviderSubagentId, (SessionId, TurnId)>,
+    /// The row each working Subagent's current stretch stands as.
     rows: HashMap<ProviderSubagentId, SubagentRow>,
-    /// Durable routing facts retained for the connection lifetime so delayed
+    /// Every Subagent the connection has named, retained for its lifetime:
+    /// a resume finds the Session it continues here, and delayed
     /// attach/metadata replies can still identify a child after it settles.
-    identities: HashMap<ProviderSubagentId, SubagentIdentityRoute>,
+    identities: HashMap<ProviderSubagentId, SubagentIdentity>,
     /// The Subagents Suru itself settled by stopping them. Their rows and
     /// routes are gone, but the Provider was not the one to close them, so
     /// its own account of their end — the settle it still owes, the progress
@@ -369,21 +372,38 @@ struct SubagentRoute {
     turn: ActiveProviderTurn,
 }
 
-/// One Subagent's row in its spawner's Transcript. Suru times the delegation
-/// itself, the way it times a Reasoning block: `started` is the moment the
-/// spawn was admitted, and the elapsed time it yields is the duration the
-/// settled row reports.
+/// One stretch of a Subagent's work as its row in the delegating Transcript.
+/// Suru times the stretch itself, the way it times a Reasoning block:
+/// `started` is the moment the spawn or resume was admitted, and the elapsed
+/// time it yields is the duration the settled row reports — this stretch's
+/// alone, however long the Subagent worked before it.
 struct SubagentRow {
-    /// The Session whose Transcript holds the row — the Subagent's spawner,
-    /// which for a nested Subagent is itself a child Session.
+    /// The Session whose Transcript holds the row — the one whose Turn
+    /// delegated the stretch: the Subagent's spawner, or for a resume
+    /// whichever Agent sent it, a sibling Subagent's included.
     owner_session_id: SessionId,
     activity_id: ActivityId,
     started: Instant,
 }
 
-#[derive(Clone, Copy)]
-struct SubagentIdentityRoute {
+/// What the connection knows of one Subagent, working or not: the Session
+/// that is its own, the Session that spawned it — its place in the tree,
+/// whoever resumes it later — the name every row of it carries, and where
+/// its latest stretch of work stands.
+#[derive(Clone)]
+struct SubagentIdentity {
     session_id: SessionId,
+    spawner: SessionId,
+    name: String,
+    stretch: SubagentStretch,
+}
+
+/// Where one stretch of a Subagent's work stands: the Turn it works in within
+/// the Subagent's own Session, and its row in the delegating Session. A
+/// resume moves a Subagent onto a new stretch, and its Model evidence follows
+/// — the spawn's Turn and row keep what they settled with.
+#[derive(Clone, Copy)]
+struct SubagentStretch {
     turn_id: TurnId,
     owner_session_id: SessionId,
     activity_id: ActivityId,
@@ -507,9 +527,10 @@ impl SubagentRoutes {
 
     /// Settles one stopped Subagent — and every Subagent below it, since
     /// stopping a delegation stops whatever it delegated in turn — as
-    /// Interrupted: the child's Turn closes with the stop, the row records
-    /// the duration Suru timed, and the identities join the stopped set so
-    /// the Provider's trailing account of them is discarded.
+    /// Interrupted: the Turn its current stretch works in closes with the
+    /// stop, that stretch's row records the duration Suru timed, and the
+    /// identities join the stopped set so the Provider's trailing account of
+    /// them is discarded.
     fn settle_stopped(
         &mut self,
         sessions: &SessionStore,
@@ -524,11 +545,18 @@ impl SubagentRoutes {
             let route = self.routes.remove(&subagent);
             self.stopped.insert(subagent);
             if let Some(mut route) = route {
+                // Below it are the Subagents it spawned. A Subagent it only
+                // resumed stands elsewhere in the tree, so its row here does
+                // not make it one of them.
                 targets.extend(
                     self.rows
-                        .iter()
-                        .filter(|(_, held)| held.owner_session_id == route.session_id)
-                        .map(|(descendant, _)| descendant.clone()),
+                        .keys()
+                        .filter(|working| {
+                            self.identities
+                                .get(*working)
+                                .is_some_and(|identity| identity.spawner == route.session_id)
+                        })
+                        .cloned(),
                 );
                 let trailing_output = route.turn.take_trailing_output();
                 let _ = updates.apply(|| {
@@ -589,8 +617,9 @@ impl SubagentRoutes {
     }
 
     /// Applies Provider-confirmed identity to both places a reader needs it:
-    /// the child's own Turn and the parent's Subagent row. Requested parent
-    /// options are deliberately dropped because they are not child evidence.
+    /// the Turn the Subagent's current stretch works in and the row that
+    /// stretch stands as. Requested parent options are deliberately dropped
+    /// because they are not child evidence.
     fn update_model(
         &self,
         sessions: &SessionStore,
@@ -598,22 +627,23 @@ impl SubagentRoutes {
         next_agent: &AgentIdentity,
         model: crate::protocol::ModelId,
     ) -> Option<anyhow::Result<()>> {
-        let route = self.identities.get(subagent)?;
+        let identity = self.identities.get(subagent)?;
+        let stretch = identity.stretch;
         let mut agent = next_agent.clone();
         agent.selection.model = model.clone();
         agent.selection.options.clear();
         Some((|| {
             sessions.publish(
-                route.session_id,
+                identity.session_id,
                 vec![SessionChange::SubagentAgentChanged {
-                    turn_id: route.turn_id,
+                    turn_id: stretch.turn_id,
                     agent,
                 }],
             )?;
             sessions.publish(
-                route.owner_session_id,
+                stretch.owner_session_id,
                 vec![SessionChange::SubagentModelChanged {
-                    activity_id: route.activity_id,
+                    activity_id: stretch.activity_id,
                     model,
                 }],
             )?;
@@ -621,11 +651,141 @@ impl SubagentRoutes {
         })())
     }
 
-    /// Settles one Subagent on the Provider's own settle signal: the child's
-    /// Turn closes along with the row, because the Provider's boundary for
-    /// the Subagent is one signal and no further event of the child's is owed
-    /// once it has passed. Returns `None` when no open row carries the
-    /// identity, on the same terms as [`Self::update_row`].
+    /// Opens a Subagent the Provider spawned: its own Session, titled from
+    /// the spawn, and the row that stands for its first stretch of work in
+    /// the delegating Turn.
+    fn spawn(
+        &mut self,
+        sessions: &SessionStore,
+        delegating: (SessionId, TurnId),
+        subagent: ProviderSubagentId,
+        name: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        if self.rows.contains_key(&subagent) || self.routes.contains_key(&subagent) {
+            return Err(anyhow::anyhow!(
+                "Provider reused an active Subagent identity"
+            ));
+        }
+        let name = normalize_provider_text(name);
+        let description = normalize_provider_text(description);
+        let spawned = sessions.create_subagent(delegating.0, &name, &description)?;
+        let activity_id =
+            add_subagent_row(sessions, delegating, &name, description, spawned.session_id)?;
+        self.open_stretch(
+            subagent,
+            (spawned.session_id, delegating.0),
+            name,
+            SubagentStretch {
+                turn_id: spawned.turn_id,
+                owner_session_id: delegating.0,
+                activity_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Resumes a settled Subagent the Provider names again: the next Turn in
+    /// the Subagent's own Session, and a new row in the delegating Turn
+    /// leading into that same Session (ADR 0031). The rows before it stay as
+    /// they settled, and the Session keeps its Title. A Continuation still
+    /// open in the Subagent's Session settles first, with the output this
+    /// actor still held for it, because the resume begins a Turn of its own.
+    fn resume(
+        &mut self,
+        sessions: &SessionStore,
+        delegating: (SessionId, TurnId),
+        subagent: ProviderSubagentId,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        if self.rows.contains_key(&subagent) {
+            return Err(anyhow::anyhow!(
+                "Provider resumed a Subagent that is still working"
+            ));
+        }
+        let Some(identity) = self.identities.get(&subagent) else {
+            return Err(anyhow::anyhow!(
+                "Provider resumed a Subagent before spawning it"
+            ));
+        };
+        let (session_id, spawner, name) =
+            (identity.session_id, identity.spawner, identity.name.clone());
+        if let Some(mut continuation) = self.routes.remove(&subagent) {
+            let trailing_output = continuation.turn.take_trailing_output();
+            sessions.finish_provider_turn(
+                session_id,
+                continuation.turn.turn_id,
+                ProviderTurnOutcome::Completed { trailing_output },
+            )?;
+        }
+        let turn_id = sessions.begin_subagent_turn(session_id)?;
+        let activity_id = add_subagent_row(
+            sessions,
+            delegating,
+            &name,
+            normalize_provider_text(description),
+            session_id,
+        )?;
+        self.open_stretch(
+            subagent,
+            (session_id, spawner),
+            name,
+            SubagentStretch {
+                turn_id,
+                owner_session_id: delegating.0,
+                activity_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Routes a Subagent's events into the stretch just begun: its row is
+    /// timed from now, its output and Context Fill land in the stretch's
+    /// Turn, and its Model evidence follows it there. A Subagent Suru stopped
+    /// before is working again, so what the Provider says of it from here on
+    /// is no late echo.
+    fn open_stretch(
+        &mut self,
+        subagent: ProviderSubagentId,
+        (session_id, spawner): (SessionId, SessionId),
+        name: String,
+        stretch: SubagentStretch,
+    ) {
+        self.rows.insert(
+            subagent.clone(),
+            SubagentRow {
+                owner_session_id: stretch.owner_session_id,
+                activity_id: stretch.activity_id,
+                started: Instant::now(),
+            },
+        );
+        self.context_routes
+            .insert(subagent.clone(), (session_id, stretch.turn_id));
+        self.routes.insert(
+            subagent.clone(),
+            SubagentRoute {
+                session_id,
+                turn: ActiveProviderTurn::new(stretch.turn_id),
+            },
+        );
+        self.stopped.remove(&subagent);
+        self.identities.insert(
+            subagent,
+            SubagentIdentity {
+                session_id,
+                spawner,
+                name,
+                stretch,
+            },
+        );
+    }
+
+    /// Settles one Subagent's current stretch on the Provider's own settle
+    /// signal: the Turn it worked in closes along with its row, because the
+    /// Provider's boundary for the stretch is one signal and no further event
+    /// of the child's is owed once it has passed — until a resume begins the
+    /// next. Returns `None` when no open row carries the identity, on the
+    /// same terms as [`Self::update_row`].
     fn settle_subagent(
         &mut self,
         sessions: &SessionStore,
@@ -3114,64 +3274,26 @@ fn project_provider_event(
                 subagent_id,
                 name,
                 description,
-            } => {
-                if subagents.rows.contains_key(&subagent_id)
-                    || subagents.routes.contains_key(&subagent_id)
-                {
-                    Err(anyhow::anyhow!(
-                        "Provider reused an active Subagent identity"
-                    ))
-                } else {
-                    let name = normalize_provider_text(&name);
-                    let description = normalize_provider_text(&description);
-                    sessions
-                        .create_subagent(session_id, &name, &description)
-                        .and_then(|spawned| {
-                            let subagent_activity_id = ActivityId::new();
-                            sessions.publish_agent_output(
-                                session_id,
-                                SessionChange::ActivityAdded {
-                                    activity: Activity::Subagent {
-                                        id: subagent_activity_id,
-                                        turn_id: active.turn_id,
-                                        status: ActivityStatus::Active,
-                                        name,
-                                        description,
-                                        model: None,
-                                        session_id: spawned.session_id,
-                                        duration_ms: None,
-                                    },
-                                },
-                            )?;
-                            subagents.rows.insert(
-                                subagent_id.clone(),
-                                SubagentRow {
-                                    owner_session_id: session_id,
-                                    activity_id: subagent_activity_id,
-                                    started: Instant::now(),
-                                },
-                            );
-                            subagents.context_routes.insert(subagent_id.clone(), (spawned.session_id, spawned.turn_id));
-                            subagents.identities.insert(
-                                subagent_id.clone(),
-                                SubagentIdentityRoute {
-                                    session_id: spawned.session_id,
-                                    turn_id: spawned.turn_id,
-                                    owner_session_id: session_id,
-                                    activity_id: subagent_activity_id,
-                                },
-                            );
-                            subagents.routes.insert(
-                                subagent_id,
-                                SubagentRoute {
-                                    session_id: spawned.session_id,
-                                    turn: ActiveProviderTurn::new(spawned.turn_id),
-                                },
-                            );
-                            Ok(ProviderEventProjection::Continue)
-                        })
-                }
-            }
+            } => subagents
+                .spawn(
+                    sessions,
+                    (session_id, active.turn_id),
+                    subagent_id,
+                    &name,
+                    &description,
+                )
+                .map(|()| ProviderEventProjection::Continue),
+            ProviderEvent::SubagentResumed {
+                subagent_id,
+                description,
+            } => subagents
+                .resume(
+                    sessions,
+                    (session_id, active.turn_id),
+                    subagent_id,
+                    &description,
+                )
+                .map(|()| ProviderEventProjection::Continue),
             ProviderEvent::SubagentUpdated {
                 subagent_id,
                 description,
@@ -3312,6 +3434,35 @@ fn project_provider_event(
         return ProviderEventProjection::Terminal;
     };
     projected
+}
+
+/// Adds the row one stretch of a Subagent's work stands as to the delegating
+/// Turn's Transcript, leading into the Subagent's own Session, and answers
+/// the row's identity.
+fn add_subagent_row(
+    sessions: &SessionStore,
+    (owner_session_id, turn_id): (SessionId, TurnId),
+    name: &str,
+    description: String,
+    session_id: SessionId,
+) -> anyhow::Result<ActivityId> {
+    let activity_id = ActivityId::new();
+    sessions.publish_agent_output(
+        owner_session_id,
+        SessionChange::ActivityAdded {
+            activity: Activity::Subagent {
+                id: activity_id,
+                turn_id,
+                status: ActivityStatus::Active,
+                name: name.to_owned(),
+                description,
+                model: None,
+                session_id,
+                duration_ms: None,
+            },
+        },
+    )?;
+    Ok(activity_id)
 }
 
 /// Renders a Provider failure as the message the Turn or Prompt carries. Every
@@ -3755,5 +3906,108 @@ running 1 test",
             "the routed Turn says why it failed"
         );
         assert!(routes.routes.is_empty());
+    }
+
+    /// A settled Subagent woken by its own work runs on in a Continuation of
+    /// its Session. A resume arriving then is a Delegation that begins a Turn
+    /// of its own, so the Continuation settles first — as worked, keeping the
+    /// line only this actor still held — and the resume's Turn begins after it.
+    #[tokio::test]
+    async fn a_resume_settles_a_continuation_open_in_the_subagents_session_before_its_turn_begins()
+    {
+        let fixture = routed_sessions().await;
+        let updates = ProviderUpdateGate::new();
+        let identity = provider_identity();
+        let subagent = ProviderSubagentId::new("task-1");
+        let delegating = (fixture.routed, fixture.routed_turn);
+        let mut routes = SubagentRoutes::default();
+        routes
+            .spawn(
+                &fixture.sessions,
+                delegating,
+                subagent.clone(),
+                "Explore",
+                "Map the seams",
+            )
+            .expect("spawn the Subagent");
+        let child = routes.identities[&subagent].session_id;
+        routes
+            .settle_subagent(
+                &fixture.sessions,
+                &subagent,
+                ProviderSubagentStatus::Completed,
+            )
+            .expect("the spawn's row is open")
+            .expect("settle the spawn's stretch");
+        let continuation = fixture
+            .sessions
+            .begin_continuation(child, identity.clone())
+            .expect("the Subagent's own work begins a Continuation");
+        routes.routes.insert(
+            subagent.clone(),
+            SubagentRoute {
+                session_id: child,
+                turn: ActiveProviderTurn::new_continuation(continuation),
+            },
+        );
+        let command = super::super::ProviderActivityId::new("exec-1");
+        for event in [
+            ProviderEvent::CommandStarted {
+                activity_id: command.clone(),
+                command: "cargo test".to_owned(),
+                cwd: None,
+            },
+            ProviderEvent::CommandOutputDelta {
+                activity_id: command,
+                content: "running 1 test".to_owned(),
+            },
+        ] {
+            routes.project_event(&fixture.sessions, &updates, &identity, &subagent, event);
+        }
+
+        routes
+            .resume(
+                &fixture.sessions,
+                delegating,
+                subagent.clone(),
+                "Map the tests too",
+            )
+            .expect("resume the Subagent");
+
+        let child = fixture
+            .sessions
+            .snapshot(child)
+            .expect("the Subagent's Session exists");
+        let statuses = child
+            .turns
+            .iter()
+            .map(|turn| turn.status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                TurnStatus::Completed,
+                TurnStatus::Completed,
+                TurnStatus::Active
+            ],
+            "the Continuation settles as worked before the resume's Turn begins"
+        );
+        assert_eq!(child.turns[1].id, continuation);
+        let Some(Activity::Command { status, output, .. }) = child
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Command { .. }))
+        else {
+            panic!("the Continuation's command is in the Transcript");
+        };
+        assert_ne!(*status, ActivityStatus::Active);
+        assert_eq!(output, "running 1 test");
+        let route = &routes.routes[&subagent];
+        assert_eq!(route.session_id, child.session.id);
+        assert_eq!(
+            route.turn.turn_id, child.turns[2].id,
+            "the Subagent's events now land in the resume's Turn"
+        );
+        assert!(route.turn.continuation.is_none());
     }
 }

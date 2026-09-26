@@ -288,11 +288,13 @@ pub enum ProviderEventAttribution {
     Subagent(ProviderSubagentId),
 }
 
-/// The Provider's own opaque identity for one Subagent it is running —
-/// Claude's spawning tool-use id, Codex's child thread id, Copilot's agent
-/// id. Like [`ProviderActivityId`], it is the Provider's to choose:
-/// orchestration only ever compares it, and only the Provider that minted it
-/// reads it back, as a stop request hands it the identity to resolve.
+/// The Provider's own opaque identity for one Subagent it runs — Claude's
+/// task id, Codex's child thread id, Copilot's agent id. It names the agent
+/// rather than any one stretch of its work, so a resume of a settled Subagent
+/// names it again. Like [`ProviderActivityId`], it is the Provider's to
+/// choose: orchestration only ever compares it, and only the Provider that
+/// minted it reads it back, as a stop request hands it the identity to
+/// resolve.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProviderSubagentId(String);
 
@@ -702,6 +704,18 @@ pub enum ProviderEvent {
         name: String,
         description: String,
     },
+    /// The Turn's Agent resumed a settled Subagent: the same agent, named by
+    /// the identity its spawn carried, continuing the same conversation. Like
+    /// a spawn, the event lands in the delegating Session — the owning
+    /// Session, or a Subagent's own when a sibling sends the resume — and
+    /// orchestration answers it by beginning the next Turn in the Subagent's
+    /// existing Session and adding the row that stands for this stretch of
+    /// its work. `description` is what the resume asked for; the Subagent's
+    /// Title stays what its spawn said.
+    SubagentResumed {
+        subagent_id: ProviderSubagentId,
+        description: String,
+    },
     /// The Provider revised what a working Subagent is doing.
     SubagentUpdated {
         subagent_id: ProviderSubagentId,
@@ -712,9 +726,11 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         model: crate::protocol::ModelId,
     },
-    /// The Provider reported a Subagent settling. This settles the Subagent's
-    /// row and its child Session's Turn together. Later output is discarded;
-    /// ordered Context Fill measurements may still refresh the child Session.
+    /// The Provider reported a Subagent's current stretch of work settling.
+    /// This settles the stretch's row and the child Session's Turn it worked
+    /// in together. Later output is discarded until a resume begins another
+    /// stretch; ordered Context Fill measurements may still refresh the child
+    /// Session.
     SubagentCompleted {
         subagent_id: ProviderSubagentId,
         status: ProviderSubagentStatus,

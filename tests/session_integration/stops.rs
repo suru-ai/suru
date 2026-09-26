@@ -616,3 +616,174 @@ async fn a_stop_the_provider_refuses_leaves_the_subagent_running_and_reports_why
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+#[tokio::test]
+async fn stopping_a_resumed_subagent_settles_only_its_resumed_stretch() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "stop-resumed-subagent-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child = spawn_subagent(&fixture, &subagent).await;
+    for event in [
+        ProviderEvent::SubagentCompleted {
+            subagent_id: subagent.clone(),
+            status: suru::provider::ProviderSubagentStatus::Completed,
+        },
+        ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            description: "Map the tests too".to_owned(),
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child,
+        "the resume begins the child's second Turn",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+
+    // The resumed Subagent's Session is what its row and the Picker stop.
+    let (response, ()) = tokio::join!(
+        interrupt(&fixture.client, fixture.server.descriptor(), child),
+        async {
+            let stop = timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_subagent_stop(),
+            )
+            .await
+            .expect("the stop reaches the Provider");
+            assert_eq!(
+                stop.subagent(),
+                "task-1",
+                "the stop names the Subagent by the identity its resume carried"
+            );
+            stop.succeed();
+        }
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resume row settles as stopped",
+        |snapshot| {
+            subagent_rows(snapshot)
+                .get(1)
+                .is_some_and(|row| row_status(row) == ActivityStatus::Interrupted)
+        },
+    )
+    .await;
+    assert_eq!(
+        row_status(subagent_rows(&parent)[0]),
+        ActivityStatus::Completed,
+        "the spawn's row stays as it settled"
+    );
+    let stopped = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child,
+        "the resumed Turn settles",
+        |snapshot| snapshot.turns[1].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(stopped.turns[0].status, TurnStatus::Completed);
+    assert_eq!(stopped.turns[1].status, TurnStatus::Interrupted);
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "nothing is left Working",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn stopping_a_subagent_leaves_working_a_subagent_it_only_resumed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "stop-resumer-test").await;
+    let reviewer = ProviderSubagentId::new("task-1");
+    let writer = ProviderSubagentId::new("task-2");
+    let reviewer_child = spawn_subagent(&fixture, &reviewer).await;
+    let writer_child = spawn_subagent(&fixture, &writer).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: writer.clone(),
+            status: suru::provider::ProviderSubagentStatus::Completed,
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(reviewer.clone()),
+            ProviderEvent::SubagentResumed {
+                subagent_id: writer,
+                description: "Tighten the notes".to_owned(),
+            },
+        )
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        reviewer_child,
+        "the reviewer holds the row of the resume it sent",
+        |snapshot| subagent_rows(snapshot).len() == 1,
+    )
+    .await;
+
+    let (response, ()) = tokio::join!(
+        interrupt(&fixture.client, fixture.server.descriptor(), reviewer_child),
+        async {
+            let stop = timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_subagent_stop(),
+            )
+            .await
+            .expect("the stop reaches the Provider");
+            assert_eq!(stop.subagent(), "task-1");
+            stop.succeed();
+        }
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let reviewer_session = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        reviewer_child,
+        "the stopped reviewer's Turn settles",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Interrupted,
+    )
+    .await;
+    assert_eq!(
+        row_status(subagent_rows(&reviewer_session)[0]),
+        ActivityStatus::Active,
+        "the writer does not stand below the reviewer, so the reviewer's stop leaves it working"
+    );
+    let writer_session = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        writer_child,
+        "the writer's resumed Turn is readable",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+    assert_eq!(writer_session.turns[1].status, TurnStatus::Active);
+    assert!(
+        fixture.provider_session.try_next_subagent_stop().is_none(),
+        "one stop went out, for the reviewer alone"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}

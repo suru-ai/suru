@@ -1438,7 +1438,10 @@ impl RenderUnit<'_> {
 
     fn activity_unit_key(activity: &Activity) -> UnitKey {
         match activity {
-            Activity::Subagent { session_id, .. } => UnitKey::Subagent(*session_id),
+            Activity::Subagent { id, session_id, .. } => UnitKey::Subagent {
+                row: *id,
+                session_id: *session_id,
+            },
             _ => UnitKey::Activity(activity.id()),
         }
     }
@@ -2357,10 +2360,14 @@ fn in_turn_gutter(unit: RenderUnit<'_>, disclosed: bool) -> RenderUnit<'_> {
 pub(super) enum UnitKey {
     Message(MessageId),
     Activity(ActivityId),
-    /// A Subagent's row, keyed by the child Session it stands for: a press on
+    /// A Subagent's row, carrying the child Session it stands for: a press on
     /// it opens that Session rather than toggling a Fold, so the key carries
-    /// what the invocation needs.
-    Subagent(SessionId),
+    /// what the invocation needs. The row itself identifies the unit, since
+    /// every row of a resumed Subagent leads into the one Session.
+    Subagent {
+        row: ActivityId,
+        session_id: SessionId,
+    },
     /// A Group, identified by its first member: the anchor a run keeps as it
     /// absorbs the next Activity to join it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every time.

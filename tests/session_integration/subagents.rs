@@ -5,8 +5,8 @@
 use crate::{
     provider_support::ControlledProvider,
     support::{
-        open_catalog_stream_with_snapshot, read_session, read_session_at_least_revision,
-        read_session_until, the_subagent_row, working_turn,
+        WorkingTurn, open_catalog_stream_with_snapshot, read_session,
+        read_session_at_least_revision, read_session_until, the_subagent_row, working_turn,
     },
 };
 use axum::http::StatusCode;
@@ -14,8 +14,8 @@ use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageRole, ModelId,
         PromptDelivery, PromptId, SessionCatalogChange, SessionChange, SessionError,
-        SessionErrorCode, SessionListItem, SessionRevision, SessionSnapshot, SessionStatus,
-        TurnStatus, ViewSessionOperationId, ViewSessionRequest,
+        SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
+        SessionStatus, TurnStatus, ViewSessionOperationId, ViewSessionRequest,
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
@@ -1611,6 +1611,390 @@ async fn a_provider_status_update_revises_what_the_row_says_the_subagent_is_doin
     };
     assert_eq!(*status, ActivityStatus::Active);
     assert_eq!(description, "Reading the orchestration actor");
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// The Subagent rows in `snapshot`, in Transcript order.
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+        .collect()
+}
+
+/// Emits `events` attributed to `subagent`, each observed before the next.
+async fn emit_for(
+    fixture: &WorkingTurn,
+    subagent: &ProviderSubagentId,
+    events: Vec<ProviderEvent>,
+) {
+    for event in events {
+        fixture
+            .provider_session
+            .emit_attributed_and_wait_until_observed(
+                ProviderEventAttribution::Subagent(subagent.clone()),
+                event,
+            )
+            .await;
+    }
+}
+
+fn agent_message(content: &str) -> Vec<ProviderEvent> {
+    vec![
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: content.to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+    ]
+}
+
+/// A Subagent spawned in the fixture's working Turn, its first stretch of work
+/// done under `model` and settled, and the Session that is its own.
+async fn spawned_and_settled(
+    fixture: &WorkingTurn,
+    subagent: &ProviderSubagentId,
+    model: &str,
+) -> SessionId {
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+        })
+        .await;
+    emit_for(fixture, subagent, agent_message("Mapped the seams.")).await;
+    for event in [
+        ProviderEvent::SubagentModelChanged {
+            subagent_id: subagent.clone(),
+            model: ModelId::new(model),
+        },
+        ProviderEvent::SubagentCompleted {
+            subagent_id: subagent.clone(),
+            status: ProviderSubagentStatus::Completed,
+        },
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Subagent's first stretch settles",
+        |snapshot| {
+            matches!(
+                subagent_rows(snapshot)[..],
+                [Activity::Subagent {
+                    status: ActivityStatus::Completed,
+                    model: Some(_),
+                    ..
+                }]
+            )
+        },
+    )
+    .await;
+    let Activity::Subagent { session_id, .. } = the_subagent_row(&parent) else {
+        unreachable!()
+    };
+    *session_id
+}
+
+#[tokio::test]
+async fn a_resume_begins_the_next_turn_in_the_subagents_own_session_and_a_row_of_its_own() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-resume-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_and_settled(&fixture, &subagent, "first-model").await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            description: "Map the tests too".to_owned(),
+        })
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resume adds a row of its own",
+        |snapshot| subagent_rows(snapshot).len() == 2,
+    )
+    .await;
+    let [
+        Activity::Subagent {
+            status: spawn_status,
+            description: spawn_description,
+            model: spawn_model,
+            duration_ms: spawn_duration,
+            ..
+        },
+        Activity::Subagent {
+            turn_id,
+            status,
+            name,
+            description,
+            model,
+            session_id,
+            duration_ms,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*spawn_status, ActivityStatus::Completed);
+    assert_eq!(spawn_description, "Map the provider seams");
+    assert_eq!(
+        spawn_model.as_ref().map(ModelId::as_str),
+        Some("first-model")
+    );
+    assert!(
+        spawn_duration.is_some(),
+        "the spawn's row stays exactly as it settled"
+    );
+    assert_eq!(*turn_id, parent.turns[0].id, "the delegating Turn holds it");
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(
+        name, "Explore",
+        "the row names the same agent its spawn did"
+    );
+    assert_eq!(description, "Map the tests too");
+    assert_eq!(*model, None, "no Model evidence of this stretch yet");
+    assert_eq!(*session_id, child_id, "the row leads into the one Session");
+    assert_eq!(*duration_ms, None);
+
+    let child = read_session(fixture.server.descriptor(), child_id).await;
+    assert_eq!(
+        child.title, "Map the provider seams",
+        "the Title stays the spawn's"
+    );
+    let [first, second] = child.turns.as_slice() else {
+        panic!("the resume begins a second Turn, got {:?}", child.turns);
+    };
+    assert_eq!(first.status, TurnStatus::Completed);
+    assert_eq!(second.status, TurnStatus::Active);
+    assert_eq!(
+        second.prompt_id, None,
+        "a Delegation, not a Prompt, begins it"
+    );
+    assert_eq!(second.agent, None);
+
+    emit_for(&fixture, &subagent, agent_message("Mapped the tests.")).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentModelChanged {
+            subagent_id: subagent.clone(),
+            model: ModelId::new("resumed-model"),
+        })
+        .await;
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the resumed stretch's Model evidence reaches its Turn",
+        |snapshot| snapshot.turns[1].agent.is_some(),
+    )
+    .await;
+    let models = child
+        .turns
+        .iter()
+        .map(|turn| {
+            turn.agent
+                .as_ref()
+                .map(|agent| agent.selection.model.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        [Some("first-model"), Some("resumed-model")],
+        "each Turn carries its own stretch's Model evidence"
+    );
+    let resumed = child
+        .messages
+        .iter()
+        .find(|message| message.content == "Mapped the tests.")
+        .expect("the resumed stretch's Message reaches the child");
+    assert_eq!(
+        resumed.turn_id, child.turns[1].id,
+        "the resumed work lands in the Turn the resume began"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the resume row settles",
+        |snapshot| {
+            matches!(
+                subagent_rows(snapshot)[..],
+                [
+                    _,
+                    Activity::Subagent {
+                        status: ActivityStatus::Completed,
+                        ..
+                    }
+                ]
+            )
+        },
+    )
+    .await;
+    let [
+        Activity::Subagent {
+            model: spawn_model, ..
+        },
+        Activity::Subagent {
+            model, duration_ms, ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        spawn_model.as_ref().map(ModelId::as_str),
+        Some("first-model")
+    );
+    assert_eq!(model.as_ref().map(ModelId::as_str), Some("resumed-model"));
+    assert!(
+        duration_ms.is_some(),
+        "the resume row times its own stretch"
+    );
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the resumed Turn settles with its row",
+        |snapshot| snapshot.turns[1].status == TurnStatus::Completed,
+    )
+    .await;
+    assert_eq!(child.turns.len(), 2);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_resume_after_its_delegating_turn_settled_keeps_the_parent_working_until_it_settles() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-resume-working-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_and_settled(&fixture, &subagent, "first-model").await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the parent settles with nothing left working",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+
+    // The Provider's loop wakes to deliver the outcome and resumes the agent
+    // from the Continuation that begins.
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            description: "Map the tests too".to_owned(),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Continuation holding the resume settles",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Completed,
+    )
+    .await;
+    let [
+        _,
+        Activity::Subagent {
+            turn_id, status, ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!("the resume adds its row, got {:?}", parent.activities);
+    };
+    assert_eq!(
+        *turn_id, parent.turns[1].id,
+        "the resume's row stands in the Continuation it began"
+    );
+    assert_eq!(*status, ActivityStatus::Active);
+    assert!(
+        parent.working_since().is_some(),
+        "the resumed Subagent keeps its parent Working past every settled Turn (ADR 0015)"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the parent stops Working once the resumed stretch settles",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    let child = read_session(fixture.server.descriptor(), child_id).await;
+    assert_eq!(child.turns[1].status, TurnStatus::Completed);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_resume_naming_no_subagent_the_connection_spawned_opens_nothing() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-unknown-resume-test").await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentResumed {
+            subagent_id: ProviderSubagentId::new("never-spawned"),
+            description: "Carry on".to_owned(),
+        })
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Provider's broken promise settles the Turn",
+        |snapshot| snapshot.turns[0].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(parent.turns[0].status, TurnStatus::Failed);
+    assert!(
+        subagent_rows(&parent).is_empty(),
+        "a resume with no Session to continue adds no row"
+    );
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");
