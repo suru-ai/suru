@@ -22,13 +22,13 @@ use crate::{
         SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
         Workspace, WorkspaceId,
     },
-    provider::ProviderResumeState,
+    provider::{ProviderResumeState, ProviderSubagentId},
 };
 
 use super::{
-    PersistedSession, StorageError, StoredResumeState, UnreadableStoredSession, activities,
-    landing_agent_selection, messages, model_catalog, prompts, provider_resume_states, sessions,
-    turns, workspaces,
+    PersistedSession, StorageError, StoredResumeState, StoredSubagentIdentity,
+    UnreadableStoredSession, activities, landing_agent_selection, messages, model_catalog, prompts,
+    provider_resume_states, provider_subagent_identities, sessions, turns, workspaces,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -224,6 +224,34 @@ impl ProviderResumeStateRow {
     }
 }
 
+/// The Provider's own identity for the Subagent a child Session is, keyed by
+/// that Session. Plain columns rather than a payload: the identity is the
+/// Provider's opaque string, which Suru only ever compares.
+#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+#[diesel(table_name = provider_subagent_identities)]
+pub(super) struct ProviderSubagentIdentityRow {
+    session_id: String,
+    provider: String,
+    subagent_id: String,
+}
+
+impl ProviderSubagentIdentityRow {
+    fn from_identity(session_id: &str, identity: StoredSubagentIdentity) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            provider: identity.provider.to_string(),
+            subagent_id: identity.subagent_id.as_str().to_owned(),
+        }
+    }
+
+    pub(super) fn into_identity(self) -> StoredSubagentIdentity {
+        StoredSubagentIdentity {
+            provider: ProviderId::new(self.provider),
+            subagent_id: ProviderSubagentId::new(self.subagent_id),
+        }
+    }
+}
+
 pub(super) struct StoredRows {
     pub(super) session_id: SessionId,
     pub(super) session: SessionRow,
@@ -231,6 +259,7 @@ pub(super) struct StoredRows {
     pub(super) turns: Vec<TurnRow>,
     pub(super) messages: Vec<MessageRow>,
     pub(super) activities: Vec<ActivityRow>,
+    pub(super) subagent_identity: Option<ProviderSubagentIdentityRow>,
 }
 
 #[derive(Clone, Copy)]
@@ -262,6 +291,7 @@ impl StoredRows {
             summary,
             snapshot,
             resume_states: _,
+            subagent_identity,
         } = persisted;
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
@@ -322,6 +352,8 @@ impl StoredRows {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let subagent_identity = subagent_identity
+            .map(|identity| ProviderSubagentIdentityRow::from_identity(&id, identity));
         Ok(Self {
             session_id,
             session,
@@ -329,6 +361,7 @@ impl StoredRows {
             turns,
             messages,
             activities,
+            subagent_identity,
         })
     }
 }

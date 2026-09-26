@@ -1,6 +1,7 @@
 //! Opening a Subagent's child Session — the one Session creation a Prompt does
-//! not drive — and beginning each later Turn a resume of the Subagent begins
-//! in it, each opened by the Delegation that began it.
+//! not drive — beginning each later Turn a resume of the Subagent begins in
+//! it, each opened by the Delegation that began it, and finding the Session a
+//! resume continues by the identity its Provider stored with it at the spawn.
 
 use std::collections::HashMap;
 
@@ -9,10 +10,12 @@ use tokio::sync::broadcast;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, Delegator, Message, MessageId, MessageRole, MessageStatus, PromptOrder, Session,
-    SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
+    Activity, Delegator, Message, MessageId, MessageRole, MessageStatus, PromptOrder, ProviderId,
+    Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
     SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
+use crate::provider::ProviderSubagentId;
+use crate::storage::StoredSubagentIdentity;
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore,
@@ -37,18 +40,32 @@ pub(crate) struct OpeningDelegation {
     pub(crate) text: NormalizedText,
 }
 
+/// A Subagent the store holds by the identity its Provider gave it: its own
+/// Session, the Session that spawned it — its place in the tree — and the
+/// name its spawn's row carries, which every later row of it repeats.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSubagent {
+    pub(crate) subagent_id: ProviderSubagentId,
+    pub(crate) session_id: SessionId,
+    pub(crate) spawner: SessionId,
+    pub(crate) name: String,
+}
+
 impl SessionStore {
     /// Creates the child Session a Subagent runs in: parented to its spawner,
     /// titled from the spawn description — never an Errand — and opened with
     /// the one prompt-less Turn its attributed events land in. The spawn's
     /// Delegation, where the Provider reported its text, opens that Turn as a
     /// Message from the spawner's Agent, ahead of anything the Subagent does.
+    /// The Provider's own identity for the Subagent is stored with it, so a
+    /// resume naming it after a restart still finds this Session (ADR 0031).
     /// The child joins no listing and rides no catalog stream, so nothing is
     /// announced; it is reachable only through the row its spawner's
     /// Transcript shows.
     pub(crate) fn create_subagent(
         &self,
         parent_id: SessionId,
+        identity: StoredSubagentIdentity,
         name: &str,
         description: &str,
         delegation: Option<NormalizedText>,
@@ -152,9 +169,11 @@ impl SessionStore {
                 viewed_operations: Default::default(),
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
+                subagent_identity: Some(identity.clone()),
             },
         );
-        self.storage.created(persisted_summary, snapshot);
+        self.storage
+            .created(persisted_summary, snapshot, Some(identity));
         // The child begins working the moment it exists, which the listed
         // root's Working reading has to carry. Its total is derived on the
         // same terms, so both readings above it are answered from the same
@@ -242,6 +261,62 @@ impl SessionStore {
         }
         state.commit(&self.storage, session_id, changes)?;
         Ok(turn_id)
+    }
+
+    /// Every Subagent in the tree `top_level` heads whose Session the store
+    /// holds by an identity `provider` minted, nearest the top first. This is
+    /// what a Provider connection that resumes its conversation — after a
+    /// restart above all — relearns its Subagents from: the identities are the
+    /// connection's own, and the connection belongs to the tree's top-level
+    /// Session, so no identity here can resolve into another tree.
+    pub(crate) fn stored_subagents(
+        &self,
+        top_level: SessionId,
+        provider: &ProviderId,
+    ) -> Vec<StoredSubagent> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let mut tree = vec![top_level];
+        let mut stored = Vec::new();
+        let mut visit = 0;
+        while visit < tree.len() {
+            let spawner = tree[visit];
+            visit += 1;
+            let mut children = state
+                .sessions
+                .iter()
+                .filter(|(_, record)| record.snapshot.session.parent == Some(spawner))
+                .map(|(child_id, record)| (*child_id, record))
+                .collect::<Vec<_>>();
+            // Spawn order, so an identity a Provider ever named twice resolves
+            // to the Subagent that first carried it.
+            children.sort_by_key(|(child_id, record)| {
+                (record.summary.created_at, child_id.to_string())
+            });
+            for (child_id, record) in children {
+                tree.push(child_id);
+                let Some(identity) = record
+                    .subagent_identity
+                    .as_ref()
+                    .filter(|identity| identity.provider == *provider)
+                else {
+                    continue;
+                };
+                // The name the spawn's row carries in the spawner's Transcript.
+                let name = delegator(&state.sessions, child_id)
+                    .name
+                    .unwrap_or_default();
+                stored.push(StoredSubagent {
+                    subagent_id: identity.subagent_id.clone(),
+                    session_id: child_id,
+                    spawner,
+                    name,
+                });
+            }
+        }
+        stored
     }
 }
 

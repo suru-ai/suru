@@ -480,6 +480,9 @@ impl ClaudeProjection {
         // streamed, the text the start carries.
         let delegation = kind.text().or(message.prompt);
         let subagent_id = ProviderSubagentId::new(task_id.clone());
+        let name = message
+            .subagent_type
+            .unwrap_or_else(|| TASK_TOOL.to_owned());
         let (conversation, event) = match (self.agent_tasks.get_mut(&task_id), kind) {
             // A task this wire started before is a settled agent resumed: the same Subagent,
             // continuing the same conversation. The start repeats the spawn's description, so the
@@ -493,6 +496,7 @@ impl ClaudeProjection {
                     task.conversation.clone(),
                     ProviderEvent::SubagentResumed {
                         subagent_id,
+                        name,
                         description,
                         delegation,
                     },
@@ -524,9 +528,7 @@ impl ClaudeProjection {
                     conversation,
                     ProviderEvent::SubagentStarted {
                         subagent_id,
-                        name: message
-                            .subagent_type
-                            .unwrap_or_else(|| TASK_TOOL.to_owned()),
+                        name,
                         description,
                         delegation,
                     },

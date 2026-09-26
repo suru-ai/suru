@@ -632,6 +632,7 @@ async fn stopping_a_resumed_subagent_settles_only_its_resumed_stretch() {
         },
         ProviderEvent::SubagentResumed {
             subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
             description: "Map the tests too".to_owned(),
             delegation: None,
         },
@@ -732,6 +733,7 @@ async fn stopping_a_subagent_leaves_working_a_subagent_it_only_resumed() {
             ProviderEventAttribution::Subagent(reviewer.clone()),
             ProviderEvent::SubagentResumed {
                 subagent_id: writer,
+                name: "Explore".to_owned(),
                 description: "Tighten the notes".to_owned(),
                 delegation: None,
             },

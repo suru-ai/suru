@@ -46,7 +46,7 @@ async fn deferred_store(
     let repository = StorageRepository::open(workspace).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
     for record in records {
-        sink.created(record.summary, record.snapshot);
+        sink.created(record.summary, record.snapshot, record.subagent_identity);
     }
     writer.shutdown().await.unwrap();
     let restored = repository.load_sessions().await.unwrap();

@@ -19,7 +19,8 @@ use crate::protocol::{
 };
 use crate::provider::ProviderResumeState;
 use crate::storage::{
-    DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, UnreadableStoredSession,
+    DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, StoredSubagentIdentity,
+    UnreadableStoredSession,
 };
 
 mod catalog;
@@ -59,7 +60,7 @@ pub(crate) use settlement::{
     InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome,
     TrailingCommandOutput,
 };
-pub(crate) use subagents::OpeningDelegation;
+pub(crate) use subagents::{OpeningDelegation, StoredSubagent};
 pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
 pub(crate) use workspace_icon::SetWorkspaceIconError;
@@ -146,6 +147,9 @@ struct SessionRecord {
     viewed_operations: HashSet<ViewSessionOperationId>,
     selection_retry_prompt: Option<PromptId>,
     resume_states: HashMap<ProviderId, ProviderResumeState>,
+    /// The Provider's own identity for the Subagent this Session is, on a
+    /// Subagent's child Session alone.
+    subagent_identity: Option<StoredSubagentIdentity>,
 }
 
 pub(crate) struct SessionFeed {

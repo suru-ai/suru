@@ -186,6 +186,7 @@ impl SessionStore {
                 summary: record.summary.clone(),
                 snapshot: record.snapshot.clone(),
                 resume_states: record.resume_states.clone(),
+                subagent_identity: record.subagent_identity.clone(),
             })?;
         }
         // A Prompt owed a Turn is owed it by the process that admitted it, and
@@ -419,6 +420,7 @@ pub(super) fn restored_record(
         snapshot: persisted.snapshot,
         summary: persisted.summary,
         resume_states: persisted.resume_states,
+        subagent_identity: persisted.subagent_identity,
         updates,
         next_prompt_order,
         steer_targets: Default::default(),

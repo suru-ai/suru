@@ -22,7 +22,7 @@ use crate::{
         SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
         UnreadableSessionSummary, WorkspaceId,
     },
-    provider::ProviderResumeState,
+    provider::{ProviderResumeState, ProviderSubagentId},
     runtime::protect_current_user_file,
 };
 
@@ -33,11 +33,12 @@ pub(crate) use writer::{StorageSink, StorageWriter};
 
 use rows::{
     ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
-    ProviderResumeStateRow, SessionRow, StoredRows, TurnRow, WorkspaceRow,
+    ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, StoredRows, TurnRow,
+    WorkspaceRow,
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260914020000";
+const CURRENT_SCHEMA_VERSION: &str = "20260926000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -88,6 +89,14 @@ diesel::table! {
         session_id -> Text,
         provider -> Text,
         payload -> Text,
+    }
+}
+
+diesel::table! {
+    provider_subagent_identities (session_id) {
+        session_id -> Text,
+        provider -> Text,
+        subagent_id -> Text,
     }
 }
 
@@ -143,6 +152,20 @@ pub(crate) struct PersistedSession {
     pub(crate) summary: SessionSummary,
     pub(crate) snapshot: SessionSnapshot,
     pub(crate) resume_states: HashMap<ProviderId, ProviderResumeState>,
+    /// Set exactly on a Subagent's child Session: the Provider's own identity
+    /// for the Subagent it is, stored with it from its spawn.
+    pub(crate) subagent_identity: Option<StoredSubagentIdentity>,
+}
+
+/// The Provider's own identity for the Subagent a child Session is — Claude's
+/// task id, Codex's child thread id — beside the Provider that minted it, which
+/// is the only one that can name it again. A resume after a restart names the
+/// Subagent by it, and this is what finds the Session that resume continues
+/// (ADR 0031).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSubagentIdentity {
+    pub(crate) provider: ProviderId,
+    pub(crate) subagent_id: ProviderSubagentId,
 }
 
 pub(crate) struct StoredResumeState {
@@ -603,6 +626,7 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 summary,
                 snapshot,
                 resume_states: HashMap::new(),
+                subagent_identity: None,
             })
         })();
         match result {
@@ -661,6 +685,12 @@ fn load_session(
         .filter(provider_resume_states::session_id.eq(&stored_session_id))
         .select(ProviderResumeStateRow::as_select())
         .load::<ProviderResumeStateRow>(connection)
+        .map_err(|error| StorageError::Read(error.to_string()))?;
+    let subagent_identity_row = provider_subagent_identities::table
+        .filter(provider_subagent_identities::session_id.eq(&stored_session_id))
+        .select(ProviderSubagentIdentityRow::as_select())
+        .first::<ProviderSubagentIdentityRow>(connection)
+        .optional()
         .map_err(|error| StorageError::Read(error.to_string()))?;
 
     let decode_started = std::time::Instant::now();
@@ -743,6 +773,7 @@ fn load_session(
         summary,
         snapshot,
         resume_states,
+        subagent_identity: subagent_identity_row.map(ProviderSubagentIdentityRow::into_identity),
     })
 }
 
@@ -786,6 +817,14 @@ fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), 
             if !rows.activities.is_empty() {
                 diesel::insert_into(activities::table)
                     .values(&rows.activities)
+                    .execute(connection)?;
+            }
+            if let Some(identity) = &rows.subagent_identity {
+                diesel::insert_into(provider_subagent_identities::table)
+                    .values(identity)
+                    .on_conflict(provider_subagent_identities::session_id)
+                    .do_update()
+                    .set(identity)
                     .execute(connection)?;
             }
             Ok(())

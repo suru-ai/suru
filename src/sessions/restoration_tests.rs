@@ -851,6 +851,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
             pending_approvals_revision: crate::protocol::SessionRevision(0),
         },
         resume_states: HashMap::new(),
+        subagent_identity: None,
     }
 }
 

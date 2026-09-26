@@ -714,10 +714,15 @@ pub enum ProviderEvent {
     /// Session, or a Subagent's own when a sibling sends the resume — and
     /// orchestration answers it by beginning the next Turn in the Subagent's
     /// existing Session and adding the row that stands for this stretch of
-    /// its work. `description` is what the resume asked for; the Subagent's
-    /// Title stays what its spawn said.
+    /// its work. The identity finds that Session even when an earlier process
+    /// spawned the Subagent, because it is stored with the Session. `description`
+    /// is what the resume asked for; the Subagent's Title stays what its spawn
+    /// said, and its rows keep its spawn's name. `name` is used only when Suru
+    /// holds no Session for the identity at all, and so records the resume as
+    /// a new Subagent rather than losing it.
     SubagentResumed {
         subagent_id: ProviderSubagentId,
+        name: String,
         description: String,
         /// The resume's Delegation: the text the delegating Agent sent the
         /// Subagent, where the Provider reports it. It opens the Turn the

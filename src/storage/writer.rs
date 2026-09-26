@@ -20,7 +20,9 @@ use crate::{
     session_projection::apply_update,
 };
 
-use super::{PersistedSession, StorageError, StorageRepository, StoredResumeState};
+use super::{
+    PersistedSession, StorageError, StorageRepository, StoredResumeState, StoredSubagentIdentity,
+};
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
@@ -290,13 +292,21 @@ impl StorageSink {
             .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
     }
 
-    pub(crate) fn created(&self, summary: SessionSummary, snapshot: SessionSnapshot) {
+    /// Records a Session just created — a Subagent's child Session together
+    /// with the Provider's identity for it, which lands in the same flush.
+    pub(crate) fn created(
+        &self,
+        summary: SessionSummary,
+        snapshot: SessionSnapshot,
+        subagent_identity: Option<StoredSubagentIdentity>,
+    ) {
         let _ = self
             .commands
             .send(WriterCommand::Create(Box::new(PersistedSession {
                 summary,
                 snapshot,
                 resume_states: HashMap::new(),
+                subagent_identity,
             })));
     }
 

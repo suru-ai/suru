@@ -518,9 +518,11 @@ impl SessionStore {
                 viewed_operations: Default::default(),
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
+                subagent_identity: None,
             },
         );
-        self.storage.created(persisted_summary, snapshot.clone());
+        self.storage
+            .created(persisted_summary, snapshot.clone(), None);
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });
         Ok(StoreOutcome::Created(snapshot))
     }

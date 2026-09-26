@@ -150,6 +150,9 @@ async fn resume(
             }),
             ProviderEvent::SubagentResumed {
                 subagent_id: ProviderSubagentId::new(subagent),
+                // Every resume here names a Subagent the tree already holds,
+                // which keeps the name its spawn gave it.
+                name: "Resumed".to_owned(),
                 description: description.to_owned(),
                 delegation: None,
             },
