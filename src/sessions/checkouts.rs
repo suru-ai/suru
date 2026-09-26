@@ -162,11 +162,17 @@ impl SessionStore {
                 sessions.retire_unobserved_checkouts(&checkouts);
                 let readings = stream::iter(checkouts.into_values().map(|checkout| {
                     let source_control = &source_control;
-                    async move { source_control.observe(&checkout).await }
+                    let sessions = &sessions;
+                    async move {
+                        let began = sessions.guarded_recordings_of(&checkout.id);
+                        (began, source_control.observe(&checkout).await)
+                    }
                 }))
                 .buffer_unordered(8);
-                if drain_until_shutdown(readings, &mut shutdown, |reading| {
-                    if let Err(error) = sessions.record_checkout(reading) {
+                if drain_until_shutdown(readings, &mut shutdown, |(began, reading)| {
+                    if let Err(error) = sessions
+                        .record_checkout_with_recovery(reading, Recording::Observed { began })
+                    {
                         tracing::warn!(%error, "Checkout recovery facts could not be persisted");
                     }
                 })
@@ -224,8 +230,28 @@ impl SessionStore {
         }
     }
 
+    /// How many guarded readings of a Worktree have been recorded, which an
+    /// observation notes before it reads that Worktree.
+    fn guarded_recordings_of(&self, checkout: &CheckoutId) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .guarded_checkout_recordings
+            .get(checkout)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record a reading taken under source control's mutation guard. It stands
+    /// over any observation reading begun before it, which may predate a
+    /// mutation made under that guard.
     pub(crate) fn record_checkout(&self, reading: CheckoutSummary) -> anyhow::Result<()> {
-        self.record_checkout_with_recovery(reading, false)
+        self.record_checkout_with_recovery(
+            reading,
+            Recording::Guarded {
+                clears_reclaim: false,
+            },
+        )
     }
 
     /// Record a checkout validated by the guarded Prompt execution gate. It
@@ -233,18 +259,37 @@ impl SessionStore {
     /// an ordinary read must carry that marker so one started before removal
     /// cannot arrive late with Available state and stale branch facts.
     pub(crate) fn record_execution_checkout(&self, reading: CheckoutSummary) -> anyhow::Result<()> {
-        self.record_checkout_with_recovery(reading, true)
+        self.record_checkout_with_recovery(
+            reading,
+            Recording::Guarded {
+                clears_reclaim: true,
+            },
+        )
     }
 
     fn record_checkout_with_recovery(
         &self,
         mut reading: CheckoutSummary,
-        clears_reclaim: bool,
+        recording: Recording,
     ) -> anyhow::Result<()> {
         // Recovery fields are never part of the live reading.
         reading.association.recovery_revision = None;
         let observed_reclaim = reading.association.reclaim.clone();
         let mut state = self.state.lock().unwrap();
+        let guarded = state
+            .guarded_checkout_recordings
+            .entry(reading.association.id.clone())
+            .or_default();
+        let clears_reclaim = match recording {
+            Recording::Guarded { clears_reclaim } => {
+                *guarded += 1;
+                clears_reclaim
+            }
+            // Nothing of it is published either, so clients never see the
+            // Worktree step back to what it was before that guarded mutation.
+            Recording::Observed { began } if began != *guarded => return Ok(()),
+            Recording::Observed { .. } => false,
+        };
         let observed = state.catalog.has_subscribers();
         let mut invalidated = Vec::new();
         for record in state.sessions.values_mut() {
@@ -303,6 +348,10 @@ impl SessionStore {
             reason: reclaim.reason,
         };
         let mut state = self.state.lock().unwrap();
+        *state
+            .guarded_checkout_recordings
+            .entry(recovery.association.id.clone())
+            .or_default() += 1;
         let observed = state.catalog.has_subscribers();
         let mut invalidated = Vec::new();
         for record in state.sessions.values_mut() {
@@ -325,6 +374,19 @@ impl SessionStore {
         publish_checkout_reading(&mut state, observed, recovery);
         Ok(())
     }
+}
+
+/// Whose reading is being recorded, which decides what it may overwrite.
+enum Recording {
+    /// Taken under source control's mutation guard, so nothing Suru does to
+    /// the Worktree came between the reading and its recording. One from the
+    /// Prompt execution gate `clears_reclaim` without the observation marker.
+    Guarded { clears_reclaim: bool },
+    /// Taken by background observation without the guard, once `began`
+    /// guarded readings of the Worktree had been recorded. A guarded one
+    /// recorded since may name what a mutation left, which this reading,
+    /// however late it arrives, cannot.
+    Observed { began: u64 },
 }
 
 fn persist_checkout_association(

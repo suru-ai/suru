@@ -503,7 +503,9 @@ impl SourceControlService {
     /// admission failed, say — so no intent is left naming a branch that no
     /// longer exists. A rename then reads the Worktree and records it before
     /// either lock is let go, so no removal or recovery can come between the
-    /// new name and the recovery facts that carry it.
+    /// new name and the recovery facts that carry it; being guarded, that
+    /// recording also stands over any observation of the old name still in
+    /// flight.
     pub(crate) async fn rename_branch(
         &self,
         preparations: &PreparationStore,

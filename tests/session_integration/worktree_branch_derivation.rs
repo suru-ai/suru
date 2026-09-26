@@ -22,7 +22,7 @@ use suru::{
     source_control::{BranchRename, CreatedBranch, GitSourceControl, SourceControl},
 };
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{Duration, timeout},
 };
 
@@ -100,6 +100,7 @@ struct Fixture {
     client: ManagedClient,
     provider: ControlledProvider,
     renames: mpsc::UnboundedReceiver<Result<BranchRename, String>>,
+    observations: Arc<HeldObservations>,
 }
 
 /// Git in every respect, reporting how each rename settled once the Server is
@@ -110,6 +111,37 @@ struct Fixture {
 struct WitnessedGit {
     git: GitSourceControl,
     renames: mpsc::UnboundedSender<Result<BranchRename, String>>,
+    observations: Arc<HeldObservations>,
+}
+
+/// Holds the next reading of a linked Worktree once Git has answered it, so a
+/// test decides when that reading reaches the Server rather than racing it.
+#[derive(Default)]
+struct HeldObservations {
+    next: std::sync::Mutex<Option<HeldObservation>>,
+}
+
+struct HeldObservation {
+    read: oneshot::Sender<CheckoutSummary>,
+    release: oneshot::Receiver<()>,
+}
+
+impl HeldObservations {
+    /// Holds the next reading of a linked Worktree, handing back where that
+    /// reading arrives once Git has answered and what lets it go on.
+    fn hold_next(&self) -> (oneshot::Receiver<CheckoutSummary>, oneshot::Sender<()>) {
+        let (read, taken) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let held = HeldObservation {
+            read,
+            release: released,
+        };
+        assert!(
+            self.next.lock().unwrap().replace(held).is_none(),
+            "one reading is held at a time"
+        );
+        (taken, release)
+    }
 }
 
 #[async_trait::async_trait]
@@ -158,7 +190,16 @@ impl SourceControl for WitnessedGit {
         self.git.recover_checkout(repository, checkout).await
     }
     async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
-        self.git.observe(checkout).await
+        let reading = self.git.observe(checkout).await;
+        let held = match checkout.kind {
+            CheckoutKind::Linked => self.observations.next.lock().unwrap().take(),
+            CheckoutKind::Main => None,
+        };
+        if let Some(held) = held {
+            let _ = held.read.send(reading.clone());
+            let _ = held.release.await;
+        }
+        reading
     }
     async fn list_checkouts(
         &self,
@@ -223,7 +264,7 @@ impl Fixture {
             .expect("configure server")
             .data_dir()
             .to_owned();
-        let (server, client, provider, renames) =
+        let (server, client, provider, renames, observations) =
             spawn(&state, channel, config.as_ref(), timings, git(&data)).await;
         Self {
             _temporary: temporary,
@@ -236,6 +277,7 @@ impl Fixture {
             client,
             provider,
             renames,
+            observations,
         }
     }
 
@@ -355,6 +397,53 @@ impl Fixture {
             .expect("the Server is still running")
     }
 
+    /// Removes a Worktree outside Suru, then prompts a Session working in it
+    /// and waits for that Prompt to reach its Provider in the Worktree Suru
+    /// recovered in its place.
+    async fn remove_and_prompt(
+        &mut self,
+        session_id: SessionId,
+        destination: &Path,
+    ) -> ControlledProviderSession {
+        git(
+            &self.main,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                destination.to_str().unwrap(),
+            ],
+        );
+        assert!(!destination.exists());
+        self.client
+            .admit_prompt(
+                session_id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "Carry on".to_owned(),
+                        skill_invocations: vec![],
+                    },
+                    delivery: PromptDelivery::Steer,
+                },
+            )
+            .await
+            .expect("admit a Prompt to the Session");
+        let start = timeout(PROGRESS_DEADLINE, self.provider.next_start())
+            .await
+            .expect("the recreated Worktree reconnects its Provider");
+        assert_eq!(start.execution_directory(), destination);
+        let mut session = start.succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: hosted_selection(PROVIDER, MODEL),
+        });
+        timeout(PROGRESS_DEADLINE, session.next_turn())
+            .await
+            .expect("the Prompt reaches the Provider")
+            .succeed();
+        session
+    }
+
     fn no_rename_attempted(&mut self) {
         assert!(
             self.renames.try_recv().is_err(),
@@ -374,6 +463,7 @@ async fn spawn(
     ManagedClient,
     ControlledProvider,
     mpsc::UnboundedReceiver<Result<BranchRename, String>>,
+    Arc<HeldObservations>,
 ) {
     let (runtime, provider) = controlled_provider();
     let mut server_config = ServerConfig::new(state, channel).expect("configure server");
@@ -381,11 +471,16 @@ async fn spawn(
         server_config = server_config.with_config_dir(config.path());
     }
     let (renames, witnessed) = mpsc::unbounded_channel();
+    let observations = Arc::new(HeldObservations::default());
     let server = server::spawn_with_source_control(
         server_config,
         vec![runtime],
         timings,
-        Arc::new(WitnessedGit { git, renames }),
+        Arc::new(WitnessedGit {
+            git,
+            renames,
+            observations: observations.clone(),
+        }),
     )
     .await
     .expect("spawn server");
@@ -394,7 +489,7 @@ async fn spawn(
             .await
             .expect("connect client");
     crate::support::receive_managed_client_initial_state(&mut client).await;
-    (server, client, provider, witnessed)
+    (server, client, provider, witnessed, observations)
 }
 
 /// An Errand the test has taken from the Provider, with what it asked kept
@@ -903,7 +998,7 @@ async fn a_restart_after_admission_attempts_no_rename() {
     server.shutdown().await.expect("shut down server");
     drop((outstanding, provider));
 
-    let (server, client, mut provider, mut renames) = spawn(
+    let (server, client, mut provider, mut renames, _) = spawn(
         &state,
         channel,
         None,
@@ -1124,44 +1219,9 @@ async fn a_worktree_removed_right_after_its_rename_recovers_on_the_new_branch() 
     recovers_on(&fixture, created.session.id, renamed).await;
 
     // Gone outside Suru, with no observation to have noticed either change.
-    git(
-        &main,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            destination.to_str().unwrap(),
-        ],
-    );
-    assert!(!destination.exists());
-    fixture
-        .client
-        .admit_prompt(
-            created.session.id,
-            AdmitPromptRequest {
-                prompt: InitialPrompt {
-                    id: PromptId::new(),
-                    text: "Carry on".to_owned(),
-                    skill_invocations: vec![],
-                },
-                delivery: PromptDelivery::Steer,
-            },
-        )
-        .await
-        .expect("admit a Prompt to the Session");
-    let start = timeout(PROGRESS_DEADLINE, fixture.provider.next_start())
-        .await
-        .expect("the recreated Worktree reconnects its Provider");
-    assert_eq!(start.execution_directory(), destination);
-    let mut session = start.succeed(AgentIdentity {
-        agent: AgentId::new("controlled-agent"),
-        selection: hosted_selection(PROVIDER, MODEL),
-    });
-    timeout(PROGRESS_DEADLINE, session.next_turn())
-        .await
-        .expect("the Prompt reaches the Provider")
-        .succeed();
-
+    let _recovered = fixture
+        .remove_and_prompt(created.session.id, &destination)
+        .await;
     assert_eq!(head(&destination).as_deref(), Some(renamed));
     assert!(!branches(&main).contains(&"suru/fix-parser".to_owned()));
     assert!(
@@ -1169,6 +1229,104 @@ async fn a_worktree_removed_right_after_its_rename_recovers_on_the_new_branch() 
         "Reclaim still finds the branch's recorded base"
     );
 
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_observation_read_before_the_rename_cannot_undo_its_recording() {
+    let mut fixture = Fixture::start("derived-branch-stale-observation").await;
+    let descriptor = fixture.server.descriptor().clone();
+    let catalog = open_catalog_stream(&descriptor).await;
+    let (stale, release_stale) = fixture.observations.hold_next();
+    let main = fixture.main.clone();
+    let (preparation, created, errand) = fixture.admitted(&main, "Fix the parser").await;
+    let destination = preparation.destination.path.clone();
+    let stale = timeout(PROGRESS_DEADLINE, stale)
+        .await
+        .expect("observation reads the fresh Worktree")
+        .expect("the reading is handed over");
+    assert!(
+        matches!(
+            &stale.revision,
+            Some(CheckoutRevision::Branch { name, .. }) if name == "suru/fix-parser"
+        ),
+        "{:?}",
+        stale.revision
+    );
+
+    // The rename is read and recorded while that reading is still on its way.
+    errand.succeed(json!({
+        "title": "Repair the config parser",
+        "icon": "md-bug",
+        "branch": "repair config parser",
+    }));
+    let _first = fixture.work_the_first_turn().await;
+    fixture.workspace_errand().await;
+    let renamed = "suru/repair-config-parser";
+    assert_eq!(
+        fixture.rename_attempted().await,
+        Ok(BranchRename::Renamed {
+            branch: renamed.to_owned()
+        })
+    );
+    recovers_on(&fixture, created.session.id, renamed).await;
+
+    // Observation goes on to its next reading of the Worktree only once the
+    // held one has arrived, and that next one is held for good, so nothing
+    // after the stale reading can put right what it did.
+    let (next, _held_for_good) = fixture.observations.hold_next();
+    release_stale.send(()).unwrap();
+    timeout(PROGRESS_DEADLINE, next)
+        .await
+        .expect("observation goes on to its next reading")
+        .expect("the reading is handed over");
+    let summary = fixture
+        .client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .find_map(|item| match item {
+            SessionListItem::Readable(summary) if summary.session.id == created.session.id => {
+                Some(summary)
+            }
+            _ => None,
+        })
+        .expect("the Session is listed");
+    let branch_of = |revision: Option<&CheckoutRevision>| match revision {
+        Some(CheckoutRevision::Branch { name, .. }) => Some(name.clone()),
+        _ => None,
+    };
+    assert_eq!(
+        branch_of(
+            summary
+                .session
+                .checkout
+                .as_ref()
+                .and_then(|checkout| checkout.recovery_revision.as_ref())
+        )
+        .as_deref(),
+        Some(renamed),
+        "the recovery facts still name the new branch"
+    );
+    assert_eq!(
+        branch_of(
+            summary
+                .checkout_state
+                .as_ref()
+                .and_then(|state| state.revision.as_ref())
+        )
+        .as_deref(),
+        Some(renamed),
+        "the Checkout State never steps back to the old branch"
+    );
+
+    let _recovered = fixture
+        .remove_and_prompt(created.session.id, &destination)
+        .await;
+    assert_eq!(head(&destination).as_deref(), Some(renamed));
+
+    drop(catalog);
     fixture.server.shutdown().await.expect("shut down server");
 }
 

@@ -100,6 +100,11 @@ struct SessionStoreState {
     /// subscriber is expressing interest, so a reading is only ever one taken
     /// during that interest.
     observed_checkouts: HashMap<crate::protocol::CheckoutId, crate::protocol::CheckoutSummary>,
+    /// How many readings taken under source control's mutation guard each
+    /// Worktree has had recorded. Observation reads without that guard, so a
+    /// reading it began before the latest of them is dropped rather than
+    /// written over what the guarded one recorded.
+    guarded_checkout_recordings: HashMap<crate::protocol::CheckoutId, u64>,
     deferred: Option<DeferredSessions>,
     /// The Sessions whose undelivered Prompt a stored Worktree preparation can
     /// still deliver, so restoring their history leaves that Prompt standing
@@ -249,6 +254,7 @@ impl SessionStore {
             catalog,
             subagent_trees: Default::default(),
             observed_checkouts: HashMap::new(),
+            guarded_checkout_recordings: HashMap::new(),
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
             posture_generations: HashMap::new(),
