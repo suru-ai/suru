@@ -64,7 +64,7 @@ async fn configured_permission_mode_is_fixed_on_the_user_session_launch() {
         r#"{"provider":{"claude":{"permissionMode":"dontAsk"}}}"#,
     )
     .await;
-    let launch = fixture.launch_carrying("--session-id");
+    let launch = fixture.wait_for_launch_carrying("--session-id").await;
     assert_eq!(launch.value("--permission-mode"), "dontAsk");
     assert_eq!(launch.value("--permission-prompt-tool"), "stdio");
     assert!(!launch.carries("--dangerously-skip-permissions"));

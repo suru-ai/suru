@@ -69,7 +69,10 @@ pub fn models_without(models: &str, value: &str) -> String {
 /// `$attempt` counts the launches for the arms that answer the CLI's nth launch differently from
 /// its first. It is a read-then-write of a shared file, so a fixture whose launches genuinely
 /// overlap should not be scripted against it.
+///
+/// A [warm-up](warm_up) launch leaves before any of that, so it is never counted as a launch.
 const SCRIPT_PREFIX: &str = r#"#!/bin/sh
+[ -n "$SURU_FIXTURE_WARM_UP" ] && exit 0
 attempt=1
 if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
   attempt=$(( $(cat "$CLAUDE_FIXTURE_ATTEMPTS") + 1 ))
@@ -389,6 +392,7 @@ impl ScriptedClaude {
             .replace("$CLAUDE_FIXTURE_SIGNED_IN", fixture_path(&signed_in))
             .replace("$CLAUDE_FIXTURE_UPGRADED", fixture_path(&upgraded));
         write_executable(&executable, &script);
+        warm_up(&executable);
         Self {
             _directory: directory,
             executable,
@@ -420,6 +424,7 @@ impl ScriptedClaude {
     /// Puts the program back at the path the runtime resolves.
     pub fn install(&self) {
         write_executable(&self.executable, &self.script);
+        warm_up(&self.executable);
     }
 
     /// Signs the fixture's user in, which is what [`signed_out_initialize_arm`] answers the account
@@ -542,10 +547,44 @@ impl ScriptedClaude {
         .await
         .unwrap_or_else(|_| panic!("{count} scripted Claude processes exit cooperatively"));
     }
+
+    /// [`launch_carrying`](Self::launch_carrying), once the runtime has made that launch. A Turn
+    /// reads as Active as soon as its Prompt is delivered, before the runtime spawns the child that
+    /// runs it, so a test holding only an Active Turn waits here rather than reading at once.
+    pub async fn wait_for_launch_carrying(&self, flag: &str) -> Launch {
+        timeout(PROGRESS_DEADLINE, async {
+            while !self
+                .exact_launches()
+                .iter()
+                .any(|launch| launch.carries(flag))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the scripted Claude is launched with {flag}"));
+        self.launch_carrying(flag)
+    }
 }
 
 fn fixture_path(path: &std::path::Path) -> &str {
     path.to_str().expect("fixture path is UTF-8")
+}
+
+/// Runs the fixture once, doing nothing, before any runtime launches it. macOS assesses a newly
+/// written program the first time it runs, which can take a few hundred milliseconds — longer
+/// than the control-request timeouts some tests inject — so without this the first launch a test
+/// makes would time out on the assessment rather than on what the test is about.
+fn warm_up(executable: &std::path::Path) {
+    let status = std::process::Command::new(executable)
+        .env("SURU_FIXTURE_WARM_UP", "1")
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("run the scripted Claude's warm-up launch");
+    assert!(
+        status.success(),
+        "the scripted Claude's warm-up launch exits cleanly"
+    );
 }
 
 /// The value `arguments` gives `flag`, which is the argument after it.
