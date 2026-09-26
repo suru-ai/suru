@@ -14,4 +14,5 @@ Claude (through `SendMessage`) and Codex (through `send_input` / `followup_task`
 - A Subagent entry's Marker comes from its Session's latest Turn. Its time is summed over all its Turns. Neither is read from any one row.
 - Each row's duration and outcome describe only its own stretch.
 - Stopping and Interventions follow the Subagent's current Turn, whichever row began it.
-- Copilot doesn't take part: its Subagents report themselves as not resumable.
+- Copilot doesn't take part: its Subagents report themselves as not resumable. Its documented `idle` and `queued` deliveries of `write_agent` look like resumes, though, so this needs re-checking against a live capture.
+- A resume that begins only after the Turn that delegated it has Settled (a late steer, ADR 0032) puts its row in whatever parent Turn is active, or a Continuation it begins.
