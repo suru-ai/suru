@@ -15,7 +15,7 @@ use suru::provider::{
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture,
     ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
     ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderTurnInput,
+    ProviderTurnInput, ProviderWatchId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -150,6 +150,7 @@ pub struct ControlledProviderSession {
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
     subagent_stops: mpsc::UnboundedReceiver<SubagentStop>,
+    watches_stops: mpsc::UnboundedReceiver<WatchesStop>,
     posture_updates: mpsc::UnboundedReceiver<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ControlledProviderEvent>,
@@ -198,6 +199,14 @@ pub struct SubagentsStop {
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
+/// One Watch stop request — the interrupt of a Session that is only
+/// Monitoring — remembering the Watches it named, held until the test answers
+/// it.
+pub struct WatchesStop {
+    watches: Vec<ProviderWatchId>,
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
 /// One per-Subagent stop request, remembering the identity it named, held
 /// until the test answers it.
 pub struct SubagentStop {
@@ -215,6 +224,7 @@ struct ControlledSessionHandle {
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
     subagent_stops: mpsc::UnboundedSender<SubagentStop>,
+    watches_stops: mpsc::UnboundedSender<WatchesStop>,
     posture_updates: mpsc::UnboundedSender<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
 }
@@ -483,6 +493,7 @@ impl StartRequest {
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
         let (subagent_stops_tx, subagent_stops_rx) = mpsc::unbounded_channel();
+        let (watches_stops_tx, watches_stops_rx) = mpsc::unbounded_channel();
         let (posture_updates_tx, posture_updates_rx) = mpsc::unbounded_channel();
         let gate_posture_updates = Arc::new(AtomicBool::new(false));
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ControlledProviderEvent>();
@@ -508,6 +519,7 @@ impl StartRequest {
                     interruptions: interruptions_tx,
                     subagents_stops: subagents_stops_tx,
                     subagent_stops: subagent_stops_tx,
+                    watches_stops: watches_stops_tx,
                     posture_updates: posture_updates_tx,
                     gate_posture_updates: gate_posture_updates.clone(),
                 }),
@@ -524,6 +536,7 @@ impl StartRequest {
             interruptions: interruptions_rx,
             subagents_stops: subagents_stops_rx,
             subagent_stops: subagent_stops_rx,
+            watches_stops: watches_stops_rx,
             posture_updates: posture_updates_rx,
             gate_posture_updates,
             events: events_tx,
@@ -657,6 +670,20 @@ impl ControlledProviderSession {
         self.subagent_stops.try_recv().ok()
     }
 
+    pub async fn next_watches_stop(&mut self) -> WatchesStop {
+        self.watches_stops
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
+    }
+
+    /// The Watch stop already asked for, without waiting for one. A test that
+    /// must show a Provider was *never* asked to stop a Watch reads the
+    /// absence here rather than waiting out a timeout.
+    pub fn try_next_watches_stop(&mut self) -> Option<WatchesStop> {
+        self.watches_stops.try_recv().ok()
+    }
+
     pub fn emit(&self, event: ProviderEvent) {
         self.events
             .send((Ok(event.into()), None))
@@ -761,6 +788,26 @@ impl SubagentsStop {
         self.response
             .send(Ok(()))
             .unwrap_or_else(|_| panic!("Provider Subagent stop response remains connected"));
+    }
+}
+
+impl WatchesStop {
+    /// The Provider identities of the Watches the stop named, as the test
+    /// minted them, in the order they were named.
+    pub fn watches(&self) -> Vec<&str> {
+        self.watches.iter().map(ProviderWatchId::as_str).collect()
+    }
+
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider Watch stop response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider Watch stop response remains connected"));
     }
 }
 
@@ -1171,6 +1218,22 @@ impl ProviderSession for ControlledSessionHandle {
             response_rx
                 .await
                 .map_err(|_| ProviderError::new("test Provider Subagent stop was abandoned"))?
+        })
+    }
+
+    fn stop_watches(&self, watches: Vec<ProviderWatchId>) -> ProviderFuture<'_, ()> {
+        let stops = self.watches_stops.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            stops
+                .send(WatchesStop {
+                    watches,
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider Watch stop was abandoned"))?
         })
     }
 

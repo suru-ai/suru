@@ -51,7 +51,10 @@ use super::{
     projection::{ClaudeProjection, provider_events},
     runtime::usable_claude_models,
     skills::ClaudeSkills,
-    transport::{ClaudeConnection, ClaudeSettingSources, ConversationSink, StreamJsonTransport},
+    transport::{
+        ClaudeConnection, ClaudeSettingSources, ConversationItem, ConversationSink,
+        StreamJsonTransport,
+    },
     turn_in_flight::TurnInFlight,
     wire::{ControlRequest, UserMessageEnvelope},
 };
@@ -60,7 +63,7 @@ use crate::{
     provider::{
         ProviderDecisionDelivery, ProviderError, ProviderFuture, ProviderResumeState,
         ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderSubagentId, ProviderTurnInput,
+        ProviderSubagentId, ProviderTurnInput, ProviderWatchId,
         harness::{ProcessGuard, ProcessRegistry},
     },
 };
@@ -360,12 +363,28 @@ impl ClaudeSession {
     }
 
     /// Stops every background task the CLI has reported running, so nothing the Turn spawned
-    /// outlives the interrupt that follows it. The stops go out together and each is bounded by
-    /// the interrupt's own timeout; one the CLI refuses or never answers is passed over, because
-    /// stopping the loop matters more than any single task and a task Suru could not stop is one
-    /// the CLI still has on its roster.
+    /// outlives the interrupt that follows it. One the CLI refuses or never answers is passed
+    /// over, because stopping the loop matters more than any single task and a task Suru could not
+    /// stop is one the CLI still has on its roster.
     async fn stop_background_tasks(&self, transport: &StreamJsonTransport) {
-        let tasks = self.turn.live_tasks();
+        let _ = self.stop_tasks(transport, self.turn.live_tasks()).await;
+    }
+
+    /// Asks the CLI to stop each of `tasks`, together, each stop bounded by the interrupt's own
+    /// timeout, and answers whether every one was acknowledged.
+    ///
+    /// A task the CLI acknowledges stopping is off its roster now: its own notification can lose
+    /// the race with whatever the caller does next, or never come at all. So it leaves Suru's
+    /// roster at once, and the conversation hears of it too, where a Watch among them settles as
+    /// stopped — a Session must not stay Monitoring on a Watch the CLI has already let go of.
+    async fn stop_tasks(
+        &self,
+        transport: &StreamJsonTransport,
+        tasks: Vec<String>,
+    ) -> Result<(), ProviderError> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
         let requests = tasks
             .iter()
             .map(|task_id| ControlRequest::StopTask {
@@ -378,13 +397,23 @@ impl ClaudeSession {
                 .map(|request| transport.control_request(request, self.interrupt_request_timeout)),
         )
         .await;
-        for (task_id, stopped) in tasks.iter().zip(stopped) {
-            // A task the CLI acknowledges stopping is off the roster now: its own notification
-            // can lose the race with the interrupt that follows.
-            if stopped.is_ok() {
-                self.turn.task_settled(task_id);
+        let mut acknowledged = Vec::new();
+        let mut failure = None;
+        for (task_id, stopped) in tasks.into_iter().zip(stopped) {
+            match stopped {
+                Ok(_) => {
+                    self.turn.task_settled(&task_id);
+                    acknowledged.push(task_id);
+                }
+                Err(error) => failure = Some(error.into_error()),
             }
         }
+        if !acknowledged.is_empty() {
+            let _ = self
+                .conversation
+                .send(Ok(ConversationItem::TasksStopped(acknowledged)));
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -645,6 +674,33 @@ impl ProviderSession for ClaudeSession {
             // can lose the race with what the caller does next.
             self.turn.task_settled(&task_id);
             Ok(())
+        })
+    }
+
+    /// Stops the named Watches with the CLI's per-task stop, and nothing else: no loop interrupt,
+    /// because the Session being interrupted is only Monitoring and runs no loop to stop. A Watch
+    /// no longer on the roster — settled, or died with a process since replaced — is passed over,
+    /// since asking the CLI to stop a task it no longer has would only be refused.
+    fn stop_watches(&self, watches: Vec<ProviderWatchId>) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            const CONTEXT: &str = "Claude Watch stop failed";
+            let transport = {
+                let slot = self.child.lock().await;
+                slot.running.as_ref().map(|child| child.transport.clone())
+            };
+            // No child means no process for a Watch to run in: every one died with the last.
+            let Some(transport) = transport else {
+                return Ok(());
+            };
+            let live = self.turn.live_tasks();
+            let tasks = watches
+                .iter()
+                .map(|watch| watch.as_str().to_owned())
+                .filter(|task_id| live.contains(task_id))
+                .collect();
+            self.stop_tasks(&transport, tasks)
+                .await
+                .map_err(|error| claude_error_context(CONTEXT, error))
         })
     }
 

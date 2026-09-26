@@ -545,6 +545,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
+        watches: Vec::new(),
         subagent_usage: Some(UsageTotal {
             fresh_input_tokens: Some(2_000),
             output_tokens: Some(500),
@@ -655,7 +656,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "cost": 0.05,
             "cost_is_partial": false
         },
-        "total_cost": null
+        "total_cost": null,
+        "watches": []
     });
 
     assert_eq!(

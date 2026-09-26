@@ -17,7 +17,7 @@ use crate::{
     managed_client::SessionProjection,
     protocol::{
         LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
-        SessionSnapshot, SessionStatus, SessionTimestamp,
+        SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -3948,9 +3948,11 @@ enum SessionTail {
     Working {
         state: WorkingIndicatorState,
         /// Absent in a claim, whose Working began at a moment only the Server
-        /// knows.
+        /// knows. For a Session that is Monitoring, when Monitoring began.
         working_since: Option<SessionTimestamp>,
         interrupt: Option<WorkingIndicatorInterrupt>,
+        /// What a Monitoring Session waits on, already worded.
+        watching: Option<String>,
     },
     /// A refusal this client draws itself: transcript-shaped, and never part of
     /// the Transcript.
@@ -4023,6 +4025,7 @@ fn render_provisional_session(
             } else {
                 interrupt_guidance(state)
             }),
+            watching: None,
         },
     };
     render_session_surface(
@@ -4071,9 +4074,8 @@ fn render_session(
     // instead of interrupting, so its indicator carries elapsed work but no
     // false gesture.
     let subagent_view = snapshot.session.parent.is_some();
-    let tail = snapshot
-        .working_since()
-        .map_or(SessionTail::Quiet, |since| SessionTail::Working {
+    let tail = if let Some(since) = snapshot.working_since() {
+        SessionTail::Working {
             state: if snapshot.session.status == SessionStatus::Active {
                 WorkingIndicatorState::Working
             } else {
@@ -4081,7 +4083,25 @@ fn render_session(
             },
             working_since: Some(since),
             interrupt: (!subagent_view).then(|| interrupt_guidance(state)),
-        });
+            watching: None,
+        }
+    } else if let Some(since) = snapshot.monitoring_since() {
+        // A stop the reader has confirmed says so until the Watches settle,
+        // since that is when the Session stops Monitoring.
+        let interrupt = if state.watch_stop_requested(session_reference, since) {
+            WorkingIndicatorInterrupt::Requested
+        } else {
+            interrupt_guidance(state)
+        };
+        SessionTail::Working {
+            state: WorkingIndicatorState::Monitoring,
+            working_since: Some(since),
+            interrupt: (!subagent_view).then_some(interrupt),
+            watching: watching_subject(&snapshot.watches),
+        }
+    } else {
+        SessionTail::Quiet
+    };
     render_session_surface(
         frame,
         state,
@@ -4147,6 +4167,7 @@ fn render_session_surface(
             state: indicator_state,
             working_since,
             interrupt,
+            watching,
         } => {
             let context = WorkingIndicatorSlotContext {
                 session_id,
@@ -4154,6 +4175,7 @@ fn render_session_surface(
                 state: *indicator_state,
                 working_since: *working_since,
                 interrupt: *interrupt,
+                watching: watching.clone(),
             };
             let default = working_indicator_line(
                 &context,
@@ -4552,6 +4574,18 @@ fn working_indicator_label(state: WorkingIndicatorState) -> &'static str {
         WorkingIndicatorState::CreatingWorktree => "Creating worktree",
         WorkingIndicatorState::Working => "Working",
         WorkingIndicatorState::WaitingForSubagents => "Waiting for subagents",
+        WorkingIndicatorState::Monitoring => "Monitoring",
+    }
+}
+
+/// How the Working Indicator names what a Monitoring Session waits on: its one
+/// Watch by the description its Provider gave it, or several by how many there
+/// are, so the line stays one line however many there are.
+fn watching_subject(watches: &[WatchSummary]) -> Option<String> {
+    match watches {
+        [] => None,
+        [watch] => Some(watch.description.clone()),
+        several => Some(format!("{} Watches", several.len())),
     }
 }
 
@@ -4570,11 +4604,25 @@ fn working_indicator_line(
     let elapsed = context
         .working_since
         .map(|since| working_indicator_elapsed(since, now));
-    let guidance = context.interrupt.map(|interrupt| match interrupt {
-        WorkingIndicatorInterrupt::Ready => format!("{interrupt_binding} to interrupt"),
-        WorkingIndicatorInterrupt::Armed => format!("{interrupt_binding} again to interrupt"),
-        WorkingIndicatorInterrupt::Requested => "interrupting…".to_owned(),
-    });
+    // Interrupting a Monitoring Session stops its Watches and nothing else,
+    // so the gesture is offered as stopping them.
+    let monitoring = context.state == WorkingIndicatorState::Monitoring;
+    let guidance = context
+        .interrupt
+        .map(|interrupt| match (interrupt, monitoring) {
+            (WorkingIndicatorInterrupt::Ready, false) => {
+                format!("{interrupt_binding} to interrupt")
+            }
+            (WorkingIndicatorInterrupt::Armed, false) => {
+                format!("{interrupt_binding} again to interrupt")
+            }
+            (WorkingIndicatorInterrupt::Requested, false) => "interrupting…".to_owned(),
+            (WorkingIndicatorInterrupt::Ready, true) => format!("{interrupt_binding} to stop"),
+            (WorkingIndicatorInterrupt::Armed, true) => {
+                format!("{interrupt_binding} again to stop")
+            }
+            (WorkingIndicatorInterrupt::Requested, true) => "stopping…".to_owned(),
+        });
     let metadata = match (elapsed, guidance) {
         (None, None) => String::new(),
         (Some(said), None) | (None, Some(said)) => format!(" ({said})"),
@@ -4589,9 +4637,15 @@ fn working_indicator_line(
     )
     .into_iter()
     .map(|span| SlotText::new(span.content.into_owned(), span.style));
+    // Only the label is live; what it names stays readable beside it.
+    let watching = context
+        .watching
+        .as_ref()
+        .map(|watching| SlotText::new(format!(" {watching}"), theme.text.subdued));
     Line::from(
         truncate_slot_text(
             label
+                .chain(watching)
                 .chain(std::iter::once(SlotText::new(metadata, theme.text.subdued)))
                 .collect(),
             usize::from(context.width),
@@ -5394,6 +5448,7 @@ mod tests {
                 pending_approvals: Vec::new(),
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: crate::protocol::SessionRevision(0),
+                watches: Vec::new(),
                 subagent_usage: Some(UsageTotal {
                     cost: Cost::from_usd(0.42),
                     ..UsageTotal::default()
@@ -5654,6 +5709,7 @@ mod tests {
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),
+                    watches: Vec::new(),
                     subagent_usage: None,
                     total_cost: None,
                 },
@@ -5735,6 +5791,7 @@ mod tests {
                     pending_approvals: Vec::new(),
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),
+                    watches: Vec::new(),
                     subagent_usage: None,
                     total_cost: None,
                 },

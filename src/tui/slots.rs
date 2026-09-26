@@ -63,6 +63,9 @@ pub(super) enum WorkingIndicatorState {
     CreatingWorktree,
     Working,
     WaitingForSubagents,
+    /// Nothing is Working, but Watches the Agent left running may still wake
+    /// it (ADR 0030). Interrupting stops them rather than any Turn.
+    Monitoring,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,13 +78,19 @@ pub(super) enum WorkingIndicatorInterrupt {
     Requested,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct WorkingIndicatorSlotContext {
     pub(super) session_id: SessionId,
     pub(super) width: u16,
     pub(super) state: WorkingIndicatorState,
+    /// When the state's elapsed time counts from: when Working began, or —
+    /// Monitoring — when Monitoring did.
     pub(super) working_since: Option<SessionTimestamp>,
     pub(super) interrupt: Option<WorkingIndicatorInterrupt>,
+    /// What a Monitoring Session waits on, already worded: its one Watch's
+    /// description, or how many Watches there are. `None` in every other
+    /// state.
+    pub(super) watching: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +275,7 @@ impl RenderSlots {
             context.state,
             context.working_since,
             context.interrupt,
+            &context.watching,
         );
         self.working_indicator.compose(context, vec![default])
     }

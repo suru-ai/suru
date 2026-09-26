@@ -2,7 +2,8 @@
 //! running keeps its Session Monitoring once nothing is Working, counted from
 //! the later of when Working last ended and when the Watch started, carried on
 //! the Session, its listing, and the catalog stream alike — and never stored,
-//! so no Session is Monitoring after a restart.
+//! so no Session is Monitoring after a restart. Interrupting a Session that is
+//! only Monitoring asks its Provider to stop the Watches, and settles nothing.
 
 use crate::server_support::{PROGRESS_DEADLINE, next_catalog_change_matching};
 use crate::support::{WorkingTurn, open_catalog_stream_with_snapshot, read_session_until};
@@ -12,8 +13,8 @@ use suru::{
         SessionSummary, SessionTimestamp, TurnStatus,
     },
     provider::{
-        ProviderEvent, ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId,
-        ProviderWatchOutcome,
+        ProviderEvent, ProviderEventAttribution, ProviderSubagentId, ProviderSubagentStatus,
+        ProviderWatchId, ProviderWatchOutcome,
     },
     server::{self, ServerConfig},
 };
@@ -358,4 +359,277 @@ async fn a_restarted_server_shows_no_session_monitoring() {
         None
     );
     restarted.shutdown().await.expect("shut down server");
+}
+
+/// Asks the server to interrupt `session_id`, answering with the raw response
+/// so what the interrupt did stays assertable.
+async fn interrupt(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> reqwest::Response {
+    client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/interrupt",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send Session interruption")
+}
+
+fn described(snapshot: &SessionSnapshot) -> Vec<&str> {
+    snapshot
+        .watches
+        .iter()
+        .map(|watch| watch.description.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn interrupting_a_monitoring_session_stops_its_watches_and_ends_monitoring_with_no_new_turn()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "interrupt-monitoring-test").await;
+    fixture
+        .provider_session
+        .emit(watch_started("task-tests", "cargo test"));
+    fixture
+        .provider_session
+        .emit(watch_started("monitor-1", "tail -f server.log"));
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let monitoring = session_where(&fixture, "the Turn settles", |snapshot| {
+        first_turn_settled(snapshot) && snapshot.watches.len() == 2
+    })
+    .await;
+    assert!(monitoring.session.monitoring_since.is_some());
+    assert_eq!(
+        described(&monitoring),
+        ["cargo test", "tail -f server.log"],
+        "a reader viewing the Session is told what it waits on, earliest first"
+    );
+
+    let (response, ()) = tokio::join!(
+        interrupt(
+            &fixture.client,
+            fixture.server.descriptor(),
+            fixture.session_id
+        ),
+        async {
+            let stop = timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_watches_stop(),
+            )
+            .await
+            .expect("the interrupt asks the Provider to stop the Watches");
+            assert_eq!(
+                stop.watches(),
+                ["monitor-1", "task-tests"],
+                "the stop names every live Watch"
+            );
+            stop.succeed();
+        }
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "stopping Watches is stopping work, not withdrawing a Prompt"
+    );
+    assert!(
+        fixture.provider_session.try_next_watches_stop().is_none(),
+        "the Watches are stopped once"
+    );
+
+    // The Provider reports each stopped Watch settling, waking nothing.
+    fixture.provider_session.emit(watch_stopped("task-tests"));
+    fixture.provider_session.emit(watch_stopped("monitor-1"));
+    let idle = session_where(&fixture, "the stopped Watches settle", |snapshot| {
+        snapshot.session.monitoring_since.is_none()
+    })
+    .await;
+    assert_eq!(idle.session.working_since, None);
+    assert!(idle.watches.is_empty(), "{:?}", idle.watches);
+    assert_eq!(
+        idle.turns.len(),
+        1,
+        "stopping Watches settles no Turn and begins none"
+    );
+    assert_eq!(
+        idle.turns[0].status,
+        TurnStatus::Completed,
+        "the Turn before the Watches keeps the settle it had"
+    );
+    assert_eq!(
+        idle.prompts, monitoring.prompts,
+        "no Prompt is withdrawn by stopping Watches"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_subagents_watch_rolls_up_to_what_its_parent_waits_on_and_the_parents_interrupt_stops_it()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "interrupt-subtree-watches-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    fixture
+        .provider_session
+        .emit(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: None,
+        });
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(subagent.clone()),
+            watch_started("child-monitor", "Watch the deploy log"),
+        )
+        .await;
+    fixture
+        .provider_session
+        .emit(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent,
+            status: ProviderSubagentStatus::Completed,
+        });
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let monitoring = session_where(&fixture, "the whole tree stops Working", |snapshot| {
+        first_turn_settled(snapshot) && snapshot.session.monitoring_since.is_some()
+    })
+    .await;
+    assert_eq!(
+        described(&monitoring),
+        ["Watch the deploy log"],
+        "a Watch a Subagent left running is what its parent waits on too"
+    );
+
+    let (response, ()) = tokio::join!(
+        interrupt(
+            &fixture.client,
+            fixture.server.descriptor(),
+            fixture.session_id
+        ),
+        async {
+            let stop = timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_watches_stop(),
+            )
+            .await
+            .expect("the interrupt asks the Provider to stop the Watches below the Session");
+            assert_eq!(stop.watches(), ["child-monitor"]);
+            stop.succeed();
+        }
+    );
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(ProviderSubagentId::new("task-1")),
+            watch_stopped("child-monitor"),
+        )
+        .await;
+    let idle = session_where(&fixture, "the Subagent's Watch settles", |snapshot| {
+        snapshot.session.monitoring_since.is_none()
+    })
+    .await;
+    assert!(idle.watches.is_empty());
+    assert_eq!(idle.turns.len(), 1);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn interrupting_a_session_whose_subagents_outlived_its_turn_stops_its_watches_as_well() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "interrupt-watches-and-subagents-test").await;
+    fixture
+        .provider_session
+        .emit(watch_started("task-tests", "cargo test"));
+    fixture
+        .provider_session
+        .emit(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: None,
+        });
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let delegated = session_where(&fixture, "the Turn settles", first_turn_settled).await;
+    assert!(delegated.session.working_since.is_some());
+
+    let (response, ()) =
+        tokio::join!(
+            interrupt(
+                &fixture.client,
+                fixture.server.descriptor(),
+                fixture.session_id
+            ),
+            async {
+                let stop = timeout(
+                    PROGRESS_DEADLINE,
+                    fixture.provider_session.next_watches_stop(),
+                )
+                .await
+                .expect("the interrupt stops the Watches");
+                assert_eq!(stop.watches(), ["task-tests"]);
+                stop.succeed();
+                timeout(
+            PROGRESS_DEADLINE,
+            fixture.provider_session.next_subagents_stop(),
+        )
+        .await
+        .expect("and the Subagents alike, since interrupting a top-level Session stops everything")
+        .succeed();
+            }
+        );
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_watch_stop_the_provider_refuses_leaves_the_session_monitoring() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "refused-watch-stop-test").await;
+    fixture
+        .provider_session
+        .emit(watch_started("task-tests", "cargo test"));
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    session_where(&fixture, "the Turn settles into Monitoring", |snapshot| {
+        first_turn_settled(snapshot) && snapshot.session.monitoring_since.is_some()
+    })
+    .await;
+
+    let (response, ()) = tokio::join!(
+        interrupt(
+            &fixture.client,
+            fixture.server.descriptor(),
+            fixture.session_id
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_watches_stop(),
+            )
+            .await
+            .expect("the interrupt asks the Provider to stop the Watch")
+            .fail("the task is not ours to stop");
+        }
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a stop the Provider refused is reported, not passed off as success"
+    );
+    let still = crate::support::read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert!(
+        still.session.monitoring_since.is_some(),
+        "a Watch the Provider would not stop is still live"
+    );
+    assert_eq!(described(&still), ["cargo test"]);
+    assert_eq!(still.turns.len(), 1);
+    fixture.server.shutdown().await.expect("shut down server");
 }

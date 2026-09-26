@@ -9,16 +9,17 @@
 
 use anyhow::anyhow;
 
-use crate::protocol::{SessionId, SessionTimestamp};
+use crate::protocol::{SessionId, SessionTimestamp, WatchSummary};
 use crate::provider::ProviderWatchId;
 
-use super::SessionStore;
+use super::{SessionStore, SessionStoreState};
 
 /// One Watch still live in a Session.
 #[derive(Debug)]
 pub(super) struct LiveWatch {
-    /// What the Watch is doing, in the words its Provider gave it — read back
-    /// when it settles, for the Watch Outcome that tells of it.
+    /// What the Watch is doing, in the words its Provider gave it: how the
+    /// Working Indicator names what a Monitoring Session waits on, and read
+    /// back when it settles, for the Watch Outcome that tells of it.
     pub(super) description: String,
     /// When the Server heard the Watch start, on the Session store's clock, so
     /// it orders against the Turn moments Monitoring is derived beside.
@@ -26,6 +27,25 @@ pub(super) struct LiveWatch {
 }
 
 impl SessionStore {
+    /// The Watches live anywhere in the Session's subtree, which is what
+    /// interrupting that Session asks its Provider to stop. A Watch belongs to
+    /// the Session whose Agent started it, so the subtree — not just the
+    /// Session — is what Monitoring and its interrupt both reach (ADR 0030).
+    pub(crate) fn live_watches(&self, session_id: SessionId) -> Vec<ProviderWatchId> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let mut watches = state
+            .subtree(session_id)
+            .into_iter()
+            .filter_map(|current| state.sessions.get(&current))
+            .flat_map(|record| record.watches.keys().cloned())
+            .collect::<Vec<_>>();
+        watches.sort_unstable();
+        watches
+    }
+
     /// Records a Watch the Session's Agent left running and re-derives the
     /// Session's liveness: once nothing in its tree is Working, the Watch
     /// keeps it Monitoring. A start repeating a live Watch's identity keeps
@@ -107,5 +127,29 @@ impl SessionStore {
             }
             state.reconcile_liveness(&self.storage, current);
         }
+    }
+}
+
+impl SessionStoreState {
+    /// What a reader viewing the Session is told it waits on: every Watch
+    /// live anywhere in its subtree, earliest first, the way Monitoring rolls
+    /// up through the tree.
+    pub(super) fn subtree_watches(&self, session_id: SessionId) -> Vec<WatchSummary> {
+        let mut watches = self
+            .subtree(session_id)
+            .into_iter()
+            .filter_map(|current| self.sessions.get(&current))
+            .flat_map(|record| record.watches.values())
+            .map(|watch| WatchSummary {
+                description: watch.description.clone(),
+                started_at: watch.started_at,
+            })
+            .collect::<Vec<_>>();
+        watches.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.description.cmp(&right.description))
+        });
+        watches
     }
 }

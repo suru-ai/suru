@@ -633,6 +633,15 @@ impl ProviderSession for CopilotSession {
         })
     }
 
+    /// Copilot reports no Watches yet, so no Session of its is ever Monitoring and there is
+    /// nothing to stop; its detached shells become Watches, and this their stop, in #387.
+    fn stop_watches(
+        &self,
+        _watches: Vec<crate::provider::ProviderWatchId>,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             // The harness process is the runtime's and hosts every other Copilot Session, so a

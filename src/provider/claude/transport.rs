@@ -54,6 +54,11 @@ pub(super) enum ConversationItem {
     /// running died with it and will never report settling. A Session outlives its processes, so
     /// this is where one process's work gives way to the next one's.
     ProcessEnded,
+    /// The Session asked the CLI to stop these tasks and the CLI acknowledged each stop, so they
+    /// are off its roster whether or not their own notifications ever follow. Sent by the Session
+    /// rather than the process, so a Watch among them settles as stopped even when the CLI never
+    /// says so itself.
+    TasksStopped(Vec<String>),
 }
 
 /// Which native filesystem settings a Claude process is allowed to load. User Sessions and Skill

@@ -66,6 +66,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
+        watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
     };

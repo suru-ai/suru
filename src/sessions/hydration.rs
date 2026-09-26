@@ -125,6 +125,7 @@ impl SessionStore {
                         record.snapshot.session.working_since;
                     persisted.snapshot.session.monitoring_since =
                         record.snapshot.session.monitoring_since;
+                    persisted.snapshot.watches = record.snapshot.watches.clone();
                     persisted.snapshot.subagent_usage = record.snapshot.subagent_usage;
                     persisted.snapshot.total_cost = record.snapshot.total_cost;
 

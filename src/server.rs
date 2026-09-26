@@ -2782,7 +2782,7 @@ async fn interrupt_session(
         Err(InterruptSessionError::NothingToInterrupt) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::NothingToInterrupt,
-            "Session has no active Turn and no working Subagent",
+            "Session has no active Turn, no working Subagent, and no live Watch",
         ),
         Err(InterruptSessionError::SubagentStopUnsupported) => session_error_response(
             StatusCode::CONFLICT,

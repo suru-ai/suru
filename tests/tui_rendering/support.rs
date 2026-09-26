@@ -515,6 +515,7 @@ pub fn failed_session_snapshot(
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
+        watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
     }
@@ -572,6 +573,7 @@ pub fn selected_session_snapshot(
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
+        watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
     }
@@ -611,6 +613,7 @@ pub fn navigable_session_snapshot(
         pending_approvals: Vec::new(),
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
+        watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
     };

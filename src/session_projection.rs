@@ -244,6 +244,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             SessionChange::SessionMonitoringChanged { monitoring_since } => {
                 next.session.monitoring_since = *monitoring_since;
             }
+            SessionChange::SessionWatchesChanged { watches } => {
+                next.watches.clone_from(watches);
+            }
             SessionChange::MessageAdded { message } => {
                 if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
                     bail!("Session update referenced an unknown Turn");
@@ -895,6 +898,7 @@ mod tests {
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
+            watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
         };

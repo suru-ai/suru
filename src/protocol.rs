@@ -3063,6 +3063,17 @@ pub struct SubagentInterventions {
     pub submitting_approvals: Vec<ApprovalId>,
 }
 
+/// One Watch live somewhere in a Session's subtree, as a reader viewing that
+/// Session is told what it is Monitoring: in the words its Provider gave it,
+/// and since when the Server heard it start. It is never stored, since no
+/// Watch outlives the Provider process that runs it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchSummary {
+    pub description: String,
+    pub started_at: SessionTimestamp,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
@@ -3102,6 +3113,13 @@ pub struct SessionSnapshot {
     /// Revision at which either live Approval list last changed.
     #[serde(default)]
     pub pending_approvals_revision: SessionRevision,
+    /// The Watches live anywhere in this Session's subtree, earliest first —
+    /// what the Session is waiting on while it is Monitoring. Derived by the
+    /// server beside [`Session::monitoring_since`], and like it never stored,
+    /// so a Session read after a restart has none. Only an open Session needs
+    /// them, so they ride the Session's own stream and no listing.
+    #[serde(default)]
+    pub watches: Vec<WatchSummary>,
 }
 
 impl SessionSnapshot {
@@ -3261,6 +3279,14 @@ pub enum SessionChange {
     /// settling can move it without any Turn moving.
     SessionMonitoringChanged {
         monitoring_since: Option<SessionTimestamp>,
+    },
+    /// The whole set of Watches live across this Session's subtree, derived
+    /// by the server whenever a Watch starts or settles anywhere below it.
+    /// Carried entire, like the Monitoring reading it explains, so a client
+    /// joining the stream late never has to reconstruct a Watch it did not
+    /// see start.
+    SessionWatchesChanged {
+        watches: Vec<WatchSummary>,
     },
     MessageAdded {
         message: Message,

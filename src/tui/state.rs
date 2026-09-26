@@ -546,6 +546,13 @@ pub struct TuiState {
     /// Whether the last frame actually drew current-Session animation. A
     /// Working Indicator that scrolled away cannot justify 32ms redraws.
     pub(super) session_animation_on_screen: Cell<bool>,
+    /// The Monitoring Session whose Watches the reader has confirmed stopping,
+    /// with when that Monitoring began. The stop settles nothing itself — the
+    /// Session stops Monitoring once the Watches settle — so the Working
+    /// Indicator says the stop is under way until then. Keyed by the reading
+    /// it was confirmed against, so Monitoring that ends and begins again
+    /// offers the gesture afresh.
+    watch_stop: Option<(SessionReference, crate::protocol::SessionTimestamp)>,
     /// When each visible Active Command first appeared to this client. Time
     /// stays out of transcript projection; the spinner tick reads these ages
     /// and writes Fold overrides only when a threshold is crossed.
@@ -864,6 +871,7 @@ impl TuiState {
             shimmer_clock: super::shimmer::Clock::default(),
             rail_origins: RefCell::new(HashMap::new()),
             session_animation_on_screen: Cell::new(false),
+            watch_stop: None,
             active_commands_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
             session_clock: SessionClock::default(),
@@ -3365,6 +3373,7 @@ impl TuiState {
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
+            watches: Vec::new(),
         })
     }
 
@@ -3583,11 +3592,37 @@ impl TuiState {
         {
             return Some(InterruptTarget::Prompt);
         }
-        let working = self
+        let snapshot = self.session.as_ref()?.snapshot();
+        if snapshot.working_since().is_some() {
+            return Some(InterruptTarget::Prompt);
+        }
+        snapshot
+            .monitoring_since()
+            .is_some()
+            .then_some(InterruptTarget::Watches)
+    }
+
+    /// Whether the reader has confirmed stopping the Watches of the Monitoring
+    /// `session` has been doing since `since`, so its Working Indicator says
+    /// the stop is under way rather than offering it again.
+    pub(super) fn watch_stop_requested(
+        &self,
+        session: &SessionReference,
+        since: crate::protocol::SessionTimestamp,
+    ) -> bool {
+        self.watch_stop
+            .as_ref()
+            .is_some_and(|(requested, at)| requested == session && *at == since)
+    }
+
+    /// Remembers that the reader confirmed stopping the open Session's
+    /// Watches, against the Monitoring reading they stop.
+    fn request_watch_stop(&mut self, session: &SessionReference) {
+        self.watch_stop = self
             .session
             .as_ref()
-            .is_some_and(|session| session.snapshot().working_since().is_some());
-        working.then_some(InterruptTarget::Prompt)
+            .and_then(|projection| projection.snapshot().monitoring_since())
+            .map(|since| (session.clone(), since));
     }
 
     fn active_turn_id(&self) -> Option<TurnId> {
@@ -3625,7 +3660,11 @@ impl TuiState {
                     Some(turn_id) => self.active_turn_id() == Some(turn_id),
                     None => matches!(
                         self.interrupt_target(),
-                        Some(InterruptTarget::Subagents | InterruptTarget::Prompt)
+                        Some(
+                            InterruptTarget::Subagents
+                                | InterruptTarget::Prompt
+                                | InterruptTarget::Watches
+                        )
                     ),
                 };
                 let expired = self
@@ -3651,6 +3690,9 @@ enum InterruptTarget {
     /// only claimed, with no Session to send anything to yet. Interrupting
     /// withdraws it instead of stopping a Turn.
     Prompt,
+    /// Nothing is Working, but the Session is Monitoring: interrupting stops
+    /// the Watches it waits on, and settles nothing (ADR 0030).
+    Watches,
 }
 
 /// Which neighbour a queued Prompt selection command moves to.
@@ -4591,6 +4633,9 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SessionOperationFailed(error) => {
+                // A Watch stop that failed stopped nothing, so the gesture is
+                // offered again.
+                self.state.watch_stop = None;
                 self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
@@ -6624,9 +6669,12 @@ impl Application {
             self.request_interrupt();
             return ApplicationTransition::Continue;
         };
+        let target = self.state.interrupt_target();
         self.state.command_mode = CommandMode::Composer;
         if let Some(turn_id) = turn_id {
             self.state.keep_interrupted_turn_open(turn_id);
+        } else if target == Some(InterruptTarget::Watches) {
+            self.state.request_watch_stop(&session);
         } else {
             self.state.await_withdrawal(&session, None);
         }
@@ -6655,7 +6703,9 @@ impl Application {
         self.state.command_mode = CommandMode::InterruptConfirmation {
             turn_id: match target {
                 InterruptTarget::Turn(turn_id) => Some(turn_id),
-                InterruptTarget::Subagents | InterruptTarget::Prompt => None,
+                InterruptTarget::Subagents | InterruptTarget::Prompt | InterruptTarget::Watches => {
+                    None
+                }
             },
             armed_at: self.state.presentation_clock.now(),
         };

@@ -197,13 +197,20 @@ enum ProviderCommand {
     SteerPrompt,
     /// Stop the Session's work, whatever it is: the active Turn — the
     /// Provider stops its background work first, in the established ordering
-    /// — or, with no Turn running, every Subagent still working.
+    /// — or, with no Turn running, every Watch still live and every Subagent
+    /// still working.
     InterruptSession {
         response: oneshot::Sender<Result<(), InterruptSessionError>>,
     },
     /// Stop the one working Subagent whose child Session is `target`, leaving
     /// everything else running.
     StopSubagent {
+        target: SessionId,
+        response: oneshot::Sender<Result<(), InterruptSessionError>>,
+    },
+    /// Stop the Watches live in `target`'s subtree, and nothing else: the
+    /// interrupt of a Session that is only Monitoring (ADR 0030).
+    StopWatches {
         target: SessionId,
         response: oneshot::Sender<Result<(), InterruptSessionError>>,
     },
@@ -1323,7 +1330,8 @@ impl ProviderOrchestrator {
 
     /// Stops what a Session is doing, whatever that is: the active Turn along
     /// with the Subagents it spawned, or — with no Turn running — the
-    /// Subagents alone. Interrupting a Subagent's own Session stops that one
+    /// Subagents alone, or — with nothing Working — the Watches it is
+    /// Monitoring. Interrupting a Subagent's own Session stops that one
     /// Subagent, through the Provider connection its root ancestor owns.
     pub(crate) async fn interrupt_session(
         &self,
@@ -1386,6 +1394,18 @@ impl ProviderOrchestrator {
             InterruptTarget::Subagent { root } => {
                 ask_actor_or_find_nothing_running(actor_commands(root), |response| {
                     ProviderCommand::StopSubagent {
+                        target: session_id,
+                        response,
+                    }
+                })
+                .await
+            }
+            // Settled by the Watches' own settling, which the Provider
+            // reports like any other: nothing here settles a Turn or
+            // withdraws a Prompt.
+            InterruptTarget::Watches => {
+                ask_actor_or_find_nothing_running(actor_commands(session_id), |response| {
+                    ProviderCommand::StopWatches {
                         target: session_id,
                         response,
                     }
@@ -1796,12 +1816,22 @@ async fn run_provider_session(
                 ProviderCommand::InterruptSession { response } => {
                     // A wake the interrupt beats begins no Turn to explain.
                     subagents.watch_outcomes.drop_all();
-                    // With no Turn active, the interrupt reaches the
-                    // Subagents that outlived it (ADR 0015). Nothing still
-                    // working answers success, because the work the caller
-                    // meant to stop is already over.
+                    // With no Turn active, the interrupt reaches the work
+                    // that outlived it: the Watches the Agent left running
+                    // (ADR 0030) and the Subagents (ADR 0015) alike, because
+                    // interrupting a top-level Session stops everything
+                    // below it. Nothing still running answers success,
+                    // because the work the caller meant to stop is already
+                    // over. A Watch stop the Provider refuses still leaves
+                    // the Subagents to stop, and is reported once they are.
+                    let watches_stopped = stop_live_watches(
+                        provider.as_ref().map(|connected| connected.session.clone()),
+                        &sessions,
+                        session_id,
+                    )
+                    .await;
                     if subagents.routes.is_empty() && subagents.rows.is_empty() {
-                        let _ = response.send(Ok(()));
+                        let _ = response.send(watches_stopped);
                         continue;
                     }
                     let connected = provider
@@ -1822,7 +1852,7 @@ async fn run_provider_session(
                     match stopped {
                         Ok(()) => {
                             subagents.stop_all(&sessions, &updates);
-                            let _ = response.send(Ok(()));
+                            let _ = response.send(watches_stopped);
                         }
                         Err(error) => {
                             let message = failure_message("Provider interruption failed", &error);
@@ -1847,6 +1877,21 @@ async fn run_provider_session(
                             &mut subagents,
                             &sessions,
                             &updates,
+                            target,
+                        )
+                        .await,
+                    );
+                    continue;
+                }
+                ProviderCommand::StopWatches { target, response } => {
+                    // Interrupting a Session that is only Monitoring, with no
+                    // Turn open: a Watch Outcome still held for the wake the
+                    // interrupt beats begins no Turn to explain (ADR 0030).
+                    subagents.watch_outcomes.drop_all();
+                    let _ = response.send(
+                        stop_live_watches(
+                            provider.as_ref().map(|c| c.session.clone()),
+                            &sessions,
                             target,
                         )
                         .await,
@@ -2596,6 +2641,19 @@ async fn run_provider_session(
                     .await,
                 );
             }
+            // A Watch stop that finds a Turn begun since it was asked for —
+            // the Watch's own settling woke the Agent, say — stops the
+            // Watches it named and leaves that Turn to run.
+            ProviderInput::Command(Some(ProviderCommand::StopWatches { target, response })) => {
+                let _ = response.send(
+                    stop_live_watches(
+                        provider.as_ref().map(|c| c.session.clone()),
+                        &sessions,
+                        target,
+                    )
+                    .await,
+                );
+            }
             ProviderInput::Event(event) => {
                 let Some(current) = active.as_mut() else {
                     continue;
@@ -2806,6 +2864,37 @@ async fn stop_one_subagent(
             &error,
         ))),
     }
+}
+
+/// Asks the Provider to stop every Watch live in `target`'s subtree. It
+/// settles nothing itself: each stopped Watch settles when the Provider
+/// reports it, as every Watch does, and the Session stops Monitoring then.
+/// With no Watch live — or no connection left for one to run over, since
+/// Watches are lost with it — there is nothing to stop, and stopping nothing
+/// succeeds. The Provider bounds each stop by its own interrupt timeout; a
+/// stop it refuses leaves everything running and reports the refusal, because
+/// a Watch the Provider would not stop is no reason to tear the Session down.
+async fn stop_live_watches(
+    connection: Option<Arc<dyn ProviderSession>>,
+    sessions: &SessionStore,
+    target: SessionId,
+) -> Result<(), InterruptSessionError> {
+    let watches = sessions.live_watches(target);
+    if watches.is_empty() {
+        return Ok(());
+    }
+    let Some(provider_session) = connection else {
+        return Ok(());
+    };
+    provider_session
+        .stop_watches(watches)
+        .await
+        .map_err(|error| {
+            InterruptSessionError::ProviderFailure(failure_message(
+                "Provider Watch stop failed",
+                &error,
+            ))
+        })
 }
 
 /// Drops the Provider connection and fails every Turn routed over it, in one

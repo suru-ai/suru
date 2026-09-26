@@ -100,6 +100,7 @@ impl SessionStoreState {
                 change,
                 SessionChange::SessionWorkingChanged { .. }
                     | SessionChange::SessionMonitoringChanged { .. }
+                    | SessionChange::SessionWatchesChanged { .. }
             )
         });
         stamp_turn_timing(&mut changes, updated_at);
@@ -311,11 +312,15 @@ impl SessionStoreState {
     /// child Session rides no catalog stream.
     ///
     /// A commit calls this for the Session it landed in; a Watch starting or
-    /// settling commits nothing, so the Watch table calls it directly.
+    /// settling commits nothing, so the Watch table calls it directly. The
+    /// Watches live below each Session ride the same revision as its
+    /// Monitoring reading, so a reader told the Session is Monitoring is told
+    /// what it is waiting on at once.
     pub(super) fn reconcile_liveness(&mut self, storage: &StorageSink, session_id: SessionId) {
         let ancestry = self.ancestry(session_id);
         for current in &ancestry.sessions {
             let reading = self.subtree_liveness_with(*current, None);
+            let watches = self.subtree_watches(*current);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
             };
@@ -332,6 +337,9 @@ impl SessionStoreState {
                 changes.push(SessionChange::SessionMonitoringChanged {
                     monitoring_since: reading.monitoring_since,
                 });
+            }
+            if record.snapshot.watches != watches {
+                changes.push(SessionChange::SessionWatchesChanged { watches });
             }
             if changes.is_empty() {
                 continue;

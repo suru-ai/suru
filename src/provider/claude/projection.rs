@@ -181,6 +181,10 @@ async fn next_provider_event(
                 let settled = events.projection.project_process_ended();
                 events.pending.extend(settled.into_iter().map(Ok));
             }
+            Ok(ConversationItem::TasksStopped(tasks)) => {
+                let settled = events.projection.project_watches_stopped(&tasks);
+                events.pending.extend(settled.into_iter().map(Ok));
+            }
             Ok(ConversationItem::Message(message)) => {
                 events.context.observe(&message);
                 let attribution = events.projection.intervention_attribution(&message);
@@ -740,6 +744,28 @@ impl ClaudeProjection {
             woke_agent: outcome != ProviderWatchOutcome::Stopped,
         };
         Some(self.attributed(&owner, event))
+    }
+
+    /// Tasks the Session stopped and the CLI acknowledged stopping, which are off its roster
+    /// whether or not their notifications follow. Each one still a live Watch settles as stopped
+    /// here, waking nothing, so the Session stops Monitoring on the acknowledgement alone; a
+    /// notification arriving afterwards finds the Watch already settled and repeats nothing.
+    fn project_watches_stopped(&mut self, tasks: &[String]) -> Vec<AttributedProviderEvent> {
+        tasks
+            .iter()
+            .filter_map(|task_id| {
+                let owner = self.watches.remove(task_id)?;
+                Some(self.attributed(
+                    &owner,
+                    ProviderEvent::WatchSettled {
+                        watch_id: ProviderWatchId::new(task_id.clone()),
+                        outcome: ProviderWatchOutcome::Stopped,
+                        summary: None,
+                        woke_agent: false,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// The CLI process this projection was reading has ended — stopped by the Session, or replaced

@@ -764,6 +764,15 @@ impl ProviderSession for CodexSession {
         })
     }
 
+    /// Codex never has a Watch: its background terminals outlive a Turn, but nothing they do
+    /// wakes the agent (ADR 0030), so no Codex Session is Monitoring and there is nothing to stop.
+    fn stop_watches(
+        &self,
+        _watches: Vec<crate::provider::ProviderWatchId>,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn stop_subagent(&self, subagent_id: ProviderSubagentId) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             let target = self

@@ -1299,6 +1299,23 @@ pub trait ProviderSession: Send + Sync + 'static {
         })
     }
 
+    /// Stops the Watches named, for the interrupt of a Session that is only
+    /// Monitoring (ADR 0030). The caller names the set — the Watches live in
+    /// the interrupted Session's subtree — so stopping all of a connection's
+    /// Watches and stopping one subtree's are the same request. It stops no
+    /// Turn and no Subagent. A Watch the Provider no longer runs has nothing
+    /// left to stop, which succeeds.
+    ///
+    /// Answering `Ok` means the Provider stopped them; each stopped Watch's
+    /// settling still arrives on the event stream as a `WatchSettled` whose
+    /// outcome is stopped and which wakes nothing, because that is where every
+    /// Watch settles. Defaulted to a refusal, so a Provider that begins
+    /// reporting Watches has to say what stopping one means.
+    fn stop_watches(&self, watches: Vec<ProviderWatchId>) -> ProviderFuture<'_, ()> {
+        let _ = watches;
+        Box::pin(async { Err(ProviderError::new("This Provider offers no Watch stop")) })
+    }
+
     /// Stops accepting Provider work and releases the Session's resources within a bounded time.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 }

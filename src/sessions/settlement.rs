@@ -21,8 +21,8 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InterruptSessionError {
     SessionNotFound,
-    /// Nothing below the Session is running: no active Turn, and no working
-    /// Subagent anywhere in its subtree.
+    /// Nothing below the Session is running: no active Turn, no working
+    /// Subagent, and no live Watch anywhere in its subtree.
     NothingToInterrupt,
     /// The interrupt named a Subagent's Session whose Provider offers no
     /// per-Subagent stop.
@@ -48,6 +48,10 @@ pub(crate) enum InterruptTarget {
     /// The Session is a Subagent's own, so the interrupt stops that one
     /// Subagent — through the Provider connection its root ancestor owns.
     Subagent { root: SessionId },
+    /// Nothing is Working, but the Session is Monitoring: the interrupt asks
+    /// the Provider to stop the Watches live in its subtree. No Turn settles
+    /// and no Prompt is withdrawn; the Session goes idle as they settle.
+    Watches,
     /// The Session was Working only because it owed a Turn to a Prompt it had
     /// not delivered, so the interrupt withdrew that Prompt where it stood.
     /// The Prompt is already Cancelled by the time this is returned: the
@@ -66,6 +70,7 @@ enum InterruptReading {
     Subagent {
         root: SessionId,
     },
+    Watches,
     /// No work is under way: the Session is Working only because it owes a
     /// Turn to this Prompt, which it has admitted and not delivered.
     UndeliveredPrompt(Box<Prompt>),
@@ -346,7 +351,8 @@ impl SessionStore {
     /// answer is a Prompt — acting under the one lock.
     ///
     /// Stopping work comes first: a Session running a Turn, or with Subagents
-    /// outliving one, is interrupted the way it always was. Only a Session
+    /// outliving one, is interrupted the way it always was, and a Session
+    /// that is only Monitoring has its Watches stopped. Only a Session
     /// Working solely because it owes a Turn to an undelivered Prompt has that
     /// Prompt withdrawn, and because the delivery that would end that state
     /// takes this same lock, the race resolves one way or the other rather
@@ -367,6 +373,7 @@ impl SessionStore {
             InterruptReading::Subagent { root } => {
                 return Ok(InterruptTarget::Subagent { root });
             }
+            InterruptReading::Watches => return Ok(InterruptTarget::Watches),
             InterruptReading::UndeliveredPrompt(prompt) => prompt,
         };
         let prompt_id = prompt.id;
@@ -457,6 +464,11 @@ impl SessionStoreState {
                 )));
             }
             return Ok(InterruptReading::Subagents);
+        }
+        if record.snapshot.session.monitoring_since.is_some() {
+            // Only Watches are left, and nothing a Turn owns: stopping them
+            // is the whole interrupt (ADR 0030).
+            return Ok(InterruptReading::Watches);
         }
         Err(InterruptSessionError::NothingToInterrupt)
     }
@@ -651,6 +663,7 @@ mod tests {
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
+            watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
             transcript: messages
