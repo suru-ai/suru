@@ -1158,6 +1158,11 @@ fn read_terminal_mode() -> String {
 }
 
 /// The terminal attributes `stty -g` reports, read the way `stty` reads them.
+///
+/// `PENDIN` is left out: it is the terminal driver's own note that input awaits
+/// reprocessing, not a mode a program chooses. A BSD kernel such as macOS's
+/// raises it whenever a terminal returns to canonical mode — pending input or
+/// not — so a TUI that restores exactly what it was given still leaves it set.
 #[cfg(unix)]
 fn read_terminal_mode() -> String {
     let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -1172,7 +1177,7 @@ fn read_terminal_mode() -> String {
         attributes.c_iflag,
         attributes.c_oflag,
         attributes.c_cflag,
-        attributes.c_lflag,
+        attributes.c_lflag & !libc::PENDIN,
         attributes.c_cc
     )
 }
