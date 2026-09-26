@@ -3,11 +3,13 @@
 //!
 //! The tree is read off the Subagent rows each Session's Transcript already
 //! carries — the rows the Provider-neutral Subagent orchestration writes on a
-//! spawn, a settle, and an update — so every Provider is covered without a
-//! word of its own. A subscribed tree is read again after each commit that
-//! could move it and compared with what its subscribers last heard, so the
-//! changes they are told about are exactly the difference, however the rows
-//! came to move.
+//! spawn, a resume, a settle, and an update — so every Provider is covered
+//! without a word of its own. A resumed Subagent has a row for every stretch
+//! of its work, all leading into its one Session, so the tree lists it once,
+//! by the row its spawn left where it first spawned (ADR 0031). A subscribed
+//! tree is read again after each commit that could move it and compared with
+//! what its subscribers last heard, so the changes they are told about are
+//! exactly the difference, however the rows came to move.
 
 use std::collections::{HashMap, HashSet};
 
@@ -206,11 +208,14 @@ impl SessionStoreState {
                 stack.pop();
                 continue;
             };
+            // However many rows lead into one Session, it is one Subagent,
+            // listed once.
             let child = entry.session_id;
-            subagents.push(entry);
-            if visited.insert(child) {
-                stack.push(self.spawned_by(child).into_iter());
+            if !visited.insert(child) {
+                continue;
             }
+            subagents.push(entry);
+            stack.push(self.spawned_by(child).into_iter());
         }
         Some(SubagentTree {
             top_level: SubagentTreeTopLevel {
@@ -223,12 +228,16 @@ impl SessionStoreState {
         })
     }
 
-    /// The Subagents `spawner`'s Transcript records, in the order they
-    /// spawned.
+    /// The Subagents `spawner`'s Transcript records spawning, in the order
+    /// they spawned. A Subagent stands where it first spawned: under the
+    /// Session its own names as parent, by the first row there leading into
+    /// it. The rows its resumes add — in that Session, or in a sibling's that
+    /// sent the resume — lead into the same Session and add no entry.
     fn spawned_by(&self, spawner: SessionId) -> Vec<SubagentTreeEntry> {
         let Some(record) = self.sessions.get(&spawner) else {
             return Vec::new();
         };
+        let mut listed = HashSet::new();
         record
             .snapshot
             .activities
@@ -243,6 +252,14 @@ impl SessionStoreState {
                     ..
                 } => Some((*session_id, name, description, *status, *duration_ms)),
                 _ => None,
+            })
+            .filter(|(session_id, ..)| {
+                // A Session not held here says nothing of its parent, so its
+                // first row stands for it.
+                self.sessions
+                    .get(session_id)
+                    .is_none_or(|child| child.snapshot.session.parent == Some(spawner))
+                    && listed.insert(*session_id)
             })
             .zip(0..)
             .map(

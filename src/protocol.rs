@@ -2407,8 +2407,10 @@ pub struct SubagentTreeTopLevel {
     pub needs_intervention: bool,
 }
 
-/// One Subagent's Session in a tree, read off the Subagent row in its
-/// spawner's Transcript, so it says what that row says.
+/// One Subagent's Session in a tree, read off the Subagent row its spawn left
+/// in its spawner's Transcript, so it says what that row says. A resumed
+/// Subagent is still one entry: the rows its resumes add lead into the same
+/// Session and stand only in the Transcripts that delegated them.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeEntry {

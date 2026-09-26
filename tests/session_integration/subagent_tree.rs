@@ -136,6 +136,25 @@ async fn settle(
         .await;
 }
 
+async fn resume(
+    provider: &ControlledProviderSession,
+    delegator: Option<&str>,
+    subagent: &str,
+    description: &str,
+) {
+    provider
+        .emit_attributed_and_wait_until_observed(
+            delegator.map_or(ProviderEventAttribution::OwningSession, |delegator| {
+                ProviderEventAttribution::Subagent(ProviderSubagentId::new(delegator))
+            }),
+            ProviderEvent::SubagentResumed {
+                subagent_id: ProviderSubagentId::new(subagent),
+                description: description.to_owned(),
+            },
+        )
+        .await;
+}
+
 /// The Subagent entry a tree lists under `name`.
 fn named<'a>(subagents: &'a [SubagentTreeEntry], name: &str) -> &'a SubagentTreeEntry {
     subagents
@@ -1187,6 +1206,97 @@ async fn two_subscribers_to_one_tree_hear_the_same_change() {
         "every subscriber to the tree hears the same change"
     );
     assert_eq!(child_revision, top_revision, "under the same revision");
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_resumed_subagent_is_one_entry_standing_where_it_first_spawned() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-resume-test").await;
+    let provider = &fixture.provider_session;
+    spawn(provider, None, "task-1", "Review", "Check the seams").await;
+    spawn(
+        provider,
+        None,
+        "task-2",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    settle(provider, None, "task-2", ProviderSubagentStatus::Completed).await;
+    let (before, mut updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    let mut revision = before.revision;
+    let explore = named(&before.subagents, "Explore").clone();
+
+    // The reviewer, which spawned before the explorer, resumes it; then the
+    // explorer settles and the top-level Session resumes it again. Each
+    // resume adds a row leading into the explorer's one Session.
+    resume(provider, Some("task-1"), "task-2", "Map the tests too").await;
+    settle(provider, None, "task-2", ProviderSubagentStatus::Completed).await;
+    resume(provider, None, "task-2", "Map the fixtures too").await;
+    let reviewer = read_session(
+        fixture.server.descriptor(),
+        named(&before.subagents, "Review").session_id,
+    )
+    .await;
+    assert!(
+        reviewer.activities.iter().any(|activity| matches!(
+            activity,
+            suru::protocol::Activity::Subagent { session_id, .. } if *session_id == explore.session_id
+        )),
+        "the reviewer's Transcript holds the row of the resume it sent"
+    );
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the top-level Session holds the second resume's row",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .filter(|activity| {
+                    matches!(
+                        activity,
+                        suru::protocol::Activity::Subagent { session_id, .. }
+                            if *session_id == explore.session_id
+                    )
+                })
+                .count()
+                == 2
+        },
+    )
+    .await;
+    spawn(provider, None, "task-3", "Plan", "Weigh the options").await;
+
+    let SubagentTreeChange::SubagentSpawned { entry } =
+        next_change(&mut updates, &mut revision).await
+    else {
+        panic!("the resumes move nothing in the tree, so the next change is the new spawn");
+    };
+    assert_eq!(entry.name, "Plan");
+    assert_eq!(
+        entry.spawn_order, 2,
+        "the resume rows take no place among the top-level Session's spawns"
+    );
+
+    let (after, _updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        shape(&after),
+        owned(&[
+            ("Review", "top-level", 0),
+            ("Explore", "top-level", 1),
+            ("Plan", "top-level", 2),
+        ]),
+        "the explorer is listed once, where it first spawned, and not again under the reviewer"
+    );
+    assert_eq!(
+        named(&after.subagents, "Explore"),
+        &explore,
+        "the entry still reads as the spawn left it"
+    );
 
     drop(fixture.provider_session);
     fixture.server.shutdown().await.expect("shut down server");

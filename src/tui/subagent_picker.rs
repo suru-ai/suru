@@ -28,7 +28,10 @@ pub(super) struct WorkingSubagent<'a> {
 
 /// The open Session's working Subagents, in the order they spawned — the tree
 /// the picker draws. A settled Subagent is not the picker's concern: its row
-/// in the Transcript is the way back into it.
+/// in the Transcript is the way back into it. A resumed Subagent works only
+/// through the row of its latest stretch — the rows before it have settled,
+/// and no resume begins while one is open — so it is offered once, by that
+/// row, and stopping it stops that stretch.
 pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubagent<'_>> {
     snapshot
         .activities
