@@ -763,6 +763,21 @@ pub enum ProviderEvent {
         /// resume begins as a Message from the delegating Agent.
         delegation: Option<String>,
     },
+    /// A Delegation the Provider delivered into a Subagent's working Turn:
+    /// a steer (ADR 0032), reported at the point the Subagent received it.
+    /// Like a spawn or a resume, the event is attributed to the delegating
+    /// Agent — the owning Session's, or a sibling Subagent's — and names the
+    /// Subagent it reached, but it begins no Turn and adds nothing to the
+    /// delegating Transcript: orchestration adds the Delegation, as a Message
+    /// from the delegating Agent, to the Turn the Subagent is working in. It
+    /// is no output of any Turn of the delegating Session's, so it never
+    /// begins a Continuation there. A steer naming a Subagent that is not
+    /// working — stopped, or settled — was never delivered, and stands
+    /// nowhere.
+    SubagentSteered {
+        subagent_id: ProviderSubagentId,
+        delegation: String,
+    },
     /// A settled Subagent's own Watch woke it: the same agent works on in the
     /// same conversation, though no Agent delegated anything to it. So it is
     /// no resume (ADR 0031) and gains no row in any Transcript: its work lands

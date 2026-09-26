@@ -35,8 +35,8 @@ use crate::protocol::{
     ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
 };
 use crate::sessions::{
-    ApprovalPostureUpdate, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
-    InterruptTarget, OpenInterventions, OpeningDelegation, ProviderTurnOutcome, SessionStore,
+    ApprovalPostureUpdate, DeliveredDelegation, DeliveredTurn, DeliveredTurnStatus,
+    InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore,
     StoredSubagent, TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
     message_content_changes, reasoning_content_changes,
 };
@@ -841,7 +841,7 @@ impl SubagentRoutes {
             session_id,
             delegation
                 .and_then(delegation_text)
-                .map(|text| OpeningDelegation {
+                .map(|text| DeliveredDelegation {
                     delegating_session: delegating.0,
                     text,
                 }),
@@ -1720,6 +1720,24 @@ async fn run_provider_session(
                             event: ProviderEvent::SubagentWoken { subagent_id },
                             ..
                         } => wake_subagent(&sessions, &updates, &mut subagents, subagent_id),
+                        // Nor is a steer: it lands in the steered Subagent's
+                        // Turn and adds nothing to the delegating Transcript.
+                        AttributedProviderEvent {
+                            attribution,
+                            event:
+                                ProviderEvent::SubagentSteered {
+                                    subagent_id,
+                                    delegation,
+                                },
+                        } => steer_subagent(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            &subagents,
+                            &attribution,
+                            &subagent_id,
+                            &delegation,
+                        ),
                         // A Subagent's events land in its own Session whether
                         // or not the owning Session has a Turn open.
                         AttributedProviderEvent {
@@ -2783,6 +2801,24 @@ async fn run_provider_session(
                         event: ProviderEvent::SubagentWoken { subagent_id },
                         ..
                     })) => wake_subagent(&sessions, &updates, &mut subagents, subagent_id),
+                    // A steer lands in the steered Subagent's Turn, whichever
+                    // Agent sent it, and never in the Turn active here.
+                    Some(Ok(AttributedProviderEvent {
+                        attribution,
+                        event:
+                            ProviderEvent::SubagentSteered {
+                                subagent_id,
+                                delegation,
+                            },
+                    })) => steer_subagent(
+                        &sessions,
+                        &updates,
+                        session_id,
+                        &subagents,
+                        &attribution,
+                        &subagent_id,
+                        &delegation,
+                    ),
                     Some(Ok(AttributedProviderEvent {
                         attribution: ProviderEventAttribution::Subagent(subagent),
                         event,
@@ -3126,6 +3162,56 @@ fn wake_subagent(
             subagent = subagent.as_str(),
             "a woken Subagent's Continuation could not begin: {error:#}"
         );
+    }
+}
+
+/// Adds a steer's Delegation to the Turn the steered Subagent is working in,
+/// as a Message from the delegating Agent — the owning Session's, or the
+/// sibling Subagent's the attribution names (ADR 0032). The delegating
+/// Transcript gains nothing. A Subagent with no working stretch — stopped, or
+/// settled — never received the steer, and one sent by an Agent the
+/// connection never named has no sender to name; either stands nowhere. A
+/// steer that cannot be recorded is logged rather than failing the Turn
+/// active here, which it was never part of.
+fn steer_subagent(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    subagents: &SubagentRoutes,
+    attribution: &ProviderEventAttribution,
+    subagent: &ProviderSubagentId,
+    delegation: &str,
+) {
+    let Some(route) = subagents.routes.get(subagent) else {
+        tracing::debug!(
+            subagent = subagent.as_str(),
+            "discarding a steer for a Subagent that is not working"
+        );
+        return;
+    };
+    let delegating_session = match attribution {
+        ProviderEventAttribution::OwningSession => Some(session_id),
+        ProviderEventAttribution::Subagent(sender) => subagents
+            .identities
+            .get(sender)
+            .map(|identity| identity.session_id),
+    };
+    let (Some(delegating_session), Some(text)) = (delegating_session, delegation_text(delegation))
+    else {
+        return;
+    };
+    let (steered, turn_id) = (route.session_id, route.turn.turn_id);
+    if let Some(Err(error)) = updates.apply(|| {
+        sessions.deliver_delegation(
+            steered,
+            turn_id,
+            DeliveredDelegation {
+                delegating_session,
+                text,
+            },
+        )
+    }) {
+        tracing::warn!(session_id = %steered, "a steer could not be recorded: {error:#}");
     }
 }
 
@@ -3880,7 +3966,8 @@ fn project_provider_event(
             // Subagents they woke, because that work is no output of it either.
             ProviderEvent::WatchStarted { .. }
             | ProviderEvent::WatchSettled { .. }
-            | ProviderEvent::SubagentWoken { .. } => Ok(ProviderEventProjection::Continue),
+            | ProviderEvent::SubagentWoken { .. }
+            | ProviderEvent::SubagentSteered { .. } => Ok(ProviderEventProjection::Continue),
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,

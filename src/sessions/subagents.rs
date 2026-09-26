@@ -1,7 +1,8 @@
 //! Opening a Subagent's child Session — the one Session creation a Prompt does
 //! not drive — beginning each later Turn a resume of the Subagent begins in
-//! it, each opened by the Delegation that began it, and finding the Session a
-//! resume continues by the identity its Provider stored with it at the spawn.
+//! it, each opened by the Delegation that began it, adding each Delegation
+//! that steers a Turn still working, and finding the Session a resume
+//! continues by the identity its Provider stored with it at the spawn.
 
 use std::collections::HashMap;
 
@@ -31,11 +32,12 @@ pub(crate) struct SpawnedSubagentSession {
     pub(crate) turn_id: TurnId,
 }
 
-/// The Delegation a resume's Turn opens with: what the delegating Agent
-/// asked, already normalized and capped the way an Agent Message's content
-/// is, and the Session whose Agent sent it — the Subagent's parent, or a
-/// sibling Subagent's.
-pub(crate) struct OpeningDelegation {
+/// A Delegation delivered to a Subagent after its spawn — the one opening a
+/// resume's Turn, or a steer into the Turn it works in: what the delegating
+/// Agent asked, already normalized and capped the way an Agent Message's
+/// content is, and the Session whose Agent sent it — the Subagent's parent,
+/// or a sibling Subagent's.
+pub(crate) struct DeliveredDelegation {
     pub(crate) delegating_session: SessionId,
     pub(crate) text: NormalizedText,
 }
@@ -207,7 +209,7 @@ impl SessionStore {
     pub(crate) fn begin_subagent_turn(
         &self,
         session_id: SessionId,
-        delegation: Option<OpeningDelegation>,
+        delegation: Option<DeliveredDelegation>,
     ) -> anyhow::Result<TurnId> {
         let mut state = self
             .state
@@ -264,6 +266,48 @@ impl SessionStore {
         }
         state.commit(&self.storage, session_id, changes)?;
         Ok(turn_id)
+    }
+
+    /// Adds a steer to the Turn a Subagent is working in (ADR 0032): the
+    /// Delegation stands as a Message from the delegating Agent after
+    /// everything the Subagent did before it received it, and begins no Turn.
+    /// A Turn that has Settled accepts no further Delegation, since a steer
+    /// is only ever delivered into work still going.
+    pub(crate) fn deliver_delegation(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        delegation: DeliveredDelegation,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let record = state
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        if !record.snapshot.session.is_subagent() {
+            return Err(anyhow!(
+                "Only a Subagent's Session is steered by a Delegation"
+            ));
+        }
+        if active_turn_id(&record.snapshot)? != Some(turn_id) {
+            return Err(anyhow!(
+                "A steer is delivered only into the Turn still working"
+            ));
+        }
+        let message = delegation_message(
+            turn_id,
+            delegator(&state.sessions, delegation.delegating_session),
+            delegation.text,
+        );
+        state.commit(
+            &self.storage,
+            session_id,
+            vec![SessionChange::MessageAdded { message }],
+        )?;
+        Ok(())
     }
 
     /// Every Subagent in the tree `top_level` heads whose Session the store
@@ -348,8 +392,8 @@ fn delegator(sessions: &HashMap<SessionId, SessionRecord>, session_id: SessionId
     Delegator { session_id, name }
 }
 
-/// The Message a Delegation stands as in the Turn it opens. It arrives whole,
-/// so it is complete from the start.
+/// The Message a Delegation stands as in the Turn it opens or steers. It
+/// arrives whole, so it is complete from the start.
 fn delegation_message(turn_id: TurnId, delegator: Delegator, text: NormalizedText) -> Message {
     Message {
         id: MessageId::new(),

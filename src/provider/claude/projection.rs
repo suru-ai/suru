@@ -31,6 +31,17 @@
 //! records the spawn each agent's conversation rides under, so an agent spawned before a restart
 //! resumes the same way once the conversation carries on; one resumed with no record claims the
 //! first conversation nothing else has, provided it is the only such agent working.
+//! A SendMessage to an agent still working **steers** it instead (ADR 0032): the CLI queues the
+//! message for the agent's next tool round and says so only in the tool's result, and nothing on
+//! the wire marks when the agent reads it. The steer is held pending against the agent, and
+//! placed — after any sent before it — just before the first assistant message the agent begins
+//! once its tool results next go back to it, as a Delegation from whichever conversation ran the SendMessage: the loop's own, or a sibling
+//! subagent's. It adds nothing to the delegating Transcript. An agent that finishes before reading
+//! it is restarted by the CLI with the steer as a fresh prompt — its task started again naming its
+//! own spawn rather than the SendMessage — and that restart is a resume the steer opens, its row
+//! described by the SendMessage as any resume's is. A steer the CLI refuses stands nowhere, nor
+//! does one still pending when its agent is stopped, or is started again by anything but that
+//! restart.
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
 //! result is still to come, since the CLI answers every message queued into a running loop with a
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
@@ -78,10 +89,16 @@ const COMMAND_TOOL: &str = "Bash";
 const TASK_TOOL: &str = "Task";
 const AGENT_TOOL: &str = "Agent";
 
-/// The tool that resumes a settled background agent. The CLI starts the agent's task again naming
-/// this tool use as its `tool_use_id`, so the resume opens in the conversation that ran it, like a
-/// spawn, and the tool's input says what the resume asks.
+/// The tool that sends an agent more: a resume of a settled background agent, or a steer of one
+/// still working. The CLI starts a resumed agent's task again naming this tool use as its
+/// `tool_use_id`, so the resume opens in the conversation that ran it, like a spawn; a steer it
+/// only queues, saying so in the tool's result. Either way the tool's input says what it asks.
 const SEND_MESSAGE_TOOL: &str = "SendMessage";
+
+/// What a SendMessage result says when the CLI queued the message for an agent still working
+/// rather than resuming one — verified against 2.1.280: "Message queued for delivery to <task> at
+/// its next tool round."
+const QUEUED_FOR_DELIVERY: &str = "queued for delivery";
 
 /// What one task the CLI reports is to Suru. Every task joins the roster an interrupt stops, but
 /// only a Subagent has a conversation of its own, and only a Watch may wake the loop once it has
@@ -346,12 +363,13 @@ enum DelegationKind {
     /// The Agent or Task tool, spawning a new agent. The task's start describes it, and the tool's
     /// `prompt` is the Delegation's text.
     Spawn { prompt: Option<String> },
-    /// SendMessage, resuming an agent that settled. Its input describes the resume — the loop's
-    /// `summary` of the message, or else the message's own first line — and its `message` is the
-    /// Delegation's text.
+    /// SendMessage, resuming an agent that settled or steering one still working. Its input
+    /// describes the resume — the loop's `summary` of the message, or else the message's own first
+    /// line — its `message` is the Delegation's text, and `to` names the agent it is sent to.
     Resume {
         description: Option<String>,
         message: Option<String>,
+        to: Option<String>,
     },
 }
 
@@ -364,9 +382,11 @@ impl DelegationKind {
             Self::Resume {
                 description,
                 message,
+                to,
             } => {
                 *description = send_message_description(input);
                 *message = input_text(input, "message");
+                *to = input_text(input, "to");
             }
         }
     }
@@ -389,6 +409,25 @@ struct AgentTask {
     /// While the agent works, the description the row of its current stretch reads, kept so
     /// updates repeating it unchanged publish nothing; `None` once that stretch has settled.
     working: Option<String>,
+}
+
+/// A Delegation the CLI queued for an agent still working — a steer (ADR 0032) — held until the
+/// agent reads it. The stream never says when that is: the CLI delivers queued messages at the
+/// agent's next tool round, so the steer stands just before the first assistant message the agent
+/// begins after that round. If the agent finishes first, the CLI restarts it with the message as
+/// a fresh prompt, and the steer is instead the Delegation that opens the resume.
+struct PendingSteer {
+    /// The conversation that ran the SendMessage: the loop's own, or a sibling subagent's.
+    delegator: ConversationKey,
+    /// The Delegation's text: the SendMessage's `message`.
+    text: String,
+    /// What a resume row the steer turns into reads: the SendMessage's `summary`, or its message's
+    /// first line.
+    description: Option<String>,
+    /// Whether the agent has had a tool round since the steer was queued — its tool results
+    /// echoed back into its conversation — and so has read it. Until then the message it is
+    /// writing is one it began without the steer, however late its snapshot arrives.
+    read: bool,
 }
 
 /// What the projection remembers between conversation messages, across every conversation the
@@ -420,6 +459,10 @@ pub(super) struct ClaudeProjection {
     /// agents spawned before a restart the Resume State never recorded — until one claims the
     /// conversation its chunks turn out to ride under.
     unplaced_resumes: BTreeSet<String>,
+    /// The steers queued for each agent and not yet read, by task id, in the order they were sent.
+    /// A stopped agent never reads its steers, so they are discarded, as are those of an agent
+    /// that settled and was then started again by anything but the CLI's restart for them.
+    pending_steers: BTreeMap<String, VecDeque<PendingSteer>>,
     /// What the Session must remember to continue after a restart, kept current as agents spawn so
     /// orchestration can store each revision.
     resume: ClaudeResumeState,
@@ -486,6 +529,7 @@ impl ClaudeProjection {
             foreground_tasks: BTreeMap::new(),
             conversation_agents,
             unplaced_resumes: BTreeSet::new(),
+            pending_steers: BTreeMap::new(),
             resume,
             subagent_models: BTreeMap::new(),
             reporting_lifetime: uuid::Uuid::new_v4().to_string(),
@@ -618,6 +662,8 @@ impl ClaudeProjection {
             if conversation.is_none() {
                 self.unplaced_resumes.insert(task_id.clone());
             }
+            // The agent was sent nothing, so any steer still waiting for it was never delivered.
+            self.pending_steers.remove(&task_id);
             let subagent_id = ProviderSubagentId::new(task_id);
             let model = conversation
                 .and_then(|conversation| self.subagent_models.get(&conversation))
@@ -635,11 +681,28 @@ impl ClaudeProjection {
         }
         // The tool use the start names is the Delegation, and the conversation that ran it is the
         // delegating one. A start naming no tool this projection saw delegates from the loop's own
-        // conversation, which always has a Turn to land in (ADR 0015).
-        let delegation = message
-            .tool_use_id
-            .as_ref()
-            .and_then(|tool| self.delegation_tools.remove(tool));
+        // conversation, which always has a Turn to land in (ADR 0015). The one exception is the
+        // CLI restarting a settled agent for a steer it finished too soon to read: that start
+        // names the agent's own spawn, and the steer is the Delegation, sent by whichever Agent
+        // sent it (ADR 0032). Any other start of a settled agent means its pending steers were
+        // never delivered, so they are discarded.
+        let delegation = match self.late_steer(&task_id, message.tool_use_id.as_deref()) {
+            Some(steer) => Some(DelegationTool {
+                delegator: steer.delegator,
+                kind: DelegationKind::Resume {
+                    description: steer.description,
+                    message: Some(steer.text),
+                    to: None,
+                },
+            }),
+            None => {
+                self.pending_steers.remove(&task_id);
+                message
+                    .tool_use_id
+                    .as_ref()
+                    .and_then(|tool| self.delegation_tools.remove(tool))
+            }
+        };
         let (delegator, mut kind) = delegation.map_or(
             (OWNING_CONVERSATION, DelegationKind::Spawn { prompt: None }),
             |tool| (tool.delegator, tool.kind),
@@ -755,6 +818,136 @@ impl ClaudeProjection {
             projected.push(self.resume_state_changed());
         }
         projected
+    }
+
+    /// The steer a settled agent's start is Claude's restart for, if it is one: a start naming the
+    /// agent's own spawn — where a resume through SendMessage names the SendMessage — while a steer
+    /// is still waiting for it. The restart hands the agent the first steer it never read as a
+    /// fresh prompt; any queued after it stay pending, read like any other steer at the restarted
+    /// stretch's next tool round.
+    fn late_steer(&mut self, task_id: &str, tool_use_id: Option<&str>) -> Option<PendingSteer> {
+        let spawn = self.agent_tasks.get(task_id)?.conversation.as_deref()?;
+        if tool_use_id != Some(spawn) {
+            return None;
+        }
+        let queued = self.pending_steers.get_mut(task_id)?;
+        let steer = queued.pop_front();
+        if queued.is_empty() {
+            self.pending_steers.remove(task_id);
+        }
+        steer
+    }
+
+    /// A tool round in a subagent conversation: its tool results echoed back on their way into
+    /// the agent's next model call, which is where the CLI hands the agent every steer queued for
+    /// it so far.
+    fn steers_read(&mut self, conversation: &str) {
+        let Some(steers) = self
+            .conversation_agents
+            .get(conversation)
+            .and_then(|task_id| self.pending_steers.get_mut(task_id))
+        else {
+            return;
+        };
+        for steer in steers {
+            steer.read = true;
+        }
+    }
+
+    /// The steers a working agent read at its last tool round, placed as its conversation carries
+    /// the first assistant message it wrote having read them — just before it, each attributed to
+    /// the conversation that sent it, in the order they were sent. Steers queued since that round
+    /// wait for the next one.
+    fn deliver_read_steers(&mut self, conversation: &str) -> Vec<AttributedProviderEvent> {
+        let Some(task_id) = self
+            .conversation_agents
+            .get(conversation)
+            .filter(|task_id| {
+                self.agent_tasks
+                    .get(*task_id)
+                    .is_some_and(|task| task.working.is_some())
+            })
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let Some(steers) = self.pending_steers.get_mut(&task_id) else {
+            return Vec::new();
+        };
+        let read = steers.iter().take_while(|steer| steer.read).count();
+        let delivered = steers.drain(..read).collect::<Vec<_>>();
+        if steers.is_empty() {
+            self.pending_steers.remove(&task_id);
+        }
+        delivered
+            .into_iter()
+            .map(|steer| {
+                self.attributed(
+                    &steer.delegator,
+                    ProviderEvent::SubagentSteered {
+                        subagent_id: ProviderSubagentId::new(task_id.clone()),
+                        delegation: steer.text,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// What a SendMessage's tool result says of the message it sent. One the CLI queued for an
+    /// agent still working is a steer, held pending against the agent the result names until the
+    /// agent reads it; one it refused (`success: false`) was never delivered, and delegates
+    /// nothing. Any other result — a resume, whose task's start carries the Delegation — leaves
+    /// the tool use to that start.
+    fn receive_send_message_result(&mut self, tool_use_id: &str, content: &Value, is_error: bool) {
+        let result = serde_json::from_str::<Value>(&tool_result_text(content)).ok();
+        let success = result
+            .as_ref()
+            .and_then(|result| result.get("success"))
+            .and_then(Value::as_bool);
+        let queued = success == Some(true)
+            && result
+                .as_ref()
+                .and_then(|result| result.get("message"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains(QUEUED_FOR_DELIVERY));
+        if !queued {
+            if is_error || success == Some(false) {
+                self.delegation_tools.remove(tool_use_id);
+            }
+            return;
+        }
+        let Some(DelegationTool {
+            delegator,
+            kind:
+                DelegationKind::Resume {
+                    description,
+                    message: Some(text),
+                    to,
+                },
+        }) = self.delegation_tools.remove(tool_use_id)
+        else {
+            return;
+        };
+        // The result pins the agent it queued the message for by its task id, which `to` — an
+        // agent's name, where it was given one — need not be.
+        let Some(target) = result
+            .as_ref()
+            .and_then(|result| result.pointer("/pin/id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(to)
+        else {
+            return;
+        };
+        self.pending_steers
+            .entry(target)
+            .or_default()
+            .push_back(PendingSteer {
+                delegator,
+                text,
+                description,
+                read: false,
+            });
     }
 
     /// A background task that may wake the loop once its Turn has ended: a Watch, described by
@@ -874,6 +1067,8 @@ impl ClaudeProjection {
         tasks
             .iter()
             .filter_map(|task_id| {
+                // A stopped agent reads none of the steers still waiting for it.
+                self.pending_steers.remove(task_id);
                 // A stopped foreground task was never a Watch, so its stop settles nothing.
                 self.foreground_tasks.remove(task_id);
                 let owner = self.watches.remove(task_id)?;
@@ -899,6 +1094,8 @@ impl ClaudeProjection {
         self.turn.tasks_died_with_process();
         // A foreground task that died with the process was never a Watch, so none is lost.
         self.foreground_tasks.clear();
+        // Nor is any steer the process still held for its agents ever delivered.
+        self.pending_steers.clear();
         std::mem::take(&mut self.watches)
             .into_iter()
             .map(|(task_id, owner)| {
@@ -983,6 +1180,11 @@ impl ClaudeProjection {
             return Vec::new();
         };
         self.turn.task_settled(&task_id);
+        // A stopped agent reads none of the steers still waiting for it. One that settled on its
+        // own keeps them, since the CLI may yet restart it to read the first.
+        if message.status.as_deref() == Some(TASK_STOPPED_STATUS) {
+            self.pending_steers.remove(&task_id);
+        }
         // A foreground task's notification comes inside the Turn that waited on it, whose tool
         // result already told the agent how it went: it wakes nothing and settles no Watch.
         if self.foreground_tasks.remove(&task_id).is_some() {
@@ -1168,6 +1370,9 @@ impl ClaudeProjection {
             self.subagent_models
                 .insert(conversation.clone(), model.clone());
         }
+        let steers = owner.as_deref().map_or_else(Vec::new, |conversation| {
+            self.deliver_read_steers(conversation)
+        });
         let held = self.conversations.remove(&owner);
         let known = held.is_some();
         let mut conversation = held.unwrap_or_default();
@@ -1228,6 +1433,7 @@ impl ClaudeProjection {
         let mut attributed_events = claimed
             .into_iter()
             .chain(model_evidence)
+            .chain(steers)
             .collect::<Vec<_>>();
         let attribution = self.attribution(&owner);
         attributed_events.extend(projected.into_iter().map(|event| AttributedProviderEvent {
@@ -1256,6 +1462,7 @@ impl ClaudeProjection {
             SEND_MESSAGE_TOOL => Some(DelegationKind::Resume {
                 description: None,
                 message: None,
+                to: None,
             }),
             _ => None,
         };
@@ -1333,9 +1540,22 @@ impl ClaudeProjection {
         let EchoedUserContent::Blocks(blocks) = message.message.content else {
             return Vec::new();
         };
+        if let Some(conversation) = message.parent_tool_use_id.as_deref()
+            && blocks.iter().any(|block| block.kind == "tool_result")
+        {
+            self.steers_read(conversation);
+        }
         let mut projected = Vec::new();
         for block in blocks {
             if block.kind != "tool_result" {
+                continue;
+            }
+            if let Some(tool) = block.tool_use_id.as_deref().filter(|tool| {
+                self.delegation_tools.get(*tool).is_some_and(|delegation| {
+                    matches!(delegation.kind, DelegationKind::Resume { .. })
+                })
+            }) {
+                self.receive_send_message_result(tool, &block.content, block.is_error);
                 continue;
             }
             let Some(command) = block
@@ -2346,6 +2566,365 @@ mod tests {
                 .contains(&attribution_of(&events, "Whose is this?")),
             "nothing tells whose the conversation is, so neither agent claims it: {events:?}"
         );
+    }
+
+    /// The loop's own conversation spawning the background agent `task` through the Agent tool
+    /// `tool`, as snapshots, and the CLI starting its task.
+    fn agent_spawned(tool: &str, task: &str, conversation: Option<&str>) -> [Value; 2] {
+        [
+            json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": tool,
+                    "name": "Agent",
+                    "input": {"description": "Run the sleeps", "prompt": "Sleep three times."},
+                }]},
+                "parent_tool_use_id": conversation,
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": task,
+                "tool_use_id": tool,
+                "description": "Run the sleeps",
+                "task_type": "local_agent",
+                "subagent_type": "general-purpose",
+            }),
+        ]
+    }
+
+    /// The conversation `conversation` — the loop's own for `None` — running SendMessage `tool` to
+    /// the agent `task` with `message`, and the CLI answering it with `result`.
+    fn send_message_answered(
+        conversation: Option<&str>,
+        tool: &str,
+        task: &str,
+        message: &str,
+        result: Value,
+    ) -> [Value; 2] {
+        [
+            json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": tool,
+                    "name": "SendMessage",
+                    "input": {"to": task, "message": message, "summary": format!("steer {message}")},
+                }]},
+                "parent_tool_use_id": conversation,
+            }),
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool,
+                    "content": [{"type": "text", "text": result.to_string()}],
+                }]},
+                "parent_tool_use_id": conversation,
+            }),
+        ]
+    }
+
+    /// The same SendMessage, which the CLI queued because `task` is still working, as the live
+    /// 2.1.280 CLI answers it.
+    fn send_message_queued(
+        conversation: Option<&str>,
+        tool: &str,
+        task: &str,
+        message: &str,
+    ) -> [Value; 2] {
+        send_message_answered(
+            conversation,
+            tool,
+            task,
+            message,
+            json!({
+                "success": true,
+                "message": format!("Message queued for delivery to {task} at its next tool round."),
+                "pin": {"id": task, "name": task, "ref": "5283b6"},
+            }),
+        )
+    }
+
+    /// A tool round in the subagent conversation `conversation`: the result of its tool use
+    /// `tool` echoed back into it.
+    fn tool_round(conversation: &str, tool: &str) -> Value {
+        json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool,
+                "content": "slept",
+                "is_error": false,
+            }]},
+            "parent_tool_use_id": conversation,
+        })
+    }
+
+    /// One block of the assistant message `id` in the subagent conversation `conversation`.
+    fn block_of(conversation: &str, id: &str, text: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "message": {"id": id, "role": "assistant", "content": [{"type": "text", "text": text}]},
+            "parent_tool_use_id": conversation,
+        })
+    }
+
+    /// Where each event stands in `events`, told apart as the steers it carries — each with the
+    /// attribution naming its sender, the agent it reached, and what it said — and the agent
+    /// Messages around them.
+    fn steers_and_messages(events: &[AttributedProviderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ProviderEvent::SubagentSteered {
+                    subagent_id,
+                    delegation,
+                } => Some(format!(
+                    "steer {delegation:?} to {} from {:?}",
+                    subagent_id.as_str(),
+                    event.attribution
+                )),
+                ProviderEvent::AgentMessageDelta { content } => Some(format!("said {content:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steers_queued_before_one_tool_round_stand_in_order_before_the_next_assistant_message() {
+        let mut projection = fresh_projection();
+        let mut messages = agent_spawned("agent_1", "agent-task", None).to_vec();
+        messages.push(block_of("agent_1", "msg_1", "Sleeping."));
+        messages.extend(send_message_queued(None, "send_1", "agent-task", "First"));
+        messages.extend(send_message_queued(None, "send_2", "agent-task", "Second"));
+        let queued = project(&mut projection, &messages);
+        assert_eq!(
+            steers_and_messages(&queued),
+            [r#"said "Sleeping.""#],
+            "nothing stands for a steer while it is only queued"
+        );
+
+        let events = project(
+            &mut projection,
+            &[
+                block_of("agent_1", "msg_1", "Still the same message."),
+                tool_round("agent_1", "toolu_sleep"),
+                block_of("agent_1", "msg_2", "Read both."),
+            ],
+        );
+
+        assert_eq!(
+            steers_and_messages(&events),
+            [
+                r#"said "Still the same message.""#.to_owned(),
+                r#"steer "First" to agent-task from OwningSession"#.to_owned(),
+                r#"steer "Second" to agent-task from OwningSession"#.to_owned(),
+                r#"said "Read both.""#.to_owned(),
+            ],
+            "the message the agent was writing when they were queued is not where it read them; \
+             both stand, in the order they were sent, before the first message after its tool round"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.event,
+                ProviderEvent::SubagentResumed { .. } | ProviderEvent::SubagentUpdated { .. }
+            )),
+            "a steer begins no Turn and revises no row: {events:?}"
+        );
+        assert!(
+            steers_and_messages(&project(
+                &mut projection,
+                &[block_of("agent_1", "msg_3", "Done.")]
+            ))
+            .iter()
+            .all(|event| !event.starts_with("steer")),
+            "a delivered steer stands once"
+        );
+    }
+
+    #[test]
+    fn a_steer_sent_by_a_sibling_is_attributed_to_the_sibling() {
+        let mut projection = fresh_projection();
+        let mut messages = agent_spawned("agent_writer", "writer-task", None).to_vec();
+        messages.extend(agent_spawned("agent_reviewer", "reviewer-task", None));
+        messages.extend(send_message_queued(
+            Some("agent_reviewer"),
+            "send_review",
+            "writer-task",
+            "Tighten the second paragraph.",
+        ));
+        messages.push(tool_round("agent_writer", "toolu_draft"));
+        messages.push(block_of("agent_writer", "msg_w", "Tightening."));
+        let events = project(&mut projection, &messages);
+
+        assert_eq!(
+            steers_and_messages(&events),
+            [
+                r#"steer "Tighten the second paragraph." to writer-task from Subagent(ProviderSubagentId("reviewer-task"))"#,
+                r#"said "Tightening.""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_send_message_creates_nothing() {
+        let mut projection = fresh_projection();
+        let mut messages = agent_spawned("agent_1", "agent-task", None).to_vec();
+        messages.extend(send_message_answered(
+            None,
+            "send_1",
+            "slowpoke",
+            "Hurry up.",
+            json!({
+                "success": false,
+                "message": "No agent named 'slowpoke' is reachable.",
+            }),
+        ));
+        messages.push(block_of("agent_1", "msg_1", "Sleeping."));
+        messages.push(task_notification("agent-task", "completed", None));
+        let events = project(&mut projection, &messages);
+
+        assert_eq!(steers_and_messages(&events), [r#"said "Sleeping.""#]);
+        assert_eq!(
+            projection.delegation_tools.len(),
+            0,
+            "the refused SendMessage delegates nothing a later start could take up"
+        );
+    }
+
+    #[test]
+    fn a_steer_pending_when_its_subagent_is_stopped_never_appears() {
+        for stop in ["acknowledged", "notified"] {
+            let mut projection = fresh_projection();
+            let mut messages = agent_spawned("agent_1", "agent-task", None).to_vec();
+            messages.extend(send_message_queued(
+                None,
+                "send_1",
+                "agent-task",
+                "Never read.",
+            ));
+            messages.push(tool_round("agent_1", "toolu_sleep"));
+            let mut events = project(&mut projection, &messages);
+            if stop == "acknowledged" {
+                events.extend(projection.project_watches_stopped(&["agent-task".to_owned()]));
+            } else {
+                events.extend(project(
+                    &mut projection,
+                    &[task_notification("agent-task", "stopped", None)],
+                ));
+            }
+            events.extend(project(
+                &mut projection,
+                &[
+                    block_of("agent_1", "msg_trailing", "Trailing output."),
+                    task_notification("agent-task", "stopped", None),
+                    // The CLI starting the agent again naming its spawn is no restart for a steer
+                    // it no longer holds.
+                    json!({
+                        "type": "system",
+                        "subtype": "task_started",
+                        "task_id": "agent-task",
+                        "tool_use_id": "agent_1",
+                        "description": "Run the sleeps",
+                        "task_type": "local_agent",
+                    }),
+                    block_of("agent_1", "msg_after", "Back again."),
+                ],
+            ));
+
+            assert!(
+                events.iter().all(|event| !matches!(
+                    &event.event,
+                    ProviderEvent::SubagentSteered { .. }
+                        | ProviderEvent::SubagentResumed {
+                            delegation: Some(_),
+                            ..
+                        }
+                )),
+                "a steer its stopped ({stop}) agent never read stands nowhere: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_steer_its_agent_settled_without_reading_is_discarded_when_another_resume_starts_it() {
+        let mut projection = fresh_projection();
+        let mut messages = agent_spawned("agent_1", "agent-task", None).to_vec();
+        messages.extend(send_message_queued(
+            None,
+            "send_1",
+            "agent-task",
+            "Too late.",
+        ));
+        messages.push(block_of("agent_1", "msg_1", "Finished."));
+        messages.push(task_notification("agent-task", "completed", None));
+        messages.extend(send_message_resuming("send_2", "agent-task"));
+        messages.push(tool_round("agent_1", "toolu_sleep"));
+        messages.push(block_of("agent_1", "msg_2", "Resumed."));
+        let events = project(&mut projection, &messages);
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, ProviderEvent::SubagentSteered { .. })),
+            "the steer was never delivered, so the resume's stretch never shows it: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_agent_restarted_naming_its_spawn_is_resumed_by_the_steer_it_never_read() {
+        let mut projection = fresh_projection();
+        let mut messages = agent_spawned("agent_1", "agent-task", None).to_vec();
+        messages.extend(agent_spawned("agent_sibling", "sibling-task", None));
+        messages.extend(send_message_queued(
+            Some("agent_sibling"),
+            "send_1",
+            "agent-task",
+            "Say PINEAPPLE.\nThen stop.",
+        ));
+        messages.push(block_of("agent_1", "msg_1", "Finished without reading it."));
+        messages.push(task_notification("agent-task", "completed", None));
+        project(&mut projection, &messages);
+
+        let events = project(
+            &mut projection,
+            &[
+                json!({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": "agent-task",
+                    "tool_use_id": "agent_1",
+                    "description": "Run the sleeps",
+                    "task_type": "local_agent",
+                    "subagent_type": "general-purpose",
+                    "prompt": "Say PINEAPPLE.\nThen stop.",
+                }),
+                block_of("agent_1", "msg_2", "PINEAPPLE"),
+            ],
+        );
+
+        assert_eq!(
+            events[0],
+            AttributedProviderEvent {
+                attribution: subagent("sibling-task"),
+                event: ProviderEvent::SubagentResumed {
+                    subagent_id: ProviderSubagentId::new("agent-task"),
+                    name: "general-purpose".to_owned(),
+                    description: "steer Say PINEAPPLE.\nThen stop.".to_owned(),
+                    delegation: Some("Say PINEAPPLE.\nThen stop.".to_owned()),
+                },
+            },
+            "the restart is a resume the steer opens, delegated by the sibling that sent it and \
+             described by its SendMessage"
+        );
+        assert_eq!(
+            steers_and_messages(&events),
+            [r#"said "PINEAPPLE""#],
+            "the steer opens the restarted stretch, and stands nowhere else"
+        );
+        assert_eq!(attribution_of(&events, "PINEAPPLE"), subagent("agent-task"));
     }
 
     #[test]

@@ -204,6 +204,10 @@ pub(super) struct AssistantMessageBody {
 #[derive(Deserialize)]
 pub(super) struct EchoedUserMessage {
     pub(super) message: EchoedUserBody,
+    /// The subagent conversation the tool results go back into, like an assistant snapshot's;
+    /// `None` for the loop's own.
+    #[serde(default)]
+    pub(super) parent_tool_use_id: Option<String>,
 }
 
 #[derive(Deserialize)]

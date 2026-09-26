@@ -61,7 +61,7 @@ pub(crate) use settlement::{
     InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome,
     TrailingCommandOutput,
 };
-pub(crate) use subagents::{OpeningDelegation, StoredSubagent};
+pub(crate) use subagents::{DeliveredDelegation, StoredSubagent};
 pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
 pub(crate) use workspace_icon::SetWorkspaceIconError;
