@@ -21,7 +21,10 @@
 //! Subagent rather than a new one, and since the resumed conversation still rides under the
 //! original spawn's id, the resumed work lands in the Subagent's own Session, in the Turn the
 //! resume begins there (ADR 0031). What the delegating tool handed the agent — the Agent tool's
-//! `prompt`, SendMessage's `message` — is the Delegation that opens that Turn.
+//! `prompt`, SendMessage's `message` — is the Delegation that opens that Turn. The Resume State
+//! records the spawn each agent's conversation rides under, so an agent spawned before a restart
+//! resumes the same way once the conversation carries on; one resumed with no record claims the
+//! first conversation nothing else has, provided it is the only such agent working.
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
 //! result is still to come, since the CLI answers every message queued into a running loop with a
 //! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
@@ -33,7 +36,7 @@
 //! does not present is passed over rather than failed, because the wire grows freely (ADR 0010).
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -44,6 +47,7 @@ use tokio::sync::mpsc;
 use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     claude_error,
+    session::ClaudeResumeState,
     thinking::{ThinkingEvent, ThinkingSplitter},
     turn_in_flight::TurnInFlight,
     wire::{
@@ -89,6 +93,7 @@ pub(super) fn provider_events(
     execution_directory: std::path::PathBuf,
     context: Arc<super::context::ContextQueries>,
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
+    resume: ClaudeResumeState,
 ) -> ProviderEventStream {
     Box::pin(stream::unfold(
         EventReceiver {
@@ -98,7 +103,7 @@ pub(super) fn provider_events(
             approvals,
             execution_directory,
             messages,
-            projection: ClaudeProjection::new(turn),
+            projection: ClaudeProjection::new(turn, resume),
             pending: VecDeque::new(),
         },
         next_provider_event,
@@ -341,6 +346,13 @@ struct ClaudeProjection {
     /// The subagent conversations, from the `parent_tool_use_id` each rides under to the task id
     /// of the agent it belongs to — whose Subagent its events are, in whichever stretch.
     conversation_agents: BTreeMap<String, String>,
+    /// The agents working in a resume whose conversation this wire does not know, by task id —
+    /// agents spawned before a restart the Resume State never recorded — until one claims the
+    /// conversation its chunks turn out to ride under.
+    unplaced_resumes: BTreeSet<String>,
+    /// What the Session must remember to continue after a restart, kept current as agents spawn so
+    /// orchestration can store each revision.
+    resume: ClaudeResumeState,
     /// Latest assistant-snapshot Model evidence by conversation, since the stretch it began in.
     /// A snapshot can race the task lifecycle, so evidence waits here until the stretch's row
     /// exists, and a settle clears it so a resume reports only its own.
@@ -372,14 +384,37 @@ impl ClaudeProjection {
             .then_some(ProviderEventAttribution::OwningSession)
     }
 
-    fn new(turn: Arc<TurnInFlight>) -> Self {
+    /// A projection for a Session whose conversation `resume` restores: every agent it records
+    /// spawning is a settled Subagent a resume may name, riding under the conversation recorded
+    /// for it.
+    fn new(turn: Arc<TurnInFlight>, resume: ClaudeResumeState) -> Self {
+        let agent_tasks = resume
+            .agents
+            .iter()
+            .map(|(task_id, conversation)| {
+                (
+                    task_id.clone(),
+                    AgentTask {
+                        conversation: Some(conversation.clone()),
+                        working: None,
+                    },
+                )
+            })
+            .collect();
+        let conversation_agents = resume
+            .agents
+            .iter()
+            .map(|(task_id, conversation)| (conversation.clone(), task_id.clone()))
+            .collect();
         Self {
             intervention_tools: BTreeMap::new(),
             conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
             delegation_tools: BTreeMap::new(),
-            agent_tasks: BTreeMap::new(),
-            conversation_agents: BTreeMap::new(),
+            agent_tasks,
+            conversation_agents,
+            unplaced_resumes: BTreeSet::new(),
+            resume,
             subagent_models: BTreeMap::new(),
             reporting_lifetime: uuid::Uuid::new_v4().to_string(),
             latest_reported_cost: None,
@@ -483,15 +518,20 @@ impl ClaudeProjection {
         let name = message
             .subagent_type
             .unwrap_or_else(|| TASK_TOOL.to_owned());
+        let mut recorded = false;
         let (conversation, event) = match (self.agent_tasks.get_mut(&task_id), kind) {
-            // A task this wire started before is a settled agent resumed: the same Subagent,
-            // continuing the same conversation. The start repeats the spawn's description, so the
-            // resume reads what the SendMessage asked instead.
+            // A task this wire started before, or one the Resume State recorded spawning before a
+            // restart, is a settled agent resumed: the same Subagent, continuing the same
+            // conversation. The start repeats the spawn's description, so the resume reads what the
+            // SendMessage asked instead.
             (Some(task), kind) => {
                 let description = resume_description(kind)
                     .or(message.description)
                     .unwrap_or_default();
                 task.working = Some(description.clone());
+                if task.conversation.is_none() {
+                    self.unplaced_resumes.insert(task_id.clone());
+                }
                 (
                     task.conversation.clone(),
                     ProviderEvent::SubagentResumed {
@@ -502,21 +542,47 @@ impl ClaudeProjection {
                     },
                 )
             }
-            (None, kind) => {
-                // A spawn's tool use is the identity the subagent's every chunk rides under. A
-                // resume of an agent this wire never saw start rides under a spawn it never saw
-                // either, so it opens as a Subagent of its own that no chunk reaches. A start that
-                // names no tool use leaves nothing to attribute chunks by, though the Subagent's
-                // row and settle still reach the Transcript.
-                let resumed = matches!(kind, DelegationKind::Resume { .. });
-                let conversation = message.tool_use_id.filter(|_| !resumed);
-                if let Some(conversation) = &conversation {
-                    self.conversation_agents
-                        .insert(conversation.clone(), task_id.clone());
-                }
+            // A resume of an agent this wire never saw start, and no Resume State recorded, is
+            // still a resume: orchestration finds the Session the agent's identity was stored
+            // with, or records it as a new Subagent where none was. Its conversation rides under a
+            // spawn this wire never saw either, so it is claimed from the chunks once they come.
+            (None, kind @ DelegationKind::Resume { .. }) => {
                 let description = resume_description(kind)
                     .or(message.description)
                     .unwrap_or_default();
+                self.agent_tasks.insert(
+                    task_id.clone(),
+                    AgentTask {
+                        conversation: None,
+                        working: Some(description.clone()),
+                    },
+                );
+                self.unplaced_resumes.insert(task_id.clone());
+                (
+                    None,
+                    ProviderEvent::SubagentResumed {
+                        subagent_id,
+                        name,
+                        description,
+                        delegation,
+                    },
+                )
+            }
+            (None, DelegationKind::Spawn { .. }) => {
+                // A spawn's tool use is the identity the subagent's every chunk rides under, and
+                // the Resume State records it so a resume after a restart still routes them. A
+                // start that names no tool use leaves nothing to attribute chunks by, though the
+                // Subagent's row and settle still reach the Transcript.
+                let conversation = message.tool_use_id;
+                if let Some(conversation) = &conversation {
+                    self.conversation_agents
+                        .insert(conversation.clone(), task_id.clone());
+                    self.resume
+                        .agents
+                        .insert(task_id.clone(), conversation.clone());
+                    recorded = true;
+                }
+                let description = message.description.unwrap_or_default();
                 self.agent_tasks.insert(
                     task_id.clone(),
                     AgentTask {
@@ -552,7 +618,43 @@ impl ClaudeProjection {
                 .into(),
             );
         }
+        if recorded {
+            projected.push(self.resume_state_changed());
+        }
         projected
+    }
+
+    /// The Resume State as it stands now, for orchestration to store in place of what the
+    /// Session's startup reported.
+    fn resume_state_changed(&self) -> AttributedProviderEvent {
+        ProviderEvent::ResumeStateChanged {
+            resume_state: self.resume.to_provider(),
+        }
+        .into()
+    }
+
+    /// Claims a subagent conversation nothing on this wire has attributed for the one agent resumed
+    /// without a conversation of its own — an agent spawned before a restart that the Resume State
+    /// never recorded, whose conversation rides under a spawn this wire never saw. Only a lone such
+    /// agent can claim it: with two working, nothing on the wire tells whose a chunk is, so neither
+    /// claims and their chunks land nowhere, as an unknown conversation's always have. A claimed
+    /// conversation is recorded like a spawned one, so the next restart need not claim it again.
+    fn claim_conversation(&mut self, owner: &ConversationKey) -> Option<AttributedProviderEvent> {
+        let conversation = owner.as_ref()?;
+        if self.unplaced_resumes.len() != 1
+            || self.conversation_agents.contains_key(conversation)
+            || self.delegation_tools.contains_key(conversation)
+        {
+            return None;
+        }
+        let task_id = self.unplaced_resumes.pop_first()?;
+        self.conversation_agents
+            .insert(conversation.clone(), task_id.clone());
+        if let Some(task) = self.agent_tasks.get_mut(&task_id) {
+            task.conversation = Some(conversation.clone());
+        }
+        self.resume.agents.insert(task_id, conversation.clone());
+        Some(self.resume_state_changed())
     }
 
     /// A revised description for a running Subagent. Tasks that are not Subagents, tasks never
@@ -598,6 +700,7 @@ impl ClaudeProjection {
             return Vec::new();
         };
         task.working = None;
+        self.unplaced_resumes.remove(&task_id);
         // The settle is the last of this stretch's events: whatever its streams leave open, the
         // settle closes in the child Session, and nothing more of the conversation's lands until a
         // resume begins the next stretch.
@@ -637,6 +740,7 @@ impl ClaudeProjection {
             ))
         })?;
         let owner: ConversationKey = message.parent_tool_use_id;
+        let claimed = self.claim_conversation(&owner);
         let event = message.event;
         // The conversation steps out of the table while its chunk projects, so the projection's
         // shared state — the commands and spawns other conversations feed too — stays reachable.
@@ -732,12 +836,12 @@ impl ClaudeProjection {
         }
         self.conversations.insert(owner.clone(), conversation);
         let attribution = self.attribution(&owner);
-        Ok(projected
+        Ok(claimed
             .into_iter()
-            .map(|event| AttributedProviderEvent {
+            .chain(projected.into_iter().map(|event| AttributedProviderEvent {
                 attribution: attribution.clone(),
                 event,
-            })
+            }))
             .collect())
     }
 
@@ -753,6 +857,7 @@ impl ClaudeProjection {
             return Vec::new();
         };
         let owner: ConversationKey = message.parent_tool_use_id;
+        let claimed = self.claim_conversation(&owner);
         let observed_model = owner.as_ref().and_then(|conversation| {
             message
                 .message
@@ -810,19 +915,20 @@ impl ClaudeProjection {
         }
         // Evidence reaches the row of the stretch the agent is working in; while none is, it waits
         // for the start that opens one.
-        let mut attributed_events = observed_model
-            .and_then(|(conversation, model)| {
-                let task_id = self.conversation_agents.get(&conversation)?;
-                self.agent_tasks.get(task_id)?.working.as_ref()?;
-                Some(
-                    ProviderEvent::SubagentModelChanged {
-                        subagent_id: ProviderSubagentId::new(task_id.clone()),
-                        model,
-                    }
-                    .into(),
-                )
-            })
+        let model_evidence = observed_model.and_then(|(conversation, model)| {
+            let task_id = self.conversation_agents.get(&conversation)?;
+            self.agent_tasks.get(task_id)?.working.as_ref()?;
+            Some(
+                ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(task_id.clone()),
+                    model,
+                }
+                .into(),
+            )
+        });
+        let mut attributed_events = claimed
             .into_iter()
+            .chain(model_evidence)
             .collect::<Vec<_>>();
         let attribution = self.attribution(&owner);
         attributed_events.extend(projected.into_iter().map(|event| AttributedProviderEvent {
@@ -1254,9 +1360,183 @@ fn tool_result_text(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::send_message_description;
+    use super::{ClaudeProjection, ClaudeResumeState, TurnInFlight, send_message_description};
+    use crate::provider::{
+        AttributedProviderEvent, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
+    };
+
+    /// The loop's own conversation running SendMessage `tool` to the agent `task`, and the CLI
+    /// starting the agent's task again for it.
+    fn send_message_resuming(tool: &str, task: &str) -> [Value; 3] {
+        [
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": tool, "name": "SendMessage", "input": {}},
+                },
+                "parent_tool_use_id": null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": 0},
+                "parent_tool_use_id": null,
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": task,
+                "tool_use_id": tool,
+                "description": "The spawn's description",
+                "task_type": "local_agent",
+                "subagent_type": "general-purpose",
+            }),
+        ]
+    }
+
+    fn said_under(conversation: &str, text: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+            "parent_tool_use_id": conversation,
+        })
+    }
+
+    fn project(
+        projection: &mut ClaudeProjection,
+        messages: &[Value],
+    ) -> Vec<AttributedProviderEvent> {
+        messages
+            .iter()
+            .flat_map(|message| {
+                projection
+                    .project(message.clone())
+                    .expect("the message projects")
+            })
+            .collect()
+    }
+
+    /// Where the agent Message `text` lands: under the Subagent the attribution names.
+    fn attribution_of(events: &[AttributedProviderEvent], text: &str) -> ProviderEventAttribution {
+        events
+            .iter()
+            .find(|event| {
+                matches!(&event.event, ProviderEvent::AgentMessageDelta { content } if content == text)
+            })
+            .unwrap_or_else(|| panic!("{text} projects as an agent Message: {events:?}"))
+            .attribution
+            .clone()
+    }
+
+    fn subagent(task: &str) -> ProviderEventAttribution {
+        ProviderEventAttribution::Subagent(ProviderSubagentId::new(task))
+    }
+
+    #[test]
+    fn a_spawn_records_the_conversation_its_agent_rides_under_in_the_resume_state() {
+        let mut projection = ClaudeProjection::new(
+            TurnInFlight::new(),
+            ClaudeResumeState {
+                session_id: "provider-session".to_owned(),
+                ..Default::default()
+            },
+        );
+
+        let events = project(
+            &mut projection,
+            &[json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "a2046dbbe8ecd4a5c",
+                "tool_use_id": "agent_1",
+                "description": "Say hello",
+                "task_type": "local_agent",
+            })],
+        );
+
+        let revised = events
+            .iter()
+            .find_map(|event| match &event.event {
+                ProviderEvent::ResumeStateChanged { resume_state } => Some(resume_state.payload()),
+                _ => None,
+            })
+            .expect("the spawn revises the Resume State");
+        assert_eq!(
+            *revised,
+            json!({
+                "session_id": "provider-session",
+                "agents": {"a2046dbbe8ecd4a5c": "agent_1"},
+            })
+        );
+    }
+
+    #[test]
+    fn an_agent_the_resume_state_recorded_resumes_with_its_conversation_routed() {
+        let mut projection = ClaudeProjection::new(
+            TurnInFlight::new(),
+            ClaudeResumeState {
+                session_id: "provider-session".to_owned(),
+                agents: [("a2046dbbe8ecd4a5c".to_owned(), "agent_1".to_owned())].into(),
+            },
+        );
+
+        let mut messages = send_message_resuming("send_1", "a2046dbbe8ecd4a5c").to_vec();
+        messages.push(said_under("agent_1", "GOODBYE"));
+        let events = project(&mut projection, &messages);
+
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                ProviderEvent::SubagentResumed { subagent_id, .. }
+                    if subagent_id.as_str() == "a2046dbbe8ecd4a5c"
+            )),
+            "the start resumes the recorded agent: {events:?}"
+        );
+        assert_eq!(
+            attribution_of(&events, "GOODBYE"),
+            subagent("a2046dbbe8ecd4a5c")
+        );
+    }
+
+    #[test]
+    fn a_lone_agent_resumed_with_no_record_claims_the_conversation_nothing_else_has() {
+        let mut projection =
+            ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default());
+
+        let mut messages = send_message_resuming("send_1", "a0ld").to_vec();
+        messages.push(said_under("agent_before", "Picking up."));
+        let events = project(&mut projection, &messages);
+
+        assert_eq!(attribution_of(&events, "Picking up."), subagent("a0ld"));
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                ProviderEvent::ResumeStateChanged { resume_state }
+                    if resume_state.payload()["agents"]["a0ld"] == "agent_before"
+            )),
+            "the claim is recorded so a later restart need not claim it again: {events:?}"
+        );
+    }
+
+    #[test]
+    fn two_agents_resumed_with_no_record_claim_no_conversation() {
+        let mut projection =
+            ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default());
+
+        let mut messages = send_message_resuming("send_1", "a0ld").to_vec();
+        messages.extend(send_message_resuming("send_2", "b0ld"));
+        messages.push(said_under("agent_before", "Whose is this?"));
+        let events = project(&mut projection, &messages);
+
+        assert!(
+            ![subagent("a0ld"), subagent("b0ld")]
+                .contains(&attribution_of(&events, "Whose is this?")),
+            "nothing tells whose the conversation is, so neither agent claims it: {events:?}"
+        );
+    }
 
     #[test]
     fn a_send_message_is_described_by_its_summary() {

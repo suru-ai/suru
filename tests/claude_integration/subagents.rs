@@ -1300,3 +1300,67 @@ async fn a_sibling_that_resumes_a_subagent_holds_the_resume_row_in_its_own_turn(
         .await
         .expect("shut the server down");
 }
+
+/// A SendMessage resuming an agent the Session holds no record of — spawned before its identity was
+/// stored, say — whose conversation rides under a spawn this wire never saw.
+const UNPLACED_RESUME_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"send_1","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"to\":\"a0ld0ld0ld0ld0ld\",\"message\":\"Pick up where you left off.\",\"summary\":\"Pick up again\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a0ld0ld0ld0ld0ld","tool_use_id":"send_1","description":"Old work","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"Picking up."}]},"parent_tool_use_id":"agent_before_the_record","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a0ld0ld0ld0ld0ld","tool_use_id":"send_1","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"DONE"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":400,"num_turns":1,"result":"DONE","session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn a_resume_of_an_agent_the_session_holds_no_record_of_opens_a_subagent_holding_its_work() {
+    let claude = conversation_fixture(UNPLACED_RESUME_TURN);
+    let opened = opened_session(&claude, "claude-subagent-unplaced", "Pick the old agent up").await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(parent.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        turn_id,
+        status,
+        name,
+        description,
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!(*turn_id, parent.turns[0].id);
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(name, "general-purpose");
+    assert_eq!(description, "Pick up again");
+
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    assert_eq!(child.session.parent, Some(opened.session_id));
+    assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        transcript_messages(&child),
+        [
+            (
+                child.turns[0].id,
+                &MessageRole::Delegation(Delegator {
+                    session_id: opened.session_id,
+                    name: None,
+                }),
+                "Pick up where you left off.",
+            ),
+            (child.turns[0].id, &MessageRole::Agent, "Picking up."),
+        ],
+        "the resume's Delegation opens the Subagent it was recorded as, ahead of its work"
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}

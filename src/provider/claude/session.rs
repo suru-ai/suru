@@ -24,6 +24,7 @@
 //! than acting on whatever came next, and both read what is running from [`super::turn_in_flight`].
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::PathBuf,
     sync::{
@@ -57,8 +58,10 @@ use crate::{
 };
 
 /// Everything Suru must remember about a Claude Session to continue it after a restart: the
-/// provider-session UUID Suru minted and spawned the CLI under. The CLI keeps the conversation on
-/// disk behind it, which is why this is all the Resume State carries.
+/// provider-session UUID Suru minted and spawned the CLI under, and the conversation every agent
+/// the Session spawned rides under. The CLI keeps the conversation on disk behind the UUID, which
+/// is all it needs; the agents are what the projection needs, since a resumed agent's start names
+/// only its task and the SendMessage that resumed it, never the spawn its conversation rides under.
 ///
 /// Suru reports this the moment the Session connects, while the CLI writes the conversation only
 /// once a Turn has run under the identifier. A Session whose every Turn failed before the CLI
@@ -66,11 +69,23 @@ use crate::{
 /// a later restart fails it the way any unhonorable resume is failed. That is the conservative
 /// end of the rule rather than an oversight: Suru cannot tell a conversation that was never
 /// written from one the CLI has lost, and quietly minting a new one is what this Provider must
-/// never do. Closing the gap needs a way to report Resume State once the conversation exists,
-/// which the Provider seam does not have.
-#[derive(Deserialize, Serialize)]
-struct ClaudeResumeState {
-    session_id: String,
+/// never do. The agents are reported as each one spawns, through a Resume State revision.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ClaudeResumeState {
+    pub(super) session_id: String,
+    /// Every agent task the conversation has run as a Subagent, by task id — the Subagent's
+    /// identity — against the `parent_tool_use_id` its conversation rides under: the id of the
+    /// tool use that spawned it, which a resume does not change.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) agents: BTreeMap<String, String>,
+}
+
+impl ClaudeResumeState {
+    pub(super) fn to_provider(&self) -> ProviderResumeState {
+        ProviderResumeState::new(
+            serde_json::to_value(self).expect("Claude Resume State serialization is infallible"),
+        )
+    }
 }
 
 /// How a child addresses the provider session: minting the conversation under the identifier Suru
@@ -118,7 +133,7 @@ pub(super) async fn start_claude_session(
     };
     // Read before anything is launched: Resume State Suru cannot read fails the startup outright
     // rather than after a discovery the Session will never use.
-    let restored = known_session_id(request.resume_state)?;
+    let restored = restored_state(request.resume_state)?;
     // The Selection the Session reports before the user chooses one: the catalog default, which is
     // what the first Turn will spawn under when nothing else was chosen.
     let selection = default_selection(
@@ -129,17 +144,20 @@ pub(super) async fn start_claude_session(
     )
     .await?;
     // A restored Session keeps the identifier its conversation is filed under, because that is
-    // what the CLI kept the work behind.
-    let (provider_session_id, next_spawn) = match restored {
-        Some(session_id) => (session_id, ProviderSessionSpawn::Resume),
-        None => (uuid::Uuid::new_v4().to_string(), ProviderSessionSpawn::Mint),
+    // what the CLI kept the work behind, and the agents it spawned, whose resumes the projection
+    // must still route.
+    let (resume, next_spawn) = match restored {
+        Some(restored) => (restored, ProviderSessionSpawn::Resume),
+        None => (
+            ClaudeResumeState {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                agents: BTreeMap::new(),
+            },
+            ProviderSessionSpawn::Mint,
+        ),
     };
-    let resume_state = ProviderResumeState::new(
-        serde_json::to_value(ClaudeResumeState {
-            session_id: provider_session_id.clone(),
-        })
-        .expect("Claude Resume State serialization is infallible"),
-    );
+    let provider_session_id = resume.session_id.clone();
+    let resume_state = resume.to_provider();
 
     let (conversation, messages) = tokio::sync::mpsc::unbounded_channel();
     let turn = TurnInFlight::new();
@@ -154,6 +172,7 @@ pub(super) async fn start_claude_session(
         request.execution_directory.clone(),
         context.clone(),
         reports,
+        resume,
     );
     let session = Arc::new(ClaudeSession {
         context,
@@ -186,13 +205,13 @@ pub(super) async fn start_claude_session(
     ))
 }
 
-/// The provider session `resume_state` names, or nothing when the Suru Session has never reached
-/// Claude. Resume State Suru cannot read is a failure rather than a reason to start over: the
-/// Session it belongs to has a conversation behind it that minting a fresh identifier would
-/// abandon while looking as though nothing was lost.
-fn known_session_id(
+/// What `resume_state` restores — the provider session it names and the agents spawned in it — or
+/// nothing when the Suru Session has never reached Claude. Resume State Suru cannot read is a
+/// failure rather than a reason to start over: the Session it belongs to has a conversation behind
+/// it that minting a fresh identifier would abandon while looking as though nothing was lost.
+fn restored_state(
     resume_state: Option<ProviderResumeState>,
-) -> Result<Option<String>, ProviderError> {
+) -> Result<Option<ClaudeResumeState>, ProviderError> {
     let Some(state) = resume_state else {
         return Ok(None);
     };
@@ -203,7 +222,7 @@ fn known_session_id(
             "Claude Resume State is invalid: the provider session identifier was empty",
         ));
     }
-    Ok(Some(state.session_id))
+    Ok(Some(state))
 }
 
 /// The Agent Selection a Session with none chosen runs under: the catalog's default row with its
@@ -648,11 +667,11 @@ fn spawn_args(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{collections::BTreeMap, ffi::OsString};
 
     use serde_json::json;
 
-    use super::{ProviderSessionSpawn, known_session_id, spawn_args};
+    use super::{ClaudeResumeState, ProviderSessionSpawn, restored_state, spawn_args};
     use crate::{
         protocol::{
             AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
@@ -923,7 +942,7 @@ mod tests {
     #[test]
     fn a_session_that_never_reached_claude_mints_a_conversation_of_its_own() {
         assert_eq!(
-            known_session_id(None).expect("no Resume State is not a failure"),
+            restored_state(None).expect("no Resume State is not a failure"),
             None
         );
     }
@@ -934,8 +953,23 @@ mod tests {
             "session_id": "11111111-2222-3333-4444-555555555555",
         }));
         assert_eq!(
-            known_session_id(Some(state)).expect("the Resume State is readable"),
-            Some("11111111-2222-3333-4444-555555555555".to_owned())
+            restored_state(Some(state)).expect("the Resume State is readable"),
+            Some(ClaudeResumeState {
+                session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+                agents: BTreeMap::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_agents_a_session_spawned_survive_a_round_trip_through_resume_state() {
+        let state = ClaudeResumeState {
+            session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+            agents: BTreeMap::from([("a2046dbbe8ecd4a5c".to_owned(), "toolu_agent".to_owned())]),
+        };
+        assert_eq!(
+            restored_state(Some(state.to_provider())).expect("the Resume State is readable"),
+            Some(state)
         );
     }
 
@@ -947,7 +981,7 @@ mod tests {
             json!({ "session_id": 7 }),
             json!("11111111-2222-3333-4444-555555555555"),
         ] {
-            let error = known_session_id(Some(ProviderResumeState::new(unusable.clone())))
+            let error = restored_state(Some(ProviderResumeState::new(unusable.clone())))
                 .expect_err("unusable Resume State fails the Session startup");
             assert!(
                 error.to_string().contains("Claude Resume State is invalid"),

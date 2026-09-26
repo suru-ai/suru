@@ -8,16 +8,16 @@
 //! an empty conversation under the same identifier.
 
 use crate::support::{
-    ScriptedClaude, agent_messages, conversation_arms, conversation_fixture, flag_value, hosting,
-    rejecting_resume_preamble, settled_session,
+    CLAUDE_MODELS, ScriptedClaude, agent_messages, conversation_arms, conversation_fixture,
+    discovery_arms, flag_value, hosting, rejecting_resume_preamble, settled_session,
 };
 use suru::{
     managed_client::ManagedClient,
     protocol::{
-        AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
-        InitialPrompt, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
-        TurnStatus, UpdateAgentSelectionRequest,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
+        CreateSessionRequest, InitialPrompt, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId,
+        SessionSnapshot, TurnId, TurnStatus, UpdateAgentSelectionRequest,
     },
     server::RunningServer,
 };
@@ -373,4 +373,176 @@ async fn an_unchanged_selection_between_turns_keeps_the_child_that_is_running() 
     );
 
     session.shutdown().await;
+}
+
+/// The durable Session's first Turn spawns two background agents, each of which says hello and
+/// settles before the loop's result, as the live 2.1.280 CLI reports a spawn.
+const SPAWNS_TWO_AGENTS: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"agent_1","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Say hello\",\"prompt\":\"Say HELLO.\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"agent_2","name":"Agent","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Say hi\",\"prompt\":\"Say HI.\",\"subagent_type\":\"Explore\",\"run_in_background\":true}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"b3157ecc9f9de5b6d","tool_use_id":"agent_2","description":"Say hi","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"HELLO"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-child","content":[{"type":"text","text":"HI"}]},"parent_tool_use_id":"agent_2","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"agent_1","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"b3157ecc9f9de5b6d","tool_use_id":"agent_2","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Launched.","session_id":"prov-session"}'
+"#;
+
+/// After the restart, the resumed conversation's loop sends both agents more through SendMessage
+/// at once, and their answers interleave. The CLI starts each agent's task again naming its
+/// SendMessage, and each agent's conversation rides under the Agent tool use that spawned it
+/// before the restart — the shape the live CLI reports within one process, assumed to hold for
+/// agents a `--resume`d CLI reloads. Nothing in the resumed stretch says which spawn is whose, so
+/// only what the Session recorded before the restart can route them.
+const RESUMES_BOTH_AGENTS: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"send_1","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"to\":\"a2046dbbe8ecd4a5c\",\"message\":\"Now say GOODBYE.\",\"summary\":\"Say goodbye\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"send_2","name":"SendMessage","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"to\":\"b3157ecc9f9de5b6d\",\"message\":\"Now say BYE.\",\"summary\":\"Say bye\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","description":"Say hello","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"b3157ecc9f9de5b6d","tool_use_id":"send_2","description":"Say hi","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-resumed","content":[{"type":"text","text":"BYE"}]},"parent_tool_use_id":"agent_2","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-resumed","content":[{"type":"text","text":"GOODBYE"}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"b3157ecc9f9de5b6d","tool_use_id":"send_2","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"a2046dbbe8ecd4a5c","tool_use_id":"send_1","status":"completed","session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"DONE"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"DONE","session_id":"prov-session"}'
+"#;
+
+/// A user-message arm that plays `timeline` only for the Prompt reading `prompt`, so one fixture
+/// can answer the Turns on either side of a restart differently.
+fn prompt_arm(prompt: &str, timeline: &str) -> String {
+    format!(
+        r#"    *'"type":"user"'*'{prompt}'*)
+{timeline}      ;;
+"#
+    )
+}
+
+/// The Subagent rows in `snapshot`, in Transcript order, as the Turn each stands in, the
+/// description it reads, and the Session it leads into.
+fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<(TurnId, &str, SessionId)> {
+    snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Subagent {
+                turn_id,
+                status,
+                description,
+                session_id,
+                ..
+            } => {
+                assert_eq!(*status, ActivityStatus::Completed, "{description} settles");
+                Some((*turn_id, description.as_str(), *session_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn agents_spawned_before_a_restart_resume_in_their_own_sessions_after_it() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        prompt_arm("Open a durable Claude conversation", SPAWNS_TWO_AGENTS),
+        prompt_arm("Send the agents back in", RESUMES_BOTH_AGENTS),
+    ));
+    let restored = DurableSession::start(&claude, "claude-restart-subagent-resume")
+        .await
+        .restarted(&claude)
+        .await;
+
+    let parent = restored.continue_with("Send the agents back in", 1).await;
+
+    assert_second_child_resumed_the_first(&claude, "the restart");
+    assert_eq!(parent.turns[1].status, TurnStatus::Completed);
+    let rows = subagent_rows(&parent);
+    let [
+        (hello_turn, "Say hello", hello_child),
+        (hi_turn, "Say hi", hi_child),
+        (goodbye_turn, "Say goodbye", goodbye_child),
+        (bye_turn, "Say bye", bye_child),
+    ] = rows[..]
+    else {
+        panic!("each spawn and each resume stands as a row, got {rows:?}");
+    };
+    assert_eq!([hello_turn, hi_turn], [parent.turns[0].id; 2]);
+    assert_eq!(
+        [goodbye_turn, bye_turn],
+        [parent.turns[1].id; 2],
+        "the resume rows stand in the Turn after the restart that delegated them"
+    );
+    assert_ne!(hello_child, hi_child);
+    assert_eq!(
+        (goodbye_child, bye_child),
+        (hello_child, hi_child),
+        "each resume leads into the Session its agent spawned into before the restart"
+    );
+
+    for (child, (spawned, spawn_delegation), (resumed, resume_delegation), model) in [
+        (
+            hello_child,
+            ("HELLO", "Say HELLO."),
+            ("GOODBYE", "Now say GOODBYE."),
+            "claude-sonnet-resumed",
+        ),
+        (
+            hi_child,
+            ("HI", "Say HI."),
+            ("BYE", "Now say BYE."),
+            "claude-opus-resumed",
+        ),
+    ] {
+        let child = settled_session(&restored.client, child, 1).await;
+        let [first, second] = child.turns.as_slice() else {
+            panic!(
+                "the resume begins a second Turn in the agent's own Session, got {:?}",
+                child.turns
+            );
+        };
+        assert_eq!(first.status, TurnStatus::Completed);
+        assert_eq!(second.status, TurnStatus::Completed);
+        assert_eq!(
+            second
+                .agent
+                .as_ref()
+                .map(|agent| agent.selection.model.as_str()),
+            Some(model),
+            "the resumed stretch's Model evidence reaches the Turn it began"
+        );
+        let messages = agent_messages(&child)
+            .into_iter()
+            .map(|message| (message.content.as_str(), message.turn_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [(spawned, first.id), (resumed, second.id)],
+            "the conversation the agent spawned under before the restart still reaches its Session"
+        );
+        let delegations = child
+            .messages
+            .iter()
+            .filter(|message| message.role.delegator().is_some())
+            .map(|message| (message.content.as_str(), message.turn_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delegations,
+            [(spawn_delegation, first.id), (resume_delegation, second.id)],
+            "the resume after the restart opens its Turn with SendMessage's message"
+        );
+    }
+
+    restored.shutdown().await;
 }
