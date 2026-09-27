@@ -238,6 +238,13 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
         ],
         "Codex runs an Errand as one ephemeral, read-only, schema-constrained run"
     );
+    assert!(
+        codex
+            .errand_arguments()
+            .iter()
+            .all(|argument| !argument.contains("mcp_servers")),
+        "an Errand is handed no MCP server, the Broker's included, so its locked flags stand"
+    );
     assert_eq!(
         codex.errand_cwd(),
         suru::paths::canonical(workspace.path()).expect("canonicalize Workspace"),

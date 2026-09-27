@@ -1014,9 +1014,11 @@ mod tests {
 
     #[test]
     fn a_session_handed_the_broker_points_each_launch_at_its_config_and_allowlists_it() {
-        let config = super::BrokerMcpConfig::write(&crate::provider::BrokerHandoff::for_tests(
-            "http://127.0.0.1:1/broker",
-        ))
+        let directory = tempfile::tempdir().expect("create a directory for the config");
+        let config = super::BrokerMcpConfig::write_in(
+            directory.path(),
+            &crate::provider::BrokerHandoff::for_tests("http://127.0.0.1:1/broker"),
+        )
         .expect("write the Broker's MCP config");
         let args = spawn_args(
             "11111111-2222-3333-4444-555555555555",
@@ -1026,17 +1028,19 @@ mod tests {
             Some(&config),
         )
         .expect("a Session handed the Broker lowers");
-        let [mcp_config, path, allowed_tools, allowlist] = config.launch_args();
+        let position = |flag: &str| {
+            args.iter()
+                .position(|argument| argument == flag)
+                .unwrap_or_else(|| panic!("the launch carries {flag}: {args:?}"))
+        };
+        let broker = position("--mcp-config");
         assert_eq!(
-            args[7..],
-            [
-                mcp_config,
-                path,
-                allowed_tools,
-                allowlist,
-                OsString::from("--model"),
-                OsString::from("fixture[1m]"),
-            ],
+            args[broker..broker + 4],
+            config.launch_args(),
+            "the launch is pointed at the config and allowlists the Broker's Tools: {args:?}"
+        );
+        assert!(
+            position("--resume") < broker && broker < position("--model"),
             "the Broker's flags follow the conversation's and precede the Selection's: {args:?}"
         );
     }

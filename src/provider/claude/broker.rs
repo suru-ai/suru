@@ -46,7 +46,11 @@ impl BrokerMcpConfig {
         Self::write_in(&std::env::temp_dir(), handoff)
     }
 
-    fn write_in(directory: &Path, handoff: &BrokerHandoff) -> Result<Self, ProviderError> {
+    /// Writes the same MCP config into `directory`, where a test keeps its files.
+    pub(super) fn write_in(
+        directory: &Path,
+        handoff: &BrokerHandoff,
+    ) -> Result<Self, ProviderError> {
         let path = directory.join(format!(
             "suru-claude-broker-{}.json",
             uuid::Uuid::new_v4().simple()
