@@ -1235,15 +1235,16 @@ impl ProviderOrchestrator {
 
     /// Spawns a brokered Subagent for the Agent of `caller`, and answers with
     /// its Session at once: the store opens the child Session and its row in
-    /// the caller's working Turn (ADR 0035), and the child's own Provider
-    /// actor starts beside it and delivers the Delegation as the child's
-    /// first Turn input, naming the Agent that delegated it. Whatever becomes
-    /// of the child after that — its Provider failing to start included —
-    /// settles its Turn and, with it, its row, rather than the answer.
+    /// the caller's working Turn — or in a Continuation begun to hold it when
+    /// none works (ADR 0035) — and the child's own Provider actor starts
+    /// beside it and delivers the Delegation as the child's first Turn input,
+    /// naming the Agent that delegated it. Whatever becomes of the child after
+    /// that — its Provider failing to start included — settles its Turn and,
+    /// with it, its row, rather than the answer.
     ///
     /// Refused, in words the delegating Agent reads, for a Provider this
-    /// server does not host or the user has turned off, an empty Delegation,
-    /// and a caller with no Turn working to hold the row.
+    /// server does not host or the user has turned off, and an empty
+    /// Delegation.
     pub(crate) fn spawn_brokered_subagent(
         &self,
         caller: SessionId,

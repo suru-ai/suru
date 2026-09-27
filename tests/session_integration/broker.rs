@@ -17,14 +17,17 @@ use serde_json::{Value, json};
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-        ApprovalPosture, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
+        ApprovalPosture, ContextFill, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
         ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, ProviderId,
         ProviderUnavailability, RuntimeDescriptor, SessionId, SessionSnapshot, SessionStatus,
         SettingMutation, SubagentTreeChange, TranscriptItem, TurnStatus, Usage, UsageTotal,
     },
-    provider::{BrokerHandoff, ProviderErrand, ProviderEvent},
+    provider::{
+        BrokerHandoff, ContextFillReport, ProviderErrand, ProviderEvent, ProviderSubagentId,
+        ProviderSubagentStatus,
+    },
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -1751,10 +1754,8 @@ async fn model_options_a_spawn_leaves_out_take_the_models_defaults() {
         .expect("shut down server");
 }
 
-#[tokio::test]
-async fn a_spawn_by_a_session_with_no_turn_working_is_refused() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let mut delegating = delegating(state_dir.path(), "broker-spawn-no-turn", None).await;
+/// The caller's Turn settled at its Provider's boundary, as `described`.
+async fn settle_callers_turn(delegating: &Delegating, described: &str) -> SessionSnapshot {
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
@@ -1762,20 +1763,272 @@ async fn a_spawn_by_a_session_with_no_turn_working_is_refused() {
     read_until(
         &delegating.descriptor,
         delegating.caller,
-        "the caller's Turn settles",
+        described,
         |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
     )
-    .await;
+    .await
+}
 
-    let refusal = delegating
-        .client
-        .refusal("spawn_subagent", researcher("codex", "gpt-5.5", json!({})))
+#[tokio::test]
+async fn a_spawn_by_a_session_whose_turn_has_settled_opens_a_continuation_holding_the_row() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-continuation", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let fill = ContextFill {
+        occupied_tokens: 12_400,
+        capacity_tokens: Some(200_000),
+    };
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::ContextFill {
+            report: ContextFillReport {
+                turn_id: None,
+                sequence: 1,
+                fill,
+            },
+        })
         .await;
-    assert!(
-        refusal.contains("has no Turn working to hold the Subagent's row"),
-        "a spawn with no Turn to stand in is refused, saying so: {refusal}"
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the caller's Context Fill is known",
+        |snapshot| snapshot.session.context_fill == Some(fill),
+    )
+    .await;
+    let idle = settle_callers_turn(&delegating, "the caller's Turn settles").await;
+    assert_eq!(
+        idle.working_since(),
+        None,
+        "nothing in the caller's tree works"
     );
-    assert!(delegating.hosted.codex.try_next_start().is_none());
+
+    // Its Agent spawns all the same — from work its Provider carries on past
+    // the Turn, say — and the spawn is taken rather than refused.
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(
+        caller.turns.len(),
+        2,
+        "a Turn is begun to hold the row: {:?}",
+        caller.turns
+    );
+    let continuation = &caller.turns[1];
+    assert_eq!(
+        continuation.prompt_id, None,
+        "a Continuation: begun by no Prompt, and in a top-level Session by no Delegation"
+    );
+    assert_eq!(
+        continuation.status,
+        TurnStatus::Completed,
+        "settled at once, since the caller's Provider knows nothing of it and will never settle it"
+    );
+    assert!(
+        continuation.started_at.is_some() && continuation.settled_at.is_some(),
+        "it records when it began and settled, as any Turn does"
+    );
+    assert_eq!(
+        continuation.agent, caller.turns[0].agent,
+        "held by the caller's own Agent"
+    );
+    assert_eq!(
+        caller.session.context_fill,
+        Some(fill),
+        "so the caller's Context Fill stands, its Model unchanged"
+    );
+    let Activity::Subagent {
+        turn_id, status, ..
+    } = row_for(&caller, child_id)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, continuation.id,
+        "the row stands in the Continuation"
+    );
+    assert_eq!(
+        *status,
+        ActivityStatus::Active,
+        "and works on past its settle, as the child does"
+    );
+    assert!(
+        caller.working_since().is_some(),
+        "the caller reads as Working through its Subagent"
+    );
+    assert_eq!(
+        caller
+            .activities
+            .iter()
+            .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+            .count(),
+        1
+    );
+
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let settled = read_until(
+        &descriptor,
+        delegating.caller,
+        "the row settles with the child's Turn, though the Turn holding it has settled",
+        |snapshot| row_status(snapshot, child_id).0 != ActivityStatus::Active,
+    )
+    .await;
+    let (status, duration_ms) = row_status(&settled, child_id);
+    assert_eq!(status, ActivityStatus::Completed);
+    assert!(duration_ms.is_some());
+    let idle = read_until(
+        &descriptor,
+        delegating.caller,
+        "nothing below the caller works any more",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(idle.session.status, SessionStatus::Idle);
+
+    // Nothing is left owing the caller's Provider a Turn: the next Prompt
+    // begins one of its own there, as after any settled Turn.
+    admit_prompt(
+        &descriptor,
+        delegating.caller,
+        "What did the Researcher find?",
+    )
+    .await;
+    let turn = timeout(PROGRESS_DEADLINE, delegating.caller_provider.next_turn())
+        .await
+        .expect("the next Prompt reaches the caller's Provider as a Turn of its own");
+    assert_eq!(turn.prompt(), "What did the Researcher find?");
+    turn.succeed();
+    let prompted = read_until(
+        &descriptor,
+        delegating.caller,
+        "the Prompt begins the caller's next Turn",
+        |snapshot| snapshot.turns.len() == 3,
+    )
+    .await;
+    assert!(prompted.turns[2].prompt_id.is_some());
+    assert_eq!(prompted.turns[2].status, TurnStatus::Active);
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_native_subagents_spawn_after_its_parents_turn_settled_opens_a_continuation_in_the_tokens_session()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-native-late", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let native = ProviderSubagentId::new("task-1");
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: native.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the seams".to_owned(),
+            delegation: Some("Map every seam.".to_owned()),
+        })
+        .await;
+    let caller = read_until(
+        &descriptor,
+        delegating.caller,
+        "the native Subagent's row opens",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Subagent { .. }))
+        },
+    )
+    .await;
+    let Activity::Subagent {
+        session_id: native_id,
+        ..
+    } = caller
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+        .expect("the native row")
+    else {
+        unreachable!()
+    };
+    let native_id = *native_id;
+    let settled = settle_callers_turn(
+        &delegating,
+        "the caller's Turn settles while its native Subagent works on",
+    )
+    .await;
+    assert!(settled.working_since().is_some());
+
+    // The native Subagent shares its parent's Provider process, and with it
+    // the token its parent's start carried: its spawn is the token's Session's.
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(child.session.parent, Some(delegating.caller));
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(caller.turns.len(), 2);
+    let continuation = &caller.turns[1];
+    assert_eq!(continuation.prompt_id, None);
+    assert_eq!(continuation.status, TurnStatus::Completed);
+    let Activity::Subagent { turn_id, .. } = row_for(&caller, child_id) else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, continuation.id,
+        "the row stands in a Continuation of the token's Session"
+    );
+    let native_session = read_session(&descriptor, native_id).await;
+    assert_eq!(
+        native_session.turns.len(),
+        1,
+        "and the native Subagent's own Session gains no Turn"
+    );
+
+    // The caller stays Working until everything beneath it has settled.
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let brokered_settled = read_until(
+        &descriptor,
+        delegating.caller,
+        "the brokered row settles",
+        |snapshot| row_status(snapshot, child_id).0 == ActivityStatus::Completed,
+    )
+    .await;
+    assert!(
+        brokered_settled.working_since().is_some(),
+        "the native Subagent works on"
+    );
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: native,
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let idle = read_until(
+        &descriptor,
+        delegating.caller,
+        "nothing below the caller works any more",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(idle.session.status, SessionStatus::Idle);
 
     delegating
         .hosted

@@ -10,6 +10,13 @@
 //! stopping Server, or the next start's repair — and the Model the child's
 //! Provider confirms for the Turn reaches the row the same way, so the Subagent
 //! tree and the Subagent Picker read a brokered row exactly as a native one.
+//!
+//! A Delegation's row stands in the Turn the delegating Agent works in. A
+//! spawn that comes after that Turn has settled — from work the caller's
+//! Provider carries on past it, or from a native Subagent riding the caller's
+//! token — stands in a Continuation of the caller's Session begun to hold it
+//! (CONTEXT.md: Subagent), which settles as it is begun because nothing else
+//! ever would (ADR 0033).
 
 use std::fmt;
 
@@ -64,8 +71,6 @@ pub(crate) enum BrokeredSpawnError {
     /// The calling Session is not one the store holds ready: deleted, or its
     /// history still unread.
     CallerNotFound,
-    /// The calling Session has no Turn working to hold the Subagent's row.
-    NoWorkingTurn,
     Storage(String),
 }
 
@@ -74,10 +79,6 @@ impl fmt::Display for BrokeredSpawnError {
         match self {
             Self::CallerNotFound => formatter
                 .write_str("the Session calling the Broker no longer exists on this Suru server"),
-            Self::NoWorkingTurn => formatter.write_str(
-                "the Session calling the Broker has no Turn working to hold the Subagent's row; \
-                 spawn it from within a working Turn",
-            ),
             Self::Storage(message) => write!(formatter, "Suru could not record it: {message}"),
         }
     }
@@ -94,9 +95,14 @@ impl SessionStore {
     ///
     /// The row that stands for it joins the caller's working Turn in the same
     /// lock, so no reader sees the child without its row or the row without
-    /// the child; a caller with no Turn working is refused, and nothing is
-    /// spawned. Nothing here reaches a Provider: whoever spawned it starts
-    /// the child's actor and delivers the Delegation.
+    /// the child. A caller with no Turn working — its Turn settled while its
+    /// Provider worked on, or a native Subagent riding its token called after
+    /// it settled — has a Continuation begun to hold the row instead, settled
+    /// in the same commit: the caller's Provider never learns of that Turn, so
+    /// nothing else would ever settle it, and the row works on past it with
+    /// the child, as any row outlives the Turn it stands in. Nothing here
+    /// reaches a Provider: whoever spawned it starts the child's actor and
+    /// delivers the Delegation.
     pub(crate) fn spawn_brokered_subagent(
         &self,
         caller: SessionId,
@@ -114,9 +120,12 @@ impl SessionStore {
             .sessions
             .get(&caller)
             .ok_or(BrokeredSpawnError::CallerNotFound)?;
-        let delegating_turn = active_turn_id(&record.snapshot)
+        let holding = match active_turn_id(&record.snapshot)
             .map_err(|error| BrokeredSpawnError::Storage(error.to_string()))?
-            .ok_or(BrokeredSpawnError::NoWorkingTurn)?;
+        {
+            Some(working) => HoldingTurn::Working(working),
+            None => HoldingTurn::Continuation(Box::new(holding_continuation(&record.snapshot))),
+        };
         let delegator = match delegator(&state.sessions, caller).name {
             Some(name) => DelegatingAgent::Subagent { name },
             None => DelegatingAgent::Session {
@@ -139,15 +148,13 @@ impl SessionStore {
                 route: SubagentRoute::Brokered,
             },
         );
-        let row = SessionChange::ActivityAdded {
-            activity: opening_subagent_row(
-                delegating_turn,
-                spawn.name,
-                spawn.description,
-                spawned.session_id,
-            ),
-        };
-        if let Err(error) = state.commit(&self.storage, caller, vec![row]) {
+        let row = opening_subagent_row(
+            holding.turn_id(),
+            spawn.name,
+            spawn.description,
+            spawned.session_id,
+        );
+        if let Err(error) = state.commit(&self.storage, caller, holding.holds(row)) {
             // A child with no row would work on where no reader could reach
             // it, keeping the caller Working for good, so it goes too.
             state.sessions.remove(&spawned.session_id);
@@ -166,6 +173,66 @@ impl SessionStore {
             turn_id: spawned.turn_id,
             delegator,
         })
+    }
+}
+
+/// The Turn a brokered Subagent's row joins in the caller's Session.
+enum HoldingTurn {
+    /// The Turn the caller's Agent is working in.
+    Working(TurnId),
+    /// A Continuation begun to hold the row, the caller having no Turn
+    /// working, which settles as it is begun.
+    Continuation(Box<Turn>),
+}
+
+impl HoldingTurn {
+    fn turn_id(&self) -> TurnId {
+        match self {
+            Self::Working(turn_id) => *turn_id,
+            Self::Continuation(turn) => turn.id,
+        }
+    }
+
+    /// The changes that stand `row` in this Turn: for a Continuation, begun
+    /// and settled around it in one commit, so no reader ever sees it open.
+    fn holds(self, row: Activity) -> Vec<SessionChange> {
+        let row = SessionChange::ActivityAdded { activity: row };
+        match self {
+            Self::Working(_) => vec![row],
+            Self::Continuation(turn) => {
+                let turn_id = turn.id;
+                vec![
+                    SessionChange::TurnAdded { turn: *turn },
+                    row,
+                    SessionChange::TurnStatusChanged {
+                        turn_id,
+                        status: TurnStatus::Completed,
+                        settled_at: None,
+                    },
+                ]
+            }
+        }
+    }
+}
+
+/// The Continuation that holds a brokered Subagent's row for a caller with no
+/// Turn working: begun by neither a Prompt nor a Delegation, and run by the
+/// Agent that ran the caller's latest Turn — the Agent calling — so the
+/// Session's Model, and the Context Fill measured against it, stand as they
+/// were. The commit that lands it stamps when it began and when it settled.
+fn holding_continuation(caller: &SessionSnapshot) -> Turn {
+    Turn {
+        id: TurnId::new(),
+        prompt_id: None,
+        agent: caller.turns.last().and_then(|turn| turn.agent.clone()),
+        status: TurnStatus::Active,
+        started_at: None,
+        settled_at: None,
+        last_output_at: None,
+        usage: None,
+        cost: None,
+        cost_basis: None,
+        cost_details: None,
     }
 }
 
