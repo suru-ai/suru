@@ -564,7 +564,7 @@ pub(crate) fn latest_agent_message(
 
 /// The Session whose Agent delegated the stretch of work `turn_id` is: the
 /// one its opening Delegation names. `None` for a Turn no Delegation opened.
-fn delegating_session(snapshot: &SessionSnapshot, turn_id: TurnId) -> Option<SessionId> {
+pub(super) fn delegating_session(snapshot: &SessionSnapshot, turn_id: TurnId) -> Option<SessionId> {
     match &snapshot
         .messages
         .iter()

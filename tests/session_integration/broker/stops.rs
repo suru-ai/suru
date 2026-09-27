@@ -75,7 +75,7 @@ pub(super) async fn interrupt(
 }
 
 /// Takes up the interrupt `provider` is asked for, as its Provider does.
-async fn acknowledge_interrupt(provider: &mut ControlledProviderSession, whose: &str) {
+pub(super) async fn acknowledge_interrupt(provider: &mut ControlledProviderSession, whose: &str) {
     timeout(PROGRESS_DEADLINE, provider.next_interrupt())
         .await
         .unwrap_or_else(|_| panic!("the interrupt reaches {whose} Provider"))

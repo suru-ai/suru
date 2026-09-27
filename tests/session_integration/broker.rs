@@ -47,6 +47,7 @@ use crate::{
 
 mod deletion;
 mod interventions;
+mod late_output;
 mod posture;
 mod watches;
 

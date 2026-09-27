@@ -2189,10 +2189,13 @@ async fn run_provider_session(
                             // follows its settle — it begins a Continuation
                             // (ADR 0015); with nothing owed, stray output —
                             // an interrupted Turn's trailing stream, say — is
-                            // discarded as it always was. A resume is never
-                            // stray: it begins a stretch of delegated work
-                            // whose row stands in a Continuation when the
-                            // Turn that delegated it has already settled
+                            // discarded as it always was. The native
+                            // Subagents are this connection's to know; the
+                            // brokered ones run on actors of their own, which
+                            // only the store follows (ADR 0035). A resume is
+                            // never stray: it begins a stretch of delegated
+                            // work whose row stands in a Continuation when
+                            // the Turn that delegated it has already settled
                             // (ADR 0031, 0032), and dropping it would leave
                             // that stretch's work with nowhere to land.
                             event => {
@@ -2201,6 +2204,7 @@ async fn run_provider_session(
                                     identity.selection = selection.clone();
                                 } else if !subagents.owes_continuation()
                                     && !matches!(event, ProviderEvent::SubagentResumed { .. })
+                                    && !sessions.owes_continuation_to_brokered_subagents(session_id)
                                 {
                                     continue;
                                 }
