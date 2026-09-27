@@ -31,15 +31,17 @@ use super::{
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::broker::{BrokerAccess, BrokerGrant};
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, InterruptOutcome, Message, MessageId,
-    MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-    ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery, TurnId,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, AgentSelection, InterruptOutcome, Message,
+    MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery,
+    TurnId, TurnStatus,
 };
 use crate::sessions::{
-    ApprovalPostureUpdate, DeliveredDelegation, DeliveredTurn, DeliveredTurnStatus,
-    InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore,
-    StoredSubagent, TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
-    message_content_changes, reasoning_content_changes,
+    ApprovalPostureUpdate, BrokeredSpawn, DelegatingAgent, DeliveredDelegation, DeliveredTurn,
+    DeliveredTurnStatus, InterruptSessionError, InterruptTarget, OpenInterventions,
+    ProviderTurnOutcome, SessionStore, StoredSubagent, TrailingCommandOutput,
+    command_output_changes, earliest_pending_prompt, message_content_changes,
+    reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::StoredSubagentIdentity;
@@ -80,6 +82,11 @@ const SUBAGENT_CONNECTION_LOST_MESSAGE: &str =
 const SUBAGENT_FAILED_MESSAGE: &str =
     "Provider execution failed: the Provider reported this Subagent failing.";
 
+/// The failure a delegated Turn settles with when its Delegation reaches the
+/// Subagent's actor while another Turn is running there.
+const DELEGATION_WHILE_WORKING_MESSAGE: &str =
+    "Provider execution failed: the Subagent was already working when this Delegation arrived.";
+
 /// Checkout guards taken while admitting a Prompt, held until that Prompt's
 /// preparation inherits them or the Prompt leaves the queue.
 type CheckoutGuards = Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>;
@@ -106,6 +113,18 @@ pub(crate) struct ProviderOrchestrator {
     checkout_skill_timeout: Duration,
     /// Mints the Broker token each Provider start is handed.
     broker: BrokerAccess,
+}
+
+/// What a delegating Agent asked the Broker to spawn, its Agent Selection
+/// already checked against the Model Catalog: the Provider, Model and Model
+/// Options the Subagent runs under, the name and description its row
+/// carries, and the Delegation — everything it is to do, since it sees none
+/// of the delegating Agent's conversation.
+pub(crate) struct BrokeredSubagentRequest {
+    pub(crate) selection: AgentSelection,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) delegation: String,
 }
 
 struct ProviderActors {
@@ -197,6 +216,14 @@ enum ProviderCommand {
     StartPrompt {
         prompt_id: PromptId,
     },
+    /// Begin the Turn a Delegation opened in the Session this actor owns — a
+    /// brokered Subagent's — by delivering it to the Provider as the Turn's
+    /// input. The store opened the Turn, headed by the Delegation, when the
+    /// Subagent was spawned; this reaches the Provider with it.
+    StartDelegation {
+        turn_id: TurnId,
+        input: ProviderPrompt,
+    },
     SteerPrompt,
     /// Stop the Session's work, whatever it is: the active Turn — the
     /// Provider stops its background work first, in the established ordering
@@ -269,6 +296,11 @@ struct ActiveProviderTurn {
     /// steering it. A Provider-owned Continuation must first interrupt its
     /// native Turn; late output alone has no Provider Turn to interrupt.
     continuation: Option<ContinuationExecution>,
+    /// Whether a Prompt began this Turn, which a rejected Agent Selection
+    /// hands back to the user to try again. A Continuation began with
+    /// nothing, and a Delegation is no user's to hand back, so a rejection of
+    /// either fails the Turn instead.
+    prompt_begun: bool,
     streaming_message: Option<ActiveProviderMessage>,
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
@@ -310,6 +342,7 @@ impl ActiveProviderTurn {
             approvals: LiveApprovals::default(),
             questionnaires: LiveQuestionnaires::default(),
             continuation: None,
+            prompt_begun: true,
             streaming_message: None,
             interruption_acknowledged: false,
             command_activities: HashMap::new(),
@@ -321,6 +354,15 @@ impl ActiveProviderTurn {
     fn new_continuation(turn_id: TurnId) -> Self {
         Self {
             continuation: Some(ContinuationExecution::LateOutput),
+            prompt_begun: false,
+            ..Self::new(turn_id)
+        }
+    }
+
+    /// A Turn a Delegation began in a brokered Subagent's Session.
+    fn new_delegated(turn_id: TurnId) -> Self {
+        Self {
+            prompt_begun: false,
             ..Self::new(turn_id)
         }
     }
@@ -1191,6 +1233,78 @@ impl ProviderOrchestrator {
         self.settings.borrow().settings.provider_enabled(provider)
     }
 
+    /// Spawns a brokered Subagent for the Agent of `caller`, and answers with
+    /// its Session at once: the store opens the child Session and its row in
+    /// the caller's working Turn (ADR 0035), and the child's own Provider
+    /// actor starts beside it and delivers the Delegation as the child's
+    /// first Turn input, naming the Agent that delegated it. Whatever becomes
+    /// of the child after that — its Provider failing to start included —
+    /// settles its Turn and, with it, its row, rather than the answer.
+    ///
+    /// Refused, in words the delegating Agent reads, for a Provider this
+    /// server does not host or the user has turned off, an empty Delegation,
+    /// and a caller with no Turn working to hold the row.
+    pub(crate) fn spawn_brokered_subagent(
+        &self,
+        caller: SessionId,
+        request: BrokeredSubagentRequest,
+    ) -> Result<SessionId, String> {
+        let provider = request.selection.provider.clone();
+        let runtime = self
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.provider_id() == provider)
+            .cloned()
+            .ok_or_else(|| format!("Provider `{provider}` is not hosted by this Suru server."))?;
+        if !self.is_enabled(&provider) {
+            return Err(format!(
+                "Provider `{provider}` is turned off in Suru's Settings; ask the user to turn \
+                 `provider.{provider}.enabled` back on, or choose another Provider."
+            ));
+        }
+        let delegation = delegation_text(&request.delegation)
+            .ok_or_else(|| "The prompt is empty: say what the Subagent is to do.".to_owned())?;
+        let delivered = delegation.content.clone();
+        let spawned = self
+            .sessions
+            .spawn_brokered_subagent(
+                caller,
+                BrokeredSpawn {
+                    selection: request.selection,
+                    name: normalize_provider_text(&request.name),
+                    description: normalize_provider_text(&request.description),
+                    delegation,
+                },
+            )
+            .map_err(|error| format!("Suru could not spawn the Subagent: {error}."))?;
+        let input = delegated_prompt(&spawned.delegator, &delivered);
+        let started = self
+            .sessions
+            .execution_directory(spawned.session_id)
+            .ok_or_else(|| anyhow::anyhow!("the Subagent's Session is gone"))
+            .and_then(|execution_directory| {
+                self.get_or_spawn_actor_commands(spawned.session_id, execution_directory, runtime)
+            })
+            .and_then(|commands| {
+                commands
+                    .send(ProviderCommand::StartDelegation {
+                        turn_id: spawned.turn_id,
+                        input,
+                    })
+                    .map_err(|_| anyhow::anyhow!("the Subagent's Provider actor stopped"))
+            });
+        if let Err(error) = started {
+            let _ = fail_delegated_turn(
+                &self.sessions,
+                &self.updates,
+                spawned.session_id,
+                spawned.turn_id,
+                format!("Provider startup failed: {error}"),
+            );
+        }
+        Ok(spawned.session_id)
+    }
+
     /// Settles a Prompt's Turn as failed before it ever reaches a Provider, and
     /// answers the caller with why nothing was scheduled.
     fn fail_prompt(
@@ -2019,6 +2133,36 @@ async fn run_provider_session(
                     continue;
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
+                ProviderCommand::StartDelegation { turn_id, input } => {
+                    match begin_delegated_turn(
+                        &connector,
+                        &source_control,
+                        &mut provider,
+                        &mut subagents,
+                        &mut shutdown,
+                        turn_id,
+                        input,
+                    )
+                    .await
+                    {
+                        DelegatedTurnStart::Began => {
+                            active = Some(ActiveProviderTurn::new_delegated(turn_id));
+                            subagents.late_settle_owes_continuation = false;
+                            // A Watch that woke the Agent heads the Turn it
+                            // next works in, whatever began it.
+                            release_watch_outcomes(
+                                &sessions,
+                                &updates,
+                                &mut subagents,
+                                session_id,
+                                turn_id,
+                            );
+                        }
+                        DelegatedTurnStart::Settled => {}
+                        DelegatedTurnStart::Stopping => break 'actor,
+                    }
+                    continue;
+                }
                 ProviderCommand::InterruptSession { response } => {
                     // A wake the interrupt beats begins no Turn to explain.
                     subagents.watch_outcomes.drop_all();
@@ -2531,6 +2675,25 @@ async fn run_provider_session(
                 let _ = response.send(updated);
             }
 
+            // A Delegation begins a Turn only in a brokered Subagent's
+            // Session, whose actor its spawn starts idle, so one arriving
+            // while a Turn runs here has nothing to begin over: its Turn fails
+            // where a reader sees it rather than waiting on nothing.
+            ProviderInput::Command(Some(ProviderCommand::StartDelegation { turn_id, .. })) => {
+                if active
+                    .as_ref()
+                    .is_some_and(|current| current.turn_id != turn_id)
+                {
+                    tracing::warn!(%session_id, "a Delegation arrived while a Turn was running");
+                    let _ = fail_delegated_turn(
+                        &sessions,
+                        &updates,
+                        session_id,
+                        turn_id,
+                        DELEGATION_WHILE_WORKING_MESSAGE.to_owned(),
+                    );
+                }
+            }
             ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
                     .as_ref()
@@ -2854,11 +3017,12 @@ async fn run_provider_session(
                         event,
                     })) => {
                         // There is no originating Prompt to restore when a
-                        // Continuation's selection is rejected. Keep the
-                        // Provider's failure and let queued work proceed.
+                        // Continuation's or a Delegation's selection is
+                        // rejected. Keep the Provider's failure and let
+                        // queued work proceed.
                         let event = match event {
                             ProviderEvent::AgentSelectionRejected { message }
-                                if current.continuation.is_some() =>
+                                if !current.prompt_begun =>
                             {
                                 ProviderEvent::TurnFailed { message }
                             }
@@ -3095,6 +3259,216 @@ impl ProviderConnector<'_> {
             _broker: broker_grant,
         })
     }
+}
+
+/// How beginning a delegated Turn went.
+enum DelegatedTurnStart {
+    /// The Provider took the Turn: it is the actor's active Turn from here.
+    Began,
+    /// The Turn settled without the Provider taking it — its Worktree was
+    /// gone, its Provider could not start or refused it — or had settled
+    /// already, stopped before its Delegation got this far.
+    Settled,
+    /// Suru is stopping, and the actor stops with it.
+    Stopping,
+}
+
+/// Begins the Turn a Delegation opened in the brokered Subagent's Session
+/// this actor owns: the Session's Worktree is leased as a Prompt's would be,
+/// its Provider is started where none runs yet — handed the Session's own
+/// Execution Directory, Approval Posture and Broker token — and the
+/// Delegation is delivered as the Turn's input under the Session's Agent
+/// Selection. Once the Provider takes the Turn, the Agent it runs is bound to
+/// the Turn: the Model its Provider confirms for the Subagent, which the
+/// Subagent's row carries from then on.
+async fn begin_delegated_turn(
+    connector: &ProviderConnector<'_>,
+    source_control: &crate::source_control::SourceControlService,
+    provider: &mut Option<ConnectedProviderSession>,
+    subagents: &mut SubagentRoutes,
+    shutdown: &mut ProviderShutdown,
+    turn_id: TurnId,
+    input: ProviderPrompt,
+) -> DelegatedTurnStart {
+    let ProviderConnector {
+        sessions,
+        updates,
+        settings,
+        connected_incarnations,
+        session_id,
+        provider_id,
+        ..
+    } = connector;
+    let session_id = *session_id;
+    let fail =
+        |message: String| fail_delegated_turn(sessions, updates, session_id, turn_id, message);
+    let Some(snapshot) = sessions.snapshot(session_id) else {
+        return DelegatedTurnStart::Settled;
+    };
+    if !snapshot
+        .turns
+        .iter()
+        .any(|turn| turn.id == turn_id && turn.status == TurnStatus::Active)
+    {
+        return DelegatedTurnStart::Settled;
+    }
+    let lease = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return DelegatedTurnStart::Stopping,
+        lease = source_control.prepare_execution(&snapshot.session, None) => lease,
+    };
+    let lease = lease.and_then(|lease| {
+        if let Some(reading) = lease.reading.clone() {
+            sessions
+                .record_checkout(reading)
+                .map_err(|error| format!("Cannot persist checkout recovery facts: {error}"))?;
+        }
+        Ok(lease)
+    });
+    let lease = match lease {
+        Ok(lease) => lease,
+        Err(message) => {
+            return fail(format!(
+                "Worktree unavailable; restore the checkout before delegating again: {message}"
+            ));
+        }
+    };
+    if provider
+        .as_ref()
+        .is_some_and(|connected| connected.incarnation != lease.incarnation)
+    {
+        if !subagents.routes.is_empty() || !subagents.working.is_empty() {
+            return fail(
+                "The Worktree was recreated while Subagents still use the previous working copy; \
+                 wait for their work to finish before delegating again"
+                    .to_owned(),
+            );
+        }
+        if let Some(previous) = provider.take() {
+            let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
+        }
+        connected_incarnations.lock().unwrap().remove(&session_id);
+    }
+    if provider.is_none() {
+        match connector
+            .open(&snapshot, lease.incarnation, subagents, shutdown)
+            .await
+        {
+            Ok(connected) => *provider = Some(connected),
+            Err(ConnectionFailure::Stopping) => return DelegatedTurnStart::Stopping,
+            Err(ConnectionFailure::Failed(message)) => return fail(message),
+        }
+    }
+    let Some(snapshot) = sessions.snapshot(session_id) else {
+        return DelegatedTurnStart::Settled;
+    };
+    let Some(selection) = snapshot.session.agent_selection.clone() else {
+        return fail(
+            "Provider startup failed: the Subagent's Session has no Agent Selection".to_owned(),
+        );
+    };
+    let connected = provider
+        .as_ref()
+        .expect("a Provider connection exists before its Delegation is delivered");
+    let agent = AgentIdentity {
+        agent: connected.identity.agent.clone(),
+        selection,
+    };
+    let posture = effective_approval_posture(&snapshot, &settings.borrow(), provider_id);
+    let posture_update = posture.and_then(|posture| {
+        sessions
+            .current_approval_posture_update(session_id)
+            .filter(|update| update.value == posture)
+    });
+    let provider_session = connected.session.clone();
+    let started = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return DelegatedTurnStart::Stopping,
+        started = provider_session.start_turn(ProviderTurnInput {
+            turn_id,
+            prompt: input,
+            selection: agent.selection.clone(),
+            approval_posture: posture,
+        }) => started,
+    };
+    drop(lease);
+    if let Err(error) = started {
+        let settled = fail(failure_message("Provider execution failed", &error));
+        if error.is_session_lost() {
+            lose_provider_connection(provider, subagents, sessions, updates, session_id);
+        }
+        return settled;
+    }
+    if let Some(update) = posture_update {
+        sessions.mark_approval_posture_application(
+            update,
+            crate::protocol::ApprovalPostureApplication::Applied,
+        );
+    }
+    match updates.apply(|| {
+        sessions.publish(
+            session_id,
+            vec![SessionChange::SubagentAgentChanged { turn_id, agent }],
+        )
+    }) {
+        None => DelegatedTurnStart::Stopping,
+        Some(bound) => {
+            if let Err(error) = bound {
+                tracing::warn!(%session_id, "a delegated Turn's Agent could not be recorded: {error:#}");
+            }
+            DelegatedTurnStart::Began
+        }
+    }
+}
+
+/// Fails a delegated Turn that never reached its Provider, saying why.
+fn fail_delegated_turn(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    turn_id: TurnId,
+    message: String,
+) -> DelegatedTurnStart {
+    match updates.apply(|| {
+        sessions.fail_turn(
+            session_id,
+            turn_id,
+            TrailingCommandOutput::new(),
+            message,
+            OpenInterventions::TurnEnded,
+        )
+    }) {
+        Some(_) => DelegatedTurnStart::Settled,
+        None => DelegatedTurnStart::Stopping,
+    }
+}
+
+/// The Delegation as a brokered Subagent's Provider receives it: one line
+/// naming the Agent that delegated it — by its Session's Title, or by its
+/// Subagent name — so the Subagent knows who asked, then what was asked.
+fn delegated_prompt(delegator: &DelegatingAgent, delegation: &str) -> ProviderPrompt {
+    let from = match delegator {
+        DelegatingAgent::Session { title } => {
+            format!("the Agent working on \"{}\"", one_line(title))
+        }
+        DelegatingAgent::Subagent { name } => format!("the Subagent \"{}\"", one_line(name)),
+    };
+    ProviderPrompt::plain(format!(
+        "Delegated to you through Suru by {from}.\n\n{delegation}"
+    ))
+}
+
+/// A name held to one short line, since a Title begins as a whole first
+/// Prompt and may run to paragraphs.
+fn one_line(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let line = text.trim().lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MAX_CHARS {
+        return line.to_owned();
+    }
+    let mut shortened = line.chars().take(MAX_CHARS - 1).collect::<String>();
+    shortened.push('…');
+    shortened
 }
 
 /// Delivers one stop-shaped command to a Session's actor and awaits its
@@ -5045,5 +5419,42 @@ running 1 test",
             "another Provider's connection names none of them"
         );
         writer.shutdown().await.expect("stop the writer");
+    }
+
+    #[test]
+    fn a_delegation_reaches_its_subagent_naming_the_agent_that_sent_it_in_one_line() {
+        assert_eq!(
+            delegated_prompt(
+                &DelegatingAgent::Session {
+                    title: "Plan the work".to_owned(),
+                },
+                "Map the seams.",
+            )
+            .text,
+            "Delegated to you through Suru by the Agent working on \"Plan the work\".\n\n\
+             Map the seams.",
+            "a top-level Session's Agent is named by its Session's Title"
+        );
+        assert_eq!(
+            delegated_prompt(
+                &DelegatingAgent::Subagent {
+                    name: "Researcher".to_owned(),
+                },
+                "Map the seams.",
+            )
+            .text,
+            "Delegated to you through Suru by the Subagent \"Researcher\".\n\nMap the seams.",
+            "a Subagent by the name its rows carry"
+        );
+
+        let long_title = format!("  {}\nand a second paragraph", "a".repeat(200));
+        let named = delegated_prompt(&DelegatingAgent::Session { title: long_title }, "Go.").text;
+        let leading = named.lines().next().expect("the naming leads");
+        assert!(
+            leading.contains(&format!("\"{}…\"", "a".repeat(79))),
+            "a Title that runs long is held to one short line: {leading}"
+        );
+        assert!(!named.contains("second paragraph"));
+        assert!(named.ends_with("\n\nGo."));
     }
 }

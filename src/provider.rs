@@ -34,7 +34,7 @@ pub use crate::broker::{BrokerEndpoint, BrokerHandoff, BrokerToken};
 pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
-pub(crate) use orchestration::{ProviderOrchestrator, ProviderUpdateGate};
+pub(crate) use orchestration::{BrokeredSubagentRequest, ProviderOrchestrator, ProviderUpdateGate};
 
 /// What one successful Provider catalog discovery found. Models are the
 /// selectable inventory every Provider supplies; `warning` is a non-blocking
