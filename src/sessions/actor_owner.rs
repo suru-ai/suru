@@ -11,8 +11,10 @@
 //! Everything Suru sends a Provider on a Session's behalf — a Decision, an
 //! Answer, an Approval Posture, an interrupt, a Watch stop — is routed through
 //! [`SessionStoreState::actor_owner_of`], and so is the posture a native
-//! Subagent inherits. The tree's top-level Session is a different question,
-//! asked for display alone.
+//! Subagent inherits. What stops everything beneath a Session reaches, beyond
+//! that, every actor owned beneath it: [`SessionStoreState::actor_owners_beneath`].
+//! The tree's top-level Session is a different question, asked for display
+//! alone.
 
 use crate::protocol::SessionId;
 
@@ -41,6 +43,15 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned")
             .actor_owner_of(session_id)
+    }
+
+    /// The Sessions beneath `session_id` that own Provider actors of their
+    /// own; see [`SessionStoreState::actor_owners_beneath`].
+    pub(crate) fn actor_owners_beneath(&self, session_id: SessionId) -> Vec<SessionId> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .actor_owners_beneath(session_id)
     }
 }
 
@@ -87,6 +98,42 @@ impl SessionStoreState {
             visit += 1;
         }
         walk
+    }
+
+    /// Every Session beneath `session_id`, at any depth, that owns a Provider
+    /// actor of its own — each a brokered Subagent's — nearest first. None of
+    /// their work rides `session_id`'s actor, whose reach
+    /// [`Self::actor_subtree`] stops at each of them, so whatever stops all
+    /// the work beneath `session_id` reaches each of them through its own
+    /// actor too. Each of those actors reaches only its own subtree in turn,
+    /// so every owner is listed, those beneath another owner included.
+    ///
+    /// The walk never visits a Session twice, so a lineage that loops back on
+    /// itself ends it rather than holding the store lock for good.
+    pub(super) fn actor_owners_beneath(&self, session_id: SessionId) -> Vec<SessionId> {
+        let mut walk = vec![session_id];
+        let mut visit = 0;
+        while visit < walk.len() {
+            let current = walk[visit];
+            let children = self
+                .sessions
+                .iter()
+                .filter(|(child_id, record)| {
+                    record.snapshot.session.parent == Some(current) && !walk.contains(child_id)
+                })
+                .map(|(child_id, _)| *child_id)
+                .collect::<Vec<_>>();
+            walk.extend(children);
+            visit += 1;
+        }
+        walk.into_iter()
+            .skip(1)
+            .filter(|beneath| {
+                self.sessions
+                    .get(beneath)
+                    .is_some_and(SessionRecord::owns_provider_actor)
+            })
+            .collect()
     }
 }
 
@@ -308,6 +355,74 @@ mod tests {
             None,
             "a Session the store does not hold"
         );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_actor_owned_beneath_a_session_is_reached_nearest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let top_level = persisted(directory.path(), None);
+        let top_level_id = top_level.snapshot.session.id;
+        let native = persisted(directory.path(), Some(top_level_id));
+        let native_id = native.snapshot.session.id;
+        let child = brokered(directory.path(), top_level_id);
+        let child_id = child.snapshot.session.id;
+        let beneath_native = brokered(directory.path(), native_id);
+        let beneath_native_id = beneath_native.snapshot.session.id;
+        let riding_child = persisted(directory.path(), Some(child_id));
+        let riding_child_id = riding_child.snapshot.session.id;
+        let grandchild = brokered(directory.path(), riding_child_id);
+        let grandchild_id = grandchild.snapshot.session.id;
+        let (store, writer) = restored(
+            directory.path(),
+            vec![
+                top_level,
+                native,
+                child,
+                beneath_native,
+                riding_child,
+                grandchild,
+            ],
+        )
+        .await;
+
+        let beneath = store.actor_owners_beneath(top_level_id);
+        assert_eq!(
+            beneath.first(),
+            Some(&child_id),
+            "the nearest owner comes first: {beneath:?}"
+        );
+        assert_eq!(beneath.len(), 3, "{beneath:?}");
+        assert!(
+            beneath.contains(&beneath_native_id),
+            "an owner beneath a native Subagent is reached"
+        );
+        assert!(
+            beneath.contains(&grandchild_id),
+            "and so is one beneath another owner, whose actor reaches none of it"
+        );
+        assert_eq!(
+            store.actor_owners_beneath(child_id),
+            [grandchild_id],
+            "neither the Session itself nor a Subagent riding its actor is an owner beneath it"
+        );
+        assert_eq!(store.actor_owners_beneath(grandchild_id), []);
+
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_walk_beneath_a_lineage_that_loops_back_on_itself_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cycle = persisted(directory.path(), None);
+        let other = brokered(directory.path(), cycle.snapshot.session.id);
+        cycle.snapshot.session.parent = Some(other.snapshot.session.id);
+        cycle.summary.session.parent = cycle.snapshot.session.parent;
+        let (cycle_id, other_id) = (cycle.snapshot.session.id, other.snapshot.session.id);
+        let (store, writer) = restored(directory.path(), vec![cycle, other]).await;
+
+        assert_eq!(store.actor_owners_beneath(cycle_id), [other_id]);
+        assert_eq!(store.actor_owners_beneath(other_id), []);
         writer.shutdown().await.unwrap();
     }
 }
