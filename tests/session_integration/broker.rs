@@ -2441,6 +2441,178 @@ async fn a_brokered_subagent_a_restart_settled_reads_as_failed_with_no_duration(
 }
 
 #[tokio::test]
+async fn a_brokered_subagent_spawns_a_brokered_subagent_one_level_down_and_the_tree_lists_all_three_levels()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-nested", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (tree, mut updates) = open_tree(&descriptor, delegating.caller).await;
+    let mut revision = tree.revision;
+
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let start = next_start(&mut delegating.hosted.codex).await;
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("a brokered Subagent's start request carries a Broker handoff of its own");
+    assert_ne!(child_handoff.token(), delegating.handoff.token());
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+
+    // The Subagent's Agent reaches the Broker on its own token, and delegates
+    // in its turn.
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(json!({
+            "provider": "claude",
+            "model": "haiku",
+            "name": "Scout",
+            "description": "Chase the Codex seam",
+            "prompt": DELEGATION,
+        }))
+        .await;
+
+    let grandchild = read_session(&descriptor, grandchild_id).await;
+    assert_eq!(
+        grandchild.session.parent,
+        Some(child_id),
+        "one level down: a child of the Subagent that spawned it"
+    );
+    let child = read_session(&descriptor, child_id).await;
+    let Activity::Subagent { turn_id, .. } = row_for(&child, grandchild_id) else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, child.turns[0].id,
+        "its row stands in the Turn the spawning Subagent works in"
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert!(
+        !caller.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Subagent { session_id, .. } if *session_id == grandchild_id
+        )),
+        "and nowhere above it"
+    );
+    let spawned = changes_until(&mut updates, &mut revision, |change| {
+        matches!(
+            change,
+            SubagentTreeChange::SubagentSpawned { entry } if entry.session_id == grandchild_id
+        )
+    })
+    .await;
+    let Some(SubagentTreeChange::SubagentSpawned { entry }) = spawned.last() else {
+        unreachable!()
+    };
+    assert_eq!(
+        entry.parent_session_id, child_id,
+        "the Section, watching from the top, learns of it beneath the Subagent that spawned it"
+    );
+
+    let start = next_start(&mut delegating.hosted.claude).await;
+    let grandchild_handoff = start
+        .broker()
+        .cloned()
+        .expect("the grandchild is handed the Broker too");
+    assert!(
+        grandchild_handoff.token() != child_handoff.token()
+            && grandchild_handoff.token() != delegating.handoff.token(),
+        "on a token of its own"
+    );
+    let mut grandchild_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: default_selection(&claude_models()),
+    });
+    let turn = timeout(PROGRESS_DEADLINE, grandchild_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the grandchild's Provider");
+    assert_eq!(
+        turn.prompt(),
+        delegated_by("the Subagent \"Researcher\""),
+        "the Delegation names the Subagent that sent it by the name its row carries"
+    );
+    turn.succeed();
+
+    read_until(
+        &descriptor,
+        child_id,
+        "the grandchild's row carries the Model its Provider confirmed",
+        |snapshot| row_model(snapshot, grandchild_id).is_some(),
+    )
+    .await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the child's row carries the Model its Provider confirmed",
+        |snapshot| row_model(snapshot, child_id).is_some(),
+    )
+    .await;
+    let (tree, _updates) = open_tree(&descriptor, grandchild_id).await;
+    assert_eq!(
+        tree.top_level.session_id, delegating.caller,
+        "the tree is the same wherever in it the reader stands"
+    );
+    assert_eq!(
+        tree.subagents
+            .iter()
+            .map(|entry| (
+                entry.session_id,
+                entry.parent_session_id,
+                entry.spawn_order,
+                entry.name.as_str(),
+                entry.model.clone(),
+                entry.status,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                child_id,
+                delegating.caller,
+                0,
+                "Researcher",
+                Some(ModelId::new("gpt-5.5")),
+                ActivityStatus::Active,
+            ),
+            (
+                grandchild_id,
+                child_id,
+                0,
+                "Scout",
+                Some(ModelId::new("haiku")),
+                ActivityStatus::Active,
+            ),
+        ],
+        "all three levels, each Subagent beneath the one that spawned it in spawn order, with \
+         the Model its own Provider confirmed rather than its spawner's"
+    );
+
+    // Each Agent above the grandchild reads it: its lineage passes through
+    // both.
+    for client in [&mut delegating.client, &mut child_client] {
+        let read = client.read_subagent(grandchild_id).await;
+        assert_eq!(read["session_id"], json!(grandchild_id));
+        assert_eq!(read["status"], json!("working"));
+    }
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn reading_an_id_that_is_not_a_brokered_subagent_beneath_the_caller_is_refused() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-read-refused", None).await;
