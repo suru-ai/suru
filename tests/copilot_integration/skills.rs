@@ -6,7 +6,7 @@ use crate::{
     server_support::{next_skill_catalog, receive_initial_state},
     support::{
         COPILOT_MODELS, ScriptedCopilot, connect_arm, create_session_arm, current_model_arm,
-        delete_session_arm, destroy_session_arm, models_arm, permission_decision_arm, send_arm,
+        delete_session_arm, detach_session_arm, models_arm, permission_decision_arm, send_arm,
         session_where, settled_session, signed_in_arm, upgradable_connect_arm,
     },
 };
@@ -221,7 +221,7 @@ async fn copilot_lists_only_native_skills_with_stable_opaque_identity_and_one_sk
         signed_in_arm(),
         create_session_arm(),
         command_catalog_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-catalog";
@@ -320,7 +320,7 @@ async fn a_partial_native_catalog_keeps_valid_skills_with_an_aggregate_warning()
         signed_in_arm(),
         create_session_arm(),
         partially_invalid_command_catalog_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-partial-catalog";
@@ -371,7 +371,7 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
         command_invocation_arm(),
         send_arm("      event sent session.idle '{}'\n"),
         permission_decision_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-invocation";
@@ -458,7 +458,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
         queued_and_steer_invocation_arm(),
         held_then_queued_send_arm(),
         permission_decision_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-queue-steer";
@@ -617,7 +617,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
         current_model_arm("claude-fixture", "high", "default"),
         unavailable_command_catalog_arm(),
         send_arm("      event ordinary-idle session.idle '{}'\n"),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-incompatible";
@@ -707,7 +707,7 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
         current_model_arm("claude-fixture", "high", "default"),
         command_catalog_arm(),
         rejected_command_invocation_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-invocation-failure";
@@ -767,7 +767,7 @@ async fn copilot_rejects_two_distinct_skills_before_opening_or_invoking_a_user_s
         signed_in_arm(),
         create_session_arm(),
         two_skill_command_catalog_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-limit";
@@ -851,7 +851,7 @@ async fn native_skill_changes_refresh_identity_and_nonsteer_commands_do_not_adve
         changing_nonsteer_skill_catalog_arms(),
         send_arm(changed),
         permission_decision_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
     ));
     let channel = "copilot-skill-change";

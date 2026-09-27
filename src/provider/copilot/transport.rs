@@ -35,7 +35,7 @@ use crate::{
 };
 
 const COPILOT_SUGGESTED_VERSION: SuggestedCliVersion =
-    SuggestedCliVersion::new("Copilot CLI", 1, 0, 80);
+    SuggestedCliVersion::new("Copilot CLI", 1, 0, 88);
 
 /// Builds the Copilot client over each freshly launched harness process.
 pub(super) struct CopilotConnector {

@@ -633,10 +633,11 @@ async fn next_provider_event(
 /// reading, not the Session: the shell's completion still records its Watch and wakes the loop
 /// into a Continuation headed by the Watch Outcome.
 ///
-/// Why the roster rather than the tool call (github-copilot-sdk 1.0.12-preview.0, CLI 1.0.82):
+/// Why the roster rather than the tool call (github-copilot-sdk 1.0.15-preview.3; the CLI wire as
+/// captured on 1.0.82):
 /// - `ToolExecutionStartData` carries the shell tool's `arguments` — `detach: true` beside
 ///   `mode: "async"` is how the Model asks for a detached shell — but no shell identity, and
-///   `ToolExecutionStartShellToolInfo` only path hints.
+///   `ToolExecutionStartShellToolInfo` only path hints and a display command.
 /// - The tool's result names the shell only in text addressed to the Model (`<command started in
 ///   detached background with shellId: …>`); the one structured content carrying a `shellId`,
 ///   `ToolExecutionCompleteContentShellExit`, needs an exit code a detached start never has.

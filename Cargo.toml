@@ -47,7 +47,7 @@ unicode-segmentation = "1.13.3"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 x509-parser = "0.18.1"
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }
-github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
+github-copilot-sdk = { version = "1.0.15-preview.3", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "pe", "std", "unaligned"] }
@@ -55,7 +55,7 @@ object = { version = "0.37", default-features = false, features = ["read_core", 
 [dev-dependencies]
 # The Copilot fixtures answer the SDK's own protocol handshake, so they read the version it speaks
 # from the crate rather than pinning a literal that silently rots on an upgrade.
-github-copilot-sdk = { version = "1.0.12-preview.0", default-features = false }
+github-copilot-sdk = { version = "1.0.15-preview.3", default-features = false }
 portable-pty = "0.9.0"
 sysinfo = "0.37.2"
 # The Claude fixtures verify the spawn-time session identifier is a well-formed UUID.

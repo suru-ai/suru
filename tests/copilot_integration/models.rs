@@ -57,7 +57,7 @@ async fn a_cli_below_the_suggested_version_warns_without_withholding_models() {
         ProviderCatalogStatus::Warning { message }
             if message.contains("Copilot CLI 1.0.79")
                 && message.contains("may have compatibility issues")
-                && message.contains("1.0.80 or newer")
+                && message.contains("1.0.88 or newer")
     ));
 
     server.shutdown().await.expect("shut the server down");

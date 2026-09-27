@@ -92,7 +92,7 @@ pub fn connect_arm() -> String {
 }
 
 /// The Copilot CLI version this build suggests, matching the live CLI it was verified against.
-pub const COPILOT_SUGGESTED_VERSION: &str = "1.0.80";
+pub const COPILOT_SUGGESTED_VERSION: &str = "1.0.88";
 
 /// Answers both startup version requests with a compatible protocol and `version` as the CLI
 /// package version.
@@ -264,10 +264,10 @@ pub fn send_arm(timeline: &str) -> String {
     )
 }
 
-/// A `session.destroy` arm acknowledging that the client is done with the Session, which is what
+/// A `session.detach` arm acknowledging that the client is done with the Session, which is what
 /// the SDK sends when a Session is disconnected.
-pub fn destroy_session_arm() -> String {
-    r#"    *'"method":"session.destroy"'*)
+pub fn detach_session_arm() -> String {
+    r#"    *'"method":"session.detach"'*)
       reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"success":true}}'
       ;;
 "#

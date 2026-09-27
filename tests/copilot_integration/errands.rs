@@ -14,7 +14,7 @@ use crate::{
     server_support::{catalog_changes_through_title, open_catalog_stream},
     support::{
         ScriptedCopilot, connect, connect_arm, connect_in, create_session_arm, current_model_arm,
-        delete_session_arm, destroy_session_arm, models_arm, permission_decision_arm,
+        delete_session_arm, detach_session_arm, models_arm, permission_decision_arm,
         resume_session_arm, send_arm, settled_session_on, signed_in_arm, skills_reload_arm,
         switch_model_arm,
     },
@@ -107,7 +107,7 @@ fn errand_fixture(errand: &str) -> ScriptedCopilot {
         current_model_arm("claude-fixture", "high", "default"),
         switch_model_arm(),
         permission_decision_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
         errand_send_arm(errand, TURN_TIMELINE),
     ))
@@ -206,7 +206,7 @@ async fn errand_send(copilot: &ScriptedCopilot) -> serde_json::Value {
 /// off, so a Title-per-Session left behind in the CLI the user works in outside Suru is exactly
 /// what closing alone would leave.
 async fn discarded_session(copilot: &ScriptedCopilot) -> String {
-    let closed = copilot.wait_for_request("session.destroy").await["params"]["sessionId"]
+    let closed = copilot.wait_for_request("session.detach").await["params"]["sessionId"]
         .as_str()
         .expect("the closed Session is named")
         .to_owned();
@@ -443,7 +443,7 @@ async fn an_errand_leaves_a_restart_nothing_of_its_own_to_resume() {
         current_model_arm("claude-fixture", "high", "default"),
         switch_model_arm(),
         permission_decision_arm(),
-        destroy_session_arm(),
+        detach_session_arm(),
         delete_session_arm(),
         errand_send_arm(&answered_errand(), TURN_TIMELINE),
     ));

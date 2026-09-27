@@ -745,7 +745,7 @@ async fn managed_worktree_native_copilot_starts_at_prepared_root() {
         crate::support::conversation_arms(),
         crate::support::resume_session_arm(),
         crate::support::skills_reload_arm(),
-        crate::support::destroy_session_arm(),
+        crate::support::detach_session_arm(),
         crate::support::delete_session_arm(),
         r#"
     *'"method":"session.commands.list"'*) reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"commands":[]}}' ;;
