@@ -1648,24 +1648,23 @@ impl ProviderOrchestrator {
             InterruptTarget::WithdrewPrompt(prompt) => {
                 return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
             }
-            // The work beneath the Session is asked to stop first and
-            // alongside its Turn, so no brokered Subagent is left keeping the
-            // Session Working once the Turn has settled.
             InterruptTarget::Turn(turn) => {
-                let (beneath, own) = tokio::join!(
-                    self.interrupt_beneath(session_id, OwnerStop::Work),
+                self.with_work_beneath(
+                    session_id,
+                    OwnerStop::Work,
                     self.interrupt_own_turn(actor, session_id, turn.id),
-                );
-                own.and(beneath)
+                )
+                .await
             }
             InterruptTarget::Subagents => {
-                let (beneath, own) = tokio::join!(
-                    self.interrupt_beneath(session_id, OwnerStop::Work),
+                self.with_work_beneath(
+                    session_id,
+                    OwnerStop::Work,
                     ask_actor_or_find_nothing_running(actor, |response| {
                         ProviderCommand::InterruptSession { response }
                     }),
-                );
-                own.and(beneath)
+                )
+                .await
             }
             // A per-Subagent stop its Provider refuses stops nothing, so what
             // the Subagent delegated through the Broker is stopped only once
@@ -1690,19 +1689,41 @@ impl ProviderOrchestrator {
             // own subtree's are stopped — those a brokered Subagent beneath
             // it runs, over that Subagent's own actor.
             InterruptTarget::Watches => {
-                let (beneath, own) = tokio::join!(
-                    self.interrupt_beneath(session_id, OwnerStop::Watches),
+                self.with_work_beneath(
+                    session_id,
+                    OwnerStop::Watches,
                     ask_actor_or_find_nothing_running(actor, |response| {
                         ProviderCommand::StopWatches {
                             target: session_id,
                             response,
                         }
                     }),
-                );
-                own.and(beneath)
+                )
+                .await
             }
         };
         stopped.map(|()| InterruptOutcome::StoppedWork)
+    }
+
+    /// Runs `own` — the stop of `session_id` itself, through the actor
+    /// holding its conversation — together with the same stop carried
+    /// beneath it ([`Self::interrupt_beneath`]), answering the Session's own
+    /// failure first and then the first beneath it. The join is biased, so
+    /// every command beneath is sent before `own` is first polled: no
+    /// brokered Subagent is left keeping the Session Working once its own
+    /// work has settled.
+    async fn with_work_beneath(
+        &self,
+        session_id: SessionId,
+        stop: OwnerStop,
+        own: impl Future<Output = Result<(), InterruptSessionError>>,
+    ) -> Result<(), InterruptSessionError> {
+        let (beneath, own) = tokio::join!(
+            biased;
+            self.interrupt_beneath(session_id, stop),
+            own,
+        );
+        own.and(beneath)
     }
 
     /// Interrupts the active Turn `turn_id` of `session_id` through `actor`,
