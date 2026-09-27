@@ -13,8 +13,9 @@
 //! hand it.
 
 use crate::protocol::{SessionCatalogChange, SessionId, SessionSummary};
+use crate::storage::StorageSink;
 
-use super::{SessionRecord, SessionStore};
+use super::{SessionRecord, SessionStore, SessionStoreState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettleSessionError {
@@ -39,19 +40,33 @@ impl SessionStore {
         session_id: SessionId,
         settled: bool,
     ) -> Result<SessionSummary, SettleSessionError> {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .expect("Session store lock is not poisoned");
-        let Some(record) = state.sessions.get(&session_id) else {
-            return Err(SettleSessionError::SessionNotFound);
-        };
+            .expect("Session store lock is not poisoned")
+            .set_settled(&self.storage, session_id, settled)
+            .ok_or(SettleSessionError::SessionNotFound)
+    }
+}
+
+impl SessionStoreState {
+    /// Sets a Session aside or brings it back, as [`SessionStore::settle`]
+    /// describes, under a lock already held — so work arriving for a Session
+    /// without a commit of its own, a Subagent Report held for its next Turn,
+    /// brings it back exactly as the user would. `None` for a Session the
+    /// store does not hold.
+    pub(super) fn set_settled(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        settled: bool,
+    ) -> Option<SessionSummary> {
+        let record = self.sessions.get(&session_id)?;
         if record.summary.settled_at.is_some() == settled {
-            return Ok(record.summary.clone());
+            return Some(record.summary.clone());
         }
-        let stamp = state.next_timestamp();
+        let stamp = self.next_timestamp();
         let settled_at = settled.then_some(stamp);
-        let record = state
+        let record = self
             .sessions
             .get_mut(&session_id)
             .expect("Session existence was checked while holding the store lock");
@@ -60,12 +75,12 @@ impl SessionStore {
             record.summary.updated_at = stamp;
         }
         let summary = record.summary.clone();
-        self.storage.summary_changed(summary.clone());
-        state.publish_catalog_change(SessionCatalogChange::SettlementChanged {
+        storage.summary_changed(summary.clone());
+        self.publish_catalog_change(SessionCatalogChange::SettlementChanged {
             session_id,
             settled_at,
         });
-        Ok(summary)
+        Some(summary)
     }
 }
 

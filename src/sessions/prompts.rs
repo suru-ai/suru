@@ -526,6 +526,7 @@ impl SessionStore {
                 watches: HashMap::new(),
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
+                held_reports: Default::default(),
             },
         );
         self.storage.created(PersistedSession::created(

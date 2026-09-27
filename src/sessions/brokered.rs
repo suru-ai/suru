@@ -21,6 +21,11 @@
 //! The Agent that spawned a brokered Subagent, and every Agent above it, reads
 //! how it stands through the Broker: its latest Turn's outcome, how long that
 //! Turn has worked, and the latest Message it wrote there.
+//!
+//! No Provider tells the delegating Agent that its brokered Subagent's stretch
+//! settled, so Suru does, as that stretch's row settles: a Subagent Report of
+//! the outcome and the start of the Subagent's final Message, held for the
+//! delegating Session's Agent until its Provider takes it (ADR 0035).
 
 use std::fmt;
 
@@ -29,6 +34,7 @@ use crate::protocol::{
     Activity, ActivityStatus, AgentSelection, BrokerSettings, Message, MessageRole, SessionChange,
     SessionId, SessionSnapshot, SessionTimestamp, Turn, TurnId, TurnStatus,
 };
+use crate::provider::{SubagentReport, SubagentReportOutcome};
 use crate::storage::StorageSink;
 
 use super::{
@@ -408,6 +414,13 @@ impl SessionStoreState {
     /// The row is found where the Turn's opening Delegation says: in the
     /// Session of the Agent that delegated it. A Turn no Delegation opened —
     /// a Continuation the Subagent's own work began — stands as no row.
+    ///
+    /// The commit that settles the row also leaves that Agent a Subagent
+    /// Report of the stretch, to be handed to its Provider (see
+    /// [`SessionStoreState::hold_report`]) — except for a stretch an
+    /// interrupt of a Session above it stopped, since the Agent that would
+    /// hear of it was interrupted too. A Turn that stands as no row, the
+    /// Continuations that only hold rows among them, reports nothing.
     pub(super) fn follow_brokered_turns(
         &mut self,
         storage: &StorageSink,
@@ -450,28 +463,76 @@ impl SessionStoreState {
             let Some(holder) = delegating_session(snapshot, turn_id) else {
                 continue;
             };
-            if turn.status == TurnStatus::Interrupted {
-                // Whether the stretch was stopped on its own or from above
-                // decides whether its delegating Agent hears of it.
-                tracing::debug!(
-                    %session_id,
-                    %turn_id,
-                    stopped_by_ancestor = self.stopped_by_ancestor(session_id, turn_id),
-                    "a brokered Subagent's stretch of work was stopped"
-                );
-            }
             let row_changes = self.row_changes(holder, session_id, turn, repaired);
             if row_changes.is_empty() {
                 continue;
             }
+            let report = row_changes
+                .iter()
+                .any(|change| matches!(change, SessionChange::SubagentStatusChanged { .. }))
+                .then(|| self.settled_report(holder, session_id, turn, repaired))
+                .flatten();
             if let Err(error) = self.commit(storage, holder, row_changes) {
                 tracing::warn!(
                     %session_id,
                     delegating_session = %holder,
                     "a brokered Subagent's row did not follow its Turn: {error:#}"
                 );
+                continue;
+            }
+            if let Some(report) = report {
+                self.hold_report(storage, holder, report);
             }
         }
+    }
+
+    /// The Subagent Report `holder`'s Agent is owed now that the brokered
+    /// Subagent `child`'s `turn` has settled, which its row is about to say:
+    /// named as that row names it, with the outcome the Turn settled with,
+    /// how long it worked, and the final Message it wrote there. A stretch
+    /// the user stopped on its own is reported as stopped; one an interrupt
+    /// from above stopped reports nothing (CONTEXT.md: Subagent Report). A
+    /// Turn a restart settled failed at the moment it last showed work was
+    /// timed by nothing and ended by nothing it said, so its Report carries
+    /// neither a duration nor an excerpt (ADR 0029).
+    fn settled_report(
+        &self,
+        holder: SessionId,
+        child: SessionId,
+        turn: &Turn,
+        repaired: &[TurnId],
+    ) -> Option<SubagentReport> {
+        let outcome = match turn.status {
+            TurnStatus::Active => return None,
+            TurnStatus::Completed => SubagentReportOutcome::Completed,
+            TurnStatus::Failed => SubagentReportOutcome::Failed,
+            TurnStatus::Interrupted if self.stopped_by_ancestor(child, turn.id) => return None,
+            TurnStatus::Interrupted => SubagentReportOutcome::Stopped,
+        };
+        let name =
+            self.sessions[&holder].snapshot.activities.iter().find_map(
+                |activity| match activity {
+                    Activity::Subagent {
+                        session_id,
+                        status: ActivityStatus::Active,
+                        name,
+                        ..
+                    } if *session_id == child => Some(name.clone()),
+                    _ => None,
+                },
+            )?;
+        if repaired.contains(&turn.id) {
+            return Some(SubagentReport::new(child, name, outcome, None, None));
+        }
+        let final_message = latest_agent_message(&self.sessions[&child].snapshot, turn.id)
+            .map(|message| message.content.as_str());
+        Some(SubagentReport::new(
+            child,
+            name,
+            outcome,
+            turn.worked_ms(),
+            final_message,
+        ))
     }
 
     /// What `holder`'s open row for the brokered Subagent `child` needs to

@@ -501,6 +501,7 @@ impl SessionStoreState {
                 watches: HashMap::new(),
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
+                held_reports: Default::default(),
             },
         );
         // The child begins working the moment it exists, which the listed

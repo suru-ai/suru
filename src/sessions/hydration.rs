@@ -438,6 +438,7 @@ pub(super) fn restored_record(
         watches: Default::default(),
         work_interrupted_at: None,
         stopped_by_ancestor: None,
+        held_reports: Default::default(),
     }
 }
 
