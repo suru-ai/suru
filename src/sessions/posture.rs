@@ -1,8 +1,8 @@
 //! Session Approval Posture overrides and live Server Setting reconciliation.
 
 use crate::protocol::{
-    ApprovalPosture, ApprovalPostureApplication, EffectiveSettings, SessionApprovalPosture,
-    SessionChange, SessionId, UpdateApprovalPostureRequest,
+    ApprovalPosture, ApprovalPostureApplication, EffectiveSettings, ProviderId,
+    SessionApprovalPosture, SessionChange, SessionId, UpdateApprovalPostureRequest,
 };
 
 use super::{SessionStore, SessionStoreState};
@@ -257,6 +257,37 @@ impl SessionStore {
                         .unwrap_or_default()
                         == update.generation
             })
+    }
+}
+
+/// The Approval Posture a brokered Subagent acts under from its spawn. On its
+/// spawner's Provider it takes the spawner's posture verbatim, as a native
+/// Subagent does (CONTEXT.md: Approval Posture). On another Provider it takes
+/// that Provider's own Setting for now: ADR 0036's table between the
+/// Providers' values replaces that arm, and the inheritance pass
+/// ([`SessionStoreState::inherit_tree_postures`]) — which passes over a
+/// brokered Subagent today, since it owns its actor — is where the table
+/// re-derives the child's reading whenever the spawner's changes.
+///
+/// No Provider runs for the child yet, so the value is recorded as applied:
+/// whatever Provider starts for it starts under it.
+pub(super) fn brokered_subagent_posture(
+    spawner: Option<SessionApprovalPosture>,
+    provider: &ProviderId,
+    settings: &EffectiveSettings,
+) -> Option<SessionApprovalPosture> {
+    match spawner {
+        Some(spawner) if spawner.value.provider() == *provider => Some(SessionApprovalPosture {
+            application: ApprovalPostureApplication::Applied,
+            ..spawner
+        }),
+        _ => {
+            ApprovalPosture::for_provider(provider, settings).map(|value| SessionApprovalPosture {
+                value,
+                pinned: false,
+                application: ApprovalPostureApplication::Applied,
+            })
+        }
     }
 }
 

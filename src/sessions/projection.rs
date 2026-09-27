@@ -103,6 +103,7 @@ impl SessionStoreState {
                     | SessionChange::SessionWatchesChanged { .. }
             )
         });
+        let repaired = super::brokered::repaired_settlements(&changes);
         stamp_turn_timing(&mut changes, updated_at);
         stamp_cost_measurements(&mut changes, updated_at);
         if let Some(snapshot) = self
@@ -186,6 +187,9 @@ impl SessionStoreState {
         {
             self.announce_subagent_tree(session_id);
         }
+        // A brokered Subagent's row follows its Turn, in the Session whose
+        // Agent delegated that Turn, once this commit has landed.
+        self.follow_brokered_turns(storage, session_id, &update.changes, &repaired);
         Ok(update)
     }
 

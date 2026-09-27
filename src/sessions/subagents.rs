@@ -282,6 +282,9 @@ pub(super) enum SubagentRoute {
     /// Its spawner's own Provider spawned it, over the spawner's Provider
     /// actor, and named it by this identity.
     Native(StoredSubagentIdentity),
+    /// Suru spawned it through the Broker, on a Provider actor of its own
+    /// (ADR 0035). The Session id is its identity.
+    Brokered,
 }
 
 /// What opening a Subagent's child Session takes beyond its spawner.
@@ -405,6 +408,7 @@ impl SessionStoreState {
         };
         let (subagent_identity, brokered) = match child.route {
             SubagentRoute::Native(identity) => (Some(identity), false),
+            SubagentRoute::Brokered => (None, true),
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         storage.created(PersistedSession {

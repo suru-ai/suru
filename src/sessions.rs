@@ -24,6 +24,7 @@ use crate::storage::{
 };
 
 mod actor_owner;
+mod brokered;
 mod catalog;
 mod checkouts;
 pub(crate) use checkouts::CheckoutActivity;
@@ -48,6 +49,7 @@ mod watches;
 mod workspace_icon;
 mod workspaces;
 
+pub(crate) use brokered::{BrokeredSpawn, DelegatingAgent};
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
 };

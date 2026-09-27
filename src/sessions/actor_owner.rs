@@ -25,6 +25,12 @@ impl SessionRecord {
     pub(super) fn owns_provider_actor(&self) -> bool {
         self.snapshot.session.parent.is_none() || self.brokered
     }
+
+    /// Whether this is a brokered Subagent's Session (ADR 0035): a Subagent's,
+    /// spawned through the Broker rather than by its spawner's own Provider.
+    pub(super) fn is_brokered_subagent(&self) -> bool {
+        self.snapshot.session.parent.is_some() && self.brokered
+    }
 }
 
 impl SessionStore {
