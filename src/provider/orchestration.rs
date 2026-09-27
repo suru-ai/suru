@@ -1624,6 +1624,13 @@ impl ProviderOrchestrator {
     /// ancestor's Provider actor, as a native Subagent's does, stops that one
     /// Subagent — or, once it has settled and its Session is only Monitoring,
     /// the Watches in its subtree — through the actor that ancestor owns.
+    ///
+    /// Whatever the interrupt stops, it stops beneath the Session too: every
+    /// brokered Subagent beneath it runs on a Provider actor of its own,
+    /// which the Session's own actor cannot reach (ADR 0035), so the
+    /// interrupt is carried down to each of those actors as well — see
+    /// [`Self::interrupt_beneath`]. It answers once every Provider asked has
+    /// answered, with the first failure among them. Nothing asks the user.
     pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
@@ -1641,61 +1648,147 @@ impl ProviderOrchestrator {
             InterruptTarget::WithdrewPrompt(prompt) => {
                 return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
             }
+            // The work beneath the Session is asked to stop first and
+            // alongside its Turn, so no brokered Subagent is left keeping the
+            // Session Working once the Turn has settled.
             InterruptTarget::Turn(turn) => {
-                let actor = actor.ok_or_else(|| {
-                    self.fail_unavailable_interruption(
-                        session_id,
-                        turn.id,
-                        "Provider interruption failed: the Session has no Provider actor.",
-                    )
-                })?;
-                let (response_tx, response_rx) = oneshot::channel();
-                actor
-                    .send(ProviderCommand::InterruptSession {
-                        response: response_tx,
-                    })
-                    .map_err(|_| {
-                        self.fail_unavailable_interruption(
-                            session_id,
-                            turn.id,
-                            "Provider interruption failed: the Provider Session stopped unexpectedly.",
-                        )
-                    })?;
-                response_rx.await.map_err(|_| {
-                    self.fail_unavailable_interruption(
-                        session_id,
-                        turn.id,
-                        "Provider interruption failed: the Provider Session stopped unexpectedly.",
-                    )
-                })?
+                let (beneath, own) = tokio::join!(
+                    self.interrupt_beneath(session_id, OwnerStop::Work),
+                    self.interrupt_own_turn(actor, session_id, turn.id),
+                );
+                own.and(beneath)
             }
             InterruptTarget::Subagents => {
-                ask_actor_or_find_nothing_running(actor, |response| {
-                    ProviderCommand::InterruptSession { response }
-                })
-                .await
+                let (beneath, own) = tokio::join!(
+                    self.interrupt_beneath(session_id, OwnerStop::Work),
+                    ask_actor_or_find_nothing_running(actor, |response| {
+                        ProviderCommand::InterruptSession { response }
+                    }),
+                );
+                own.and(beneath)
             }
+            // A per-Subagent stop its Provider refuses stops nothing, so what
+            // the Subagent delegated through the Broker is stopped only once
+            // the Subagent itself has been.
             InterruptTarget::Subagent => {
-                ask_actor_or_find_nothing_running(actor, |response| ProviderCommand::StopSubagent {
-                    target: session_id,
-                    response,
+                match ask_actor_or_find_nothing_running(actor, |response| {
+                    ProviderCommand::StopSubagent {
+                        target: session_id,
+                        response,
+                    }
                 })
                 .await
+                {
+                    Ok(()) => self.interrupt_beneath(session_id, OwnerStop::Work).await,
+                    refused => refused,
+                }
             }
             // Settled by the Watches' own settling, which the Provider
             // reports like any other: nothing here settles a Turn or
             // withdraws a Prompt. A native Subagent's Watches run over the
             // connection of the actor its conversation rides, and only its
-            // own subtree's are stopped.
+            // own subtree's are stopped — those a brokered Subagent beneath
+            // it runs, over that Subagent's own actor.
             InterruptTarget::Watches => {
-                ask_actor_or_find_nothing_running(actor, |response| ProviderCommand::StopWatches {
-                    target: session_id,
-                    response,
-                })
-                .await
+                let (beneath, own) = tokio::join!(
+                    self.interrupt_beneath(session_id, OwnerStop::Watches),
+                    ask_actor_or_find_nothing_running(actor, |response| {
+                        ProviderCommand::StopWatches {
+                            target: session_id,
+                            response,
+                        }
+                    }),
+                );
+                own.and(beneath)
             }
         };
         stopped.map(|()| InterruptOutcome::StoppedWork)
+    }
+
+    /// Interrupts the active Turn `turn_id` of `session_id` through `actor`,
+    /// the Provider actor the Session owns. A Turn whose actor cannot be
+    /// reached is failed here, since no actor is left to settle it.
+    async fn interrupt_own_turn(
+        &self,
+        actor: Option<mpsc::UnboundedSender<ProviderCommand>>,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<(), InterruptSessionError> {
+        let actor = actor.ok_or_else(|| {
+            self.fail_unavailable_interruption(
+                session_id,
+                turn_id,
+                "Provider interruption failed: the Session has no Provider actor.",
+            )
+        })?;
+        let (response_tx, response_rx) = oneshot::channel();
+        actor
+            .send(ProviderCommand::InterruptSession {
+                response: response_tx,
+            })
+            .map_err(|_| {
+                self.fail_unavailable_interruption(
+                    session_id,
+                    turn_id,
+                    "Provider interruption failed: the Provider Session stopped unexpectedly.",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            self.fail_unavailable_interruption(
+                session_id,
+                turn_id,
+                "Provider interruption failed: the Provider Session stopped unexpectedly.",
+            )
+        })?
+    }
+
+    /// Carries an interrupt of `session_id` down to every Session beneath it
+    /// that owns a Provider actor of its own — each brokered Subagent at any
+    /// depth — asking each, through its own actor, for what `stop` names.
+    /// None of their work rides `session_id`'s actor, so nothing else would
+    /// reach it (ADR 0035). Each Turn this stops is marked first as stopped
+    /// from above, which no Subagent Report tells of; a Watch stop settles no
+    /// Turn, and marks none, so a Turn a Watch has since woken runs on
+    /// unmarked.
+    async fn interrupt_beneath(
+        &self,
+        session_id: SessionId,
+        stop: OwnerStop,
+    ) -> Result<(), InterruptSessionError> {
+        let owners = self.sessions.actor_owners_beneath(session_id);
+        if stop == OwnerStop::Work {
+            self.sessions.mark_stopped_by_ancestor(&owners);
+        }
+        self.stop_actor_owners(owners, stop).await
+    }
+
+    /// Asks every Session in `owners` — each owning a Provider actor of its
+    /// own — for what `stop` names, through that actor: all of them at once,
+    /// in the order given, and then every answer awaited, so no slow Provider
+    /// holds back the stop of another. Answers the first failure in that
+    /// order, or success once all have answered; an owner with no actor
+    /// running has nothing running to stop.
+    async fn stop_actor_owners(
+        &self,
+        owners: Vec<SessionId>,
+        stop: OwnerStop,
+    ) -> Result<(), InterruptSessionError> {
+        let answers = owners.into_iter().map(|owner| {
+            ask_actor_or_find_nothing_running(
+                self.actor_commands(owner),
+                move |response| match stop {
+                    OwnerStop::Work => ProviderCommand::InterruptSession { response },
+                    OwnerStop::Watches => ProviderCommand::StopWatches {
+                        target: owner,
+                        response,
+                    },
+                },
+            )
+        });
+        futures_util::future::join_all(answers)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Fails a Turn whose Provider actor could not be reached, settling whatever
@@ -3491,10 +3584,23 @@ fn one_line(text: &str) -> String {
     shortened
 }
 
+/// What an interrupt carried beneath the Session interrupted asks of each
+/// Provider actor it reaches there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerStop {
+    /// Stop whatever the actor's Session is doing, as interrupting that
+    /// Session would: its active Turn, or with none, the Watches and native
+    /// Subagents its actor runs.
+    Work,
+    /// Stop only the Watches the actor runs: the interrupt of a Session that
+    /// is only Monitoring, which settles nothing (ADR 0030).
+    Watches,
+}
+
 /// Delivers one stop-shaped command to a Session's actor and awaits its
-/// answer. These stops target only Subagents, which live and die with their
-/// actor's connection: no actor left — or one that stopped before answering —
-/// means nothing is still running, and stopping nothing is success.
+/// answer. What these stop lives and dies with the actor's connection: no
+/// actor left — or one that stopped before answering — means nothing is still
+/// running, and stopping nothing is success.
 async fn ask_actor_or_find_nothing_running(
     actor: Option<mpsc::UnboundedSender<ProviderCommand>>,
     command: impl FnOnce(oneshot::Sender<Result<(), InterruptSessionError>>) -> ProviderCommand,

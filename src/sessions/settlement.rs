@@ -36,14 +36,17 @@ pub(crate) enum InterruptSessionError {
 /// What one interrupt of a Session did, resolved by the store so every caller
 /// acts on the same reading of the same snapshot. Everything the interrupt
 /// still has to reach is the Provider's; the one thing the store settles
-/// itself, it has settled by the time it answers.
+/// itself, it has settled by the time it answers. Whatever it reaches through
+/// the actor holding the Session's conversation, it reaches beneath the
+/// Session too, through the actor each brokered Subagent there owns.
 pub(crate) enum InterruptTarget {
     /// The Session's active Turn, on the Provider actor the Session owns. The
-    /// Provider stops the Turn's background work — its Subagents included —
-    /// before the loop, in the established ordering.
+    /// Provider stops the Turn's background work — its native Subagents
+    /// included — before the loop, in the established ordering.
     Turn(Box<Turn>),
     /// No Turn is active, but Subagents below the Session still work; the
-    /// interrupt stops them all, through the Provider actor the Session owns.
+    /// interrupt stops them all: the native ones through the Provider actor
+    /// the Session owns, and the brokered ones through their own.
     Subagents,
     /// The Session's conversation rides the Provider actor of an ancestor, as
     /// a native Subagent's does, so the interrupt stops that one Subagent
