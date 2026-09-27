@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     );
     match mode.as_str() {
         "serve" => {
-            let url = start_server(options.server()).await?;
+            let url = start_server(options.server()?).await?;
             eprintln!("serving {url}; Ctrl-C to stop");
             tokio::signal::ctrl_c().await?;
             Ok(())
@@ -168,15 +168,12 @@ impl Options {
             .transpose()
     }
 
-    fn server(&self) -> ServerOptions {
-        let progress = self
-            .get("progress")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(30);
-        ServerOptions {
+    fn server(&self) -> anyhow::Result<ServerOptions> {
+        let progress = self.number("progress")?.unwrap_or(30);
+        Ok(ServerOptions {
             progress_every: (progress > 0).then(|| Duration::from_secs(progress)),
             json_only: self.get("response") == Some("json"),
-        }
+        })
     }
 
     fn model<'a>(&'a self, default: &'a str) -> &'a str {
@@ -663,8 +660,6 @@ const CODEX_TURN: Duration = Duration::from_secs(600);
 struct AppServer {
     process: LineChild,
     next_id: i64,
-    /// Answer `mcpServer/elicitation/request` with an error, as Suru's Codex transport does today.
-    reject_elicitations: bool,
 }
 
 impl AppServer {
@@ -682,7 +677,6 @@ impl AppServer {
         let mut server = Self {
             process: LineChild::spawn("codex", command)?,
             next_id: 0,
-            reject_elicitations: true,
         };
         server
             .request(
@@ -737,12 +731,10 @@ impl AppServer {
         };
         log("codex", "server_request", message);
         let reply = match method.as_str() {
-            "mcpServer/elicitation/request" if self.reject_elicitations => json!({
+            // Refused as Suru's Codex transport refuses it today.
+            "mcpServer/elicitation/request" => json!({
                 "jsonrpc": "2.0", "id": id,
                 "error": {"code": -32000, "message": "Suru does not support interactive request `mcpServer/elicitation/request`"},
-            }),
-            "mcpServer/elicitation/request" => json!({
-                "jsonrpc": "2.0", "id": id, "result": {"action": "accept", "content": {}},
             }),
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => json!({
                 "jsonrpc": "2.0", "id": id, "result": {"decision": "decline"},
@@ -811,7 +803,7 @@ fn codex_thread_params(
 }
 
 async fn codex(scenario: &str, options: &Options) -> anyhow::Result<()> {
-    let url = start_server(options.server()).await?;
+    let url = start_server(options.server()?).await?;
     let workspace = tempfile::tempdir()?;
     let cwd = workspace
         .path()
@@ -1000,7 +992,7 @@ async fn codex(scenario: &str, options: &Options) -> anyhow::Result<()> {
 // ------------------------------------------------------------------------------------------------
 
 async fn claude(scenario: &str, options: &Options) -> anyhow::Result<()> {
-    let url = start_server(options.server()).await?;
+    let url = start_server(options.server()?).await?;
     let mut entry = json!({
         "type": "http",
         "url": url,
@@ -1261,7 +1253,7 @@ async fn copilot_turn(session: &Session, label: &str, prompt: &str) -> anyhow::R
 }
 
 async fn copilot(scenario: &str, options: &Options) -> anyhow::Result<()> {
-    let url = start_server(options.server()).await?;
+    let url = start_server(options.server()?).await?;
     let workspace = tempfile::tempdir()?;
     let model = options.model("gpt-5-mini");
     let timeout = options.number("timeout-ms")?;
