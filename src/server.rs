@@ -3031,7 +3031,9 @@ async fn delete_session(
                     state.timings.worktree_reclaim_day,
                 );
             }
-            state.providers.close_session(session_id).await;
+            for owner in deleted.actor_owners {
+                state.providers.close_session(owner).await;
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(DeleteSessionError::SessionNotFound) => session_error_response(

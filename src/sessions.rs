@@ -194,6 +194,10 @@ pub(crate) struct DeletedSession {
     /// A Session outside supported source control has no Repository pass to
     /// run after deletion.
     pub(crate) repository: Option<crate::protocol::Repository>,
+    /// Every Session whose Provider actor held a conversation the deletion
+    /// took, the deleted Session first: each actor has nothing left to serve
+    /// and is closed.
+    pub(crate) actor_owners: Vec<SessionId>,
 }
 
 impl SessionStore {
@@ -530,6 +534,20 @@ impl SessionStore {
         }) {
             return Err(DeleteSessionError::WorkingSession);
         }
+        // Every Provider actor holding a conversation the deletion takes
+        // closes with it: the deleted Session's own — a top-level Session
+        // owns one even when its history was unreadable and the store holds
+        // no record to ask — and that of any Subagent below it with an actor
+        // of its own.
+        let mut actor_owners = vec![session_id];
+        for owner in doomed
+            .iter()
+            .filter_map(|doomed_id| state.actor_owner_of(*doomed_id))
+        {
+            if !actor_owners.contains(&owner) {
+                actor_owners.push(owner);
+            }
+        }
         for doomed_id in doomed.iter().rev() {
             self.storage
                 .deleted(*doomed_id)
@@ -548,7 +566,10 @@ impl SessionStore {
             .retain(|_, owner| !doomed.contains(&owner.session_id));
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         state.subagent_trees.invalidate(session_id);
-        Ok(DeletedSession { repository })
+        Ok(DeletedSession {
+            repository,
+            actor_owners,
+        })
     }
 
     pub(crate) fn list(

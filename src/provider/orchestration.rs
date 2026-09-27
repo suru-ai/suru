@@ -1602,6 +1602,9 @@ impl ProviderOrchestrator {
         InterruptSessionError::ProviderFailure(message.to_owned())
     }
 
+    /// Closes the Provider actor `session_id` owns, and what it held for that
+    /// Session, once the Session's deletion has left the actor nothing to
+    /// serve. Every Session riding the actor was deleted with it.
     pub(crate) async fn close_session(&self, session_id: SessionId) {
         self.checkout_guards
             .lock()
