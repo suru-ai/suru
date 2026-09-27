@@ -190,7 +190,7 @@ impl SessionStoreState {
     /// The top-level Session heading the tree `session_id` belongs to, or
     /// `None` when the Session is not held or its line up to a top-level
     /// Session is broken.
-    fn top_level_of(&self, session_id: SessionId) -> Option<SessionId> {
+    pub(super) fn top_level_of(&self, session_id: SessionId) -> Option<SessionId> {
         let (top_level, record) = self.ancestors(session_id).last()?;
         record
             .snapshot

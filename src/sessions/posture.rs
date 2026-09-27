@@ -7,6 +7,8 @@ use crate::protocol::{
 
 mod table;
 
+use std::collections::{HashMap, HashSet};
+
 use super::{SessionStore, SessionStoreState};
 use crate::storage::StorageSink;
 use table::PostureLevel;
@@ -93,7 +95,12 @@ impl SessionStore {
                 )
                 .map_err(|_| ApprovalPostureMutationError::Storage)?;
         }
-        if !state.inherit_tree_postures(&self.storage, [session_id]) {
+        if !state.inherit_tree_postures(
+            &self.storage,
+            [session_id],
+            settings,
+            PostureDelivery::Owed,
+        ) {
             return Err(ApprovalPostureMutationError::Storage);
         }
         let update = if application == ApprovalPostureApplication::Applying {
@@ -142,7 +149,7 @@ impl SessionStore {
         for &owner in &owners {
             state.follow_settings(&self.storage, owner, settings, PostureDelivery::Owed);
         }
-        state.inherit_tree_postures(&self.storage, owners);
+        state.inherit_tree_postures(&self.storage, owners, settings, PostureDelivery::Owed);
         pending_posture_updates(&mut state)
     }
 
@@ -167,7 +174,7 @@ impl SessionStore {
         }
         let owner = state.actor_owner_of(session_id)?;
         state.follow_settings(&self.storage, owner, settings, PostureDelivery::Owed);
-        state.inherit_tree_postures(&self.storage, [owner]);
+        state.inherit_tree_postures(&self.storage, [owner], settings, PostureDelivery::Owed);
         state.outstanding_posture_update(owner)
     }
 
@@ -177,6 +184,7 @@ impl SessionStore {
         application: ApprovalPostureApplication,
     ) -> bool {
         let session_id = update.session_id;
+        let settings = self.settings.borrow().settings.clone();
         let mut state = self
             .state
             .lock()
@@ -213,7 +221,12 @@ impl SessionStore {
             tracing::warn!(session = %session_id, "could not record Approval Posture application: {error:#}");
             return false;
         }
-        state.inherit_tree_postures(&self.storage, [session_id]);
+        state.inherit_tree_postures(
+            &self.storage,
+            [session_id],
+            &settings,
+            PostureDelivery::Owed,
+        );
         true
     }
 
@@ -370,7 +383,8 @@ fn next_posture_generation(state: &mut SessionStoreState, session_id: SessionId)
 }
 
 /// Every native application still owed to a Provider actor: posture is
-/// delivered to the actor, so only the Sessions that own one can owe it.
+/// delivered to the actor, so only the Sessions that own one can owe it — a
+/// top-level Session, or a brokered Subagent owed what was derived for it.
 fn pending_posture_updates(state: &mut SessionStoreState) -> Vec<ApprovalPostureUpdate> {
     let owners = state
         .sessions
@@ -414,14 +428,15 @@ impl SessionStoreState {
         for &owner in &owners {
             self.follow_settings(storage, owner, settings, PostureDelivery::Settled);
         }
-        self.inherit_tree_postures(storage, owners);
+        self.inherit_tree_postures(storage, owners, settings, PostureDelivery::Settled);
     }
 
     /// Sets `owner`'s unpinned posture to what `settings` say for its
     /// Provider. A value that does not change keeps whatever application it
     /// had reached, except that a Settled delivery closes an Applying one.
     /// Only a top-level Session follows the Settings: a Subagent's Session
-    /// never does, even one that owns its actor, so it is left as it is.
+    /// never does, even one that owns its actor, since its reading is its
+    /// spawner's, given it by [`Self::inherit_tree_postures`].
     fn follow_settings(
         &mut self,
         storage: &StorageSink,
@@ -441,67 +456,103 @@ impl SessionStoreState {
             }
             let provider = &session.agent_selection.as_ref()?.provider;
             let value = ApprovalPosture::for_provider(provider, settings)?;
-            let (application, _) =
-                application_for_desired(session.approval_posture.as_ref(), value, false);
-            let application = match delivery {
-                PostureDelivery::Owed => application,
-                PostureDelivery::Settled if application == ApprovalPostureApplication::Applying => {
-                    ApprovalPostureApplication::Applied
+            Some(
+                HeldPosture {
+                    value,
+                    pinned: false,
                 }
-                PostureDelivery::Settled => application,
-            };
-            Some(SessionApprovalPosture {
-                value,
-                pinned: false,
-                application,
-            })
+                .reading(session.approval_posture.as_ref(), delivery),
+            )
         }) else {
             return;
         };
-        if self.sessions[&owner]
-            .snapshot
-            .session
-            .approval_posture
-            .as_ref()
-            == Some(&next)
-        {
-            return;
-        }
-        let applying = next.application == ApprovalPostureApplication::Applying;
-        if self.commit_posture(storage, owner, Some(next)) && applying {
-            next_posture_generation(self, owner);
-        }
+        self.hold_posture(storage, owner, next);
     }
 
-    /// A native Subagent's Session rides the Provider actor of its nearest
-    /// ancestor that owns one, so it acts under that owner's posture: an
-    /// inherited reading rather than an independently mutable value. Every
-    /// hydrated Session riding the actor of an owner in `owners` takes its
-    /// reading in one pass over the store; deferred ones take it when they
-    /// are hydrated. Reports whether every reading landed.
+    /// Every hydrated Session beneath the top-level Session of each tree an
+    /// owner in `owners` belongs to takes its reading from the Session that
+    /// spawned it, each after its spawner, so what one level derives is what
+    /// the next derives from.
+    ///
+    /// A native Subagent's conversation rides the Provider actor of its
+    /// nearest ancestor that owns one, so it reads its spawner's posture
+    /// verbatim, how far that has been applied included: an inherited reading
+    /// rather than an independently mutable value. A brokered Subagent owns
+    /// an actor of its own, so it holds what [`derived_posture`] reads from
+    /// its spawner's, and `delivery` says whether its own Provider is owed a
+    /// value that changes here. Deferred Sessions take their readings when
+    /// they are hydrated, and a line with no top-level Session to head it is
+    /// passed over, since no actor can have run it. Reports whether every
+    /// reading landed.
     fn inherit_tree_postures(
         &mut self,
         storage: &StorageSink,
         owners: impl IntoIterator<Item = SessionId>,
+        settings: &EffectiveSettings,
+        delivery: PostureDelivery,
     ) -> bool {
-        let owners = owners.into_iter().collect::<std::collections::HashSet<_>>();
-        let readings = self
-            .sessions
-            .iter()
-            .filter(|(id, _)| !self.is_deferred(**id))
-            .filter_map(|(id, record)| {
-                let owner = self
-                    .actor_owner_of(*id)
-                    .filter(|owner| owner != id && owners.contains(owner))?;
-                let inherited = self.sessions.get(&owner)?.snapshot.session.approval_posture;
-                (record.snapshot.session.approval_posture != inherited).then_some((*id, inherited))
-            })
-            .collect::<Vec<_>>();
+        let top_levels = owners
+            .into_iter()
+            .filter_map(|owner| self.top_level_of(owner))
+            .collect::<HashSet<_>>();
         let mut landed = true;
-        for (child, inherited) in readings {
-            landed &= self.commit_posture(storage, child, inherited);
+        for (spawner, child) in self.spawn_order_beneath(top_levels) {
+            let spawners = self.sessions[&spawner].snapshot.session.approval_posture;
+            let record = &self.sessions[&child];
+            let current = record.snapshot.session.approval_posture;
+            if !record.is_brokered_subagent() {
+                if current != spawners {
+                    landed &= self.commit_posture(storage, child, spawners);
+                }
+                continue;
+            }
+            let Some(provider) = record
+                .snapshot
+                .session
+                .agent_selection
+                .as_ref()
+                .map(|selection| selection.provider.clone())
+            else {
+                continue;
+            };
+            landed &= match derived_posture(spawners.as_ref(), &provider, settings) {
+                Some(held) => {
+                    let next = held.reading(current.as_ref(), delivery);
+                    self.hold_posture(storage, child, next)
+                }
+                None => current.is_none() || self.commit_posture(storage, child, None),
+            };
         }
         landed
+    }
+
+    /// Every hydrated Session beneath `top_levels`, each paired with the
+    /// Session that spawned it and reached after that Session: the order a
+    /// reading passes down a tree in.
+    fn spawn_order_beneath(
+        &self,
+        top_levels: impl IntoIterator<Item = SessionId>,
+    ) -> Vec<(SessionId, SessionId)> {
+        let mut children = HashMap::<SessionId, Vec<SessionId>>::new();
+        for (&id, record) in &self.sessions {
+            if let Some(parent) = record.snapshot.session.parent
+                && !self.is_deferred(id)
+            {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        let mut order = Vec::new();
+        let mut spawners = top_levels
+            .into_iter()
+            .filter(|top_level| !self.is_deferred(*top_level))
+            .collect::<Vec<_>>();
+        while let Some(spawner) = spawners.pop() {
+            for &child in children.get(&spawner).into_iter().flatten() {
+                order.push((spawner, child));
+                spawners.push(child);
+            }
+        }
+        order
     }
 
     /// The actor owner's native application still outstanding, as an update
@@ -520,6 +571,33 @@ impl SessionStoreState {
                 generation: *self.posture_generations.entry(owner).or_default(),
             }
         })
+    }
+
+    /// Records `next` as the reading of `session_id`, a Session that owns its
+    /// Provider actor, where it differs from what it reads now; a reading that
+    /// begins Applying begins a new generation of the native application it
+    /// owes. Reports whether the reading landed.
+    fn hold_posture(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        next: SessionApprovalPosture,
+    ) -> bool {
+        if self.sessions[&session_id]
+            .snapshot
+            .session
+            .approval_posture
+            .as_ref()
+            == Some(&next)
+        {
+            return true;
+        }
+        let applying = next.application == ApprovalPostureApplication::Applying;
+        let landed = self.commit_posture(storage, session_id, Some(next));
+        if landed && applying {
+            next_posture_generation(self, session_id);
+        }
+        landed
     }
 
     /// Reconciliation is best-effort: a refusal is logged and the reading it

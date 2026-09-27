@@ -208,34 +208,63 @@ async fn reconciling_one_session_refreshes_its_tree_and_no_other() {
     writer.shutdown().await.unwrap();
 }
 
+/// A brokered Subagent's Session as the next process reads it back: a child
+/// of `parent`, spawned through the Broker onto `provider`'s `model`, holding
+/// `posture` as the process that stored it last derived it.
+fn brokered(
+    workspace: &Path,
+    parent: SessionId,
+    provider: &str,
+    model: &str,
+    posture: ApprovalPosture,
+) -> PersistedSession {
+    let mut record = PersistedSession {
+        brokered: true,
+        ..persisted(workspace, Some(parent))
+    };
+    record.snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new(provider),
+        model: ModelId::new(model),
+        options: Vec::new(),
+    });
+    record.snapshot.session.approval_posture = Some(SessionApprovalPosture {
+        value: posture,
+        pinned: false,
+        application: ApprovalPostureApplication::Applying,
+    });
+    record.summary.session = record.snapshot.session.clone();
+    record
+}
+
+fn codex_posture(
+    approval_policy: CodexApprovalPolicy,
+    sandbox_mode: CodexSandboxMode,
+) -> ApprovalPosture {
+    ApprovalPosture::Codex {
+        approval_policy,
+        sandbox_mode,
+    }
+}
+
 /// A brokered Subagent owns its Provider actor across a restart: the next
-/// process reads it back brokered, so hydration leaves it the posture its
-/// spawn gave it for its own Provider rather than handing it its spawner's,
-/// as it would a native Subagent's riding the spawner's actor (ADR 0035).
+/// process reads it back brokered. Hydration is when its spawner catches up
+/// with the Settings, and so when its own reading is derived again from the
+/// spawner's through ADR 0036's table — never handed the spawner's Claude
+/// value itself, as a native Subagent riding the spawner's actor would be —
+/// and nothing is owed to a Provider that does not exist yet.
 #[tokio::test]
-async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_and_posture() {
+async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_and_rederives_its_posture()
+ {
     let directory = tempfile::tempdir().unwrap();
     let root = stale(directory.path(), None);
     let root_id = root.snapshot.session.id;
-    let mut child = PersistedSession {
-        brokered: true,
-        ..persisted(directory.path(), Some(root_id))
-    };
-    let codex = SessionApprovalPosture {
-        value: ApprovalPosture::Codex {
-            approval_policy: CodexApprovalPolicy::Never,
-            sandbox_mode: CodexSandboxMode::WorkspaceWrite,
-        },
-        pinned: false,
-        application: ApprovalPostureApplication::Applied,
-    };
-    child.snapshot.session.agent_selection = Some(AgentSelection {
-        provider: ProviderId::new("codex"),
-        model: ModelId::new("gpt-5.5"),
-        options: Vec::new(),
-    });
-    child.snapshot.session.approval_posture = Some(codex);
-    child.summary.session = child.snapshot.session.clone();
+    let child = brokered(
+        directory.path(),
+        root_id,
+        "codex",
+        "gpt-5.5",
+        codex_posture(CodexApprovalPolicy::Never, CodexSandboxMode::WorkspaceWrite),
+    );
     let child_id = child.snapshot.session.id;
     let (repository, writer, store) = deferred_store(directory.path(), vec![root, child]).await;
 
@@ -247,36 +276,175 @@ async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_a
     store.hydrate(child_id).await.unwrap();
     assert_eq!(store.actor_owner(child_id), Some(child_id), "and after");
     assert_eq!(
-        snapshot(&store, child_id).session.approval_posture,
-        Some(codex),
-        "its posture is its own, not its Claude spawner's"
-    );
-    assert_eq!(
         snapshot(&store, root_id).session.approval_posture,
         Some(claude_posture(ClaudePermissionMode::Default)),
-        "while its spawner catches up with the Settings as ever"
+        "its spawner catches up with the Settings as ever"
+    );
+    let derived = SessionApprovalPosture {
+        value: codex_posture(
+            CodexApprovalPolicy::Untrusted,
+            CodexSandboxMode::WorkspaceWrite,
+        ),
+        pinned: false,
+        application: ApprovalPostureApplication::Applied,
+    };
+    assert_eq!(
+        snapshot(&store, child_id).session.approval_posture,
+        Some(derived),
+        "and it reads Codex's value at its spawner's level, applied"
     );
 
     writer.shutdown().await.unwrap();
+    let reloaded = repository.session(child_id).await.unwrap().unwrap();
     assert!(
-        repository
-            .session(child_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .brokered,
-        "and the next process reads it back brokered again"
+        reloaded.brokered,
+        "the next process reads it back brokered again"
     );
+    assert_eq!(reloaded.snapshot.session.approval_posture, Some(derived));
 }
 
-fn codex_posture(
-    approval_policy: CodexApprovalPolicy,
-    sandbox_mode: CodexSandboxMode,
-) -> ApprovalPosture {
-    ApprovalPosture::Codex {
-        approval_policy,
-        sandbox_mode,
-    }
+/// A reading derived one level down is what the next level derives from, and
+/// a native Subagent of a brokered one rides that brokered one's actor, so it
+/// reads that posture rather than the top-level Session's.
+#[tokio::test]
+async fn each_level_of_a_tree_derives_from_the_level_above_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut root = stale(directory.path(), None);
+    root.snapshot.session.approval_posture = Some(SessionApprovalPosture {
+        value: ApprovalPosture::Claude {
+            permission_mode: ClaudePermissionMode::DontAsk,
+        },
+        pinned: true,
+        application: ApprovalPostureApplication::Applied,
+    });
+    root.summary.session = root.snapshot.session.clone();
+    let root_id = root.snapshot.session.id;
+    let stored = ApprovalPosture::Copilot {
+        permissions: crate::protocol::CopilotPermissions::AllowAll,
+    };
+    let codex = brokered(directory.path(), root_id, "codex", "gpt-5.5", stored);
+    let codex_id = codex.snapshot.session.id;
+    let copilot = brokered(directory.path(), codex_id, "copilot", "gpt-4.1", stored);
+    let copilot_id = copilot.snapshot.session.id;
+    let claude = brokered(directory.path(), copilot_id, "claude", "haiku", stored);
+    let claude_id = claude.snapshot.session.id;
+    let native = persisted(directory.path(), Some(claude_id));
+    let native_id = native.snapshot.session.id;
+    let (_repository, writer, store) =
+        deferred_store(directory.path(), vec![root, codex, copilot, claude, native]).await;
+
+    store.hydrate(native_id).await.unwrap();
+
+    let reading = |value, pinned| {
+        Some(SessionApprovalPosture {
+            value,
+            pinned,
+            application: ApprovalPostureApplication::Applied,
+        })
+    };
+    assert_eq!(
+        snapshot(&store, codex_id).session.approval_posture,
+        reading(
+            codex_posture(CodexApprovalPolicy::Never, CodexSandboxMode::WorkspaceWrite),
+            true
+        ),
+        "Claude's dontAsk reads as Codex's never within the workspace, the root's pin carried"
+    );
+    let asks = ApprovalPosture::Copilot {
+        permissions: crate::protocol::CopilotPermissions::Ask,
+    };
+    assert_eq!(
+        snapshot(&store, copilot_id).session.approval_posture,
+        reading(asks, true),
+        "Copilot has no contained value that runs unasked, so it asks"
+    );
+    let default = ApprovalPosture::Claude {
+        permission_mode: ClaudePermissionMode::Default,
+    };
+    assert_eq!(
+        snapshot(&store, claude_id).session.approval_posture,
+        reading(default, true),
+        "and a Claude Subagent beneath it reads what Copilot's ask is, not the root's dontAsk"
+    );
+    assert_eq!(
+        snapshot(&store, native_id).session.approval_posture,
+        reading(default, true),
+        "a native Subagent reads the posture of the brokered one whose actor it rides"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// A Settings change that moves an unpinned top-level Session moves every
+/// brokered Subagent beneath it, and each is owed its own value on its own
+/// actor, as the top-level Session is on its.
+#[tokio::test]
+async fn a_settings_change_rederives_a_brokered_subagent_and_owes_its_own_actor_the_value() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = stale(directory.path(), None);
+    let root_id = root.snapshot.session.id;
+    let child = brokered(
+        directory.path(),
+        root_id,
+        "codex",
+        "gpt-5.5",
+        codex_posture(
+            CodexApprovalPolicy::Untrusted,
+            CodexSandboxMode::WorkspaceWrite,
+        ),
+    );
+    let child_id = child.snapshot.session.id;
+    let (_repository, writer, store) = deferred_store(directory.path(), vec![root, child]).await;
+    store.hydrate(child_id).await.unwrap();
+
+    let mut settings = EffectiveSettings::default();
+    settings.provider.claude.permission_mode = ClaudePermissionMode::BypassPermissions;
+    let updates = store.reconcile_approval_postures(&settings);
+
+    let unrestricted = codex_posture(
+        CodexApprovalPolicy::Never,
+        CodexSandboxMode::DangerFullAccess,
+    );
+    let owed = updates
+        .iter()
+        .map(|update| (update.session_id, update.value))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        owed,
+        [
+            (
+                root_id,
+                ApprovalPosture::Claude {
+                    permission_mode: ClaudePermissionMode::BypassPermissions
+                }
+            ),
+            (child_id, unrestricted),
+        ]
+        .into(),
+        "each actor is owed its own Provider's value"
+    );
+    assert_eq!(
+        snapshot(&store, child_id).session.approval_posture,
+        Some(SessionApprovalPosture {
+            value: unrestricted,
+            pinned: false,
+            application: ApprovalPostureApplication::Applying,
+        })
+    );
+    let update = updates
+        .into_iter()
+        .find(|update| update.session_id == child_id)
+        .unwrap();
+    assert!(store.approval_posture_update_is_pending(update));
+    assert!(store.mark_approval_posture_application(update, ApprovalPostureApplication::Applied));
+    assert_eq!(
+        snapshot(&store, child_id)
+            .session
+            .approval_posture
+            .map(|posture| posture.application),
+        Some(ApprovalPostureApplication::Applied),
+        "and reads it applied once its own Provider has taken it"
+    );
+    writer.shutdown().await.unwrap();
 }
 
 /// A brokered Subagent on its spawner's Provider acts under its spawner's
