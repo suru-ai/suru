@@ -481,7 +481,7 @@ impl SessionStoreState {
                 continue;
             }
             if let Some(report) = report {
-                self.hold_report(storage, holder, report);
+                self.hold_report(holder, report);
             }
         }
     }

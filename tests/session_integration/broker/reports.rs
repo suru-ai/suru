@@ -116,6 +116,19 @@ async fn settled_at(
         .settled_at()
 }
 
+/// Reads the Session listing until `session_id` is no longer set aside. A
+/// Report brings a settled Session back once its Provider has taken it, which
+/// the double's answer to the delivery only just allowed.
+async fn active_again(descriptor: &RuntimeDescriptor, session_id: SessionId) {
+    timeout(PROGRESS_DEADLINE, async {
+        while settled_at(descriptor, session_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Session is active again");
+}
+
 /// Everything `snapshot`'s Transcript holds that stands in Turn `turn_id`.
 fn held_in(snapshot: &SessionSnapshot, turn_id: suru::protocol::TurnId) -> usize {
     snapshot
@@ -478,17 +491,16 @@ async fn a_report_delivered_to_a_session_the_user_had_settled_makes_it_active_ag
     first_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
-    next_turn(
+    let woken = next_turn(
         &mut delegating.caller_provider,
         "the Report wakes the parent's Provider",
     )
-    .await
-    .succeed();
-    assert_eq!(
-        settled_at(&descriptor, delegating.caller).await,
-        None,
-        "a Report that wakes a settled Session makes it active again"
-    );
+    .await;
+    assert_eq!(woken.reports().len(), 1);
+    woken.succeed();
+    // A Report that wakes a settled Session makes it active again, its Agent
+    // working on it.
+    active_again(&descriptor, delegating.caller).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
@@ -501,7 +513,8 @@ async fn a_report_delivered_to_a_session_the_user_had_settled_makes_it_active_ag
     )
     .await;
 
-    // A Report held for want of a Provider process makes it active too.
+    // A Report held for want of a Provider process leaves it settled, since
+    // nothing works on it until the next Turn delivers it.
     let second = delegating
         .client
         .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
@@ -510,7 +523,7 @@ async fn a_report_delivered_to_a_session_the_user_had_settled_makes_it_active_ag
         run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
     settle_session(&descriptor, delegating.caller, true).await;
     let Delegating {
-        hosted,
+        mut hosted,
         caller,
         caller_provider,
         handoff,
@@ -528,11 +541,32 @@ async fn a_report_delivered_to_a_session_the_user_had_settled_makes_it_active_ag
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
     row_settles(&descriptor, caller, second).await;
-    assert_eq!(
-        settled_at(&descriptor, caller).await,
-        None,
-        "a Report held for the parent's next Turn makes it active again as it arrives"
+    assert!(
+        settled_at(&descriptor, caller).await.is_some(),
+        "a Report only held for the parent's next Turn leaves it set aside"
     );
+
+    // The next Prompt delivers it, and the Session is active again.
+    admit_prompt(&descriptor, caller, "What did the Researcher find?").await;
+    let mut relaunched = next_start(&mut hosted.claude).await.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: default_selection(&claude_models()),
+    });
+    let turn = next_turn(
+        &mut relaunched,
+        "the Prompt's Turn reaches the Provider it relaunched",
+    )
+    .await;
+    assert_eq!(
+        turn.reports()
+            .iter()
+            .map(|report| report.subagent)
+            .collect::<Vec<_>>(),
+        [second],
+        "the held Report stands at the head of the Turn the Prompt begins"
+    );
+    turn.succeed();
+    active_again(&descriptor, caller).await;
 
     hosted.server.shutdown().await.expect("shut down server");
 }

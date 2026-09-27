@@ -50,10 +50,10 @@ impl SessionStore {
 
 impl SessionStoreState {
     /// Sets a Session aside or brings it back, as [`SessionStore::settle`]
-    /// describes, under a lock already held — so work arriving for a Session
-    /// without a commit of its own, a Subagent Report held for its next Turn,
-    /// brings it back exactly as the user would. `None` for a Session the
-    /// store does not hold.
+    /// describes, under a lock already held — so work reaching a Session
+    /// without a commit of its own, a Subagent Report its Provider has just
+    /// taken, brings it back exactly as the user would. `None` for a Session
+    /// the store does not hold.
     pub(super) fn set_settled(
         &mut self,
         storage: &StorageSink,

@@ -2821,6 +2821,9 @@ async fn run_provider_session(
                     crate::protocol::ApprovalPostureApplication::Applied,
                 );
             }
+            if !reports.is_empty() {
+                let _ = updates.apply(|| sessions.reports_delivered(session_id));
+            }
             active = Some(ActiveProviderTurn::new(turn_id));
             subagents.late_settle_owes_continuation = false;
             // A Prompt that won the race to a Watch's wake begins the Turn
@@ -3045,17 +3048,23 @@ async fn run_provider_session(
                         input: ProviderInput::from_reports(reports.clone()),
                     }) => steered,
                 };
-                if let Err(error) = steered {
-                    // The Provider's Turn ended before the steer reached it —
-                    // Suru hears of its end only after — or the Provider
-                    // refused it. Either way the Reports wait, and once this
-                    // Turn settles they wake the Agent afresh.
-                    tracing::debug!(
-                        %session_id,
-                        "Subagent Reports could not steer the working Turn: {error}"
-                    );
-                    sessions.hold_reports_again(session_id, reports);
-                    reports_owed = true;
+                match steered {
+                    Ok(()) => {
+                        let _ = updates.apply(|| sessions.reports_delivered(session_id));
+                    }
+                    Err(error) => {
+                        // The Provider's Turn ended before the steer reached
+                        // it — Suru hears of its end only after — or the
+                        // Provider refused it. Either way the Reports wait,
+                        // and once this Turn settles they wake the Agent
+                        // afresh.
+                        tracing::debug!(
+                            %session_id,
+                            "Subagent Reports could not steer the working Turn: {error}"
+                        );
+                        sessions.hold_reports_again(session_id, reports);
+                        reports_owed = true;
+                    }
                 }
             }
             ActorInput::Command(Some(ProviderCommand::SteerPrompt)) => {
@@ -3804,6 +3813,9 @@ async fn begin_delegated_turn(
             crate::protocol::ApprovalPostureApplication::Applied,
         );
     }
+    if !reports.is_empty() {
+        let _ = updates.apply(|| sessions.reports_delivered(session_id));
+    }
     match updates.apply(|| {
         sessions.publish(
             session_id,
@@ -3839,7 +3851,8 @@ enum ReportWake {
 /// whose whole input is the Subagent Reports waiting for it (ADR 0035): a Turn
 /// begun by neither a Prompt nor a Delegation, run by the Session's Agent under
 /// its current Agent Selection and Approval Posture, which the Provider settles
-/// at its own boundary like any Turn. Only a Provider connection already open
+/// at its own boundary like any Turn. Once the Provider takes them, a Session
+/// the user had set aside is brought back. Only a Provider connection already open
 /// takes them — Suru never starts a Provider to deliver a Report — and only
 /// while the user has left that Provider on; otherwise they wait for the
 /// Session's next Turn. The Session's Worktree is leased as any Turn's start
@@ -3947,6 +3960,7 @@ async fn wake_for_reports(
             crate::protocol::ApprovalPostureApplication::Applied,
         );
     }
+    let _ = updates.apply(|| sessions.reports_delivered(session_id));
     ReportWake::Began(turn_id)
 }
 
@@ -3980,7 +3994,10 @@ async fn deliver_to_native_subagent(
         .deliver_to_subagent(subagent.clone(), ProviderInput::from_reports(reports))
         .await
     {
-        Ok(()) => wake_subagent(sessions, updates, subagents, subagent),
+        Ok(()) => {
+            let _ = updates.apply(|| sessions.reports_delivered(target));
+            wake_subagent(sessions, updates, subagents, subagent);
+        }
         Err(error) => tracing::warn!(
             session_id = %target,
             "Subagent Reports for a native Subagent its Provider would not take are dropped: \

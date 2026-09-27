@@ -6,9 +6,9 @@
 //! orchestration hands it to that Agent's Provider: at once — steering a Turn
 //! at work, or waking an idle Agent into a Continuation — or at the head of
 //! the Session's next Turn when no Provider process is running to take it.
-//! Suru never relaunches a Provider to deliver one. A Report arriving is work
-//! for the Session, so one the user had set aside is brought back as it
-//! arrives, whether it wakes the Agent or waits.
+//! Suru never relaunches a Provider to deliver one. A Report its Provider
+//! takes has its Agent working again, so a Session the user had set aside is
+//! brought back once one is delivered — never while one only waits.
 //!
 //! Nothing here reaches a Transcript: a Report stands in none.
 
@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 
 use crate::protocol::{AgentIdentity, SessionChange, SessionId, Turn, TurnId};
 use crate::provider::SubagentReport;
-use crate::storage::StorageSink;
 
 use super::{SessionStore, SessionStoreState, projection::active_turn_id};
 
@@ -63,6 +62,27 @@ impl SessionStore {
         }
     }
 
+    /// Brings `session_id` back from being set aside — and every Session above
+    /// it, since the one a tree is listed by is its top-level Session — now
+    /// that its Provider has taken Subagent Reports for its Agent, which is
+    /// working on them: waking into a Continuation, steered, or beginning its
+    /// next Turn with them at its head (CONTEXT.md: Subagent Report). Brought
+    /// back exactly as the user bringing it back would, so its last activity
+    /// is now and auto-settle leaves it standing.
+    pub(crate) fn reports_delivered(&self, session_id: SessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let lineage = state
+            .ancestors(session_id)
+            .map(|(session_id, _)| session_id)
+            .collect::<Vec<_>>();
+        for session_id in lineage {
+            state.set_settled(&self.storage, session_id, false);
+        }
+    }
+
     /// Begins the Continuation the Reports waiting for `session_id` wake its
     /// idle Agent into — run by `agent`, begun by neither a Prompt nor a
     /// Delegation — and takes those Reports as the whole of its input, in the
@@ -103,27 +123,14 @@ impl SessionStore {
 
 impl SessionStoreState {
     /// Holds `report` for `recipient`'s Agent and says so to whoever asked to
-    /// hear. The Report is work arriving for the Session, so the Session —
-    /// and the one its tree is listed by — comes back from being set aside,
-    /// exactly as the user bringing it back would, whether the Report wakes
-    /// its Agent or waits for the next Turn (CONTEXT.md: Subagent Report).
-    pub(super) fn hold_report(
-        &mut self,
-        storage: &StorageSink,
-        recipient: SessionId,
-        report: SubagentReport,
-    ) {
+    /// hear. Held, the Report leaves a Session the user set aside where it
+    /// stands: nothing is working on it until a Provider takes it (see
+    /// [`SessionStore::reports_delivered`]).
+    pub(super) fn hold_report(&mut self, recipient: SessionId, report: SubagentReport) {
         let Some(record) = self.sessions.get_mut(&recipient) else {
             return;
         };
         record.held_reports.push_back(report);
-        let lineage = self
-            .ancestors(recipient)
-            .map(|(session_id, _)| session_id)
-            .collect::<Vec<_>>();
-        for session_id in lineage {
-            self.set_settled(storage, session_id, false);
-        }
         if let Some(notices) = &self.report_notices
             && notices.send(recipient).is_err()
         {
