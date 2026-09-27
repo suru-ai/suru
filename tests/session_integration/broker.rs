@@ -2039,6 +2039,20 @@ fn reopen_every_turn(state_dir: &Path, channel: &str, caller_id: SessionId) {
 const FINDING: &str =
     "The Provider seams are ProviderRuntime and ProviderSession, both in src/provider.rs.";
 
+/// Has `provider` write `text` as one whole Agent Message, each event taken
+/// up by the Provider actor before the next is sent.
+async fn write_agent_message(provider: &ControlledProviderSession, text: &str) {
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: text.to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+    ] {
+        provider.emit_and_wait_until_observed(event).await;
+    }
+}
+
 /// Has a brokered Subagent's Provider write `text` as one whole Agent
 /// Message, and waits until the Subagent's Session holds it.
 async fn say(
@@ -2047,13 +2061,7 @@ async fn say(
     provider: &ControlledProviderSession,
     text: &str,
 ) {
-    provider.emit(ProviderEvent::AgentMessageStarted);
-    provider.emit(ProviderEvent::AgentMessageDelta {
-        content: text.to_owned(),
-    });
-    provider
-        .emit_and_wait_until_observed(ProviderEvent::AgentMessageCompleted)
-        .await;
+    write_agent_message(provider, text).await;
     read_until(
         descriptor,
         child_id,

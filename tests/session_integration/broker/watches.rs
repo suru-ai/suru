@@ -189,15 +189,7 @@ async fn a_watch_that_wakes_a_settled_brokered_subagent_records_its_outcome_in_t
             woke_agent: true,
         })
         .await;
-    for event in [
-        ProviderEvent::AgentMessageStarted,
-        ProviderEvent::AgentMessageDelta {
-            content: "The tests pass.".to_owned(),
-        },
-        ProviderEvent::AgentMessageCompleted,
-    ] {
-        child_provider.emit_and_wait_until_observed(event).await;
-    }
+    write_agent_message(&child_provider, "The tests pass.").await;
     let child = read_until(
         &descriptor,
         child_id,

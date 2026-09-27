@@ -15,20 +15,6 @@ use super::*;
 /// What the parent's Agent says once its Turn has settled.
 const LATE: &str = "The Researcher's survey is in: folding its findings into the plan.";
 
-/// Has `provider` write `text` as one whole Agent Message, with no Turn
-/// active to hold it.
-async fn say_late(provider: &ControlledProviderSession, text: &str) {
-    for event in [
-        ProviderEvent::AgentMessageStarted,
-        ProviderEvent::AgentMessageDelta {
-            content: text.to_owned(),
-        },
-        ProviderEvent::AgentMessageCompleted,
-    ] {
-        provider.emit_and_wait_until_observed(event).await;
-    }
-}
-
 /// A brokered Subagent on Codex working on its own Provider beneath the
 /// Claude Session `delegating` holds, whose own Turn has settled at its
 /// Provider's boundary.
@@ -98,7 +84,7 @@ async fn late_output_owed_by_the_parent_after_its_brokered_subagent_settles_begi
     .await;
 
     // The parent's Provider works on for the Subagent it heard settle.
-    say_late(&delegating.caller_provider, LATE).await;
+    write_agent_message(&delegating.caller_provider, LATE).await;
     let parent = read_until(
         &descriptor,
         delegating.caller,
@@ -161,7 +147,7 @@ async fn late_output_owed_by_the_parent_while_its_brokered_subagent_works_begins
         .working_since()
         .expect("the parent reads Working while its brokered Subagent works");
 
-    say_late(&delegating.caller_provider, LATE).await;
+    write_agent_message(&delegating.caller_provider, LATE).await;
     let parent = read_until(
         &descriptor,
         delegating.caller,
@@ -303,7 +289,7 @@ async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_its_b
 
     // The interrupted stream trails on, first while the Subagent stopped
     // with it has yet to reach its own boundary, and again once it has.
-    say_late(&delegating.caller_provider, "Trailing words, before.").await;
+    write_agent_message(&delegating.caller_provider, "Trailing words, before.").await;
     discarded(
         &after_a_watch_starts(
             &descriptor,
@@ -324,7 +310,7 @@ async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_its_b
         |snapshot| row_status(snapshot, stopped_id).0 == ActivityStatus::Interrupted,
     )
     .await;
-    say_late(&delegating.caller_provider, "Trailing words, after.").await;
+    write_agent_message(&delegating.caller_provider, "Trailing words, after.").await;
     discarded(
         &after_a_watch_starts(
             &descriptor,
@@ -378,7 +364,7 @@ async fn interrupting_a_parent_whose_brokered_subagents_outlive_its_turn_leaves_
     );
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    say_late(&delegating.caller_provider, "Trailing words, before.").await;
+    write_agent_message(&delegating.caller_provider, "Trailing words, before.").await;
     discarded(
         &after_a_watch_starts(
             &descriptor,
@@ -399,7 +385,7 @@ async fn interrupting_a_parent_whose_brokered_subagents_outlive_its_turn_leaves_
         |snapshot| row_status(snapshot, stopped_id).0 == ActivityStatus::Interrupted,
     )
     .await;
-    say_late(&delegating.caller_provider, "Trailing words, after.").await;
+    write_agent_message(&delegating.caller_provider, "Trailing words, after.").await;
     discarded(
         &after_a_watch_starts(
             &descriptor,
@@ -488,7 +474,7 @@ async fn an_interrupt_carried_down_leaves_a_brokered_subagents_trailing_output_n
     )
     .await;
 
-    say_late(&child_provider, "Trailing words, after.").await;
+    write_agent_message(&child_provider, "Trailing words, after.").await;
     discarded(
         &after_a_watch_starts(&descriptor, child_id, &child_provider, "tail the test log").await,
         &[TurnStatus::Interrupted],
@@ -545,7 +531,7 @@ async fn a_parents_stray_output_is_owed_nothing_for_the_brokered_subagent_its_br
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
-    say_late(&delegating.caller_provider, LATE).await;
+    write_agent_message(&delegating.caller_provider, LATE).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
@@ -569,7 +555,7 @@ async fn a_parents_stray_output_is_owed_nothing_for_the_brokered_subagent_its_br
 
     // What that Subagent delegated is owed to the Subagent's Provider, not
     // the parent's: stray output from the parent's lands nowhere.
-    say_late(&delegating.caller_provider, "Trailing words, after.").await;
+    write_agent_message(&delegating.caller_provider, "Trailing words, after.").await;
     discarded(
         &after_a_watch_starts(
             &descriptor,
