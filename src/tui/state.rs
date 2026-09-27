@@ -2345,19 +2345,29 @@ impl TuiState {
         self.subagent_picker.reconcile(&working);
     }
 
-    /// Whether the open Session's Provider offers stopping one working
-    /// Subagent on its own — the affordance the Subagent Picker's rows carry.
-    /// Read off the Session's own settled Selection, because the Subagents on
-    /// offer run under it whatever Selection edit may be pending.
-    pub(super) fn subagent_stop_offered(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|session| session.snapshot().session.agent_selection.as_ref())
-            .is_some_and(|selection| {
-                built_in_providers().iter().any(|provider| {
-                    provider.id == selection.provider && provider.supports_subagent_stop
+    /// Whether the working Subagent `subagent` may be stopped on its own from
+    /// its Subagent Picker row. A brokered one always may: Suru runs it on a
+    /// Provider actor of its own (ADR 0035). A native one may where the open
+    /// Session's Provider offers stopping one of its Subagents on its own —
+    /// read off the Session's own settled Selection, because the native
+    /// Subagents on offer run under it whatever Selection edit may be pending.
+    pub(super) fn subagent_stop_offered(&self, subagent: SessionId) -> bool {
+        let Some(snapshot) = self.session.as_ref().map(|session| session.snapshot()) else {
+            return false;
+        };
+        let brokered = working_subagents(snapshot)
+            .iter()
+            .any(|working| working.session_id == subagent && working.brokered);
+        brokered
+            || snapshot
+                .session
+                .agent_selection
+                .as_ref()
+                .is_some_and(|selection| {
+                    built_in_providers().iter().any(|provider| {
+                        provider.id == selection.provider && provider.supports_subagent_stop
+                    })
                 })
-            })
     }
 
     fn composer_down_is_inert(&self) -> bool {
@@ -6105,8 +6115,8 @@ impl Application {
                 // of it live, and the reader keeps their place among the
                 // Subagents still working. No confirmation — interrupting
                 // never asks.
-                if self.state.subagent_stop_offered()
-                    && let Some(session_id) = self.state.selected_working_subagent()
+                if let Some(session_id) = self.state.selected_working_subagent()
+                    && self.state.subagent_stop_offered(session_id)
                     && let Some(session) = self.state.reference_in_current_origin(session_id)
                 {
                     return self

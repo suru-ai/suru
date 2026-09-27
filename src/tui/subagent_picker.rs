@@ -14,8 +14,10 @@ use ratatui::layout::Position;
 
 use crate::protocol::{Activity, ActivityStatus, ModelId, SessionId, SessionSnapshot};
 
-/// One working Subagent on offer: the child Session its entry opens, and the
-/// name and description its row is drawn from.
+/// One working Subagent on offer: the child Session its entry opens, the name
+/// and description its row is drawn from, and whether Suru spawned it through
+/// the Broker, which lets it be stopped whatever the open Session's Provider
+/// allows.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WorkingSubagent<'a> {
     pub(super) session_id: SessionId,
@@ -24,6 +26,7 @@ pub(super) struct WorkingSubagent<'a> {
     pub(super) pending_approvals: usize,
     pub(super) description: &'a str,
     pub(super) model: Option<&'a ModelId>,
+    pub(super) brokered: bool,
 }
 
 /// The open Session's working Subagents, in the order they spawned — the tree
@@ -43,6 +46,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 description,
                 model,
                 session_id,
+                brokered,
                 ..
             } => Some(WorkingSubagent {
                 pending_questionnaires: snapshot.pending_questionnaires_in_subagent(*session_id),
@@ -51,6 +55,7 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
                 name,
                 description,
                 model: model.as_ref(),
+                brokered: *brokered,
             }),
             _ => None,
         })

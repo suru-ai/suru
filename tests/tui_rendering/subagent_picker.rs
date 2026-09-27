@@ -783,6 +783,62 @@ fn x_stays_inert_and_unadvertised_where_the_provider_offers_no_stop() {
 }
 
 #[test]
+fn x_stops_a_brokered_subagent_whatever_its_parents_provider_offers() {
+    let workspace = workspace_dir();
+    let (mut snapshot, spawned) = parent_with_working_subagents(
+        workspace.path(),
+        &[
+            ("Researcher", "Scout the workspace"),
+            ("Reviewer", "Check the plan on Codex"),
+        ],
+    );
+    select_provider(&mut snapshot, "copilot");
+    // Suru spawned the second through the Broker, on an actor of its own, so
+    // its stop never waits on what Copilot offers for Subagents of its own.
+    let Some(Activity::Subagent { brokered, .. }) =
+        snapshot.activities.iter_mut().find(|activity| {
+            matches!(activity, Activity::Subagent { session_id, .. } if *session_id == spawned[1].child_id)
+        })
+    else {
+        unreachable!()
+    };
+    *brokered = true;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Copilot Session with a native and a brokered Subagent working");
+
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Enter open · Esc close") && !text.contains("x stop"),
+        "on the native Subagent Copilot cannot stop, the footer names no stop: {text}"
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::Continue,
+        "and the key stays inert there"
+    );
+
+    press_key(&mut application, KeyCode::Down);
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("Enter open · x stop · Esc close"),
+        "on the brokered Subagent the footer offers the stop: {text}"
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::InterruptSession {
+            session: suru::protocol::SessionReference::new(
+                suru::protocol::Outlook::Local,
+                spawned[1].child_id,
+            )
+        },
+        "the stop interrupts the brokered Subagent's own Session, which Suru runs itself"
+    );
+}
+
+#[test]
 fn escape_interrupts_the_session_when_only_subagents_keep_it_working() {
     let workspace = workspace_dir();
     let (mut snapshot, _) =

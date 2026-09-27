@@ -2519,9 +2519,10 @@ fn render_subagent_picker(
         ));
     }
     if shows_footer {
-        // The stop key stands in the footer only where the Provider offers
-        // the stop, so the picker never names a key that would do nothing.
-        let footer = if state.subagent_stop_offered() {
+        // The stop key stands in the footer only while the entry the reader
+        // is on may be stopped, so the picker never names a key that would
+        // do nothing.
+        let footer = if selected.is_some_and(|selected| state.subagent_stop_offered(selected)) {
             "Enter open · x stop · Esc close"
         } else {
             "Enter open · Esc close"
