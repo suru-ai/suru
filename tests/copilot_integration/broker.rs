@@ -157,8 +157,7 @@ fn broker_token<'a>(params: &'a Value, method: &str, endpoint: &str) -> &'a str 
     assert_eq!(
         servers.keys().collect::<Vec<_>>(),
         ["suru"],
-        "{method} names the Broker and nothing else, leaving the user's own servers to the CLI's \
-         configuration: {params}"
+        "{method} names the Broker and nothing else: {params}"
     );
     let server = &servers["suru"];
     assert_eq!(server["type"], "http", "{method}: {server}");

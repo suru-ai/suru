@@ -7,8 +7,10 @@
 //! (docs/validation/0408-copilot-mcp-tool-timeout.md). So each of those requests names the Broker
 //! as the HTTP server `suru`, with the token that Session's start was handed as its
 //! `Authorization` header and a per-server `timeout` in place of the 180 seconds of silence Copilot
-//! otherwise allows a call; every Tool the Broker serves is offered. The list is Suru's own and
-//! names nothing else: the user's own servers still come from the CLI's configuration.
+//! otherwise allows a call; every Tool the Broker serves is offered. Suru's list names that one
+//! server and nothing else. Whether Copilot merges it with the servers its own configuration
+//! discovers, or lets it replace them, no capture has established; the live smoke (#421) is to
+//! confirm it.
 //!
 //! Copilot asks Suru's permission handler before every MCP call, and the handler approves the
 //! Broker's own ([`super::approval`]); the projection absorbs the Broker's tool executions, which
