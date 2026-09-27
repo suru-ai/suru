@@ -47,15 +47,16 @@ pub(crate) enum InterruptTarget {
     Subagents,
     /// The Session's conversation rides the Provider actor of an ancestor, as
     /// a native Subagent's does, so the interrupt stops that one Subagent
-    /// through the actor `owner` owns. With no owner — a lineage that left
-    /// the store — no actor can be running any of it.
-    Subagent { owner: Option<SessionId> },
+    /// through the actor its nearest actor-owning ancestor owns. A lineage
+    /// that left the store reaches no actor, and no actor can be running any
+    /// of it.
+    Subagent,
     /// Nothing is Working, but the Session is Monitoring: the interrupt asks
     /// the Provider to stop the Watches live in its subtree, and none above
-    /// it — through the actor `owner` owns, which is the Session itself where
-    /// it owns one. No Turn settles and no Prompt is withdrawn; the Session
-    /// goes idle as they settle.
-    Watches { owner: Option<SessionId> },
+    /// it — through the actor holding its conversation, which is its own
+    /// where it owns one. No Turn settles and no Prompt is withdrawn; the
+    /// Session goes idle as they settle.
+    Watches,
     /// The Session was Working only because it owed a Turn to a Prompt it had
     /// not delivered, so the interrupt withdrew that Prompt where it stood.
     /// The Prompt is already Cancelled by the time this is returned: the
@@ -71,12 +72,8 @@ pub(crate) enum InterruptTarget {
 enum InterruptReading {
     Turn(Box<Turn>),
     Subagents,
-    Subagent {
-        owner: Option<SessionId>,
-    },
-    Watches {
-        owner: Option<SessionId>,
-    },
+    Subagent,
+    Watches,
     /// No work is under way: the Session is Working only because it owes a
     /// Turn to this Prompt, which it has admitted and not delivered.
     UndeliveredPrompt(Box<Prompt>),
@@ -376,12 +373,8 @@ impl SessionStore {
         let prompt = match state.interrupt_reading(session_id)? {
             InterruptReading::Turn(turn) => return Ok(InterruptTarget::Turn(turn)),
             InterruptReading::Subagents => return Ok(InterruptTarget::Subagents),
-            InterruptReading::Subagent { owner } => {
-                return Ok(InterruptTarget::Subagent { owner });
-            }
-            InterruptReading::Watches { owner } => {
-                return Ok(InterruptTarget::Watches { owner });
-            }
+            InterruptReading::Subagent => return Ok(InterruptTarget::Subagent),
+            InterruptReading::Watches => return Ok(InterruptTarget::Watches),
             InterruptReading::UndeliveredPrompt(prompt) => prompt,
         };
         let prompt_id = prompt.id;
@@ -412,8 +405,7 @@ impl SessionStoreState {
             .sessions
             .get(&session_id)
             .ok_or(InterruptSessionError::SessionNotFound)?;
-        let owner = self.actor_owner_of(session_id);
-        if owner != Some(session_id) {
+        if self.actor_owner_of(session_id) != Some(session_id) {
             // The Session's conversation rides an ancestor's Provider actor,
             // as a native Subagent's does, so what the interrupt reaches is
             // that one Subagent, through that actor. A Subagent whose own
@@ -424,9 +416,9 @@ impl SessionStoreState {
             // to stop.
             let session = &record.snapshot.session;
             if session.working_since.is_none() && session.monitoring_since.is_some() {
-                return Ok(InterruptReading::Watches { owner });
+                return Ok(InterruptReading::Watches);
             }
-            return Ok(InterruptReading::Subagent { owner });
+            return Ok(InterruptReading::Subagent);
         }
         // From here the Session owns the Provider actor its work runs on, so
         // whatever the interrupt stops, it stops through that actor.
@@ -465,7 +457,7 @@ impl SessionStoreState {
         if record.snapshot.session.monitoring_since.is_some() {
             // Only Watches are left, and nothing a Turn owns: stopping them
             // is the whole interrupt (ADR 0030).
-            return Ok(InterruptReading::Watches { owner });
+            return Ok(InterruptReading::Watches);
         }
         Err(InterruptSessionError::NothingToInterrupt)
     }

@@ -1300,7 +1300,7 @@ impl ProviderOrchestrator {
     /// Returns the Provider actor `session_id` owns, spawning it on `runtime`
     /// when none runs. Only a Session that owns its actor is given one here:
     /// a Session riding an ancestor's actor reaches it through
-    /// [`Self::schedule_on_actor_owner`] instead.
+    /// [`Self::owner_commands`] instead.
     fn get_or_spawn_actor_commands(
         &self,
         session_id: SessionId,
@@ -1396,19 +1396,18 @@ impl ProviderOrchestrator {
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
-    /// Schedules `command` on the Provider actor that holds `session_id`'s
-    /// conversation: the Session's own, or that of its nearest ancestor that
-    /// owns one, as a native Subagent's conversation rides its spawner's.
-    fn schedule_on_actor_owner(
+    /// The command channel of the Provider actor that holds `session_id`'s
+    /// conversation, if one runs: the Session's own, or that of its nearest
+    /// ancestor that owns one, as a native Subagent's conversation rides its
+    /// spawner's. Every Decision, Answer, Approval Posture and interrupt
+    /// reaches its Provider through this; a Prompt and its steers go straight
+    /// to the Session's own actor, since only a Session that owns one is
+    /// offered a Prompt.
+    fn owner_commands(
         &self,
         session_id: SessionId,
-        command: ProviderCommand,
-    ) -> Result<()> {
-        let owner = self
-            .sessions
-            .actor_owner(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
-        self.schedule(owner, command)
+    ) -> Option<mpsc::UnboundedSender<ProviderCommand>> {
+        self.actor_commands(self.sessions.actor_owner(session_id)?)
     }
 
     /// The command channel of the Provider actor `owner` owns, if one runs.
@@ -1428,16 +1427,18 @@ impl ProviderOrchestrator {
         submission: crate::protocol::QuestionnaireSubmission,
     ) -> Result<(), String> {
         let (response, received) = oneshot::channel();
-        self.schedule_on_actor_owner(
-            session_id,
-            ProviderCommand::SubmitQuestionnaire {
-                target: session_id,
-                id,
-                submission,
-                response,
-            },
-        )
-        .map_err(|_| "Questionnaire is unavailable".to_owned())?;
+        self.owner_commands(session_id)
+            .and_then(|actor| {
+                actor
+                    .send(ProviderCommand::SubmitQuestionnaire {
+                        target: session_id,
+                        id,
+                        submission,
+                        response,
+                    })
+                    .ok()
+            })
+            .ok_or_else(|| "Questionnaire is unavailable".to_owned())?;
         received
             .await
             .map_err(|_| "Questionnaire delivery could not be confirmed".to_owned())?
@@ -1450,16 +1451,18 @@ impl ProviderOrchestrator {
         decision: crate::protocol::Decision,
     ) -> Result<(), String> {
         let (response, received) = oneshot::channel();
-        self.schedule_on_actor_owner(
-            session_id,
-            ProviderCommand::SubmitDecision {
-                target: session_id,
-                id,
-                decision,
-                response,
-            },
-        )
-        .map_err(|_| "Approval is unavailable".to_owned())?;
+        self.owner_commands(session_id)
+            .and_then(|actor| {
+                actor
+                    .send(ProviderCommand::SubmitDecision {
+                        target: session_id,
+                        id,
+                        decision,
+                        response,
+                    })
+                    .ok()
+            })
+            .ok_or_else(|| "Approval is unavailable".to_owned())?;
         received
             .await
             .map_err(|_| "Decision delivery could not be confirmed".to_owned())?
@@ -1469,11 +1472,7 @@ impl ProviderOrchestrator {
         &self,
         update: ApprovalPostureUpdate,
     ) -> Result<ProviderPostureApplication, String> {
-        let commands = self
-            .sessions
-            .actor_owner(update.session_id)
-            .and_then(|owner| self.actor_commands(owner));
-        let Some(commands) = commands else {
+        let Some(commands) = self.owner_commands(update.session_id) else {
             self.sessions.mark_approval_posture_application(
                 update,
                 crate::protocol::ApprovalPostureApplication::Applied,
@@ -1514,12 +1513,11 @@ impl ProviderOrchestrator {
         &self,
         session_id: SessionId,
     ) -> Result<InterruptOutcome, InterruptSessionError> {
-        let owner_commands =
-            |owner: Option<SessionId>| owner.and_then(|owner| self.actor_commands(owner));
-        let stopped: Result<(), InterruptSessionError> = match self
-            .sessions
-            .interrupt_or_withdraw(session_id)?
-        {
+        let target = self.sessions.interrupt_or_withdraw(session_id)?;
+        // Whatever the reading asks for is asked of the actor holding the
+        // Session's conversation; the reading decides only what to ask.
+        let actor = self.owner_commands(session_id);
+        let stopped: Result<(), InterruptSessionError> = match target {
             // The startup this Prompt set going is left to abandon itself:
             // the actor re-reads the Prompt before it delivers one, and a
             // Cancelled Prompt is one it declines to deliver. A Provider
@@ -1529,7 +1527,7 @@ impl ProviderOrchestrator {
                 return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
             }
             InterruptTarget::Turn(turn) => {
-                let actor = self.actor_commands(session_id).ok_or_else(|| {
+                let actor = actor.ok_or_else(|| {
                     self.fail_unavailable_interruption(
                         session_id,
                         turn.id,
@@ -1557,17 +1555,15 @@ impl ProviderOrchestrator {
                 })?
             }
             InterruptTarget::Subagents => {
-                ask_actor_or_find_nothing_running(self.actor_commands(session_id), |response| {
+                ask_actor_or_find_nothing_running(actor, |response| {
                     ProviderCommand::InterruptSession { response }
                 })
                 .await
             }
-            InterruptTarget::Subagent { owner } => {
-                ask_actor_or_find_nothing_running(owner_commands(owner), |response| {
-                    ProviderCommand::StopSubagent {
-                        target: session_id,
-                        response,
-                    }
+            InterruptTarget::Subagent => {
+                ask_actor_or_find_nothing_running(actor, |response| ProviderCommand::StopSubagent {
+                    target: session_id,
+                    response,
                 })
                 .await
             }
@@ -1576,12 +1572,10 @@ impl ProviderOrchestrator {
             // withdraws a Prompt. A native Subagent's Watches run over the
             // connection of the actor its conversation rides, and only its
             // own subtree's are stopped.
-            InterruptTarget::Watches { owner } => {
-                ask_actor_or_find_nothing_running(owner_commands(owner), |response| {
-                    ProviderCommand::StopWatches {
-                        target: session_id,
-                        response,
-                    }
+            InterruptTarget::Watches => {
+                ask_actor_or_find_nothing_running(actor, |response| ProviderCommand::StopWatches {
+                    target: session_id,
+                    response,
                 })
                 .await
             }
