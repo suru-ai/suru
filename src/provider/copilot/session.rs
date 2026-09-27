@@ -579,30 +579,38 @@ impl ProviderSession for CopilotSession {
                 .begin_turn()?;
             let started = async {
                 self.apply_selection(&input.selection).await?;
-                let head = input.input.report_text();
                 // A Turn the Subagent Reports alone begin — the Continuation
                 // a Report wakes — is sent in immediate mode, so a loop
                 // Copilot is running on its own takes the Reports at once
                 // rather than after it stops (ADR 0035). A Prompt keeps the
                 // default delivery it always had, the Reports at its head.
-                let message = match input.input.prompt {
-                    Some(prompt) => {
-                        let prompt = self
-                            .skills
-                            .expand(
-                                &self.handle,
-                                &self.execution_directory,
-                                &self.native,
-                                crate::protocol::SkillPromptDelivery::Initial,
-                                prompt,
-                            )
-                            .await?;
-                        MessageOptions::new(headed_text(head, prompt))
-                    }
-                    None => MessageOptions::new(head.ok_or_else(|| {
-                        copilot_error("Copilot was handed no input to begin a Turn with")
-                    })?)
-                    .with_mode(DeliveryMode::Immediate),
+                let reports_alone = input.input.prompt.is_none();
+                let text = input
+                    .input
+                    .lower(
+                        "Copilot",
+                        |reports| reports,
+                        async |prompt, head| {
+                            Ok(headed_text(
+                                head,
+                                self.skills
+                                    .expand(
+                                        &self.handle,
+                                        &self.execution_directory,
+                                        &self.native,
+                                        crate::protocol::SkillPromptDelivery::Initial,
+                                        prompt,
+                                    )
+                                    .await?,
+                            ))
+                        },
+                    )
+                    .await?;
+                let message = MessageOptions::new(text);
+                let message = if reports_alone {
+                    message.with_mode(DeliveryMode::Immediate)
+                } else {
+                    message
                 };
                 self.correlation
                     .lock()
@@ -630,24 +638,27 @@ impl ProviderSession for CopilotSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.require_running_turn("steer")?;
-            let head = input.input.report_text();
-            let prompt = match input.input.prompt {
-                Some(prompt) => headed_text(
-                    head,
-                    self.skills
-                        .expand(
-                            &self.handle,
-                            &self.execution_directory,
-                            &self.native,
-                            crate::protocol::SkillPromptDelivery::Steer,
-                            prompt,
-                        )
-                        .await?,
-                ),
-                None => {
-                    head.ok_or_else(|| copilot_error("Copilot was handed no input to steer with"))?
-                }
-            };
+            let prompt = input
+                .input
+                .lower(
+                    "Copilot",
+                    |reports| reports,
+                    async |prompt, head| {
+                        Ok(headed_text(
+                            head,
+                            self.skills
+                                .expand(
+                                    &self.handle,
+                                    &self.execution_directory,
+                                    &self.native,
+                                    crate::protocol::SkillPromptDelivery::Steer,
+                                    prompt,
+                                )
+                                .await?,
+                        ))
+                    },
+                )
+                .await?;
             // Immediate delivery injects the Prompt into the loop already running, where Copilot's
             // default would hold it back and run it as a Turn of its own once this one stopped.
             //

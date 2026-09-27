@@ -478,13 +478,14 @@ impl ProviderSession for ClaudeSession {
             // Whatever the Turn begins with — a Prompt, a Delegation, or the
             // Subagent Reports that wake a Continuation — reaches the CLI as
             // one user message on stdin, the Reports at its head.
-            let head = input.input.report_text();
-            let prompt = match input.input.prompt {
-                Some(prompt) => self.skills.lower(&self.execution_directory, prompt, head)?,
-                None => head.ok_or_else(|| {
-                    claude_error("Claude was handed no input to begin a Turn with")
-                })?,
-            };
+            let prompt = input
+                .input
+                .lower(
+                    "Claude",
+                    |reports| reports,
+                    async |prompt, head| self.skills.lower(&self.execution_directory, prompt, head),
+                )
+                .await?;
             let mut slot = self.child.lock().await;
             let permission_mode = match input.approval_posture.as_ref() {
                 Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => {
@@ -586,18 +587,17 @@ impl ProviderSession for ClaudeSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn steering failed";
-            let head = input.input.report_text();
-            let text = match input.input.prompt {
-                Some(prompt) if !prompt.skill_invocations.is_empty() => {
-                    return Err(claude_error(
-                        "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
-                    ));
-                }
-                Some(prompt) => headed_text(head, prompt.text),
-                None => {
-                    head.ok_or_else(|| claude_error("Claude was handed no input to steer with"))?
-                }
-            };
+            let text = input
+                .input
+                .lower("Claude", |reports| reports, async |prompt, head| {
+                    if !prompt.skill_invocations.is_empty() {
+                        return Err(claude_error(
+                            "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
+                        ));
+                    }
+                    Ok(headed_text(head, prompt.text))
+                })
+                .await?;
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a

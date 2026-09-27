@@ -643,6 +643,29 @@ impl ProviderInput {
         self
     }
 
+    /// Lowers this input to what its harness sends, in the one order every
+    /// harness keeps: the Reports' text at the head, then the Prompt — or
+    /// Delegation. `headed_prompt` is handed the Prompt and the Reports' text
+    /// to stand ahead of it, and places that text ahead of the Prompt's own
+    /// words as its transport allows (see [`headed_text`]); input with
+    /// Reports and no Prompt is `reports_alone`'s to lower from their text.
+    /// `provider` names the harness in the failure for input holding
+    /// neither, which Suru never hands a Provider.
+    pub(crate) async fn lower<T>(
+        self,
+        provider: &str,
+        reports_alone: impl FnOnce(String) -> T,
+        headed_prompt: impl AsyncFnOnce(ProviderPrompt, Option<String>) -> Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let head = self.report_text();
+        match self.prompt {
+            Some(prompt) => headed_prompt(prompt, head).await,
+            None => head.map(reports_alone).ok_or_else(|| {
+                ProviderError::new(format!("{provider} was handed no input for its Turn"))
+            }),
+        }
+    }
+
     /// The Reports as the Agent reads them — each in the one text Suru
     /// renders it as, a blank line apart — or `None` for input carrying none.
     pub fn report_text(&self) -> Option<String> {
@@ -1508,6 +1531,54 @@ pub(crate) async fn wait_for_shutdown(signal: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, sync::Mutex};
+
+    #[tokio::test]
+    async fn every_harness_lowers_its_input_reports_first_whatever_it_carries() {
+        use super::{ProviderInput, ProviderPrompt, SubagentReport, SubagentReportOutcome};
+        let report = SubagentReport::new(
+            crate::protocol::SessionId::new(),
+            "Researcher",
+            SubagentReportOutcome::Completed,
+            Some(1_000),
+            Some("Done."),
+        );
+        let lower = async |input: ProviderInput| {
+            input
+                .lower(
+                    "Fixture",
+                    |reports| format!("alone: {reports}"),
+                    async |prompt, head| Ok(format!("{head:?} then {}", prompt.text)),
+                )
+                .await
+        };
+
+        assert_eq!(
+            lower(ProviderInput::from_reports(vec![report.clone()]))
+                .await
+                .expect("Reports alone lower"),
+            format!("alone: {report}")
+        );
+        assert_eq!(
+            lower(
+                ProviderInput::from_prompt(ProviderPrompt::plain("Go."))
+                    .headed_by(vec![report.clone()])
+            )
+            .await
+            .expect("a Prompt headed by Reports lowers"),
+            format!("{:?} then Go.", Some(report.to_string())),
+            "the Prompt's lowering is handed the Reports to stand at its head"
+        );
+        assert_eq!(
+            lower(ProviderInput::from_prompt(ProviderPrompt::plain("Go.")))
+                .await
+                .expect("a Prompt alone lowers"),
+            "None then Go."
+        );
+        let neither = lower(ProviderInput::from_reports(Vec::new()))
+            .await
+            .expect_err("input holding neither is refused");
+        assert!(neither.to_string().contains("Fixture was handed no input"));
+    }
 
     #[cfg(windows)]
     use super::executable_shadowed_by_windows_app_alias;

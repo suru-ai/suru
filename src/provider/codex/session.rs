@@ -710,7 +710,8 @@ impl ProviderSession for CodexSession {
                 &self.context.skills,
                 &self.context.execution_directory,
                 input.input,
-            )?;
+            )
+            .await?;
             let turn_id = self
                 .correlation
                 .lock()
@@ -887,22 +888,26 @@ struct NativeTurnStartRequest {
 /// A Turn's input as the items Codex takes on `turn/start` or `turn/steer`: the
 /// Subagent Reports it opens with as one text item at the head, then the
 /// Prompt's text and each Skill it invokes.
-fn lower_input(
+async fn lower_input(
     skills: &CodexSkills,
     execution_directory: &std::path::Path,
     input: ProviderInput,
 ) -> Result<Vec<super::wire::UserInput>, ProviderError> {
-    let mut lowered = Vec::new();
-    if let Some(text) = input.report_text() {
-        lowered.push(super::wire::UserInput::Text { text });
-    }
-    if let Some(prompt) = input.prompt {
-        lowered.extend(skills.lower(execution_directory, prompt)?);
-    }
-    if lowered.is_empty() {
-        return Err(codex_error("Codex was handed no input for its Turn"));
-    }
-    Ok(lowered)
+    use super::wire::UserInput;
+    input
+        .lower(
+            "Codex",
+            |reports| vec![UserInput::Text { text: reports }],
+            async |prompt, head| {
+                let mut lowered = head
+                    .map(|text| UserInput::Text { text })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                lowered.extend(skills.lower(execution_directory, prompt)?);
+                Ok(lowered)
+            },
+        )
+        .await
 }
 
 async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), ProviderError> {
@@ -920,7 +925,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
     } = request;
     let started = async {
         let options = lower_turn_options(&selection)?;
-        let native_input = lower_input(&skills, &execution_directory, input)?;
+        let native_input = lower_input(&skills, &execution_directory, input).await?;
         let result = transport
             .request(
                 "turn/start",
