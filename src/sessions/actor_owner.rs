@@ -59,21 +59,9 @@ impl SessionStoreState {
     /// their conversations: nothing of them is left to reach, and they have
     /// no owner whose Approval Posture to inherit.
     pub(super) fn actor_owner_of(&self, session_id: SessionId) -> Option<SessionId> {
-        let mut current = session_id;
-        // A line longer than the store holds Sessions has looped back on
-        // itself, which bounds the walk without remembering where it has been.
-        for _ in 0..=self.sessions.len() {
-            let record = self.sessions.get(&current)?;
-            if record.owns_provider_actor() {
-                return Some(current);
-            }
-            current = record
-                .snapshot
-                .session
-                .parent
-                .expect("a Session that owns no Provider actor is a Subagent's");
-        }
-        None
+        self.ancestors(session_id)
+            .find(|(_, record)| record.owns_provider_actor())
+            .map(|(owner, _)| owner)
     }
 
     /// `session_id` and every Session below it whose conversation rides the
@@ -268,6 +256,35 @@ mod tests {
             vec![orphan, below_orphan, cycle, other, own_parent],
         )
         .await;
+
+        // The walk up each lineage ends however that lineage does.
+        {
+            let state = store.state.lock().unwrap();
+            let walk = |id| {
+                state
+                    .ancestors(id)
+                    .map(|(ancestor, _)| ancestor)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                walk(below_orphan_id),
+                [below_orphan_id, orphan_id],
+                "where the line reaches a Session the store does not hold"
+            );
+            assert_eq!(
+                walk(SessionId::new()),
+                [],
+                "at once, from one it does not hold"
+            );
+            let looped = walk(cycle_id);
+            assert_eq!(
+                looped.len(),
+                5,
+                "and a line that loops, once it has yielded as many Sessions as the store holds"
+            );
+            assert!(looped.iter().all(|id| [cycle_id, other_id].contains(id)));
+            assert_eq!(walk(own_parent_id), [own_parent_id; 5]);
+        }
 
         assert_eq!(
             store.actor_owner(orphan_id),

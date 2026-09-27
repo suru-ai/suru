@@ -451,33 +451,18 @@ impl SessionStoreState {
     /// A brokered Subagent is its tree's to reach only from above: not from
     /// itself, nor a sibling, nor another tree. A Session whose history is
     /// still unread lies in no tree the caller's hydrated history reaches,
-    /// since a tree hydrates whole.
+    /// since a tree hydrates whole, and a caller the store does not hold has
+    /// nothing beneath it.
     pub(super) fn is_brokered_beneath(&self, subagent: SessionId, caller: SessionId) -> bool {
-        if self.is_deferred(subagent)
-            || !self
+        !self.is_deferred(subagent)
+            && self
                 .sessions
                 .get(&subagent)
                 .is_some_and(|record| record.is_brokered_subagent())
-        {
-            return false;
-        }
-        let mut current = subagent;
-        // A line longer than the store holds Sessions has looped back on
-        // itself, which bounds the walk without remembering where it has been.
-        for _ in 0..self.sessions.len() {
-            let Some(spawner) = self
-                .sessions
-                .get(&current)
-                .and_then(|record| record.snapshot.session.parent)
-            else {
-                return false;
-            };
-            if spawner == caller {
-                return true;
-            }
-            current = spawner;
-        }
-        false
+            && self
+                .ancestors(subagent)
+                .skip(1)
+                .any(|(spawner, _)| spawner == caller)
     }
 
     /// How the brokered Subagent `subagent`, which the caller has found held,

@@ -186,17 +186,13 @@ impl SessionStoreState {
     /// `None` when the Session is not held or its line up to a top-level
     /// Session is broken.
     fn top_level_of(&self, session_id: SessionId) -> Option<SessionId> {
-        let mut current = session_id;
-        let mut visited = HashSet::new();
-        loop {
-            if !visited.insert(current) {
-                return None;
-            }
-            match self.sessions.get(&current)?.snapshot.session.parent {
-                None => return Some(current),
-                Some(parent) => current = parent,
-            }
-        }
+        let (top_level, record) = self.ancestors(session_id).last()?;
+        record
+            .snapshot
+            .session
+            .parent
+            .is_none()
+            .then_some(top_level)
     }
 
     /// Reads the tree `top_level` heads, depth-first in spawn order.

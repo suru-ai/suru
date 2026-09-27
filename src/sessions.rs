@@ -640,4 +640,42 @@ impl SessionStoreState {
         self.last_timestamp = Some(timestamp);
         timestamp
     }
+
+    /// `session_id` and each Session up the line that spawned it, nearest
+    /// first, for as long as the store holds them: every walk up a tree reads
+    /// the tree through this. The walk ends at a top-level Session, whose
+    /// line ends there, or where the line reaches a Session the store does
+    /// not hold — `session_id` itself included — as restoration's orphans do.
+    /// A line that loops back on itself, as a restored cyclic component's
+    /// does, ends once it has yielded as many Sessions as the store holds,
+    /// which no line that ends can outrun, so the walk always ends without
+    /// remembering where it has been. A caller that must tell a line that
+    /// reached its top from one that broke off reads the parent of the last
+    /// Session yielded.
+    fn ancestors(&self, session_id: SessionId) -> Ancestors<'_> {
+        Ancestors {
+            sessions: &self.sessions,
+            next: Some(session_id),
+            remaining: self.sessions.len(),
+        }
+    }
+}
+
+/// The walk [`SessionStoreState::ancestors`] takes.
+struct Ancestors<'a> {
+    sessions: &'a HashMap<SessionId, SessionRecord>,
+    next: Option<SessionId>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = (SessionId, &'a SessionRecord);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.remaining = self.remaining.checked_sub(1)?;
+        let session_id = self.next.take()?;
+        let record = self.sessions.get(&session_id)?;
+        self.next = record.snapshot.session.parent;
+        Some((session_id, record))
+    }
 }
