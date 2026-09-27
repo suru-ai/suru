@@ -364,6 +364,16 @@ impl SessionStoreState {
             let Some(holder) = delegating_session(snapshot, turn_id) else {
                 continue;
             };
+            if turn.status == TurnStatus::Interrupted {
+                // Whether the stretch was stopped on its own or from above
+                // decides whether its delegating Agent hears of it.
+                tracing::debug!(
+                    %session_id,
+                    %turn_id,
+                    stopped_by_ancestor = self.stopped_by_ancestor(session_id, turn_id),
+                    "a brokered Subagent's stretch of work was stopped"
+                );
+            }
             let row_changes = self.row_changes(holder, session_id, turn, repaired);
             if row_changes.is_empty() {
                 continue;

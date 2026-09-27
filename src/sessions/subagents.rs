@@ -499,6 +499,7 @@ impl SessionStoreState {
                 subagent_identity,
                 brokered,
                 watches: HashMap::new(),
+                stopped_by_ancestor: None,
             },
         );
         // The child begins working the moment it exists, which the listed

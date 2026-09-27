@@ -436,6 +436,7 @@ pub(super) fn restored_record(
         viewed_operations: Default::default(),
         selection_retry_prompt: None,
         watches: Default::default(),
+        stopped_by_ancestor: None,
     }
 }
 

@@ -524,6 +524,7 @@ impl SessionStore {
                 // A top-level Session owns its actor by having no parent.
                 brokered: false,
                 watches: HashMap::new(),
+                stopped_by_ancestor: None,
             },
         );
         self.storage.created(PersistedSession::created(
