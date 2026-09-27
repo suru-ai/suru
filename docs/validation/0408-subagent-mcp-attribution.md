@@ -107,16 +107,20 @@ calls carried the parent's token. Every call's `_meta` also had `callId`,
   `_meta.threadId`, as ADR 0034 and ADR 0035 expect. `sessionId` names the root
   and must not be used for this. Fallback: the token's Session, when `threadId`
   names no Session the Broker knows.
-- **Claude: attribution can improve to the exact Subagent.** A call's
-  `_meta["claudecode/toolUseId"]` names a `tool_use` that Suru's Claude
-  projection has already read with its `parent_tool_use_id`, and so already
-  places in a native Subagent's Session or the root's. This is a join on
-  identity, not the timing-and-arguments correlation ADR 0035 refused. The
-  `tool_use` reached stdout 1–5 ms before its call in every run, but the two
-  arrive on different channels, so the Broker waits, briefly and with a bound,
-  for the projection to have read the id. Fallback: the token's Session, when
-  the key is absent or its id is not seen within the bound. The key is
-  vendor-prefixed and undocumented, so its absence is expected someday.
+- **Claude: attribution stays at the token's Session.** No header tells a
+  Subagent's call apart. The Broker therefore attributes a native Claude
+  Subagent's spawn to the Session its token names, as spec #407 and ADR 0035
+  decide. Fallback: none needed; the token's Session is the path.
+
+  The capture does leave a candidate for a later spec.
+  `_meta["claudecode/toolUseId"]` names the calling `tool_use`, which Suru's
+  Claude projection already places under a native Subagent through
+  `parent_tool_use_id`. Joining the two would attribute by identity rather than
+  by timing and arguments. But the join runs through the projection's tool_use
+  stream, which spec #407 keeps out of scope. It would also depend on the
+  projection having read the id when the call arrives: the `tool_use` reached
+  stdout 1–5 ms before its call in every run, but over another channel, so
+  nothing guarantees that order. The key is vendor-prefixed and undocumented.
 - **Copilot: attribution stays at the token's Session.** Nothing on the call
   names the Subagent, and pairing it with the permission request or
   `tool.execution_start` would be the correlation ADR 0035 refused. Fallback:
