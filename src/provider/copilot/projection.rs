@@ -39,7 +39,8 @@
 //! requesting no tools, with the next message it consumes and the loop's idle as backstops. The
 //! `agent_idle` notification Copilot sometimes raises for it settles nothing. The send itself is
 //! no work of the sender's, so its `write_agent` execution projects nothing in the sender's
-//! Transcript ([`WRITE_AGENT_TOOL`]).
+//! Transcript ([`WRITE_AGENT_TOOL`]). Nor does a call to one of the Broker's Tools, which the
+//! Broker's own rows answer for ([`is_broker_call`]).
 //!
 //! A Suru Turn spans one stretch of Copilot's agentic loop: it opens when the Prompt is delivered
 //! and settles on the session-level idle signal, not on the per-model-call `assistant.turn_end`.
@@ -93,6 +94,7 @@ use super::{
     event_drain::EventDrainCheckpoint, pricing::CopilotPricing, session::until_crash,
     skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
 };
+use crate::broker::BROKER_SERVER_NAME;
 use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
 use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
@@ -285,6 +287,14 @@ const SPAWN_TOOL: &str = "task";
 /// resume's row, so the execution projects nothing, whatever it came to.
 const WRITE_AGENT_TOOL: &str = "write_agent";
 
+/// Whether `started` is a call to one of the Broker's Tools, which Copilot reports as an execution
+/// on the MCP server Suru handed the Session the Broker as. Its execution is not work of its own
+/// either: the Broker adds whatever row stands for what the call did, so the execution projects
+/// nothing, whatever it came to — as a [`WRITE_AGENT_TOOL`] send projects nothing.
+fn is_broker_call(started: &ToolExecutionStartData) -> bool {
+    started.mcp_server_name.as_deref() == Some(BROKER_SERVER_NAME)
+}
+
 /// A Command Copilot is still running, and the output it has streamed so far — against which the
 /// completed execution's repeat of it is reconciled.
 #[derive(Default)]
@@ -299,7 +309,8 @@ struct ActiveCommand {
     /// argument — kept for the `subagent.started` that opens it, which names the spawning tool
     /// call but never carries the prompt itself.
     spawn_prompt: Option<String>,
-    /// Whether the execution is a [`WRITE_AGENT_TOOL`] send, which projects nothing at all.
+    /// Whether the execution is a [`WRITE_AGENT_TOOL`] send or a Broker call, which project
+    /// nothing at all.
     absorbed: bool,
 }
 
@@ -1666,7 +1677,7 @@ fn project_command_started(
         // its withheld header.
         return Vec::new();
     }
-    if started.tool_name == WRITE_AGENT_TOOL {
+    if started.tool_name == WRITE_AGENT_TOOL || is_broker_call(started) {
         streams.commands.insert(
             started.tool_call_id.clone(),
             ActiveCommand {
@@ -3686,6 +3697,85 @@ mod tests {
             )
             .is_empty(),
             "the main loop's own messages are the user's Prompts, which Suru already holds"
+        );
+    }
+
+    /// The Broker's Tools reach Copilot as executions on the MCP server `suru`. None of it is work
+    /// a Transcript presents — the Broker adds whatever row stands for what a call did — so the
+    /// execution projects nothing in the conversation that made it, the main agent's or a native
+    /// Subagent's, while a call to any other MCP server stands as a Command as ever.
+    #[test]
+    fn a_broker_call_adds_nothing_to_the_transcript_of_the_agent_that_made_it() {
+        let mut correlation = with_subagent();
+        let broker_call = |tool_call_id: &str| {
+            json!({
+                "toolCallId": tool_call_id,
+                "toolName": "suru-spawn_subagent",
+                "mcpServerName": "suru",
+                "mcpToolName": "spawn_subagent",
+                "arguments": { "provider": "codex", "model": "gpt-5.5", "prompt": "Map it." },
+            })
+        };
+        for (event_type, data) in [
+            ("tool.execution_start", broker_call("t-broker")),
+            (
+                "tool.execution_partial_result",
+                json!({ "toolCallId": "t-broker", "partialOutput": "Spawning" }),
+            ),
+            (
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t-broker",
+                    "success": true,
+                    "result": { "content": "Spawned the Subagent." },
+                }),
+            ),
+        ] {
+            assert!(
+                project(&mut correlation, event_type, data).is_empty(),
+                "the main agent's Broker call projects nothing at `{event_type}`"
+            );
+        }
+        for event in [
+            agent_event(
+                "agent-1",
+                "tool.execution_start",
+                broker_call("t-sub-broker"),
+            ),
+            agent_event(
+                "agent-1",
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t-sub-broker",
+                    "success": false,
+                    "error": { "message": "The spawn was refused." },
+                }),
+            ),
+        ] {
+            assert!(
+                project_attributed(&mut correlation, event).is_empty(),
+                "a Subagent's Broker call projects nothing in its own conversation either"
+            );
+        }
+
+        assert_eq!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "t-linear",
+                    "toolName": "linear-list_issues",
+                    "mcpServerName": "linear",
+                    "mcpToolName": "list_issues",
+                    "arguments": {},
+                }),
+            ),
+            [ProviderEvent::CommandStarted {
+                activity_id: ProviderActivityId::new("command:t-linear"),
+                command: "linear/list_issues".to_owned(),
+                cwd: None,
+            }],
+            "another MCP server's call is still a Command"
         );
     }
 

@@ -328,6 +328,22 @@ async fn an_errand_runs_at_copilots_declared_selection_carrying_no_tools_and_sto
         serde_json::json!(false),
         "an Errand takes the least-persistent mode the CLI offers"
     );
+    assert!(
+        params.get("mcpServers").is_none(),
+        "an Errand is handed no MCP server, the Broker's included: {params}"
+    );
+    let conversation = request_where(
+        &copilot,
+        "the Session's own Copilot Session is created",
+        |request| {
+            request["method"] == "session.create" && request["params"]["model"] != ERRAND_MODEL
+        },
+    )
+    .await;
+    assert!(
+        conversation["params"]["mcpServers"]["suru"].is_object(),
+        "while the Session's own Copilot Session beside it is handed the Broker: {conversation}"
+    );
     assert_eq!(
         params["workingDirectory"].as_str(),
         suru::paths::canonical(workspace.path())

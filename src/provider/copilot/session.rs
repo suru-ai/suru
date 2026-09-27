@@ -33,6 +33,7 @@ use tokio::time::{Duration, timeout};
 use super::{
     CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_HARNESS_NAME,
     COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
+    broker::broker_mcp_servers,
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
     projection::{CopilotCorrelation, TaskRosterSource, provider_events},
@@ -75,7 +76,10 @@ const RESUME_CONTEXT: &str = "Copilot Session resume failed";
 /// otherwise.
 ///
 /// Both paths install Suru's permission bridge before the native Session opens, so requests that
-/// arrive during creation and after resume follow the fixed posture captured for this Session.
+/// arrive during creation and after resume follow the fixed posture captured for this Session. Both
+/// hand the Session the Broker, when this start was handed it, in the server list Copilot takes on
+/// create and resume alike — a resume carrying the token this start was handed, since Copilot
+/// connects anew with whatever headers the resume names.
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
@@ -99,6 +103,7 @@ pub(super) async fn start_copilot_session(
         permissions,
         execution_directory.clone(),
     ));
+    let broker = request.broker.as_ref().map(broker_mcp_servers);
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an
@@ -106,7 +111,7 @@ pub(super) async fn start_copilot_session(
         // would read as continuous while having forgotten everything, so the failure stands and the
         // Transcript the Session was restored with stays readable.
         Some(session_id) => {
-            let config = ResumeSessionConfig::new(session_id.clone())
+            let mut config = ResumeSessionConfig::new(session_id.clone())
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.execution_directory)
                 .with_streaming(true)
@@ -117,6 +122,7 @@ pub(super) async fn start_copilot_session(
                 .with_enable_skills(true)
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
+            config.mcp_servers = broker;
             let native = until_crash(
                 &handle,
                 RESUME_CONTEXT,
@@ -129,7 +135,7 @@ pub(super) async fn start_copilot_session(
         // what gives the Session-scoped requests the CLI may issue mid-creation somewhere to land.
         None => {
             let session_id = CopilotSessionId::new(uuid::Uuid::new_v4().to_string());
-            let config = SessionConfig::default()
+            let mut config = SessionConfig::default()
                 .with_session_id(session_id.clone())
                 .with_client_name(COPILOT_CLIENT_NAME)
                 .with_working_directory(request.execution_directory)
@@ -141,6 +147,7 @@ pub(super) async fn start_copilot_session(
                 .with_enable_skills(true)
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
+            config.mcp_servers = broker;
             let native = until_crash(
                 &handle,
                 STARTUP_CONTEXT,

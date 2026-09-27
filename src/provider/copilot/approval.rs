@@ -24,6 +24,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
 
 use crate::{
+    broker::BROKER_SERVER_NAME,
     protocol::{
         Approval, ApprovalId, ApprovalSubject, CommandAction, CopilotPermissions, Decision,
     },
@@ -204,6 +205,13 @@ impl PermissionHandler for CopilotApprovals {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
+        // A Broker Tool never asks an Approval (ADR 0035), whatever the Session's posture: its
+        // calls are Suru's own to permit, and Copilot asks this handler before every one of them,
+        // a native Subagent's included (docs/validation/0408-copilot-mcp-tool-timeout.md). Only a
+        // managed policy demanding an explicit human decision still takes the path it always has.
+        if is_broker_call(&data) && data.managed_approval_required != Some(true) {
+            return PermissionResult::approve_once();
+        }
         let managed_settings_enabled = data.managed_settings_enabled
             || request(&data)["managedSettingsEnabled"]
                 .as_bool()
@@ -282,6 +290,13 @@ fn pair_request(
 
 fn request(data: &PermissionRequestData) -> &Value {
     data.extra.get("permissionRequest").unwrap_or(&data.extra)
+}
+
+/// Whether `data` asks to call one of the Broker's Tools: an MCP call to the server Suru handed
+/// every Session the Broker as.
+fn is_broker_call(data: &PermissionRequestData) -> bool {
+    data.kind == Some(PermissionRequestKind::Mcp)
+        && request(data)["serverName"] == BROKER_SERVER_NAME
 }
 
 fn reason(data: &PermissionRequestData) -> Option<String> {
