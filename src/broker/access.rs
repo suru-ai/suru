@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::protocol::{SessionId, SettingsSnapshot};
 
 /// The Broker endpoint's URL, on the Server's loopback listener.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerEndpoint(String);
 
 impl BrokerEndpoint {
@@ -28,15 +28,6 @@ impl BrokerEndpoint {
 impl fmt::Display for BrokerEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
-    }
-}
-
-impl fmt::Debug for BrokerEndpoint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("BrokerEndpoint")
-            .field(&self.0)
-            .finish()
     }
 }
 

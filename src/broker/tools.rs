@@ -171,10 +171,34 @@ struct ListedProvider {
     /// there is no Availability to report.
     available: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'static str>,
+    reason: Option<UnavailableReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
     models: Vec<ListedModel>,
+}
+
+/// Why a listed Provider cannot be used now: one of the conditions the
+/// Tool's description names, spelled as it names them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UnavailableReason {
+    NotInstalled,
+    NotSignedIn,
+    IncompatibleVersion,
+    /// Suru could not learn the Provider's Models, for no reason it can name.
+    CatalogFailed,
+    /// Suru is still asking the Provider for its Models for the first time.
+    Checking,
+}
+
+impl From<ProviderUnavailability> for UnavailableReason {
+    fn from(reason: ProviderUnavailability) -> Self {
+        match reason {
+            ProviderUnavailability::NotInstalled => Self::NotInstalled,
+            ProviderUnavailability::NotSignedIn => Self::NotSignedIn,
+            ProviderUnavailability::IncompatibleVersion => Self::IncompatibleVersion,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -243,13 +267,13 @@ fn listed_provider(catalog: ProviderModelCatalog) -> ListedProvider {
         ProviderCatalogStatus::Disabled => listed(None, None, None, Vec::new()),
         ProviderCatalogStatus::Unavailable { reason, message } => listed(
             Some(false),
-            Some(unavailability_reason(*reason)),
+            Some(UnavailableReason::from(*reason)),
             Some(message.clone()),
             Vec::new(),
         ),
         ProviderCatalogStatus::Failed { message } => listed(
             Some(false),
-            Some("catalog_failed"),
+            Some(UnavailableReason::CatalogFailed),
             Some(message.clone()),
             Vec::new(),
         ),
@@ -257,7 +281,7 @@ fn listed_provider(catalog: ProviderModelCatalog) -> ListedProvider {
         // re-check of Models already known leaves them selectable.
         ProviderCatalogStatus::Refreshing if models.is_empty() => listed(
             Some(false),
-            Some("checking"),
+            Some(UnavailableReason::Checking),
             Some(
                 "Suru is still asking this Provider for its Models; ask again shortly.".to_owned(),
             ),
@@ -276,14 +300,6 @@ fn listed_provider(catalog: ProviderModelCatalog) -> ListedProvider {
                 .map(listed_model)
                 .collect(),
         ),
-    }
-}
-
-fn unavailability_reason(reason: ProviderUnavailability) -> &'static str {
-    match reason {
-        ProviderUnavailability::NotInstalled => "not_installed",
-        ProviderUnavailability::NotSignedIn => "not_signed_in",
-        ProviderUnavailability::IncompatibleVersion => "incompatible_version",
     }
 }
 
@@ -461,6 +477,25 @@ mod tests {
         let checking = listed(ProviderCatalogStatus::Refreshing, Vec::new());
         assert_eq!(checking["available"], json!(false));
         assert_eq!(checking["reason"], json!("checking"));
+    }
+
+    #[test]
+    fn the_description_names_every_reason_a_provider_may_be_unavailable_for() {
+        for reason in [
+            UnavailableReason::NotInstalled,
+            UnavailableReason::NotSignedIn,
+            UnavailableReason::IncompatibleVersion,
+            UnavailableReason::CatalogFailed,
+            UnavailableReason::Checking,
+        ] {
+            let spelled = serde_json::to_value(reason)
+                .expect("a reason serializes")
+                .to_string();
+            assert!(
+                LIST_PROVIDERS_DESCRIPTION.contains(&spelled),
+                "list_providers' description names {spelled}"
+            );
+        }
     }
 
     #[test]
