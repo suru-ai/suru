@@ -252,7 +252,10 @@ mod tests {
     fn settings(enabled: bool) -> SettingsSnapshot {
         SettingsSnapshot {
             settings: EffectiveSettings {
-                broker: BrokerSettings { enabled },
+                broker: BrokerSettings {
+                    enabled,
+                    ..BrokerSettings::default()
+                },
                 ..EffectiveSettings::default()
             },
             ..SettingsSnapshot::default()

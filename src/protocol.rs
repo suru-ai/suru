@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 63;
+pub const PROTOCOL_VERSION: u32 = 64;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -1303,15 +1303,30 @@ pub struct ServingSettings {
 /// Provider Suru hosts. Off means no Provider start is handed the endpoint and
 /// the endpoint answers nothing; a Provider already running keeps what it was
 /// handed until its next launch.
+///
+/// The caps bound what the Broker spawns, each read at the moment of a spawn:
+/// a spawn past either is refused, naming the cap, and never queued.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerSettings {
     pub enabled: bool,
+    /// How many Sessions deep a tree may stand through the Broker, its
+    /// top-level Session counting as the first: a spawn that would place its
+    /// Subagent deeper is refused.
+    pub max_depth: u32,
+    /// How many brokered Subagents may work at once anywhere beneath one
+    /// top-level Session: a spawn while that many work is refused. Native
+    /// Subagents are not counted, because Suru cannot refuse them.
+    pub max_concurrent_subagents: u32,
 }
 
 impl Default for BrokerSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            max_depth: 3,
+            max_concurrent_subagents: 6,
+        }
     }
 }
 
@@ -1746,6 +1761,12 @@ pub enum SettingMutation {
     },
     BrokerEnabled {
         value: Option<bool>,
+    },
+    BrokerMaxDepth {
+        value: Option<u32>,
+    },
+    BrokerMaxConcurrentSubagents {
+        value: Option<u32>,
     },
 }
 

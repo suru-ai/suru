@@ -78,6 +78,8 @@ const SERVING_ENABLED: &str = "serving.enabled";
 const SERVING_PORT: &str = "serving.port";
 const SERVING_BIND_ADDRESS: &str = "serving.bindAddress";
 const BROKER_ENABLED: &str = "broker.enabled";
+const BROKER_MAX_DEPTH: &str = "broker.maxDepth";
+const BROKER_MAX_CONCURRENT_SUBAGENTS: &str = "broker.maxConcurrentSubagents";
 
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
@@ -387,6 +389,35 @@ const SERVING_PORT_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
     },
 );
 
+/// The choices of a Setting that counts something, each spelled as the whole
+/// number a Config Document pins and pinned through `$variant`, in the order
+/// given — which is the order a reader cycles them.
+macro_rules! count_choices {
+    ($variant:ident: $($count:literal),+ $(,)?) => {
+        &[$(SettingChoice {
+            value: stringify!($count),
+            build_mutation: || SettingMutation::$variant { value: Some($count) },
+        }),+]
+    };
+}
+
+// Each Broker cap counts from one — a tree of the top-level Session alone, or
+// one brokered Subagent at a time — up to twice its built-in default. A cap
+// exists to bound spending, so it has a ceiling of its own, and a Setting whose
+// every value is named up front is one a reader cycles in a few presses and
+// one a diagnostic can spell out whole.
+const BROKER_MAX_DEPTH_CHOICES: &[SettingChoice] = count_choices!(BrokerMaxDepth: 1, 2, 3, 4, 5, 6);
+const BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES: &[SettingChoice] = count_choices!(
+    BrokerMaxConcurrentSubagents: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+);
+
+/// Writes a count from a Config Document, refusing any the Setting's `choices`
+/// do not name: a Fixed Setting holds only what it can say, so a count outside
+/// its choices is diagnosed rather than quietly taken.
+fn apply_count(value: &Value, choices: &[SettingChoice], write: impl FnOnce(u32)) -> bool {
+    choices.iter().any(|choice| choice.pinned_value() == *value) && apply_value(value, write)
+}
+
 impl SettingValues {
     /// The values the schema names, which is everything a Fixed Setting accepts
     /// and only part of what an Open one does. This is the list a client cycles
@@ -606,6 +637,10 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
             *value == Some(settings.serving.bind_address)
         }
         SettingMutation::BrokerEnabled { value } => *value == Some(settings.broker.enabled),
+        SettingMutation::BrokerMaxDepth { value } => *value == Some(settings.broker.max_depth),
+        SettingMutation::BrokerMaxConcurrentSubagents { value } => {
+            *value == Some(settings.broker.max_concurrent_subagents)
+        }
     }
 }
 
@@ -1468,6 +1503,34 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    SettingDescriptor {
+        key: BROKER_MAX_DEPTH,
+        label: "Broker depth limit",
+        description: "How many Sessions deep the Broker may spawn Subagents, the top-level Session counting as one",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(BROKER_MAX_DEPTH_CHOICES),
+        reset: SettingMutation::BrokerMaxDepth { value: None },
+        apply: |settings, value| {
+            apply_count(value, BROKER_MAX_DEPTH_CHOICES, |depth| {
+                settings.broker.max_depth = depth;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: BROKER_MAX_CONCURRENT_SUBAGENTS,
+        label: "Broker concurrency limit",
+        description: "How many brokered Subagents may work at once beneath one top-level Session",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES),
+        reset: SettingMutation::BrokerMaxConcurrentSubagents { value: None },
+        apply: |settings, value| {
+            apply_count(value, BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES, |count| {
+                settings.broker.max_concurrent_subagents = count;
+            })
+        },
+    },
 ];
 
 /// The Setting through which the user turns one Provider on or off, which is
@@ -1671,6 +1734,10 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::ServingPort { value } => (SERVING_PORT, pinned(value)),
         SettingMutation::ServingBindAddress { value } => (SERVING_BIND_ADDRESS, pinned(value)),
         SettingMutation::BrokerEnabled { value } => (BROKER_ENABLED, pinned(value)),
+        SettingMutation::BrokerMaxDepth { value } => (BROKER_MAX_DEPTH, pinned(value)),
+        SettingMutation::BrokerMaxConcurrentSubagents { value } => {
+            (BROKER_MAX_CONCURRENT_SUBAGENTS, pinned(value))
+        }
     }
 }
 
@@ -2201,6 +2268,9 @@ mod tests {
                 "a port from 0 to 65535".to_owned(),
                 "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),
                 "one of true or false".to_owned(),
+                // A count is spelled bare, as the number a reader types.
+                "one of 1, 2, 3, 4, 5, or 6".to_owned(),
+                "one of 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12".to_owned(),
             ]
         );
     }

@@ -711,6 +711,59 @@ fn the_broker_setting_stands_under_the_experimental_tab_and_is_on_by_default() {
     );
 }
 
+/// The limits on brokered Subagents stand beside the Broker under the
+/// Experimental tab, each at its built-in cap until the reader pins another,
+/// and each is cycled one count on as any other Setting is.
+#[test]
+fn the_broker_limits_stand_under_the_experimental_tab_at_their_default_caps() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_experimental_tab(&mut application);
+
+    for (label, key, default) in [
+        ("Broker depth limit", "broker.maxDepth", "3 [default]"),
+        (
+            "Broker concurrency limit",
+            "broker.maxConcurrentSubagents",
+            "6 [default]",
+        ),
+    ] {
+        let limit = row(&application, label);
+        assert!(
+            limit.contains(default),
+            "{key} holds its built-in cap until the reader pins another: {limit:?}"
+        );
+        let descriptor = suru::settings::SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == key)
+            .unwrap_or_else(|| panic!("the schema declares {key}"));
+        assert_eq!(descriptor.group, SettingGroup::Experimental);
+        assert_eq!(descriptor.scope, SettingScope::Server);
+    }
+
+    focus_setting(&mut application, "broker.maxDepth");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxDepth { value: Some(4) }),
+        "Space steps the depth limit one Session deeper"
+    );
+    focus_setting(&mut application, "broker.maxConcurrentSubagents");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxConcurrentSubagents {
+            value: Some(7),
+        }),
+        "and the concurrency limit one Subagent more"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    assert!(
+        !has_row(&application, "Broker depth limit")
+            && !has_row(&application, "Broker concurrency limit"),
+        "an experimental Setting is not also a General one"
+    );
+}
+
 /// The tab bar is a surface the reader can point at, and pointing at a label
 /// is the same arrival as walking onto it: the tab that presents the Providers
 /// re-reads their Availability however the reader got there — the reader
