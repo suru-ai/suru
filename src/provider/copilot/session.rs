@@ -78,8 +78,9 @@ const RESUME_CONTEXT: &str = "Copilot Session resume failed";
 /// Both paths install Suru's permission bridge before the native Session opens, so requests that
 /// arrive during creation and after resume follow the fixed posture captured for this Session. Both
 /// hand the Session the Broker, when this start was handed it, in the server list Copilot takes on
-/// create and resume alike — a resume carrying the token this start was handed, since Copilot
-/// connects anew with whatever headers the resume names.
+/// create and resume alike: a resume carries the token this start was handed, and a CLI process
+/// resuming the Session connects anew with the headers the resume names
+/// (docs/validation/0408-copilot-mcp-tool-timeout.md).
 pub(super) async fn start_copilot_session(
     handle: SharedHarnessHandle<CopilotConnection>,
     request: ProviderSessionRequest,
