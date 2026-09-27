@@ -9,17 +9,21 @@
 //! system prompt saying the Broker is there, naming its Tools by the full names Claude gives them
 //! so the Agent can select them (docs/validation/0408-claude-http-mcp-long-calls.md). With the
 //! Broker turned off a launch carries none of it.
+//!
+//! A Subagent Report reaches a Claude Agent the way a Prompt does: as one stream-json user message
+//! on its process's stdin (ADR 0035).
 
+use crate::server_support::broker::McpClient;
 use crate::support::{
-    Launch, LiveTurn, McpConfigFile, conversation_fixture, hosting, settled_session,
+    Launch, LiveTurn, McpConfigFile, conversation_fixture, hosting, opened_session, settled_session,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use suru::{
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        TurnStatus,
+        Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole,
+        PromptDelivery, PromptId, TurnStatus,
     },
-    provider::ClaudeRuntime,
+    provider::{ClaudeRuntime, SubagentReport, SubagentReportOutcome},
 };
 
 /// One agent Message and the terminal result that Settles the Turn.
@@ -248,4 +252,87 @@ async fn with_the_broker_off_a_session_launch_carries_no_mcp_config_allowlist_or
     );
 
     live.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_report_leaves_as_a_stdin_user_message_waking_the_idle_parent() {
+    let claude = conversation_fixture(ANSWERED);
+    let opened = opened_session(&claude, "claude-broker-report", "Delegate the survey").await;
+    let parent_id = opened.session_id;
+    settled_session(&opened.client, parent_id, 0).await;
+    let parent_launch = claude.wait_for_launch_carrying("--session-id").await;
+    let server = broker_server(&claude.mcp_config_of(&parent_launch)).clone();
+    let mut broker = McpClient::presenting(
+        server["url"].as_str().expect("the Broker's URL"),
+        server["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+
+    // The idle parent's Agent spawns a Claude Subagent, whose own process answers its Delegation
+    // and settles.
+    let child_id = broker
+        .spawn_subagent(json!({
+            "provider": "claude",
+            "model": "haiku",
+            "options": {},
+            "name": "Researcher",
+            "description": "Survey the seams",
+            "prompt": "Survey the seams.",
+        }))
+        .await;
+
+    // Its Report wakes the parent into a Continuation — the parent's third Turn, after its first
+    // and the Continuation that holds the Subagent's row — which the parent's process settles.
+    let woken = settled_session(&opened.client, parent_id, 2).await;
+    assert_eq!(woken.turns[2].status, TurnStatus::Completed);
+    assert_eq!(woken.turns[2].prompt_id, None, "a Continuation");
+    let Some(Activity::Subagent { duration_ms, .. }) = woken.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child_id),
+    ) else {
+        panic!("the parent's Transcript holds the Subagent's row");
+    };
+    let report = SubagentReport::new(
+        child_id,
+        "Researcher",
+        SubagentReportOutcome::Completed,
+        *duration_ms,
+        Some("Done"),
+    )
+    .to_string();
+    let user_messages = claude
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("type").and_then(Value::as_str) == Some("user"))
+        .collect::<Vec<_>>();
+    let delivered = user_messages
+        .iter()
+        .filter(|request| request.pointer("/message/content/0/text") == Some(&json!(report)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the Report leaves once, as a stdin user message: {user_messages:?}"
+    );
+    assert_eq!(
+        delivered[0]["message"]["content"].as_array().map(Vec::len),
+        Some(1),
+        "whose one text block is the Report as Suru words it"
+    );
+    assert!(
+        woken
+            .messages
+            .iter()
+            .filter(|message| message.turn_id == woken.turns[2].id)
+            .all(|message| message.role == MessageRole::Agent),
+        "the Report stands nowhere in the parent's Transcript"
+    );
+
+    let opened_server = opened.server;
+    drop(opened.client);
+    opened_server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }
