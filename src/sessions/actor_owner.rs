@@ -210,19 +210,24 @@ mod tests {
             "with one actor, it reaches the whole subtree"
         );
         give_own_actor(&store, owning_id);
-        let state = store.state.lock().unwrap();
-        assert_eq!(
-            state.actor_subtree(top_level_id),
-            [top_level_id, native_id],
-            "the top-level Session's actor stops where another actor's reach begins"
-        );
-        assert_eq!(
-            state.actor_subtree(native_id),
-            [native_id],
-            "a native Subagent's reach is its actor's"
-        );
-        assert_eq!(state.actor_subtree(owning_id), [owning_id, below_id]);
-        drop(state);
+        {
+            let state = store.state.lock().unwrap();
+            assert_eq!(
+                state.actor_subtree(top_level_id),
+                [top_level_id, native_id],
+                "the top-level Session's actor stops where another actor's reach begins"
+            );
+            assert_eq!(
+                state.actor_subtree(native_id),
+                [native_id],
+                "a native Subagent's reach is its actor's"
+            );
+            assert_eq!(
+                state.actor_subtree(owning_id),
+                [owning_id, below_id],
+                "the owning Subagent's actor reaches everything below it"
+            );
+        }
         writer.shutdown().await.unwrap();
     }
 
