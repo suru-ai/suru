@@ -1606,7 +1606,9 @@ impl ApprovalPosture {
 }
 
 /// The effective Approval Posture reported by a Session. `pinned` distinguishes
-/// a Session override from a live reading of the Server Setting.
+/// a Session override from a live reading of the Server Setting. A Subagent's
+/// `pinned` is its spawner's, since a Subagent's posture is never set on
+/// itself.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionApprovalPosture {

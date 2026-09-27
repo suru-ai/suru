@@ -161,11 +161,23 @@ impl SessionStore {
 
     /// Refreshes the posture of the Provider actor `session_id`'s
     /// conversation runs on — its owner's unpinned posture, and the reading
-    /// every Session riding that actor inherits from it — and returns the
-    /// owner's outstanding native application, if any. This is what a change
+    /// every Session of its tree takes from it — and returns the owner's
+    /// outstanding native application, if any. This is what a change
     /// confined to one Session (its creation, its Agent Selection, its
-    /// Provider starting) reconciles, without walking every other Session the
+    /// Provider starting) reconciles, without refreshing every other tree the
     /// store holds.
+    ///
+    /// Only the owner's update is returned, yet no brokered Subagent in the
+    /// tree is left owed a value no reader delivers: what this reconciles
+    /// never moves a spawner's posture once it has Subagents. A Session takes
+    /// its first Agent Selection before it has spawned anything, its Provider
+    /// is fixed once chosen, and its unpinned posture already reads the
+    /// Settings, since they change only through
+    /// [`Self::reconcile_approval_postures`].
+    /// Every path that does move a spawner's posture hands on what its
+    /// brokered Subagents are owed: a Settings change and a pin or reset
+    /// ([`Self::apply_approval_posture_command`]) return their updates, and
+    /// hydration records them applied, no Provider running for them yet.
     pub(crate) fn reconcile_tree_approval_posture(
         &self,
         session_id: SessionId,
@@ -503,12 +515,12 @@ impl SessionStoreState {
             .collect::<HashSet<_>>();
         let mut landed = true;
         for (spawner, child) in self.spawn_order_beneath(top_levels) {
-            let spawners = self.sessions[&spawner].snapshot.session.approval_posture;
+            let spawners_posture = self.sessions[&spawner].snapshot.session.approval_posture;
             let record = &self.sessions[&child];
             let current = record.snapshot.session.approval_posture;
             if !record.is_brokered_subagent() {
-                if current != spawners {
-                    landed &= self.commit_posture(storage, child, spawners);
+                if current != spawners_posture {
+                    landed &= self.commit_posture(storage, child, spawners_posture);
                 }
                 continue;
             }
@@ -521,7 +533,7 @@ impl SessionStoreState {
             else {
                 continue;
             };
-            landed &= match derived_posture(spawners.as_ref(), &provider, settings) {
+            landed &= match derived_posture(spawners_posture.as_ref(), &provider, settings) {
                 Some(held) => {
                     let next = held.reading(current.as_ref(), delivery);
                     self.hold_posture(storage, child, next)
