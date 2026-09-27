@@ -20,7 +20,7 @@ use suru::{
 };
 
 /// One agent Message arriving as the CLI streams it in partial-message chunks, then the terminal
-/// result settling the Turn as completed. The surrounding traffic mirrors a live 2.1.237 CLI:
+/// result settling the Turn as completed. The surrounding traffic mirrors a live 2.1.280 CLI:
 /// system messages and a `rate_limit_event` around the stream, a full `assistant` snapshot of the
 /// Message beside the chunks, and a `message_delta` whose delta object carries no `type` at all.
 const STREAMED_MESSAGE: &str = r#"      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
@@ -37,7 +37,8 @@ const STREAMED_MESSAGE: &str = r#"      emit '{"type":"system","subtype":"init",
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Hello from Claude","session_id":"prov-session"}'
 "#;
 
-const REPORTED_USAGE: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"cache_creation_input_tokens":400,"output_tokens":900},"total_cost_usd":0.03}'
+/// A result as a live 2.1.280 CLI reports one: its output tokens count the thinking it breaks out.
+const REPORTED_USAGE: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":1200,"cache_read_input_tokens":300,"cache_creation_input_tokens":400,"output_tokens":900,"output_tokens_details":{"thinking_tokens":600}},"total_cost_usd":0.03}'
 "#;
 
 const USAGE_WITHOUT_COST: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Measured","session_id":"prov-session","usage":{"input_tokens":20,"output_tokens":5}}'
@@ -95,8 +96,8 @@ async fn a_terminal_result_records_claudes_usage_and_reported_cost_on_the_turn()
             fresh_input_tokens: Some(1_200),
             cache_read_tokens: Some(300),
             cache_write_tokens: Some(400),
-            output_tokens: Some(900),
-            reasoning_tokens: None,
+            output_tokens: Some(300),
+            reasoning_tokens: Some(600),
             native_meter: None,
             model_context_window: None,
         })

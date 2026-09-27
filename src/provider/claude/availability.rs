@@ -36,7 +36,7 @@ use crate::{
 
 /// The Claude Code CLI whose stream-json behavior this build is verified against (ADR 0010).
 const CLAUDE_SUGGESTED_VERSION: SuggestedCliVersion =
-    SuggestedCliVersion::new("Claude Code CLI", 2, 1, 237);
+    SuggestedCliVersion::new("Claude Code CLI", 2, 1, 280);
 
 /// How long a verdict that Claude is usable stands before it is asked of the CLI again.
 const AVAILABILITY_TTL: Duration = Duration::from_secs(300);

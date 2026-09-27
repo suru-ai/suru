@@ -81,7 +81,7 @@ const RESPAWNED_TURN_COMPLETES: &str = r#"      emit '{"type":"stream_event","ev
 
 /// What the CLI writes once the interrupt has stopped its loop.
 const ABORTED_RESULT: &str = r#"      emit '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"num_turns":1,"result":"","terminal_reason":"aborted_streaming","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"terminal_reason":"aborted_streaming","session_id":"prov-session"}'
 "#;
 
 /// The Selection the second Turn runs under — different spawn flags from the default the first

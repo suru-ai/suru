@@ -244,7 +244,7 @@ async fn a_prompt_during_resumed_reasoning_waits_for_the_native_interrupt_bounda
             r#"
       interrupted=yes
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
-      emit '{"type":"result","subtype":"success","terminal_reason":"aborted_streaming"}'
+      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming"}'
 "#
         ),
         user_turn_arm(

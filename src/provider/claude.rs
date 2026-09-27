@@ -20,7 +20,7 @@
 //!
 //! A CLI that is not installed or has no signed-in user reaches Model discovery — and so a Turn's
 //! Session startup — as its own typed reason rather than as a failure. [`availability`] also asks
-//! the CLI for its version: one below the verified 2.1.237 suggestion remains usable with advisory
+//! the CLI for its version: one below the verified 2.1.280 suggestion remains usable with advisory
 //! guidance, while a CLI too old to answer the probe is incompatible. A catalog refresh re-runs
 //! conditions that need the user to fix something outside Suru.
 

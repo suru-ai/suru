@@ -28,9 +28,9 @@ const WORK_IN_FLIGHT: &str = r#"      emit '{"type":"stream_event","event":{"typ
 
 /// What the CLI writes once the interrupt has stopped its loop: the interruption on the record as a
 /// user message, then the terminal result whose `terminal_reason` says the Turn was aborted rather
-/// than finished — the `success` subtype notwithstanding.
+/// than failed — the errored subtype notwithstanding, as a live 2.1.280 CLI reports it.
 const ABORTED_RESULT: &str = r#"      emit '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"num_turns":1,"result":"","terminal_reason":"aborted_streaming","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"terminal_reason":"aborted_streaming","session_id":"prov-session"}'
 "#;
 
 #[tokio::test]
@@ -196,7 +196,7 @@ const STEERED_THEN_STOPPED: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
 
 /// The interrupt lands while the loop is waiting on a tool, and the steer it never reached runs
 /// afterwards as a stretch of its own — output belonging to a Turn that has already Settled.
-const ABORTED_WITH_A_SURVIVING_STEER: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"num_turns":1,"result":"","terminal_reason":"aborted_tools","session_id":"prov-session"}'
+const ABORTED_WITH_A_SURVIVING_STEER: &str = r#"      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"terminal_reason":"aborted_tools","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Bonjour"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2,"num_turns":1,"result":"Bonjour","terminal_reason":"completed","session_id":"prov-session"}'

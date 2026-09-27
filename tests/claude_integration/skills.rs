@@ -17,8 +17,8 @@ use suru::protocol::{
 
 fn skill_catalog_arms() -> String {
     skill_catalog_arms_with_commands(
-        r#"[{"name":"review","description":"Shadowed review (user)","argumentHint":""},{"name":"review","description":"Review the current change (project)","argumentHint":""},{"name":"explain","description":"Explain the current change (user)","argumentHint":"<topic>"},{"name":"charts","description":"(data-tools@official) Draw a chart","argumentHint":""},{"name":"invalid name","description":"Not invocable (project)","argumentHint":""}]"#,
-        r#"[{"name":"help","description":"Built-in help","argumentHint":""},{"name":"hidden","description":"A non-Skill command","argumentHint":""},{"name":"implement","description":"Implement a piece of work (user)","argumentHint":""}]"#,
+        r#"[{"name":"review","description":"Shadowed review (user)","argumentHint":""},{"name":"review","description":"Review the current change (project)","argumentHint":""},{"name":"explain","description":"Explain the current change (user)","argumentHint":"<topic>"},{"name":"charts","description":"(data-tools@official) Draw a chart","argumentHint":""},{"name":"invalid name","description":"Not invocable (project)","argumentHint":""},{"name":"anthropic-skills:pdf","description":"Work with PDF files (claude.ai sync)","argumentHint":""}]"#,
+        r#"[{"name":"help","description":"Built-in help","argumentHint":"","builtin":true},{"name":"hidden","description":"A non-Skill command","argumentHint":"","builtin":true},{"name":"implement","description":"Implement a piece of work (user)","argumentHint":""}]"#,
     )
 }
 
@@ -109,6 +109,11 @@ async fn claude_discovers_native_skills_in_configured_short_lived_processes() {
             ))
             .collect::<Vec<_>>(),
         [
+            (
+                "anthropic-skills:pdf",
+                "Work with PDF files",
+                Some("claude.ai")
+            ),
             (
                 "charts",
                 "Draw a chart",

@@ -235,7 +235,7 @@ async fn a_failed_live_mode_update_is_visible_and_retried_without_restarting_on_
 async fn immediate_native_completion_waits_for_the_decision_to_be_recorded() {
     let request = request("immediate", "Bash", json!({"command":"false"}), json!({}));
     let completion = r#"    *'"type":"control_response"'*)
-      emit '{"type":"result","subtype":"success","is_error":false,"result":"Stopped","terminal_reason":"aborted_tools","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"terminal_reason":"aborted_tools","session_id":"prov-session"}'
       ;;
 "#;
     let fixture = ScriptedClaude::new(&format!(

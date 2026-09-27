@@ -99,10 +99,10 @@ const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
 
 /// The version the fixture reports when nothing has downgraded it: the suggestion itself, which is
 /// the version Suru's wire behavior is verified against.
-pub const CLAUDE_SUGGESTED_VERSION: &str = "2.1.237";
+pub const CLAUDE_SUGGESTED_VERSION: &str = "2.1.280";
 
 /// A readable version below the suggestion, which remains usable with guidance.
-pub const CLAUDE_VERSION_BELOW_SUGGESTION: &str = "2.1.236";
+pub const CLAUDE_VERSION_BELOW_SUGGESTION: &str = "2.1.279";
 
 /// A version above the suggestion, standing in for the CLI the user updates to.
 pub const CLAUDE_VERSION_ABOVE_SUGGESTION: &str = "2.2.0";
@@ -672,7 +672,7 @@ pub fn failed_errand_envelope() -> String {
 }
 
 /// A preamble standing in for a CLI asked to resume a conversation it does not have: it reports
-/// the conversation is missing and exits, which is how a live 2.1.237 CLI answers `--resume` for
+/// the conversation is missing and exits, which is how a live 2.1.280 CLI answers `--resume` for
 /// a session id it cannot find — a terminal `result` naming the session, then a failing exit.
 pub fn rejecting_resume_preamble() -> String {
     r#"resumed=$(printf '%s' "$*" | sed -n 's/.*--resume \([^ ]*\).*/\1/p')

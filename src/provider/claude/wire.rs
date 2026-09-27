@@ -1,10 +1,9 @@
 //! The serde types Suru exchanges with a Claude Code CLI over its stream-json wire.
 //!
-//! The baseline wire is verified against Claude Code CLI 2.1.237 and Agent SDK type definitions
-//! 0.3.241; optional get_context_usage is additionally verified against CLI 2.1.260 (see
-//! docs/validation/0300-claude-context-fill.md). The wire is an SDK implementation detail, so drift is
-//! ours to absorb (ADR 0010). Decoding tolerates fields and control-response subtypes it does not
-//! know, because the CLI grows both freely.
+//! The wire is verified against Claude Code CLI 2.1.280, live, and the Agent SDK type definitions
+//! 0.3.280 that ship with it (see docs/claude-metering-contract.md for the metering half). The wire
+//! is an SDK implementation detail, so drift is ours to absorb (ADR 0010). Decoding tolerates fields
+//! and control-response subtypes it does not know, because the CLI grows both freely.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,7 +32,7 @@ impl<'a> ControlRequestEnvelope<'a> {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub(super) enum ControlRequest {
     ListModels,
-    /// Optional snapshot of this process’s own conversation (CLI 2.1.260 verified).
+    /// Optional snapshot of this process’s own conversation (CLI 2.1.280 verified).
     GetContextUsage,
     /// Asks the CLI which version it is, which is what the availability probe checks against the
     /// suggested version ADR 0010 pins.
@@ -261,7 +260,8 @@ pub(super) struct ResultMessage {
     #[serde(default)]
     pub(super) errors: Vec<String>,
     /// Why the loop stopped. An interrupted Turn is the reason this is read at all: the CLI reports
-    /// one as an unerrored `success` carrying no answer, so an abort is legible nowhere else.
+    /// one as an errored `error_during_execution` carrying only a CLI-internal diagnostic, so it is
+    /// told apart from a failure nowhere else.
     #[serde(default)]
     pub(super) terminal_reason: Option<String>,
     /// The answer as the JSON schema the launch asked for shaped it, which is what an Errand came
@@ -273,8 +273,14 @@ pub(super) struct ResultMessage {
     /// optional so a CLI that omits one does not turn that omission into zero.
     #[serde(default)]
     pub(super) usage: Option<ResultUsage>,
+    /// What the conversation has cost so far, cumulative for as long as the CLI keeps one running
+    /// total for it — across the processes that resume it, but not across a `/clear`.
     #[serde(default)]
     pub(super) total_cost_usd: Option<f64>,
+    /// The conversation the result belongs to: the one the process was spawned or resumed under,
+    /// until a `/clear` moves it onto a new one, whose running total starts again at zero.
+    #[serde(default)]
+    pub(super) session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -285,8 +291,19 @@ pub(super) struct ResultUsage {
     pub(super) cache_read_input_tokens: Option<f64>,
     #[serde(default)]
     pub(super) cache_creation_input_tokens: Option<f64>,
+    /// Every output token, the thinking among them.
     #[serde(default)]
     pub(super) output_tokens: Option<f64>,
+    #[serde(default)]
+    pub(super) output_tokens_details: Option<OutputTokensDetails>,
+}
+
+/// How a result's output tokens break down. Absent from CLIs that predate the breakdown.
+#[derive(Deserialize)]
+pub(super) struct OutputTokensDetails {
+    /// The thinking tokens, already counted in `output_tokens`.
+    #[serde(default)]
+    pub(super) thinking_tokens: Option<f64>,
 }
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task

@@ -263,7 +263,7 @@ async fn claude_cancellation_withdraws_the_questionnaire_without_a_native_respon
 
 #[tokio::test]
 async fn interrupting_claude_while_a_questionnaire_is_pending_stops_the_turn_without_answering() {
-    let interrupted = "      emit '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"terminal_reason\":\"aborted_tools\",\"session_id\":\"prov-session\"}'\n";
+    let interrupted = "      emit '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"terminal_reason\":\"aborted_tools\",\"session_id\":\"prov-session\"}'\n";
     let fixture = ScriptedClaude::new(&format!(
         "{}{}{}",
         discovery_arms(CLAUDE_MODELS),

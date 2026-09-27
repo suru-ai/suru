@@ -53,7 +53,7 @@
 //! does not present is passed over rather than failed, because the wire grows freely (ADR 0010).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -70,7 +70,7 @@ use super::{
     turn_in_flight::TurnInFlight,
     wire::{
         AssistantMessageSnapshot, ContentBlock, EchoedUserContent, EchoedUserMessage,
-        ResultMessage, StreamEventMessage, SystemMessage,
+        ResultMessage, ResultUsage, StreamEventMessage, SystemMessage,
     },
 };
 use crate::protocol::{Cost, Usage};
@@ -470,8 +470,9 @@ pub(super) struct ClaudeProjection {
     /// A snapshot can race the task lifecycle, so evidence waits here until the stretch's row
     /// exists, and a settle clears it so a resume reports only its own.
     subagent_models: BTreeMap<String, crate::protocol::ModelId>,
-    reporting_lifetime: String,
-    latest_reported_cost: Option<Cost>,
+    /// The latest cumulative Cost results reported, by the reporting lifetime whose running total
+    /// each is. A later report in the same lifetime is accepted only if it has not gone back.
+    latest_reported_costs: HashMap<String, Cost>,
     seen_results: HashSet<String>,
     reasoning_blocks: u64,
     turn_metering: Option<ReportedTurnMetering>,
@@ -532,8 +533,7 @@ impl ClaudeProjection {
             pending_steers: BTreeMap::new(),
             resume,
             subagent_models: BTreeMap::new(),
-            reporting_lifetime: uuid::Uuid::new_v4().to_string(),
-            latest_reported_cost: None,
+            latest_reported_costs: HashMap::new(),
             seen_results: HashSet::new(),
             reasoning_blocks: 0,
             turn_metering: None,
@@ -1348,7 +1348,7 @@ impl ClaudeProjection {
 
     /// A full-message snapshot of an assistant message. A conversation that streamed is already
     /// in the Transcript chunk by chunk, so its snapshots are passed over. A subagent's
-    /// conversation never streams — verified against 2.1.237, which attributes no `stream_event`
+    /// conversation never streams — verified against 2.1.280, which attributes no `stream_event`
     /// to a parent tool use — so its snapshots are all the wire carries of it, and each block
     /// projects as a settled whole: text as the agent Message, thinking as Reasoning split at its
     /// headings, and tool uses through the same open/close pair the streaming path takes, which
@@ -1672,6 +1672,22 @@ impl ClaudeProjection {
         }
     }
 
+    /// The reporting lifetime a result's cumulative Cost belongs to: the conversation the CLI keeps
+    /// the running total for. The CLI saves that total into the conversation when a process exits
+    /// and a process resuming it carries on from there, so every process a Session spawns under
+    /// one conversation — across Selection changes and Suru restarts alike — continues one total,
+    /// and reporting each process separately would count what came before it again. A `/clear`
+    /// moves the process onto a new conversation whose total starts from zero, which is a new
+    /// lifetime. A result naming no conversation belongs to the one the Session is filed under.
+    fn reporting_lifetime(&self, result: &ResultMessage) -> String {
+        let conversation = result
+            .session_id
+            .as_deref()
+            .filter(|conversation| !conversation.is_empty())
+            .unwrap_or(&self.resume.session_id);
+        format!("claude:{conversation}")
+    }
+
     fn project_result(
         &mut self,
         message: Value,
@@ -1730,29 +1746,24 @@ impl ClaudeProjection {
                 ..ConversationInFlight::default()
             },
         );
+        let reporting_lifetime = self.reporting_lifetime(&result);
         let reported_cost = result
             .total_cost_usd
             .and_then(Cost::from_usd)
             .filter(|cost| {
-                self.latest_reported_cost
+                self.latest_reported_costs
+                    .get(&reporting_lifetime)
                     .is_none_or(|latest| cost.nano_usd() >= latest.nano_usd())
             });
         if let Some(cost) = reported_cost {
-            self.latest_reported_cost = Some(cost);
+            self.latest_reported_costs
+                .insert(reporting_lifetime.clone(), cost);
         }
         if result.usage.is_some() || reported_cost.is_some() || self.turn_metering.is_some() {
             let usage = result
                 .usage
                 .as_ref()
-                .map_or_else(Usage::default, |usage| Usage {
-                    fresh_input_tokens: reported_token_count(usage.input_tokens),
-                    cache_read_tokens: reported_token_count(usage.cache_read_input_tokens),
-                    cache_write_tokens: reported_token_count(usage.cache_creation_input_tokens),
-                    output_tokens: reported_token_count(usage.output_tokens),
-                    reasoning_tokens: None,
-                    native_meter: None,
-                    model_context_window: None,
-                });
+                .map_or_else(Usage::default, result_usage);
             if let Some(metering) = self.turn_metering.as_mut() {
                 metering.add_usage_with_cumulative_cost(usage, reported_cost);
             } else {
@@ -1762,7 +1773,7 @@ impl ClaudeProjection {
                 .turn_metering
                 .as_ref()
                 .expect("Claude Turn metering was just initialized");
-            projected.push(metering.subtree_event(&self.reporting_lifetime));
+            projected.push(metering.subtree_event(&reporting_lifetime));
         }
         let turn_settled;
         if was_interrupted(&result) {
@@ -1835,6 +1846,36 @@ fn send_message_description(input: &Value) -> Option<String> {
 /// Reads an integer token count without letting a malformed negative,
 /// fractional, non-finite, or unrepresentable Provider number become a
 /// fabricated zero.
+/// A result's usage in Suru's disjoint parts. The CLI counts thinking inside its output tokens, so
+/// the thinking it breaks out is taken back out of the output; a breakdown it does not give leaves
+/// the thinking unknown and the output as stated.
+fn result_usage(usage: &ResultUsage) -> Usage {
+    let output = reported_token_count(usage.output_tokens);
+    let reasoning = usage
+        .output_tokens_details
+        .as_ref()
+        .and_then(|details| details.thinking_tokens)
+        .map(|thinking| reported_token_count(Some(thinking)));
+    let (output_tokens, reasoning_tokens) = match reasoning {
+        None => (output, None),
+        Some(reasoning) => (
+            output
+                .zip(reasoning)
+                .and_then(|(output, reasoning)| output.checked_sub(reasoning)),
+            reasoning,
+        ),
+    };
+    Usage {
+        fresh_input_tokens: reported_token_count(usage.input_tokens),
+        cache_read_tokens: reported_token_count(usage.cache_read_input_tokens),
+        cache_write_tokens: reported_token_count(usage.cache_creation_input_tokens),
+        output_tokens,
+        reasoning_tokens,
+        native_meter: None,
+        model_context_window: None,
+    }
+}
+
 fn reported_token_count(value: Option<f64>) -> Option<u64> {
     value
         .filter(|value| {
@@ -1843,11 +1884,12 @@ fn reported_token_count(value: Option<f64>) -> Option<u64> {
         .map(|value| value as u64)
 }
 
-/// Whether a result is a Turn the user stopped. The CLI reports an interrupted loop as an unerrored
-/// `success` carrying no answer, so the abort is legible only in `terminal_reason` — verified
-/// against 2.1.237, whose interrupted result reads `aborted_streaming`. Which of the two abort
-/// reasons the CLI gives says only where its loop was when the interrupt landed: streaming an
-/// answer, or waiting on a tool it had already called.
+/// Whether a result is a Turn the user stopped. The CLI reports an interrupted loop as an errored
+/// `error_during_execution` whose only error is a CLI-internal diagnostic, so the abort is legible
+/// only in `terminal_reason` — verified against 2.1.280, whose interrupted result reads
+/// `aborted_streaming` or `aborted_tools`. Which of the two abort reasons the CLI gives says only
+/// where its loop was when the interrupt landed: streaming an answer, or waiting on a tool it had
+/// already called.
 fn was_interrupted(result: &ResultMessage) -> bool {
     matches!(
         result.terminal_reason.as_deref(),
@@ -1883,7 +1925,9 @@ fn tool_result_text(content: &Value) -> String {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{ClaudeProjection, ClaudeResumeState, TurnInFlight, send_message_description};
+    use super::{
+        ClaudeProjection, ClaudeResumeState, Cost, TurnInFlight, send_message_description,
+    };
     use crate::provider::{
         AttributedProviderEvent, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
         ProviderWatchId, ProviderWatchOutcome,
@@ -2961,5 +3005,162 @@ mod tests {
             None
         );
         assert_eq!(send_message_description(&serde_json::Value::Null), None);
+    }
+
+    /// A terminal result carrying `total_cost_usd` for the conversation `session_id`.
+    fn result_costing(uuid: &str, session_id: &str, total_cost_usd: f64) -> Value {
+        json!({
+            "type": "result",
+            "uuid": uuid,
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "completed",
+            "session_id": session_id,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "total_cost_usd": total_cost_usd,
+        })
+    }
+
+    /// The Cost the one Usage event among `events` reports, with the lifetime it is cumulative in.
+    fn reported_cost(events: &[AttributedProviderEvent]) -> Option<(Cost, String)> {
+        let [usage] = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ProviderEvent::Usage { cost, .. } => Some(cost),
+                _ => None,
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("a result reports its metering once: {events:?}");
+        };
+        usage.as_ref().map(|cost| {
+            let crate::protocol::CostCoverage::SessionSubtree { reporting_lifetime } =
+                cost.coverage()
+            else {
+                panic!("a Claude Cost is cumulative for its conversation: {cost:?}");
+            };
+            (cost.cost(), reporting_lifetime.clone())
+        })
+    }
+
+    fn usd(usd: f64) -> Cost {
+        Cost::from_usd(usd).expect("a fixture Cost is a valid USD figure")
+    }
+
+    #[test]
+    fn a_resumed_conversation_continues_the_reporting_lifetime_it_was_filed_under() {
+        // The CLI carries a conversation's running total into every process that resumes it, so a
+        // Session restored after a restart reports into the lifetime it reported into before —
+        // where a lifetime of its own would count the earlier spend a second time.
+        let resume = ClaudeResumeState {
+            session_id: "conversation-1".to_owned(),
+            agents: Default::default(),
+        };
+        let mut before = ClaudeProjection::new(TurnInFlight::new(), resume.clone());
+        let mut after = ClaudeProjection::new(TurnInFlight::new(), resume);
+
+        let first = project(
+            &mut before,
+            &[result_costing("result-1", "conversation-1", 0.25)],
+        );
+        let resumed = project(
+            &mut after,
+            &[result_costing("result-2", "conversation-1", 0.40)],
+        );
+
+        assert_eq!(
+            reported_cost(&first),
+            Some((usd(0.25), "claude:conversation-1".to_owned()))
+        );
+        assert_eq!(
+            reported_cost(&resumed),
+            Some((usd(0.40), "claude:conversation-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_cleared_conversation_reports_its_fresh_total_in_a_lifetime_of_its_own() {
+        let mut projection = fresh_projection();
+        let before = project(
+            &mut projection,
+            &[result_costing("result-1", "conversation-1", 0.25)],
+        );
+        // `/clear` moves the process onto a new conversation whose running total starts again.
+        let cleared = project(
+            &mut projection,
+            &[result_costing("result-2", "conversation-2", 0.0)],
+        );
+        let regressed = project(
+            &mut projection,
+            &[result_costing("result-3", "conversation-1", 0.10)],
+        );
+
+        assert_eq!(
+            reported_cost(&before),
+            Some((usd(0.25), "claude:conversation-1".to_owned()))
+        );
+        assert_eq!(
+            reported_cost(&cleared),
+            Some((usd(0.0), "claude:conversation-2".to_owned())),
+            "a new conversation's total is no regression of the old one's"
+        );
+        assert_eq!(
+            reported_cost(&regressed),
+            None,
+            "a total that went back within one conversation is still not believed"
+        );
+    }
+
+    #[test]
+    fn a_results_thinking_is_taken_out_of_its_output_as_reasoning() {
+        let usage_of = |usage: Value| {
+            let mut projection = fresh_projection();
+            let events = project(
+                &mut projection,
+                &[json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "usage": usage,
+                })],
+            );
+            events
+                .into_iter()
+                .find_map(|event| match event.event {
+                    ProviderEvent::Usage { usage, .. } => Some(usage),
+                    _ => None,
+                })
+                .expect("a result with usage reports it")
+        };
+
+        let broken_out = usage_of(json!({
+            "input_tokens": 10,
+            "output_tokens": 46,
+            "output_tokens_details": {"thinking_tokens": 39},
+        }));
+        assert_eq!(
+            (broken_out.output_tokens, broken_out.reasoning_tokens),
+            (Some(7), Some(39))
+        );
+
+        let not_broken_out = usage_of(json!({"input_tokens": 10, "output_tokens": 46}));
+        assert_eq!(
+            (
+                not_broken_out.output_tokens,
+                not_broken_out.reasoning_tokens
+            ),
+            (Some(46), None),
+            "output stands as stated when the CLI says nothing of its thinking"
+        );
+
+        let unreadable = usage_of(json!({
+            "output_tokens": 5,
+            "output_tokens_details": {"thinking_tokens": 39},
+        }));
+        assert_eq!(
+            (unreadable.output_tokens, unreadable.reasoning_tokens),
+            (None, Some(39)),
+            "more thinking than output leaves the output unknown rather than wrapped"
+        );
     }
 }

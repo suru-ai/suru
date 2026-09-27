@@ -259,6 +259,8 @@ fn scoped_metadata(description: &str) -> Option<SafeMetadata> {
         (" (project, gitignored)", "Workspace"),
         (" (user)", "User"),
         (" (plugin)", "Plugin"),
+        // The Skills a signed-in user enabled on claude.ai, which the CLI syncs down (2.1.275+).
+        (" (claude.ai sync)", "claude.ai"),
     ] {
         if let Some(description) = description.strip_suffix(suffix) {
             return Some(SafeMetadata {

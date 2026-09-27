@@ -99,7 +99,7 @@ async fn a_cli_below_the_suggested_version_warns_without_withholding_models() {
         );
     };
     assert!(
-        message.contains("Claude Code CLI 2.1.236")
+        message.contains("Claude Code CLI 2.1.279")
             && message.contains("may have compatibility issues")
             && message.contains(CLAUDE_SUGGESTED_VERSION),
         "the warning names the reported and suggested versions, got: {message}"
