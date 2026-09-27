@@ -1280,14 +1280,7 @@ impl ProviderOrchestrator {
         if let Some(message) = self.disabled_provider_failure(session_id) {
             return Err(self.fail_prompt(session_id, prompt_id, message));
         }
-        if let Some(commands) = self
-            .actors
-            .lock()
-            .expect("Provider actor registry lock is not poisoned")
-            .entries
-            .get(&session_id)
-            .map(|actor| actor.commands.clone())
-        {
+        if let Some(commands) = self.actor_commands(session_id) {
             return Ok(commands);
         }
         let runtime = match self.resolve_runtime(session_id) {
@@ -1386,16 +1379,36 @@ impl ProviderOrchestrator {
 
     fn schedule(&self, session_id: SessionId, command: ProviderCommand) -> Result<()> {
         let actor = self
-            .actors
-            .lock()
-            .expect("Provider actor registry lock is not poisoned")
-            .entries
-            .get(&session_id)
-            .map(|actor| actor.commands.clone())
+            .actor_commands(session_id)
             .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
         actor
             .send(command)
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
+    }
+
+    /// Schedules `command` on the Provider actor that holds `session_id`'s
+    /// conversation: the Session's own, or that of its nearest ancestor that
+    /// owns one, as a native Subagent's conversation rides its spawner's.
+    fn schedule_on_actor_owner(
+        &self,
+        session_id: SessionId,
+        command: ProviderCommand,
+    ) -> Result<()> {
+        let owner = self
+            .sessions
+            .actor_owner(session_id)
+            .ok_or_else(|| anyhow::anyhow!("Session has no Provider actor"))?;
+        self.schedule(owner, command)
+    }
+
+    /// The command channel of the Provider actor `owner` owns, if one runs.
+    fn actor_commands(&self, owner: SessionId) -> Option<mpsc::UnboundedSender<ProviderCommand>> {
+        self.actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .entries
+            .get(&owner)
+            .map(|actor| actor.commands.clone())
     }
 
     pub(crate) async fn submit_questionnaire(
@@ -1404,10 +1417,9 @@ impl ProviderOrchestrator {
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
     ) -> Result<(), String> {
-        let actor_id = self.sessions.actor_session(session_id);
         let (response, received) = oneshot::channel();
-        self.schedule(
-            actor_id,
+        self.schedule_on_actor_owner(
+            session_id,
             ProviderCommand::SubmitQuestionnaire {
                 target: session_id,
                 id,
@@ -1427,10 +1439,9 @@ impl ProviderOrchestrator {
         id: crate::protocol::ApprovalId,
         decision: crate::protocol::Decision,
     ) -> Result<(), String> {
-        let actor_id = self.sessions.actor_session(session_id);
         let (response, received) = oneshot::channel();
-        self.schedule(
-            actor_id,
+        self.schedule_on_actor_owner(
+            session_id,
             ProviderCommand::SubmitDecision {
                 target: session_id,
                 id,
@@ -1448,15 +1459,10 @@ impl ProviderOrchestrator {
         &self,
         update: ApprovalPostureUpdate,
     ) -> Result<ProviderPostureApplication, String> {
-        let session_id = update.session_id;
-        let actor_id = self.sessions.actor_session(session_id);
         let commands = self
-            .actors
-            .lock()
-            .expect("Provider actor registry lock is not poisoned")
-            .entries
-            .get(&actor_id)
-            .map(|actor| actor.commands.clone());
+            .sessions
+            .actor_owner(update.session_id)
+            .and_then(|owner| self.actor_commands(owner));
         let Some(commands) = commands else {
             self.sessions.mark_approval_posture_application(
                 update,

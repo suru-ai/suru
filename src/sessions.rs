@@ -23,6 +23,7 @@ use crate::storage::{
     UnreadableStoredSession,
 };
 
+mod actor_owner;
 mod catalog;
 mod checkouts;
 pub(crate) use checkouts::CheckoutActivity;
@@ -151,6 +152,13 @@ struct SessionRecord {
     /// The Provider's own identity for the Subagent this Session is, on a
     /// Subagent's child Session alone.
     subagent_identity: Option<StoredSubagentIdentity>,
+    /// Whether this Subagent's Session was given a Provider actor of its own
+    /// rather than riding the actor of its nearest ancestor that owns one, as
+    /// a native Subagent's does. A brokered Subagent's will be (ADR 0035);
+    /// nothing gives one yet. A top-level Session owns its actor by having no
+    /// parent, so this says nothing of one: ask
+    /// [`SessionRecord::owns_provider_actor`] instead.
+    own_provider_actor: bool,
     /// The Watches this Session's Agent left running, by the Provider's own
     /// identity for each. They are never stored: every Watch dies with the
     /// Provider process that runs it, so a Session read back from storage has

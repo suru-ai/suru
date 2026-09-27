@@ -395,17 +395,6 @@ impl SessionStore {
         withdrawn.status = PromptStatus::Cancelled;
         Ok(InterruptTarget::WithdrewPrompt(Box::new(withdrawn)))
     }
-
-    /// The Session whose Provider actor holds this one's conversation: a
-    /// Subagent's work runs over the connection its root ancestor owns, and
-    /// every other Session is its own.
-    pub(crate) fn actor_session(&self, session_id: SessionId) -> SessionId {
-        let state = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned");
-        state.root_of(session_id)
-    }
 }
 
 impl SessionStoreState {

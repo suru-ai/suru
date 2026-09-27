@@ -521,6 +521,8 @@ impl SessionStore {
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
                 subagent_identity: None,
+                // A top-level Session owns its actor by having no parent.
+                own_provider_actor: false,
                 watches: HashMap::new(),
             },
         );

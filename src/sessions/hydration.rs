@@ -424,6 +424,8 @@ pub(super) fn restored_record(
         summary: persisted.summary,
         resume_states: persisted.resume_states,
         subagent_identity: persisted.subagent_identity,
+        // Nothing stored yet gives a Subagent's Session an actor of its own.
+        own_provider_actor: false,
         updates,
         next_prompt_order,
         steer_targets: Default::default(),

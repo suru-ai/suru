@@ -174,6 +174,8 @@ impl SessionStore {
                 selection_retry_prompt: None,
                 resume_states: HashMap::new(),
                 subagent_identity: Some(identity.clone()),
+                // A native Subagent's conversation rides its spawner's actor.
+                own_provider_actor: false,
                 watches: HashMap::new(),
             },
         );
