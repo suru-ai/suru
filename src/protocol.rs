@@ -1298,6 +1298,23 @@ pub struct ServingSettings {
     pub bind_address: IpAddr,
 }
 
+/// Whether Provider Sessions are offered the Broker: Suru's own Tools, served
+/// on the Server's loopback listener, through which an Agent reaches any
+/// Provider Suru hosts. Off means no Provider start is handed the endpoint and
+/// the endpoint answers nothing; a Provider already running keeps what it was
+/// handed until its next launch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerSettings {
+    pub enabled: bool,
+}
+
+impl Default for BrokerSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// The addresses a Serving user chose to advertise in a freshly issued
 /// Invite. They are concrete socket addresses because this first Pairing
 /// transport has no discovery or name-resolution contract of its own.
@@ -1480,6 +1497,7 @@ pub struct EffectiveSettings {
     pub worktree: WorktreeSettings,
     pub provider: ProviderSettings,
     pub serving: ServingSettings,
+    pub broker: BrokerSettings,
 }
 
 /// The Provider-native controls that govern which tool uses require an
@@ -1723,6 +1741,9 @@ pub enum SettingMutation {
     },
     ServingBindAddress {
         value: Option<IpAddr>,
+    },
+    BrokerEnabled {
+        value: Option<bool>,
     },
 }
 

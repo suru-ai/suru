@@ -77,6 +77,7 @@ const PROVIDER_CLAUDE_PERMISSION_MODE: &str = "provider.claude.permissionMode";
 const SERVING_ENABLED: &str = "serving.enabled";
 const SERVING_PORT: &str = "serving.port";
 const SERVING_BIND_ADDRESS: &str = "serving.bindAddress";
+const BROKER_ENABLED: &str = "broker.enabled";
 
 /// What a Config Document that does not exist yet is edited as.
 const EMPTY_DOCUMENT: &str = "{}\n";
@@ -604,6 +605,7 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::ServingBindAddress { value } => {
             *value == Some(settings.serving.bind_address)
         }
+        SettingMutation::BrokerEnabled { value } => *value == Some(settings.broker.enabled),
     }
 }
 
@@ -1443,6 +1445,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             })
         },
     },
+    SettingDescriptor {
+        key: BROKER_ENABLED,
+        label: "Broker",
+        description: "Whether every Provider Session is offered the Broker's Tools",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "true",
+                build_mutation: || SettingMutation::BrokerEnabled { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                build_mutation: || SettingMutation::BrokerEnabled { value: Some(false) },
+            },
+        ]),
+        reset: SettingMutation::BrokerEnabled { value: None },
+        apply: |settings, value| {
+            apply_value(value, |enabled| {
+                settings.broker.enabled = enabled;
+            })
+        },
+    },
 ];
 
 /// The Setting through which the user turns one Provider on or off, which is
@@ -1645,6 +1670,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::ServingEnabled { value } => (SERVING_ENABLED, pinned(value)),
         SettingMutation::ServingPort { value } => (SERVING_PORT, pinned(value)),
         SettingMutation::ServingBindAddress { value } => (SERVING_BIND_ADDRESS, pinned(value)),
+        SettingMutation::BrokerEnabled { value } => (BROKER_ENABLED, pinned(value)),
     }
 }
 
@@ -2174,6 +2200,7 @@ mod tests {
                 "one of false or true".to_owned(),
                 "a port from 0 to 65535".to_owned(),
                 "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),
+                "one of true or false".to_owned(),
             ]
         );
     }

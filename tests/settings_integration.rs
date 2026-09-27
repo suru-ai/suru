@@ -1843,6 +1843,45 @@ async fn claude_permission_mode_defaults_pins_through_the_config_document_and_re
     server.shutdown().await.unwrap();
 }
 
+/// The Broker is offered unless the user says otherwise, and turning it off is
+/// a pin like any other: it lands in the Config Document, reads back, and a
+/// reset lets the built-in default resume.
+#[tokio::test]
+async fn broker_enabled_defaults_on_pins_through_the_config_document_and_resets() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-broker-enabled")
+            .unwrap()
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .unwrap();
+    let (client, initial) = attach(state_dir.path(), "settings-broker-enabled").await;
+    assert!(
+        initial.settings.broker.enabled,
+        "every Provider Session is offered the Broker unless the user turns it off"
+    );
+
+    let pinned = client
+        .mutate_setting(SettingMutation::BrokerEnabled { value: Some(false) })
+        .await
+        .unwrap();
+    assert!(!pinned.settings.broker.enabled);
+    assert_eq!(pinned.pinned, ["broker.enabled"]);
+    assert!(config_document(config_dir.path()).contains("\"broker\": {"));
+    assert!(config_document(config_dir.path()).contains("\"enabled\": false"));
+
+    let reset = client
+        .mutate_setting(SettingMutation::BrokerEnabled { value: None })
+        .await
+        .unwrap();
+    assert!(reset.settings.broker.enabled);
+    assert_eq!(reset.pinned, [] as [String; 0]);
+    drop(client);
+    server.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn an_unset_keeps_the_comments_that_outlive_the_pin_it_removes() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

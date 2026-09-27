@@ -676,6 +676,41 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
     );
 }
 
+/// The Broker is still finding its shape, so the Setting that turns it off is
+/// met under the Experimental tab: on until the reader says otherwise, and
+/// cycled off like any other Server Setting.
+#[test]
+fn the_broker_setting_stands_under_the_experimental_tab_and_is_on_by_default() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_experimental_tab(&mut application);
+
+    let broker = row(&application, "Broker");
+    assert!(
+        broker.contains("true [default]"),
+        "the Broker is offered until the reader turns it off: {broker:?}"
+    );
+    let descriptor = suru::settings::SCHEMA
+        .iter()
+        .find(|descriptor| descriptor.key == "broker.enabled")
+        .expect("the schema declares broker.enabled");
+    assert_eq!(descriptor.group, SettingGroup::Experimental);
+    assert_eq!(descriptor.scope, SettingScope::Server);
+
+    focus_setting(&mut application, "broker.enabled");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::BrokerEnabled { value: Some(false) }),
+        "Space cycles the Broker off, as it cycles any other Setting"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    assert!(
+        !has_row(&application, "Broker"),
+        "an experimental Setting is not also a General one"
+    );
+}
+
 /// The tab bar is a surface the reader can point at, and pointing at a label
 /// is the same arrival as walking onto it: the tab that presents the Providers
 /// re-reads their Availability however the reader got there — the reader
