@@ -5,19 +5,25 @@
 //! longest call, and approve-by-default for its Tools so no call waits on a reviewer or an
 //! elicitation. Nothing of the server is kept with the thread, so every `thread/resume` carries it
 //! again — with the token its own launch was handed. With the Broker turned off neither carries it.
+//!
+//! A Codex Subagent a Session on another Provider spawns through the Broker starts its thread under
+//! the Codex value ADR 0036's table gives for that Session's posture.
 
 use std::sync::Arc;
 
+use crate::provider_support::ControlledProvider;
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
-use serde_json::Value;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
-        SessionId, TurnStatus,
+        AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, ApprovalPosture,
+        ClaudePermissionMode, CreateSessionRequest, InitialPrompt, ModelAvailability,
+        ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
     },
-    provider::CodexRuntime,
+    provider::{BrokerHandoff, CodexRuntime},
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -225,4 +231,255 @@ async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_
     }
 
     resumed.shutdown().await;
+}
+
+/// An app-server that lists one Model and starts a thread and a Turn on it, answering each request
+/// by the id it came with, since discovery and the Subagent's own launch are processes of their own.
+const BROKERED_THREAD: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{}}'
+      ;;
+    *'"method":"model/list"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"brokered-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"brokered-turn"}}}'
+      ;;
+  esac
+done
+"#;
+
+/// The MCP client an Agent's harness is, reduced to what spawning a Subagent takes: the
+/// handshake, then Tool calls, posted to the Broker endpoint under the bearer token a Provider
+/// start carried.
+struct BrokerClient {
+    http: reqwest::Client,
+    endpoint: String,
+    authorization: String,
+    next_id: u64,
+}
+
+impl BrokerClient {
+    async fn handed(handoff: &BrokerHandoff) -> Self {
+        let mut client = Self {
+            http: reqwest::Client::new(),
+            endpoint: handoff.endpoint().to_string(),
+            authorization: handoff.token().bearer(),
+            next_id: 0,
+        };
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "suru-codex-broker-test", "version": "0" },
+                }),
+            )
+            .await;
+        let initialized = client
+            .post(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .await;
+        assert_eq!(initialized.status(), reqwest::StatusCode::ACCEPTED);
+        client
+    }
+
+    async fn post(&self, message: &Value) -> reqwest::Response {
+        self.http
+            .post(&self.endpoint)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header(AUTHORIZATION, &self.authorization)
+            .json(message)
+            .send()
+            .await
+            .expect("reach the Broker endpoint")
+    }
+
+    /// Sends one request and answers with its JSON-RPC result, read from a JSON body or from the
+    /// event stream the endpoint may answer with instead.
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let response = self
+            .post(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{method} is answered"
+        );
+        let body = response.text().await.expect("read the Broker's answer");
+        let answer = serde_json::from_str::<Value>(&body)
+            .ok()
+            .or_else(|| {
+                body.split("\n\n").find_map(|event| {
+                    let data = event
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .map(str::trim_start)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    serde_json::from_str::<Value>(&data)
+                        .ok()
+                        .filter(|message| message["id"] == json!(id))
+                })
+            })
+            .unwrap_or_else(|| panic!("{method} is answered with JSON-RPC: {body}"));
+        answer
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("{method} was answered with an error: {answer}"))
+    }
+
+    async fn spawn_subagent(&mut self, arguments: Value) -> SessionId {
+        let result = self
+            .request(
+                "tools/call",
+                json!({ "name": "spawn_subagent", "arguments": arguments }),
+            )
+            .await;
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "spawn_subagent answers: {result}"
+        );
+        serde_json::from_value(result["structuredContent"]["session_id"].clone())
+            .unwrap_or_else(|_| panic!("the answer names the Subagent's Session: {result}"))
+    }
+}
+
+#[tokio::test]
+async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_its_thread_never_asking_with_full_access()
+ {
+    let codex = ScriptedCodex::new(BROKERED_THREAD);
+    let opus = AgentSelection {
+        provider: ProviderId::new("claude"),
+        model: ModelId::new("opus"),
+        options: Vec::new(),
+    };
+    let (claude_runtime, mut claude) = ControlledProvider::with_provider(
+        ProviderId::new("claude"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("claude"),
+            id: ModelId::new("opus"),
+            display_name: "Opus".to_owned(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{"provider":{"claude":{"permissionMode":"bypassPermissions"}}}"#,
+    )
+    .expect("write Config Document");
+    let channel = "codex-broker-derived-posture";
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), channel)
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        vec![
+            claude_runtime,
+            Arc::new(CodexRuntime::new(codex.executable())),
+        ],
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: Some(opus.clone()),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Hand the Codex seam to a Codex Agent".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Claude Session");
+    let start = timeout(PROGRESS_DEADLINE, claude.next_start())
+        .await
+        .expect("the Claude Session's Provider is asked to start");
+    assert_eq!(
+        start.approval_posture(),
+        Some(&ApprovalPosture::Claude {
+            permission_mode: ClaudePermissionMode::BypassPermissions,
+        }),
+        "the Claude Session follows the bypassPermissions Setting"
+    );
+    let handoff = start
+        .broker()
+        .cloned()
+        .expect("the Claude Session is handed the Broker");
+    let mut parent = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: opus,
+    });
+    timeout(PROGRESS_DEADLINE, parent.next_turn())
+        .await
+        .expect("the Claude Session's first Turn reaches its Provider")
+        .succeed();
+
+    let mut broker = BrokerClient::handed(&handoff).await;
+    broker
+        .spawn_subagent(json!({
+            "provider": "codex",
+            "model": "gpt-fixture",
+            "name": "Researcher",
+            "description": "Survey the Codex seam",
+            "prompt": "Find where Codex plugs into Suru.",
+        }))
+        .await;
+
+    codex.wait_for_method("turn/start").await;
+    let requests = codex.requests();
+    let params_of = |method: &str| {
+        requests
+            .iter()
+            .find(|request| request["method"] == method)
+            .unwrap_or_else(|| panic!("Suru sent {method}: {:?}", codex.methods()))["params"]
+            .clone()
+    };
+    let thread_start = params_of("thread/start");
+    assert_eq!(
+        (&thread_start["approvalPolicy"], &thread_start["sandbox"]),
+        (&json!("never"), &json!("danger-full-access")),
+        "the Subagent's thread starts under Codex's value at bypassPermissions' level, not the \
+         Codex Setting: {thread_start}"
+    );
+    let turn_start = params_of("turn/start");
+    assert_eq!(
+        (
+            &turn_start["approvalPolicy"],
+            &turn_start["sandboxPolicy"]["type"]
+        ),
+        (&json!("never"), &json!("dangerFullAccess")),
+        "and its Delegation's Turn runs under the same: {turn_start}"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    drop(parent);
 }
