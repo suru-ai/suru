@@ -44,6 +44,8 @@ use crate::{
     support::{create_session, read_session, read_session_until},
 };
 
+mod posture;
+
 /// The MCP revision the test client speaks, as the harnesses Suru hosts do
 /// today.
 const PROTOCOL_VERSION: &str = "2025-06-18";
