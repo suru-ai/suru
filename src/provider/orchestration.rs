@@ -1791,6 +1791,47 @@ impl ProviderOrchestrator {
             .collect()
     }
 
+    /// Stops the brokered Subagent `subagent` for the Agent of `caller`, as
+    /// the user interrupting its Session would: its Turn and everything
+    /// working beneath it, through its own actor and theirs. The stop is the
+    /// Subagent's own rather than one from above, so its delegating Agent is
+    /// the one to hear of it (CONTEXT.md: Subagent Report). Answers whether it
+    /// was working, once every Provider asked has taken the stop; its Turn
+    /// settles at its Provider's own boundary.
+    ///
+    /// Refused, in words the calling Agent reads, for a Session that is no
+    /// brokered Subagent beneath `caller`, and for a stop its Provider did
+    /// not take.
+    pub(crate) async fn stop_brokered_subagent(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+    ) -> Result<bool, String> {
+        if !self.sessions.is_brokered_subagent_beneath(caller, subagent) {
+            return Err(format!(
+                "`{subagent}` names no Subagent spawned through the Broker beneath you: \
+                 stop_subagent takes a session_id spawn_subagent answered you, or one of your \
+                 Subagents, with."
+            ));
+        }
+        match self.interrupt_session(subagent).await {
+            Ok(_) => Ok(true),
+            Err(InterruptSessionError::NothingToInterrupt) => Ok(false),
+            Err(InterruptSessionError::SessionNotFound) => {
+                Err("The Subagent's Session no longer exists on this Suru server.".to_owned())
+            }
+            Err(
+                InterruptSessionError::ProviderFailure(message)
+                | InterruptSessionError::Storage(message),
+            ) => Err(format!("Suru could not stop the Subagent: {message}")),
+            // A brokered Subagent owns its actor, so its interrupt never
+            // asks its Provider to stop one Subagent of its own.
+            Err(InterruptSessionError::SubagentStopUnsupported) => {
+                Err("Suru could not stop the Subagent: its Provider offers no stop.".to_owned())
+            }
+        }
+    }
+
     /// Fails a Turn whose Provider actor could not be reached, settling whatever
     /// it left in flight. It carries no trailing output because it has no
     /// normalizer to drain: an actor stays registered until it has stopped, so

@@ -597,13 +597,19 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
             .iter()
             .map(|tool| tool["name"].as_str().expect("every Tool is named"))
             .collect::<Vec<_>>(),
-        ["list_providers", "spawn_subagent", "read_subagent"],
+        [
+            "list_providers",
+            "spawn_subagent",
+            "read_subagent",
+            "stop_subagent"
+        ],
         "the Broker offers the Tools it has so far, in its own order"
     );
     for (tool, answers_with, read_only) in [
         (&tools[0], "\"providers\"", true),
         (&tools[1], "\"session_id\"", false),
         (&tools[2], "\"status\"", true),
+        (&tools[3], "\"stopped\"", false),
     ] {
         assert_eq!(tool["inputSchema"]["type"], json!("object"));
         assert!(
@@ -618,6 +624,11 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         tools[1]["inputSchema"]["required"],
         json!(["provider", "model", "name", "description", "prompt"]),
         "a spawn names its target and its Delegation, and may leave its Model Options out"
+    );
+    assert_eq!(
+        tools[2]["inputSchema"]["required"],
+        json!(["id"]),
+        "a stop names the Subagent it stops"
     );
 
     let listing = client.list_providers().await;

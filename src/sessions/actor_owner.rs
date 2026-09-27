@@ -53,6 +53,26 @@ impl SessionStore {
             .expect("Session store lock is not poisoned")
             .actor_owners_beneath(session_id)
     }
+
+    /// Whether `subagent` is a brokered Subagent's Session beneath
+    /// `session_id`, at any depth: one the Broker spawned for the Agent of
+    /// `session_id` or of a Subagent beneath it. `session_id` itself never
+    /// is.
+    pub(crate) fn is_brokered_subagent_beneath(
+        &self,
+        session_id: SessionId,
+        subagent: SessionId,
+    ) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state
+            .sessions
+            .get(&subagent)
+            .is_some_and(SessionRecord::is_brokered_subagent)
+            && state.actor_owners_beneath(session_id).contains(&subagent)
+    }
 }
 
 impl SessionStoreState {
@@ -408,6 +428,24 @@ mod tests {
         );
         assert_eq!(store.actor_owners_beneath(grandchild_id), []);
 
+        for (session, subagent, beneath) in [
+            (top_level_id, child_id, true),
+            (top_level_id, grandchild_id, true),
+            (child_id, grandchild_id, true),
+            (native_id, beneath_native_id, true),
+            (top_level_id, native_id, false),
+            (top_level_id, riding_child_id, false),
+            (grandchild_id, child_id, false),
+            (child_id, child_id, false),
+            (native_id, child_id, false),
+            (top_level_id, SessionId::new(), false),
+        ] {
+            assert_eq!(
+                store.is_brokered_subagent_beneath(session, subagent),
+                beneath,
+                "{subagent} is a brokered Subagent beneath {session}: {beneath}"
+            );
+        }
         writer.shutdown().await.unwrap();
     }
 

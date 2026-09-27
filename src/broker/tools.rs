@@ -26,12 +26,17 @@ pub(super) enum BrokerTool {
     ListProviders,
     SpawnSubagent,
     ReadSubagent,
+    StopSubagent,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 3] =
-        [Self::ListProviders, Self::SpawnSubagent, Self::ReadSubagent];
+    pub(super) const ALL: [Self; 4] = [
+        Self::ListProviders,
+        Self::SpawnSubagent,
+        Self::ReadSubagent,
+        Self::StopSubagent,
+    ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
@@ -42,6 +47,7 @@ impl BrokerTool {
             Self::ListProviders => "list_providers",
             Self::SpawnSubagent => "spawn_subagent",
             Self::ReadSubagent => "read_subagent",
+            Self::StopSubagent => "stop_subagent",
         }
     }
 
@@ -50,6 +56,7 @@ impl BrokerTool {
             Self::ListProviders => "List Providers",
             Self::SpawnSubagent => "Spawn Subagent",
             Self::ReadSubagent => "Read Subagent",
+            Self::StopSubagent => "Stop Subagent",
         }
     }
 
@@ -61,6 +68,7 @@ impl BrokerTool {
             Self::ListProviders => LIST_PROVIDERS_DESCRIPTION,
             Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
             Self::ReadSubagent => READ_SUBAGENT_DESCRIPTION,
+            Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
         }
     }
 
@@ -110,7 +118,7 @@ impl BrokerTool {
                 "required": ["provider", "model", "name", "description", "prompt"],
                 "additionalProperties": false,
             }),
-            Self::ReadSubagent => json!({
+            Self::ReadSubagent | Self::StopSubagent => json!({
                 "type": "object",
                 "properties": {
                     "id": {
@@ -132,7 +140,7 @@ impl BrokerTool {
     pub(super) fn is_read_only(self) -> bool {
         match self {
             Self::ListProviders | Self::ReadSubagent => true,
-            Self::SpawnSubagent => false,
+            Self::SpawnSubagent | Self::StopSubagent => false,
         }
     }
 }
@@ -188,6 +196,17 @@ once settled, and null where Suru never learned when it ended; and \
 — its final answer once settled — or null when it has written none. An id \
 naming no Subagent spawned with spawn_subagent by you or by a Subagent beneath \
 you is refused.";
+
+const STOP_SUBAGENT_DESCRIPTION: &str = "\
+Stop a Subagent spawned with spawn_subagent — by you, or by a Subagent beneath \
+you — while it works: it stops at once, along with anything it delegated in \
+turn, asking no one. Takes \"id\", the Subagent's Session id as spawn_subagent \
+answered with it. Answers with JSON of the shape {\"session_id\": \"...\", \
+\"stopped\": true} once its Provider has been told to stop, or \
+{\"session_id\": \"...\", \"stopped\": false, \"reason\": \"...\"} when it \
+was not working, having already settled. Its row in your Transcript settles as \
+stopped. An id that names no Subagent spawned through the Broker beneath you is \
+refused.";
 
 /// One call of a Tool: who is calling, and the arguments as the Agent sent
 /// them.
@@ -275,6 +294,24 @@ impl BrokerTools {
                 Ok(json!({ "session_id": session_id }))
             }
             BrokerTool::ReadSubagent => self.read_subagent(call),
+            BrokerTool::StopSubagent => {
+                let subagent = StopArguments::read(&call.arguments)?.id;
+                let stopped = self
+                    .providers
+                    .stop_brokered_subagent(call.caller.session_id(), subagent)
+                    .await
+                    .map_err(ToolRefusal)?;
+                Ok(if stopped {
+                    json!({ "session_id": subagent, "stopped": true })
+                } else {
+                    json!({
+                        "session_id": subagent,
+                        "stopped": false,
+                        "reason": "The Subagent was not working: its latest work had already \
+                            settled, so there was nothing to stop.",
+                    })
+                })
+            }
         }
     }
 
@@ -380,6 +417,43 @@ impl From<TurnStatus> for SubagentStatus {
             TurnStatus::Failed => Self::Failed,
             TurnStatus::Interrupted => Self::Stopped,
         }
+    }
+}
+
+/// What `stop_subagent` was called with: the one Subagent to stop.
+#[derive(Debug, Eq, PartialEq)]
+struct StopArguments {
+    id: SessionId,
+}
+
+impl StopArguments {
+    const TAKES: [&'static str; 1] = ["id"];
+
+    fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
+        if let Some(unknown) = arguments
+            .keys()
+            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
+        {
+            return Err(ToolRefusal::new(format!(
+                "stop_subagent takes no argument `{unknown}`; it takes `id`."
+            )));
+        }
+        let id = match arguments.get("id") {
+            Some(Value::String(id)) => id,
+            None | Some(Value::Null) => {
+                return Err(ToolRefusal::new("stop_subagent needs `id`."));
+            }
+            Some(_) => return Err(ToolRefusal::new("stop_subagent's `id` must be a string.")),
+        };
+        let id = uuid::Uuid::parse_str(id.trim()).map_err(|_| {
+            ToolRefusal::new(format!(
+                "`{id}` is not a Session id; give stop_subagent the session_id spawn_subagent \
+                 answered with."
+            ))
+        })?;
+        Ok(Self {
+            id: SessionId::from_uuid(id),
+        })
     }
 }
 
@@ -980,6 +1054,53 @@ mod tests {
             assert_eq!(tool.input_schema()["type"], json!("object"));
         }
         assert_eq!(BrokerTool::named("spawn_everything"), None);
+    }
+
+    #[test]
+    fn stop_arguments_are_read_as_their_schema_gives_them() {
+        let id = SessionId::new();
+        assert_eq!(
+            StopArguments::read(&options(json!({ "id": id }))),
+            Ok(StopArguments { id })
+        );
+        for (value, says) in [
+            (json!({}), "needs `id`"),
+            (json!({ "id": null }), "needs `id`"),
+            (json!({ "id": 7 }), "`id` must be a string"),
+            (json!({ "id": "the researcher" }), "is not a Session id"),
+            (
+                json!({ "id": id, "force": true }),
+                "takes no argument `force`",
+            ),
+        ] {
+            let refusal = StopArguments::read(&options(value))
+                .expect_err("the arguments are refused")
+                .to_string();
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn stop_subagents_schema_requires_what_its_description_says_it_takes() {
+        let schema = BrokerTool::StopSubagent.input_schema();
+        for argument in StopArguments::TAKES {
+            assert!(
+                schema["properties"]
+                    .as_object()
+                    .is_some_and(|properties| properties.contains_key(argument)),
+                "the schema takes {argument}"
+            );
+            assert!(
+                STOP_SUBAGENT_DESCRIPTION.contains(&format!("\"{argument}\"")),
+                "the description says what {argument} is"
+            );
+        }
+        assert_eq!(schema["required"], json!(StopArguments::TAKES));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(
+            !BrokerTool::StopSubagent.is_read_only(),
+            "a stop changes what Suru holds"
+        );
     }
 
     /// Codex's catalog with one Model that runs, carrying a select option

@@ -5,9 +5,57 @@
 //! own — and an interrupt of any Session above it, which carries down to
 //! everything beneath. None of them asks before acting.
 
-use suru::provider::{ProviderWatchId, ProviderWatchOutcome};
+use suru::provider::{ProviderSubagentId, ProviderWatchId, ProviderWatchOutcome};
 
 use super::*;
+
+impl McpClient {
+    /// `stop_subagent`'s answer for `subagent`, read from the structured
+    /// content the call carries.
+    async fn stop_subagent(&mut self, subagent: SessionId) -> Value {
+        let result = self
+            .call_tool("stop_subagent", json!({ "id": subagent }))
+            .await;
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "stop_subagent answers: {result}"
+        );
+        result["structuredContent"].clone()
+    }
+}
+
+/// The brokered Subagent's own Provider, started on `provider`'s double, with
+/// the Broker handoff its start carried, and its first Turn taken up — for a
+/// Subagent that delegates in turn.
+async fn run_handed_child(
+    provider: &mut ControlledProvider,
+    selection: AgentSelection,
+) -> (ControlledProviderSession, BrokerHandoff) {
+    let start = next_start(provider).await;
+    let handoff = start
+        .broker()
+        .cloned()
+        .expect("a brokered Subagent is handed the Broker too");
+    let mut child = start.succeed(AgentIdentity {
+        agent: AgentId::new(format!("{}-agent", selection.provider)),
+        selection,
+    });
+    timeout(PROGRESS_DEADLINE, child.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+    (child, handoff)
+}
+
+/// The Agent Selection a Claude Subagent on Haiku runs under.
+fn haiku_selection() -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("claude"),
+        model: ModelId::new("haiku"),
+        options: Vec::new(),
+    }
+}
 
 /// Asks the Server to interrupt `session_id`, as a client does — the Picker
 /// row's stop of one Subagent included — answering with the raw response.
@@ -58,6 +106,194 @@ async fn row_settled(
     )
     .await;
     row_status(&settled, child)
+}
+
+#[tokio::test]
+async fn stop_subagent_settles_a_brokered_subagents_turn_stopped_and_its_row_with_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-stop-subagent", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+
+    let (answer, ()) = tokio::join!(
+        delegating.client.stop_subagent(child_id),
+        acknowledge_interrupt(&mut child_provider, "the Subagent's own"),
+    );
+    assert_eq!(
+        answer,
+        json!({ "session_id": child_id, "stopped": true }),
+        "the Agent is told the Subagent was stopped"
+    );
+    assert!(
+        delegating.caller_provider.try_next_interrupt().is_none(),
+        "the stop reaches the Subagent alone, never the Turn that spawned it"
+    );
+
+    // The Subagent's Turn settles at its Provider's own boundary, as any
+    // interrupted Turn does, and the row follows it.
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    assert_eq!(
+        first_turn_settled(&descriptor, child_id).await,
+        TurnStatus::Interrupted
+    );
+    let (status, duration_ms) = row_settled(&descriptor, delegating.caller, child_id).await;
+    assert_eq!(status, ActivityStatus::Interrupted, "the row reads Stopped");
+    assert!(
+        duration_ms.is_some(),
+        "a stop is a real settle, so the row says how long the Subagent worked"
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(
+        caller.turns[0].status,
+        TurnStatus::Active,
+        "the caller's own Turn works on"
+    );
+
+    let again = delegating.client.stop_subagent(child_id).await;
+    assert_eq!(again["session_id"], json!(child_id));
+    assert_eq!(
+        again["stopped"],
+        json!(false),
+        "a Subagent that has settled has nothing left to stop"
+    );
+    assert!(
+        again["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not working")),
+        "and the Agent is told why rather than refused: {again}"
+    );
+    assert!(child_provider.try_next_interrupt().is_none());
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn stop_subagent_refuses_anything_but_a_brokered_subagent_beneath_the_caller() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-stop-refusals", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let workspace = delegating.hosted.workspace.path().to_owned();
+
+    // A native Subagent the caller's own Provider spawned.
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: None,
+        })
+        .await;
+    let caller = read_until(
+        &descriptor,
+        delegating.caller,
+        "the native Subagent's row opens",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Subagent { .. }))
+        },
+    )
+    .await;
+    let Some(Activity::Subagent {
+        session_id: native_id,
+        brokered,
+        ..
+    }) = caller
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+    else {
+        unreachable!()
+    };
+    assert!(
+        !*brokered,
+        "a row the caller's own Provider spawned says it is native"
+    );
+    let native_id = *native_id;
+
+    // A brokered Subagent another Session's Agent spawned.
+    let (_other, other_handoff, _other_provider) = start_session(
+        &descriptor,
+        &mut delegating.hosted.codex,
+        &workspace,
+        default_selection(&codex_models()),
+    )
+    .await;
+    let mut other_client = McpClient::handed(&other_handoff);
+    other_client.initialize().await;
+    let foreign_id = other_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (mut foreign_provider, _) =
+        run_child(&mut delegating.hosted.claude, haiku_selection()).await;
+
+    for (id, refused) in [
+        (json!(delegating.caller), "the caller's own Session"),
+        (json!(native_id), "a native Subagent"),
+        (
+            json!(foreign_id),
+            "a brokered Subagent beneath another Session",
+        ),
+        (json!(SessionId::new()), "a Session Suru does not hold"),
+    ] {
+        let refusal = delegating
+            .client
+            .refusal("stop_subagent", json!({ "id": id }))
+            .await;
+        assert!(
+            refusal.contains("names no Subagent spawned through the Broker beneath you"),
+            "{refused} is refused, saying which Subagents may be stopped: {refusal}"
+        );
+    }
+    for (arguments, says) in [
+        (json!({}), "needs `id`"),
+        (json!({ "id": 7 }), "`id` must be a string"),
+        (json!({ "id": "the researcher" }), "is not a Session id"),
+        (
+            json!({ "id": foreign_id, "force": true }),
+            "takes no argument `force`",
+        ),
+    ] {
+        let refusal = delegating.client.refusal("stop_subagent", arguments).await;
+        assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+    }
+
+    // The foreign Subagent's own spawner may stop it, which shows the refusals
+    // above were about the caller rather than the Subagent.
+    let (answer, ()) = tokio::join!(
+        other_client.stop_subagent(foreign_id),
+        acknowledge_interrupt(&mut foreign_provider, "the foreign Subagent's"),
+    );
+    assert_eq!(answer["stopped"], json!(true));
+    assert!(
+        delegating.caller_provider.try_next_interrupt().is_none()
+            && delegating
+                .caller_provider
+                .try_next_subagent_stop()
+                .is_none(),
+        "nothing refused reached a Provider"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
 }
 
 #[tokio::test]
@@ -248,6 +484,74 @@ async fn interrupting_a_monitoring_parent_stops_the_watches_its_brokered_subagen
         row_status(&idle, child_id).0,
         ActivityStatus::Completed,
         "the Subagent's settled row keeps its outcome: only its Watch was stopped"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn stopping_a_brokered_subagent_stops_whatever_it_delegated_in_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-stop-subtree", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, child_handoff) =
+        run_handed_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    // The Subagent's own Agent delegates one level down, through the Broker.
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (mut grandchild_provider, _) =
+        run_child(&mut delegating.hosted.claude, haiku_selection()).await;
+
+    let (answer, (), ()) = tokio::join!(
+        delegating.client.stop_subagent(child_id),
+        acknowledge_interrupt(&mut child_provider, "the Subagent's own"),
+        acknowledge_interrupt(
+            &mut grandchild_provider,
+            "the Subagent it delegated to's own"
+        ),
+    );
+    assert_eq!(answer, json!({ "session_id": child_id, "stopped": true }));
+
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    assert_eq!(
+        first_turn_settled(&descriptor, grandchild_id).await,
+        TurnStatus::Interrupted
+    );
+    assert_eq!(
+        row_settled(&descriptor, child_id, grandchild_id).await.0,
+        ActivityStatus::Interrupted,
+        "the row in the Subagent's own Transcript reads Stopped"
+    );
+    assert_eq!(
+        first_turn_settled(&descriptor, child_id).await,
+        TurnStatus::Interrupted
+    );
+    assert_eq!(
+        row_settled(&descriptor, delegating.caller, child_id)
+            .await
+            .0,
+        ActivityStatus::Interrupted
+    );
+    assert!(
+        delegating.caller_provider.try_next_interrupt().is_none(),
+        "the Session above the stopped Subagent works on"
     );
 
     delegating
