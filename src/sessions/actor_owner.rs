@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_session_of_a_tree_with_one_actor_rides_its_top_level_sessions() {
+    async fn every_session_of_a_tree_with_one_actor_rides_the_top_level_sessions_actor() {
         let directory = tempfile::tempdir().unwrap();
         let top_level = persisted(directory.path(), None);
         let top_level_id = top_level.snapshot.session.id;
@@ -243,8 +243,15 @@ mod tests {
         cycle.snapshot.session.parent = Some(other.snapshot.session.id);
         cycle.summary.session.parent = cycle.snapshot.session.parent;
         let (cycle_id, other_id) = (cycle.snapshot.session.id, other.snapshot.session.id);
-        let (store, writer) =
-            restored(directory.path(), vec![orphan, below_orphan, cycle, other]).await;
+        let mut own_parent = persisted(directory.path(), None);
+        own_parent.snapshot.session.parent = Some(own_parent.snapshot.session.id);
+        own_parent.summary.session.parent = own_parent.snapshot.session.parent;
+        let own_parent_id = own_parent.snapshot.session.id;
+        let (store, writer) = restored(
+            directory.path(),
+            vec![orphan, below_orphan, cycle, other, own_parent],
+        )
+        .await;
 
         assert_eq!(
             store.actor_owner(orphan_id),
@@ -258,6 +265,11 @@ mod tests {
         );
         assert_eq!(store.actor_owner(cycle_id), None, "a cyclic lineage");
         assert_eq!(store.actor_owner(other_id), None, "a cyclic lineage");
+        assert_eq!(
+            store.actor_owner(own_parent_id),
+            None,
+            "a Session that is its own parent"
+        );
         assert_eq!(
             store.actor_owner(SessionId::new()),
             None,
