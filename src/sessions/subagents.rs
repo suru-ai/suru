@@ -1,8 +1,9 @@
 //! Opening a Subagent's child Session — the one Session creation a Prompt does
-//! not drive — beginning each later Turn a resume of the Subagent begins in
-//! it, each opened by the Delegation that began it, adding each Delegation
-//! that steers a Turn still working, and finding the Session a resume
-//! continues by the identity its Provider stored with it at the spawn.
+//! not drive, whichever route spawned the Subagent — beginning each later Turn
+//! a resume of the Subagent begins in it, each opened by the Delegation that
+//! began it, adding each Delegation that steers a Turn still working, and
+//! finding the Session a resume continues by the identity its Provider stored
+//! with it at the spawn.
 
 use std::collections::HashMap;
 
@@ -11,15 +12,16 @@ use tokio::sync::broadcast;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, Delegator, Message, MessageId, MessageRole, MessageStatus, PromptOrder, ProviderId,
-    Session, SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs,
-    SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
+    Activity, AgentSelection, Delegator, Message, MessageId, MessageRole, MessageStatus,
+    ModelAvailability, PromptOrder, ProviderId, Session, SessionApprovalPosture, SessionChange,
+    SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus,
+    SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 use crate::provider::ProviderSubagentId;
-use crate::storage::{PersistedSession, StoredSubagentIdentity};
+use crate::storage::{PersistedSession, StorageSink, StoredSubagentIdentity};
 
 use super::{
-    SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore,
+    SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState,
     projection::active_turn_id,
     settlement::{OpenInterventions, TrailingCommandOutput, settle_in_flight_changes},
 };
@@ -76,123 +78,22 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        if !state.sessions.contains_key(&parent_id) {
-            return Err(anyhow!("Session does not exist on this server instance"));
-        }
-        let session_id = SessionId::new();
-        let turn_id = TurnId::new();
-        let timestamp = state.next_timestamp();
         let parent = state
             .sessions
             .get(&parent_id)
-            .expect("Session existence was checked while holding the store lock");
-        let parent_session = &parent.snapshot.session;
-        let title = match description.trim() {
-            "" => name.trim().to_owned(),
-            described => described.to_owned(),
-        };
-        let delegation = delegation
-            .map(|text| delegation_message(turn_id, delegator(&state.sessions, parent_id), text));
-        let transcript = delegation
-            .iter()
-            .map(|message| TranscriptItem::Message {
-                message_id: message.id,
-            })
-            .collect();
-        let snapshot = SessionSnapshot {
-            title: title.clone(),
-            icon: None,
-            session: Session {
-                checkout: parent_session.checkout.clone(),
-                context_fill: None,
-                id: session_id,
-                execution_directory: parent_session.execution_directory.clone(),
-                workspace: parent_session.workspace.clone(),
-                agent_selection: None,
-                agent_selection_availability: parent_session.agent_selection_availability,
-                approval_posture: parent_session.approval_posture,
-                status: SessionStatus::Active,
-                working_since: Some(timestamp),
-                monitoring_since: None,
-                parent: Some(parent_id),
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        let approval_posture = parent.snapshot.session.approval_posture;
+        Ok(state.open_child_session(
+            &self.storage,
+            parent_id,
+            ChildSession {
+                title: subagent_title(name, description),
+                selection: None,
+                approval_posture,
+                delegation,
+                route: SubagentRoute::Native(identity),
             },
-            revision: SessionRevision::INITIAL,
-            prompts: Vec::new(),
-            turns: vec![Turn {
-                id: turn_id,
-                prompt_id: None,
-                agent: None,
-                status: TurnStatus::Active,
-                // Stamped here rather than by a commit, because the spawn is
-                // the child's creation and no commit delivers its Turn.
-                started_at: Some(timestamp),
-                settled_at: None,
-                last_output_at: None,
-                usage: None,
-                cost: None,
-                cost_basis: None,
-                cost_details: None,
-            }],
-            messages: delegation.into_iter().collect(),
-            activities: Vec::new(),
-            transcript,
-            subagent_interventions: Vec::new(),
-            pending_approvals: Vec::new(),
-            submitting_approvals: Vec::new(),
-            pending_approvals_revision: crate::protocol::SessionRevision(0),
-            watches: Vec::new(),
-            subagent_usage: None,
-            total_cost: None,
-        };
-        let summary = SessionSummary {
-            checkout_state: None,
-            session: snapshot.session.clone(),
-            title,
-            // A child is titled from its spawn description alone: no Errand
-            // derives it a Title, so no Icon ever arrives beside one.
-            icon: None,
-            settled_at: None,
-            standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
-            total_usage: snapshot.total_usage(),
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
-        let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
-        let persisted_summary = summary.clone();
-        state.sessions.insert(
-            session_id,
-            SessionRecord {
-                context_fill_order: None,
-                snapshot: snapshot.clone(),
-                summary,
-                updates,
-                next_prompt_order: PromptOrder(1),
-                steer_targets: HashMap::new(),
-                turn_start_admissions: Default::default(),
-                selection_operations: HashMap::new(),
-                viewed_operations: Default::default(),
-                selection_retry_prompt: None,
-                resume_states: HashMap::new(),
-                subagent_identity: Some(identity.clone()),
-                // A native Subagent's conversation rides its spawner's actor.
-                brokered: false,
-                watches: HashMap::new(),
-            },
-        );
-        self.storage.created(PersistedSession {
-            subagent_identity: Some(identity),
-            ..PersistedSession::created(persisted_summary, snapshot)
-        });
-        // The child begins working the moment it exists, which the listed
-        // root's Working reading has to carry. Its total is derived on the
-        // same terms, so both readings above it are answered from the same
-        // subtree — a child that has consumed nothing yet moves neither.
-        state.reconcile_liveness(&self.storage, session_id);
-        state.reconcile_usage(&self.storage, session_id);
-        Ok(SpawnedSubagentSession {
-            session_id,
-            turn_id,
-        })
+        ))
     }
 
     /// Begins the next Turn in a Subagent's existing Session, for a resume:
@@ -375,10 +276,181 @@ impl SessionStore {
     }
 }
 
+/// Which route spawned a Subagent (CONTEXT.md: Subagent), with what that
+/// route fixes about its Session for good.
+pub(super) enum SubagentRoute {
+    /// Its spawner's own Provider spawned it, over the spawner's Provider
+    /// actor, and named it by this identity.
+    Native(StoredSubagentIdentity),
+}
+
+/// What opening a Subagent's child Session takes beyond its spawner.
+pub(super) struct ChildSession {
+    pub(super) title: String,
+    /// The Agent Selection it runs under, where its spawn chose one: a
+    /// brokered Subagent's. A native Subagent's Model is known only once its
+    /// Provider confirms one, so its Session selects nothing.
+    pub(super) selection: Option<AgentSelection>,
+    pub(super) approval_posture: Option<SessionApprovalPosture>,
+    pub(super) delegation: Option<NormalizedText>,
+    pub(super) route: SubagentRoute,
+}
+
+/// A Subagent's Title: what its spawn described it doing, or its name where
+/// the spawn described nothing.
+pub(super) fn subagent_title(name: &str, description: &str) -> String {
+    match description.trim() {
+        "" => name.trim().to_owned(),
+        described => described.to_owned(),
+    }
+}
+
+impl SessionStoreState {
+    /// Opens a Subagent's child Session under `parent_id`, which the caller
+    /// has found held: parented to it, in its Execution Directory, Workspace
+    /// and checkout, and opened with the one prompt-less Turn the Subagent's
+    /// first stretch of work runs in — headed by the spawn's Delegation, where
+    /// there is one, as a Message from the parent's Agent. The child joins no
+    /// listing and rides no catalog stream, so nothing is announced; it is
+    /// reachable only through the row its spawner's Transcript shows, which
+    /// the caller adds.
+    pub(super) fn open_child_session(
+        &mut self,
+        storage: &StorageSink,
+        parent_id: SessionId,
+        child: ChildSession,
+    ) -> SpawnedSubagentSession {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let timestamp = self.next_timestamp();
+        let parent_session = &self
+            .sessions
+            .get(&parent_id)
+            .expect("the caller found the parent held under the store lock")
+            .snapshot
+            .session;
+        let delegation = child
+            .delegation
+            .map(|text| delegation_message(turn_id, delegator(&self.sessions, parent_id), text));
+        let transcript = delegation
+            .iter()
+            .map(|message| TranscriptItem::Message {
+                message_id: message.id,
+            })
+            .collect();
+        let snapshot = SessionSnapshot {
+            title: child.title.clone(),
+            icon: None,
+            session: Session {
+                checkout: parent_session.checkout.clone(),
+                context_fill: None,
+                id: session_id,
+                execution_directory: parent_session.execution_directory.clone(),
+                workspace: parent_session.workspace.clone(),
+                // A selection a brokered spawn chose was checked against the
+                // Model Catalog as it spawned; a native Subagent's Session
+                // selects nothing and reads as its parent's does.
+                agent_selection_availability: if child.selection.is_some() {
+                    ModelAvailability::Available
+                } else {
+                    parent_session.agent_selection_availability
+                },
+                agent_selection: child.selection,
+                approval_posture: child.approval_posture,
+                status: SessionStatus::Active,
+                working_since: Some(timestamp),
+                monitoring_since: None,
+                parent: Some(parent_id),
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: vec![Turn {
+                id: turn_id,
+                prompt_id: None,
+                agent: None,
+                status: TurnStatus::Active,
+                // Stamped here rather than by a commit, because the spawn is
+                // the child's creation and no commit delivers its Turn.
+                started_at: Some(timestamp),
+                settled_at: None,
+                last_output_at: None,
+                usage: None,
+                cost: None,
+                cost_basis: None,
+                cost_details: None,
+            }],
+            messages: delegation.into_iter().collect(),
+            activities: Vec::new(),
+            transcript,
+            subagent_interventions: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
+            watches: Vec::new(),
+            subagent_usage: None,
+            total_cost: None,
+        };
+        let summary = SessionSummary {
+            checkout_state: None,
+            session: snapshot.session.clone(),
+            title: child.title,
+            // A child is titled from its spawn alone: no Errand derives it a
+            // Title, so no Icon ever arrives beside one.
+            icon: None,
+            settled_at: None,
+            standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
+            total_usage: snapshot.total_usage(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let (subagent_identity, brokered) = match child.route {
+            SubagentRoute::Native(identity) => (Some(identity), false),
+        };
+        let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
+        storage.created(PersistedSession {
+            subagent_identity: subagent_identity.clone(),
+            brokered,
+            ..PersistedSession::created(summary.clone(), snapshot.clone())
+        });
+        self.sessions.insert(
+            session_id,
+            SessionRecord {
+                context_fill_order: None,
+                snapshot,
+                summary,
+                updates,
+                next_prompt_order: PromptOrder(1),
+                steer_targets: HashMap::new(),
+                turn_start_admissions: Default::default(),
+                selection_operations: HashMap::new(),
+                viewed_operations: Default::default(),
+                selection_retry_prompt: None,
+                resume_states: HashMap::new(),
+                subagent_identity,
+                brokered,
+                watches: HashMap::new(),
+            },
+        );
+        // The child begins working the moment it exists, which the listed
+        // root's Working reading has to carry. Its total is derived on the
+        // same terms, so both readings above it are answered from the same
+        // subtree — a child that has consumed nothing yet moves neither.
+        self.reconcile_liveness(storage, session_id);
+        self.reconcile_usage(storage, session_id);
+        SpawnedSubagentSession {
+            session_id,
+            turn_id,
+        }
+    }
+}
+
 /// Names the Agent of `session_id` the way a Delegation it sent names it: by
 /// its Session, and — when that is a Subagent's — by the name the Subagent's
 /// rows carry in its spawner's Transcript.
-fn delegator(sessions: &HashMap<SessionId, SessionRecord>, session_id: SessionId) -> Delegator {
+pub(super) fn delegator(
+    sessions: &HashMap<SessionId, SessionRecord>,
+    session_id: SessionId,
+) -> Delegator {
     let name = sessions
         .get(&session_id)
         .and_then(|record| record.snapshot.session.parent)
@@ -402,7 +474,11 @@ fn delegator(sessions: &HashMap<SessionId, SessionRecord>, session_id: SessionId
 
 /// The Message a Delegation stands as in the Turn it opens or steers. It
 /// arrives whole, so it is complete from the start.
-fn delegation_message(turn_id: TurnId, delegator: Delegator, text: NormalizedText) -> Message {
+pub(super) fn delegation_message(
+    turn_id: TurnId,
+    delegator: Delegator,
+    text: NormalizedText,
+) -> Message {
     Message {
         id: MessageId::new(),
         turn_id,
