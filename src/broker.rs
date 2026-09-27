@@ -41,12 +41,19 @@ pub(crate) const BROKER_PATH: &str = "/broker";
 /// Suru to permit them.
 pub(crate) const BROKER_SERVER_NAME: &str = "suru";
 
-/// How long a harness lets one Broker call run. Each takes its per-server
+/// How long a harness lets one Broker call run, in the milliseconds Claude's
+/// and Copilot's per-server `timeout` take. Each harness takes its per-server
 /// timeout as a hard limit on the whole call — progress extends neither
 /// Claude's nor Codex's, and Copilot's replaces the 180 seconds of silence it
 /// otherwise allows — so this stands above the Broker's longest call, a wait
-/// at its 600-second ceiling (`docs/validation/0408-*`).
-pub(crate) const BROKER_CALL_TIMEOUT: Duration = Duration::from_secs(900);
+/// at its 600-second ceiling (`docs/validation/0408-*`). A `u32`, so every
+/// harness's integer type holds it without a fallible conversion.
+pub(crate) const BROKER_CALL_TIMEOUT_MS: u32 = 900_000;
+
+/// [`BROKER_CALL_TIMEOUT_MS`] as a duration, for a harness that takes the
+/// timeout in other units — Codex's `tool_timeout_sec`.
+pub(crate) const BROKER_CALL_TIMEOUT: Duration =
+    Duration::from_millis(BROKER_CALL_TIMEOUT_MS as u64);
 
 /// Whether `path` addresses the Broker, which is never forwarded to a Peer.
 pub(crate) fn is_broker_path(path: &str) -> bool {

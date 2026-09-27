@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 
 use super::claude_error;
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
     provider::{BrokerHandoff, ProviderError},
 };
 
@@ -106,15 +106,13 @@ fn unwritable(path: &Path, error: &dyn std::fmt::Display) -> ProviderError {
 /// as its `Authorization` header.
 fn mcp_config(handoff: &BrokerHandoff) -> Value {
     let (header, value) = handoff.authorization_header();
-    let timeout_ms = u64::try_from(BROKER_CALL_TIMEOUT.as_millis())
-        .expect("the Broker's call timeout is a whole number of milliseconds a u64 holds");
     json!({
         "mcpServers": {
             BROKER_SERVER_NAME: {
                 "type": "http",
                 "url": handoff.endpoint().as_str(),
                 "headers": { header: value },
-                "timeout": timeout_ms,
+                "timeout": BROKER_CALL_TIMEOUT_MS,
             },
         },
     })

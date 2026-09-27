@@ -21,20 +21,18 @@ use std::collections::HashMap;
 use github_copilot_sdk::{IndexMap, McpHttpServerConfig, McpServerConfig};
 
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
     provider::BrokerHandoff,
 };
 
 /// The server list a Session handed `handoff` is created or resumed with.
 pub(super) fn broker_mcp_servers(handoff: &BrokerHandoff) -> IndexMap<String, McpServerConfig> {
     let (header, value) = handoff.authorization_header();
-    let timeout_ms = i64::try_from(BROKER_CALL_TIMEOUT.as_millis())
-        .expect("the Broker's call timeout is a whole number of milliseconds an i64 holds");
     IndexMap::from_iter([(
         BROKER_SERVER_NAME.to_owned(),
         McpServerConfig::Http(McpHttpServerConfig {
             tools: None,
-            timeout: Some(timeout_ms),
+            timeout: Some(i64::from(BROKER_CALL_TIMEOUT_MS)),
             url: handoff.endpoint().as_str().to_owned(),
             headers: HashMap::from([(header.to_owned(), value)]),
         }),
