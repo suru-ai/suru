@@ -9,25 +9,28 @@
 //! Transcript as a Command. Beside the server list, each of those requests appends a note to
 //! Copilot's own system message saying the Broker is there. With the Broker turned off no Session
 //! is handed the server or the note.
+//!
+//! A Subagent Report that wakes an idle Copilot Agent leaves as a `session.send` in immediate mode
+//! (ADR 0035).
 
 use std::{path::Path, sync::Arc};
 
 use crate::{
-    server_support::PROGRESS_DEADLINE,
+    server_support::{PROGRESS_DEADLINE, broker::McpClient},
     support::{
         LiveTurn, ScriptedCopilot, connect_in, conversation_arms, conversation_fixture,
         opened_session, resumable_conversation_fixture, send_arm, settled_session,
         settled_session_on,
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use suru::{
     managed_client::ManagedClientConfig,
     protocol::{
         Activity, AdmitPromptRequest, ApprovalSubject, CreateSessionRequest, InitialPrompt,
         PromptDelivery, PromptId, TurnStatus,
     },
-    provider::CopilotRuntime,
+    provider::{CopilotRuntime, SubagentReport, SubagentReportOutcome},
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -364,4 +367,84 @@ async fn a_broker_tool_execution_adds_no_command() {
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+/// One agent Message and the loop going idle, for every send to every Session, each send's events
+/// under ids of their own.
+const ANSWERED_EVERY_SEND: &str = r#"      sends=$(( ${sends:-0} + 1 ))
+      event "m$sends" assistant.message '{"messageId":"m'"$sends"'","content":"Done."}'
+      event "i$sends" session.idle '{}'
+"#;
+
+#[tokio::test]
+async fn a_report_leaves_as_an_immediate_session_send_waking_the_idle_parent() {
+    let copilot = conversation_fixture(ANSWERED_EVERY_SEND);
+    let opened = opened_session(&copilot, "copilot-broker-report", "Delegate the survey").await;
+    let parent_id = opened.session_id;
+    settled_session(&opened.client, parent_id, 0).await;
+    let create = copilot.wait_for_request("session.create").await["params"].clone();
+    let parent_sid = create["sessionId"].clone();
+    let server_entry = &create["mcpServers"]["suru"];
+    let mut broker = McpClient::presenting(
+        server_entry["url"].as_str().expect("the Broker's URL"),
+        server_entry["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+
+    // The idle parent's Agent spawns a Copilot Subagent, which the same CLI runs as a Session of
+    // its own, answering its Delegation and going idle.
+    let child_id = broker
+        .spawn_subagent(json!({
+            "provider": "copilot",
+            "model": "claude-fixture",
+            "options": {},
+            "name": "Researcher",
+            "description": "Survey the seams",
+            "prompt": "Survey the seams.",
+        }))
+        .await;
+
+    // Its Report wakes the parent into a Continuation — its third Turn, after its first and the
+    // Continuation that holds the Subagent's row — which the parent's loop settles.
+    let woken = settled_session(&opened.client, parent_id, 2).await;
+    assert_eq!(woken.turns[2].status, TurnStatus::Completed);
+    assert_eq!(woken.turns[2].prompt_id, None, "a Continuation");
+    let Some(Activity::Subagent { duration_ms, .. }) = woken.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child_id),
+    ) else {
+        panic!("the parent's Transcript holds the Subagent's row");
+    };
+    let report = SubagentReport::new(
+        child_id,
+        "Researcher",
+        SubagentReportOutcome::Completed,
+        *duration_ms,
+        Some("Done."),
+    )
+    .to_string();
+    let reporting = copilot
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "session.send")
+        .filter(|request| request["params"]["prompt"] == report.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reporting.len(),
+        1,
+        "the Report leaves once, on a session.send"
+    );
+    assert_eq!(
+        reporting[0]["params"]["sessionId"], parent_sid,
+        "to the parent's own Session"
+    );
+    assert_eq!(
+        reporting[0]["params"]["mode"], "immediate",
+        "in immediate mode, so a loop Copilot is running takes it at once"
+    );
+
+    let server = opened.server;
+    drop(opened.client);
+    server.shutdown().await.expect("shut the server down");
 }
