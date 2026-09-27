@@ -15,7 +15,7 @@ use crate::{
         ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         ProviderUnavailability, SessionId, TurnStatus,
     },
-    provider::{BrokeredSubagentRequest, ProviderOrchestrator},
+    provider::{BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator},
     sessions::{BrokeredReadError, BrokeredSubagentReading, SessionStore},
 };
 
@@ -202,11 +202,13 @@ Stop a Subagent spawned with spawn_subagent — by you, or by a Subagent beneath
 you — while it works: it stops at once, along with anything it delegated in \
 turn, asking no one. Takes \"id\", the Subagent's Session id as spawn_subagent \
 answered with it. Answers with JSON of the shape {\"session_id\": \"...\", \
-\"stopped\": true} once its Provider has been told to stop, or \
-{\"session_id\": \"...\", \"stopped\": false, \"reason\": \"...\"} when it \
-was not working, having already settled. Its row in your Transcript settles as \
-stopped. An id that names no Subagent spawned through the Broker beneath you is \
-refused.";
+\"stopped\": true} when its own work was stopped, once its Provider has been \
+told to stop; its row in your Transcript then settles as stopped. When its own \
+work had already settled it answers {\"session_id\": \"...\", \
+\"stopped\": false, \"reason\": \"...\"}, the reason saying what, if \
+anything, the stop did instead — Subagents it delegated to that still worked, \
+or Watches it left running, are stopped, and its row stays as it settled. An \
+id that names no Subagent spawned through the Broker beneath you is refused.";
 
 /// One call of a Tool: who is calling, and the arguments as the Agent sent
 /// them.
@@ -296,21 +298,12 @@ impl BrokerTools {
             BrokerTool::ReadSubagent => self.read_subagent(call),
             BrokerTool::StopSubagent => {
                 let subagent = StopArguments::read(&call.arguments)?.id;
-                let stopped = self
+                let stop = self
                     .providers
                     .stop_brokered_subagent(call.caller.session_id(), subagent)
                     .await
                     .map_err(ToolRefusal)?;
-                Ok(if stopped {
-                    json!({ "session_id": subagent, "stopped": true })
-                } else {
-                    json!({
-                        "session_id": subagent,
-                        "stopped": false,
-                        "reason": "The Subagent was not working: its latest work had already \
-                            settled, so there was nothing to stop.",
-                    })
-                })
+                Ok(stop_answer(subagent, stop))
             }
         }
     }
@@ -418,6 +411,34 @@ impl From<TurnStatus> for SubagentStatus {
             TurnStatus::Interrupted => Self::Stopped,
         }
     }
+}
+
+/// What `stop_subagent` answers for `subagent`: `stopped` only where its work
+/// was stopped, and otherwise the reason, saying what the stop did instead.
+fn stop_answer(subagent: SessionId, stop: BrokeredStop) -> Value {
+    let reason = match stop {
+        BrokeredStop::StoppedWork => {
+            return json!({ "session_id": subagent, "stopped": true });
+        }
+        BrokeredStop::StoppedDelegatedWork => {
+            "The Subagent's own work had already settled, and its row stays as it settled. The \
+             Subagents it delegated to, which were still working, were stopped."
+        }
+        BrokeredStop::StoppedWatches => {
+            "The Subagent was not working: its latest work had already settled, and its row \
+             stays as it settled. Only the Watches it left running, which could have woken it, \
+             were stopped."
+        }
+        BrokeredStop::WithdrewPrompt => {
+            "The Subagent had not begun: the work waiting to begin it was withdrawn before it \
+             started, so there was nothing running to stop."
+        }
+        BrokeredStop::NothingRunning => {
+            "The Subagent was not working: its latest work had already settled, so there was \
+             nothing to stop."
+        }
+    };
+    json!({ "session_id": subagent, "stopped": false, "reason": reason })
 }
 
 /// What `stop_subagent` was called with: the one Subagent to stop.
@@ -1077,6 +1098,37 @@ mod tests {
                 .expect_err("the arguments are refused")
                 .to_string();
             assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn stop_subagent_says_stopped_only_where_the_subagents_work_was_stopped() {
+        let id = SessionId::new();
+        assert_eq!(
+            stop_answer(id, BrokeredStop::StoppedWork),
+            json!({ "session_id": id, "stopped": true })
+        );
+        for (stop, says) in [
+            (
+                BrokeredStop::StoppedDelegatedWork,
+                "The Subagents it delegated to, which were still working, were stopped",
+            ),
+            (
+                BrokeredStop::StoppedWatches,
+                "Only the Watches it left running",
+            ),
+            (BrokeredStop::WithdrewPrompt, "had not begun"),
+            (BrokeredStop::NothingRunning, "nothing to stop"),
+        ] {
+            let answer = stop_answer(id, stop);
+            assert_eq!(answer["session_id"], json!(id));
+            assert_eq!(answer["stopped"], json!(false), "{stop:?}");
+            assert!(
+                answer["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(says)),
+                "{stop:?} says {says:?}: {answer}"
+            );
         }
     }
 

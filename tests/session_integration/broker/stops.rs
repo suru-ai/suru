@@ -180,6 +180,146 @@ async fn stop_subagent_settles_a_brokered_subagents_turn_stopped_and_its_row_wit
 }
 
 #[tokio::test]
+async fn stop_subagent_on_a_settled_subagent_stops_only_the_watches_it_left_running() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-stop-watches", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::WatchStarted {
+            watch_id: ProviderWatchId::new("watch-tests"),
+            description: "cargo test".to_owned(),
+        })
+        .await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_until(
+        &descriptor,
+        child_id,
+        "the Subagent settles, Monitoring the Watch it left running",
+        |snapshot| snapshot.working_since().is_none() && snapshot.monitoring_since().is_some(),
+    )
+    .await;
+
+    let (answer, ()) = tokio::join!(delegating.client.stop_subagent(child_id), async {
+        let stop = timeout(PROGRESS_DEADLINE, child_provider.next_watches_stop())
+            .await
+            .expect("the Watch stop reaches the Subagent's own Provider");
+        assert_eq!(stop.watches(), ["watch-tests"]);
+        stop.succeed();
+    });
+    assert_eq!(answer["session_id"], json!(child_id));
+    assert_eq!(
+        answer["stopped"],
+        json!(false),
+        "the Subagent's work had settled, so it is not said to be stopped: {answer}"
+    );
+    assert!(
+        answer["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Watches it left running")),
+        "the Agent is told only its Watches were stopped: {answer}"
+    );
+    assert!(
+        child_provider.try_next_interrupt().is_none(),
+        "no Turn was working to interrupt"
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(
+        row_status(&caller, child_id).0,
+        ActivityStatus::Completed,
+        "the row stays as it settled"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn stop_subagent_on_a_settled_subagent_stops_only_what_it_delegated_that_still_works() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-stop-delegated", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, child_handoff) =
+        run_handed_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (mut grandchild_provider, _) =
+        run_child(&mut delegating.hosted.claude, haiku_selection()).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    assert_eq!(
+        row_settled(&descriptor, delegating.caller, child_id)
+            .await
+            .0,
+        ActivityStatus::Completed
+    );
+
+    let (answer, ()) = tokio::join!(
+        delegating.client.stop_subagent(child_id),
+        acknowledge_interrupt(
+            &mut grandchild_provider,
+            "the Subagent it delegated to's own"
+        ),
+    );
+    assert_eq!(answer["session_id"], json!(child_id));
+    assert_eq!(
+        answer["stopped"],
+        json!(false),
+        "the Subagent's own work had settled, so it is not said to be stopped: {answer}"
+    );
+    assert!(
+        answer["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("The Subagents it delegated to")),
+        "the Agent is told what was stopped instead: {answer}"
+    );
+    assert!(
+        child_provider.try_next_interrupt().is_none(),
+        "the Subagent had no Turn working to interrupt"
+    );
+
+    grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    assert_eq!(
+        row_settled(&descriptor, child_id, grandchild_id).await.0,
+        ActivityStatus::Interrupted
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(
+        row_status(&caller, child_id).0,
+        ActivityStatus::Completed,
+        "the Subagent's own row stays as it settled"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn stop_subagent_refuses_anything_but_a_brokered_subagent_beneath_the_caller() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-stop-refusals", None).await;

@@ -1635,29 +1635,41 @@ impl ProviderOrchestrator {
         &self,
         session_id: SessionId,
     ) -> Result<InterruptOutcome, InterruptSessionError> {
+        Ok(match self.stop_session(session_id).await? {
+            SessionStop::Turn | SessionStop::Subagents | SessionStop::Watches => {
+                InterruptOutcome::StoppedWork
+            }
+            SessionStop::WithdrewPrompt(prompt) => InterruptOutcome::WithdrewPrompt { prompt },
+        })
+    }
+
+    /// The interrupt of [`Self::interrupt_session`], answering what it
+    /// stopped.
+    async fn stop_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionStop, InterruptSessionError> {
         let target = self.sessions.interrupt_or_withdraw(session_id)?;
         // Whatever the reading asks for is asked of the actor holding the
         // Session's conversation; the reading decides only what to ask.
         let actor = self.owner_commands(session_id);
-        let stopped: Result<(), InterruptSessionError> = match target {
+        match target {
             // The startup this Prompt set going is left to abandon itself:
             // the actor re-reads the Prompt before it delivers one, and a
             // Cancelled Prompt is one it declines to deliver. A Provider
             // connection that finished starting stays where it is, idle,
             // exactly as a Session between Turns keeps its connection.
-            InterruptTarget::WithdrewPrompt(prompt) => {
-                return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
-            }
-            InterruptTarget::Turn(turn) => {
-                self.with_work_beneath(
+            InterruptTarget::WithdrewPrompt(prompt) => Ok(SessionStop::WithdrewPrompt(*prompt)),
+            InterruptTarget::Turn(turn) => self
+                .with_work_beneath(
                     session_id,
                     OwnerStop::Work,
                     self.interrupt_own_turn(actor, session_id, turn.id),
                 )
                 .await
-            }
-            InterruptTarget::Subagents => {
-                self.with_work_beneath(
+                .map(|()| SessionStop::Turn),
+            InterruptTarget::Subagents => self
+                .with_work_beneath(
                     session_id,
                     OwnerStop::Work,
                     ask_actor_or_find_nothing_running(actor, |response| {
@@ -1665,22 +1677,21 @@ impl ProviderOrchestrator {
                     }),
                 )
                 .await
-            }
+                .map(|()| SessionStop::Subagents),
             // A per-Subagent stop its Provider refuses stops nothing, so what
             // the Subagent delegated through the Broker is stopped only once
             // the Subagent itself has been.
             InterruptTarget::Subagent => {
-                match ask_actor_or_find_nothing_running(actor, |response| {
+                ask_actor_or_find_nothing_running(actor, |response| {
                     ProviderCommand::StopSubagent {
                         target: session_id,
                         response,
                     }
                 })
-                .await
-                {
-                    Ok(()) => self.interrupt_beneath(session_id, OwnerStop::Work).await,
-                    refused => refused,
-                }
+                .await?;
+                self.interrupt_beneath(session_id, OwnerStop::Work)
+                    .await
+                    .map(|()| SessionStop::Turn)
             }
             // Settled by the Watches' own settling, which the Provider
             // reports like any other: nothing here settles a Turn or
@@ -1688,8 +1699,8 @@ impl ProviderOrchestrator {
             // connection of the actor its conversation rides, and only its
             // own subtree's are stopped — those a brokered Subagent beneath
             // it runs, over that Subagent's own actor.
-            InterruptTarget::Watches => {
-                self.with_work_beneath(
+            InterruptTarget::Watches => self
+                .with_work_beneath(
                     session_id,
                     OwnerStop::Watches,
                     ask_actor_or_find_nothing_running(actor, |response| {
@@ -1700,9 +1711,8 @@ impl ProviderOrchestrator {
                     }),
                 )
                 .await
-            }
-        };
-        stopped.map(|()| InterruptOutcome::StoppedWork)
+                .map(|()| SessionStop::Watches),
+        }
     }
 
     /// Runs `own` — the stop of `session_id` itself, through the actor
@@ -1816,8 +1826,8 @@ impl ProviderOrchestrator {
     /// the user interrupting its Session would: its Turn and everything
     /// working beneath it, through its own actor and theirs. The stop is the
     /// Subagent's own rather than one from above, so its delegating Agent is
-    /// the one to hear of it (CONTEXT.md: Subagent Report). Answers whether it
-    /// was working, once every Provider asked has taken the stop; its Turn
+    /// the one to hear of it (CONTEXT.md: Subagent Report). Answers what the
+    /// stop did, once every Provider asked has taken it; a Turn it stops
     /// settles at its Provider's own boundary.
     ///
     /// Refused, in words the calling Agent reads, for a Session that is no
@@ -1827,7 +1837,7 @@ impl ProviderOrchestrator {
         &self,
         caller: SessionId,
         subagent: SessionId,
-    ) -> Result<bool, String> {
+    ) -> Result<BrokeredStop, String> {
         if !self.sessions.is_brokered_subagent_beneath(caller, subagent) {
             return Err(format!(
                 "`{subagent}` names no Subagent spawned through the Broker beneath you: \
@@ -1835,9 +1845,12 @@ impl ProviderOrchestrator {
                  Subagents, with."
             ));
         }
-        match self.interrupt_session(subagent).await {
-            Ok(_) => Ok(true),
-            Err(InterruptSessionError::NothingToInterrupt) => Ok(false),
+        match self.stop_session(subagent).await {
+            Ok(SessionStop::Turn) => Ok(BrokeredStop::StoppedWork),
+            Ok(SessionStop::Subagents) => Ok(BrokeredStop::StoppedDelegatedWork),
+            Ok(SessionStop::Watches) => Ok(BrokeredStop::StoppedWatches),
+            Ok(SessionStop::WithdrewPrompt(_)) => Ok(BrokeredStop::WithdrewPrompt),
+            Err(InterruptSessionError::NothingToInterrupt) => Ok(BrokeredStop::NothingRunning),
             Err(InterruptSessionError::SessionNotFound) => {
                 Err("The Subagent's Session no longer exists on this Suru server.".to_owned())
             }
@@ -3644,6 +3657,44 @@ fn one_line(text: &str) -> String {
     let mut shortened = line.chars().take(MAX_CHARS - 1).collect::<String>();
     shortened.push('…');
     shortened
+}
+
+/// What one interrupt of a Session stopped, as the reading it acted on gave
+/// it.
+enum SessionStop {
+    /// The Session's own work: its active Turn, or — for a native Subagent,
+    /// stopped through the actor its conversation rides — the stretch of
+    /// work it was doing. Either settles as stopped.
+    Turn,
+    /// With no Turn of its own working, the Subagents below it that still
+    /// were: its own work stays as it settled.
+    Subagents,
+    /// Only the Watches of a Session that was Monitoring, which settles no
+    /// Turn (ADR 0030).
+    Watches,
+    /// The Prompt the Session was Working over but had not delivered, now
+    /// Cancelled.
+    WithdrewPrompt(Prompt),
+}
+
+/// What stopping one brokered Subagent did, so the Agent that asked is told
+/// no more than happened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokeredStop {
+    /// Its Turn was working and has been told to stop, along with everything
+    /// beneath it: the Turn settles as stopped, and its row with it.
+    StoppedWork,
+    /// Its own work had settled, but Subagents it delegated to still worked,
+    /// and those were stopped: its row stays as it settled.
+    StoppedDelegatedWork,
+    /// It had settled but left Watches running, and only those were stopped:
+    /// its row stays as it settled.
+    StoppedWatches,
+    /// It was Working only for a Prompt it had not delivered, which was
+    /// withdrawn before it began anything.
+    WithdrewPrompt,
+    /// Nothing of it was running, so nothing was stopped.
+    NothingRunning,
 }
 
 /// What an interrupt carried beneath the Session interrupted asks of each
