@@ -114,10 +114,10 @@ impl SessionStore {
     }
 
     /// Refreshes every hydrated, unpinned Session against `settings` and
-    /// returns all roots whose native application remains outstanding.
-    /// Returning the durable Applying set, rather than only values changed by
-    /// this caller, means an ordinary reader cannot consume work owed by the
-    /// Settings mutation that follows.
+    /// returns every Provider actor owner whose native application remains
+    /// outstanding. Returning the durable Applying set, rather than only
+    /// values changed by this caller, means an ordinary reader cannot consume
+    /// work owed by the Settings mutation that follows.
     ///
     /// This is the Settings adoption refresh: a Settings change is the one
     /// event that can leave a loaded posture behind. Deferred Sessions are
@@ -130,27 +130,26 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let roots = state
+        let owners = state
             .sessions
             .iter()
-            .filter(|(id, record)| {
-                !record.snapshot.session.is_subagent() && !state.is_deferred(**id)
-            })
+            .filter(|(id, record)| record.owns_provider_actor() && !state.is_deferred(**id))
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        for &root in &roots {
-            state.follow_settings(&self.storage, root, settings, PostureDelivery::Owed);
+        for &owner in &owners {
+            state.follow_settings(&self.storage, owner, settings, PostureDelivery::Owed);
         }
-        state.inherit_tree_postures(&self.storage, roots);
+        state.inherit_tree_postures(&self.storage, owners);
         pending_posture_updates(&mut state)
     }
 
-    /// Refreshes the tree `session_id` belongs to — its root's unpinned
-    /// posture and its Subagents' inherited reading — and returns the root's
-    /// outstanding native application, if any. This is what a change confined
-    /// to one Session (its creation, its Agent Selection, its Provider
-    /// starting) reconciles, without walking every other Session the store
-    /// holds.
+    /// Refreshes the posture of the Provider actor `session_id`'s
+    /// conversation runs on — its owner's unpinned posture, and the reading
+    /// every Session riding that actor inherits from it — and returns the
+    /// owner's outstanding native application, if any. This is what a change
+    /// confined to one Session (its creation, its Agent Selection, its
+    /// Provider starting) reconciles, without walking every other Session the
+    /// store holds.
     pub(crate) fn reconcile_tree_approval_posture(
         &self,
         session_id: SessionId,
@@ -163,10 +162,10 @@ impl SessionStore {
         if state.is_deferred(session_id) {
             return None;
         }
-        let root = state.posture_root(session_id)?;
-        state.follow_settings(&self.storage, root, settings, PostureDelivery::Owed);
-        state.inherit_tree_postures(&self.storage, [root]);
-        state.outstanding_posture_update(root)
+        let owner = state.actor_owner_of(session_id)?;
+        state.follow_settings(&self.storage, owner, settings, PostureDelivery::Owed);
+        state.inherit_tree_postures(&self.storage, [owner]);
+        state.outstanding_posture_update(owner)
     }
 
     pub(crate) fn mark_approval_posture_application(
@@ -283,16 +282,18 @@ fn next_posture_generation(state: &mut SessionStoreState, session_id: SessionId)
     *generation
 }
 
+/// Every native application still owed to a Provider actor: posture is
+/// delivered to the actor, so only the Sessions that own one can owe it.
 fn pending_posture_updates(state: &mut SessionStoreState) -> Vec<ApprovalPostureUpdate> {
-    let roots = state
+    let owners = state
         .sessions
         .iter()
-        .filter(|(_, record)| !record.snapshot.session.is_subagent())
+        .filter(|(_, record)| record.owns_provider_actor())
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
-    roots
+    owners
         .into_iter()
-        .filter_map(|root| state.outstanding_posture_update(root))
+        .filter_map(|owner| state.outstanding_posture_update(owner))
         .collect()
 }
 
@@ -319,27 +320,29 @@ impl SessionStoreState {
         hydrated: &[SessionId],
         settings: &EffectiveSettings,
     ) {
-        let roots = hydrated
+        let owners = hydrated
             .iter()
-            .filter_map(|&id| self.posture_root(id))
+            .filter_map(|&id| self.actor_owner_of(id))
             .collect::<std::collections::HashSet<_>>();
-        for &root in &roots {
-            self.follow_settings(storage, root, settings, PostureDelivery::Settled);
+        for &owner in &owners {
+            self.follow_settings(storage, owner, settings, PostureDelivery::Settled);
         }
-        self.inherit_tree_postures(storage, roots);
+        self.inherit_tree_postures(storage, owners);
     }
 
-    /// Sets `root`'s unpinned posture to what `settings` say for its
+    /// Sets `owner`'s unpinned posture to what `settings` say for its
     /// Provider. A value that does not change keeps whatever application it
     /// had reached, except that a Settled delivery closes an Applying one.
+    /// Only a top-level Session follows the Settings: a Subagent's Session
+    /// never does, even one that owns its actor, so it is left as it is.
     fn follow_settings(
         &mut self,
         storage: &StorageSink,
-        root: SessionId,
+        owner: SessionId,
         settings: &EffectiveSettings,
         delivery: PostureDelivery,
     ) {
-        let Some(next) = self.sessions.get(&root).and_then(|record| {
+        let Some(next) = self.sessions.get(&owner).and_then(|record| {
             let session = &record.snapshot.session;
             if session.is_subagent()
                 || session
@@ -368,7 +371,7 @@ impl SessionStoreState {
         }) else {
             return;
         };
-        if self.sessions[&root]
+        if self.sessions[&owner]
             .snapshot
             .session
             .approval_posture
@@ -378,29 +381,32 @@ impl SessionStoreState {
             return;
         }
         let applying = next.application == ApprovalPostureApplication::Applying;
-        if self.commit_posture(storage, root, Some(next)) && applying {
-            next_posture_generation(self, root);
+        if self.commit_posture(storage, owner, Some(next)) && applying {
+            next_posture_generation(self, owner);
         }
     }
 
-    /// Child Sessions share their root Session's native Provider actor, so
-    /// their posture is an inherited reading rather than an independently
-    /// mutable value. Every hydrated descendant of a root in `roots` takes
-    /// its reading in one pass over the store; deferred descendants take it
-    /// when they are hydrated. Reports whether every reading landed.
+    /// A native Subagent's Session rides the Provider actor of its nearest
+    /// ancestor that owns one, so it acts under that owner's posture: an
+    /// inherited reading rather than an independently mutable value. Every
+    /// hydrated Session riding the actor of an owner in `owners` takes its
+    /// reading in one pass over the store; deferred ones take it when they
+    /// are hydrated. Reports whether every reading landed.
     fn inherit_tree_postures(
         &mut self,
         storage: &StorageSink,
-        roots: impl IntoIterator<Item = SessionId>,
+        owners: impl IntoIterator<Item = SessionId>,
     ) -> bool {
-        let roots = roots.into_iter().collect::<std::collections::HashSet<_>>();
+        let owners = owners.into_iter().collect::<std::collections::HashSet<_>>();
         let readings = self
             .sessions
             .iter()
-            .filter(|(id, record)| record.snapshot.session.is_subagent() && !self.is_deferred(**id))
+            .filter(|(id, _)| !self.is_deferred(**id))
             .filter_map(|(id, record)| {
-                let root = self.posture_root(*id).filter(|root| roots.contains(root))?;
-                let inherited = self.sessions.get(&root)?.snapshot.session.approval_posture;
+                let owner = self
+                    .actor_owner_of(*id)
+                    .filter(|owner| owner != id && owners.contains(owner))?;
+                let inherited = self.sessions.get(&owner)?.snapshot.session.approval_posture;
                 (record.snapshot.session.approval_posture != inherited).then_some((*id, inherited))
             })
             .collect::<Vec<_>>();
@@ -411,41 +417,22 @@ impl SessionStoreState {
         landed
     }
 
-    /// The root's native application still outstanding, as an update a
-    /// reader may deliver to its Provider.
-    fn outstanding_posture_update(&mut self, root: SessionId) -> Option<ApprovalPostureUpdate> {
+    /// The actor owner's native application still outstanding, as an update
+    /// a reader may deliver to its Provider.
+    fn outstanding_posture_update(&mut self, owner: SessionId) -> Option<ApprovalPostureUpdate> {
         let posture = self
             .sessions
-            .get(&root)?
+            .get(&owner)?
             .snapshot
             .session
             .approval_posture?;
         (posture.application == ApprovalPostureApplication::Applying).then(|| {
             ApprovalPostureUpdate {
-                session_id: root,
+                session_id: owner,
                 value: posture.value,
-                generation: *self.posture_generations.entry(root).or_default(),
+                generation: *self.posture_generations.entry(owner).or_default(),
             }
         })
-    }
-
-    /// The root whose posture `session_id` reads. Restoration deliberately
-    /// retains readable cyclic components and children whose parent is
-    /// missing, but does not promote either into a root: they have no
-    /// authoritative root posture, so they resolve to none.
-    fn posture_root(&self, session_id: SessionId) -> Option<SessionId> {
-        let mut current = session_id;
-        let mut visited = std::collections::HashSet::new();
-        loop {
-            if !visited.insert(current) {
-                return None;
-            }
-            let record = self.sessions.get(&current)?;
-            match record.snapshot.session.parent {
-                Some(parent) => current = parent,
-                None => return Some(current),
-            }
-        }
     }
 
     /// Reconciliation is best-effort: a refusal is logged and the reading it
