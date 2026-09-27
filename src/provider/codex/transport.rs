@@ -51,7 +51,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UNSUPPORTED_INTERACTION_ERROR_CODE: i64 = -32000;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const CODEX_SUGGESTED_VERSION: SuggestedCliVersion =
-    SuggestedCliVersion::new("Codex CLI", 0, 150, 1);
+    SuggestedCliVersion::new("Codex CLI", 0, 156, 0);
 
 type PendingResponse = oneshot::Sender<Result<Value, ProviderError>>;
 
@@ -969,7 +969,10 @@ fn finish_transport(state: &TransportState, error: ProviderError, publish_error:
 mod tests {
     use serde_json::json;
 
-    use super::{NativeNotification, codex_version_warning, decode_notification};
+    use super::{
+        NativeNotification, NativeTurnFailureKind, NativeTurnOutcome, codex_version_warning,
+        decode_notification,
+    };
 
     fn warning_for(version: &str) -> Option<String> {
         codex_version_warning(&json!({
@@ -978,25 +981,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_versions_below_0_150_1_warn_about_compatibility() {
-        for version in ["0.149.0", "0.150.0", "0.150.1-alpha.1"] {
+    fn codex_versions_below_0_156_0_warn_about_compatibility() {
+        for version in ["0.150.1", "0.155.2", "0.156.0-alpha.1"] {
             let warning = warning_for(version)
                 .unwrap_or_else(|| panic!("Codex CLI {version} should carry the warning"));
             assert!(warning.contains(version));
-            assert!(warning.contains("0.150.1 or newer"));
+            assert!(warning.contains("0.156.0 or newer"));
             assert!(warning.contains("may have compatibility issues"));
         }
     }
 
     #[test]
-    fn codex_versions_at_or_above_0_150_1_carry_no_warning() {
-        for version in ["0.150.1", "0.150.1+build.7", "0.151.0", "1.0.0"] {
+    fn codex_versions_at_or_above_0_156_0_carry_no_warning() {
+        for version in ["0.156.0", "0.156.0+build.7", "0.157.0", "1.0.0"] {
             assert_eq!(warning_for(version), None, "Codex CLI {version}");
         }
     }
 
     /// A `userMessage` item as Codex's app-server v2 `ThreadItem::UserMessage`
-    /// serializes it, carrying text beside an image.
+    /// serializes it, carrying text beside an image by URL and one by uploaded file.
     fn user_message_item(stage: &str) -> Option<NativeNotification> {
         decode_notification(
             &format!("item/{stage}"),
@@ -1010,6 +1013,7 @@ mod tests {
                     "content": [
                         { "type": "text", "text": "Count the lines too", "text_elements": [] },
                         { "type": "image", "url": "https://example.test/chart.png" },
+                        { "type": "image", "fileId": "file-chart" },
                     ],
                 },
             })),
@@ -1029,11 +1033,87 @@ mod tests {
         };
         assert_eq!(
             (thread_id.as_str(), turn_id.as_str(), text.as_str()),
-            ("child-thread", "child-turn", "Count the lines too\n[image]")
+            (
+                "child-thread",
+                "child-turn",
+                "Count the lines too\n[image]\n[image]"
+            )
         );
         assert!(
             user_message_item("started").is_none(),
             "the input arrives whole with the completed item, so its start carries nothing"
+        );
+    }
+
+    /// A failed `turn/completed` carrying `codexErrorInfo` as Codex's app-server
+    /// v2 `TurnError` serializes it.
+    fn failed_turn(codex_error_info: serde_json::Value) -> NativeNotification {
+        decode_notification(
+            "turn/completed",
+            Some(&json!({
+                "threadId": "native-thread",
+                "turn": {
+                    "id": "native-turn",
+                    "items": [],
+                    "itemsView": "full",
+                    "status": "failed",
+                    "error": {
+                        "message": "Codex could not finish",
+                        "codexErrorInfo": codex_error_info,
+                        "additionalDetails": "{\"error\":{\"param\":\"model\"}}",
+                        "misalignment": null,
+                    },
+                    "startedAt": null,
+                    "completedAt": null,
+                    "durationMs": null,
+                },
+            })),
+        )
+        .unwrap_or_else(|_| panic!("decode a failed turn carrying {codex_error_info}"))
+        .expect("a failed turn decodes as a TurnCompleted")
+    }
+
+    #[test]
+    fn every_codex_error_info_shape_decodes_as_a_failed_turn() {
+        for info in [
+            json!("flexUnavailable"),
+            json!("serverOverloaded"),
+            json!({ "httpConnectionFailed": { "httpStatusCode": 502 } }),
+            json!({ "responseStreamDisconnected": { "httpStatusCode": null } }),
+            json!({ "activeTurnNotSteerable": { "turnKind": "review" } }),
+            json!(null),
+        ] {
+            let NativeNotification::TurnCompleted {
+                outcome: NativeTurnOutcome::Failed { message, kind },
+                ..
+            } = failed_turn(info.clone())
+            else {
+                panic!("{info} decodes as a failed Turn");
+            };
+            assert_eq!(message, "Codex could not finish");
+            assert!(
+                matches!(kind, NativeTurnFailureKind::Other),
+                "{info} is not a bad request"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_request_keeps_the_details_that_name_its_parameter() {
+        let NativeNotification::TurnCompleted {
+            outcome:
+                NativeTurnOutcome::Failed {
+                    kind: NativeTurnFailureKind::BadRequest { additional_details },
+                    ..
+                },
+            ..
+        } = failed_turn(json!("badRequest"))
+        else {
+            panic!("a bad request decodes as one");
+        };
+        assert_eq!(
+            additional_details.as_deref(),
+            Some("{\"error\":{\"param\":\"model\"}}")
         );
     }
 

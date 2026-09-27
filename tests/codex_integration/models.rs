@@ -351,7 +351,7 @@ async fn an_outdated_codex_cli_warns_without_withholding_its_models() {
         &codex.status,
         ProviderCatalogStatus::Warning { message }
             if message.contains("0.149.0")
-                && message.contains("0.150.1 or newer")
+                && message.contains("0.156.0 or newer")
                 && message.contains("may have compatibility issues")
     ));
 

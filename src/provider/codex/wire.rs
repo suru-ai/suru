@@ -943,12 +943,26 @@ pub(super) struct NativeTurnError {
     pub(super) additional_details: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// The one `codexErrorInfo` Suru reads a meaning from. Codex's union mixes bare
+/// names (`"badRequest"`, `"flexUnavailable"`) with single-key objects that
+/// carry details (`{"httpConnectionFailed": {"httpStatusCode": 502}}`) and grows
+/// freely, so every shape other than a bad request reads as [`Self::Other`]
+/// rather than failing the whole `turn/completed` it rides on.
 pub(super) enum NativeCodexErrorInfo {
     BadRequest,
-    #[serde(other)]
     Other,
+}
+
+impl<'de> Deserialize<'de> for NativeCodexErrorInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::String(name) if name == "badRequest" => Self::BadRequest,
+            _ => Self::Other,
+        })
+    }
 }
 
 #[derive(Deserialize)]
