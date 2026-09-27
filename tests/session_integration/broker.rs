@@ -50,6 +50,7 @@ mod interventions;
 mod late_output;
 mod limits;
 mod posture;
+mod reports;
 mod watches;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {
