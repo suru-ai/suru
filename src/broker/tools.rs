@@ -1407,6 +1407,32 @@ mod tests {
     }
 
     #[test]
+    fn a_subagent_report_sends_its_agent_to_the_tool_that_reads_the_whole_message() {
+        use crate::provider::{SubagentReport, SubagentReportOutcome};
+        let subagent = SessionId::new();
+        let long = "a".repeat(SubagentReport::EXCERPT_CHARS + 1);
+        let report = SubagentReport::new(
+            subagent,
+            "Researcher",
+            SubagentReportOutcome::Completed,
+            Some(1_000),
+            Some(&long),
+        )
+        .to_string();
+        let read = BrokerTool::ReadSubagent.name();
+        assert!(
+            report.contains(&format!(
+                "Its session_id is {subagent}, which {read} takes."
+            )),
+            "the Report names the id the Broker's read takes: {report}"
+        );
+        assert!(
+            report.ends_with(&format!("{read} gives the whole Message.]")),
+            "and, cut short, where the rest is: {report}"
+        );
+    }
+
+    #[test]
     fn the_read_description_names_every_status_a_subagent_may_stand_at() {
         for status in [
             TurnStatus::Active,
