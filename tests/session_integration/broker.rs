@@ -2143,6 +2143,13 @@ async fn a_restart_settles_a_brokered_subagents_open_turn_failed_and_its_row_wit
         (ActivityStatus::Failed, None),
         "the row settles with the Turn, with no duration since nothing timed its end"
     );
+    let Activity::Subagent { brokered, .. } = row_for(&caller, child_id) else {
+        unreachable!()
+    };
+    assert!(
+        *brokered,
+        "the row read back from storage still says Suru spawned the Subagent through the Broker"
+    );
     assert_eq!(caller.working_since(), None);
     assert_eq!(caller.session.status, SessionStatus::Idle);
     assert_eq!(
