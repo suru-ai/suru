@@ -1733,6 +1733,17 @@ async fn run_provider_session(
     let mut deferred_prompt_id = None;
     let mut pending_turn_starts = VecDeque::new();
     let provider_id = runtime.provider_id();
+    let connector = ProviderConnector {
+        runtime: &runtime,
+        sessions: &sessions,
+        updates: &updates,
+        settings: &settings,
+        broker: &broker,
+        connected_incarnations: &connected_incarnations,
+        session_id,
+        execution_directory: &execution_directory,
+        provider_id: &provider_id,
+    };
 
     'actor: loop {
         questionnaire_deliveries.reconcile(&sessions);
@@ -2230,33 +2241,19 @@ async fn run_provider_session(
                 }
             }
             if provider.is_none() {
-                let session_posture =
-                    effective_approval_posture(&snapshot, &settings.borrow(), &provider_id);
-                // Every start — the first and each relaunch — is handed a token
-                // of its own, retired when this grant is dropped: with the
-                // connection it opens, or here if the start fails.
-                let broker_grant = broker.grant(session_id);
-                let connection = tokio::select! {
-                    biased;
-                    _ = shutdown.wait() => break 'actor,
-                    connection = runtime.start_session(ProviderSessionRequest {
-                        execution_directory: execution_directory.clone(),
-                        resume_state: sessions.resume_state(session_id, &provider_id),
-                        approval_posture: session_posture,
-                        broker: broker_grant.as_ref().map(|grant| grant.handoff().clone()),
-                    }) => connection,
-                };
-                let connection = match connection {
-                    Ok(connection) => connection,
-                    Err(error) => {
+                match connector
+                    .open(&snapshot, lease.incarnation, &mut subagents, &mut shutdown)
+                    .await
+                {
+                    Ok(connected) => provider = Some(connected),
+                    Err(ConnectionFailure::Stopping) => break 'actor,
+                    Err(ConnectionFailure::Failed(message)) => {
                         let Some(_) = updates.apply(|| {
                             sessions.deliver_prompt(
                                 session_id,
                                 prompt_id,
                                 None,
-                                DeliveredTurnStatus::Failed {
-                                    message: startup_failure_message(&provider_id, &error),
-                                },
+                                DeliveredTurnStatus::Failed { message },
                             )
                         }) else {
                             break;
@@ -2264,80 +2261,7 @@ async fn run_provider_session(
                         defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                         continue;
                     }
-                };
-                let (identity, resume_state, session, events) = connection.into_parts();
-                if let Some(resume_state) = resume_state
-                    && let Err(error) =
-                        sessions.save_resume_state(session_id, provider_id.clone(), resume_state)
-                {
-                    let _ = updates.apply(|| {
-                        sessions.deliver_prompt(
-                            session_id,
-                            prompt_id,
-                            None,
-                            DeliveredTurnStatus::Failed {
-                                message: failure_message(
-                                    "Provider startup failed: save Resume State",
-                                    &error,
-                                ),
-                            },
-                        )
-                    });
-                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
-                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
-                    continue;
                 }
-                let selection = identity.selection.clone();
-                let Some(selected) =
-                    updates.apply(|| sessions.initialize_agent_selection(session_id, selection))
-                else {
-                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
-                    break;
-                };
-                if let Err(error) = selected {
-                    let _ = updates.apply(|| {
-                        sessions.deliver_prompt(
-                            session_id,
-                            prompt_id,
-                            None,
-                            DeliveredTurnStatus::Failed {
-                                message: failure_message("Provider startup failed", &error),
-                            },
-                        )
-                    });
-                    let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
-                    defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
-                    continue;
-                }
-                // Provider discovery can supply the Session's first Agent Selection. Derive the
-                // corresponding unpinned posture immediately so snapshots do not remain empty
-                // until a later HTTP mutation happens to reconcile them.
-                let posture_update = sessions
-                    .reconcile_tree_approval_posture(session_id, &settings.borrow().settings)
-                    .filter(|update| {
-                        update.session_id == session_id && Some(update.value) == session_posture
-                    });
-                if let Some(update) = posture_update {
-                    sessions.mark_approval_posture_application(
-                        update,
-                        crate::protocol::ApprovalPostureApplication::Applied,
-                    );
-                }
-                connected_incarnations
-                    .lock()
-                    .unwrap()
-                    .insert(session_id, lease.incarnation);
-                // The connection may carry on a conversation whose Subagents
-                // an earlier process spawned; it names them by the identities
-                // stored with their Sessions.
-                subagents.restore(sessions.stored_subagents(session_id, &provider_id));
-                provider = Some(ConnectedProviderSession {
-                    incarnation: lease.incarnation,
-                    identity,
-                    session,
-                    events,
-                    _broker: broker_grant,
-                });
             }
 
             let identity = provider
@@ -3042,6 +2966,134 @@ async fn run_provider_session(
 
     if let Some(connected) = provider {
         let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
+    }
+}
+
+/// Why no Provider connection could be opened for the Turn about to begin.
+enum ConnectionFailure {
+    /// The Provider could not be started, or what it answered could not be
+    /// recorded: the message says which, in the words the Turn's failure
+    /// carries.
+    Failed(String),
+    /// Suru is stopping, and the actor stops with it.
+    Stopping,
+}
+
+/// What an actor needs to open its Provider connection: the part of its
+/// environment every start reads, whichever Turn — a Prompt's or a
+/// Delegation's — is about to begin over it.
+struct ProviderConnector<'a> {
+    runtime: &'a Arc<dyn ProviderRuntime>,
+    sessions: &'a SessionStore,
+    updates: &'a ProviderUpdateGate,
+    settings: &'a watch::Receiver<SettingsSnapshot>,
+    broker: &'a BrokerAccess,
+    connected_incarnations: &'a Arc<Mutex<HashMap<SessionId, u64>>>,
+    session_id: SessionId,
+    execution_directory: &'a PathBuf,
+    provider_id: &'a ProviderId,
+}
+
+impl ProviderConnector<'_> {
+    /// Starts the Provider for the Session the actor owns, as `snapshot`
+    /// reads it, over the Worktree incarnation the caller leased: under its
+    /// Approval Posture, with its Resume State and a Broker token of its own,
+    /// and — once the Provider answers — with what it answered recorded and
+    /// the Subagents its conversation already carries relearned. A Provider
+    /// that answers but cannot be recorded is shut down again rather than
+    /// left running beside a Session that never learned of it.
+    async fn open(
+        &self,
+        snapshot: &crate::protocol::SessionSnapshot,
+        incarnation: u64,
+        subagents: &mut SubagentRoutes,
+        shutdown: &mut ProviderShutdown,
+    ) -> Result<ConnectedProviderSession, ConnectionFailure> {
+        let Self {
+            runtime,
+            sessions,
+            updates,
+            settings,
+            broker,
+            connected_incarnations,
+            session_id,
+            execution_directory,
+            provider_id,
+        } = self;
+        let session_id = *session_id;
+        let session_posture = effective_approval_posture(snapshot, &settings.borrow(), provider_id);
+        // Every start — the first and each relaunch — is handed a token of
+        // its own, retired when this grant is dropped: with the connection it
+        // opens, or here if the start fails.
+        let broker_grant = broker.grant(session_id);
+        let connection = tokio::select! {
+            biased;
+            _ = shutdown.wait() => return Err(ConnectionFailure::Stopping),
+            connection = runtime.start_session(ProviderSessionRequest {
+                execution_directory: (*execution_directory).clone(),
+                resume_state: sessions.resume_state(session_id, provider_id),
+                approval_posture: session_posture,
+                broker: broker_grant.as_ref().map(|grant| grant.handoff().clone()),
+            }) => connection,
+        };
+        let connection = connection.map_err(|error| {
+            ConnectionFailure::Failed(startup_failure_message(provider_id, &error))
+        })?;
+        let (identity, resume_state, session, events) = connection.into_parts();
+        if let Some(resume_state) = resume_state
+            && let Err(error) =
+                sessions.save_resume_state(session_id, (*provider_id).clone(), resume_state)
+        {
+            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            return Err(ConnectionFailure::Failed(failure_message(
+                "Provider startup failed: save Resume State",
+                &error,
+            )));
+        }
+        let selection = identity.selection.clone();
+        let Some(selected) =
+            updates.apply(|| sessions.initialize_agent_selection(session_id, selection))
+        else {
+            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            return Err(ConnectionFailure::Stopping);
+        };
+        if let Err(error) = selected {
+            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            return Err(ConnectionFailure::Failed(failure_message(
+                "Provider startup failed",
+                &error,
+            )));
+        }
+        // Provider discovery can supply the Session's first Agent Selection.
+        // Derive the corresponding unpinned posture immediately so snapshots
+        // do not remain empty until a later HTTP mutation happens to reconcile
+        // them.
+        let posture_update = sessions
+            .reconcile_tree_approval_posture(session_id, &settings.borrow().settings)
+            .filter(|update| {
+                update.session_id == session_id && Some(update.value) == session_posture
+            });
+        if let Some(update) = posture_update {
+            sessions.mark_approval_posture_application(
+                update,
+                crate::protocol::ApprovalPostureApplication::Applied,
+            );
+        }
+        connected_incarnations
+            .lock()
+            .unwrap()
+            .insert(session_id, incarnation);
+        // The connection may carry on a conversation whose Subagents an
+        // earlier process spawned; it names them by the identities stored
+        // with their Sessions.
+        subagents.restore(sessions.stored_subagents(session_id, provider_id));
+        Ok(ConnectedProviderSession {
+            incarnation,
+            identity,
+            session,
+            events,
+            _broker: broker_grant,
+        })
     }
 }
 
