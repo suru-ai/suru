@@ -172,12 +172,13 @@ struct SessionRecord {
     /// none, and the Monitoring derived from them starts over with it.
     watches: HashMap<ProviderWatchId, watches::LiveWatch>,
     /// The Turn of this brokered Subagent's Session that an interrupt of a
-    /// Session above it stopped, rather than one the Subagent was stopped in
-    /// on its own — by the user, or by an Agent's `stop_subagent`. A
-    /// Subagent Report tells the delegating Agent of a stop on its own and
-    /// of none from above (CONTEXT.md: Subagent Report), so this is read as
-    /// the Turn settles. Never stored: no Turn a restart finds open settles
-    /// as stopped.
+    /// Session above it last found working, so that, settled as stopped, it
+    /// reads as stopped from above rather than on its own — by the user, or
+    /// by an Agent's `stop_subagent`. A Subagent Report tells the delegating
+    /// Agent of a stop on its own and of none from above (CONTEXT.md:
+    /// Subagent Report), so this is read as the Turn settles, through
+    /// [`SessionStoreState::stopped_by_ancestor`]. Never stored: no Turn a
+    /// restart finds open settles as stopped.
     stopped_by_ancestor: Option<TurnId>,
 }
 

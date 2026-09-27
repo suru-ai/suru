@@ -382,13 +382,13 @@ impl SessionStore {
         Ok(InterruptTarget::WithdrewPrompt(Box::new(withdrawn)))
     }
 
-    /// Marks the Turn each of `sessions` is working in as stopped by an
-    /// interrupt of a Session above it, before the interrupt carried down to
-    /// them reaches their Providers, so however each Turn settles, it is known
-    /// to have been stopped from above rather than on its own (see
-    /// [`SessionStoreState::stopped_by_ancestor`]). A Session with no Turn
-    /// working has nothing there for the interrupt to stop, and gains no
-    /// mark.
+    /// Marks the Turn each of `sessions` is working in as the one an
+    /// interrupt of a Session above it found working, before the interrupt
+    /// carried down to them reaches their Providers, so a Turn that then
+    /// settles as stopped is known to have been stopped from above rather
+    /// than on its own (see [`SessionStoreState::stopped_by_ancestor`]). A
+    /// Session with no Turn working has nothing there for the interrupt to
+    /// stop, and gains no mark.
     pub(crate) fn mark_stopped_by_ancestor(&self, sessions: &[SessionId]) {
         let mut state = self
             .state
@@ -478,17 +478,24 @@ impl SessionStoreState {
         Err(InterruptSessionError::NothingToInterrupt)
     }
 
-    /// Whether `turn_id` of `session_id` was stopped by an interrupt of a
-    /// Session above it — the parent's, or any ancestor's, carried down the
-    /// tree — rather than on its own. A brokered Subagent stopped on its own
-    /// is reported to its delegating Agent as stopped, since that Agent
+    /// Whether `turn_id` of `session_id` settled as stopped by an interrupt
+    /// of a Session above it — the parent's, or any ancestor's, carried down
+    /// the tree — rather than on its own. A brokered Subagent stopped on its
+    /// own is reported to its delegating Agent as stopped, since that Agent
     /// planned on the result; one stopped from above is reported nothing, the
     /// Agent that would hear of it having been interrupted too (CONTEXT.md:
-    /// Subagent Report).
+    /// Subagent Report). Only a Turn that has settled Interrupted was
+    /// stopped at all: one the interrupt found working that then completed
+    /// or failed on its own, or one still working, reads false.
     pub(super) fn stopped_by_ancestor(&self, session_id: SessionId, turn_id: TurnId) -> bool {
-        self.sessions
-            .get(&session_id)
-            .is_some_and(|record| record.stopped_by_ancestor == Some(turn_id))
+        self.sessions.get(&session_id).is_some_and(|record| {
+            record.stopped_by_ancestor == Some(turn_id)
+                && record
+                    .snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == turn_id && turn.status == TurnStatus::Interrupted)
+        })
     }
 }
 
@@ -916,7 +923,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_turn_an_interrupt_from_above_found_working_reads_as_stopped_by_it() {
+    async fn only_a_turn_an_interrupt_from_above_found_working_and_that_settled_stopped_reads_as_stopped_by_it()
+     {
         use crate::protocol::{
             AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId, ProviderId,
         };
@@ -962,20 +970,29 @@ mod tests {
             model: ModelId::new("gpt-5.5"),
             options: Vec::new(),
         };
-        let child = sessions
-            .spawn_brokered_subagent(
-                caller_id,
-                BrokeredSpawn {
-                    selection: selection.clone(),
-                    name: "Researcher".to_owned(),
-                    description: "Survey the seams".to_owned(),
-                    delegation: NormalizedText {
-                        content: "Survey the seams.".to_owned(),
-                        truncated: false,
+        let spawn = |name: &str| {
+            sessions
+                .spawn_brokered_subagent(
+                    caller_id,
+                    BrokeredSpawn {
+                        selection: selection.clone(),
+                        name: name.to_owned(),
+                        description: "Survey the seams".to_owned(),
+                        delegation: NormalizedText {
+                            content: "Survey the seams.".to_owned(),
+                            truncated: false,
+                        },
                     },
-                },
-            )
-            .unwrap();
+                )
+                .unwrap()
+        };
+        let stopped = spawn("Researcher");
+        let finished = spawn("Reviewer");
+        let settle = |session_id, turn_id, outcome| {
+            sessions
+                .finish_provider_turn(session_id, turn_id, outcome)
+                .unwrap();
+        };
         let stopped_by_ancestor = |session_id, turn_id| {
             sessions
                 .state
@@ -983,43 +1000,63 @@ mod tests {
                 .unwrap()
                 .stopped_by_ancestor(session_id, turn_id)
         };
-        assert!(!stopped_by_ancestor(child.session_id, child.turn_id));
 
-        sessions.mark_stopped_by_ancestor(&[child.session_id]);
+        sessions.mark_stopped_by_ancestor(&[stopped.session_id, finished.session_id]);
         assert!(
-            stopped_by_ancestor(child.session_id, child.turn_id),
-            "the Turn the Subagent was working in is the one stopped from above"
+            !stopped_by_ancestor(stopped.session_id, stopped.turn_id),
+            "a Turn still working has not been stopped yet"
         );
         assert!(
             !stopped_by_ancestor(caller_id, caller_turn),
             "and only the Sessions the interrupt was carried down to are marked"
         );
 
-        sessions
-            .finish_provider_turn(
-                child.session_id,
-                child.turn_id,
-                ProviderTurnOutcome::Interrupted {
-                    trailing_output: TrailingCommandOutput::new(),
-                },
-            )
-            .unwrap();
-        let continuation = sessions
-            .begin_continuation(
-                child.session_id,
-                AgentIdentity {
-                    agent: AgentId::new("codex-agent"),
-                    selection,
-                },
-            )
-            .unwrap();
-        assert!(
-            stopped_by_ancestor(child.session_id, child.turn_id),
-            "the settled Turn keeps its mark for whoever reads how it was stopped"
+        settle(
+            stopped.session_id,
+            stopped.turn_id,
+            ProviderTurnOutcome::Interrupted {
+                trailing_output: TrailingCommandOutput::new(),
+            },
+        );
+        settle(
+            finished.session_id,
+            finished.turn_id,
+            ProviderTurnOutcome::Completed {
+                trailing_output: TrailingCommandOutput::new(),
+            },
         );
         assert!(
-            !stopped_by_ancestor(child.session_id, continuation),
-            "a later Turn was stopped by nothing"
+            stopped_by_ancestor(stopped.session_id, stopped.turn_id),
+            "the Turn the interrupt found working, settled stopped, was stopped from above"
+        );
+        assert!(
+            !stopped_by_ancestor(finished.session_id, finished.turn_id),
+            "one that completed on its own before the stop reached it was stopped by nothing"
+        );
+
+        let continuation = sessions
+            .begin_continuation(
+                stopped.session_id,
+                AgentIdentity {
+                    agent: AgentId::new("codex-agent"),
+                    selection: selection.clone(),
+                },
+            )
+            .unwrap();
+        settle(
+            stopped.session_id,
+            continuation,
+            ProviderTurnOutcome::Interrupted {
+                trailing_output: TrailingCommandOutput::new(),
+            },
+        );
+        assert!(
+            !stopped_by_ancestor(stopped.session_id, continuation),
+            "a later Turn stopped on its own was not stopped from above"
+        );
+        assert!(
+            stopped_by_ancestor(stopped.session_id, stopped.turn_id),
+            "and the earlier Turn keeps its answer"
         );
         writer.shutdown().await.unwrap();
     }
