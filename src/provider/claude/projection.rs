@@ -3163,4 +3163,127 @@ mod tests {
             "more thinking than output leaves the output unknown rather than wrapped"
         );
     }
+
+    /// A tool use the loop streams, its input given whole as the block opens.
+    fn streamed_tool_use(index: u64, tool: &str, name: &str, input: Value) -> [Value; 2] {
+        [
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": tool, "name": name, "input": input},
+                },
+                "parent_tool_use_id": null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": index},
+                "parent_tool_use_id": null,
+            }),
+        ]
+    }
+
+    /// A tool use a subagent's conversation restates whole.
+    fn restated_tool_use(conversation: &str, tool: &str, name: &str, input: Value) -> Value {
+        json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use", "id": tool, "name": name, "input": input,
+            }]},
+            "parent_tool_use_id": conversation,
+        })
+    }
+
+    /// The result the CLI echoes back for `tool`, in the conversation that ran it.
+    fn tool_result(conversation: Option<&str>, tool: &str) -> Value {
+        json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": tool, "content": "done", "is_error": false,
+            }]},
+            "parent_tool_use_id": conversation,
+        })
+    }
+
+    /// The Broker's Tools reach Claude as MCP tool uses named `mcp__suru__*`, and 2.1.283 defers
+    /// them behind a native `ToolSearch` the Agent calls before its first use of each
+    /// (docs/validation/0408-claude-http-mcp-long-calls.md). Neither is work a Transcript
+    /// presents — the Broker's own rows are the Broker's to add, and the search is the CLI's
+    /// plumbing — whether the loop calls them or a native Subagent does: a stream carrying them
+    /// projects exactly what the same stream without them does.
+    #[test]
+    fn a_broker_call_and_the_tool_search_that_loads_it_add_nothing_to_any_transcript() {
+        let search = json!({"query": "select:mcp__suru__list_providers", "max_results": 1});
+        let spawn = json!({
+            "provider": "codex", "model": "gpt-5.5", "name": "Scout",
+            "description": "Map the crates", "prompt": "Map the crates.",
+        });
+        let loop_bash = streamed_tool_use(2, "toolu_bash", "Bash", json!({"command": "ls"}));
+        let [spawned, started] = agent_spawned("toolu_agent", "agent-task", None);
+        let with_broker = [
+            streamed_tool_use(0, "toolu_search", "ToolSearch", search.clone()).to_vec(),
+            vec![tool_result(None, "toolu_search")],
+            streamed_tool_use(1, "toolu_list", "mcp__suru__list_providers", json!({})).to_vec(),
+            vec![tool_result(None, "toolu_list")],
+            loop_bash.to_vec(),
+            vec![
+                tool_result(None, "toolu_bash"),
+                spawned.clone(),
+                started.clone(),
+            ],
+            vec![
+                restated_tool_use("toolu_agent", "toolu_sub_search", "ToolSearch", search),
+                tool_result(Some("toolu_agent"), "toolu_sub_search"),
+                restated_tool_use(
+                    "toolu_agent",
+                    "toolu_sub_spawn",
+                    "mcp__suru__spawn_subagent",
+                    spawn,
+                ),
+                tool_result(Some("toolu_agent"), "toolu_sub_spawn"),
+                restated_tool_use(
+                    "toolu_agent",
+                    "toolu_sub_bash",
+                    "Bash",
+                    json!({"command": "cargo check"}),
+                ),
+                tool_result(Some("toolu_agent"), "toolu_sub_bash"),
+            ],
+        ]
+        .concat();
+        let without_broker = [
+            loop_bash.to_vec(),
+            vec![tool_result(None, "toolu_bash"), spawned, started],
+            vec![
+                restated_tool_use(
+                    "toolu_agent",
+                    "toolu_sub_bash",
+                    "Bash",
+                    json!({"command": "cargo check"}),
+                ),
+                tool_result(Some("toolu_agent"), "toolu_sub_bash"),
+            ],
+        ]
+        .concat();
+
+        let projected = project(&mut fresh_projection(), &with_broker);
+        assert_eq!(
+            projected,
+            project(&mut fresh_projection(), &without_broker),
+            "the Broker's calls and the searches loading them project nothing"
+        );
+        let commands = projected
+            .iter()
+            .filter_map(|event| match &event.event {
+                ProviderEvent::CommandStarted { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            ["ls", "cargo check"],
+            "the stream around them still projects, a Subagent's work included"
+        );
+    }
 }

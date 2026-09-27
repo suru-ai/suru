@@ -1045,6 +1045,58 @@ mod tests {
         );
     }
 
+    /// A call to one of the Broker's Tools as Codex's app-server v2
+    /// `ThreadItem::McpToolCall` serializes it, at `stage` and in `status`.
+    fn broker_tool_call(stage: &str, status: &str) -> Option<NativeNotification> {
+        decode_notification(
+            &format!("item/{stage}"),
+            Some(&json!({
+                "threadId": "native-thread",
+                "turnId": "native-turn",
+                "item": {
+                    "type": "mcpToolCall",
+                    "id": "call-broker",
+                    "server": "suru",
+                    "tool": "spawn_subagent",
+                    "status": status,
+                    "arguments": {"provider": "claude", "model": "opus", "prompt": "Map it."},
+                    "appContext": null,
+                    "mcpAppUi": null,
+                    "pluginId": null,
+                    "readOnlyHint": null,
+                    "result": (status == "completed").then(|| json!({
+                        "content": [{"type": "text", "text": "Spawned."}],
+                        "structuredContent": null,
+                    })),
+                    "error": null,
+                    "durationMs": (status == "completed").then_some(12),
+                },
+            })),
+        )
+        .expect("an MCP tool call decodes")
+    }
+
+    /// The Broker's Tools reach Codex as MCP tool calls on server `suru`. None of it is work a
+    /// Transcript presents — the Broker's own rows are the Broker's to add — so the call's
+    /// start, the progress Codex reports on it, and its completion all reach the projection as
+    /// nothing, and no Command Activity can come of them.
+    #[test]
+    fn a_broker_tool_call_reaches_the_projection_as_nothing() {
+        assert!(broker_tool_call("started", "inProgress").is_none());
+        assert!(broker_tool_call("completed", "completed").is_none());
+        let progress = decode_notification(
+            "item/mcpToolCall/progress",
+            Some(&json!({
+                "threadId": "native-thread",
+                "turnId": "native-turn",
+                "itemId": "call-broker",
+                "message": "30s of 600s",
+            })),
+        )
+        .expect("progress on an MCP tool call decodes");
+        assert!(progress.is_none());
+    }
+
     /// A failed `turn/completed` carrying `codexErrorInfo` as Codex's app-server
     /// v2 `TurnError` serializes it.
     fn failed_turn(codex_error_info: serde_json::Value) -> NativeNotification {
