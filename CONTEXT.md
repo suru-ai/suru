@@ -143,6 +143,10 @@ _Avoid_: Cost source, cost type
 User input submitted for delivery to an agent. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn.
 _Avoid_: Request, draft, message
 
+**Attachment**:
+Media a user places on a Prompt beside its text — an image pasted from the clipboard being the first kind — that stands in the Prompt's text as a numbered label such as `[Image 1]`, carried as a typed binding beside the text as a Skill Invocation is, and travels with the Prompt whether that Prompt begins a Turn or steers one. An Attachment belongs to the user Message its Prompt becomes for as long as the Session does, so every client viewing the Session can present it.
+_Avoid_: File, upload, media, image (for the concept), attachment (for a Client joining a Session)
+
 **Delegation**:
 The instruction a Turn's Agent gives a Subagent, through its Provider or through the Broker: at its spawn, at each resume, and whenever it sends more to a Subagent still working. The delegating Agent is whichever Agent sent it — the Subagent's parent or another Subagent — and a Delegation names it wherever it stands. A Delegation stands in the Subagent's Transcript as a Message from the delegating Agent, drawn apart from a user Message, and it stands there only once the Subagent has received it: one never delivered — refused, or overtaken by the Subagent being stopped — stands nowhere. What a Delegation does is decided by how it is delivered, not by what the Subagent was doing when it was sent. One that begins a Turn is a spawn or a resume, as a Prompt begins a Turn in the Session a user addresses — even one sent while the Subagent worked, if that work finished before it arrived. One delivered into a Turn still working **steers** it, without beginning another Turn or adding a row to the parent's Transcript, and it stands at the point in that Turn where the Subagent received it. A Subagent's Session is offered Delegations in place of Prompts.
 _Avoid_: Spawn prompt, task prompt, send message, instruction, queued message
