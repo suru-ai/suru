@@ -172,6 +172,15 @@ struct SessionRecord {
     /// Provider process that runs it, so a Session read back from storage has
     /// none, and the Monitoring derived from them starts over with it.
     watches: HashMap<ProviderWatchId, watches::LiveWatch>,
+    /// When an interrupt last reached the work this Session's own Provider
+    /// actor runs — its Turn, or the Subagents outliving one, whether the
+    /// interrupt was this Session's or carried down from one above — which
+    /// stands down whatever output its Provider still owed the brokered
+    /// Subagents its Agents delegated to, as it stands down what the actor
+    /// owed native ones (see
+    /// [`SessionStoreState::owes_continuation_to_brokered_subagents`]). Never
+    /// stored: no Provider connection survives a stop to owe anything.
+    work_interrupted_at: Option<SessionTimestamp>,
     /// The Turn of this brokered Subagent's Session that an interrupt of a
     /// Session above it last found working, so that, settled as stopped, it
     /// reads as stopped from above rather than on its own — by the user, or

@@ -4,8 +4,10 @@
 //! them still works, or once one has settled — is owed to them: it begins a
 //! Continuation of the delegating Session, which settles at that Provider's
 //! next boundary like any Turn, rather than being discarded as stray. An
-//! interrupted Turn's trailing stream owes nothing to the Subagents the
-//! interrupt stopped with it, so it is discarded as it always was.
+//! interrupt answers whatever was owed, as it does for native Subagents: a
+//! Provider's stream trailing on after it owes nothing to the brokered
+//! Subagents the interrupt stopped, nor to those that had settled before it,
+//! so it is discarded as it always was.
 
 use super::stops::{acknowledge_interrupt, interrupt};
 use super::*;
@@ -261,16 +263,29 @@ fn discarded(snapshot: &SessionSnapshot, settled: &[TurnStatus]) {
 }
 
 #[tokio::test]
-async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_the_brokered_subagent_stopped_with_it()
- {
+async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_its_brokered_subagents()
+{
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-late-output-interrupted", None).await;
     let descriptor = delegating.descriptor.clone();
+    let (settled_id, settled_provider) = spawn_working_child(&mut delegating).await;
     let (stopped_id, mut stopped_provider) = spawn_working_child(&mut delegating).await;
+    // One Subagent settles while the parent's Turn works on, so output is
+    // owed for it until something answers it.
+    settled_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the first Subagent's row settles",
+        |snapshot| row_status(snapshot, settled_id).0 == ActivityStatus::Completed,
+    )
+    .await;
 
     let (response, (), ()) = tokio::join!(
         interrupt(&descriptor, delegating.caller),
-        acknowledge_interrupt(&mut stopped_provider, "the Subagent's own"),
+        acknowledge_interrupt(&mut stopped_provider, "the working Subagent's own"),
         acknowledge_interrupt(&mut delegating.caller_provider, "the parent's own"),
     );
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -318,6 +333,164 @@ async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_the_b
             "tail the test log",
         )
         .await,
+        &[TurnStatus::Interrupted],
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn interrupting_a_parent_whose_brokered_subagents_outlive_its_turn_leaves_its_stray_output_no_continuation()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating =
+        delegating(state_dir.path(), "broker-late-output-idle-interrupt", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (settled_id, settled_provider) = spawn_working_child(&mut delegating).await;
+    let (stopped_id, mut stopped_provider) = spawn_working_child(&mut delegating).await;
+    settled_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the parent's Turn settles with one Subagent settled and one working",
+        |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Completed
+                && row_status(snapshot, settled_id).0 == ActivityStatus::Completed
+        },
+    )
+    .await;
+
+    // With no Turn to stop, the interrupt reaches the Subagent still working.
+    let (response, ()) = tokio::join!(
+        interrupt(&descriptor, delegating.caller),
+        acknowledge_interrupt(&mut stopped_provider, "the working Subagent's own"),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    say_late(&delegating.caller_provider, "Trailing words, before.").await;
+    discarded(
+        &after_a_watch_starts(
+            &descriptor,
+            delegating.caller,
+            &delegating.caller_provider,
+            "tail the build log",
+        )
+        .await,
+        &[TurnStatus::Completed],
+    );
+    stopped_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the stopped Subagent's row settles with its Turn",
+        |snapshot| row_status(snapshot, stopped_id).0 == ActivityStatus::Interrupted,
+    )
+    .await;
+    say_late(&delegating.caller_provider, "Trailing words, after.").await;
+    discarded(
+        &after_a_watch_starts(
+            &descriptor,
+            delegating.caller,
+            &delegating.caller_provider,
+            "tail the test log",
+        )
+        .await,
+        &[TurnStatus::Completed],
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_interrupt_carried_down_leaves_a_brokered_subagents_trailing_output_no_continuation_for_its_own()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating =
+        delegating(state_dir.path(), "broker-late-output-carried-down", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let start = next_start(&mut delegating.hosted.codex).await;
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("a brokered Subagent is handed the Broker too");
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+
+    // The Subagent delegates in its turn, and what it delegated settles while
+    // the Subagent works on, so its Provider is owed output for it.
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (grandchild_provider, _) = run_child(
+        &mut delegating.hosted.claude,
+        default_selection(&claude_models()),
+    )
+    .await;
+    grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_until(
+        &descriptor,
+        child_id,
+        "the grandchild's row settles in the Subagent's Transcript",
+        |snapshot| row_status(snapshot, grandchild_id).0 == ActivityStatus::Completed,
+    )
+    .await;
+
+    // Interrupting the top-level Session carries down to the Subagent.
+    let (response, (), ()) = tokio::join!(
+        interrupt(&descriptor, delegating.caller),
+        acknowledge_interrupt(&mut child_provider, "the Subagent's own"),
+        acknowledge_interrupt(
+            &mut delegating.caller_provider,
+            "the top-level Session's own"
+        ),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+        .await;
+    read_until(
+        &descriptor,
+        child_id,
+        "the Subagent's Turn settles stopped",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Interrupted,
+    )
+    .await;
+
+    say_late(&child_provider, "Trailing words, after.").await;
+    discarded(
+        &after_a_watch_starts(&descriptor, child_id, &child_provider, "tail the test log").await,
         &[TurnStatus::Interrupted],
     );
 

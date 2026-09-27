@@ -351,6 +351,11 @@ impl SessionStore {
     /// than into a failure: delivery first leaves a Turn here to stop, and the
     /// withdrawal first leaves the actor a Cancelled Prompt it declines to
     /// deliver.
+    ///
+    /// An interrupt that reaches the work of the Provider actor the Session
+    /// owns — its Turn, or the Subagents outliving one — is recorded as it is
+    /// read, so the output that actor's Provider still owed brokered
+    /// Subagents is owed no longer.
     pub(crate) fn interrupt_or_withdraw(
         &self,
         session_id: SessionId,
@@ -360,8 +365,14 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         let prompt = match state.interrupt_reading(session_id)? {
-            InterruptReading::Turn(turn) => return Ok(InterruptTarget::Turn(turn)),
-            InterruptReading::Subagents => return Ok(InterruptTarget::Subagents),
+            InterruptReading::Turn(turn) => {
+                state.record_work_interrupted(session_id);
+                return Ok(InterruptTarget::Turn(turn));
+            }
+            InterruptReading::Subagents => {
+                state.record_work_interrupted(session_id);
+                return Ok(InterruptTarget::Subagents);
+            }
             InterruptReading::Subagent => return Ok(InterruptTarget::Subagent),
             InterruptReading::Watches => return Ok(InterruptTarget::Watches),
             InterruptReading::UndeliveredPrompt(prompt) => prompt,
@@ -388,13 +399,15 @@ impl SessionStore {
     /// settles as stopped is known to have been stopped from above rather
     /// than on its own (see [`SessionStoreState::stopped_by_ancestor`]). A
     /// Session with no Turn working has nothing there for the interrupt to
-    /// stop, and gains no mark.
+    /// stop, and gains no mark. Each is recorded as interrupted all the same,
+    /// since the interrupt reaches whatever its own actor runs.
     pub(crate) fn mark_stopped_by_ancestor(&self, sessions: &[SessionId]) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         for session_id in sessions {
+            state.record_work_interrupted(*session_id);
             let Some(record) = state.sessions.get_mut(session_id) else {
                 continue;
             };

@@ -499,6 +499,7 @@ impl SessionStoreState {
                 subagent_identity,
                 brokered,
                 watches: HashMap::new(),
+                work_interrupted_at: None,
                 stopped_by_ancestor: None,
             },
         );
