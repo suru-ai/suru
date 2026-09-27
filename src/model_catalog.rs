@@ -248,13 +248,14 @@ impl ModelCatalogService {
         }
     }
 
-    /// The catalog as Suru last found it, for a reader that must never
-    /// provoke a re-check: an Agent asking through the Broker. An enabled
-    /// Provider this process has neither heard from nor remembers is asked
-    /// once, as an Errand's resolution would ask it, because otherwise every
-    /// such reader before a client's first listing would find nothing; one
-    /// whose first answer is still coming is waited for. No Provider that has
-    /// answered — Models, failure, or unavailability — is asked again.
+    /// The catalog as this process has found it, for a reader that must never
+    /// provoke a re-check: an Agent asking through the Broker. Availability is
+    /// never remembered across restarts, so an enabled Provider this process
+    /// has not yet asked is asked once — even one whose Models are remembered,
+    /// which would otherwise be reported usable on the strength of a past run
+    /// — and one whose first answer is still coming is waited for. A Provider
+    /// that has answered this process — Models, failure, or unavailability —
+    /// is not asked again.
     pub(crate) async fn known(&self) -> ModelCatalog {
         ModelCatalog {
             providers: join_all(self.providers.iter().map(ProviderCatalog::known)).await,
@@ -424,14 +425,14 @@ impl ProviderCatalog {
         if !self.is_enabled() {
             return self.disabled_catalog();
         }
-        let never_answered = {
-            let state = self
-                .state
-                .lock()
-                .expect("Model catalog lock is not poisoned");
-            state.models.is_none() && !state.discovered_live
-        };
-        if never_answered {
+        let answered_live = self
+            .state
+            .lock()
+            .expect("Model catalog lock is not poisoned")
+            .discovered_live;
+        if !answered_live {
+            // Joins a first discovery already in flight rather than
+            // beginning another.
             return self.refresh().await;
         }
         self.current()
@@ -821,7 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_known_catalog_asks_only_a_provider_never_heard_from_and_only_once() {
+    async fn the_known_catalog_asks_each_provider_once_per_process_and_never_again() {
         let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
         let runtime = Arc::new(FailingAfterFirstRuntime::new());
         let service = ModelCatalogService::new(
@@ -851,8 +852,10 @@ mod tests {
         );
     }
 
+    /// A remembered catalog says which Models a Provider offered in an earlier
+    /// run, not whether it can be used now, so it is asked once all the same.
     #[tokio::test]
-    async fn the_known_catalog_serves_a_remembered_catalog_without_asking() {
+    async fn the_known_catalog_asks_a_remembered_provider_once_and_serves_what_it_learned() {
         let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
         let runtime = Arc::new(FailingAfterFirstRuntime::new());
         let service = ModelCatalogService::new(
@@ -865,8 +868,20 @@ mod tests {
         );
 
         let known = service.known().await;
-        assert_eq!(known.providers[0].models[0].display_name, "Remembered Stub");
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(known.providers[0].status, ProviderCatalogStatus::Fresh);
+        assert_eq!(
+            known.providers[0].models[0].display_name, "Stub",
+            "what the Provider answered this process replaces what was remembered"
+        );
+
+        let again = service.known().await;
+        assert_eq!(again.providers[0].models[0].display_name, "Stub");
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            1,
+            "a Provider that has answered this process is not asked again"
+        );
     }
 
     #[tokio::test]
