@@ -12,9 +12,8 @@
 use std::sync::Arc;
 
 use crate::provider_support::ControlledProvider;
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::server_support::{PROGRESS_DEADLINE, broker::McpClient};
 use crate::support::{ScriptedCodex, receive_initial_state};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -23,7 +22,7 @@ use suru::{
         ClaudePermissionMode, CreateSessionRequest, InitialPrompt, ModelAvailability,
         ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
     },
-    provider::{BrokerHandoff, CodexRuntime},
+    provider::CodexRuntime,
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -256,107 +255,6 @@ while IFS= read -r line; do
 done
 "#;
 
-/// The MCP client an Agent's harness is, reduced to what spawning a Subagent takes: the
-/// handshake, then Tool calls, posted to the Broker endpoint under the bearer token a Provider
-/// start carried.
-struct BrokerClient {
-    http: reqwest::Client,
-    endpoint: String,
-    authorization: String,
-    next_id: u64,
-}
-
-impl BrokerClient {
-    async fn handed(handoff: &BrokerHandoff) -> Self {
-        let mut client = Self {
-            http: reqwest::Client::new(),
-            endpoint: handoff.endpoint().to_string(),
-            authorization: handoff.token().bearer(),
-            next_id: 0,
-        };
-        client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": { "name": "suru-codex-broker-test", "version": "0" },
-                }),
-            )
-            .await;
-        let initialized = client
-            .post(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
-            .await;
-        assert_eq!(initialized.status(), reqwest::StatusCode::ACCEPTED);
-        client
-    }
-
-    async fn post(&self, message: &Value) -> reqwest::Response {
-        self.http
-            .post(&self.endpoint)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream")
-            .header("mcp-protocol-version", "2025-06-18")
-            .header(AUTHORIZATION, &self.authorization)
-            .json(message)
-            .send()
-            .await
-            .expect("reach the Broker endpoint")
-    }
-
-    /// Sends one request and answers with its JSON-RPC result, read from a JSON body or from the
-    /// event stream the endpoint may answer with instead.
-    async fn request(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        let response = self
-            .post(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await;
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::OK,
-            "{method} is answered"
-        );
-        let body = response.text().await.expect("read the Broker's answer");
-        let answer = serde_json::from_str::<Value>(&body)
-            .ok()
-            .or_else(|| {
-                body.split("\n\n").find_map(|event| {
-                    let data = event
-                        .lines()
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .map(str::trim_start)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    serde_json::from_str::<Value>(&data)
-                        .ok()
-                        .filter(|message| message["id"] == json!(id))
-                })
-            })
-            .unwrap_or_else(|| panic!("{method} is answered with JSON-RPC: {body}"));
-        answer
-            .get("result")
-            .cloned()
-            .unwrap_or_else(|| panic!("{method} was answered with an error: {answer}"))
-    }
-
-    async fn spawn_subagent(&mut self, arguments: Value) -> SessionId {
-        let result = self
-            .request(
-                "tools/call",
-                json!({ "name": "spawn_subagent", "arguments": arguments }),
-            )
-            .await;
-        assert_ne!(
-            result["isError"],
-            json!(true),
-            "spawn_subagent answers: {result}"
-        );
-        serde_json::from_value(result["structuredContent"]["session_id"].clone())
-            .unwrap_or_else(|_| panic!("the answer names the Subagent's Session: {result}"))
-    }
-}
-
 #[tokio::test]
 async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_its_thread_never_asking_with_full_access()
  {
@@ -442,7 +340,8 @@ async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_i
         .expect("the Claude Session's first Turn reaches its Provider")
         .succeed();
 
-    let mut broker = BrokerClient::handed(&handoff).await;
+    let mut broker = McpClient::handed(&handoff);
+    broker.initialize().await;
     broker
         .spawn_subagent(json!({
             "provider": "codex",
