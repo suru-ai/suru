@@ -894,6 +894,7 @@ mod aside {
                 spawn_order: 0,
                 name: "Explore".to_owned(),
                 title: "Find the widget".to_owned(),
+                model: None,
                 status: ActivityStatus::Active,
                 worked_ms: Some(0),
                 working_since: None,

@@ -511,6 +511,7 @@ mod tests {
             spawn_order: 0,
             name: "Explore".to_owned(),
             title: "Map the seams".to_owned(),
+            model: None,
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: Some(crate::protocol::SessionTimestamp(1_000)),

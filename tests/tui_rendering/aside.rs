@@ -14,10 +14,10 @@ use ratatui::style::Color;
 use suru::{
     managed_client::SubagentTreeEvent,
     protocol::{
-        Activity, ActivityStatus, AsideSettings, AsideVisibility, EffectiveSettings, Outlook,
-        PromptId, SessionId, SessionReference, SessionSnapshot, SessionStatus, SessionTimestamp,
-        SidebarVisibility, SubagentTreeChange, SubagentTreeEntry, SubagentTreeRevision,
-        SubagentTreeSnapshot, SubagentTreeTopLevel, TurnStatus,
+        Activity, ActivityStatus, AsideSettings, AsideVisibility, EffectiveSettings, ModelId,
+        Outlook, PromptId, SessionId, SessionReference, SessionSnapshot, SessionStatus,
+        SessionTimestamp, SidebarVisibility, SubagentTreeChange, SubagentTreeEntry,
+        SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel, TurnStatus,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
 };
@@ -101,6 +101,7 @@ fn entry(
         spawn_order,
         name: name.to_owned(),
         title: title.to_owned(),
+        model: None,
         status,
         worked_ms,
         // Unknown unless a test says when the working Turn began.
@@ -299,6 +300,103 @@ fn the_title_has_the_first_line_and_the_name_and_time_the_second() {
         ],
         "the Title has the whole of its line, and the name stands whole beneath it \
          beside the time: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_subagents_confirmed_model_follows_its_name_and_an_unconfirmed_one_is_left_unsaid() {
+    let workspace = workspace_dir();
+    let tree = Tree::new();
+    let mut application = client(workspace.path());
+    open(&mut application, workspace.path(), tree.top, None);
+    let mut snapshot = tree.snapshot();
+    snapshot.subagents[0].model = Some(ModelId::new("sonnet"));
+    snapshot.subagents[2].status = ActivityStatus::Failed;
+    snapshot.subagents[2].model = Some(ModelId::new("opus"));
+    deliver_tree(
+        &mut application,
+        tree.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let rows = aside_rows(&application, WIDTH);
+    assert_eq!(
+        rows[2..8],
+        [
+            "├ ✓ Map the provider seams",
+            "│ │ Explore · sonnet      12s",
+            "│ └ ⠋ Check the mapped seams",
+            "│     Review",
+            "└ × Weigh the options",
+            "    Plan · opus · Failed",
+        ],
+        "the Model the Provider confirmed follows the name, before any outcome word, and \
+         a Subagent whose Model is not yet known says its name alone: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_model_confirmed_after_the_snapshot_updates_its_entry_in_place() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    let before = aside_rows(&application, WIDTH);
+    assert_eq!(
+        before[4..6],
+        ["│ └ ⠋ Check the mapped seams", "│     Review"]
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentModelChanged {
+            session_id: tree.review,
+            model: ModelId::new("haiku"),
+        },
+    );
+
+    let mut expected = before;
+    expected[5] = "│     Review · haiku".to_owned();
+    assert_eq!(
+        aside_rows(&application, WIDTH),
+        expected,
+        "the confirmed Model joins the entry's second line where it stands, and nothing \
+         else moves"
+    );
+}
+
+#[test]
+fn at_the_launch_width_the_model_is_dropped_whole_before_the_name_gives_way() {
+    let workspace = workspace_dir();
+    let tree = Tree::new();
+    let detail_line = |name: &str, model: &str| {
+        let mut application = client(workspace.path());
+        open(&mut application, workspace.path(), tree.top, None);
+        let mut snapshot = tree.snapshot();
+        snapshot.subagents.truncate(1);
+        snapshot.subagents[0].name = name.to_owned();
+        snapshot.subagents[0].model = Some(ModelId::new(model));
+        deliver_tree(
+            &mut application,
+            tree.top,
+            SubagentTreeEvent::Snapshot(snapshot),
+        );
+        aside_rows(&application, WIDTH)[3].clone()
+    };
+
+    assert_eq!(
+        detail_line("Cartographer", "sonnet"),
+        "    Cartographer · sonnet 12s",
+        "a name and Model that just fit beside the time are both drawn whole"
+    );
+    assert_eq!(
+        detail_line("Cartographer", "claude-sonnet-4-5"),
+        "    Cartographer          12s",
+        "a Model that does not fit is dropped whole, never cut, and the name stands whole"
+    );
+    assert_eq!(
+        detail_line("Cartographer-of-every-seam", "sonnet"),
+        "    Cartographer-of-ever… 12s",
+        "with the Model gone, a name too long for the line gives way to the time as ever"
     );
 }
 

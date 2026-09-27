@@ -2532,6 +2532,12 @@ pub struct SubagentTreeEntry {
     /// What the Subagent was asked to do, as its spawn — or the Provider's
     /// latest update to it — described it.
     pub title: String,
+    /// The latest Model the Provider confirmed for this Subagent, read from
+    /// its rows in its spawner's Transcript. It is Provider evidence, never
+    /// inherited from the parent's Agent Selection, and absent until the
+    /// Provider supplies it (ADR 0025).
+    #[serde(default)]
+    pub model: Option<ModelId>,
     /// The Marker of the Subagent's Session's latest Turn: `Active` while
     /// that Turn works, and otherwise the outcome it settled with.
     pub status: ActivityStatus,
@@ -2584,6 +2590,12 @@ pub enum SubagentTreeChange {
         session_id: SessionId,
         name: String,
         title: String,
+    },
+    /// The Provider confirmed a Subagent's Model, or confirmed another one.
+    /// It never withdraws one: a Model, once known, stays until replaced.
+    SubagentModelChanged {
+        session_id: SessionId,
+        model: ModelId,
     },
     /// The top-level Session's Title changed.
     TopLevelRetitled { title: String },

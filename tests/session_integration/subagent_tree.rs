@@ -20,8 +20,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SubagentTreeEvent},
     protocol::{
         ActivityStatus, AdmitPromptRequest, Approval, ApprovalId, ApprovalSubject,
-        CreateSessionRequest, Decision, InitialPrompt, Outlook, PromptDelivery, PromptId, Question,
-        Questionnaire, QuestionnaireId, RuntimeDescriptor, SUBAGENT_TREE_SNAPSHOT_EVENT,
+        CreateSessionRequest, Decision, InitialPrompt, ModelId, Outlook, PromptDelivery, PromptId,
+        Question, Questionnaire, QuestionnaireId, RuntimeDescriptor, SUBAGENT_TREE_SNAPSHOT_EVENT,
         SUBAGENT_TREE_UPDATED_EVENT, SessionError, SessionErrorCode, SessionId, SessionTimestamp,
         SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeUpdate,
         TurnStatus,
@@ -436,6 +436,62 @@ async fn spawns_settles_and_updates_arrive_as_changes_and_settled_entries_keep_t
     assert_eq!(
         named(&settled.subagents, "Plan").status,
         ActivityStatus::Active
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// A Subagent's Model is Provider evidence (ADR 0025): its entry carries none
+/// until the Provider confirms one — never the parent's Agent Selection — and
+/// a confirmation after the spawn arrives as its own change.
+#[tokio::test]
+async fn a_subagents_entry_carries_the_model_the_provider_confirmed_and_never_the_parents() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-tree-model-test").await;
+    let provider = &fixture.provider_session;
+    let (snapshot, mut updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    let mut revision = snapshot.revision;
+
+    spawn(
+        provider,
+        None,
+        "task-1",
+        "Explore",
+        "Map the provider seams",
+    )
+    .await;
+    let SubagentTreeChange::SubagentSpawned { entry: explore } =
+        next_change(&mut updates, &mut revision).await
+    else {
+        panic!("a spawn arrives as a spawned entry");
+    };
+    assert_eq!(
+        explore.model, None,
+        "no Model is known until the Provider confirms one, whatever the parent's \
+         Agent Selection (gpt-subagent) says"
+    );
+
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentModelChanged {
+            subagent_id: ProviderSubagentId::new("task-1"),
+            model: ModelId::new("sonnet"),
+        })
+        .await;
+    assert_eq!(
+        next_change(&mut updates, &mut revision).await,
+        SubagentTreeChange::SubagentModelChanged {
+            session_id: explore.session_id,
+            model: ModelId::new("sonnet"),
+        },
+        "the Provider's confirmation arrives as a change to the entry"
+    );
+
+    let (confirmed, _updates) = open_tree(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        named(&confirmed.subagents, "Explore").model,
+        Some(ModelId::new("sonnet")),
+        "and a fresh snapshot carries it"
     );
 
     drop(fixture.provider_session);

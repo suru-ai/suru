@@ -10452,6 +10452,7 @@ impl Family {
             spawn_order: 0,
             name: name.to_owned(),
             title: format!("{name} the seams"),
+            model: None,
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: None,

@@ -63,6 +63,7 @@ fn session_with_its_tree(
                     spawn_order: 0,
                     name: "Explore".to_owned(),
                     title: "Map the provider seams".to_owned(),
+                    model: None,
                     status: ActivityStatus::Completed,
                     worked_ms: Some(12_000),
                     working_since: None,

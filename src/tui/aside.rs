@@ -978,6 +978,11 @@ impl SubagentTreeReading {
                     entry.title = title;
                 }
             }
+            SubagentTreeChange::SubagentModelChanged { session_id, model } => {
+                if let Some(entry) = self.entry_mut(session_id) {
+                    entry.model = Some(model);
+                }
+            }
             SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
             SubagentTreeChange::TopLevelWorkingChanged {
                 working_since,
@@ -1071,6 +1076,7 @@ mod tests {
             spawn_order,
             name: "Explore".to_owned(),
             title: "Map".to_owned(),
+            model: None,
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: None,

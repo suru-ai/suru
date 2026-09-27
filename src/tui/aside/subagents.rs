@@ -167,6 +167,7 @@ impl Section for SubagentsSection {
                         DetailParts {
                             guides: entry.continuation_guides(),
                             name: &subagent.name,
+                            model: subagent.model.as_ref().map(|model| model.as_str()),
                             outcome: outcome_word(subagent.status).map(|word| (word, marker_style)),
                             right: right_slot(subagent.needs_intervention, time, theme),
                         },
@@ -312,6 +313,9 @@ struct DetailParts<'a> {
     guides: String,
     /// Which kind of agent the Subagent was.
     name: &'a str,
+    /// The Model the Provider confirmed for the Subagent, where it has
+    /// confirmed one.
+    model: Option<&'a str>,
     /// How the Subagent's work ended where its Marker alone would not say —
     /// failed and stopped share a glyph — in the Marker's style.
     outcome: Option<(&'static str, Style)>,
@@ -377,8 +381,10 @@ fn title_line(
 }
 
 /// A Subagent entry's second line: the guides carried on beneath its first,
-/// the name dimmed, its outcome where its Marker does not say it, and the
-/// right slot right-aligned. The name gives way to the slot.
+/// the name dimmed and its Model after it where the Provider confirmed one,
+/// its outcome where its Marker does not say it, and the right slot
+/// right-aligned. Space runs out on the Model first, which is dropped whole
+/// rather than cut; then the name gives way to the slot.
 fn detail_line(
     parts: DetailParts<'_>,
     width: usize,
@@ -391,7 +397,16 @@ fn detail_line(
         .outcome
         .map(|(word, style)| (format!(" · {word}"), style));
     let room = line.room_beside(width, &[&outcome, &parts.right]);
+    // The Model is drawn whole or not at all, so the name keeps what room
+    // there is; where the Model fits, the name fits whole beside it.
+    let model = parts
+        .model
+        .map(|model| format!(" · {model}"))
+        .filter(|model| parts.name.width() + model.width() <= room);
     line.push(truncate_to_width(parts.name, room), theme.text.subdued);
+    if let Some(model) = model {
+        line.push(model, theme.text.subdued);
+    }
     if let Some((word, style)) = outcome {
         line.push(word, style);
     }

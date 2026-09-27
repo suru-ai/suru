@@ -236,15 +236,29 @@ impl SessionStoreState {
     /// they spawned. A Subagent stands where it first spawned: under the
     /// Session its own names as parent, by the first row there leading into
     /// it. The rows its resumes add — in that Session, or in a sibling's that
-    /// sent the resume — lead into the same Session and add no entry.
+    /// sent the resume — lead into the same Session and add no entry. Its
+    /// Model is the latest any of its rows here carries, since each of its
+    /// stretches holds the Model the Provider confirmed for that stretch.
     fn spawned_by(&self, spawner: SessionId) -> Vec<SubagentTreeEntry> {
         let Some(record) = self.sessions.get(&spawner) else {
             return Vec::new();
         };
+        let activities = &record.snapshot.activities;
+        // Rows stand in Transcript order, and a later row's Model replaces
+        // an earlier one's for the same Session, so the last row wins.
+        let models = activities
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::Subagent {
+                    session_id,
+                    model: Some(model),
+                    ..
+                } => Some((*session_id, model)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut listed = HashSet::new();
-        record
-            .snapshot
-            .activities
+        activities
             .iter()
             .filter_map(|activity| match activity {
                 Activity::Subagent {
@@ -285,6 +299,7 @@ impl SessionStoreState {
                         spawn_order,
                         name: name.clone(),
                         title: description.clone(),
+                        model: models.get(&session_id).map(|&model| model.clone()),
                         status: work.status,
                         worked_ms: work.worked_ms,
                         working_since: work.working_since,
@@ -401,8 +416,8 @@ impl SubagentTreePublisher {
 
 /// What moved between two readings of one tree, in the order a reader applying
 /// them needs: a spawner always joins before what it spawns. `None` when the
-/// difference is one no change can say: an entry gone, or moved from where it
-/// stood.
+/// difference is one no change can say: an entry gone, moved from where it
+/// stood, or left without the Model it was known to run.
 fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<SubagentTreeChange>> {
     let mut changes = Vec::new();
     if before.top_level.session_id != after.top_level.session_id {
@@ -459,6 +474,15 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
                 title: entry.title.clone(),
             });
         }
+        if previous.model != entry.model {
+            // A Model once confirmed is only ever replaced, so a Model gone
+            // is a difference no change can say.
+            let model = entry.model.clone()?;
+            changes.push(SubagentTreeChange::SubagentModelChanged {
+                session_id: entry.session_id,
+                model,
+            });
+        }
         if previous.status != entry.status
             || previous.worked_ms != entry.worked_ms
             || previous.working_since != entry.working_since
@@ -482,14 +506,15 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
     Some(changes)
 }
 
-/// Whether a committed change could move a tree's rows, a Subagent's work, or
-/// the top-level Title. A Turn beginning or settling in a Subagent's Session
-/// moves its entry's Marker and time — a resume, or a Continuation its own
-/// work began, as much as a settle — even where no row in its spawner moves
-/// with it. The tree's top-level Working and Intervention readings are
-/// compared by the commit itself, because what moves them is derived rather
-/// than carried by any one change. A commit that moves none of them leaves
-/// every subscribed tree unread.
+/// Whether a committed change could move a tree's rows — a Subagent's name,
+/// Title, or confirmed Model among them — a Subagent's work, or the top-level
+/// Title. A Turn beginning or settling in a Subagent's Session moves its
+/// entry's Marker and time — a resume, or a Continuation its own work began,
+/// as much as a settle — even where no row in its spawner moves with it. The
+/// tree's top-level Working and Intervention readings are compared by the
+/// commit itself, because what moves them is derived rather than carried by
+/// any one change. A commit that moves none of them leaves every subscribed
+/// tree unread.
 pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
     matches!(
         change,
@@ -497,6 +522,7 @@ pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
             activity: Activity::Subagent { .. }
         } | SessionChange::SubagentStatusChanged { .. }
             | SessionChange::SubagentDescriptionChanged { .. }
+            | SessionChange::SubagentModelChanged { .. }
             | SessionChange::TitleChanged { .. }
             | SessionChange::TurnAdded { .. }
             | SessionChange::TurnStatusChanged { .. }
@@ -506,7 +532,7 @@ pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ActivityStatus;
+    use crate::protocol::{ActivityStatus, ModelId};
 
     fn entry(session_id: SessionId, parent: SessionId, spawn_order: u32) -> SubagentTreeEntry {
         SubagentTreeEntry {
@@ -515,6 +541,7 @@ mod tests {
             spawn_order,
             name: "Explore".to_owned(),
             title: "Map the seams".to_owned(),
+            model: None,
             status: ActivityStatus::Active,
             worked_ms: Some(0),
             working_since: Some(SessionTimestamp(1_000)),
@@ -548,6 +575,7 @@ mod tests {
         settled.working_since = None;
         settled.monitoring_since = Some(SessionTimestamp(1_012));
         settled.title = "Mapped the seams".to_owned();
+        settled.model = Some(ModelId::new("sonnet"));
         settled.needs_intervention = true;
         let mut after_top_level = top_level(top, "Delegate the mapping");
         after_top_level.working_since = None;
@@ -576,6 +604,10 @@ mod tests {
                     session_id: child,
                     name: "Explore".to_owned(),
                     title: "Mapped the seams".to_owned(),
+                },
+                SubagentTreeChange::SubagentModelChanged {
+                    session_id: child,
+                    model: ModelId::new("sonnet"),
                 },
                 SubagentTreeChange::SubagentWorkingChanged {
                     session_id: child,
@@ -614,6 +646,14 @@ mod tests {
         let mut moved = before.clone();
         moved.subagents[0].spawn_order = 1;
         assert_eq!(tree_changes(&before, &moved), None, "an entry moved");
+
+        let mut confirmed = before.clone();
+        confirmed.subagents[0].model = Some(ModelId::new("sonnet"));
+        assert_eq!(
+            tree_changes(&confirmed, &before),
+            None,
+            "a Subagent's confirmed Model gone"
+        );
     }
 
     fn turn(status: TurnStatus, started_at: Option<u64>, settled_at: Option<u64>) -> Turn {
