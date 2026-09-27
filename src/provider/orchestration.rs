@@ -241,6 +241,11 @@ struct ProviderSessionContext {
     runtime: Arc<dyn ProviderRuntime>,
     sessions: SessionStore,
     skill_catalog: SkillCatalogService,
+    /// The Session that owns this actor. Its Prompts begin Turns here, output
+    /// owed after one of its Turns settles begins a Continuation of it, and
+    /// every Session whose conversation rides the actor — each native
+    /// Subagent spawned over this connection — reaches its Provider through
+    /// it (see [`SessionStore::actor_owner`]).
     session_id: SessionId,
     execution_directory: PathBuf,
     updates: ProviderUpdateGate,
@@ -501,9 +506,10 @@ impl SubagentRoutes {
             .map(|route| &mut route.turn.questionnaires)
     }
 
-    /// Whether output arriving with no Turn active is owed a Continuation
-    /// rather than being stray: some Subagent is still working, or one just
-    /// settled and its provoked output is still to come.
+    /// Whether output arriving over this connection with no Turn active is
+    /// owed a Continuation of the Session that owns the actor, rather than
+    /// being stray: some Subagent riding the actor is still working, or one
+    /// just settled and its provoked output is still to come.
     fn owes_continuation(&self) -> bool {
         self.late_settle_owes_continuation || !self.working.is_empty() || !self.routes.is_empty()
     }
@@ -1291,6 +1297,10 @@ impl ProviderOrchestrator {
             .map_err(|error| self.fail_prompt(session_id, prompt_id, error.to_string()))
     }
 
+    /// Returns the Provider actor `session_id` owns, spawning it on `runtime`
+    /// when none runs. Only a Session that owns its actor is given one here:
+    /// a Session riding an ancestor's actor reaches it through
+    /// [`Self::schedule_on_actor_owner`] instead.
     fn get_or_spawn_actor_commands(
         &self,
         session_id: SessionId,
