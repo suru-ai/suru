@@ -16,11 +16,13 @@ use reqwest::{
 use serde_json::{Value, json};
 use suru::{
     protocol::{
-        AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, CreateSessionRequest,
-        InitialPrompt, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, PromptDelivery, PromptId, ProviderId, ProviderUnavailability,
-        RuntimeDescriptor, SessionId, SettingMutation, TurnStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
+        ApprovalPosture, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
+        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, ProviderId,
+        ProviderUnavailability, RuntimeDescriptor, SessionId, SessionSnapshot, SessionStatus,
+        SettingMutation, SubagentTreeChange, TranscriptItem, TurnStatus, Usage, UsageTotal,
     },
     provider::{BrokerHandoff, ProviderErrand, ProviderEvent},
     server::{self, RunningServer, ServerConfig},
@@ -32,7 +34,8 @@ use crate::{
         ControlledProvider, ControlledProviderRuntime, ControlledProviderSession, StartRequest,
     },
     server_support::{PROGRESS_DEADLINE, read_runtime_descriptor},
-    support::{create_session, read_session_until},
+    subagent_tree::{changes_until, open_tree},
+    support::{create_session, read_session, read_session_until},
 };
 
 /// The MCP revision the test client speaks, as the harnesses Suru hosts do
@@ -993,4 +996,899 @@ async fn nothing_about_the_broker_is_written_into_the_runtime_descriptor() {
     assert_eq!(read_runtime_descriptor(&descriptor_path), descriptor);
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// What every spawn below asks its Subagent to do.
+const DELEGATION: &str =
+    "Find every seam where a Provider plugs into Suru, and say which file holds each.";
+
+/// The Delegation as the Subagent's Provider receives it: one leading line
+/// naming the delegating Agent, then what it asked.
+fn delegated_by(delegator: &str) -> String {
+    format!("Delegated to you through Suru by {delegator}.\n\n{DELEGATION}")
+}
+
+/// `spawn_subagent`'s arguments for a Subagent named Researcher on
+/// `provider`'s `model`, with `options` as the Agent sent them.
+fn researcher(provider: &str, model: &str, options: Value) -> Value {
+    json!({
+        "provider": provider,
+        "model": model,
+        "options": options,
+        "name": "Researcher",
+        "description": "Survey the Provider seams",
+        "prompt": DELEGATION,
+    })
+}
+
+/// The Agent Selection a Codex Subagent on GPT-5.5 at `effort` runs under.
+fn codex_selection(effort: &str) -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.5"),
+        options: vec![ModelOptionSelection {
+            id: ModelOptionId::new("reasoning_effort"),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(effort),
+            },
+        }],
+    }
+}
+
+impl McpClient {
+    /// Spawns a brokered Subagent and answers with its Session, read from the
+    /// structured content the call carries.
+    async fn spawn_subagent(&mut self, arguments: Value) -> SessionId {
+        let result = self.call_tool("spawn_subagent", arguments).await;
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "spawn_subagent answers: {result}"
+        );
+        serde_json::from_value(result["structuredContent"]["session_id"].clone())
+            .unwrap_or_else(|_| panic!("the answer names the Subagent's Session: {result}"))
+    }
+
+    /// What `tool` refuses a call with: the Tool's own error, in words the
+    /// calling Agent reads.
+    async fn refusal(&mut self, tool: &str, arguments: Value) -> String {
+        let result = self.call_tool(tool, arguments).await;
+        assert_eq!(result["isError"], json!(true), "{tool} refuses: {result}");
+        result["content"][0]["text"]
+            .as_str()
+            .expect("a refusal is told in text")
+            .to_owned()
+    }
+}
+
+/// A Claude Session whose first Turn is working, on a Server hosting it beside
+/// Codex and an unavailable Copilot, and the MCP client its Agent is, holding
+/// the Broker token its Provider start carried.
+struct Delegating {
+    hosted: HostedProviders,
+    descriptor: RuntimeDescriptor,
+    caller: SessionId,
+    caller_provider: ControlledProviderSession,
+    handoff: BrokerHandoff,
+    client: McpClient,
+}
+
+async fn delegating(state_dir: &Path, channel: &str, config_dir: Option<&Path>) -> Delegating {
+    let mut hosted = host_providers(state_dir, channel, config_dir).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (caller, handoff, caller_provider) = start_session(
+        &descriptor,
+        &mut hosted.claude,
+        &workspace,
+        default_selection(&claude_models()),
+    )
+    .await;
+    let mut client = McpClient::handed(&handoff);
+    client.initialize().await;
+    Delegating {
+        hosted,
+        descriptor,
+        caller,
+        caller_provider,
+        handoff,
+        client,
+    }
+}
+
+/// The brokered Subagent's own Provider, started on `provider`'s double as
+/// the Agent its start answers with, and the first Turn it is asked to run,
+/// taken up.
+async fn run_child(
+    provider: &mut ControlledProvider,
+    selection: AgentSelection,
+) -> (ControlledProviderSession, String) {
+    let start = next_start(provider).await;
+    let mut child = start.succeed(AgentIdentity {
+        agent: AgentId::new(format!("{}-agent", selection.provider)),
+        selection,
+    });
+    let turn = timeout(PROGRESS_DEADLINE, child.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider");
+    let delivered = turn.prompt().to_owned();
+    turn.succeed();
+    (child, delivered)
+}
+
+/// The Subagent row `snapshot` holds for `child`.
+fn row_for(snapshot: &SessionSnapshot, child: SessionId) -> &Activity {
+    snapshot
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child))
+        .unwrap_or_else(|| panic!("the Transcript holds a row for {child}"))
+}
+
+fn row_status(snapshot: &SessionSnapshot, child: SessionId) -> (ActivityStatus, Option<u64>) {
+    let Activity::Subagent {
+        status,
+        duration_ms,
+        ..
+    } = row_for(snapshot, child)
+    else {
+        unreachable!()
+    };
+    (*status, *duration_ms)
+}
+
+fn row_model(snapshot: &SessionSnapshot, child: SessionId) -> Option<ModelId> {
+    let Activity::Subagent { model, .. } = row_for(snapshot, child) else {
+        unreachable!()
+    };
+    model.clone()
+}
+
+async fn read_until(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    described: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    read_session_until(
+        &reqwest::Client::new(),
+        descriptor,
+        session_id,
+        described,
+        predicate,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_spawned_brokered_subagent_is_a_child_session_on_the_agent_selection_it_named() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-child", None).await;
+    let workspace = delegating.hosted.workspace.path().to_owned();
+
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher(
+            "codex",
+            "gpt-5.5",
+            json!({ "reasoning_effort": "low" }),
+        ))
+        .await;
+
+    let child = read_session(&delegating.descriptor, child_id).await;
+    assert_eq!(
+        child.session.parent,
+        Some(delegating.caller),
+        "the Subagent's Session is a child of the Session whose Agent spawned it"
+    );
+    assert_eq!(
+        child.session.agent_selection,
+        Some(codex_selection("low")),
+        "on the Provider, Model and Model Options the spawn named"
+    );
+    assert_eq!(child.title, "Survey the Provider seams");
+    assert_eq!(child.session.execution_directory.path, workspace);
+
+    let start = next_start(&mut delegating.hosted.codex).await;
+    assert_eq!(
+        start.execution_directory(),
+        workspace,
+        "the Subagent works in its caller's Execution Directory"
+    );
+    assert_eq!(
+        start.resume_state(),
+        None,
+        "a new Subagent has nothing to resume"
+    );
+    assert_eq!(
+        start.approval_posture().map(ApprovalPosture::provider),
+        Some(ProviderId::new("codex")),
+        "its own Provider's posture"
+    );
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("the Subagent is handed the Broker too");
+    assert_ne!(
+        child_handoff.token(),
+        delegating.handoff.token(),
+        "on a token of its own"
+    );
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    let turn = timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider");
+    assert_eq!(
+        turn.prompt(),
+        delegated_by("the Agent working on \"Plan the work\""),
+        "its first Turn's input is the Delegation, naming the Agent that delegated it by its \
+         Session's Title"
+    );
+    assert_eq!(
+        turn.selection(),
+        &codex_selection("low"),
+        "under the Agent Selection the spawn named"
+    );
+    turn.succeed();
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_callers_working_turn_gains_a_row_leading_into_a_child_that_opens_with_the_delegation()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-row", None).await;
+
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+
+    let caller = read_session(&delegating.descriptor, delegating.caller).await;
+    let Activity::Subagent {
+        turn_id,
+        status,
+        name,
+        description,
+        model,
+        session_id,
+        duration_ms,
+        ..
+    } = row_for(&caller, child_id)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, caller.turns[0].id,
+        "the row stands in the Turn whose Agent spawned it"
+    );
+    assert_eq!(caller.turns[0].status, TurnStatus::Active);
+    assert_eq!(
+        (name.as_str(), description.as_str()),
+        ("Researcher", "Survey the Provider seams")
+    );
+    assert_eq!(*session_id, child_id, "and leads into the child's Session");
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(
+        (model, duration_ms),
+        (&None, &None),
+        "no Model is known before the child's Provider confirms one, and no duration before it \
+         settles"
+    );
+
+    let child = read_session(&delegating.descriptor, child_id).await;
+    assert_eq!(child.turns.len(), 1);
+    assert_eq!(
+        child.turns[0].prompt_id, None,
+        "a Delegation, not a Prompt, begins it"
+    );
+    let Some(TranscriptItem::Message { message_id }) = child.transcript.first() else {
+        panic!("the child's Transcript opens with a Message: {child:?}");
+    };
+    let opening = child
+        .messages
+        .iter()
+        .find(|message| message.id == *message_id)
+        .expect("the opening Message is held");
+    assert_eq!(
+        opening.role,
+        MessageRole::Delegation(Delegator {
+            session_id: delegating.caller,
+            name: None,
+        }),
+        "the Delegation stands as a Message from the Agent that delegated it, apart from a \
+         user Message"
+    );
+    assert_eq!(opening.content, DELEGATION);
+    assert_eq!(opening.turn_id, child.turns[0].id);
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_caller_is_working_until_its_brokered_subagent_settles_and_the_row_settles_completed_with_it()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-working", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+
+    // The caller's own Turn settles at its Provider's boundary while the
+    // Subagent it spawned works on.
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let waiting = read_until(
+        &descriptor,
+        delegating.caller,
+        "the caller's Turn settles while its Subagent works",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+    )
+    .await;
+    assert!(
+        waiting.working_since().is_some(),
+        "the caller reads as Working while its brokered Subagent works"
+    );
+    assert_eq!(
+        row_status(&waiting, child_id),
+        (ActivityStatus::Active, None)
+    );
+
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let settled = read_until(
+        &descriptor,
+        delegating.caller,
+        "the row settles with the child's Turn",
+        |snapshot| row_status(snapshot, child_id).0 != ActivityStatus::Active,
+    )
+    .await;
+    let (status, duration_ms) = row_status(&settled, child_id);
+    assert_eq!(status, ActivityStatus::Completed);
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        duration_ms,
+        child.turns[0]
+            .settled_at
+            .zip(child.turns[0].started_at)
+            .map(|(settled, started)| settled.0 - started.0),
+        "and says how long the Subagent worked, timed from its spawn"
+    );
+    let idle = read_until(
+        &descriptor,
+        delegating.caller,
+        "nothing below the caller works any more",
+        |snapshot| snapshot.working_since().is_none(),
+    )
+    .await;
+    assert_eq!(idle.session.status, SessionStatus::Idle);
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_brokered_subagent_whose_turn_fails_settles_its_row_failed_with_a_duration() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-failed", None).await;
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnFailed {
+            message: "the sandbox refused the command".to_owned(),
+        })
+        .await;
+    let settled = read_until(
+        &delegating.descriptor,
+        delegating.caller,
+        "the row settles with the child's failed Turn",
+        |snapshot| row_status(snapshot, child_id).0 != ActivityStatus::Active,
+    )
+    .await;
+    let (status, duration_ms) = row_status(&settled, child_id);
+    assert_eq!(status, ActivityStatus::Failed);
+    assert!(duration_ms.is_some(), "a failed stretch was timed too");
+    let child = read_session(&delegating.descriptor, child_id).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Failed);
+    assert!(child.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text == "the sandbox refused the command"
+    )));
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_in_the_tree() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-model", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (tree, mut updates) = open_tree(&descriptor, delegating.caller).await;
+    let mut revision = tree.revision;
+
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let spawned = changes_until(&mut updates, &mut revision, |change| {
+        matches!(change, SubagentTreeChange::SubagentSpawned { .. })
+    })
+    .await;
+    let Some(SubagentTreeChange::SubagentSpawned { entry }) = spawned.last() else {
+        unreachable!()
+    };
+    assert_eq!(
+        (entry.session_id, entry.parent_session_id),
+        (child_id, delegating.caller)
+    );
+    assert_eq!(entry.name, "Researcher");
+    assert_eq!(
+        entry.model, None,
+        "no Model is known until the child's Provider confirms one"
+    );
+
+    // The child's Provider takes its first Turn under the Model the spawn
+    // chose: the first word from the Provider on which Model it runs.
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    let confirmed = changes_until(&mut updates, &mut revision, |change| {
+        matches!(change, SubagentTreeChange::SubagentModelChanged { .. })
+    })
+    .await;
+    assert_eq!(
+        confirmed.last(),
+        Some(&SubagentTreeChange::SubagentModelChanged {
+            session_id: child_id,
+            model: ModelId::new("gpt-5.5"),
+        })
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(row_model(&caller, child_id), Some(ModelId::new("gpt-5.5")));
+
+    // Later the Provider reports running another.
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::AgentSelectionChanged {
+            selection: AgentSelection {
+                model: ModelId::new("gpt-5.4"),
+                ..codex_selection("high")
+            },
+        })
+        .await;
+    let revised = changes_until(&mut updates, &mut revision, |change| {
+        matches!(change, SubagentTreeChange::SubagentModelChanged { .. })
+    })
+    .await;
+    assert_eq!(
+        revised.last(),
+        Some(&SubagentTreeChange::SubagentModelChanged {
+            session_id: child_id,
+            model: ModelId::new("gpt-5.4"),
+        }),
+        "the entry follows the Model the Provider confirmed last"
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(row_model(&caller, child_id), Some(ModelId::new("gpt-5.4")));
+    let (fresh, _updates) = open_tree(&descriptor, child_id).await;
+    assert_eq!(
+        fresh
+            .subagents
+            .iter()
+            .find(|entry| entry.session_id == child_id)
+            .and_then(|entry| entry.model.clone()),
+        Some(ModelId::new("gpt-5.4")),
+        "and a fresh snapshot of the tree, opened from the child, carries it"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_brokered_subagents_usage_is_its_own_and_rolls_into_its_callers_total() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-usage", None).await;
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    let measured = |fresh_input, output| Usage {
+        fresh_input_tokens: Some(fresh_input),
+        output_tokens: Some(output),
+        ..Usage::default()
+    };
+
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(4_000, 1_000),
+            cost: None,
+        })
+        .await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: measured(2_000, 500),
+            cost: None,
+        })
+        .await;
+
+    let tokens = |total: Option<UsageTotal>| {
+        total.map(|total| (total.fresh_input_tokens, total.output_tokens))
+    };
+    let caller = read_until(
+        &delegating.descriptor,
+        delegating.caller,
+        "the caller's total carries its Subagent's Usage",
+        |snapshot| tokens(snapshot.total_usage()) == Some((Some(6_000), Some(1_500))),
+    )
+    .await;
+    assert_eq!(
+        tokens(caller.subagent_usage),
+        Some((Some(2_000), Some(500))),
+        "the roll-up stands apart from the caller's own Turns"
+    );
+    let child = read_session(&delegating.descriptor, child_id).await;
+    assert_eq!(
+        tokens(child.total_usage()),
+        Some((Some(2_000), Some(500))),
+        "the Subagent's Session keeps its own Usage"
+    );
+    assert_eq!(child.turns[0].usage, Some(measured(2_000, 500)));
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_spawn_on_a_provider_or_model_that_cannot_be_chosen_is_refused_in_words_the_agent_reads()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        "{ \"provider\": { \"codex\": { \"enabled\": false } } }\n",
+    )
+    .expect("write Config Document");
+    let mut delegating = delegating(
+        state_dir.path(),
+        "broker-spawn-refused",
+        Some(config_dir.path()),
+    )
+    .await;
+
+    for (arguments, says) in [
+        (
+            researcher("codex", "gpt-5.5", json!({})),
+            "Provider `codex` is turned off in Suru",
+        ),
+        (
+            researcher("copilot", "gpt-4.1", json!({})),
+            "Provider `copilot` cannot be used now: the copilot CLI is not signed in",
+        ),
+        (
+            researcher("gemini", "pro", json!({})),
+            "Suru hosts no Provider `gemini`; the Providers it hosts are `claude`, `codex`, \
+             `copilot`",
+        ),
+        (
+            researcher("claude", "sonnet-9", json!({})),
+            "Provider `claude` offers no Model `sonnet-9`; choose one of `opus`, `haiku`",
+        ),
+        (
+            researcher("claude", "opus", json!({ "effort": "ultra" })),
+            "Model Option `effort` has no choice `ultra`; choose one of `low`, `medium`, `high`",
+        ),
+        (
+            researcher("claude", "opus", json!({ "fast": "yes" })),
+            "Model Option `fast` is a toggle and takes true or false",
+        ),
+        (
+            researcher("claude", "opus", json!({ "verbosity": "low" })),
+            "Model `opus` has no Model Option `verbosity`; its Model Options are `effort`, `fast`",
+        ),
+        (
+            json!({ "provider": "claude", "model": "opus", "name": "Researcher",
+                    "description": "Survey the Provider seams", "prompt": "  " }),
+            "`prompt` is empty",
+        ),
+        (
+            json!({ "provider": "claude", "model": "opus", "name": "Researcher",
+                    "prompt": DELEGATION }),
+            "spawn_subagent needs `description`",
+        ),
+        (
+            json!({ "provider": "claude", "model": "opus", "name": "Researcher",
+                    "description": "Survey", "prompt": DELEGATION, "isolation": "worktree" }),
+            "spawn_subagent takes no argument `isolation`",
+        ),
+    ] {
+        let refusal = delegating.client.refusal("spawn_subagent", arguments).await;
+        assert!(
+            refusal.contains(says),
+            "the refusal says {says:?}, but said {refusal:?}"
+        );
+    }
+
+    let caller = read_session(&delegating.descriptor, delegating.caller).await;
+    assert!(
+        !caller
+            .activities
+            .iter()
+            .any(|activity| matches!(activity, Activity::Subagent { .. })),
+        "a refused spawn adds no row"
+    );
+    assert!(
+        delegating.hosted.codex.try_next_start().is_none()
+            && delegating.hosted.claude.try_next_start().is_none(),
+        "and starts no Provider"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn model_options_a_spawn_leaves_out_take_the_models_defaults() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-defaults", None).await;
+    let caller = read_session(&delegating.descriptor, delegating.caller).await;
+
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("claude", "opus", json!({ "fast": true })))
+        .await;
+
+    let defaulted = AgentSelection {
+        provider: ProviderId::new("claude"),
+        model: ModelId::new("opus"),
+        options: vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("medium"),
+                },
+            },
+            ModelOptionSelection {
+                id: ModelOptionId::new("fast"),
+                value: ModelOptionValue::Toggle { enabled: true },
+            },
+        ],
+    };
+    let child = read_session(&delegating.descriptor, child_id).await;
+    assert_eq!(
+        child.session.agent_selection,
+        Some(defaulted.clone()),
+        "the option the spawn named is set, and the one it left out takes the Model's default"
+    );
+
+    // A Subagent on its spawner's own Provider runs a Provider of its own all
+    // the same, under its spawner's very posture.
+    let start = next_start(&mut delegating.hosted.claude).await;
+    assert_eq!(
+        start.approval_posture(),
+        caller
+            .session
+            .approval_posture
+            .as_ref()
+            .map(|posture| &posture.value),
+        "a brokered Subagent on its spawner's Provider acts under its spawner's posture"
+    );
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: default_selection(&claude_models()),
+    });
+    let turn = timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider");
+    assert_eq!(turn.selection(), &defaulted);
+    turn.succeed();
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_spawn_by_a_session_with_no_turn_working_is_refused() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-spawn-no-turn", None).await;
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    read_until(
+        &delegating.descriptor,
+        delegating.caller,
+        "the caller's Turn settles",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+    )
+    .await;
+
+    let refusal = delegating
+        .client
+        .refusal("spawn_subagent", researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    assert!(
+        refusal.contains("has no Turn working to hold the Subagent's row"),
+        "a spawn with no Turn to stand in is refused, saying so: {refusal}"
+    );
+    assert!(delegating.hosted.codex.try_next_start().is_none());
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+/// A brokered Subagent working when the Server stops cleanly: the stop
+/// settles its Turn, and its row with it, before the Server is gone.
+async fn stop_with_a_brokered_subagent_working(
+    state_dir: &Path,
+    channel: &str,
+) -> (SessionId, SessionId) {
+    let mut delegating = delegating(state_dir, channel, None).await;
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    read_until(
+        &delegating.descriptor,
+        child_id,
+        "the Subagent is working on its Model",
+        |snapshot| snapshot.turns[0].agent.is_some(),
+    )
+    .await;
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+    drop(child_provider);
+    (delegating.caller, child_id)
+}
+
+#[tokio::test]
+async fn a_stopping_server_settles_a_brokered_subagents_turn_and_its_row_with_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "broker-spawn-stop";
+    let (caller_id, child_id) =
+        stop_with_a_brokered_subagent_working(state_dir.path(), channel).await;
+
+    let restarted = host_providers(state_dir.path(), channel, None).await;
+    let descriptor = restarted.server.descriptor().clone();
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Failed);
+    assert!(child.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. }
+            if text == "Provider execution failed: Suru stopped the Provider Session before the Turn completed."
+    )));
+    let caller = read_session(&descriptor, caller_id).await;
+    let (status, duration_ms) = row_status(&caller, child_id);
+    assert_eq!(
+        status,
+        ActivityStatus::Failed,
+        "the row settled with the Turn"
+    );
+    assert!(
+        duration_ms.is_some(),
+        "timed by the stop that ended the Subagent's work"
+    );
+    assert_eq!(caller.working_since(), None);
+
+    restarted.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_restart_settles_a_brokered_subagents_open_turn_failed_and_its_row_with_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "broker-spawn-restart";
+    let (caller_id, child_id) =
+        stop_with_a_brokered_subagent_working(state_dir.path(), channel).await;
+
+    // Put the history back the way a process that never settled its work
+    // would have left it: every Turn open, the Subagent's row still live.
+    {
+        use diesel::{Connection, RunQueryDsl, SqliteConnection};
+        let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
+        let mut database =
+            SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
+                .unwrap();
+        diesel::sql_query(
+            "UPDATE turns SET payload = json_set(payload, '$.status', 'active', '$.settled_at', json('null'))",
+        )
+        .execute(&mut database)
+        .unwrap();
+        diesel::sql_query(format!(
+            "UPDATE activities SET payload = json_set(payload, '$.status', 'active', '$.duration_ms', json('null')) WHERE session_id = '{caller_id}' AND json_extract(payload, '$.kind') = 'subagent'"
+        ))
+        .execute(&mut database)
+        .unwrap();
+    }
+
+    let restarted = host_providers(state_dir.path(), channel, None).await;
+    let descriptor = restarted.server.descriptor().clone();
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(child.turns[0].status, TurnStatus::Failed);
+    assert!(child.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Error { text, .. } if text == "The server stopped before this Subagent finished."
+    )));
+    assert_eq!(child.working_since(), None);
+    let caller = read_session(&descriptor, caller_id).await;
+    assert_eq!(
+        row_status(&caller, child_id),
+        (ActivityStatus::Failed, None),
+        "the row settles with the Turn, with no duration since nothing timed its end"
+    );
+    assert_eq!(caller.working_since(), None);
+    assert_eq!(caller.session.status, SessionStatus::Idle);
+    assert_eq!(
+        child
+            .session
+            .approval_posture
+            .map(|posture| posture.value.provider()),
+        Some(ProviderId::new("codex")),
+        "the next process still reads the Subagent as brokered, on an actor of its own: it \
+         keeps its own posture rather than taking its Claude spawner's"
+    );
+
+    restarted.server.shutdown().await.expect("shut down server");
 }

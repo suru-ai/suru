@@ -984,3 +984,100 @@ fn a_subagent_session_opened_by_delegations_still_offers_no_prompt_composer() {
         "the view says how to leave instead of offering a composer: {text}"
     );
 }
+
+/// A brokered Subagent's row is the same Activity a native one is — only its
+/// child Session tells the routes apart, by running an Agent Selection of its
+/// own on another Provider — so it renders exactly as a native row does and
+/// leads into the child's Session all the same, and that Session opens with
+/// the Delegation drawn apart from a user Message.
+#[test]
+fn a_brokered_subagents_row_renders_like_a_native_one_and_opens_its_session() {
+    let workspace = workspace_dir();
+    let row_line = |snapshot: SessionSnapshot| {
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a Subagent row");
+        let rows = rendered_application_rows_at(&application, 80, 22);
+        let line = rows
+            .iter()
+            .find(|row| row.contains("Explore: Map the provider seams"))
+            .unwrap_or_else(|| panic!("the row renders: {}", rows.join("\n")))
+            .clone();
+        (application, line)
+    };
+    let (native, _) = parent_with_subagent_row(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some(12_000),
+        true,
+    );
+    let (mut brokered, child_id) = parent_with_subagent_row(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some(12_000),
+        true,
+    );
+    // A brokered row carries the Model its child's own Provider confirmed.
+    let Activity::Subagent { model, .. } = &mut brokered.activities[0] else {
+        unreachable!()
+    };
+    *model = Some(ModelId::new("gpt-5.5"));
+    let parent_id = brokered.session.id;
+
+    let (_native, native_line) = row_line(native);
+    let (mut application, brokered_line) = row_line(brokered);
+    assert_eq!(
+        brokered_line, native_line,
+        "a brokered row renders exactly as a native one"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 22, "Explore: Map the provider seams"),
+        ApplicationTransition::AttachSession(suru::protocol::SessionReference::new(
+            suru::protocol::Outlook::Local,
+            child_id,
+        )),
+        "and pressing it opens the brokered Subagent's own Session"
+    );
+
+    let codex = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.5"),
+        options: Vec::new(),
+    };
+    let mut child = child_session_snapshot(child_id, parent_id, workspace.path());
+    child.session.agent_selection = Some(codex.clone());
+    child.turns[0].agent = Some(AgentIdentity {
+        agent: AgentId::new("codex"),
+        selection: codex,
+    });
+    let spawn = delegation(
+        child.turns[0].id,
+        parent_id,
+        None,
+        "Map the provider seams.",
+    );
+    child.transcript.insert(
+        0,
+        TranscriptItem::Message {
+            message_id: spawn.id,
+        },
+    );
+    child.messages.insert(0, spawn);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach the brokered Subagent's Session");
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("│ Delegated by parent") && text.contains("│ Map the provider seams."),
+        "its Transcript opens with the Delegation, naming the Agent that sent it: {text}"
+    );
+    assert!(
+        !text.contains("┃ Map the provider seams."),
+        "drawn apart from a user Message: {text}"
+    );
+    assert!(
+        text.contains("gpt-5.5"),
+        "on the Model its own Provider runs: {text}"
+    );
+}

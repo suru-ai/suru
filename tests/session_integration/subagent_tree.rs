@@ -34,7 +34,7 @@ use suru::{
 };
 use tokio::time::{Duration, timeout};
 
-type TreeUpdates = Pin<Box<dyn Stream<Item = SubagentTreeUpdate> + Send>>;
+pub(crate) type TreeUpdates = Pin<Box<dyn Stream<Item = SubagentTreeUpdate> + Send>>;
 
 fn tree_url(descriptor: &RuntimeDescriptor, session_id: SessionId) -> String {
     format!(
@@ -45,7 +45,7 @@ fn tree_url(descriptor: &RuntimeDescriptor, session_id: SessionId) -> String {
 
 /// Opens the per-tree stream through `session_id` and decodes its leading
 /// snapshot, handing back the changes that follow it.
-async fn open_tree(
+pub(crate) async fn open_tree(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
 ) -> (SubagentTreeSnapshot, TreeUpdates) {
@@ -82,7 +82,7 @@ async fn open_tree(
 }
 
 /// The next change, checked to follow the revision before it without a gap.
-async fn next_change(
+pub(crate) async fn next_change(
     updates: &mut TreeUpdates,
     revision: &mut suru::protocol::SubagentTreeRevision,
 ) -> SubagentTreeChange {
@@ -908,7 +908,7 @@ async fn a_restart_restores_the_tree_and_its_entries() {
 
 /// Every change up to and including the first that `wanted` picks out, each
 /// checked to follow the one before it without a gap.
-async fn changes_until(
+pub(crate) async fn changes_until(
     updates: &mut TreeUpdates,
     revision: &mut suru::protocol::SubagentTreeRevision,
     wanted: impl Fn(&SubagentTreeChange) -> bool,
