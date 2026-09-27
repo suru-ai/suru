@@ -610,6 +610,13 @@ impl ControlledProviderSession {
             .expect("Provider remains connected")
     }
 
+    /// The Decision already delivered, without waiting for one. A test that
+    /// must show a Provider was *never* handed a Decision reads the absence
+    /// here rather than waiting out a timeout.
+    pub fn try_next_decision(&mut self) -> Option<DecisionDelivery> {
+        self.decisions.try_recv().ok()
+    }
+
     pub async fn next_questionnaire_submission(
         &mut self,
     ) -> (
@@ -635,6 +642,13 @@ impl ControlledProviderSession {
             .recv()
             .await
             .expect("Provider remains connected")
+    }
+
+    /// The Answer already delivered, without waiting for one. A test that
+    /// must show a Provider was *never* handed an Answer reads the absence
+    /// here rather than waiting out a timeout.
+    pub fn try_next_questionnaire_delivery(&mut self) -> Option<QuestionnaireDelivery> {
+        self.questionnaires.try_recv().ok()
     }
 
     pub async fn next_turn(&mut self) -> TurnStart {

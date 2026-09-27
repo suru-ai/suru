@@ -266,6 +266,10 @@ async fn a_brokered_subagents_approval_crosses_the_client_and_its_decision_reach
     );
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(delivered, (request.id, Decision::Accept));
+    assert!(
+        delegating.caller_provider.try_next_decision().is_none(),
+        "the parent's Provider is handed no Decision on an Approval it never raised"
+    );
 
     let decided = read_until(
         &descriptor,
@@ -405,6 +409,13 @@ async fn a_brokered_subagents_questionnaire_crosses_the_client_and_its_answer_re
     );
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(delivered, (asked.id, answer));
+    assert!(
+        delegating
+            .caller_provider
+            .try_next_questionnaire_delivery()
+            .is_none(),
+        "the parent's Provider is handed no Answer to a Questionnaire it never raised"
+    );
 
     read_until(
         &descriptor,
@@ -484,7 +495,8 @@ async fn declining_and_interrupting_a_brokered_subagents_approval_ends_its_turn_
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(delivered, (request.id, Decision::DeclineAndInterrupt));
     assert!(
-        delegating.caller_provider.try_next_interrupt().is_none()
+        delegating.caller_provider.try_next_decision().is_none()
+            && delegating.caller_provider.try_next_interrupt().is_none()
             && delegating
                 .caller_provider
                 .try_next_subagent_stop()
