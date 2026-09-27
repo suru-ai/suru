@@ -9,7 +9,9 @@
 //! once, by the row its spawn left where it first spawned. Each row describes
 //! only its own stretch, so where a Subagent's work stands — its Marker and
 //! its time — is read from its own Session's Turns instead: the latest Turn's
-//! Marker, and the time summed over them all (ADR 0031). A subscribed tree is
+//! Marker, and the time summed over them all (ADR 0031), passing over any
+//! Continuation begun only to hold the row of a Subagent it delegated to after
+//! its own stretch settled, where it did no work. A subscribed tree is
 //! read again after each commit that could move it and compared with what its
 //! subscribers last heard, so the changes they are told about are exactly the
 //! difference, however the rows or Turns came to move.
@@ -24,7 +26,10 @@ use crate::protocol::{
     SubagentTreeUpdate, Turn, TurnStatus,
 };
 
-use super::{SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState};
+use super::{
+    SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState,
+    subagents::stretches_of_work,
+};
 
 /// The top-level Session of a subscribed tree with its Working and Monitoring
 /// readings, as a commit found them before it landed.
@@ -283,7 +288,7 @@ impl SessionStoreState {
                     // to say. Only a Session not held here leaves its first
                     // row to say it instead.
                     let work = own
-                        .and_then(|record| SubagentWork::read(&record.snapshot.turns))
+                        .and_then(|record| SubagentWork::read(stretches_of_work(&record.snapshot)))
                         .unwrap_or(SubagentWork {
                             status,
                             worked_ms: duration_ms,
@@ -326,19 +331,21 @@ struct SubagentWork {
 }
 
 impl SubagentWork {
-    /// Reads a Subagent's Turns, oldest first: the latest Turn's Marker —
-    /// Working while it works, and otherwise the outcome it settled with —
-    /// and the time every settled Turn worked, summed. While the latest Turn
-    /// works, that sum is what its time counts up from, from the moment the
-    /// Turn began. Once it settles, the sum takes it in too, unless Suru never
+    /// Reads a Subagent's stretches of work, oldest first — its Turns, less
+    /// any that only hold a row (see [`stretches_of_work`]): the latest one's
+    /// Marker — Working while it works, and otherwise the outcome it settled
+    /// with — and the time every settled one worked, summed. While the latest
+    /// works, that sum is what its time counts up from, from the moment it
+    /// began. Once it settles, the sum takes it in too, unless Suru never
     /// learned when its work ended, which leaves the time unsaid rather than
-    /// understated; an earlier Turn whose end went unlearned adds nothing.
+    /// understated; an earlier one whose end went unlearned adds nothing.
     /// `None` for a Session with no Turn at all, which says nothing.
-    fn read(turns: &[Turn]) -> Option<Self> {
+    fn read<'a>(turns: impl IntoIterator<Item = &'a Turn>) -> Option<Self> {
+        let turns = turns.into_iter().collect::<Vec<_>>();
         let (latest, earlier) = turns.split_last()?;
         let earlier_ms = earlier
             .iter()
-            .filter_map(worked_span)
+            .filter_map(|turn| worked_span(turn))
             .fold(0_u64, u64::saturating_add);
         let status = match latest.status {
             TurnStatus::Active => {
@@ -677,6 +684,54 @@ mod tests {
             worked_ms,
             working_since: working_since.map(SessionTimestamp),
         })
+    }
+
+    #[test]
+    fn a_continuation_that_only_holds_a_row_is_no_stretch_of_a_subagents_work() {
+        use crate::protocol::{Message, MessageId, MessageRole, MessageStatus};
+        use crate::sessions::{opening_subagent_row, restoration_tests::persisted};
+
+        let mut snapshot =
+            persisted(std::path::Path::new("workspace"), Some(SessionId::new())).snapshot;
+        let worked = turn(TurnStatus::Failed, Some(1_000), Some(4_000));
+        let holding = turn(TurnStatus::Completed, Some(5_000), Some(5_000));
+        let spoke_and_spawned = turn(TurnStatus::Completed, Some(6_000), Some(7_000));
+        let did_nothing = turn(TurnStatus::Completed, Some(8_000), Some(9_000));
+        let spawning = turn(TurnStatus::Active, Some(10_000), None);
+        let said = |turn: &Turn| Message {
+            id: MessageId::new(),
+            turn_id: turn.id,
+            role: MessageRole::Agent,
+            status: MessageStatus::Completed,
+            content: "Found it.".to_owned(),
+            skill_invocations: Vec::new(),
+            truncated: false,
+        };
+        let row = |turn: &Turn| {
+            opening_subagent_row(turn.id, "Scout".to_owned(), String::new(), SessionId::new())
+        };
+        snapshot.messages = vec![said(&worked), said(&spoke_and_spawned)];
+        snapshot.activities = vec![row(&holding), row(&spoke_and_spawned), row(&spawning)];
+        snapshot.turns = vec![
+            worked.clone(),
+            holding,
+            spoke_and_spawned.clone(),
+            did_nothing.clone(),
+            spawning.clone(),
+        ];
+
+        assert_eq!(
+            stretches_of_work(&snapshot),
+            [&worked, &spoke_and_spawned, &did_nothing, &spawning],
+            "only a settled Continuation holding nothing but a row is passed over: not one that \
+             also did work, nor one that did nothing, nor one still working"
+        );
+        snapshot.turns.truncate(2);
+        assert_eq!(
+            SubagentWork::read(stretches_of_work(&snapshot)),
+            work(ActivityStatus::Failed, Some(3_000), None),
+            "so a Subagent's entry keeps the outcome and time of its own work"
+        );
     }
 
     #[test]

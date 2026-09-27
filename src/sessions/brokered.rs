@@ -35,7 +35,10 @@ use super::{
     SessionStore, SessionStoreState,
     posture::brokered_subagent_posture,
     projection::active_turn_id,
-    subagents::{ChildSession, SubagentRoute, delegator, opening_subagent_row, subagent_title},
+    subagents::{
+        ChildSession, SubagentRoute, delegator, opening_subagent_row, stretches_of_work,
+        subagent_title,
+    },
 };
 
 /// What a delegating Agent asked the Broker to spawn, checked against the
@@ -89,8 +92,10 @@ impl fmt::Display for BrokeredSpawnError {
 }
 
 /// How a brokered Subagent stands, as the Agents above it read it through the
-/// Broker. The Subagent itself never Settles, so this is its Session's latest
-/// Turn: the stretch of work it is doing, or the one it last settled.
+/// Broker. The Subagent itself never Settles, so this is its latest stretch
+/// of work: the one it is doing, or the one it last settled — its Session's
+/// latest Turn, passing over a Continuation that only holds the row of a
+/// Subagent it spawned after that stretch settled (see [`stretches_of_work`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BrokeredSubagentReading {
     pub(crate) session_id: SessionId,
@@ -453,15 +458,21 @@ impl SessionStoreState {
 
     /// How the brokered Subagent `subagent`, which the caller has found held,
     /// stands `now`: see [`BrokeredSubagentReading`]. Its spawn opened its
-    /// Session with a Turn, so it always has one; were it ever without, it
-    /// would read as still owed the work it was spawned for.
+    /// Session with a Turn its Delegation heads, which is a stretch of its
+    /// work, so it always has one; were it ever without, it would read by its
+    /// latest Turn, and without any, as still owed the work it was spawned
+    /// for.
     fn brokered_subagent_reading(
         &self,
         subagent: SessionId,
         now: SessionTimestamp,
     ) -> BrokeredSubagentReading {
         let snapshot = &self.sessions[&subagent].snapshot;
-        let Some(latest) = snapshot.turns.last() else {
+        let Some(latest) = stretches_of_work(snapshot)
+            .last()
+            .copied()
+            .or_else(|| snapshot.turns.last())
+        else {
             return BrokeredSubagentReading {
                 session_id: subagent,
                 status: TurnStatus::Active,

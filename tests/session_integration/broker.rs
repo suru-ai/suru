@@ -2613,6 +2613,100 @@ async fn a_brokered_subagent_spawns_a_brokered_subagent_one_level_down_and_the_t
 }
 
 #[tokio::test]
+async fn a_brokered_subagent_that_spawns_after_its_turn_settled_still_reads_as_its_own_work_ended()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-read-past-holding", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let start = next_start(&mut delegating.hosted.codex).await;
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("the Subagent is handed the Broker");
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+    say(&descriptor, child_id, &child_provider, FINDING).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnFailed {
+            message: "the sandbox refused the command".to_owned(),
+        })
+        .await;
+    let caller = read_until(
+        &descriptor,
+        delegating.caller,
+        "the child's row settles with its failed Turn",
+        |snapshot| row_status(snapshot, child_id).0 == ActivityStatus::Failed,
+    )
+    .await;
+    let (_, row_duration) = row_status(&caller, child_id);
+    assert!(row_duration.is_some());
+
+    // Its Provider carries on past that Turn and spawns in its turn, so the
+    // grandchild's row stands in a Continuation of the child's Session.
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(json!({
+            "provider": "claude",
+            "model": "haiku",
+            "name": "Scout",
+            "description": "Chase the Codex seam",
+            "prompt": DELEGATION,
+        }))
+        .await;
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(child.turns.len(), 2);
+    let Activity::Subagent { turn_id, .. } = row_for(&child, grandchild_id) else {
+        unreachable!()
+    };
+    assert_eq!(
+        (*turn_id, child.turns[1].prompt_id, child.turns[1].status),
+        (child.turns[1].id, None, TurnStatus::Completed),
+        "the Continuation holding the row is the child Session's latest Turn"
+    );
+
+    assert_eq!(
+        delegating.client.read_subagent(child_id).await,
+        json!({
+            "session_id": child_id,
+            "status": "failed",
+            "duration_ms": row_duration,
+            "message": FINDING,
+        }),
+        "the child still reads as its own work ended: a Continuation that only holds a row is no \
+         stretch of its work"
+    );
+    let (tree, _updates) = open_tree(&descriptor, delegating.caller).await;
+    let entry = tree
+        .subagents
+        .iter()
+        .find(|entry| entry.session_id == child_id)
+        .expect("the tree lists the child");
+    assert_eq!(
+        (entry.status, entry.worked_ms),
+        (ActivityStatus::Failed, row_duration),
+        "and its entry in the Subagents Section keeps its outcome and its time"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn reading_an_id_that_is_not_a_brokered_subagent_beneath_the_caller_is_refused() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-read-refused", None).await;

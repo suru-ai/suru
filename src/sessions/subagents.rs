@@ -5,7 +5,7 @@
 //! finding the Session a resume continues by the identity its Provider stored
 //! with it at the spawn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use tokio::sync::broadcast;
@@ -306,6 +306,49 @@ pub(crate) fn opening_subagent_row(
         session_id,
         duration_ms: None,
     }
+}
+
+/// A Session's stretches of work, oldest first: its Turns, less each
+/// Continuation begun only to hold a Subagent's row — for a spawn or a resume
+/// delegated after the Turn its delegating Agent worked in had settled (ADR
+/// 0033, 0035). Such a Continuation is begun by no Prompt, settled at once,
+/// and holds nothing but that row: its Agent did no work in it, so
+/// whatever reads how a Subagent's work stands — its Marker and time in the
+/// Subagent tree, what `read_subagent` answers — passes over it, as anything
+/// that reports a stretch settling must.
+pub(super) fn stretches_of_work(snapshot: &SessionSnapshot) -> Vec<&Turn> {
+    let holding = snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Subagent { .. }))
+        .map(Activity::turn_id)
+        .collect::<HashSet<_>>();
+    if holding.is_empty() {
+        return snapshot.turns.iter().collect();
+    }
+    let worked = snapshot
+        .messages
+        .iter()
+        .map(|message| message.turn_id)
+        .chain(
+            snapshot
+                .activities
+                .iter()
+                .filter(|activity| !matches!(activity, Activity::Subagent { .. }))
+                .map(Activity::turn_id),
+        )
+        .collect::<HashSet<_>>();
+    snapshot
+        .turns
+        .iter()
+        .filter(|turn| {
+            let only_holds_rows = turn.is_continuation()
+                && turn.status.is_terminal()
+                && holding.contains(&turn.id)
+                && !worked.contains(&turn.id);
+            !only_holds_rows
+        })
+        .collect()
 }
 
 /// A Subagent's Title: what its spawn described it doing, or its name where
