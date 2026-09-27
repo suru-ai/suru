@@ -4035,6 +4035,12 @@ fn provider_turn_start(
     )
 }
 
+/// The posture a Provider start or Turn carries for the Session `snapshot`
+/// reads. A top-level Session acts under its pin, or else under the live
+/// reading of its Provider's Setting. A Subagent's Session never reads the
+/// Settings itself: what it holds is its spawner's posture, inherited or
+/// derived through ADR 0036's table and pinned or not, so that is what it acts
+/// under.
 fn effective_approval_posture(
     snapshot: &crate::protocol::SessionSnapshot,
     settings: &SettingsSnapshot,
@@ -4044,7 +4050,7 @@ fn effective_approval_posture(
         .session
         .approval_posture
         .as_ref()
-        .filter(|posture| posture.pinned)
+        .filter(|posture| posture.pinned || snapshot.session.is_subagent())
         .map(|posture| posture.value)
         .filter(|posture| posture.provider() == *provider)
         .or_else(|| crate::protocol::ApprovalPosture::for_provider(provider, &settings.settings))

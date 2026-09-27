@@ -2293,10 +2293,18 @@ async fn update_approval_posture(
         .apply_approval_posture_command(session_id, request, &settings)
     {
         Ok(mutation) => {
-            let applied = match mutation.update {
-                Some(update) => state.providers.update_approval_posture(update).await,
-                None => Ok(crate::provider::ProviderPostureApplication::Applied),
+            // The brokered Subagents beneath the Session hold what was just
+            // derived from this posture, each owed it on an actor of its own;
+            // they are told alongside it, so the answer finds the tree
+            // following the change.
+            let own = async {
+                match mutation.update {
+                    Some(update) => state.providers.update_approval_posture(update).await,
+                    None => Ok(crate::provider::ProviderPostureApplication::Applied),
+                }
             };
+            let (applied, ()) =
+                tokio::join!(own, apply_live_posture_updates(&state, mutation.derived));
             match applied {
                 Ok(_) => Json(
                     state

@@ -32,6 +32,10 @@ pub(crate) struct ApprovalPostureUpdate {
 pub(crate) struct ApprovalPostureMutation {
     pub(crate) posture: SessionApprovalPosture,
     pub(crate) update: Option<ApprovalPostureUpdate>,
+    /// What each brokered Subagent beneath the Session is owed now its
+    /// posture has been re-derived from the one just set: an update to
+    /// deliver to that Subagent's own Provider actor.
+    pub(crate) derived: Vec<ApprovalPostureUpdate>,
 }
 
 impl SessionStore {
@@ -117,9 +121,11 @@ impl SessionStore {
         } else {
             None
         };
+        let derived = state.brokered_updates_beneath(session_id);
         Ok(ApprovalPostureMutation {
             posture: value,
             update,
+            derived,
         })
     }
 
@@ -553,6 +559,22 @@ impl SessionStoreState {
             }
         }
         order
+    }
+
+    /// What each brokered Subagent beneath `session_id` is still owed: the
+    /// native application re-deriving its posture left outstanding, as an
+    /// update to deliver to that Subagent's own Provider actor.
+    fn brokered_updates_beneath(&mut self, session_id: SessionId) -> Vec<ApprovalPostureUpdate> {
+        let brokered = self
+            .spawn_order_beneath([session_id])
+            .into_iter()
+            .map(|(_, child)| child)
+            .filter(|child| self.sessions[child].is_brokered_subagent())
+            .collect::<Vec<_>>();
+        brokered
+            .into_iter()
+            .filter_map(|child| self.outstanding_posture_update(child))
+            .collect()
     }
 
     /// The actor owner's native application still outstanding, as an update
