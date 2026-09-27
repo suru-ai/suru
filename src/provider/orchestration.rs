@@ -1849,6 +1849,7 @@ async fn run_provider_session(
     let provider_id = runtime.provider_id();
     let connector = ProviderConnector {
         runtime: &runtime,
+        source_control: &source_control,
         sessions: &sessions,
         updates: &updates,
         settings: &settings,
@@ -2136,7 +2137,6 @@ async fn run_provider_session(
                 ProviderCommand::StartDelegation { turn_id, input } => {
                     match begin_delegated_turn(
                         &connector,
-                        &source_control,
                         &mut provider,
                         &mut subagents,
                         &mut shutdown,
@@ -2299,40 +2299,31 @@ async fn run_provider_session(
                 .lock()
                 .unwrap()
                 .remove(&(session_id, prompt_id));
-            let preparation = tokio::select! {
-                _ = shutdown.wait() => break 'actor,
-                result = source_control.prepare_execution(&snapshot.session, inherited) => result,
-            };
-            let preparation = preparation.and_then(|lease| {
-                if let Some(reading) = lease.reading.clone() {
-                    sessions
-                        .record_checkout(reading)
-                        .map_err(|e| format!("Cannot persist checkout recovery facts: {e}"))?;
-                }
-                Ok(lease)
-            });
-            let lease = match preparation {
+            let lease = match connector
+                .lease_worktree(
+                    &snapshot.session,
+                    inherited,
+                    &mut provider,
+                    &subagents,
+                    &mut shutdown,
+                )
+                .await
+            {
                 Ok(lease) => lease,
-                Err(message) => {
-                    let _ = updates.apply(|| sessions.deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Failed { message: format!("Worktree unavailable; restore the checkout or retry recovery: {message}") }));
+                Err(ConnectionFailure::Stopping) => break 'actor,
+                Err(ConnectionFailure::Failed(message)) => {
+                    let _ = updates.apply(|| {
+                        sessions.deliver_prompt(
+                            session_id,
+                            prompt_id,
+                            None,
+                            DeliveredTurnStatus::Failed { message },
+                        )
+                    });
                     defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
                     continue;
                 }
             };
-            let reconnect = provider
-                .as_ref()
-                .is_some_and(|p| p.incarnation != lease.incarnation);
-            if reconnect && (!subagents.routes.is_empty() || !subagents.working.is_empty()) {
-                let _ = updates.apply(|| sessions.deliver_prompt(session_id, prompt_id, None, DeliveredTurnStatus::Failed { message: "The Worktree was recreated while Subagents still use the previous working copy; wait for their work to finish before retrying".to_owned() }));
-                defer_next_queued_prompt(&mut deferred_prompt_id, &sessions, session_id);
-                continue;
-            }
-            if reconnect {
-                if let Some(previous) = provider.take() {
-                    let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
-                }
-                connected_incarnations.lock().unwrap().remove(&session_id);
-            }
             if snapshot
                 .session
                 .checkout
@@ -3133,11 +3124,12 @@ async fn run_provider_session(
     }
 }
 
-/// Why no Provider connection could be opened for the Turn about to begin.
+/// Why the Turn about to begin could not be given its Worktree or a Provider
+/// connection over it.
 enum ConnectionFailure {
-    /// The Provider could not be started, or what it answered could not be
-    /// recorded: the message says which, in the words the Turn's failure
-    /// carries.
+    /// The Worktree could not be leased, or the Provider could not be started,
+    /// or what it answered could not be recorded: the message says which, in
+    /// the words the Turn's failure carries.
     Failed(String),
     /// Suru is stopping, and the actor stops with it.
     Stopping,
@@ -3148,6 +3140,7 @@ enum ConnectionFailure {
 /// Delegation's — is about to begin over it.
 struct ProviderConnector<'a> {
     runtime: &'a Arc<dyn ProviderRuntime>,
+    source_control: &'a crate::source_control::SourceControlService,
     sessions: &'a SessionStore,
     updates: &'a ProviderUpdateGate,
     settings: &'a watch::Receiver<SettingsSnapshot>,
@@ -3159,6 +3152,62 @@ struct ProviderConnector<'a> {
 }
 
 impl ProviderConnector<'_> {
+    /// Leases the Worktree the Session the actor owns works in, for a Turn
+    /// about to begin there — holding `inherited`, the guard its admission
+    /// already took, where it took one — and records what the lease read of
+    /// the checkout. Where the Worktree was recreated since `provider` was
+    /// opened over it, the connection is dropped so the next one opens in the
+    /// new copy, unless Subagents still work in the old one, which refuses
+    /// the Turn instead.
+    async fn lease_worktree(
+        &self,
+        session: &crate::protocol::Session,
+        inherited: Option<tokio::sync::OwnedMutexGuard<()>>,
+        provider: &mut Option<ConnectedProviderSession>,
+        subagents: &SubagentRoutes,
+        shutdown: &mut ProviderShutdown,
+    ) -> Result<crate::source_control::ExecutionLease, ConnectionFailure> {
+        let prepared = tokio::select! {
+            biased;
+            _ = shutdown.wait() => return Err(ConnectionFailure::Stopping),
+            prepared = self.source_control.prepare_execution(session, inherited) => prepared,
+        };
+        let lease = prepared
+            .and_then(|lease| {
+                if let Some(reading) = lease.reading.clone() {
+                    self.sessions
+                        .record_checkout(reading)
+                        .map_err(|e| format!("Cannot persist checkout recovery facts: {e}"))?;
+                }
+                Ok(lease)
+            })
+            .map_err(|message| {
+                ConnectionFailure::Failed(format!(
+                    "Worktree unavailable; restore the checkout or retry recovery: {message}"
+                ))
+            })?;
+        if provider
+            .as_ref()
+            .is_some_and(|connected| connected.incarnation != lease.incarnation)
+        {
+            if !subagents.routes.is_empty() || !subagents.working.is_empty() {
+                return Err(ConnectionFailure::Failed(
+                    "The Worktree was recreated while Subagents still use the previous working \
+                     copy; wait for their work to finish before retrying"
+                        .to_owned(),
+                ));
+            }
+            if let Some(previous) = provider.take() {
+                let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
+            }
+            self.connected_incarnations
+                .lock()
+                .unwrap()
+                .remove(&self.session_id);
+        }
+        Ok(lease)
+    }
+
     /// Starts the Provider for the Session the actor owns, as `snapshot`
     /// reads it, over the Worktree incarnation the caller leased: under its
     /// Approval Posture, with its Resume State and a Broker token of its own,
@@ -3183,6 +3232,7 @@ impl ProviderConnector<'_> {
             session_id,
             execution_directory,
             provider_id,
+            ..
         } = self;
         let session_id = *session_id;
         let session_posture = effective_approval_posture(snapshot, &settings.borrow(), provider_id);
@@ -3283,7 +3333,6 @@ enum DelegatedTurnStart {
 /// Subagent's row carries from then on.
 async fn begin_delegated_turn(
     connector: &ProviderConnector<'_>,
-    source_control: &crate::source_control::SourceControlService,
     provider: &mut Option<ConnectedProviderSession>,
     subagents: &mut SubagentRoutes,
     shutdown: &mut ProviderShutdown,
@@ -3294,7 +3343,6 @@ async fn begin_delegated_turn(
         sessions,
         updates,
         settings,
-        connected_incarnations,
         session_id,
         provider_id,
         ..
@@ -3312,43 +3360,14 @@ async fn begin_delegated_turn(
     {
         return DelegatedTurnStart::Settled;
     }
-    let lease = tokio::select! {
-        biased;
-        _ = shutdown.wait() => return DelegatedTurnStart::Stopping,
-        lease = source_control.prepare_execution(&snapshot.session, None) => lease,
-    };
-    let lease = lease.and_then(|lease| {
-        if let Some(reading) = lease.reading.clone() {
-            sessions
-                .record_checkout(reading)
-                .map_err(|error| format!("Cannot persist checkout recovery facts: {error}"))?;
-        }
-        Ok(lease)
-    });
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(message) => {
-            return fail(format!(
-                "Worktree unavailable; restore the checkout before delegating again: {message}"
-            ));
-        }
-    };
-    if provider
-        .as_ref()
-        .is_some_and(|connected| connected.incarnation != lease.incarnation)
+    let lease = match connector
+        .lease_worktree(&snapshot.session, None, provider, subagents, shutdown)
+        .await
     {
-        if !subagents.routes.is_empty() || !subagents.working.is_empty() {
-            return fail(
-                "The Worktree was recreated while Subagents still use the previous working copy; \
-                 wait for their work to finish before delegating again"
-                    .to_owned(),
-            );
-        }
-        if let Some(previous) = provider.take() {
-            let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
-        }
-        connected_incarnations.lock().unwrap().remove(&session_id);
-    }
+        Ok(lease) => lease,
+        Err(ConnectionFailure::Stopping) => return DelegatedTurnStart::Stopping,
+        Err(ConnectionFailure::Failed(message)) => return fail(message),
+    };
     if provider.is_none() {
         match connector
             .open(&snapshot, lease.incarnation, subagents, shutdown)
