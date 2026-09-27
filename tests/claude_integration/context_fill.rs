@@ -600,6 +600,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
             execution_directory: workspace.path().to_owned(),
             resume_state: None,
             approval_posture: None,
+            broker: None,
         })
         .await
         .unwrap()

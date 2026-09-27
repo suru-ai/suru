@@ -1194,8 +1194,10 @@ async fn forward_peer_api(
     let Some(canonical_path) = canonical_forward_path(request.uri()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if peer_route_class(request.method(), &canonical_path) == PeerRouteClass::Administration {
-        return StatusCode::FORBIDDEN.into_response();
+    match peer_route_class(request.method(), &canonical_path) {
+        PeerRouteClass::Api => {}
+        PeerRouteClass::Administration => return StatusCode::FORBIDDEN.into_response(),
+        PeerRouteClass::LoopbackOnly => return StatusCode::NOT_FOUND.into_response(),
     }
     match forward_request(
         &state.controller.local_api.http,
@@ -1221,13 +1223,18 @@ fn canonical_forward_path(uri: &axum::http::Uri) -> Option<String> {
 enum PeerRouteClass {
     Api,
     Administration,
+    /// Served on the loopback listener alone, and to a Peer not at all: the
+    /// Broker, whose tokens name this machine's own Provider Sessions.
+    LoopbackOnly,
 }
 
 fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
     let settings_mutation = *method == Method::POST && path == "/v1/settings";
     let stop = *method == Method::POST && path == "/v1/server/stop";
     let pairing_management = path == "/v1/pairing" || path.starts_with("/v1/pairing/");
-    if settings_mutation || stop || pairing_management {
+    if crate::broker::is_broker_path(path) {
+        PeerRouteClass::LoopbackOnly
+    } else if settings_mutation || stop || pairing_management {
         PeerRouteClass::Administration
     } else {
         PeerRouteClass::Api

@@ -248,6 +248,19 @@ impl ModelCatalogService {
         }
     }
 
+    /// The catalog as Suru last found it, for a reader that must never
+    /// provoke a re-check: an Agent asking through the Broker. An enabled
+    /// Provider this process has neither heard from nor remembers is asked
+    /// once, as an Errand's resolution would ask it, because otherwise every
+    /// such reader before a client's first listing would find nothing; one
+    /// whose first answer is still coming is waited for. No Provider that has
+    /// answered — Models, failure, or unavailability — is asked again.
+    pub(crate) async fn known(&self) -> ModelCatalog {
+        ModelCatalog {
+            providers: join_all(self.providers.iter().map(ProviderCatalog::known)).await,
+        }
+    }
+
     /// The Agent Selection a fresh Landing starts from: hosted Providers are
     /// consulted in their fixed built-in order, and the first selectable one
     /// whose cached catalog carries a default Model supplies it. A Provider the
@@ -405,6 +418,23 @@ impl ProviderCatalog {
             return;
         }
         self.refresh().await;
+    }
+
+    async fn known(&self) -> ProviderModelCatalog {
+        if !self.is_enabled() {
+            return self.disabled_catalog();
+        }
+        let never_answered = {
+            let state = self
+                .state
+                .lock()
+                .expect("Model catalog lock is not poisoned");
+            state.models.is_none() && !state.discovered_live
+        };
+        if never_answered {
+            return self.refresh().await;
+        }
+        self.current()
     }
 
     async fn list(&self) -> ProviderModelCatalog {
@@ -788,6 +818,55 @@ mod tests {
             service.default_selection().map(|selection| selection.model),
             Some(ModelId::new("stub-model"))
         );
+    }
+
+    #[tokio::test]
+    async fn the_known_catalog_asks_only_a_provider_never_heard_from_and_only_once() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime.clone() as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory::none(),
+        );
+
+        let first = service.known().await;
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.providers[0].status, ProviderCatalogStatus::Fresh);
+        assert_eq!(first.providers[0].models[0].id, ModelId::new("stub-model"));
+
+        // A later check fails; what Suru knows is then the stale catalog, and
+        // reading it asks nothing more of the Provider.
+        service.refresh().await;
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+        let known = service.known().await;
+        assert!(matches!(
+            known.providers[0].status,
+            ProviderCatalogStatus::Stale { .. }
+        ));
+        assert_eq!(
+            runtime.calls.load(Ordering::SeqCst),
+            2,
+            "a Provider that has answered is never asked again by a reader of what is known"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_known_catalog_serves_a_remembered_catalog_without_asking() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime.clone() as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory {
+                remembered: vec![remembered("Remembered Stub")],
+                remember: None,
+            },
+        );
+
+        let known = service.known().await;
+        assert_eq!(known.providers[0].models[0].display_name, "Remembered Stub");
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

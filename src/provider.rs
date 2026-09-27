@@ -30,6 +30,7 @@ mod reasoning;
 mod shell_wrapper;
 mod version;
 
+pub use crate::broker::{BrokerEndpoint, BrokerHandoff, BrokerToken};
 pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
@@ -477,12 +478,21 @@ pub struct ProviderSessionRequest {
     pub execution_directory: PathBuf,
     pub resume_state: Option<ProviderResumeState>,
     pub approval_posture: Option<ApprovalPosture>,
+    /// The Broker endpoint and the bearer token naming the Session this start
+    /// is for, which the harness offers its Agent as an MCP server beside its
+    /// own Tools. The token is minted for this start alone and retired when
+    /// the connection it opens closes. `None` while the `broker.enabled`
+    /// Setting is off, and always for a session an Errand opens, since
+    /// Errands carry no Tools.
+    pub broker: Option<BrokerHandoff>,
 }
 
 /// One Errand: a single Provider call Suru makes for its own purposes rather
 /// than the user's. It carries one Prompt, the shape the answer should take,
 /// and the Agent Selection to run under — and no Tools, no Session, and nothing
-/// the Provider is expected to remember afterwards.
+/// the Provider is expected to remember afterwards. So it carries no Broker
+/// handoff either: a runtime running an Errand through a session of its own
+/// starts that session with `broker: None`.
 ///
 /// The schema is a request rather than a guarantee: a runtime falling back to a
 /// Provider-side session has no way to be handed one, so whatever asks for an

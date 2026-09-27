@@ -433,6 +433,11 @@ impl ControlledProviderRuntime {
 }
 
 impl ErrandRequest {
+    /// The whole Errand as the Provider was asked it.
+    pub fn errand(&self) -> &ProviderErrand {
+        &self.errand
+    }
+
     pub fn prompt(&self) -> &str {
         &self.errand.prompt
     }
@@ -473,6 +478,12 @@ impl StartRequest {
 
     pub fn approval_posture(&self) -> Option<&suru::protocol::ApprovalPosture> {
         self.request.approval_posture.as_ref()
+    }
+
+    /// The Broker endpoint and bearer token this start was handed beside its
+    /// posture, or nothing while the Broker is off.
+    pub fn broker(&self) -> Option<&suru::provider::BrokerHandoff> {
+        self.request.broker.as_ref()
     }
 
     pub fn succeed(self, identity: AgentIdentity) -> ControlledProviderSession {
@@ -1026,6 +1037,7 @@ async fn run_errand_through_a_session(
             execution_directory: errand.execution_directory,
             resume_state: None,
             approval_posture: None,
+            broker: None,
         },
     )
     .await?;

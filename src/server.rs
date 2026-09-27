@@ -26,6 +26,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::RuntimeConfig;
+use crate::broker::{self, BrokerAccess, BrokerTools};
 use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
@@ -664,6 +665,18 @@ pub async fn spawn_with_source_control(
     );
     let runtimes = Arc::new(runtimes);
     let skill_catalog = SkillCatalogService::new(runtimes.clone(), settings.subscribe());
+    // The Broker lives on this same loopback listener, and its endpoint is
+    // handed only to Provider starts: never written into the runtime
+    // descriptor, whose token grants the whole API (ADR 0034).
+    let broker_access = BrokerAccess::new(
+        format!("{}{}", descriptor.base_url, broker::BROKER_PATH),
+        settings.subscribe(),
+    );
+    let broker_routes = broker::router(
+        broker_access.clone(),
+        BrokerTools::new(model_catalog.clone()),
+        provider_shutdown_rx.clone(),
+    );
     let providers = ProviderOrchestrator::new(
         runtimes.as_ref().clone(),
         sessions.clone(),
@@ -673,6 +686,7 @@ pub async fn spawn_with_source_control(
         skill_catalog.clone(),
         source_control.clone(),
         timings.checkout_skill_timeout,
+        broker_access,
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
@@ -793,7 +807,8 @@ pub async fn spawn_with_source_control(
                 )),
         )
         .route("/v1/server/stop", post(stop_server))
-        .with_state(state);
+        .with_state(state)
+        .merge(broker_routes);
     let descriptor_path = config.descriptor_path();
     let instance_id = descriptor.identity.instance_id;
     let task_lifecycle = lifecycle.clone();

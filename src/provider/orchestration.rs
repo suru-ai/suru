@@ -29,6 +29,7 @@ use super::{
     ProviderSubagentStatus, ProviderTurnInput,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
+use crate::broker::{BrokerAccess, BrokerGrant};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, InterruptOutcome, Message, MessageId,
     MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
@@ -103,6 +104,8 @@ pub(crate) struct ProviderOrchestrator {
     checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
+    /// Mints the Broker token each Provider start is handed.
+    broker: BrokerAccess,
 }
 
 struct ProviderActors {
@@ -225,6 +228,9 @@ struct ConnectedProviderSession {
     identity: AgentIdentity,
     session: Arc<dyn ProviderSession>,
     events: ProviderEventStream,
+    /// The Broker token this connection was handed, held and never read: it
+    /// is retired when the connection is dropped, by whichever path closes it.
+    _broker: Option<BrokerGrant>,
 }
 
 struct ProviderSessionContext {
@@ -239,6 +245,7 @@ struct ProviderSessionContext {
     execution_directory: PathBuf,
     updates: ProviderUpdateGate,
     settings: watch::Receiver<SettingsSnapshot>,
+    broker: BrokerAccess,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1104,6 +1111,7 @@ impl ProviderOrchestrator {
         skill_catalog: SkillCatalogService,
         source_control: crate::source_control::SourceControlService,
         checkout_skill_timeout: Duration,
+        broker: BrokerAccess,
     ) -> Self {
         assert!(
             !runtimes.is_empty(),
@@ -1126,6 +1134,7 @@ impl ProviderOrchestrator {
             checkout_skill_timeout,
             checkout_guards: Default::default(),
             connected_incarnations: Default::default(),
+            broker,
         }
     }
 
@@ -1321,6 +1330,7 @@ impl ProviderOrchestrator {
                 execution_directory,
                 updates: self.updates.clone(),
                 settings: self.settings.clone(),
+                broker: self.broker.clone(),
             },
             commands_rx,
             ProviderShutdown {
@@ -1700,6 +1710,7 @@ async fn run_provider_session(
         execution_directory,
         updates,
         settings,
+        broker,
     } = context;
     let _checkout_cleanup = CheckoutActorCleanup {
         session_id,
@@ -2212,6 +2223,10 @@ async fn run_provider_session(
             if provider.is_none() {
                 let session_posture =
                     effective_approval_posture(&snapshot, &settings.borrow(), &provider_id);
+                // Every start — the first and each relaunch — is handed a token
+                // of its own, retired when this grant is dropped: with the
+                // connection it opens, or here if the start fails.
+                let broker_grant = broker.grant(session_id);
                 let connection = tokio::select! {
                     biased;
                     _ = shutdown.wait() => break 'actor,
@@ -2219,6 +2234,7 @@ async fn run_provider_session(
                         execution_directory: execution_directory.clone(),
                         resume_state: sessions.resume_state(session_id, &provider_id),
                         approval_posture: session_posture,
+                        broker: broker_grant.as_ref().map(|grant| grant.handoff().clone()),
                     }) => connection,
                 };
                 let connection = match connection {
@@ -2311,6 +2327,7 @@ async fn run_provider_session(
                     identity,
                     session,
                     events,
+                    _broker: broker_grant,
                 });
             }
 
