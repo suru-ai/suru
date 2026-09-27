@@ -45,6 +45,7 @@ use crate::{
     support::{create_session, read_session, read_session_until},
 };
 
+mod interventions;
 mod posture;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {
@@ -964,6 +965,20 @@ async fn run_child(
     let delivered = turn.prompt().to_owned();
     turn.succeed();
     (child, delivered)
+}
+
+/// A brokered Subagent on Codex spawned by the Session `delegating` holds,
+/// with its first Turn working on its own Provider.
+async fn spawn_working_child(
+    delegating: &mut Delegating,
+) -> (SessionId, ControlledProviderSession) {
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    (child_id, child_provider)
 }
 
 /// The Subagent row `snapshot` holds for `child`.
