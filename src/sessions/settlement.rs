@@ -216,26 +216,12 @@ impl SessionStore {
                 ));
             }
         }
-        let turn_id = TurnId::new();
+        let turn = Turn::unprompted(Some(agent));
+        let turn_id = turn.id;
         state.commit(
             &self.storage,
             session_id,
-            vec![SessionChange::TurnAdded {
-                turn: Turn {
-                    id: turn_id,
-                    prompt_id: None,
-                    agent: Some(agent),
-                    status: TurnStatus::Active,
-                    // The commit that lands this Turn stamps when it began.
-                    started_at: None,
-                    settled_at: None,
-                    last_output_at: None,
-                    usage: None,
-                    cost: None,
-                    cost_basis: None,
-                    cost_details: None,
-                },
-            }],
+            vec![SessionChange::TurnAdded { turn }],
         )?;
         Ok(turn_id)
     }

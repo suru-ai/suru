@@ -284,19 +284,7 @@ impl HoldingTurn {
 /// Session's Model, and the Context Fill measured against it, stand as they
 /// were. The commit that lands it stamps when it began and when it settled.
 fn holding_continuation(caller: &SessionSnapshot) -> Turn {
-    Turn {
-        id: TurnId::new(),
-        prompt_id: None,
-        agent: caller.turns.last().and_then(|turn| turn.agent.clone()),
-        status: TurnStatus::Active,
-        started_at: None,
-        settled_at: None,
-        last_output_at: None,
-        usage: None,
-        cost: None,
-        cost_basis: None,
-        cost_details: None,
-    }
+    Turn::unprompted(caller.turns.last().and_then(|turn| turn.agent.clone()))
 }
 
 /// The Turns a batch of changes settles at a moment it carries itself rather
@@ -432,9 +420,7 @@ impl SessionStoreState {
             let duration_ms = if repaired.contains(&turn.id) {
                 None
             } else {
-                turn.settled_at
-                    .zip(turn.started_at)
-                    .and_then(|(settled, started)| settled.0.checked_sub(started.0))
+                turn.worked_ms()
             };
             changes.push(SessionChange::SubagentStatusChanged {
                 activity_id: *id,
@@ -514,11 +500,6 @@ impl SessionStoreState {
         snapshot: &SessionSnapshot,
         turn: &Turn,
     ) -> Option<u64> {
-        let span = || {
-            turn.settled_at
-                .zip(turn.started_at)
-                .and_then(|(settled, started)| settled.0.checked_sub(started.0))
-        };
         let row = delegating_session(snapshot, turn.id)
             .and_then(|holder| self.sessions.get(&holder))
             .and_then(|holder| {
@@ -539,7 +520,7 @@ impl SessionStoreState {
             });
         match row {
             Some((status, duration_ms)) if status != ActivityStatus::Active => duration_ms,
-            _ => span(),
+            _ => turn.worked_ms(),
         }
     }
 }

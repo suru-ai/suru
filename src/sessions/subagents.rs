@@ -143,23 +143,9 @@ impl SessionStore {
                 settled_at: None,
             });
         }
-        let turn_id = TurnId::new();
-        changes.push(SessionChange::TurnAdded {
-            turn: Turn {
-                id: turn_id,
-                prompt_id: None,
-                agent: None,
-                status: TurnStatus::Active,
-                // The commit that lands this Turn stamps when it began.
-                started_at: None,
-                settled_at: None,
-                last_output_at: None,
-                usage: None,
-                cost: None,
-                cost_basis: None,
-                cost_details: None,
-            },
-        });
+        let turn = Turn::unprompted(None);
+        let turn_id = turn.id;
+        changes.push(SessionChange::TurnAdded { turn });
         if let Some(delegation) = delegation {
             changes.push(SessionChange::MessageAdded {
                 message: delegation_message(
@@ -392,18 +378,10 @@ impl SessionStoreState {
             prompts: Vec::new(),
             turns: vec![Turn {
                 id: turn_id,
-                prompt_id: None,
-                agent: None,
-                status: TurnStatus::Active,
                 // Stamped here rather than by a commit, because the spawn is
                 // the child's creation and no commit delivers its Turn.
                 started_at: Some(timestamp),
-                settled_at: None,
-                last_output_at: None,
-                usage: None,
-                cost: None,
-                cost_basis: None,
-                cost_details: None,
+                ..Turn::unprompted(None)
             }],
             messages: delegation.into_iter().collect(),
             activities: Vec::new(),

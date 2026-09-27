@@ -3073,6 +3073,33 @@ impl Turn {
     pub const fn is_continuation(&self) -> bool {
         self.prompt_id.is_none()
     }
+
+    /// A Turn begun by no Prompt — a Continuation, or in a Subagent's Session
+    /// the Turn a Delegation opens — run by `agent` where it is known: working,
+    /// with nothing measured yet, and untimed until the commit that lands it
+    /// stamps when it began.
+    pub fn unprompted(agent: Option<AgentIdentity>) -> Self {
+        Self {
+            id: TurnId::new(),
+            prompt_id: None,
+            agent,
+            status: TurnStatus::Active,
+            started_at: None,
+            settled_at: None,
+            last_output_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
+            cost_details: None,
+        }
+    }
+
+    /// How long this Turn worked, from the commit that began it to the one
+    /// that settled it; `None` while it works, or where either moment went
+    /// unrecorded.
+    pub fn worked_ms(&self) -> Option<u64> {
+        self.settled_at?.0.checked_sub(self.started_at?.0)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

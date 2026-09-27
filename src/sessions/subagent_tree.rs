@@ -366,8 +366,7 @@ impl SubagentWork {
 /// than it began: a restart settles a Turn that never showed any work where
 /// it began (ADR 0029), which says nothing of when that work ended.
 fn worked_span(turn: &Turn) -> Option<u64> {
-    let span = turn.settled_at?.0.checked_sub(turn.started_at?.0)?;
-    (span > 0).then_some(span)
+    turn.worked_ms().filter(|span| *span > 0)
 }
 
 /// Whether a Session's own Transcript holds a live Approval or Questionnaire —
