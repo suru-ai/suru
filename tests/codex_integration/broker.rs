@@ -11,6 +11,10 @@
 //!
 //! A Codex Subagent a Session on another Provider spawns through the Broker starts its thread under
 //! the Codex value ADR 0036's table gives for that Session's posture.
+//!
+//! A Subagent Report that wakes an idle Codex Agent is the whole input of a `turn/start` on its
+//! thread, and one reaching a working Codex Turn is the harness's own `turn/steer` pinned to it
+//! (ADR 0035).
 
 use std::sync::Arc;
 
@@ -21,11 +25,11 @@ use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, ApprovalPosture,
+        Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, ApprovalPosture,
         ClaudePermissionMode, CreateSessionRequest, InitialPrompt, ModelAvailability,
         ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
     },
-    provider::CodexRuntime,
+    provider::{CodexRuntime, SubagentReport, SubagentReportOutcome},
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -421,4 +425,284 @@ async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_i
     drop(client);
     server.shutdown().await.expect("shut down server");
     drop(parent);
+}
+
+/// An app-server for every Session, each running one thread whose every Turn answers "Done." and
+/// completes, echoing each request's own id so a process answers as many Turns as it is asked.
+const ANSWERING_EVERY_TURN: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"model/list"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
+      ;;
+    *'"method":"thread/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"report-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"turn-'"$id"'"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"report-thread","turnId":"turn-'"$id"'","item":{"type":"agentMessage","id":"message-'"$id"'","text":""}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"report-thread","turnId":"turn-'"$id"'","itemId":"message-'"$id"'","delta":"Done."}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"report-thread","turnId":"turn-'"$id"'","item":{"type":"agentMessage","id":"message-'"$id"'","text":"Done."}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"report-thread","turn":{"id":"turn-'"$id"'","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
+    let codex = ScriptedCodex::new_multiprocess(ANSWERING_EVERY_TURN);
+    let channel = "codex-broker-report";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let parent_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Delegate the survey".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session")
+        .session
+        .id;
+    turn_settles(&client, parent_id, 0).await;
+    let thread_start = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/start")
+        .expect("the parent's thread was started")["params"]
+        .clone();
+    let server_entry = broker_server(&thread_start, "thread/start");
+    let mut broker = McpClient::presenting(
+        server_entry["url"].as_str().expect("the Broker's URL"),
+        server_entry["http_headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+
+    // The idle parent's Agent spawns a Codex Subagent, whose own app-server answers its
+    // Delegation and settles.
+    let child_id = broker
+        .spawn_subagent(json!({
+            "provider": "codex",
+            "model": "gpt-fixture",
+            "options": {},
+            "name": "Researcher",
+            "description": "Survey the seams",
+            "prompt": "Survey the seams.",
+        }))
+        .await;
+
+    // Its Report wakes the parent into a Continuation — its third Turn, after its first and the
+    // Continuation that holds the Subagent's row — which the parent's app-server completes.
+    turn_settles(&client, parent_id, 2).await;
+    let woken = client.read_session(parent_id).await.expect("read Session");
+    assert_eq!(woken.turns[2].prompt_id, None, "a Continuation");
+    let Some(Activity::Subagent { duration_ms, .. }) = woken.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child_id),
+    ) else {
+        panic!("the parent's Transcript holds the Subagent's row");
+    };
+    let report = SubagentReport::new(
+        child_id,
+        "Researcher",
+        SubagentReportOutcome::Completed,
+        *duration_ms,
+        Some("Done."),
+    )
+    .to_string();
+    let reporting = codex
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .filter(|request| {
+            request["params"]["input"]
+                .as_array()
+                .is_some_and(|input| input.iter().any(|item| item["text"] == report.as_str()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reporting.len(),
+        1,
+        "the Report leaves once, on a turn/start"
+    );
+    assert_eq!(
+        reporting[0]["params"]["input"],
+        json!([{ "type": "text", "text": report }]),
+        "whose whole input is the Report as Suru words it"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The same app-servers, except that the Turn a Session's first Prompt begins keeps running until
+/// it is steered, and the steer's answer completes it.
+const RUNNING_UNTIL_STEERED: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"model/list"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
+      ;;
+    *'"method":"thread/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"report-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*'"text":"Delegate the survey"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      running="turn-$id"
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"'"$running"'"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"turn-'"$id"'"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"report-thread","turn":{"id":"turn-'"$id"'","status":"completed","items":[]}}}'
+      ;;
+    *'"method":"turn/steer"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"turnId":"'"$running"'"}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"report-thread","turn":{"id":"'"$running"'","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its_turn() {
+    let codex = ScriptedCodex::new_multiprocess(RUNNING_UNTIL_STEERED);
+    let channel = "codex-broker-report-steer";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let parent_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Delegate the survey".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session")
+        .session
+        .id;
+    codex.wait_for_method("turn/start").await;
+    let thread_start = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/start")
+        .expect("the parent's thread was started")["params"]
+        .clone();
+    let server_entry = broker_server(&thread_start, "thread/start");
+    let mut broker = McpClient::presenting(
+        server_entry["url"].as_str().expect("the Broker's URL"),
+        server_entry["http_headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+
+    // The parent's Agent spawns a Codex Subagent while its own Turn still works, and the
+    // Subagent's app-server settles it at once.
+    let child_id = broker
+        .spawn_subagent(json!({
+            "provider": "codex",
+            "model": "gpt-fixture",
+            "options": {},
+            "name": "Researcher",
+            "description": "Survey the seams",
+            "prompt": "Survey the seams.",
+        }))
+        .await;
+
+    // Its Report steers the parent's working Turn, whose steer answer completes it.
+    turn_settles(&client, parent_id, 0).await;
+    let steered = client.read_session(parent_id).await.expect("read Session");
+    assert_eq!(
+        steered.turns.len(),
+        1,
+        "the Report began no Turn of its own"
+    );
+    let Some(Activity::Subagent { duration_ms, .. }) = steered.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child_id),
+    ) else {
+        panic!("the parent's Transcript holds the Subagent's row");
+    };
+    let report = SubagentReport::new(
+        child_id,
+        "Researcher",
+        SubagentReportOutcome::Completed,
+        *duration_ms,
+        None,
+    )
+    .to_string();
+    let requests = codex.requests();
+    let running = requests
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .find(|request| request["params"]["input"][0]["text"] == "Delegate the survey")
+        .map(|request| format!("turn-{}", request["id"]))
+        .expect("the parent's first Turn started");
+    let steers = requests
+        .iter()
+        .filter(|request| request["method"] == "turn/steer")
+        .collect::<Vec<_>>();
+    assert_eq!(steers.len(), 1, "the Report leaves once, as a steer");
+    assert_eq!(
+        steers[0]["params"]["input"],
+        json!([{ "type": "text", "text": report }]),
+        "whose whole input is the Report as Suru words it"
+    );
+    assert_eq!(
+        steers[0]["params"]["expectedTurnId"], running,
+        "pinned to the Turn it steers, so a Turn that has ended is never steered"
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "turn/start")
+            .all(|request| request["params"]["input"][0]["text"] != report.as_str()),
+        "and no turn/start carries it"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }
