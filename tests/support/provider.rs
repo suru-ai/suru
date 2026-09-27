@@ -12,10 +12,10 @@ use suru::protocol::{
 };
 use suru::provider::{
     AttributedProviderEvent, ProviderDecisionDelivery, ProviderErrand, ProviderError,
-    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture,
+    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
     ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
     ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderTurnInput, ProviderWatchId,
+    ProviderTurnInput, ProviderWatchId, SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -771,12 +771,35 @@ impl ControlledProviderSession {
 }
 
 impl PromptOperation {
+    /// The text of the Prompt — or Delegation — this Turn began with. A Turn
+    /// Subagent Reports alone began has none, which a test asking for one is
+    /// wrong about.
     pub fn prompt(&self) -> &str {
-        &self.input.prompt.text
+        &self.begun_with().text
     }
 
     pub fn skill_invocations(&self) -> &[suru::provider::ProviderSkillInvocation] {
-        &self.input.prompt.skill_invocations
+        &self.begun_with().skill_invocations
+    }
+
+    /// Whether a Prompt or Delegation stands in this Turn's input, beside any
+    /// Reports at its head.
+    pub fn has_prompt(&self) -> bool {
+        self.input.input.prompt.is_some()
+    }
+
+    /// The Subagent Reports at the head of this Turn's input, in the order
+    /// Suru delivered them — the whole input of a Continuation a Report woke.
+    pub fn reports(&self) -> &[SubagentReport] {
+        &self.input.input.reports
+    }
+
+    fn begun_with(&self) -> &ProviderPrompt {
+        self.input
+            .input
+            .prompt
+            .as_ref()
+            .unwrap_or_else(|| panic!("the Turn began with Reports alone: {:?}", self.input))
     }
 
     pub fn selection(&self) -> &suru::protocol::AgentSelection {
@@ -807,12 +830,27 @@ impl PromptOperation {
 }
 
 impl TurnSteer {
+    /// The text of the Prompt this steer delivered. A steer that delivered a
+    /// Subagent Report carries none.
     pub fn prompt(&self) -> &str {
-        &self.input.prompt.text
+        &self.steered_with().text
     }
 
     pub fn skill_invocations(&self) -> &[suru::provider::ProviderSkillInvocation] {
-        &self.input.prompt.skill_invocations
+        &self.steered_with().skill_invocations
+    }
+
+    /// The Subagent Reports this steer delivered into the working Turn.
+    pub fn reports(&self) -> &[SubagentReport] {
+        &self.input.input.reports
+    }
+
+    fn steered_with(&self) -> &ProviderPrompt {
+        self.input
+            .input
+            .prompt
+            .as_ref()
+            .unwrap_or_else(|| panic!("the steer delivered Reports alone: {:?}", self.input))
     }
 
     pub fn succeed(self) {
@@ -1087,7 +1125,7 @@ async fn run_errand_through_a_session(
     session
         .start_turn(ProviderTurnInput {
             turn_id: suru::protocol::TurnId::new(),
-            prompt: ProviderPrompt::plain(errand.prompt),
+            input: ProviderInput::from_prompt(ProviderPrompt::plain(errand.prompt)),
             selection: errand.selection,
             approval_posture: None,
         })

@@ -49,7 +49,7 @@ use crate::{
     provider::{
         AttributedProviderEvent, ProviderError, ProviderFuture, ProviderResumeState,
         ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle,
+        ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle, headed_text,
     },
 };
 
@@ -579,16 +579,31 @@ impl ProviderSession for CopilotSession {
                 .begin_turn()?;
             let started = async {
                 self.apply_selection(&input.selection).await?;
-                let prompt = self
-                    .skills
-                    .expand(
-                        &self.handle,
-                        &self.execution_directory,
-                        &self.native,
-                        crate::protocol::SkillPromptDelivery::Initial,
-                        input.prompt,
-                    )
-                    .await?;
+                let head = input.input.report_text();
+                // A Turn the Subagent Reports alone begin — the Continuation
+                // a Report wakes — is sent in immediate mode, so a loop
+                // Copilot is running on its own takes the Reports at once
+                // rather than after it stops (ADR 0035). A Prompt keeps the
+                // default delivery it always had, the Reports at its head.
+                let message = match input.input.prompt {
+                    Some(prompt) => {
+                        let prompt = self
+                            .skills
+                            .expand(
+                                &self.handle,
+                                &self.execution_directory,
+                                &self.native,
+                                crate::protocol::SkillPromptDelivery::Initial,
+                                prompt,
+                            )
+                            .await?;
+                        MessageOptions::new(headed_text(head, prompt))
+                    }
+                    None => MessageOptions::new(head.ok_or_else(|| {
+                        copilot_error("Copilot was handed no input to begin a Turn with")
+                    })?)
+                    .with_mode(DeliveryMode::Immediate),
+                };
                 self.correlation
                     .lock()
                     .expect("Copilot correlation lock is not poisoned")
@@ -596,7 +611,7 @@ impl ProviderSession for CopilotSession {
                 until_crash(
                     &self.handle,
                     "Copilot Turn startup failed",
-                    self.native.send(prompt.as_str()),
+                    self.native.send(message),
                 )
                 .await
                 .map(|_message_id| ())
@@ -615,16 +630,24 @@ impl ProviderSession for CopilotSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.require_running_turn("steer")?;
-            let prompt = self
-                .skills
-                .expand(
-                    &self.handle,
-                    &self.execution_directory,
-                    &self.native,
-                    crate::protocol::SkillPromptDelivery::Steer,
-                    input.prompt,
-                )
-                .await?;
+            let head = input.input.report_text();
+            let prompt = match input.input.prompt {
+                Some(prompt) => headed_text(
+                    head,
+                    self.skills
+                        .expand(
+                            &self.handle,
+                            &self.execution_directory,
+                            &self.native,
+                            crate::protocol::SkillPromptDelivery::Steer,
+                            prompt,
+                        )
+                        .await?,
+                ),
+                None => {
+                    head.ok_or_else(|| copilot_error("Copilot was handed no input to steer with"))?
+                }
+            };
             // Immediate delivery injects the Prompt into the loop already running, where Copilot's
             // default would hold it back and run it as a Turn of its own once this one stopped.
             //

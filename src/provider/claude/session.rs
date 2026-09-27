@@ -70,6 +70,7 @@ use crate::{
         ProviderResumeState, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
         ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId,
         harness::{ProcessGuard, ProcessRegistry},
+        headed_text,
     },
 };
 
@@ -474,7 +475,16 @@ impl ProviderSession for ClaudeSession {
             const CONTEXT: &str = "Claude Turn startup failed";
             self.context
                 .begin_turn(input.turn_id, input.selection.model.as_str());
-            let prompt = self.skills.lower(&self.execution_directory, input.prompt)?;
+            // Whatever the Turn begins with — a Prompt, a Delegation, or the
+            // Subagent Reports that wake a Continuation — reaches the CLI as
+            // one user message on stdin, the Reports at its head.
+            let head = input.input.report_text();
+            let prompt = match input.input.prompt {
+                Some(prompt) => self.skills.lower(&self.execution_directory, prompt, head)?,
+                None => head.ok_or_else(|| {
+                    claude_error("Claude was handed no input to begin a Turn with")
+                })?,
+            };
             let mut slot = self.child.lock().await;
             let permission_mode = match input.approval_posture.as_ref() {
                 Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => {
@@ -576,11 +586,18 @@ impl ProviderSession for ClaudeSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn steering failed";
-            if !input.prompt.skill_invocations.is_empty() {
-                return Err(claude_error(
-                    "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
-                ));
-            }
+            let head = input.input.report_text();
+            let text = match input.input.prompt {
+                Some(prompt) if !prompt.skill_invocations.is_empty() => {
+                    return Err(claude_error(
+                        "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
+                    ));
+                }
+                Some(prompt) => headed_text(head, prompt.text),
+                None => {
+                    head.ok_or_else(|| claude_error("Claude was handed no input to steer with"))?
+                }
+            };
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a
@@ -594,7 +611,7 @@ impl ProviderSession for ClaudeSession {
             }
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&input.prompt.text))
+                .send(&UserMessageEnvelope::text(&text))
                 .await
                 .map_err(|error| {
                     self.turn.withdraw_prompt();
@@ -806,7 +823,8 @@ mod tests {
             selection,
         };
         use crate::provider::{
-            ProviderSession, ProviderSteerInput, ProviderTurnInput, harness::ProcessRegistry,
+            ProviderInput, ProviderSession, ProviderSteerInput, ProviderTurnInput,
+            harness::ProcessRegistry,
         };
 
         /// A stand-in CLI that consumes its stdin and exits when it closes, which is all a
@@ -860,7 +878,9 @@ mod tests {
             let session = scripted_session(&directory);
             let error = session
                 .steer_turn(ProviderSteerInput {
-                    prompt: crate::provider::ProviderPrompt::plain("Answer in French instead"),
+                    input: ProviderInput::from_prompt(crate::provider::ProviderPrompt::plain(
+                        "Answer in French instead",
+                    )),
                 })
                 .await
                 .expect_err("a Session with no Turn running has none to steer");
@@ -872,7 +892,9 @@ mod tests {
             session
                 .start_turn(ProviderTurnInput {
                     turn_id: crate::protocol::TurnId::new(),
-                    prompt: crate::provider::ProviderPrompt::plain("Say hello"),
+                    input: ProviderInput::from_prompt(crate::provider::ProviderPrompt::plain(
+                        "Say hello",
+                    )),
                     selection: selection(Vec::new()),
                     approval_posture: None,
                 })
@@ -880,7 +902,9 @@ mod tests {
                 .expect("the first Turn spawns the child");
             session
                 .steer_turn(ProviderSteerInput {
-                    prompt: crate::provider::ProviderPrompt::plain("Answer in French instead"),
+                    input: ProviderInput::from_prompt(crate::provider::ProviderPrompt::plain(
+                        "Answer in French instead",
+                    )),
                 })
                 .await
                 .expect("the running Turn takes the steer");
@@ -920,7 +944,9 @@ mod tests {
             session
                 .start_turn(ProviderTurnInput {
                     turn_id: crate::protocol::TurnId::new(),
-                    prompt: crate::provider::ProviderPrompt::plain("Say hello"),
+                    input: ProviderInput::from_prompt(crate::provider::ProviderPrompt::plain(
+                        "Say hello",
+                    )),
                     selection: selection(Vec::new()),
                     approval_posture: None,
                 })
@@ -935,7 +961,9 @@ mod tests {
             let error = session
                 .start_turn(ProviderTurnInput {
                     turn_id: crate::protocol::TurnId::new(),
-                    prompt: crate::provider::ProviderPrompt::plain("Too late"),
+                    input: ProviderInput::from_prompt(crate::provider::ProviderPrompt::plain(
+                        "Too late",
+                    )),
                     selection: selection(Vec::new()),
                     approval_posture: None,
                 })

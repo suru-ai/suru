@@ -23,7 +23,7 @@ use tokio::{
 
 use super::{
     AttributedProviderEvent, MeteredCost, ProviderCommandStatus, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
+    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderInput,
     ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
     ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
     ProviderSubagentStatus, ProviderTurnInput,
@@ -1147,7 +1147,7 @@ impl SubagentRoutes {
     }
 }
 
-enum ProviderInput {
+enum ActorInput {
     Command(Option<ProviderCommand>),
     Event(Option<Result<AttributedProviderEvent, super::ProviderError>>),
 }
@@ -2065,29 +2065,29 @@ async fn run_provider_session(
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => break,
-                    event = connected.events.next() => ProviderInput::Event(event),
+                    event = connected.events.next() => ActorInput::Event(event),
                     _ = std::future::ready(()), if pending_prompt.is_some() => {
                         let prompt_id = pending_turn_starts.pop_front()
                             .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
-                        ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                        ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                     }
-                    command = commands.recv() => ProviderInput::Command(command),
+                    command = commands.recv() => ActorInput::Command(command),
                 }
             } else if let Some(prompt_id) = pending_turn_starts
                 .pop_front()
                 .or_else(|| deferred_prompt_id.take())
             {
-                ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
             } else {
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => break,
-                    command = commands.recv() => ProviderInput::Command(command),
+                    command = commands.recv() => ActorInput::Command(command),
                 }
             };
             let command = match input {
-                ProviderInput::Command(command) => command,
-                ProviderInput::Event(Some(Ok(attributed))) => {
+                ActorInput::Command(command) => command,
+                ActorInput::Event(Some(Ok(attributed))) => {
                     let identity = provider
                         .as_ref()
                         .expect("Provider events arrive over a live connection")
@@ -2269,7 +2269,7 @@ async fn run_provider_session(
                     }
                     continue;
                 }
-                ProviderInput::Event(Some(Err(_)) | None) => {
+                ActorInput::Event(Some(Err(_)) | None) => {
                     lose_provider_connection(
                         &mut provider,
                         &mut subagents,
@@ -2728,40 +2728,40 @@ async fn run_provider_session(
                 // became ready while an RPC was in flight.
                 biased;
                 _ = shutdown.wait() => break 'actor,
-                event = events.next() => ProviderInput::Event(event),
+                event = events.next() => ActorInput::Event(event),
                 _ = std::future::ready(()), if deliver_pending => {
                     if pending_native_continuation {
                         // Keep the queue in place while the native loop stops. Removing and
                         // re-enqueuing its front would let later admissions overtake it.
                         let (response, _) = oneshot::channel();
-                        ProviderInput::Command(Some(ProviderCommand::InterruptSession { response }))
+                        ActorInput::Command(Some(ProviderCommand::InterruptSession { response }))
                     } else {
                         let prompt_id = pending_turn_starts.pop_front()
                             .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
-                        ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                        ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                     }
                 }
-                command = commands.recv() => ProviderInput::Command(command),
+                command = commands.recv() => ActorInput::Command(command),
             }
         };
         // A native Continuation must release its Provider Turn before the
         // next Prompt starts one. Reuse the normal interrupt path and wait
         // for its terminal event; a local settle alone leaves Codex busy.
         let input = match input {
-            ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+            ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                 if active.as_ref().is_some_and(|turn| {
                     turn.continuation == Some(ContinuationExecution::ProviderTurn)
                 }) =>
             {
                 pending_turn_starts.push_back(prompt_id);
                 let (response, _) = oneshot::channel();
-                ProviderInput::Command(Some(ProviderCommand::InterruptSession { response }))
+                ActorInput::Command(Some(ProviderCommand::InterruptSession { response }))
             }
             input => input,
         };
         match input {
-            ProviderInput::Command(None) => break,
-            ProviderInput::Command(Some(ProviderCommand::StartPrompt { prompt_id })) => {
+            ActorInput::Command(None) => break,
+            ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id })) => {
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
@@ -2788,7 +2788,7 @@ async fn run_provider_session(
                     pending_turn_starts.push_back(prompt_id);
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::SubmitQuestionnaire {
+            ActorInput::Command(Some(ProviderCommand::SubmitQuestionnaire {
                 target,
                 id,
                 submission,
@@ -2814,7 +2814,7 @@ async fn run_provider_session(
                     let _ = response.send(Err("Questionnaire is unavailable".into()));
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::SubmitDecision {
+            ActorInput::Command(Some(ProviderCommand::SubmitDecision {
                 target,
                 id,
                 decision,
@@ -2841,7 +2841,7 @@ async fn run_provider_session(
                 }
             }
 
-            ProviderInput::Command(Some(ProviderCommand::UpdateApprovalPosture {
+            ActorInput::Command(Some(ProviderCommand::UpdateApprovalPosture {
                 update,
                 response,
             })) => {
@@ -2867,7 +2867,7 @@ async fn run_provider_session(
             // Session, whose actor its spawn starts idle, so one arriving
             // while a Turn runs here has nothing to begin over: its Turn fails
             // where a reader sees it rather than waiting on nothing.
-            ProviderInput::Command(Some(ProviderCommand::StartDelegation { turn_id, .. })) => {
+            ActorInput::Command(Some(ProviderCommand::StartDelegation { turn_id, .. })) => {
                 if active
                     .as_ref()
                     .is_some_and(|current| current.turn_id != turn_id)
@@ -2882,7 +2882,7 @@ async fn run_provider_session(
                     );
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::SteerPrompt)) => {
+            ActorInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
                     .as_ref()
                     .expect("Provider input is handled while a Turn is active");
@@ -2950,10 +2950,10 @@ async fn run_provider_session(
                     biased;
                     _ = shutdown.wait() => break 'actor,
                     steered = provider_session.steer_turn(ProviderSteerInput {
-                        prompt: ProviderPrompt::from_user_prompt(
+                        input: ProviderInput::from_prompt(ProviderPrompt::from_user_prompt(
                             prompt.text.clone(),
                             prompt.skill_invocations.clone(),
-                        ),
+                        )),
                     }) => steered,
                 };
                 match steered {
@@ -2984,7 +2984,7 @@ async fn run_provider_session(
                     }
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::InterruptSession { response })) => {
+            ActorInput::Command(Some(ProviderCommand::InterruptSession { response })) => {
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
@@ -3108,7 +3108,7 @@ async fn run_provider_session(
                     }
                 }
             }
-            ProviderInput::Command(Some(ProviderCommand::StopSubagent { target, response })) => {
+            ActorInput::Command(Some(ProviderCommand::StopSubagent { target, response })) => {
                 let _ = response.send(
                     stop_one_subagent(
                         &runtime,
@@ -3124,7 +3124,7 @@ async fn run_provider_session(
             // A Watch stop that finds a Turn begun since it was asked for —
             // the Watch's own settling woke the Agent, say — stops the
             // Watches it named and leaves that Turn to run.
-            ProviderInput::Command(Some(ProviderCommand::StopWatches { target, response })) => {
+            ActorInput::Command(Some(ProviderCommand::StopWatches { target, response })) => {
                 subagents
                     .watch_outcomes
                     .drop_for(&sessions.watch_stop_sessions(target));
@@ -3137,7 +3137,7 @@ async fn run_provider_session(
                     .await,
                 );
             }
-            ProviderInput::Event(event) => {
+            ActorInput::Event(event) => {
                 let Some(current) = active.as_mut() else {
                     continue;
                 };
@@ -3602,7 +3602,7 @@ async fn begin_delegated_turn(
         _ = shutdown.wait() => return DelegatedTurnStart::Stopping,
         started = provider_session.start_turn(ProviderTurnInput {
             turn_id,
-            prompt: input,
+            input: ProviderInput::from_prompt(input),
             selection: agent.selection.clone(),
             approval_posture: posture,
         }) => started,
@@ -4053,10 +4053,10 @@ fn provider_turn_start(
         turn_id,
         ProviderTurnInput {
             turn_id,
-            prompt: ProviderPrompt::from_user_prompt(
+            input: ProviderInput::from_prompt(ProviderPrompt::from_user_prompt(
                 delivered.prompt.text,
                 delivered.prompt.skill_invocations,
-            ),
+            )),
             selection,
             approval_posture,
         },

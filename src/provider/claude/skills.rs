@@ -19,7 +19,7 @@ use crate::{
         ProviderId, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor,
         SkillId, SkillPromptDelivery,
     },
-    provider::{ProviderError, ProviderPrompt, harness::ProcessRegistry},
+    provider::{ProviderError, ProviderPrompt, harness::ProcessRegistry, headed_text},
 };
 
 const DISCOVERY_CONTEXT: &str = "Claude Skill discovery failed";
@@ -193,13 +193,19 @@ impl ClaudeSkills {
         })
     }
 
+    /// `prompt` as the text of the user message the CLI takes, with `head` —
+    /// the Subagent Reports the Turn's input opens with — standing ahead of
+    /// the Prompt's own words. A Skill Invocation lowers to its slash command,
+    /// which the CLI only reads at the start of a message, so the commands
+    /// lead and the Reports head the words after them.
     pub(super) fn lower(
         &self,
         execution_directory: &Path,
         prompt: ProviderPrompt,
+        head: Option<String>,
     ) -> Result<String, ProviderError> {
         if prompt.skill_invocations.is_empty() {
-            return Ok(prompt.text);
+            return Ok(headed_text(head, prompt.text));
         }
         if prompt.skill_invocations.len() > MAX_DISTINCT_SKILLS {
             return Err(claude_error(
@@ -231,7 +237,7 @@ impl ClaudeSkills {
             .collect::<Result<Vec<_>, _>>()?;
         drop(catalogs);
 
-        let remainder = prompt.without_skill_markers("Claude")?;
+        let remainder = headed_text(head, prompt.without_skill_markers("Claude")?);
         let prefix = commands.join("\n");
         if remainder.is_empty() {
             Ok(prefix)

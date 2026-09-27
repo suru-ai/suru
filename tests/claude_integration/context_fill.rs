@@ -575,7 +575,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
             ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue, TurnId,
         },
         provider::{
-            ProviderEvent, ProviderPrompt, ProviderRuntime, ProviderSessionRequest,
+            ProviderEvent, ProviderInput, ProviderPrompt, ProviderRuntime, ProviderSessionRequest,
             ProviderTurnInput,
         },
     };
@@ -608,7 +608,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
     session
         .start_turn(ProviderTurnInput {
             turn_id: TurnId::new(),
-            prompt: ProviderPrompt::plain("First"),
+            input: ProviderInput::from_prompt(ProviderPrompt::plain("First")),
             selection: identity.selection,
             approval_posture: None,
         })
@@ -627,7 +627,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
     let error = session
         .start_turn(ProviderTurnInput {
             turn_id: TurnId::new(),
-            prompt: ProviderPrompt::plain("New Model"),
+            input: ProviderInput::from_prompt(ProviderPrompt::plain("New Model")),
             selection: AgentSelection {
                 provider: ProviderId::new("claude"),
                 model: ModelId::new("middling"),

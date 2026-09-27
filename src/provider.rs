@@ -27,6 +27,7 @@ mod copilot;
 pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
+mod report;
 mod shell_wrapper;
 mod version;
 
@@ -38,6 +39,7 @@ pub(crate) use orchestration::{
     BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator,
     ProviderUpdateGate,
 };
+pub use report::{SubagentReport, SubagentReportOutcome};
 
 /// What one successful Provider catalog discovery found. Models are the
 /// selectable inventory every Provider supplies; `warning` is a non-blocking
@@ -604,11 +606,71 @@ pub struct ProviderSkillInvocation {
     pub marker_spans: Vec<SkillMarkerSpan>,
 }
 
+/// What Suru hands a Provider as its Agent's own input, to begin a Turn or to
+/// steer one: the Subagent Reports it delivers, standing at the head, then the
+/// Prompt — or, in a brokered Subagent's Session, the Delegation — beside
+/// them. Input with Reports and no Prompt is how a Report alone wakes an idle
+/// Agent into a Continuation (ADR 0035). Suru never hands a Provider input
+/// holding neither.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderInput {
+    pub reports: Vec<SubagentReport>,
+    pub prompt: Option<ProviderPrompt>,
+}
+
+impl ProviderInput {
+    /// A Prompt, or a Delegation, with no Report beside it.
+    pub fn from_prompt(prompt: ProviderPrompt) -> Self {
+        Self {
+            reports: Vec::new(),
+            prompt: Some(prompt),
+        }
+    }
+
+    /// Subagent Reports alone.
+    pub fn from_reports(reports: Vec<SubagentReport>) -> Self {
+        Self {
+            reports,
+            prompt: None,
+        }
+    }
+
+    /// This input with `reports` standing at its head, ahead of any it
+    /// already carried.
+    pub fn headed_by(mut self, mut reports: Vec<SubagentReport>) -> Self {
+        reports.append(&mut self.reports);
+        self.reports = reports;
+        self
+    }
+
+    /// The Reports as the Agent reads them — each in the one text Suru
+    /// renders it as, a blank line apart — or `None` for input carrying none.
+    pub fn report_text(&self) -> Option<String> {
+        (!self.reports.is_empty()).then(|| {
+            self.reports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+    }
+}
+
+/// `text` with `head` standing ahead of it, a blank line apart: how the
+/// Reports a Turn's input opens with head the text its Prompt lowers to.
+pub(crate) fn headed_text(head: Option<String>, text: String) -> String {
+    match head {
+        Some(head) if text.is_empty() => head,
+        Some(head) => format!("{head}\n\n{text}"),
+        None => text,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTurnInput {
     /// Correlates optional asynchronous Context Fill requests with this Turn.
     pub turn_id: crate::protocol::TurnId,
-    pub prompt: ProviderPrompt,
+    pub input: ProviderInput,
     pub selection: AgentSelection,
     pub approval_posture: Option<ApprovalPosture>,
 }
@@ -620,9 +682,11 @@ pub enum ProviderPostureApplication {
     NextTurn,
 }
 
+/// Input delivered into a Turn still working, without beginning another: a
+/// steer Prompt, or a Subagent Report reaching an Agent mid-Turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSteerInput {
-    pub prompt: ProviderPrompt,
+    pub input: ProviderInput,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1349,6 +1413,27 @@ pub trait ProviderSession: Send + Sync + 'static {
         Box::pin(async {
             Err(ProviderError::new(
                 "This Provider offers no per-Subagent stop",
+            ))
+        })
+    }
+
+    /// Delivers `input` to the one native Subagent the identity names, as
+    /// that Subagent's own input, through the Provider's route to it: a
+    /// Subagent Report to a native Subagent that delegated through the Broker
+    /// (ADR 0035). A settled Subagent wakes into a Continuation of its own
+    /// Session, which Suru opens once the Provider takes the input, and whose
+    /// events the Provider attributes to the Subagent until its next settle;
+    /// a working one is steered. Defaulted to a refusal, so a Provider that
+    /// lets Suru address its Subagents has to say how.
+    fn deliver_to_subagent(
+        &self,
+        subagent_id: ProviderSubagentId,
+        input: ProviderInput,
+    ) -> ProviderFuture<'_, ()> {
+        let _ = (subagent_id, input);
+        Box::pin(async {
+            Err(ProviderError::new(
+                "This Provider offers no route to deliver input to one of its Subagents",
             ))
         })
     }

@@ -42,10 +42,10 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderFuture,
-        ProviderModelDiscovery, ProviderPrompt, ProviderResumeState, ProviderRuntime,
-        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderSubagentId, ProviderTurnInput,
+        ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderFuture, ProviderInput,
+        ProviderModelDiscovery, ProviderResumeState, ProviderRuntime, ProviderSession,
+        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+        ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -685,7 +685,7 @@ impl ProviderSession for CodexSession {
             );
             let task = tokio::spawn(start_native_turn(NativeTurnStartRequest {
                 thread_id: self.thread_id.clone(),
-                prompt: input.prompt,
+                input: input.input,
                 selection: input.selection,
                 summary,
                 posture: *self
@@ -706,10 +706,11 @@ impl ProviderSession for CodexSession {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            let native_input = self
-                .context
-                .skills
-                .lower(&self.context.execution_directory, input.prompt)?;
+            let native_input = lower_input(
+                &self.context.skills,
+                &self.context.execution_directory,
+                input.input,
+            )?;
             let turn_id = self
                 .correlation
                 .lock()
@@ -872,7 +873,7 @@ impl ProviderSession for CodexSession {
 
 struct NativeTurnStartRequest {
     thread_id: String,
-    prompt: ProviderPrompt,
+    input: ProviderInput,
     selection: AgentSelection,
     summary: &'static str,
     posture: CodexPosture,
@@ -883,10 +884,31 @@ struct NativeTurnStartRequest {
     turn_start_changed: Arc<Notify>,
 }
 
+/// A Turn's input as the items Codex takes on `turn/start` or `turn/steer`: the
+/// Subagent Reports it opens with as one text item at the head, then the
+/// Prompt's text and each Skill it invokes.
+fn lower_input(
+    skills: &CodexSkills,
+    execution_directory: &std::path::Path,
+    input: ProviderInput,
+) -> Result<Vec<super::wire::UserInput>, ProviderError> {
+    let mut lowered = Vec::new();
+    if let Some(text) = input.report_text() {
+        lowered.push(super::wire::UserInput::Text { text });
+    }
+    if let Some(prompt) = input.prompt {
+        lowered.extend(skills.lower(execution_directory, prompt)?);
+    }
+    if lowered.is_empty() {
+        return Err(codex_error("Codex was handed no input for its Turn"));
+    }
+    Ok(lowered)
+}
+
 async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), ProviderError> {
     let NativeTurnStartRequest {
         thread_id,
-        prompt,
+        input,
         selection,
         summary,
         posture,
@@ -898,7 +920,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
     } = request;
     let started = async {
         let options = lower_turn_options(&selection)?;
-        let native_input = skills.lower(&execution_directory, prompt)?;
+        let native_input = lower_input(&skills, &execution_directory, input)?;
         let result = transport
             .request(
                 "turn/start",
