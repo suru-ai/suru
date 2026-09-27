@@ -950,7 +950,10 @@ impl ChildThreadAttachment {
     /// Requests the child thread's stream, so its items reach this connection.
     /// The resumed thread's own lineage — the parent it declares — is not
     /// re-checked: the spawn item on the parent's stream already named the
-    /// relationship, and it is the spawner's account Suru follows.
+    /// relationship, and it is the spawner's account Suru follows. The attach
+    /// carries no `config`: a child thread inherits its parent's per-thread MCP
+    /// servers, the Broker's included, and Codex ignores a `config` on a
+    /// running thread and may rebuild an idle one from it.
     /// Fire-and-forget: a child Codex will not hand over leaves its Subagent's
     /// Session sparse — settled by the lifecycle items the spawner's thread
     /// still carries — rather than failing the parent's.
@@ -970,6 +973,7 @@ impl ChildThreadAttachment {
                         cwd: &cwd,
                         approval_policy: posture.approval_policy(),
                         sandbox: posture.sandbox(),
+                        config: None,
                     },
                 )
                 .await

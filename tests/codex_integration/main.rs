@@ -14,6 +14,7 @@ mod server_support;
 mod scripted_binary_support;
 
 mod approvals;
+mod broker;
 mod errands;
 mod errors;
 mod interruption;

@@ -11,13 +11,14 @@ use serde_json::Value;
 
 use super::{DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID};
 use crate::{
+    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
     protocol::{
         AgentSelection, CodexApprovalPolicy, CodexSandboxMode, FileChange, ModelAvailability,
         ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
         ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue, ProviderId,
         ReasoningSummaryDetail, Usage,
     },
-    provider::{ProviderError, exclusive_count, humanized_wire_id, reported_count},
+    provider::{BrokerHandoff, ProviderError, exclusive_count, humanized_wire_id, reported_count},
 };
 
 // Native user-input requests preserve both JSON-RPC and thread/Turn/item correlation.
@@ -369,6 +370,8 @@ pub(super) struct ThreadStartParams<'a> {
     pub(super) approval_policy: &'a str,
     pub(super) sandbox: &'a str,
     pub(super) ephemeral: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) config: Option<&'a ThreadConfig>,
 }
 
 #[derive(Serialize)]
@@ -378,6 +381,44 @@ pub(super) struct ThreadResumeParams<'a> {
     pub(super) cwd: &'a str,
     pub(super) approval_policy: &'a str,
     pub(super) sandbox: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) config: Option<&'a ThreadConfig>,
+}
+
+/// The Codex configuration a thread is started or resumed under beyond the user's own: each entry
+/// keyed by the dotted path it sets, applied the way a `-c` override is, so an entry replaces that
+/// one value and leaves the rest of the user's configuration standing.
+pub(super) type ThreadConfig = serde_json::Map<String, Value>;
+
+/// The Broker as one thread's MCP server, which is all a thread's `config` carries: the entry
+/// `mcp_servers.suru`, reached over streamable HTTP with the token as a static `Authorization`
+/// header — never `bearer_token`, which Codex refuses for streamable HTTP — with a per-call timeout
+/// above the Broker's longest call, since progress does not extend it, and every Tool approved by
+/// default, since otherwise a call waits on Codex's automatic reviewer or raises an elicitation
+/// Suru refuses (docs/validation/0408-codex-per-thread-mcp-config.md). Codex keeps none of it with
+/// the thread, so a resume is handed it again.
+pub(super) fn broker_thread_config(handoff: &BrokerHandoff) -> ThreadConfig {
+    let (header, value) = handoff.authorization_header();
+    let server = NativeBrokerServer {
+        url: handoff.endpoint().as_str(),
+        http_headers: BTreeMap::from([(header, value)]),
+        tool_timeout_sec: BROKER_CALL_TIMEOUT.as_secs_f64(),
+        default_tools_approval_mode: "approve",
+    };
+    ThreadConfig::from_iter([(
+        format!("mcp_servers.{BROKER_SERVER_NAME}"),
+        serde_json::to_value(server).expect("a Broker server entry serializes"),
+    )])
+}
+
+/// One streamable-HTTP MCP server entry, in the keys Codex's configuration reads.
+#[derive(Serialize)]
+struct NativeBrokerServer<'a> {
+    url: &'a str,
+    http_headers: BTreeMap<&'static str, String>,
+    /// Seconds, which Codex reads as a float.
+    tool_timeout_sec: f64,
+    default_tools_approval_mode: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -1335,4 +1376,51 @@ pub(super) enum NativeTurnOutcome {
 pub(super) enum NativeTurnFailureKind {
     BadRequest { additional_details: Option<String> },
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ThreadResumeParams, ThreadStartParams, broker_thread_config};
+    use crate::provider::BrokerHandoff;
+
+    #[test]
+    fn the_broker_is_one_dotted_mcp_server_override_approved_by_default() {
+        let handoff = BrokerHandoff::for_tests("http://127.0.0.1:1/broker");
+        let config = broker_thread_config(&handoff);
+        assert_eq!(
+            serde_json::to_value(&config).expect("the config serializes"),
+            json!({
+                "mcp_servers.suru": {
+                    "url": "http://127.0.0.1:1/broker",
+                    "http_headers": {"Authorization": handoff.token().bearer()},
+                    "tool_timeout_sec": 900.0,
+                    "default_tools_approval_mode": "approve",
+                },
+            })
+        );
+        let start = serde_json::to_value(ThreadStartParams {
+            cwd: "/workspace",
+            approval_policy: "on-request",
+            sandbox: "workspace-write",
+            ephemeral: false,
+            config: Some(&config),
+        })
+        .expect("thread/start serializes");
+        assert_eq!(start["config"], serde_json::to_value(&config).unwrap());
+    }
+
+    #[test]
+    fn a_thread_handed_no_broker_overrides_nothing() {
+        let resume = serde_json::to_value(ThreadResumeParams {
+            thread_id: "thread",
+            cwd: "/workspace",
+            approval_policy: "on-request",
+            sandbox: "workspace-write",
+            config: None,
+        })
+        .expect("thread/resume serializes");
+        assert!(resume.get("config").is_none(), "{resume}");
+    }
 }

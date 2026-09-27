@@ -428,6 +428,20 @@ async fn a_collab_spawn_opens_the_row_and_the_child_session_fed_by_the_childs_ow
     );
     assert_eq!(resumed["params"]["approvalPolicy"], "on-request");
     assert_eq!(resumed["params"]["sandbox"], "workspace-write");
+    let started = fixture
+        .requests()
+        .into_iter()
+        .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
+        .expect("Suru starts the parent's thread");
+    assert!(
+        started["params"]["config"]["mcp_servers.suru"].is_object(),
+        "the parent's thread is handed the Broker: {started}"
+    );
+    assert!(
+        resumed["params"].get("config").is_none(),
+        "the child's thread inherits the Broker from its parent's rather than being handed it \
+         again, which Codex would ignore on a running thread: {resumed}"
+    );
 
     opened.server.shutdown().await.expect("shut down server");
 }

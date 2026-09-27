@@ -2,7 +2,9 @@
 //!
 //! [`CodexRuntime`] launches one app-server process per Suru Session, and [`CodexSession`] drives
 //! that process's single native Turn slot: starting a Turn, steering it, interrupting it, and
-//! stopping the process once the Session is done with it.
+//! stopping the process once the Session is done with it. A Session handed the Broker hands it on
+//! to its thread through the per-thread `config` map, on `thread/start` and on every
+//! `thread/resume` a relaunch sends, with the token that launch was handed.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -28,8 +30,8 @@ use super::{
     wire::{
         CodexPosture, ModelListParams, NativeField, NativeModelList, ThreadConnectionResult,
         ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-        TurnStartResult, TurnSteerParams, TurnSteerResult, lower_reasoning_summary,
-        lower_turn_options,
+        TurnStartResult, TurnSteerParams, TurnSteerResult, broker_thread_config,
+        lower_reasoning_summary, lower_turn_options,
     },
 };
 use crate::{
@@ -380,6 +382,9 @@ async fn start_codex_thread(
         .transpose()
         .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
         .map(|state| state.thread_id);
+    // The Broker goes on the thread's start and on every resume alike, carrying the token this
+    // launch was handed, because Codex keeps nothing of an MCP server with the thread.
+    let config = request.broker.as_ref().map(broker_thread_config);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
         let posture = *context
             .posture
@@ -393,6 +398,7 @@ async fn start_codex_thread(
                     cwd,
                     approval_policy: posture.approval_policy(),
                     sandbox: posture.sandbox(),
+                    config: config.as_ref(),
                 },
             )
             .await
@@ -411,6 +417,7 @@ async fn start_codex_thread(
                     approval_policy: posture.approval_policy(),
                     sandbox: posture.sandbox(),
                     ephemeral: false,
+                    config: config.as_ref(),
                 },
             )
             .await
