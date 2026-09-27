@@ -501,3 +501,90 @@ async fn an_interrupt_carried_down_leaves_a_brokered_subagents_trailing_output_n
         .await
         .expect("shut down server");
 }
+
+#[tokio::test]
+async fn a_parents_stray_output_is_owed_nothing_for_the_brokered_subagent_its_brokered_subagent_delegated_to()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-late-output-grandchild", None).await;
+    let descriptor = delegating.descriptor.clone();
+    delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let start = next_start(&mut delegating.hosted.codex).await;
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("a brokered Subagent is handed the Broker too");
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    timeout(PROGRESS_DEADLINE, child_provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    child_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (_grandchild_provider, _) = run_child(
+        &mut delegating.hosted.claude,
+        default_selection(&claude_models()),
+    )
+    .await;
+
+    // The Subagent settles, leaving what it delegated working, and the
+    // parent's Provider works on for the Subagent it heard settle.
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    say_late(&delegating.caller_provider, LATE).await;
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let answered = read_until(
+        &descriptor,
+        delegating.caller,
+        "the Continuation the Subagent was owed settles",
+        |snapshot| {
+            snapshot
+                .turns
+                .get(1)
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+        },
+    )
+    .await;
+    assert!(
+        answered.working_since().is_some(),
+        "the tree works on in the Subagent's own Subagent"
+    );
+
+    // What that Subagent delegated is owed to the Subagent's Provider, not
+    // the parent's: stray output from the parent's lands nowhere.
+    say_late(&delegating.caller_provider, "Trailing words, after.").await;
+    discarded(
+        &after_a_watch_starts(
+            &descriptor,
+            delegating.caller,
+            &delegating.caller_provider,
+            "tail the build log",
+        )
+        .await,
+        &[TurnStatus::Completed, TurnStatus::Completed],
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}

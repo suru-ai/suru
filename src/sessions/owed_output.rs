@@ -10,9 +10,7 @@
 //! answers for them here — whichever path settled the stretch, and whether or
 //! not a Subagent Report told the delegating Agent of it.
 
-use std::collections::HashSet;
-
-use crate::protocol::{Activity, SessionId, SessionTimestamp, Turn, TurnStatus};
+use crate::protocol::{SessionId, SessionTimestamp, Turn, TurnStatus};
 
 use super::{
     SessionRecord, SessionStore, SessionStoreState, brokered::delegating_session,
@@ -58,21 +56,11 @@ impl SessionStoreState {
             .last()
             .and_then(|turn| turn.started_at)
             .max(record.work_interrupted_at);
+        // A Delegation reaches only a brokered Subagent beneath the Agent
+        // that sent it, so every stretch an Agent on this actor delegated
+        // belongs to one of the actors owned beneath `owner`.
         let delegators = self.actor_subtree(owner);
-        let delegated = delegators
-            .iter()
-            .filter_map(|delegator| self.sessions.get(delegator))
-            .flat_map(|delegator| &delegator.snapshot.activities)
-            .filter_map(|activity| match activity {
-                Activity::Subagent {
-                    brokered: true,
-                    session_id,
-                    ..
-                } => Some(*session_id),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        delegated
+        self.actor_owners_beneath(owner)
             .into_iter()
             .filter_map(|subagent| self.sessions.get(&subagent))
             .any(|subagent| {
