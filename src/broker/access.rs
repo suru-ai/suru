@@ -83,6 +83,24 @@ impl BrokerHandoff {
     pub fn token(&self) -> &BrokerToken {
         &self.token
     }
+
+    /// The HTTP header presenting the token, as the name and value a harness
+    /// sends on every request it makes to the endpoint.
+    pub fn authorization_header(&self) -> (&'static str, String) {
+        ("Authorization", self.token.bearer())
+    }
+}
+
+#[cfg(test)]
+impl BrokerHandoff {
+    /// A handoff naming `endpoint` with a fresh token no Broker holds, for a
+    /// test of how a harness lowers one onto its own seam.
+    pub(crate) fn for_tests(endpoint: &str) -> Self {
+        Self {
+            endpoint: BrokerEndpoint(endpoint.to_owned()),
+            token: BrokerToken::mint(),
+        }
+    }
 }
 
 /// The Session a Broker request came from, resolved from the token it

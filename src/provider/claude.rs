@@ -9,7 +9,8 @@
 //! Suru's Model catalog, [`availability`] decides whether the CLI can be driven at all before
 //! anything asks it to work, [`session`] runs one Session per long-lived CLI process,
 //! [`turn_in_flight`] holds what a Session and its projection must agree on about the Turn in
-//! flight, [`errand`] runs Suru's own one-shot work through the CLI's print mode, and [`runtime`]
+//! flight, [`broker`] writes the MCP config each Session launch is handed the Broker through,
+//! [`errand`] runs Suru's own one-shot work through the CLI's print mode, and [`runtime`]
 //! composes them into the Provider runtime the rest of Suru uses. What the layers share sits here:
 //! how a Claude failure reads, and the launch flags an Agent Selection lowers onto, which a
 //! Session's child and an Errand's one-shot carry alike.
@@ -26,6 +27,7 @@
 
 mod approval;
 mod availability;
+mod broker;
 mod catalog;
 mod context;
 mod errand;

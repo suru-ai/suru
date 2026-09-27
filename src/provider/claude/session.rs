@@ -14,7 +14,11 @@
 //!
 //! The child is launched under the Session's effective native permission mode, which later changes
 //! reach the same process over its control channel. Suru's stdio permission-prompt channel and the
-//! Session's Workspace are carried with it. A Prompt is
+//! Session's Workspace are carried with it, and so is the Broker, when the Session was handed it:
+//! each launch is pointed at an MCP config file of its own carrying the token this Session's
+//! Provider connection was handed, and allowlists the Broker's Tools ([`super::broker`]). A
+//! relaunch after a restart is a new Provider connection, so it is handed a fresh token; a respawn
+//! for a Selection change stays on the connection and the token it holds. A Prompt is
 //! delivered as a stream-json user message; the Turn's output streams back through
 //! [`super::projection`] and the CLI's terminal result message Settles it.
 //!
@@ -47,6 +51,7 @@ use tokio::{sync::Mutex, time::Duration};
 use super::{
     CLAUDE_AGENT_ID,
     availability::ClaudeAvailability,
+    broker::BrokerMcpConfig,
     claude_error, claude_error_context,
     projection::{ClaudeProjection, provider_events},
     runtime::usable_claude_models,
@@ -61,9 +66,9 @@ use super::{
 use crate::{
     protocol::{AgentId, AgentIdentity, AgentSelection, ClaudePermissionMode, ModelDescriptor},
     provider::{
-        ProviderDecisionDelivery, ProviderError, ProviderFuture, ProviderResumeState,
-        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderSubagentId, ProviderTurnInput, ProviderWatchId,
+        BrokerHandoff, ProviderDecisionDelivery, ProviderError, ProviderFuture,
+        ProviderResumeState, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId,
         harness::{ProcessGuard, ProcessRegistry},
     },
 };
@@ -192,6 +197,7 @@ pub(super) async fn start_claude_session(
         processes,
         execution_directory: request.execution_directory,
         provider_session_id,
+        broker: request.broker,
         conversation,
         child: Mutex::new(ChildSlot {
             running: None,
@@ -266,6 +272,9 @@ struct ClaudeSession {
     execution_directory: PathBuf,
     /// The provider-session UUID Suru minted, which the child is spawned under.
     provider_session_id: String,
+    /// The Broker this Session's Provider connection was handed, which every child it launches is
+    /// handed in turn. None while the Broker is off.
+    broker: Option<BrokerHandoff>,
     /// Where every child this Session spawns delivers its conversation, so the Session's event
     /// stream outlives any one process.
     conversation: ConversationSink,
@@ -297,6 +306,9 @@ struct ClaudeChild {
     process: Arc<ProcessGuard>,
     selection: AgentSelection,
     permission_mode: ClaudePermissionMode,
+    /// The MCP config the process was pointed at to reach the Broker, kept for as long as the
+    /// process might read it.
+    broker_config: Option<BrokerMcpConfig>,
 }
 
 impl ClaudeChild {
@@ -316,6 +328,9 @@ impl ClaudeChild {
         self.transport
             .drain_within(self.process.wait_budget())
             .await;
+        if let Some(broker_config) = &self.broker_config {
+            broker_config.remove();
+        }
         stopped
     }
 }
@@ -482,12 +497,20 @@ impl ProviderSession for ClaudeSession {
                 .is_none_or(|child| child.selection != input.selection)
             {
                 // The Selection is lowered onto flags before anything is torn down, so one the CLI
-                // has no flags for leaves the Session running on the child it had.
+                // has no flags for leaves the Session running on the child it had — and so is the
+                // Broker, whose MCP config each child is handed a file of its own for.
+                let broker_config = self
+                    .broker
+                    .as_ref()
+                    .map(BrokerMcpConfig::write)
+                    .transpose()
+                    .map_err(|error| claude_error_context(CONTEXT, error))?;
                 let args = spawn_args(
                     &self.provider_session_id,
                     &input.selection,
                     slot.next_spawn,
                     permission_mode,
+                    broker_config.as_ref(),
                 )?;
                 if let Some(previous) = slot.running.take() {
                     self.stop_child(&previous)
@@ -521,6 +544,7 @@ impl ProviderSession for ClaudeSession {
                     process,
                     selection: input.selection.clone(),
                     permission_mode,
+                    broker_config,
                 });
             }
             self.apply_permission_mode(
@@ -727,12 +751,14 @@ fn no_live_turn(operation: &str) -> ProviderError {
 }
 
 /// The flags one Turn's Agent Selection spawns the child under, beside the conversation `spawn`
-/// addresses and the fixed permission posture every Claude Session launches with.
+/// addresses, the fixed permission posture every Claude Session launches with, and the Broker's MCP
+/// config when the Session was handed the Broker.
 fn spawn_args(
     provider_session_id: &str,
     selection: &AgentSelection,
     spawn: ProviderSessionSpawn,
     permission_mode: ClaudePermissionMode,
+    broker: Option<&BrokerMcpConfig>,
 ) -> Result<Vec<OsString>, ProviderError> {
     let mut args: Vec<OsString> = [
         "--include-partial-messages",
@@ -746,6 +772,7 @@ fn spawn_args(
     .into_iter()
     .map(OsString::from)
     .collect();
+    args.extend(broker.into_iter().flat_map(BrokerMcpConfig::launch_args));
     args.extend(super::selection_args(selection)?);
     Ok(args)
 }
@@ -810,6 +837,7 @@ mod tests {
                 processes,
                 execution_directory: directory.path().to_owned(),
                 provider_session_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+                broker: None,
                 conversation,
                 child: Mutex::new(ChildSlot {
                     running: None,
@@ -941,6 +969,7 @@ mod tests {
             &selection(vec![effort("low")]),
             ProviderSessionSpawn::Mint,
             crate::protocol::ClaudePermissionMode::Default,
+            None,
         )
         .expect("a reasoning-effort selection lowers");
         assert_eq!(
@@ -969,6 +998,7 @@ mod tests {
             &selection(Vec::new()),
             ProviderSessionSpawn::Resume,
             crate::protocol::ClaudePermissionMode::Default,
+            None,
         )
         .expect("a resuming spawn lowers");
         assert_eq!(
@@ -983,12 +1013,42 @@ mod tests {
     }
 
     #[test]
+    fn a_session_handed_the_broker_points_each_launch_at_its_config_and_allowlists_it() {
+        let config = super::BrokerMcpConfig::write(&crate::provider::BrokerHandoff::for_tests(
+            "http://127.0.0.1:1/broker",
+        ))
+        .expect("write the Broker's MCP config");
+        let args = spawn_args(
+            "11111111-2222-3333-4444-555555555555",
+            &selection(Vec::new()),
+            ProviderSessionSpawn::Resume,
+            crate::protocol::ClaudePermissionMode::Default,
+            Some(&config),
+        )
+        .expect("a Session handed the Broker lowers");
+        let [mcp_config, path, allowed_tools, allowlist] = config.launch_args();
+        assert_eq!(
+            args[7..],
+            [
+                mcp_config,
+                path,
+                allowed_tools,
+                allowlist,
+                OsString::from("--model"),
+                OsString::from("fixture[1m]"),
+            ],
+            "the Broker's flags follow the conversation's and precede the Selection's: {args:?}"
+        );
+    }
+
+    #[test]
     fn a_selection_without_effort_spawns_no_effort_flag() {
         let args = spawn_args(
             "id",
             &selection(Vec::new()),
             ProviderSessionSpawn::Mint,
             crate::protocol::ClaudePermissionMode::Default,
+            None,
         )
         .expect("an effortless selection lowers");
         assert!(!args.contains(&OsString::from("--effort")));
@@ -1006,6 +1066,7 @@ mod tests {
             }]),
             ProviderSessionSpawn::Mint,
             crate::protocol::ClaudePermissionMode::Default,
+            None,
         )
         .expect_err("an unknown Model Option is a rejected selection");
         assert!(error.is_selection_rejected());
@@ -1019,6 +1080,7 @@ mod tests {
             &selection(vec![effort("low"), effort("high")]),
             ProviderSessionSpawn::Mint,
             crate::protocol::ClaudePermissionMode::Default,
+            None,
         )
         .expect_err("a duplicated Model Option is a rejected selection");
         assert!(error.is_selection_rejected());

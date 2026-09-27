@@ -182,6 +182,19 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
         errand.arguments
     );
     assert!(
+        errand.carries("--strict-mcp-config")
+            && !errand.carries("--mcp-config")
+            && !errand.carries("--allowedTools"),
+        "an Errand starts no MCP server, the Broker's included: {:?}",
+        errand.arguments
+    );
+    let conversation = claude.wait_for_launch_carrying("--session-id").await;
+    assert!(
+        conversation.carries("--mcp-config"),
+        "while the Session's own launch beside it is handed the Broker: {:?}",
+        conversation.arguments
+    );
+    assert!(
         !errand.carries("--session-id") && !errand.carries("--resume"),
         "an Errand neither mints a conversation nor continues one: {:?}",
         errand.arguments

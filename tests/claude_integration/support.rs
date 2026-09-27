@@ -70,6 +70,11 @@ pub fn models_without(models: &str, value: &str) -> String {
 /// its first. It is a read-then-write of a shared file, so a fixture whose launches genuinely
 /// overlap should not be scripted against it.
 ///
+/// A launch pointed at an MCP config with `--mcp-config` also records that file as it found it —
+/// its permissions, its path, and its contents — ahead of the launch itself, because the file is
+/// Suru's to remove once the launch is done with it and a test reading the launch must still be able
+/// to read what it was handed.
+///
 /// A [warm-up](warm_up) launch leaves before any of that, so it is never counted as a launch.
 const SCRIPT_PREFIX: &str = r#"#!/bin/sh
 [ -n "$SURU_FIXTURE_WARM_UP" ] && exit 0
@@ -79,6 +84,15 @@ if [ -e "$CLAUDE_FIXTURE_ATTEMPTS" ]; then
 fi
 printf '%s\n' "$attempt" > "$CLAUDE_FIXTURE_ATTEMPTS"
 printf '%s\n' "$*" >> "$CLAUDE_FIXTURE_ARGV"
+mcp_config=
+previous=
+for argument in "$@"; do
+  [ "$previous" = "--mcp-config" ] && mcp_config=$argument
+  previous=$argument
+done
+if [ -n "$mcp_config" ]; then
+  printf '%s\t%s\t%s\n' "$(ls -ln "$mcp_config" | cut -c1-10)" "$mcp_config" "$(cat "$mcp_config")" >> "$CLAUDE_FIXTURE_MCP_CONFIGS"
+fi
 ( IFS=$(printf '\037'); printf '%s\t%s\n' "$PWD" "$*" >> "$CLAUDE_FIXTURE_LAUNCHES" )
 trap 'printf "exited\n" >> "$CLAUDE_FIXTURE_EXITED"' EXIT
 
@@ -310,11 +324,22 @@ pub struct ScriptedClaude {
     argv: std::path::PathBuf,
     /// One line per launch: its working directory, then its arguments exactly as it received them.
     launches: std::path::PathBuf,
+    /// One line per launch pointed at an MCP config: the file's permissions, path, and contents.
+    mcp_configs: std::path::PathBuf,
     errand_prompt: std::path::PathBuf,
     exited: std::path::PathBuf,
     release: std::path::PathBuf,
     signed_in: std::path::PathBuf,
     upgraded: std::path::PathBuf,
+}
+
+/// The MCP config file one launch was pointed at with `--mcp-config`, as the launch found it.
+#[derive(Debug)]
+pub struct McpConfigFile {
+    /// The file's permissions as `ls -l` spells them, such as `-rw-------`.
+    pub permissions: String,
+    pub path: std::path::PathBuf,
+    pub contents: serde_json::Value,
 }
 
 /// One launch of the fixture, as a test that must tell one from another reads it.
@@ -373,6 +398,7 @@ impl ScriptedClaude {
         let argv = path("argv");
         let attempts = path("attempts");
         let launches = path("launches");
+        let mcp_configs = path("mcp-configs");
         let errand_prompt = path("errand-prompt");
         let exited = path("exited");
         let release = path("release");
@@ -383,6 +409,7 @@ impl ScriptedClaude {
             .replace("$CLAUDE_FIXTURE_ARGV", fixture_path(&argv))
             .replace("$CLAUDE_FIXTURE_ATTEMPTS", fixture_path(&attempts))
             .replace("$CLAUDE_FIXTURE_LAUNCHES", fixture_path(&launches))
+            .replace("$CLAUDE_FIXTURE_MCP_CONFIGS", fixture_path(&mcp_configs))
             .replace(
                 "$CLAUDE_FIXTURE_ERRAND_PROMPT",
                 fixture_path(&errand_prompt),
@@ -400,6 +427,7 @@ impl ScriptedClaude {
             log,
             argv,
             launches,
+            mcp_configs,
             errand_prompt,
             exited,
             release,
@@ -508,6 +536,35 @@ impl ScriptedClaude {
             "exactly one launch carries {flag}, got {carrying:?}"
         );
         carrying.pop().expect("the launch carrying the flag")
+    }
+
+    /// The MCP config file each launch pointed at one was handed, oldest launch first.
+    pub fn mcp_configs(&self) -> Vec<McpConfigFile> {
+        std::fs::read_to_string(&self.mcp_configs)
+            .unwrap_or_default()
+            .lines()
+            .map(|record| {
+                let mut fields = record.splitn(3, '\t');
+                let mut field = || fields.next().unwrap_or_default().to_owned();
+                let (permissions, path, contents) = (field(), field(), field());
+                McpConfigFile {
+                    permissions,
+                    path: std::path::PathBuf::from(path),
+                    contents: serde_json::from_str(&contents).unwrap_or_else(|error| {
+                        panic!("the launch found an MCP config it could read as JSON: {error}: {record}")
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// The MCP config file `launch` was pointed at, as it found it.
+    pub fn mcp_config_of(&self, launch: &Launch) -> McpConfigFile {
+        let path = std::path::Path::new(launch.value("--mcp-config"));
+        self.mcp_configs()
+            .into_iter()
+            .find(|config| config.path == path)
+            .unwrap_or_else(|| panic!("the fixture recorded the MCP config at {path:?}"))
     }
 
     /// The Prompts the fixture was given on stdin across every Errand it answered.
@@ -838,6 +895,11 @@ pub struct LiveTurn {
 }
 
 impl LiveTurn {
+    /// Where the server serves the Broker, which is the endpoint a Session's launch is handed.
+    pub fn broker_url(&self) -> String {
+        format!("{}/broker", self.server.descriptor().base_url)
+    }
+
     /// Opens a Session on `runtime` under `name`, delivers `prompt`, and comes back once the Turn
     /// it began is running. `name` is the client channel, so each test needs its own.
     pub async fn start(runtime: ClaudeRuntime, name: &'static str, prompt: &str) -> Self {

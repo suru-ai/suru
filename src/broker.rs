@@ -16,11 +16,15 @@
 //! Provider start is handed an endpoint and the endpoint answers nothing.
 //!
 //! Everything MCP-specific stays in [`mcp`]; the Tools themselves, in Suru's
-//! own terms, are in [`tools`].
+//! own terms, are in [`tools`]. What each harness is handed is lowered by that
+//! harness onto its own per-Session seam, from the handoff and the constants
+//! here, which are the same in every one.
 
 mod access;
 mod mcp;
 mod tools;
+
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -30,6 +34,19 @@ pub(crate) use tools::BrokerTools;
 
 /// Where the Broker is served on the Server's loopback listener.
 pub(crate) const BROKER_PATH: &str = "/broker";
+
+/// The name every harness knows the Broker by among its MCP servers. It is
+/// what an Agent's Broker Tools go by — `mcp__suru__list_providers` to
+/// Claude — and what Suru recognizes the Broker's calls by where a harness asks
+/// Suru to permit them.
+pub(crate) const BROKER_SERVER_NAME: &str = "suru";
+
+/// How long a harness lets one Broker call run. Each takes its per-server
+/// timeout as a hard limit on the whole call — progress extends neither
+/// Claude's nor Codex's, and Copilot's replaces the 180 seconds of silence it
+/// otherwise allows — so this stands above the Broker's longest call, a wait
+/// at its 600-second ceiling (`docs/validation/0408-*`).
+pub(crate) const BROKER_CALL_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Whether `path` addresses the Broker, which is never forwarded to a Peer.
 pub(crate) fn is_broker_path(path: &str) -> bool {
