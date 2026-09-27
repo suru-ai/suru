@@ -47,6 +47,7 @@ use crate::{
 
 mod interventions;
 mod posture;
+mod watches;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {
     ModelOptionChoice {

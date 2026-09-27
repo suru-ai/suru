@@ -59,7 +59,10 @@ fn haiku_selection() -> AgentSelection {
 
 /// Asks the Server to interrupt `session_id`, as a client does — the Picker
 /// row's stop of one Subagent included — answering with the raw response.
-async fn interrupt(descriptor: &RuntimeDescriptor, session_id: SessionId) -> reqwest::Response {
+pub(super) async fn interrupt(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!(
             "{}/v1/sessions/{session_id}/interrupt",
