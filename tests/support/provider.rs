@@ -151,6 +151,10 @@ pub struct ControlledProviderSession {
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
     subagent_stops: mpsc::UnboundedReceiver<SubagentStop>,
     watches_stops: mpsc::UnboundedReceiver<WatchesStop>,
+    // Read once a native Subagent can delegate through the Broker, which is
+    // the only way one receives a Subagent Report (#420).
+    #[allow(dead_code)]
+    subagent_deliveries: mpsc::UnboundedReceiver<SubagentDelivery>,
     posture_updates: mpsc::UnboundedReceiver<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
     shutdowns: mpsc::UnboundedReceiver<()>,
@@ -215,6 +219,17 @@ pub struct SubagentStop {
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
+/// Input Suru delivered to one native Subagent by the identity the double
+/// minted for it — a Subagent Report to a native Subagent that delegated
+/// through the Broker — held until the test answers it. Nothing reaches it
+/// until a native Subagent can delegate through the Broker (#420).
+#[allow(dead_code)]
+pub struct SubagentDelivery {
+    subagent_id: ProviderSubagentId,
+    input: ProviderInput,
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
 struct ControlledSessionHandle {
     decisions: mpsc::UnboundedSender<DecisionDelivery>,
     gate_decisions: Arc<AtomicBool>,
@@ -226,6 +241,7 @@ struct ControlledSessionHandle {
     subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
     subagent_stops: mpsc::UnboundedSender<SubagentStop>,
     watches_stops: mpsc::UnboundedSender<WatchesStop>,
+    subagent_deliveries: mpsc::UnboundedSender<SubagentDelivery>,
     posture_updates: mpsc::UnboundedSender<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
     shutdowns: mpsc::UnboundedSender<()>,
@@ -507,6 +523,7 @@ impl StartRequest {
         let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
         let (subagent_stops_tx, subagent_stops_rx) = mpsc::unbounded_channel();
         let (watches_stops_tx, watches_stops_rx) = mpsc::unbounded_channel();
+        let (subagent_deliveries_tx, subagent_deliveries_rx) = mpsc::unbounded_channel();
         let (posture_updates_tx, posture_updates_rx) = mpsc::unbounded_channel();
         let gate_posture_updates = Arc::new(AtomicBool::new(false));
         let (shutdowns_tx, shutdowns_rx) = mpsc::unbounded_channel();
@@ -534,6 +551,7 @@ impl StartRequest {
                     subagents_stops: subagents_stops_tx,
                     subagent_stops: subagent_stops_tx,
                     watches_stops: watches_stops_tx,
+                    subagent_deliveries: subagent_deliveries_tx,
                     posture_updates: posture_updates_tx,
                     gate_posture_updates: gate_posture_updates.clone(),
                     shutdowns: shutdowns_tx,
@@ -552,6 +570,7 @@ impl StartRequest {
             subagents_stops: subagents_stops_rx,
             subagent_stops: subagent_stops_rx,
             watches_stops: watches_stops_rx,
+            subagent_deliveries: subagent_deliveries_rx,
             posture_updates: posture_updates_rx,
             gate_posture_updates,
             shutdowns: shutdowns_rx,
@@ -672,6 +691,13 @@ impl ControlledProviderSession {
             .expect("Provider Session remains connected")
     }
 
+    /// The steer already delivered, without waiting for one. A test that must
+    /// show a Provider was *never* steered reads the absence here rather than
+    /// waiting out a timeout.
+    pub fn try_next_steer(&mut self) -> Option<TurnSteer> {
+        self.steers.try_recv().ok()
+    }
+
     pub async fn next_interrupt(&mut self) -> TurnInterrupt {
         self.interruptions
             .recv()
@@ -735,6 +761,16 @@ impl ControlledProviderSession {
     /// reads the absence here rather than waiting out a timeout.
     pub fn was_shut_down(&mut self) -> bool {
         self.shutdowns.try_recv().is_ok()
+    }
+
+    /// The next input Suru delivers to one of this Provider's native
+    /// Subagents by identity.
+    #[allow(dead_code)]
+    pub async fn next_subagent_delivery(&mut self) -> SubagentDelivery {
+        self.subagent_deliveries
+            .recv()
+            .await
+            .expect("Provider Session remains connected")
     }
 
     pub fn emit(&self, event: ProviderEvent) {
@@ -899,6 +935,31 @@ impl WatchesStop {
         self.response
             .send(Err(ProviderError::new(message)))
             .unwrap_or_else(|_| panic!("Provider Watch stop response remains connected"));
+    }
+}
+
+#[allow(dead_code)]
+impl SubagentDelivery {
+    /// The Provider identity the delivery named, as the test minted it.
+    pub fn subagent(&self) -> &str {
+        self.subagent_id.as_str()
+    }
+
+    /// The Subagent Reports delivered, in the order Suru delivered them.
+    pub fn reports(&self) -> &[SubagentReport] {
+        &self.input.reports
+    }
+
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider Subagent delivery response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider Subagent delivery response remains connected"));
     }
 }
 
@@ -1310,6 +1371,27 @@ impl ProviderSession for ControlledSessionHandle {
             response_rx
                 .await
                 .map_err(|_| ProviderError::new("test Provider Subagent stop was abandoned"))?
+        })
+    }
+
+    fn deliver_to_subagent(
+        &self,
+        subagent_id: ProviderSubagentId,
+        input: ProviderInput,
+    ) -> ProviderFuture<'_, ()> {
+        let deliveries = self.subagent_deliveries.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            deliveries
+                .send(SubagentDelivery {
+                    subagent_id,
+                    input,
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider Subagent delivery was abandoned"))?
         })
     }
 

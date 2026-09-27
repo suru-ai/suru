@@ -583,6 +583,7 @@ async fn interrupting_a_monitoring_parent_stops_the_watches_its_brokered_subagen
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)

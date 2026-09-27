@@ -236,6 +236,15 @@ enum ProviderCommand {
         input: ProviderPrompt,
     },
     SteerPrompt,
+    /// Hand the Subagent Reports waiting in the store for `target` to its
+    /// Agent (ADR 0035): the Session this actor owns — whose Turn at work is
+    /// steered, and whose idle Agent wakes into a Continuation — or a native
+    /// Subagent riding this actor, through its Provider's route to it. With
+    /// no Provider connection open, they wait for the head of the Session's
+    /// next Turn: nothing here starts a Provider.
+    DeliverReports {
+        target: SessionId,
+    },
     /// Stop the Session's work, whatever it is: the active Turn — the
     /// Provider stops its background work first, in the established ordering
     /// — or, with no Turn running, every Watch still live and every Subagent
@@ -373,6 +382,17 @@ impl ActiveProviderTurn {
     /// A Turn a Delegation began in a brokered Subagent's Session.
     fn new_delegated(turn_id: TurnId) -> Self {
         Self {
+            prompt_begun: false,
+            ..Self::new(turn_id)
+        }
+    }
+
+    /// The Continuation Subagent Reports woke the idle Agent into: a Turn the
+    /// Provider runs and settles at its own boundary, like the one it begins
+    /// on its own, so the next Prompt interrupts it before beginning another.
+    fn new_report_continuation(turn_id: TurnId) -> Self {
+        Self {
+            continuation: Some(ContinuationExecution::ProviderTurn),
             prompt_begun: false,
             ..Self::new(turn_id)
         }
@@ -673,6 +693,16 @@ impl SubagentRoutes {
     /// spawned.
     fn was_stopped(&self, subagent: &ProviderSubagentId) -> bool {
         self.stopped.contains(subagent)
+    }
+
+    /// The Provider's identity for the Subagent whose own Session is
+    /// `target`, working or settled, where the connection knows it — itself,
+    /// or relearned from the store.
+    fn identity_of_session(&self, target: SessionId) -> Option<ProviderSubagentId> {
+        self.identities
+            .iter()
+            .find(|(_, identity)| identity.session_id == target)
+            .map(|(subagent, _)| subagent.clone())
     }
 
     /// The working Subagent whose child Session is `target`, resolved for a
@@ -1177,7 +1207,9 @@ impl ProviderOrchestrator {
             "Provider orchestration requires at least one hosted runtime"
         );
         let (shutdown_complete, _) = watch::channel(false);
-        Self {
+        let (report_notices, held_reports) = mpsc::unbounded_channel();
+        sessions.announce_held_reports_to(report_notices);
+        let orchestrator = Self {
             runtimes: Arc::new(runtimes),
             sessions,
             actors: Arc::new(Mutex::new(ProviderActors {
@@ -1194,6 +1226,21 @@ impl ProviderOrchestrator {
             checkout_guards: Default::default(),
             connected_incarnations: Default::default(),
             broker,
+        };
+        // Every Subagent Report the store comes to hold is handed on to the
+        // actor that reaches its Agent, for as long as the Server runs.
+        tokio::spawn(forward_held_reports(orchestrator.clone(), held_reports));
+        orchestrator
+    }
+
+    /// Hands the Subagent Reports waiting for `recipient` to the Provider
+    /// actor holding its conversation: its own, or — for a native Subagent —
+    /// the one its nearest ancestor owns. With no actor running there is no
+    /// Provider process to take them, and they wait for the head of the
+    /// Session's next Turn: Suru never starts a Provider to deliver one.
+    fn deliver_held_reports(&self, recipient: SessionId) {
+        if let Some(actor) = self.owner_commands(recipient) {
+            let _ = actor.send(ProviderCommand::DeliverReports { target: recipient });
         }
     }
 
@@ -1988,6 +2035,26 @@ impl ProviderOrchestrator {
     }
 }
 
+/// Forwards each Session the store says a Subagent Report waits for to the
+/// actor that reaches its Agent, until the Server stops.
+async fn forward_held_reports(
+    providers: ProviderOrchestrator,
+    mut notices: mpsc::UnboundedReceiver<SessionId>,
+) {
+    let mut shutdown = providers.shutdown.clone();
+    loop {
+        let recipient = tokio::select! {
+            biased;
+            _ = super::wait_for_shutdown(&mut shutdown) => return,
+            recipient = notices.recv() => match recipient {
+                Some(recipient) => recipient,
+                None => return,
+            },
+        };
+        providers.deliver_held_reports(recipient);
+    }
+}
+
 /// An actor owns every pending startup lease and native incarnation it publishes.
 /// Drop also handles cancellation or a panic before the normal shutdown path.
 struct CheckoutActorCleanup {
@@ -2039,6 +2106,10 @@ async fn run_provider_session(
     let mut decision_deliveries = DecisionDeliveries::default();
     let mut deferred_prompt_id = None;
     let mut pending_turn_starts = VecDeque::new();
+    // Whether Subagent Reports a working Turn could not take were put back to
+    // wait, to be delivered again once that Turn settles — waking the Agent
+    // then, unless a Prompt begins the next Turn first and takes them itself.
+    let mut reports_owed = false;
     let provider_id = runtime.provider_id();
     let connector = ProviderConnector {
         runtime: &runtime,
@@ -2070,6 +2141,12 @@ async fn run_provider_session(
                         let prompt_id = pending_turn_starts.pop_front()
                             .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
                         ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                    }
+                    _ = std::future::ready(()), if reports_owed => {
+                        reports_owed = false;
+                        ActorInput::Command(Some(ProviderCommand::DeliverReports {
+                            target: session_id,
+                        }))
                     }
                     command = commands.recv() => ActorInput::Command(command),
                 }
@@ -2360,9 +2437,49 @@ async fn run_provider_session(
                     }
                     continue;
                 }
+                ProviderCommand::DeliverReports { target } if target != session_id => {
+                    let connection = provider.as_ref().map(|connected| connected.session.clone());
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => break 'actor,
+                        () = deliver_to_native_subagent(
+                            connection,
+                            &mut subagents,
+                            &sessions,
+                            &updates,
+                            target,
+                        ) => {}
+                    }
+                    continue;
+                }
+                ProviderCommand::DeliverReports { .. } => {
+                    match wake_for_reports(&connector, &mut provider, &mut subagents, &mut shutdown)
+                        .await
+                    {
+                        ReportWake::Began(turn_id) => {
+                            active = Some(ActiveProviderTurn::new_report_continuation(turn_id));
+                            subagents.late_settle_owes_continuation = false;
+                            // A Watch that woke the Agent heads the Turn it
+                            // next works in, whatever began it.
+                            release_watch_outcomes(
+                                &sessions,
+                                &updates,
+                                &mut subagents,
+                                session_id,
+                                turn_id,
+                            );
+                        }
+                        ReportWake::Waiting => {}
+                        ReportWake::Stopping => break 'actor,
+                    }
+                    continue;
+                }
                 ProviderCommand::InterruptSession { response } => {
                     // A wake the interrupt beats begins no Turn to explain.
                     subagents.watch_outcomes.drop_all();
+                    // Nor is a Report put back for want of a Turn delivered
+                    // on the interrupt's heels: it waits for the next Turn.
+                    reports_owed = false;
                     // With no Turn active, the interrupt reaches the work
                     // that outlived it: the Watches the Agent left running
                     // (ADR 0030) and the Subagents (ADR 0015) alike, because
@@ -2668,13 +2785,19 @@ async fn run_provider_session(
                     .current_approval_posture_update(session_id)
                     .filter(|update| update.value == posture)
             });
-            let (turn_id, input) = provider_turn_start(delivered, posture);
+            // The Subagent Reports that waited for this Session's next Turn
+            // stand at the head of its input, ahead of the Prompt.
+            let reports = sessions.take_held_reports(session_id);
+            let (turn_id, input) = provider_turn_start(delivered, posture, reports.clone());
             let started = tokio::select! {
                 biased;
                 _ = shutdown.wait() => break 'actor,
                 started = provider_session.start_turn(input) => started,
             };
             if let Err(error) = started {
+                // The Turn never reached its Provider, so neither did the
+                // Reports: they wait for the next one.
+                sessions.hold_reports_again(session_id, reports);
                 let session_lost = error.is_session_lost();
                 let selection_rejected = error.is_selection_rejected();
                 project_turn_start_failure(&sessions, &updates, session_id, turn_id, &error);
@@ -2882,6 +3005,59 @@ async fn run_provider_session(
                     );
                 }
             }
+            ActorInput::Command(Some(ProviderCommand::DeliverReports { target }))
+                if target != session_id =>
+            {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'actor,
+                    () = deliver_to_native_subagent(
+                        Some(provider_session),
+                        &mut subagents,
+                        &sessions,
+                        &updates,
+                        target,
+                    ) => {}
+                }
+            }
+            // A Report reaching an Agent whose Turn still works steers that
+            // Turn, as a steer Prompt would, and begins nothing. A Turn being
+            // interrupted is left to settle: what the user stopped is not
+            // steered, and the Reports wait for the next Turn.
+            ActorInput::Command(Some(ProviderCommand::DeliverReports { .. })) => {
+                let current = active
+                    .as_ref()
+                    .expect("Provider input is handled while a Turn is active");
+                if current.interruption_acknowledged {
+                    continue;
+                }
+                let reports = sessions.take_held_reports(session_id);
+                if reports.is_empty() {
+                    continue;
+                }
+                let steered = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        sessions.hold_reports_again(session_id, reports);
+                        break 'actor;
+                    }
+                    steered = provider_session.steer_turn(ProviderSteerInput {
+                        input: ProviderInput::from_reports(reports.clone()),
+                    }) => steered,
+                };
+                if let Err(error) = steered {
+                    // The Provider's Turn ended before the steer reached it —
+                    // Suru hears of its end only after — or the Provider
+                    // refused it. Either way the Reports wait, and once this
+                    // Turn settles they wake the Agent afresh.
+                    tracing::debug!(
+                        %session_id,
+                        "Subagent Reports could not steer the working Turn: {error}"
+                    );
+                    sessions.hold_reports_again(session_id, reports);
+                    reports_owed = true;
+                }
+            }
             ActorInput::Command(Some(ProviderCommand::SteerPrompt)) => {
                 let current = active
                     .as_ref()
@@ -2985,6 +3161,9 @@ async fn run_provider_session(
                 }
             }
             ActorInput::Command(Some(ProviderCommand::InterruptSession { response })) => {
+                // A Report the Turn could not take waits for the next Turn
+                // rather than waking the Agent the user just stopped.
+                reports_owed = false;
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
@@ -3597,18 +3776,22 @@ async fn begin_delegated_turn(
             .filter(|update| update.value == posture)
     });
     let provider_session = connected.session.clone();
+    // The Subagent Reports that waited for this Session's next Turn stand at
+    // the head of its input, ahead of the Delegation.
+    let reports = sessions.take_held_reports(session_id);
     let started = tokio::select! {
         biased;
         _ = shutdown.wait() => return DelegatedTurnStart::Stopping,
         started = provider_session.start_turn(ProviderTurnInput {
             turn_id,
-            input: ProviderInput::from_prompt(input),
+            input: ProviderInput::from_prompt(input).headed_by(reports.clone()),
             selection: agent.selection.clone(),
             approval_posture: posture,
         }) => started,
     };
     drop(lease);
     if let Err(error) = started {
+        sessions.hold_reports_again(session_id, reports);
         let settled = fail(failure_message("Provider execution failed", &error));
         if error.is_session_lost() {
             lose_provider_connection(provider, subagents, sessions, updates, session_id);
@@ -3634,6 +3817,175 @@ async fn begin_delegated_turn(
             }
             DelegatedTurnStart::Began
         }
+    }
+}
+
+/// How handing the Subagent Reports waiting for an idle Agent to its Provider
+/// went.
+enum ReportWake {
+    /// The Provider took them as the input of a Continuation, which is the
+    /// actor's active Turn from here.
+    Began(TurnId),
+    /// They wait for the head of the Session's next Turn: no Provider
+    /// connection is open to take them, none was waiting, a Turn already
+    /// open in the Session will carry them, or the Provider failed to take
+    /// them — whose Continuation then stands settled as failed.
+    Waiting,
+    /// Suru is stopping, and the actor stops with it.
+    Stopping,
+}
+
+/// Wakes the idle Agent of the Session this actor owns into a Continuation
+/// whose whole input is the Subagent Reports waiting for it (ADR 0035): a Turn
+/// begun by neither a Prompt nor a Delegation, run by the Session's Agent under
+/// its current Agent Selection and Approval Posture, which the Provider settles
+/// at its own boundary like any Turn. Only a Provider connection already open
+/// takes them — Suru never starts a Provider to deliver a Report — and only
+/// while the user has left that Provider on; otherwise they wait for the
+/// Session's next Turn. The Session's Worktree is leased as any Turn's start
+/// leases it, and a connection opened over a copy since recreated is let go
+/// rather than woken there.
+async fn wake_for_reports(
+    connector: &ProviderConnector<'_>,
+    provider: &mut Option<ConnectedProviderSession>,
+    subagents: &mut SubagentRoutes,
+    shutdown: &mut ProviderShutdown,
+) -> ReportWake {
+    let ProviderConnector {
+        sessions,
+        updates,
+        settings,
+        session_id,
+        provider_id,
+        ..
+    } = connector;
+    let session_id = *session_id;
+    if provider.is_none() || !settings.borrow().settings.provider_enabled(provider_id) {
+        return ReportWake::Waiting;
+    }
+    let Some(snapshot) = sessions.snapshot(session_id) else {
+        return ReportWake::Waiting;
+    };
+    let lease = match connector
+        .lease_worktree(&snapshot.session, None, provider, subagents, shutdown)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(ConnectionFailure::Stopping) => return ReportWake::Stopping,
+        Err(ConnectionFailure::Failed(message)) => {
+            tracing::warn!(%session_id, "Subagent Reports wait for the next Turn: {message}");
+            return ReportWake::Waiting;
+        }
+    };
+    let Some(connected) = provider.as_ref() else {
+        return ReportWake::Waiting;
+    };
+    let agent = AgentIdentity {
+        agent: connected.identity.agent.clone(),
+        selection: snapshot
+            .session
+            .agent_selection
+            .clone()
+            .unwrap_or_else(|| connected.identity.selection.clone()),
+    };
+    let Some(begun) =
+        updates.apply(|| sessions.begin_report_continuation(session_id, agent.clone()))
+    else {
+        return ReportWake::Stopping;
+    };
+    let (turn_id, reports) = match begun {
+        Ok(Some(begun)) => begun,
+        Ok(None) => return ReportWake::Waiting,
+        Err(error) => {
+            tracing::warn!(%session_id, "a Continuation for Subagent Reports could not begin: {error:#}");
+            return ReportWake::Waiting;
+        }
+    };
+    let posture = effective_approval_posture(&snapshot, &settings.borrow(), provider_id);
+    let posture_update = posture.and_then(|posture| {
+        sessions
+            .current_approval_posture_update(session_id)
+            .filter(|update| update.value == posture)
+    });
+    let provider_session = connected.session.clone();
+    let started = tokio::select! {
+        biased;
+        _ = shutdown.wait() => {
+            sessions.hold_reports_again(session_id, reports);
+            return ReportWake::Stopping;
+        }
+        started = provider_session.start_turn(ProviderTurnInput {
+            turn_id,
+            input: ProviderInput::from_reports(reports.clone()),
+            selection: agent.selection,
+            approval_posture: posture,
+        }) => started,
+    };
+    drop(lease);
+    if let Err(error) = started {
+        sessions.hold_reports_again(session_id, reports);
+        let settled = updates.apply(|| {
+            sessions.fail_turn(
+                session_id,
+                turn_id,
+                TrailingCommandOutput::new(),
+                failure_message("Provider execution failed", &error),
+                OpenInterventions::TurnEnded,
+            )
+        });
+        if error.is_session_lost() {
+            lose_provider_connection(provider, subagents, sessions, updates, session_id);
+        }
+        return match settled {
+            Some(_) => ReportWake::Waiting,
+            None => ReportWake::Stopping,
+        };
+    }
+    if let Some(update) = posture_update {
+        sessions.mark_approval_posture_application(
+            update,
+            crate::protocol::ApprovalPostureApplication::Applied,
+        );
+    }
+    ReportWake::Began(turn_id)
+}
+
+/// Hands the Subagent Reports waiting for `target` — a native Subagent riding
+/// this actor, which delegated through the Broker — to the Subagent itself,
+/// through its Provider's route to it (ADR 0035). A settled Subagent wakes
+/// into a Continuation of its own Session once the Provider takes them, as its
+/// own Watch would wake it: no Transcript gains a row, and its Provider's next
+/// settle of it settles that Continuation. A working one is steered and begins
+/// nothing. With no connection open, or none that knows the Subagent, they
+/// wait; a Provider that refuses them — one offering no such route — leaves
+/// nothing to wait for, since no later Turn of a native Subagent's is Suru's
+/// to begin, and they are dropped.
+async fn deliver_to_native_subagent(
+    connection: Option<Arc<dyn ProviderSession>>,
+    subagents: &mut SubagentRoutes,
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    target: SessionId,
+) {
+    let (Some(provider_session), Some(subagent)) =
+        (connection, subagents.identity_of_session(target))
+    else {
+        return;
+    };
+    let reports = sessions.take_held_reports(target);
+    if reports.is_empty() {
+        return;
+    }
+    match provider_session
+        .deliver_to_subagent(subagent.clone(), ProviderInput::from_reports(reports))
+        .await
+    {
+        Ok(()) => wake_subagent(sessions, updates, subagents, subagent),
+        Err(error) => tracing::warn!(
+            session_id = %target,
+            "Subagent Reports for a native Subagent its Provider would not take are dropped: \
+             {error}"
+        ),
     }
 }
 
@@ -4040,9 +4392,12 @@ fn fail_active_turn(
         .apply(|| sessions.fail_turn(session_id, turn_id, trailing_output, message, interventions));
 }
 
+/// The Provider's input for the Turn a Prompt was just delivered to begin,
+/// headed by the Subagent Reports that waited for it.
 fn provider_turn_start(
     delivered: DeliveredTurn,
     approval_posture: Option<crate::protocol::ApprovalPosture>,
+    reports: Vec<super::SubagentReport>,
 ) -> (TurnId, ProviderTurnInput) {
     let turn_id = delivered.turn_id;
     let selection = delivered
@@ -4056,7 +4411,8 @@ fn provider_turn_start(
             input: ProviderInput::from_prompt(ProviderPrompt::from_user_prompt(
                 delivered.prompt.text,
                 delivered.prompt.skill_invocations,
-            )),
+            ))
+            .headed_by(reports),
             selection,
             approval_posture,
         },
@@ -4958,6 +5314,7 @@ mod tests {
         AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
         ModelId, SessionSnapshot, TranscriptItem, TurnStatus,
     };
+    use crate::provider::{SubagentReport, SubagentReportOutcome};
     use crate::sessions::StoreOutcome;
     use crate::storage::{StorageRepository, StorageWriter};
 
@@ -5486,6 +5843,311 @@ running 1 test",
             .expect("deliver the Session's Prompt")
             .expect("the Session has no other active Turn");
         (created.session.id, delivered.turn_id)
+    }
+
+    /// A Provider connection that records the input Suru delivers to its
+    /// native Subagents by identity, and takes it — or, standing in for a
+    /// Provider offering no such route, refuses it.
+    struct NativeRoute {
+        takes: bool,
+        delivered: Mutex<Vec<(ProviderSubagentId, ProviderInput)>>,
+    }
+
+    impl NativeRoute {
+        fn new(takes: bool) -> Arc<Self> {
+            Arc::new(Self {
+                takes,
+                delivered: Mutex::default(),
+            })
+        }
+
+        fn delivered(&self) -> Vec<(ProviderSubagentId, ProviderInput)> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
+    fn not_asked<T>() -> crate::provider::ProviderFuture<'static, T> {
+        Box::pin(async { Err(ProviderError::new("not asked of this connection")) })
+    }
+
+    impl ProviderSession for NativeRoute {
+        fn update_approval_posture(
+            &self,
+            _: crate::protocol::ApprovalPosture,
+            _: bool,
+        ) -> crate::provider::ProviderFuture<'_, ProviderPostureApplication> {
+            not_asked()
+        }
+
+        fn start_turn(&self, _: ProviderTurnInput) -> crate::provider::ProviderFuture<'_, ()> {
+            not_asked()
+        }
+
+        fn steer_turn(&self, _: ProviderSteerInput) -> crate::provider::ProviderFuture<'_, ()> {
+            not_asked()
+        }
+
+        fn interrupt_turn(&self) -> crate::provider::ProviderFuture<'_, ()> {
+            not_asked()
+        }
+
+        fn stop_subagents(&self) -> crate::provider::ProviderFuture<'_, ()> {
+            not_asked()
+        }
+
+        fn deliver_to_subagent(
+            &self,
+            subagent_id: ProviderSubagentId,
+            input: ProviderInput,
+        ) -> crate::provider::ProviderFuture<'_, ()> {
+            if !self.takes {
+                return not_asked();
+            }
+            self.delivered.lock().unwrap().push((subagent_id, input));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> crate::provider::ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A native Subagent a fresh Session's working Turn spawned over
+    /// `routes`, its stretch settled, and a brokered Subagent it then
+    /// delegated to through the Broker — the path a native Subagent's
+    /// attributed Broker call takes (#420) — whose Turn has just settled with
+    /// `answer` as its final Message. Answers the owning Session, the native
+    /// Subagent's Session and identity, and the brokered Subagent's Session.
+    fn native_subagent_owed_a_report(
+        sessions: &SessionStore,
+        workspace: &std::path::Path,
+        routes: &mut SubagentRoutes,
+        answer: &str,
+    ) -> (SessionId, SessionId, ProviderSubagentId, SessionId) {
+        let delegating = delegating_turn(sessions, workspace, "Delegate the survey");
+        let native = ProviderSubagentId::new("native-1");
+        routes
+            .spawn(
+                sessions,
+                delegating,
+                native.clone(),
+                "Scout",
+                "Scout the seams",
+                Some("Scout the seams, delegating what you like."),
+            )
+            .expect("spawn the native Subagent");
+        routes
+            .settle_subagent(sessions, &native, ProviderSubagentStatus::Completed)
+            .expect("the spawn's row is open")
+            .expect("settle the native Subagent's stretch");
+        let native_session = routes.identities[&native].session_id;
+        let brokered = sessions
+            .spawn_brokered_subagent(
+                native_session,
+                BrokeredSpawn {
+                    selection: AgentSelection {
+                        provider: ProviderId::new("codex"),
+                        model: ModelId::new("gpt-5.5"),
+                        options: Vec::new(),
+                    },
+                    name: "Researcher".to_owned(),
+                    description: "Survey the seams".to_owned(),
+                    delegation: delegation_text("Survey the seams.").expect("a Delegation"),
+                },
+            )
+            .expect("the native Subagent spawns through the Broker");
+        sessions
+            .publish(
+                brokered.session_id,
+                vec![SessionChange::MessageAdded {
+                    message: Message {
+                        id: MessageId::new(),
+                        turn_id: brokered.turn_id,
+                        role: MessageRole::Agent,
+                        status: MessageStatus::Completed,
+                        content: answer.to_owned(),
+                        skill_invocations: Vec::new(),
+                        truncated: false,
+                    },
+                }],
+            )
+            .expect("the brokered Subagent answers");
+        sessions
+            .finish_provider_turn(
+                brokered.session_id,
+                brokered.turn_id,
+                ProviderTurnOutcome::Completed {
+                    trailing_output: TrailingCommandOutput::new(),
+                },
+            )
+            .expect("the brokered Subagent's Turn settles");
+        (delegating.0, native_session, native, brokered.session_id)
+    }
+
+    #[tokio::test]
+    async fn a_report_to_a_settled_native_subagent_wakes_a_continuation_of_its_own_session_through_its_route()
+     {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let sessions =
+            SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let updates = ProviderUpdateGate::new();
+        let mut routes = subagent_routes();
+        let answer = "Three seams, all in src/provider.rs.";
+        let (owning, native_session, native, brokered) =
+            native_subagent_owed_a_report(&sessions, workspace.path(), &mut routes, answer);
+        let owning_rows = subagent_rows(&sessions.snapshot(owning).expect("owning Session"))
+            .into_iter()
+            .map(|(name, session_id)| (name.to_owned(), session_id))
+            .collect::<Vec<_>>();
+        let before = sessions
+            .snapshot(native_session)
+            .expect("the native Subagent's Session");
+        let Some(Activity::Subagent { duration_ms, .. }) =
+            before.activities.iter().find(|activity| {
+                matches!(activity, Activity::Subagent { session_id, .. } if *session_id == brokered)
+            })
+        else {
+            panic!("the native Subagent's Transcript holds the brokered Subagent's row");
+        };
+
+        let route = NativeRoute::new(true);
+        deliver_to_native_subagent(
+            Some(route.clone()),
+            &mut routes,
+            &sessions,
+            &updates,
+            native_session,
+        )
+        .await;
+
+        assert_eq!(
+            route.delivered(),
+            [(
+                native.clone(),
+                ProviderInput::from_reports(vec![SubagentReport::new(
+                    brokered,
+                    "Researcher",
+                    SubagentReportOutcome::Completed,
+                    *duration_ms,
+                    Some(answer),
+                )])
+            )],
+            "the Report reaches the native Subagent through its Provider's route to it"
+        );
+        let woken = sessions
+            .snapshot(native_session)
+            .expect("the native Subagent's Session");
+        assert_eq!(
+            woken.turns.len(),
+            before.turns.len() + 1,
+            "it wakes into a Turn of its own Session"
+        );
+        let continuation = woken.turns.last().expect("the woken Turn");
+        assert_eq!(continuation.status, TurnStatus::Active);
+        assert!(
+            continuation.is_continuation(),
+            "a Continuation, which no Delegation began"
+        );
+        assert!(
+            woken
+                .messages
+                .iter()
+                .all(|message| message.turn_id != continuation.id)
+                && woken
+                    .activities
+                    .iter()
+                    .all(|activity| activity.turn_id() != continuation.id),
+            "the Report stands nowhere in its Transcript"
+        );
+        assert_eq!(
+            subagent_rows(&sessions.snapshot(owning).expect("owning Session"))
+                .into_iter()
+                .map(|(name, session_id)| (name.to_owned(), session_id))
+                .collect::<Vec<_>>(),
+            owning_rows,
+            "and no row stands for the wake in the Transcript that spawned it"
+        );
+
+        for event in [
+            ProviderEvent::AgentMessageStarted,
+            ProviderEvent::AgentMessageDelta {
+                content: "The Researcher found three seams.".to_owned(),
+            },
+            ProviderEvent::AgentMessageCompleted,
+        ] {
+            routes.project_event(&sessions, &updates, &provider_identity(), &native, event);
+        }
+        routes
+            .settle_subagent(&sessions, &native, ProviderSubagentStatus::Completed)
+            .expect("the woken stretch is open")
+            .expect("settle the woken stretch");
+        let settled = sessions
+            .snapshot(native_session)
+            .expect("the native Subagent's Session");
+        let continuation = settled.turns.last().expect("the woken Turn");
+        assert_eq!(
+            continuation.status,
+            TurnStatus::Completed,
+            "its Provider's settle of it settles the Continuation"
+        );
+        assert_eq!(
+            settled
+                .messages
+                .iter()
+                .filter(|message| message.turn_id == continuation.id)
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["The Researcher found three seams."],
+            "its work in the Continuation lands there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_a_provider_offers_no_route_for_wakes_no_native_subagent() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let sessions =
+            SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let updates = ProviderUpdateGate::new();
+        let mut routes = subagent_routes();
+        let (_, native_session, _, _) =
+            native_subagent_owed_a_report(&sessions, workspace.path(), &mut routes, "Done.");
+        let before = sessions
+            .snapshot(native_session)
+            .expect("the native Subagent's Session");
+
+        let route = NativeRoute::new(false);
+        deliver_to_native_subagent(
+            Some(route.clone()),
+            &mut routes,
+            &sessions,
+            &updates,
+            native_session,
+        )
+        .await;
+
+        assert!(route.delivered().is_empty());
+        assert_eq!(
+            sessions
+                .snapshot(native_session)
+                .expect("the native Subagent's Session")
+                .turns,
+            before.turns,
+            "a Provider that will not route the Report wakes nothing"
+        );
+        assert!(
+            sessions.take_held_reports(native_session).is_empty(),
+            "and no Turn of a native Subagent's is Suru's to begin, so it is not kept"
+        );
     }
 
     fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<(&str, SessionId)> {

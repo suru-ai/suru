@@ -1245,6 +1245,7 @@ async fn the_caller_is_working_until_its_brokered_subagent_settles_and_the_row_s
             .map(|(settled, started)| settled.0 - started.0),
         "and says how long the Subagent worked, timed from its spawn"
     );
+    wake_for_the_report(&mut delegating.caller_provider, child_id).await;
     let idle = read_until(
         &descriptor,
         delegating.caller,
@@ -1621,6 +1622,46 @@ async fn model_options_a_spawn_leaves_out_take_the_models_defaults() {
 }
 
 /// The caller's Turn settled at its Provider's boundary, as `described`.
+/// Takes up the Continuation the Subagent Report of `child` wakes an idle
+/// caller's Provider into (ADR 0035), and settles it at that Provider's own
+/// boundary, as its Agent answering the Report would.
+async fn wake_for_the_report(caller: &mut ControlledProviderSession, child: SessionId) {
+    let woken = timeout(PROGRESS_DEADLINE, caller.next_turn())
+        .await
+        .expect("the Subagent's Report wakes the idle caller's Provider");
+    assert_eq!(
+        woken
+            .reports()
+            .iter()
+            .map(|report| report.subagent)
+            .collect::<Vec<_>>(),
+        [child],
+        "a Continuation whose input is the Subagent's Report"
+    );
+    woken.succeed();
+    caller
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+}
+
+/// Takes up the steer the Subagent Report of `child` delivers into a caller
+/// whose Turn still works (ADR 0035), as its Provider would.
+async fn steered_by_the_report(caller: &mut ControlledProviderSession, child: SessionId) {
+    let steer = timeout(PROGRESS_DEADLINE, caller.next_steer())
+        .await
+        .expect("the Subagent's Report steers the caller's working Turn");
+    assert_eq!(
+        steer
+            .reports()
+            .iter()
+            .map(|report| report.subagent)
+            .collect::<Vec<_>>(),
+        [child],
+        "a steer delivering the Subagent's Report"
+    );
+    steer.succeed();
+}
+
 async fn settle_callers_turn(delegating: &Delegating, described: &str) -> SessionSnapshot {
     delegating
         .caller_provider
@@ -1748,6 +1789,9 @@ async fn a_spawn_by_a_session_whose_turn_has_settled_opens_a_continuation_holdin
     let (status, duration_ms) = row_status(&settled, child_id);
     assert_eq!(status, ActivityStatus::Completed);
     assert!(duration_ms.is_some());
+    // The Subagent's Report wakes the caller's idle Agent into a Continuation
+    // of its own, which its Provider settles at its own boundary (ADR 0035).
+    wake_for_the_report(&mut delegating.caller_provider, child_id).await;
     let idle = read_until(
         &descriptor,
         delegating.caller,
@@ -1774,11 +1818,11 @@ async fn a_spawn_by_a_session_whose_turn_has_settled_opens_a_continuation_holdin
         &descriptor,
         delegating.caller,
         "the Prompt begins the caller's next Turn",
-        |snapshot| snapshot.turns.len() == 3,
+        |snapshot| snapshot.turns.len() == 4,
     )
     .await;
-    assert!(prompted.turns[2].prompt_id.is_some());
-    assert_eq!(prompted.turns[2].status, TurnStatus::Active);
+    assert!(prompted.turns[3].prompt_id.is_some());
+    assert_eq!(prompted.turns[3].status, TurnStatus::Active);
 
     delegating
         .hosted
@@ -1880,6 +1924,7 @@ async fn a_native_subagents_spawn_after_its_parents_turn_settled_opens_a_continu
         brokered_settled.working_since().is_some(),
         "the native Subagent works on"
     );
+    wake_for_the_report(&mut delegating.caller_provider, child_id).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
