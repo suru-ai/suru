@@ -400,17 +400,19 @@ impl SessionStore {
     /// than on its own (see [`SessionStoreState::stopped_by_ancestor`]). A
     /// Session with no Turn working has nothing there for the interrupt to
     /// stop, and gains no mark. Each is recorded as interrupted all the same,
-    /// since the interrupt reaches whatever its own actor runs.
+    /// at the one moment the interrupt reached them, since it reaches
+    /// whatever its own actor runs.
     pub(crate) fn mark_stopped_by_ancestor(&self, sessions: &[SessionId]) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        let interrupted_at = state.next_timestamp();
         for session_id in sessions {
-            state.record_work_interrupted(*session_id);
             let Some(record) = state.sessions.get_mut(session_id) else {
                 continue;
             };
+            record.work_interrupted_at = Some(interrupted_at);
             if let Some(turn) = record
                 .snapshot
                 .turns
