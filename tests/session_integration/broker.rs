@@ -1463,10 +1463,19 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
         "no Model is known until the child's Provider confirms one"
     );
 
-    // The child's Provider takes its first Turn under the Model the spawn
-    // chose: the first word from the Provider on which Model it runs.
-    let (child_provider, _) =
-        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+    // The child's Provider starts up naming a Model of its own — the
+    // default it reports before anything is asked of it — and then takes its
+    // first Turn under the Model the spawn chose. Taking the Turn is its
+    // first word on which Model runs the Subagent; its startup default says
+    // nothing of that.
+    let (child_provider, _) = run_child(
+        &mut delegating.hosted.codex,
+        AgentSelection {
+            model: ModelId::new("gpt-5.4"),
+            ..codex_selection("high")
+        },
+    )
+    .await;
     let confirmed = changes_until(&mut updates, &mut revision, |change| {
         matches!(change, SubagentTreeChange::SubagentModelChanged { .. })
     })
@@ -1476,7 +1485,9 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
         Some(&SubagentTreeChange::SubagentModelChanged {
             session_id: child_id,
             model: ModelId::new("gpt-5.5"),
-        })
+        }),
+        "the entry carries the Model the child's Provider took the Turn under, not the one its \
+         startup named"
     );
     let caller = read_session(&descriptor, delegating.caller).await;
     assert_eq!(row_model(&caller, child_id), Some(ModelId::new("gpt-5.5")));
@@ -1485,8 +1496,8 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::AgentSelectionChanged {
             selection: AgentSelection {
-                model: ModelId::new("gpt-5.4"),
-                ..codex_selection("high")
+                model: ModelId::new("gpt-5.3"),
+                ..codex_selection("low")
             },
         })
         .await;
@@ -1498,12 +1509,12 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
         revised.last(),
         Some(&SubagentTreeChange::SubagentModelChanged {
             session_id: child_id,
-            model: ModelId::new("gpt-5.4"),
+            model: ModelId::new("gpt-5.3"),
         }),
         "the entry follows the Model the Provider confirmed last"
     );
     let caller = read_session(&descriptor, delegating.caller).await;
-    assert_eq!(row_model(&caller, child_id), Some(ModelId::new("gpt-5.4")));
+    assert_eq!(row_model(&caller, child_id), Some(ModelId::new("gpt-5.3")));
     let (fresh, _updates) = open_tree(&descriptor, child_id).await;
     assert_eq!(
         fresh
@@ -1511,7 +1522,7 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
             .iter()
             .find(|entry| entry.session_id == child_id)
             .and_then(|entry| entry.model.clone()),
-        Some(ModelId::new("gpt-5.4")),
+        Some(ModelId::new("gpt-5.3")),
         "and a fresh snapshot of the tree, opened from the child, carries it"
     );
 
