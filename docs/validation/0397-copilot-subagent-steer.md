@@ -112,12 +112,12 @@ second `subagent.started`.
   a steer for a Subagent that is not working or unknown. A queued message
   arrives after `subagent.completed`, when its Subagent is no longer routed, so
   it lands nowhere. Reading it, and the unannounced run it starts, as a resume
-  is #398.
+  is #404 (decided in ADR 0033).
 - `write_agent` executions project nothing in the sender's Transcript, from the
   main agent or a Subagent, whether they succeed, fail, or stay open when the
   loop stops. Before this change each one showed as a `write_agent {…}` Command.
   Because of the queueing above, a `write_agent` currently leaves no trace in
-  either Transcript until #398 lands.
+  either Transcript until #404 lands.
 - A `user.message` without an `agentId` (the user's own Prompt or steer) still
   projects nothing.
 

@@ -9,7 +9,11 @@
 //! cargo run --example copilot_steer_capture -- parent  > parent.jsonl  # main agent's write_agent
 //! cargo run --example copilot_steer_capture -- sibling > sibling.jsonl # a sibling's write_agent
 //! cargo run --example copilot_steer_capture -- rpc     > rpc.jsonl     # tasks.sendMessage, mid-run
+//! cargo run --example copilot_steer_capture -- idle    > idle.jsonl    # write_agent after it settled
 //! ```
+//!
+//! The `idle` mode is #398's: the worker runs one short command and the main agent waits for it
+//! to finish before the `write_agent`, so the message meets an agent whose stretch has ended.
 //!
 //! `SURU_COPILOT_PATH` names the CLI (default `copilot`), `CAPTURE_MODEL` the Model (default
 //! `gpt-5-mini`). Scrub account details from the output before committing it. What the captures
@@ -28,6 +32,10 @@ const WORKER: &str = "Make THREE SEPARATE bash tool calls, one at a time, waitin
     `sleep 15 && echo two`, then `sleep 15 && echo three`. Then write a one-paragraph final \
     report of what they printed.";
 const STEER: &str = "STEER-MARKER: also say the word PINEAPPLE in your final report";
+const QUICK_WORKER: &str = "Run exactly one bash tool call: `echo one`. Then write a one-sentence \
+    final report of what it printed.";
+const FOLLOW_UP: &str = "FOLLOW-UP: now run `echo two` with one bash tool call and write a \
+    one-sentence report that names both words you have printed so far, and say PINEAPPLE.";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rpc" => format!(
             "Use the task tool (mode: background) to start an agent with exactly this prompt: \
              '{WORKER}' Then wait for it with read_agent (wait: true) and report what it said."
+        ),
+        "idle" => format!(
+            "Step 1: use the task tool (mode: background) to start an agent with exactly this \
+             prompt: '{QUICK_WORKER}' Step 2: wait for it to finish with read_agent (wait: true). \
+             Step 3: only once it has finished, use write_agent to send it: '{FOLLOW_UP}'. \
+             Step 4: wait for it again with read_agent (wait: true) and report what it said."
         ),
         other => return Err(format!("unknown mode {other}").into()),
     };

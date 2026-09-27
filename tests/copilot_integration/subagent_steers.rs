@@ -7,7 +7,7 @@
 //! (docs/validation/0397-copilot-subagent-steer.md). In them the CLI never steers: it queues every
 //! `write_agent` to a working Subagent until its stretch ends and delivers it only after the
 //! stretch's `subagent.completed`, as a run of its own. So the replays pin what a send changes —
-//! nothing, in either Transcript, until a queued delivery is read as a resume (#398) — while the
+//! nothing, in either Transcript, until a queued delivery is read as a resume (ADR 0033, #404) — while the
 //! steer itself is scripted in the shape the SDK's schema documents for it.
 
 use crate::support::{conversation_fixture, opened_session, settled_session};
