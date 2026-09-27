@@ -312,22 +312,24 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Every Subagent in the tree `top_level` heads whose Session the store
-    /// holds by an identity `provider` minted, nearest the top first. This is
-    /// what a Provider connection that resumes its conversation — after a
-    /// restart above all — relearns its Subagents from: the identities are the
-    /// connection's own, and the connection belongs to the tree's top-level
-    /// Session, so no identity here can resolve into another tree.
+    /// Every Subagent riding the Provider actor `owner` owns whose Session the
+    /// store holds by an identity `provider` minted, nearest the top first.
+    /// This is what a Provider connection that resumes its conversation —
+    /// after a restart above all — relearns its Subagents from: the identities
+    /// are the connection's own, and the connection belongs to the Session
+    /// that owns its actor, so no identity here can resolve into another tree,
+    /// nor below a Subagent with an actor of its own, whose connection minted
+    /// the identities beneath it.
     pub(crate) fn stored_subagents(
         &self,
-        top_level: SessionId,
+        owner: SessionId,
         provider: &ProviderId,
     ) -> Vec<StoredSubagent> {
         let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let mut tree = vec![top_level];
+        let mut tree = vec![owner];
         let mut stored = Vec::new();
         let mut visit = 0;
         while visit < tree.len() {
@@ -336,7 +338,9 @@ impl SessionStore {
             let mut children = state
                 .sessions
                 .iter()
-                .filter(|(_, record)| record.snapshot.session.parent == Some(spawner))
+                .filter(|(_, record)| {
+                    record.snapshot.session.parent == Some(spawner) && !record.owns_provider_actor()
+                })
                 .map(|(child_id, record)| (*child_id, record))
                 .collect::<Vec<_>>();
             // Spawn order, so an identity a Provider ever named twice resolves

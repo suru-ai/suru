@@ -28,17 +28,21 @@ pub(super) struct LiveWatch {
 }
 
 impl SessionStore {
-    /// The Watches live anywhere in the Session's subtree, which is what
-    /// interrupting that Session asks its Provider to stop. A Watch belongs to
-    /// the Session whose Agent started it, so the subtree — not just the
-    /// Session — is what Monitoring and its interrupt both reach (ADR 0030).
+    /// The Watches live in the Session's subtree that run over the Provider
+    /// actor its conversation rides, which is what interrupting that Session
+    /// asks that actor's Provider to stop. A Watch belongs to the Session
+    /// whose Agent started it, so the subtree — not just the Session — is
+    /// what Monitoring and its interrupt both reach (ADR 0030). A Subagent
+    /// below it with an actor of its own runs its Watches, and those of
+    /// everything below it, over that actor instead, where this Provider
+    /// connection cannot reach them.
     pub(crate) fn live_watches(&self, session_id: SessionId) -> Vec<ProviderWatchId> {
         let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let mut watches = state
-            .subtree(session_id)
+            .actor_subtree(session_id)
             .into_iter()
             .filter_map(|current| state.sessions.get(&current))
             .flat_map(|record| record.watches.keys().cloned())
@@ -48,13 +52,14 @@ impl SessionStore {
     }
 
     /// The Sessions an interrupt of `session_id` reaches when it stops
-    /// Watches: the Session and every Session below it, whose Watch Outcomes
-    /// still held for a wake the stop beats are dropped with them.
-    pub(crate) fn subtree_sessions(&self, session_id: SessionId) -> Vec<SessionId> {
+    /// Watches: the Session and every Session below it riding the same
+    /// Provider actor, whose Watch Outcomes still held for a wake the stop
+    /// beats are dropped with them.
+    pub(crate) fn watch_stop_sessions(&self, session_id: SessionId) -> Vec<SessionId> {
         self.state
             .lock()
             .expect("Session store lock is not poisoned")
-            .subtree(session_id)
+            .actor_subtree(session_id)
     }
 
     /// Records a Watch the Session's Agent left running and re-derives the
@@ -115,17 +120,19 @@ impl SessionStore {
         Some(settled.description)
     }
 
-    /// Forgets every Watch in the Session's subtree, because the Provider
-    /// connection they ran over is gone and none of them will ever report
-    /// settling. Each is lost, which wakes nothing, so all that moves is the
-    /// Monitoring they held up.
-    pub(crate) fn lose_watches(&self, session_id: SessionId) {
+    /// Forgets every Watch that ran over the Provider actor `owner` owns —
+    /// its own and those of every Session below it riding that actor —
+    /// because the connection they ran over is gone and none of them will
+    /// ever report settling. Each is lost, which wakes nothing, so all that
+    /// moves is the Monitoring they held up. A Subagent below with an actor of
+    /// its own keeps its Watches: they run over another connection.
+    pub(crate) fn lose_watches(&self, owner: SessionId) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let watched = state
-            .subtree(session_id)
+            .actor_subtree(owner)
             .into_iter()
             .filter(|current| {
                 state
@@ -140,7 +147,7 @@ impl SessionStore {
             }
             state.reconcile_liveness(&self.storage, current);
         }
-        state.announce_subagent_tree(session_id);
+        state.announce_subagent_tree(owner);
     }
 }
 

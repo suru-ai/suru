@@ -2079,7 +2079,7 @@ async fn run_provider_session(
                     // (ADR 0030). One held above it still wakes its Agent.
                     subagents
                         .watch_outcomes
-                        .drop_for(&sessions.subtree_sessions(target));
+                        .drop_for(&sessions.watch_stop_sessions(target));
                     let _ = response.send(
                         stop_live_watches(
                             provider.as_ref().map(|c| c.session.clone()),
@@ -2845,7 +2845,7 @@ async fn run_provider_session(
             ProviderInput::Command(Some(ProviderCommand::StopWatches { target, response })) => {
                 subagents
                     .watch_outcomes
-                    .drop_for(&sessions.subtree_sessions(target));
+                    .drop_for(&sessions.watch_stop_sessions(target));
                 let _ = response.send(
                     stop_live_watches(
                         provider.as_ref().map(|c| c.session.clone()),

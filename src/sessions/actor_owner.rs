@@ -69,6 +69,31 @@ impl SessionStoreState {
         }
         None
     }
+
+    /// `session_id` and every Session below it whose conversation rides the
+    /// same Provider actor as its own, each reached after the Session that
+    /// spawned it: what that actor's Provider can reach of the subtree. The
+    /// walk stops at any Subagent that owns an actor of its own, because that
+    /// Subagent and everything below it ride that actor or one deeper, over
+    /// another Provider connection.
+    pub(super) fn actor_subtree(&self, session_id: SessionId) -> Vec<SessionId> {
+        let mut walk = vec![session_id];
+        let mut visit = 0;
+        while visit < walk.len() {
+            let current = walk[visit];
+            walk.extend(
+                self.sessions
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.snapshot.session.parent == Some(current)
+                            && !record.owns_provider_actor()
+                    })
+                    .map(|(child_id, _)| *child_id),
+            );
+            visit += 1;
+        }
+        walk
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +187,42 @@ mod tests {
             Some(owning_id),
             "a Subagent below it rides its actor, not the top-level Session's"
         );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_actors_reach_stops_at_a_subagent_with_an_actor_of_its_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let top_level = persisted(directory.path(), None);
+        let top_level_id = top_level.snapshot.session.id;
+        let native = persisted(directory.path(), Some(top_level_id));
+        let native_id = native.snapshot.session.id;
+        let owning = persisted(directory.path(), Some(native_id));
+        let owning_id = owning.snapshot.session.id;
+        let below = persisted(directory.path(), Some(owning_id));
+        let below_id = below.snapshot.session.id;
+        let (store, writer) =
+            restored(directory.path(), vec![top_level, native, owning, below]).await;
+
+        assert_eq!(
+            store.state.lock().unwrap().actor_subtree(top_level_id),
+            [top_level_id, native_id, owning_id, below_id],
+            "with one actor, it reaches the whole subtree"
+        );
+        give_own_actor(&store, owning_id);
+        let state = store.state.lock().unwrap();
+        assert_eq!(
+            state.actor_subtree(top_level_id),
+            [top_level_id, native_id],
+            "the top-level Session's actor stops where another actor's reach begins"
+        );
+        assert_eq!(
+            state.actor_subtree(native_id),
+            [native_id],
+            "a native Subagent's reach is its actor's"
+        );
+        assert_eq!(state.actor_subtree(owning_id), [owning_id, below_id]);
+        drop(state);
         writer.shutdown().await.unwrap();
     }
 
