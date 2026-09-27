@@ -153,6 +153,7 @@ pub struct ControlledProviderSession {
     watches_stops: mpsc::UnboundedReceiver<WatchesStop>,
     posture_updates: mpsc::UnboundedReceiver<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
+    shutdowns: mpsc::UnboundedReceiver<()>,
     events: mpsc::UnboundedSender<ControlledProviderEvent>,
 }
 
@@ -227,6 +228,7 @@ struct ControlledSessionHandle {
     watches_stops: mpsc::UnboundedSender<WatchesStop>,
     posture_updates: mpsc::UnboundedSender<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
+    shutdowns: mpsc::UnboundedSender<()>,
 }
 
 impl ControlledProvider {
@@ -507,6 +509,7 @@ impl StartRequest {
         let (watches_stops_tx, watches_stops_rx) = mpsc::unbounded_channel();
         let (posture_updates_tx, posture_updates_rx) = mpsc::unbounded_channel();
         let gate_posture_updates = Arc::new(AtomicBool::new(false));
+        let (shutdowns_tx, shutdowns_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ControlledProviderEvent>();
         let events: ProviderEventStream = Box::pin(stream::unfold(events_rx, |mut events| async {
             events.recv().await.map(|(event, observed)| {
@@ -533,6 +536,7 @@ impl StartRequest {
                     watches_stops: watches_stops_tx,
                     posture_updates: posture_updates_tx,
                     gate_posture_updates: gate_posture_updates.clone(),
+                    shutdowns: shutdowns_tx,
                 }),
                 events,
             )))
@@ -550,6 +554,7 @@ impl StartRequest {
             watches_stops: watches_stops_rx,
             posture_updates: posture_updates_rx,
             gate_posture_updates,
+            shutdowns: shutdowns_rx,
             events: events_tx,
         }
     }
@@ -700,6 +705,22 @@ impl ControlledProviderSession {
     /// absence here rather than waiting out a timeout.
     pub fn try_next_watches_stop(&mut self) -> Option<WatchesStop> {
         self.watches_stops.try_recv().ok()
+    }
+
+    /// Waits for Suru to shut this Provider Session down, as it does when it
+    /// closes the Provider actor that held it — the Session's deletion, say.
+    pub async fn next_shutdown(&mut self) {
+        self.shutdowns
+            .recv()
+            .await
+            .expect("Suru shuts the Provider Session down rather than dropping it");
+    }
+
+    /// Whether Suru has already shut this Provider Session down, without
+    /// waiting. A test that must show a Provider Session was *never* shut down
+    /// reads the absence here rather than waiting out a timeout.
+    pub fn was_shut_down(&mut self) -> bool {
+        self.shutdowns.try_recv().is_ok()
     }
 
     pub fn emit(&self, event: ProviderEvent) {
@@ -1257,6 +1278,9 @@ impl ProviderSession for ControlledSessionHandle {
     }
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        // A test that never looks has dropped the receiver; the shutdown
+        // still succeeds.
+        let _ = self.shutdowns.send(());
         Box::pin(async { Ok(()) })
     }
 }

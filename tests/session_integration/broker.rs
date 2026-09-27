@@ -45,6 +45,7 @@ use crate::{
     support::{create_session, read_session, read_session_until},
 };
 
+mod deletion;
 mod interventions;
 mod posture;
 mod watches;
