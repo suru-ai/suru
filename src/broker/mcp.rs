@@ -45,7 +45,8 @@ use crate::provider::wait_for_shutdown;
 const INSTRUCTIONS: &str = "\
 Suru's Broker offers Tools for working across every Provider Suru hosts, \
 beside the Tools your own Provider gives you. Call list_providers to learn \
-which Providers, Models and Model Options may be chosen.";
+which Providers, Models and Model Options may be chosen, and spawn_subagent to \
+delegate a piece of work to a Subagent on any of them.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 

@@ -10,10 +10,12 @@ use super::BrokerCaller;
 use crate::{
     model_catalog::ModelCatalogService,
     protocol::{
-        ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability,
+        AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId,
+        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+        ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        ProviderUnavailability,
     },
+    provider::{BrokeredSubagentRequest, ProviderOrchestrator},
 };
 
 /// One Tool the Broker offers. A new Tool is a variant here, its description
@@ -21,11 +23,12 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BrokerTool {
     ListProviders,
+    SpawnSubagent,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 1] = [Self::ListProviders];
+    pub(super) const ALL: [Self; 2] = [Self::ListProviders, Self::SpawnSubagent];
 
     pub(super) fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
@@ -34,12 +37,14 @@ impl BrokerTool {
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::ListProviders => "list_providers",
+            Self::SpawnSubagent => "spawn_subagent",
         }
     }
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::ListProviders => "List Providers",
+            Self::SpawnSubagent => "Spawn Subagent",
         }
     }
 
@@ -49,6 +54,7 @@ impl BrokerTool {
     pub(super) fn description(self) -> &'static str {
         match self {
             Self::ListProviders => LIST_PROVIDERS_DESCRIPTION,
+            Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
         }
     }
 
@@ -58,6 +64,44 @@ impl BrokerTool {
             Self::ListProviders => json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false,
+            }),
+            Self::SpawnSubagent => json!({
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "The id of the Provider to run the Subagent on, as \
+                            list_providers gives it.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "The id of one of that Provider's Models, as \
+                            list_providers gives it.",
+                    },
+                    "options": {
+                        "type": "object",
+                        "description": "Model Option id to value: a choice id for a select \
+                            option, true or false for a toggle. Options left out take the \
+                            Model's defaults.",
+                        "additionalProperties": { "type": ["string", "boolean"] },
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "A short name for the Subagent, such as the kind of \
+                            work it does.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "A few words on what the Subagent is asked to do.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Everything the Subagent needs to do the work; it sees \
+                            none of your conversation.",
+                    },
+                },
+                "required": ["provider", "model", "name", "description", "prompt"],
                 "additionalProperties": false,
             }),
         };
@@ -71,6 +115,7 @@ impl BrokerTool {
     pub(super) fn is_read_only(self) -> bool {
         match self {
             Self::ListProviders => true,
+            Self::SpawnSubagent => false,
         }
     }
 }
@@ -94,6 +139,24 @@ option has a boolean \"default\". Only Models and choices that can be selected \
 are listed. Availability is as Suru last found it; calling again does not \
 re-check a Provider.";
 
+const SPAWN_SUBAGENT_DESCRIPTION: &str = "\
+Spawn a Subagent on any Provider Suru hosts, your own or another, to do a \
+piece of work for you; it answers at once while the Subagent works on its own. \
+Call list_providers first to learn which Providers, Models and Model Options \
+may be chosen. Takes \"provider\" and \"model\", ids as list_providers gives \
+them; \"options\", an object from Model Option id to a choice id for a \
+\"select\" option or true or false for a \"toggle\" option, where any option \
+left out takes the Model's default; \"name\", a short name for the Subagent, \
+such as the kind of work it does; \"description\", a few words on what it is \
+asked to do, which titles its Session; and \"prompt\", everything it needs to \
+do the work, since it sees none of your conversation. By default the Subagent \
+works in the same directory and checkout as you. Answers with JSON of the \
+shape {\"session_id\": \"...\"}, the id of the Subagent's own Session. The \
+Subagent stands as a row in your Transcript while it works and once it \
+settles. A Provider that is turned off or cannot be used now, a Model it does \
+not offer, or an option value the Model does not take is refused, saying what \
+was wrong.";
+
 /// One call of a Tool: who is calling, and the arguments as the Agent sent
 /// them.
 pub(super) struct ToolCall {
@@ -111,15 +174,25 @@ impl std::fmt::Display for ToolRefusal {
     }
 }
 
+impl ToolRefusal {
+    fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+}
+
 /// The Server-side services the Broker's Tools answer from.
 #[derive(Clone)]
 pub(crate) struct BrokerTools {
     model_catalog: ModelCatalogService,
+    providers: ProviderOrchestrator,
 }
 
 impl BrokerTools {
-    pub(crate) fn new(model_catalog: ModelCatalogService) -> Self {
-        Self { model_catalog }
+    pub(crate) fn new(model_catalog: ModelCatalogService, providers: ProviderOrchestrator) -> Self {
+        Self {
+            model_catalog,
+            providers,
+        }
     }
 
     /// Answers one call of `tool` with the JSON its description promises.
@@ -141,7 +214,235 @@ impl BrokerTools {
                         .expect("a Provider listing always serializes"),
                 )
             }
+            BrokerTool::SpawnSubagent => {
+                let spawn = SpawnArguments::read(&call.arguments)?;
+                let selection = requested_selection(
+                    &self.model_catalog.known().await,
+                    &spawn.provider,
+                    &spawn.model,
+                    &spawn.options,
+                )?;
+                let session_id = self
+                    .providers
+                    .spawn_brokered_subagent(
+                        call.caller.session_id(),
+                        BrokeredSubagentRequest {
+                            selection,
+                            name: spawn.name,
+                            description: spawn.description,
+                            delegation: spawn.prompt,
+                        },
+                    )
+                    .map_err(ToolRefusal)?;
+                Ok(json!({ "session_id": session_id }))
+            }
         }
+    }
+}
+
+/// What `spawn_subagent` was called with, each argument checked for the shape
+/// its schema gives it.
+#[derive(Debug, Eq, PartialEq)]
+struct SpawnArguments {
+    provider: String,
+    model: String,
+    options: Map<String, Value>,
+    name: String,
+    description: String,
+    prompt: String,
+}
+
+impl SpawnArguments {
+    const TAKES: [&'static str; 6] = [
+        "provider",
+        "model",
+        "options",
+        "name",
+        "description",
+        "prompt",
+    ];
+
+    fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
+        if let Some(unknown) = arguments
+            .keys()
+            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
+        {
+            return Err(ToolRefusal::new(format!(
+                "spawn_subagent takes no argument `{unknown}`; it takes {}.",
+                Self::TAKES
+                    .map(|argument| format!("`{argument}`"))
+                    .join(", ")
+            )));
+        }
+        let text = |argument: &str| match arguments.get(argument) {
+            Some(Value::String(text)) => Ok(text.clone()),
+            None | Some(Value::Null) => Err(ToolRefusal::new(format!(
+                "spawn_subagent needs `{argument}`."
+            ))),
+            Some(_) => Err(ToolRefusal::new(format!(
+                "spawn_subagent's `{argument}` must be a string."
+            ))),
+        };
+        let options = match arguments.get("options") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(options)) => options.clone(),
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "spawn_subagent's `options` must be an object from Model Option id to value.",
+                ));
+            }
+        };
+        let read = Self {
+            provider: text("provider")?,
+            model: text("model")?,
+            options,
+            name: text("name")?,
+            description: text("description")?,
+            prompt: text("prompt")?,
+        };
+        if read.name.trim().is_empty() {
+            return Err(ToolRefusal::new(
+                "spawn_subagent's `name` is empty; give the Subagent a short name.",
+            ));
+        }
+        if read.prompt.trim().is_empty() {
+            return Err(ToolRefusal::new(
+                "spawn_subagent's `prompt` is empty; say what the Subagent is to do.",
+            ));
+        }
+        Ok(read)
+    }
+}
+
+/// The Agent Selection a spawn asked for, checked against the Model Catalog
+/// as `list_providers` reads it: the Provider hosted, turned on, and usable
+/// now; the Model one it offers and will run; and each Model Option named one
+/// the Model has, set to a value it takes. Options left out take the Model's
+/// defaults. A refusal names what was wrong and what may be chosen instead.
+fn requested_selection(
+    catalog: &ModelCatalog,
+    provider: &str,
+    model: &str,
+    options: &Map<String, Value>,
+) -> Result<AgentSelection, ToolRefusal> {
+    let Some(hosted) = catalog
+        .providers
+        .iter()
+        .find(|hosted| hosted.provider.as_str() == provider)
+    else {
+        return Err(ToolRefusal::new(format!(
+            "Suru hosts no Provider `{provider}`; the Providers it hosts are {}. Call \
+             list_providers to see which may be chosen.",
+            listed(
+                catalog
+                    .providers
+                    .iter()
+                    .map(|hosted| hosted.provider.as_str())
+            )
+        )));
+    };
+    let mut models = match choosable(hosted) {
+        Choosable::Disabled => {
+            return Err(ToolRefusal::new(format!(
+                "Provider `{provider}` is turned off in Suru; ask the user to turn it back on, or \
+                 choose another Provider."
+            )));
+        }
+        Choosable::Unavailable { detail, .. } => {
+            return Err(ToolRefusal::new(format!(
+                "Provider `{provider}` cannot be used now: {detail} Choose another Provider."
+            )));
+        }
+        Choosable::Models(models) => models,
+    };
+    let Some(descriptor) = models.find(|descriptor| descriptor.id.as_str() == model) else {
+        return Err(ToolRefusal::new(format!(
+            "Provider `{provider}` offers no Model `{model}`; choose one of {}.",
+            listed(choosable_models(hosted).map(|descriptor| descriptor.id.as_str()))
+        )));
+    };
+    let mut selection = descriptor.default_agent_selection();
+    for (option_id, value) in options {
+        let Some(option) = descriptor
+            .options
+            .iter()
+            .find(|option| option.id.as_str() == option_id)
+        else {
+            return Err(ToolRefusal::new(if descriptor.options.is_empty() {
+                format!(
+                    "Model `{model}` has no Model Options; call spawn_subagent without `{option_id}`."
+                )
+            } else {
+                format!(
+                    "Model `{model}` has no Model Option `{option_id}`; its Model Options are {}.",
+                    listed(descriptor.options.iter().map(|option| option.id.as_str()))
+                )
+            }));
+        };
+        let chosen = option_value(option, value)?;
+        if let Some(selected) = selection
+            .options
+            .iter_mut()
+            .find(|selected| selected.id == option.id)
+        {
+            selected.value = chosen;
+        }
+    }
+    Ok(selection)
+}
+
+/// The value `value` sets Model Option `option` to, if it is one the option
+/// takes.
+fn option_value(
+    option: &ModelOptionDescriptor,
+    value: &Value,
+) -> Result<ModelOptionValue, ToolRefusal> {
+    let id = &option.id;
+    match (&option.kind, value) {
+        (ModelOptionKind::Select { choices, .. }, value) => {
+            let offered = || {
+                listed(
+                    choices
+                        .iter()
+                        .filter(|choice| choice.availability == ModelAvailability::Available)
+                        .map(|choice| choice.id.as_str()),
+                )
+            };
+            let Value::String(choice) = value else {
+                return Err(ToolRefusal::new(format!(
+                    "Model Option `{id}` takes a choice id as a string: one of {}.",
+                    offered()
+                )));
+            };
+            if !choices.iter().any(|offered| {
+                offered.id.as_str() == choice
+                    && offered.availability == ModelAvailability::Available
+            }) {
+                return Err(ToolRefusal::new(format!(
+                    "Model Option `{id}` has no choice `{choice}`; choose one of {}.",
+                    offered()
+                )));
+            }
+            Ok(ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(choice.clone()),
+            })
+        }
+        (ModelOptionKind::Toggle { .. }, Value::Bool(enabled)) => {
+            Ok(ModelOptionValue::Toggle { enabled: *enabled })
+        }
+        (ModelOptionKind::Toggle { .. }, _) => Err(ToolRefusal::new(format!(
+            "Model Option `{id}` is a toggle and takes true or false."
+        ))),
+    }
+}
+
+/// Ids as a refusal lists them: each quoted, in the order given.
+fn listed<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    let listed = ids.map(|id| format!("`{id}`")).collect::<Vec<_>>();
+    if listed.is_empty() {
+        "none".to_owned()
+    } else {
+        listed.join(", ")
     }
 }
 
@@ -247,59 +548,76 @@ fn provider_listing(catalog: ModelCatalog) -> ProviderListing {
     }
 }
 
+/// Whether an Agent may choose from a Provider's catalog now: the one reading
+/// `list_providers` reports and `spawn_subagent` checks a spawn against, so
+/// neither offers what the other refuses.
+enum Choosable<'a> {
+    /// The user has turned the Provider off, so Suru never checked it.
+    Disabled,
+    /// It cannot be used now, for the reason given, which says what to tell
+    /// the user.
+    Unavailable {
+        reason: UnavailableReason,
+        detail: String,
+    },
+    /// It can be used now, and these are the Models it will run.
+    Models(Box<dyn Iterator<Item = &'a ModelDescriptor> + 'a>),
+}
+
+fn choosable(catalog: &ProviderModelCatalog) -> Choosable<'_> {
+    match &catalog.status {
+        ProviderCatalogStatus::Disabled => Choosable::Disabled,
+        ProviderCatalogStatus::Unavailable { reason, message } => Choosable::Unavailable {
+            reason: UnavailableReason::from(*reason),
+            detail: message.clone(),
+        },
+        ProviderCatalogStatus::Failed { message } => Choosable::Unavailable {
+            reason: UnavailableReason::CatalogFailed,
+            detail: message.clone(),
+        },
+        // A first discovery still in flight has nothing to offer yet; a
+        // re-check of Models already known leaves them selectable.
+        ProviderCatalogStatus::Refreshing if catalog.models.is_empty() => Choosable::Unavailable {
+            reason: UnavailableReason::Checking,
+            detail: "Suru is still asking this Provider for its Models; ask again shortly."
+                .to_owned(),
+        },
+        ProviderCatalogStatus::Fresh
+        | ProviderCatalogStatus::Warning { .. }
+        | ProviderCatalogStatus::Stale { .. }
+        | ProviderCatalogStatus::Refreshing => {
+            Choosable::Models(Box::new(choosable_models(catalog)))
+        }
+    }
+}
+
+/// The Models a usable Provider will run: a Model it lists but will not run
+/// is left out, since naming it could only be refused.
+fn choosable_models(catalog: &ProviderModelCatalog) -> impl Iterator<Item = &ModelDescriptor> {
+    catalog
+        .models
+        .iter()
+        .filter(|model| model.availability == ModelAvailability::Available)
+}
+
 fn listed_provider(catalog: ProviderModelCatalog) -> ListedProvider {
-    let ProviderModelCatalog {
-        provider,
-        display_name,
-        models,
-        status,
-    } = catalog;
     let listed = |available, reason, detail, models| ListedProvider {
-        id: provider.clone(),
-        name: display_name.clone(),
-        enabled: !matches!(status, ProviderCatalogStatus::Disabled),
+        id: catalog.provider.clone(),
+        name: catalog.display_name.clone(),
+        enabled: !matches!(catalog.status, ProviderCatalogStatus::Disabled),
         available,
         reason,
         detail,
         models,
     };
-    match &status {
-        ProviderCatalogStatus::Disabled => listed(None, None, None, Vec::new()),
-        ProviderCatalogStatus::Unavailable { reason, message } => listed(
-            Some(false),
-            Some(UnavailableReason::from(*reason)),
-            Some(message.clone()),
-            Vec::new(),
-        ),
-        ProviderCatalogStatus::Failed { message } => listed(
-            Some(false),
-            Some(UnavailableReason::CatalogFailed),
-            Some(message.clone()),
-            Vec::new(),
-        ),
-        // A first discovery still in flight has nothing to offer yet; a
-        // re-check of Models already known leaves them selectable.
-        ProviderCatalogStatus::Refreshing if models.is_empty() => listed(
-            Some(false),
-            Some(UnavailableReason::Checking),
-            Some(
-                "Suru is still asking this Provider for its Models; ask again shortly.".to_owned(),
-            ),
-            Vec::new(),
-        ),
-        ProviderCatalogStatus::Fresh
-        | ProviderCatalogStatus::Warning { .. }
-        | ProviderCatalogStatus::Stale { .. }
-        | ProviderCatalogStatus::Refreshing => listed(
-            Some(true),
-            None,
-            None,
-            models
-                .iter()
-                .filter(|model| model.availability == ModelAvailability::Available)
-                .map(listed_model)
-                .collect(),
-        ),
+    match choosable(&catalog) {
+        Choosable::Disabled => listed(None, None, None, Vec::new()),
+        Choosable::Unavailable { reason, detail } => {
+            listed(Some(false), Some(reason), Some(detail), Vec::new())
+        }
+        Choosable::Models(models) => {
+            listed(Some(true), None, None, models.map(listed_model).collect())
+        }
     }
 }
 
@@ -519,5 +837,236 @@ mod tests {
             assert_eq!(tool.input_schema()["type"], json!("object"));
         }
         assert_eq!(BrokerTool::named("spawn_everything"), None);
+    }
+
+    /// Codex's catalog with one Model that runs, carrying a select option
+    /// with a choice it will not run and a toggle, and one Model it lists but
+    /// will not run.
+    fn spawnable(status: ProviderCatalogStatus) -> ModelCatalog {
+        let mut runs = model("runs", ModelAvailability::Available);
+        runs.options.push(ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Fast".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        });
+        catalog(
+            status,
+            vec![runs, model("refused", ModelAvailability::Unavailable)],
+        )
+    }
+
+    fn options(options: Value) -> Map<String, Value> {
+        let Value::Object(options) = options else {
+            panic!("options are an object");
+        };
+        options
+    }
+
+    fn refused(catalog: &ModelCatalog, provider: &str, model: &str, chosen: Value) -> String {
+        requested_selection(catalog, provider, model, &options(chosen))
+            .expect_err("the spawn is refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_spawns_model_options_are_its_models_defaults_with_what_it_named_set() {
+        let catalog = spawnable(ProviderCatalogStatus::Fresh);
+        let selection = |chosen| {
+            requested_selection(&catalog, "codex", "runs", &options(chosen))
+                .expect("the spawn is taken")
+        };
+        let choice = |id: &str| ModelOptionValue::Select {
+            choice: ModelOptionChoiceId::new(id),
+        };
+        let values = |selection: AgentSelection| {
+            selection
+                .options
+                .into_iter()
+                .map(|option| (option.id.to_string(), option.value))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            values(selection(json!({}))),
+            [
+                ("effort".to_owned(), choice("low")),
+                (
+                    "fast".to_owned(),
+                    ModelOptionValue::Toggle { enabled: false }
+                ),
+            ],
+            "every option left out takes the Model's default"
+        );
+        assert_eq!(
+            values(selection(json!({ "fast": true }))),
+            [
+                ("effort".to_owned(), choice("low")),
+                (
+                    "fast".to_owned(),
+                    ModelOptionValue::Toggle { enabled: true }
+                ),
+            ],
+            "an option named is set, the rest defaulted"
+        );
+        let chosen = selection(json!({}));
+        assert_eq!(
+            (chosen.provider, chosen.model),
+            (ProviderId::new("codex"), ModelId::new("runs"))
+        );
+    }
+
+    #[test]
+    fn a_spawn_is_refused_anything_list_providers_would_not_offer_saying_what() {
+        let fresh = spawnable(ProviderCatalogStatus::Fresh);
+        for (catalog, provider, model, chosen, says) in [
+            (
+                &fresh,
+                "claude",
+                "runs",
+                json!({}),
+                "Suru hosts no Provider `claude`; the Providers it hosts are `codex`",
+            ),
+            (
+                &fresh,
+                "codex",
+                "refused",
+                json!({}),
+                "Provider `codex` offers no Model `refused`; choose one of `runs`",
+            ),
+            (
+                &fresh,
+                "codex",
+                "runs",
+                json!({ "effort": "max" }),
+                "Model Option `effort` has no choice `max`; choose one of `low`",
+            ),
+            (
+                &fresh,
+                "codex",
+                "runs",
+                json!({ "effort": true }),
+                "Model Option `effort` takes a choice id as a string: one of `low`",
+            ),
+            (
+                &fresh,
+                "codex",
+                "runs",
+                json!({ "fast": "on" }),
+                "Model Option `fast` is a toggle and takes true or false",
+            ),
+            (
+                &fresh,
+                "codex",
+                "runs",
+                json!({ "speed": "fast" }),
+                "Model `runs` has no Model Option `speed`; its Model Options are `effort`, `fast`",
+            ),
+            (
+                &spawnable(ProviderCatalogStatus::Disabled),
+                "codex",
+                "runs",
+                json!({}),
+                "Provider `codex` is turned off in Suru",
+            ),
+            (
+                &spawnable(ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotSignedIn,
+                    message: "sign in to the Codex CLI.".to_owned(),
+                }),
+                "codex",
+                "runs",
+                json!({}),
+                "Provider `codex` cannot be used now: sign in to the Codex CLI. Choose another Provider.",
+            ),
+            (
+                &catalog(ProviderCatalogStatus::Refreshing, Vec::new()),
+                "codex",
+                "runs",
+                json!({}),
+                "Suru is still asking this Provider for its Models",
+            ),
+        ] {
+            let refusal = refused(catalog, provider, model, chosen);
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_already_known_may_be_spawned_on_while_its_catalog_is_checked_again() {
+        requested_selection(
+            &spawnable(ProviderCatalogStatus::Refreshing),
+            "codex",
+            "runs",
+            &Map::new(),
+        )
+        .expect("a re-check leaves known Models selectable, as list_providers lists them");
+    }
+
+    #[test]
+    fn spawn_arguments_are_read_as_their_schema_gives_them() {
+        let arguments = |value| options(value);
+        let read = SpawnArguments::read(&arguments(json!({
+            "provider": "codex",
+            "model": "runs",
+            "name": "Researcher",
+            "description": "",
+            "prompt": "Map the seams.",
+        })))
+        .expect("every required argument is given");
+        assert_eq!(read.options, Map::new(), "options may be left out");
+        assert_eq!(read.description, "", "and a description may be empty");
+
+        for (value, says) in [
+            (
+                json!({ "model": "runs", "name": "R", "description": "", "prompt": "p" }),
+                "needs `provider`",
+            ),
+            (
+                json!({ "provider": 7, "model": "runs", "name": "R", "description": "", "prompt": "p" }),
+                "`provider` must be a string",
+            ),
+            (
+                json!({ "provider": "codex", "model": "runs", "name": " ", "description": "", "prompt": "p" }),
+                "`name` is empty",
+            ),
+            (
+                json!({ "provider": "codex", "model": "runs", "name": "R", "description": "", "prompt": "\n" }),
+                "`prompt` is empty",
+            ),
+            (
+                json!({ "provider": "codex", "model": "runs", "name": "R", "description": "", "prompt": "p", "options": [] }),
+                "`options` must be an object",
+            ),
+            (
+                json!({ "provider": "codex", "model": "runs", "name": "R", "description": "", "prompt": "p", "cwd": "/" }),
+                "takes no argument `cwd`",
+            ),
+        ] {
+            let refusal = SpawnArguments::read(&arguments(value))
+                .expect_err("the arguments are refused")
+                .to_string();
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn spawn_subagents_schema_requires_what_its_description_says_it_takes() {
+        let schema = BrokerTool::SpawnSubagent.input_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("the schema names its properties");
+        for argument in SpawnArguments::TAKES {
+            assert!(
+                properties.contains_key(argument),
+                "the schema takes {argument}"
+            );
+            assert!(
+                SPAWN_SUBAGENT_DESCRIPTION.contains(&format!("\"{argument}\"")),
+                "the description says what {argument} is"
+            );
+        }
+        assert_eq!(schema["additionalProperties"], json!(false));
     }
 }

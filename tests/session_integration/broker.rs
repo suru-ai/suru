@@ -588,18 +588,27 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
             .iter()
             .map(|tool| tool["name"].as_str().expect("every Tool is named"))
             .collect::<Vec<_>>(),
-        ["list_providers"],
-        "list_providers is the one Tool the Broker offers so far"
+        ["list_providers", "spawn_subagent"],
+        "the Broker offers the Tools it has so far, in its own order"
     );
-    assert_eq!(tools[0]["inputSchema"]["type"], json!("object"));
-    assert!(
-        tools[0]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("\"providers\"")),
-        "the Tool's description documents the shape it answers with: {}",
-        tools[0]
+    for (tool, answers_with, read_only) in [
+        (&tools[0], "\"providers\"", true),
+        (&tools[1], "\"session_id\"", false),
+    ] {
+        assert_eq!(tool["inputSchema"]["type"], json!("object"));
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|description| description.contains(answers_with)),
+            "each Tool's description documents the shape it answers with: {tool}"
+        );
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(read_only));
+    }
+    assert_eq!(
+        tools[1]["inputSchema"]["required"],
+        json!(["provider", "model", "name", "description", "prompt"]),
+        "a spawn names its target and its Delegation, and may leave its Model Options out"
     );
-    assert_eq!(tools[0]["annotations"]["readOnlyHint"], json!(true));
 
     let listing = client.list_providers().await;
     assert_eq!(

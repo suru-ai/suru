@@ -672,11 +672,6 @@ pub async fn spawn_with_source_control(
         format!("{}{}", descriptor.base_url, broker::BROKER_PATH),
         settings.subscribe(),
     );
-    let broker_routes = broker::router(
-        broker_access.clone(),
-        BrokerTools::new(model_catalog.clone()),
-        provider_shutdown_rx.clone(),
-    );
     let providers = ProviderOrchestrator::new(
         runtimes.as_ref().clone(),
         sessions.clone(),
@@ -686,7 +681,14 @@ pub async fn spawn_with_source_control(
         skill_catalog.clone(),
         source_control.clone(),
         timings.checkout_skill_timeout,
+        broker_access.clone(),
+    );
+    // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
+    // through the same orchestrator every other Session's runs on.
+    let broker_routes = broker::router(
         broker_access,
+        BrokerTools::new(model_catalog.clone(), providers.clone()),
+        provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
