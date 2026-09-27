@@ -2204,6 +2204,7 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         description: "Map the edge".to_owned(),
         model: None,
         session_id: SessionId::new(),
+        brokered: false,
         duration_ms: None,
     };
     subagents

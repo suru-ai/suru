@@ -266,6 +266,7 @@ fn subagent_row(parent: &mut PersistedSession, child: SessionId) -> ActivityId {
         description: "map the seams".into(),
         model: None,
         session_id: child,
+        brokered: false,
         duration_ms: None,
     });
     parent

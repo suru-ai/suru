@@ -11,7 +11,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 62;
+pub const PROTOCOL_VERSION: u32 = 63;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -2003,6 +2003,14 @@ pub enum Activity {
         /// The Subagent's own Session: a child of the Session this row is in,
         /// and the way into everything the Subagent did.
         session_id: SessionId,
+        /// Whether Suru spawned the Subagent through the Broker, on a Provider
+        /// actor of its own, rather than the delegating Agent's own Provider
+        /// spawning it (ADR 0035). A brokered Subagent may always be stopped
+        /// on its own, whatever the delegating Agent's Provider allows for
+        /// Subagents of its own, so a client offers its stop from the row
+        /// regardless.
+        #[serde(default)]
+        brokered: bool,
         /// How long the Subagent worked, timed by Suru from its spawn. Known
         /// only once it settles — by the Provider's own settle event or by a
         /// stop the user asked for — and absent on a row that a lost Provider

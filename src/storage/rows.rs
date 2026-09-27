@@ -978,6 +978,10 @@ enum StoredActivityPayload {
         #[serde(default)]
         model: Option<ModelId>,
         session_id: SessionId,
+        /// Absent in every row stored before brokered Subagents were marked,
+        /// all of which were native.
+        #[serde(default)]
+        brokered: bool,
         duration_ms: Option<u64>,
     },
     WatchOutcome {
@@ -1064,6 +1068,7 @@ impl StoredActivityPayload {
                 description,
                 model,
                 session_id,
+                brokered,
                 duration_ms,
             } => Activity::Subagent {
                 id,
@@ -1073,6 +1078,7 @@ impl StoredActivityPayload {
                 description,
                 model,
                 session_id,
+                brokered,
                 duration_ms,
             },
             Self::WatchOutcome {
@@ -1163,6 +1169,7 @@ impl From<Activity> for StoredActivityPayload {
                 description,
                 model,
                 session_id,
+                brokered,
                 duration_ms,
                 ..
             } => Self::Subagent {
@@ -1171,6 +1178,7 @@ impl From<Activity> for StoredActivityPayload {
                 description,
                 model,
                 session_id,
+                brokered,
                 duration_ms,
             },
             Activity::WatchOutcome {

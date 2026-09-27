@@ -843,6 +843,7 @@ fn parent_with_working_subagent(workspace: &std::path::Path) -> (SessionSnapshot
         description: "Map the provider seams".to_owned(),
         model: None,
         session_id: child,
+        brokered: false,
         duration_ms: None,
     };
     (snapshot, child)

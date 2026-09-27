@@ -3221,6 +3221,7 @@ fn subagent_activity_session(
         description: description.to_owned(),
         model: None,
         session_id: SessionId::new(),
+        brokered: false,
         duration_ms,
     };
     (snapshot, activity_id)
@@ -3439,6 +3440,7 @@ fn each_row_of_a_resumed_subagent_reads_and_settles_as_its_own_stretch() {
         description: "Say goodbye".to_owned(),
         model: None,
         session_id: child,
+        brokered: false,
         duration_ms: None,
     });
     snapshot.transcript.push(TranscriptItem::Activity {

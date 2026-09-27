@@ -89,6 +89,7 @@ fn parent_with_working_subagents(
             description: (*description).to_owned(),
             model: None,
             session_id: child_id,
+            brokered: false,
             duration_ms: None,
         };
         if index == 0 {
@@ -169,6 +170,7 @@ fn child_with_working_subagent(
             description: "Check the mapped seams".to_owned(),
             model: None,
             session_id: grandchild_id,
+            brokered: false,
             duration_ms: None,
         }],
         subagent_interventions: Vec::new(),
@@ -393,6 +395,7 @@ fn down_keeps_walking_history_even_while_subagents_work() {
                         description: "Map the provider seams".to_owned(),
                         model: None,
                         session_id: SessionId::new(),
+                        brokered: false,
                         duration_ms: None,
                     },
                 }],
@@ -458,6 +461,7 @@ fn the_picker_takes_in_a_subagent_spawning_while_it_is_open() {
                         description: "Design the picker".to_owned(),
                         model: None,
                         session_id: SessionId::new(),
+                        brokered: false,
                         duration_ms: None,
                     },
                 }],

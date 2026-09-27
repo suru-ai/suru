@@ -1138,6 +1138,7 @@ fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
                     description: "Map the provider seams".to_owned(),
                     model: None,
                     session_id: child_session_id,
+                    brokered: false,
                     duration_ms: None,
                 },
             }],
@@ -1175,6 +1176,7 @@ fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
                     "description": "Map the provider seams",
                     "model": null,
                     "session_id": "0198b27e-4f11-7d80-a4de-3f2a6f6b3a01",
+                    "brokered": false,
                     "duration_ms": null
                 }
             }]

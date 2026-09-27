@@ -7,6 +7,8 @@
 //! that client and the doubles observe. The doubles are hosted under the real
 //! Provider identities, because Enablement is a Setting keyed by them.
 
+mod stops;
+
 use std::{path::Path, sync::Arc};
 
 use reqwest::{

@@ -55,6 +55,7 @@ fn parent_with_subagent_row(
         description: "Map the provider seams".to_owned(),
         model: None,
         session_id: child_id,
+        brokered: false,
         duration_ms,
     };
     if turn_in_flight || status == ActivityStatus::Active {

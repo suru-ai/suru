@@ -285,16 +285,37 @@ pub(super) struct ChildSession {
     pub(super) route: SubagentRoute,
 }
 
-/// The row a stretch of a Subagent's work stands as in the Turn that
-/// delegated it, as the stretch opens — a spawn's or a resume's, whichever
-/// route the Subagent took: working, leading into the Subagent's own Session,
-/// and saying no Model until its Provider confirms one and no duration until
-/// the stretch settles.
+/// The row a stretch of a native Subagent's work stands as in the Turn that
+/// delegated it, as the stretch opens — a spawn's or a resume's: working,
+/// leading into the Subagent's own Session, and saying no Model until its
+/// Provider confirms one and no duration until the stretch settles.
 pub(crate) fn opening_subagent_row(
     turn_id: TurnId,
     name: String,
     description: String,
     session_id: SessionId,
+) -> Activity {
+    opening_row(turn_id, name, description, session_id, false)
+}
+
+/// The row a stretch of a brokered Subagent's work opens as: a native one's
+/// in every way but the route it names, which is what lets a client offer its
+/// stop whatever the delegating Agent's Provider allows (ADR 0035).
+pub(super) fn opening_brokered_subagent_row(
+    turn_id: TurnId,
+    name: String,
+    description: String,
+    session_id: SessionId,
+) -> Activity {
+    opening_row(turn_id, name, description, session_id, true)
+}
+
+fn opening_row(
+    turn_id: TurnId,
+    name: String,
+    description: String,
+    session_id: SessionId,
+    brokered: bool,
 ) -> Activity {
     Activity::Subagent {
         id: ActivityId::new(),
@@ -304,6 +325,7 @@ pub(crate) fn opening_subagent_row(
         description,
         model: None,
         session_id,
+        brokered,
         duration_ms: None,
     }
 }

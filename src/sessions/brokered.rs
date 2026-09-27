@@ -36,7 +36,7 @@ use super::{
     posture::brokered_subagent_posture,
     projection::active_turn_id,
     subagents::{
-        ChildSession, SubagentRoute, delegator, opening_subagent_row, stretches_of_work,
+        ChildSession, SubagentRoute, delegator, opening_brokered_subagent_row, stretches_of_work,
         subagent_title,
     },
 };
@@ -189,7 +189,7 @@ impl SessionStore {
                 route: SubagentRoute::Brokered,
             },
         );
-        let row = opening_subagent_row(
+        let row = opening_brokered_subagent_row(
             holding.turn_id(),
             spawn.name,
             spawn.description,

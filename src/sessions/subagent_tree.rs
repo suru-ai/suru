@@ -876,6 +876,7 @@ mod tests {
                         description: "Map the seams".to_owned(),
                         model: None,
                         session_id: child,
+                        brokered: false,
                         duration_ms: None,
                     },
                 },

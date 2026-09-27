@@ -660,6 +660,13 @@ impl ControlledProviderSession {
             .expect("Provider Session remains connected")
     }
 
+    /// The interrupt already asked for, without waiting for one. A test that
+    /// must show a Provider was *never* asked to interrupt its Turn reads the
+    /// absence here rather than waiting out a timeout.
+    pub fn try_next_interrupt(&mut self) -> Option<TurnInterrupt> {
+        self.interruptions.try_recv().ok()
+    }
+
     pub async fn next_subagents_stop(&mut self) -> SubagentsStop {
         self.subagents_stops
             .recv()
