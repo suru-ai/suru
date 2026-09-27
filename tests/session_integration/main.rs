@@ -43,6 +43,7 @@ mod workspace_icons;
 
 mod approval_posture;
 mod approvals;
+mod broker;
 mod questionnaires;
 mod repositories;
 

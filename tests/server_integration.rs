@@ -2251,6 +2251,64 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
     pair.shutdown().await;
 }
 
+/// The Broker's tokens name this machine's own Provider Sessions, so Serving
+/// never carries its endpoint to a Peer: the Peer finds nothing there, rather
+/// than an endpoint refusing the credential Serving forwards.
+#[tokio::test]
+async fn remote_proxy_does_not_carry_the_broker_to_peers() {
+    let pair = paired_servers("remote-broker").await;
+    let http = reqwest::Client::new();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "peer", "version": "0" },
+        },
+    });
+    let descriptor = pair.connecting.descriptor();
+    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+    for path in ["/broker", "/ordinary/%2e%2e/broker"] {
+        let response = http
+            .post(format!("{remote_api}{path}"))
+            .bearer_auth(&descriptor.token)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .json(&initialize)
+            .send()
+            .await
+            .expect("attempt the Remote's Broker");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "Serving does not forward {path} to the Serving Server's Broker"
+        );
+    }
+
+    // The Serving Server's own loopback listener does serve the Broker — to a
+    // token naming one of its Sessions, which is never the API token Serving
+    // forwards a Peer's request under.
+    let serving = pair.serving.descriptor();
+    let local = http
+        .post(format!("{}/broker", serving.base_url))
+        .bearer_auth(&serving.token)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&initialize)
+        .send()
+        .await
+        .expect("reach the Serving Server's own Broker");
+    assert_eq!(local.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use() {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
