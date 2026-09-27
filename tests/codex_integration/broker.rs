@@ -4,7 +4,9 @@
 //! naming the endpoint, the bearer token as a static header, a tool timeout above the Broker's
 //! longest call, and approve-by-default for its Tools so no call waits on a reviewer or an
 //! elicitation. Nothing of the server is kept with the thread, so every `thread/resume` carries it
-//! again — with the token its own launch was handed. With the Broker turned off neither carries it.
+//! again — with the token its own launch was handed. The thread also starts with a note in its
+//! developer instructions saying the Broker is there, which Codex keeps in the thread's history, so
+//! a resume carries none. With the Broker turned off neither request carries anything of it.
 //!
 //! A Codex Subagent a Session on another Provider spawns through the Broker starts its thread under
 //! the Codex value ADR 0036's table gives for that Session's posture.
@@ -218,7 +220,43 @@ async fn thread_start_and_thread_resume_carry_the_server_headers_timeout_and_app
 }
 
 #[tokio::test]
-async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_server() {
+async fn thread_start_carries_the_broker_note_in_its_developer_instructions() {
+    let resumed = ResumedThread::run("codex-broker-note", "{}").await;
+
+    let start = resumed.params_of("thread/start");
+    let note = start["developerInstructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start carries developer instructions: {start}"));
+    for tool in [
+        "mcp__suru__list_providers",
+        "mcp__suru__spawn_subagent",
+        "mcp__suru__read_subagent",
+        "mcp__suru__stop_subagent",
+    ] {
+        assert!(
+            note.contains(tool),
+            "the note names {tool} as Codex names an MCP server's Tools: {note:?}"
+        );
+    }
+    assert!(
+        note.contains("when the user names another Provider or Model"),
+        "the note says when to prefer the Broker: {note:?}"
+    );
+    assert!(
+        note.contains("Suru never re-routes them"),
+        "the note leaves the Agent's own subagent tools in place: {note:?}"
+    );
+    let resume = resumed.params_of("thread/resume");
+    assert!(
+        resume.get("developerInstructions").is_none(),
+        "the resumed thread keeps the note its start put in its history: {resume}"
+    );
+
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_server_or_note() {
     let resumed = ResumedThread::run("codex-broker-off", r#"{"broker":{"enabled":false}}"#).await;
 
     for method in ["thread/start", "thread/resume"] {
@@ -226,6 +264,10 @@ async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_
         assert!(
             params.get("config").is_none(),
             "{method} made while the Broker is off overrides nothing: {params}"
+        );
+        assert!(
+            params.get("developerInstructions").is_none(),
+            "{method} made while the Broker is off tells the Agent of none: {params}"
         );
     }
 

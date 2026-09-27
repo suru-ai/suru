@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID};
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
+    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME, instruction_note},
     protocol::{
         AgentSelection, CodexApprovalPolicy, CodexSandboxMode, FileChange, ModelAvailability,
         ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
@@ -372,6 +372,10 @@ pub(super) struct ThreadStartParams<'a> {
     pub(super) ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) config: Option<&'a ThreadConfig>,
+    /// What the thread's Agent is told beyond Codex's own instructions, which Codex keeps in the
+    /// thread's history — so a resume has no need of it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) developer_instructions: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -409,6 +413,15 @@ pub(super) fn broker_thread_config(handoff: &BrokerHandoff) -> ThreadConfig {
         format!("mcp_servers.{BROKER_SERVER_NAME}"),
         serde_json::to_value(server).expect("a Broker server entry serializes"),
     )])
+}
+
+/// The developer instructions a thread handed the Broker starts with: the Broker's note, naming
+/// each Tool as Codex names an MCP server's Tools to its Agent — `mcp__suru__spawn_subagent`.
+///
+/// Codex takes a thread's developer instructions in place of any the user's own configuration
+/// sets, rather than beside them, so a Session handed the Broker is started with the note alone.
+pub(super) fn broker_developer_instructions() -> String {
+    instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"))
 }
 
 /// One streamable-HTTP MCP server entry, in the keys Codex's configuration reads.
@@ -1382,7 +1395,9 @@ pub(super) enum NativeTurnFailureKind {
 mod tests {
     use serde_json::json;
 
-    use super::{ThreadResumeParams, ThreadStartParams, broker_thread_config};
+    use super::{
+        ThreadResumeParams, ThreadStartParams, broker_developer_instructions, broker_thread_config,
+    };
     use crate::provider::BrokerHandoff;
 
     #[test]
@@ -1400,15 +1415,22 @@ mod tests {
                 },
             })
         );
+        let note = broker_developer_instructions();
         let start = serde_json::to_value(ThreadStartParams {
             cwd: "/workspace",
             approval_policy: "on-request",
             sandbox: "workspace-write",
             ephemeral: false,
             config: Some(&config),
+            developer_instructions: Some(&note),
         })
         .expect("thread/start serializes");
         assert_eq!(start["config"], serde_json::to_value(&config).unwrap());
+        assert_eq!(start["developerInstructions"], note.as_str());
+        assert!(
+            note.contains("mcp__suru__spawn_subagent"),
+            "the note names the Broker's Tools as Codex does: {note}"
+        );
     }
 
     #[test]

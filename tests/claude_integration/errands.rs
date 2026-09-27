@@ -184,8 +184,9 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
     assert!(
         errand.carries("--strict-mcp-config")
             && !errand.carries("--mcp-config")
-            && !errand.carries("--allowedTools"),
-        "an Errand starts no MCP server, the Broker's included: {:?}",
+            && !errand.carries("--allowedTools")
+            && !errand.carries("--append-system-prompt"),
+        "an Errand starts no MCP server, the Broker's included, and is told of none: {:?}",
         errand.arguments
     );
     let conversation = claude.wait_for_launch_carrying("--session-id").await;

@@ -6,7 +6,9 @@
 //! handed as a header and a per-server timeout above the Broker's longest call. Copilot asks
 //! Suru's own permission handler before every MCP call, and the handler approves the Broker's
 //! calls itself, so none reaches the user as an Approval; nor does a Broker call stand in the
-//! Transcript as a Command. With the Broker turned off no Session is handed the server.
+//! Transcript as a Command. Beside the server list, each of those requests appends a note to
+//! Copilot's own system message saying the Broker is there. With the Broker turned off no Session
+//! is handed the server or the note.
 
 use std::{path::Path, sync::Arc};
 
@@ -190,7 +192,49 @@ async fn session_create_and_resume_carry_the_broker_server_each_with_its_own_tok
 }
 
 #[tokio::test]
-async fn with_the_broker_off_neither_create_nor_resume_carries_the_server() {
+async fn session_create_and_resume_append_the_broker_note_to_copilots_system_message() {
+    let sent = created_then_resumed("copilot-broker-note", "{}").await;
+
+    for (method, params) in [
+        ("session.create", &sent.create),
+        ("session.resume", &sent.resume),
+    ] {
+        let message = &params["systemMessage"];
+        assert_eq!(
+            message["mode"], "append",
+            "{method} adds to Copilot's own system message rather than replacing it: {params}"
+        );
+        assert!(
+            message.get("sections").is_none(),
+            "{method} customizes no section of Copilot's: {params}"
+        );
+        let note = message["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{method} carries the note: {params}"));
+        for tool in [
+            "suru-list_providers",
+            "suru-spawn_subagent",
+            "suru-read_subagent",
+            "suru-stop_subagent",
+        ] {
+            assert!(
+                note.contains(tool),
+                "{method}'s note names {tool} as Copilot names an MCP server's Tools: {note:?}"
+            );
+        }
+        assert!(
+            note.contains("when the user names another Provider or Model"),
+            "{method}'s note says when to prefer the Broker: {note:?}"
+        );
+        assert!(
+            note.contains("Suru never re-routes them"),
+            "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn with_the_broker_off_neither_create_nor_resume_carries_the_server_or_note() {
     let sent = created_then_resumed("copilot-broker-off", r#"{"broker":{"enabled":false}}"#).await;
 
     for (method, params) in [
@@ -200,6 +244,10 @@ async fn with_the_broker_off_neither_create_nor_resume_carries_the_server() {
         assert!(
             params.get("mcpServers").is_none(),
             "{method} made while the Broker is off names no server: {params}"
+        );
+        assert!(
+            params.get("systemMessage").is_none(),
+            "{method} made while the Broker is off tells the Agent of none: {params}"
         );
     }
 }

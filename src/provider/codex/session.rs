@@ -30,8 +30,8 @@ use super::{
     wire::{
         CodexPosture, ModelListParams, NativeField, NativeModelList, ThreadConnectionResult,
         ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-        TurnStartResult, TurnSteerParams, TurnSteerResult, broker_thread_config,
-        lower_reasoning_summary, lower_turn_options,
+        TurnStartResult, TurnSteerParams, TurnSteerResult, broker_developer_instructions,
+        broker_thread_config, lower_reasoning_summary, lower_turn_options,
     },
 };
 use crate::{
@@ -383,8 +383,10 @@ async fn start_codex_thread(
         .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
         .map(|state| state.thread_id);
     // The Broker goes on the thread's start and on every resume alike, carrying the token this
-    // launch was handed, because Codex keeps nothing of an MCP server with the thread.
+    // launch was handed, because Codex keeps nothing of an MCP server with the thread. Its note
+    // goes on the start alone: Codex keeps that in the thread's history.
     let config = request.broker.as_ref().map(broker_thread_config);
+    let note = request.broker.is_some().then(broker_developer_instructions);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
         let posture = *context
             .posture
@@ -418,6 +420,7 @@ async fn start_codex_thread(
                     sandbox: posture.sandbox(),
                     ephemeral: false,
                     config: config.as_ref(),
+                    developer_instructions: note.as_deref(),
                 },
             )
             .await

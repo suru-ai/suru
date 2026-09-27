@@ -5,9 +5,14 @@
 //! timeout above the longest call the Broker serves; `--allowedTools` allowlists the Broker's Tools
 //! so calling one never raises an Approval. The token travels in that owner-only file rather than
 //! on the command line, the file is gone once the process it served is, and a relaunch after a
-//! restart is handed a token of its own. With the Broker turned off a launch carries none of it.
+//! restart is handed a token of its own. Every such launch also appends a note to the Agent's
+//! system prompt saying the Broker is there, naming its Tools by the full names Claude gives them
+//! so the Agent can select them (docs/validation/0408-claude-http-mcp-long-calls.md). With the
+//! Broker turned off a launch carries none of it.
 
-use crate::support::{LiveTurn, McpConfigFile, conversation_fixture, hosting, settled_session};
+use crate::support::{
+    Launch, LiveTurn, McpConfigFile, conversation_fixture, hosting, settled_session,
+};
 use serde_json::Value;
 use suru::{
     protocol::{
@@ -36,6 +41,32 @@ fn broker_server(config: &McpConfigFile) -> &Value {
         config.contents
     );
     &servers["suru"]
+}
+
+/// Checks the note `launch` appends to the Agent's system prompt: it names each of the Broker's
+/// Tools by the name Claude gives an MCP server's Tools, says when to prefer them, and leaves the
+/// Agent's own subagent tools where they are.
+fn assert_carries_the_broker_note(launch: &Launch) {
+    let note = launch.value("--append-system-prompt");
+    for tool in [
+        "mcp__suru__list_providers",
+        "mcp__suru__spawn_subagent",
+        "mcp__suru__read_subagent",
+        "mcp__suru__stop_subagent",
+    ] {
+        assert!(
+            note.contains(tool),
+            "the note names {tool} as the Agent would select it: {note:?}"
+        );
+    }
+    assert!(
+        note.contains("when the user names another Provider or Model"),
+        "the note says when to prefer the Broker: {note:?}"
+    );
+    assert!(
+        note.contains("Suru never re-routes them"),
+        "the note leaves the Agent's own subagent tools in place: {note:?}"
+    );
 }
 
 /// The bearer token the Broker's entry presents.
@@ -95,6 +126,7 @@ async fn a_session_launch_carries_the_broker_config_and_allowlist_with_a_token()
         "the user's own MCP servers still load beside the Broker: {:?}",
         launch.arguments
     );
+    assert_carries_the_broker_note(&launch);
 
     live.shutdown().await;
     assert!(
@@ -159,6 +191,9 @@ async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
     );
     let resume = claude.launch_carrying("--resume");
     assert_eq!(resume.value("--allowedTools"), "mcp__suru__*");
+    // A system prompt lives only as long as the process it was given to, so the relaunch appends
+    // the note again.
+    assert_carries_the_broker_note(&resume);
     let resumed = claude.mcp_config_of(&resume);
 
     let (opened_server, resumed_server) = (broker_server(&opened), broker_server(&resumed));
@@ -186,7 +221,7 @@ async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
 }
 
 #[tokio::test]
-async fn with_the_broker_off_a_session_launch_carries_no_mcp_config_or_allowlist() {
+async fn with_the_broker_off_a_session_launch_carries_no_mcp_config_allowlist_or_note() {
     let claude = conversation_fixture("      :\n");
     let live = LiveTurn::start_configured(
         ClaudeRuntime::new(claude.executable()),
@@ -200,6 +235,11 @@ async fn with_the_broker_off_a_session_launch_carries_no_mcp_config_or_allowlist
     assert!(
         !launch.carries("--mcp-config") && !launch.carries("--allowedTools"),
         "a launch made while the Broker is off is handed no server: {:?}",
+        launch.arguments
+    );
+    assert!(
+        !launch.carries("--append-system-prompt"),
+        "nor told of a Broker it cannot reach: {:?}",
         launch.arguments
     );
     assert!(

@@ -15,13 +15,17 @@
 //! Copilot asks Suru's permission handler before every MCP call, and the handler approves the
 //! Broker's own ([`super::approval`]); the projection absorbs the Broker's tool executions, which
 //! the Broker's own rows answer for ([`super::projection`]).
+//!
+//! Beside the server list, each of those requests carries the Broker's note as a system message
+//! in append mode, added to Copilot's own rather than replacing any of it, and naming each Tool as
+//! Copilot names an MCP server's Tools to its Agent — `suru-spawn_subagent`.
 
 use std::collections::HashMap;
 
-use github_copilot_sdk::{IndexMap, McpHttpServerConfig, McpServerConfig};
+use github_copilot_sdk::{IndexMap, McpHttpServerConfig, McpServerConfig, SystemMessageConfig};
 
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME, instruction_note},
     provider::BrokerHandoff,
 };
 
@@ -39,12 +43,36 @@ pub(super) fn broker_mcp_servers(handoff: &BrokerHandoff) -> IndexMap<String, Mc
     )])
 }
 
+/// The system message a Session handed the Broker is created or resumed with: the Broker's note,
+/// appended to Copilot's own.
+pub(super) fn broker_system_message() -> SystemMessageConfig {
+    SystemMessageConfig::new()
+        .with_mode("append")
+        .with_content(instruction_note(|tool| {
+            format!("{BROKER_SERVER_NAME}-{tool}")
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::broker_mcp_servers;
+    use super::{broker_mcp_servers, broker_system_message};
     use crate::provider::BrokerHandoff;
+
+    #[test]
+    fn the_note_is_appended_naming_the_brokers_tools_as_copilot_does() {
+        let message =
+            serde_json::to_value(broker_system_message()).expect("the message serializes");
+        assert_eq!(message["mode"], "append");
+        assert!(message.get("sections").is_none(), "{message}");
+        assert!(
+            message["content"]
+                .as_str()
+                .is_some_and(|note| note.contains("suru-spawn_subagent")),
+            "{message}"
+        );
+    }
 
     #[test]
     fn the_broker_is_the_one_http_server_with_its_token_and_call_timeout() {

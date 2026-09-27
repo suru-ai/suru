@@ -18,9 +18,11 @@
 //! Everything MCP-specific stays in [`mcp`]; the Tools themselves, in Suru's
 //! own terms, are in [`tools`]. What each harness is handed is lowered by that
 //! harness onto its own per-Session seam, from the handoff and the constants
-//! here, which are the same in every one.
+//! here, which are the same in every one — and so is the note each harness
+//! appends to its Agent's instructions, in [`instructions`].
 
 mod access;
+mod instructions;
 mod mcp;
 mod tools;
 
@@ -30,6 +32,7 @@ use tokio::sync::watch;
 
 pub(crate) use access::{BrokerAccess, BrokerCaller, BrokerGrant};
 pub use access::{BrokerEndpoint, BrokerHandoff, BrokerToken};
+pub(crate) use instructions::instruction_note;
 pub(crate) use tools::BrokerTools;
 
 /// Where the Broker is served on the Server's loopback listener.

@@ -1034,10 +1034,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("the launch carries {flag}: {args:?}"))
         };
         let broker = position("--mcp-config");
+        let flags = config.launch_args();
         assert_eq!(
-            args[broker..broker + 4],
-            config.launch_args(),
-            "the launch is pointed at the config and allowlists the Broker's Tools: {args:?}"
+            args[broker..broker + flags.len()],
+            flags,
+            "the launch carries the Broker's flags together: {args:?}"
         );
         assert!(
             position("--resume") < broker && broker < position("--model"),

@@ -10,7 +10,11 @@
 //! `Authorization` header, with a per-server `timeout` above the Broker's longest call, since
 //! Claude's default would abort a call at 60 seconds. Beside it the launch allowlists
 //! `mcp__suru__*`, so no Broker call raises an Approval, a native Subagent's included
-//! (`docs/validation/0408-claude-http-mcp-long-calls.md`).
+//! (`docs/validation/0408-claude-http-mcp-long-calls.md`), and appends the Broker's note to the
+//! Agent's system prompt with `--append-system-prompt`, naming each Tool as Claude does —
+//! `mcp__suru__spawn_subagent` — which is what the Agent selects a deferred MCP Tool by. A system
+//! prompt lives as long as the process it was given to, so every launch, a `--resume` included,
+//! appends it again.
 //!
 //! A file lives as long as the process it was written for: it is removed once that process has
 //! stopped, and in any case when the child holding it is dropped — replaced by the next launch, or
@@ -31,7 +35,7 @@ use serde_json::{Value, json};
 
 use super::claude_error;
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME, instruction_note},
     provider::{BrokerHandoff, ProviderError},
 };
 
@@ -75,13 +79,16 @@ impl BrokerMcpConfig {
         Ok(config)
     }
 
-    /// The flags pointing a launch at this file and allowlisting every Tool the Broker serves.
-    pub(super) fn launch_args(&self) -> [OsString; 4] {
+    /// The flags pointing a launch at this file, allowlisting every Tool the Broker serves, and
+    /// telling the Agent the Broker is there.
+    pub(super) fn launch_args(&self) -> [OsString; 6] {
         [
             OsString::from("--mcp-config"),
             self.path.clone().into_os_string(),
             OsString::from("--allowedTools"),
-            OsString::from(format!("mcp__{BROKER_SERVER_NAME}__*")),
+            OsString::from(tool_name("*")),
+            OsString::from("--append-system-prompt"),
+            OsString::from(instruction_note(tool_name)),
         ]
     }
 
@@ -96,6 +103,11 @@ impl Drop for BrokerMcpConfig {
     fn drop(&mut self) {
         self.remove();
     }
+}
+
+/// What Claude calls the Broker's Tool `tool`, or — for `*` — every Tool the Broker serves.
+fn tool_name(tool: &str) -> String {
+    format!("mcp__{BROKER_SERVER_NAME}__{tool}")
 }
 
 /// The failure a launch reports when its MCP config could not be written.
@@ -152,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_is_pointed_at_the_file_and_allowlists_the_brokers_tools() {
+    fn a_launch_is_pointed_at_the_file_allowlists_the_brokers_tools_and_is_told_of_them() {
         let directory = tempfile::tempdir().expect("create a directory for the config");
         let config =
             BrokerMcpConfig::write_in(directory.path(), &BrokerHandoff::for_tests(ENDPOINT))
@@ -164,6 +176,10 @@ mod tests {
                 config.path.clone().into_os_string(),
                 OsString::from("--allowedTools"),
                 OsString::from("mcp__suru__*"),
+                OsString::from("--append-system-prompt"),
+                OsString::from(crate::broker::instruction_note(|tool| format!(
+                    "mcp__suru__{tool}"
+                ))),
             ]
         );
     }

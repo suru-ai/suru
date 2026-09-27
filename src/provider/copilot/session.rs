@@ -33,7 +33,7 @@ use tokio::time::{Duration, timeout};
 use super::{
     CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_HARNESS_NAME,
     COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
-    broker::broker_mcp_servers,
+    broker::{broker_mcp_servers, broker_system_message},
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
     projection::{CopilotCorrelation, TaskRosterSource, provider_events},
@@ -105,6 +105,7 @@ pub(super) async fn start_copilot_session(
         execution_directory.clone(),
     ));
     let broker = request.broker.as_ref().map(broker_mcp_servers);
+    let broker_note = request.broker.is_some().then(broker_system_message);
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an
@@ -124,6 +125,7 @@ pub(super) async fn start_copilot_session(
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             config.mcp_servers = broker;
+            config.system_message = broker_note;
             let native = until_crash(
                 &handle,
                 RESUME_CONTEXT,
@@ -149,6 +151,7 @@ pub(super) async fn start_copilot_session(
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             config.mcp_servers = broker;
+            config.system_message = broker_note;
             let native = until_crash(
                 &handle,
                 STARTUP_CONTEXT,
