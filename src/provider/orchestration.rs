@@ -1496,22 +1496,16 @@ impl ProviderOrchestrator {
     /// Stops what a Session is doing, whatever that is: the active Turn along
     /// with the Subagents it spawned, or — with no Turn running — the
     /// Subagents alone, or — with nothing Working — the Watches it is
-    /// Monitoring. Interrupting a Subagent's own Session stops that one
+    /// Monitoring. Interrupting a Session whose conversation rides an
+    /// ancestor's Provider actor, as a native Subagent's does, stops that one
     /// Subagent — or, once it has settled and its Session is only Monitoring,
-    /// the Watches in its subtree — through the Provider connection its root
-    /// ancestor owns.
+    /// the Watches in its subtree — through the actor that ancestor owns.
     pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
     ) -> Result<InterruptOutcome, InterruptSessionError> {
-        let actor_commands = |actor_id: SessionId| {
-            self.actors
-                .lock()
-                .expect("Provider actor registry lock is not poisoned")
-                .entries
-                .get(&actor_id)
-                .map(|actor| actor.commands.clone())
-        };
+        let owner_commands =
+            |owner: Option<SessionId>| owner.and_then(|owner| self.actor_commands(owner));
         let stopped: Result<(), InterruptSessionError> = match self
             .sessions
             .interrupt_or_withdraw(session_id)?
@@ -1525,7 +1519,7 @@ impl ProviderOrchestrator {
                 return Ok(InterruptOutcome::WithdrewPrompt { prompt: *prompt });
             }
             InterruptTarget::Turn(turn) => {
-                let actor = actor_commands(session_id).ok_or_else(|| {
+                let actor = self.actor_commands(session_id).ok_or_else(|| {
                     self.fail_unavailable_interruption(
                         session_id,
                         turn.id,
@@ -1553,13 +1547,13 @@ impl ProviderOrchestrator {
                 })?
             }
             InterruptTarget::Subagents => {
-                ask_actor_or_find_nothing_running(actor_commands(session_id), |response| {
+                ask_actor_or_find_nothing_running(self.actor_commands(session_id), |response| {
                     ProviderCommand::InterruptSession { response }
                 })
                 .await
             }
-            InterruptTarget::Subagent { root } => {
-                ask_actor_or_find_nothing_running(actor_commands(root), |response| {
+            InterruptTarget::Subagent { owner } => {
+                ask_actor_or_find_nothing_running(owner_commands(owner), |response| {
                     ProviderCommand::StopSubagent {
                         target: session_id,
                         response,
@@ -1569,10 +1563,11 @@ impl ProviderOrchestrator {
             }
             // Settled by the Watches' own settling, which the Provider
             // reports like any other: nothing here settles a Turn or
-            // withdraws a Prompt. A Subagent's Watches run over its root
-            // ancestor's connection, and only its own subtree's are stopped.
-            InterruptTarget::Watches { root } => {
-                ask_actor_or_find_nothing_running(actor_commands(root), |response| {
+            // withdraws a Prompt. A native Subagent's Watches run over the
+            // connection of the actor its conversation rides, and only its
+            // own subtree's are stopped.
+            InterruptTarget::Watches { owner } => {
+                ask_actor_or_find_nothing_running(owner_commands(owner), |response| {
                     ProviderCommand::StopWatches {
                         target: session_id,
                         response,
@@ -2012,11 +2007,12 @@ async fn run_provider_session(
                     // With no Turn active, the interrupt reaches the work
                     // that outlived it: the Watches the Agent left running
                     // (ADR 0030) and the Subagents (ADR 0015) alike, because
-                    // interrupting a top-level Session stops everything
-                    // below it. Nothing still running answers success,
-                    // because the work the caller meant to stop is already
-                    // over. A Watch stop the Provider refuses still leaves
-                    // the Subagents to stop, and is reported once they are.
+                    // interrupting the Session that owns this actor stops
+                    // everything below it on this actor. Nothing still
+                    // running answers success, because the work the caller
+                    // meant to stop is already over. A Watch stop the
+                    // Provider refuses still leaves the Subagents to stop,
+                    // and is reported once they are.
                     let watches_stopped = stop_live_watches(
                         provider.as_ref().map(|connected| connected.session.clone()),
                         &sessions,

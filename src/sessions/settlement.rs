@@ -38,22 +38,24 @@ pub(crate) enum InterruptSessionError {
 /// still has to reach is the Provider's; the one thing the store settles
 /// itself, it has settled by the time it answers.
 pub(crate) enum InterruptTarget {
-    /// The Session's active Turn. The Provider stops the Turn's background
-    /// work — its Subagents included — before the loop, in the established
-    /// ordering.
+    /// The Session's active Turn, on the Provider actor the Session owns. The
+    /// Provider stops the Turn's background work — its Subagents included —
+    /// before the loop, in the established ordering.
     Turn(Box<Turn>),
     /// No Turn is active, but Subagents below the Session still work; the
-    /// interrupt stops them all.
+    /// interrupt stops them all, through the Provider actor the Session owns.
     Subagents,
-    /// The Session is a Subagent's own, so the interrupt stops that one
-    /// Subagent — through the Provider connection its root ancestor owns.
-    Subagent { root: SessionId },
+    /// The Session's conversation rides the Provider actor of an ancestor, as
+    /// a native Subagent's does, so the interrupt stops that one Subagent
+    /// through the actor `owner` owns. With no owner — a lineage that left
+    /// the store — no actor can be running any of it.
+    Subagent { owner: Option<SessionId> },
     /// Nothing is Working, but the Session is Monitoring: the interrupt asks
     /// the Provider to stop the Watches live in its subtree, and none above
-    /// it — through the Provider connection its root ancestor owns, which is
-    /// the Session itself for a top-level one. No Turn settles and no Prompt
-    /// is withdrawn; the Session goes idle as they settle.
-    Watches { root: SessionId },
+    /// it — through the actor `owner` owns, which is the Session itself where
+    /// it owns one. No Turn settles and no Prompt is withdrawn; the Session
+    /// goes idle as they settle.
+    Watches { owner: Option<SessionId> },
     /// The Session was Working only because it owed a Turn to a Prompt it had
     /// not delivered, so the interrupt withdrew that Prompt where it stood.
     /// The Prompt is already Cancelled by the time this is returned: the
@@ -70,10 +72,10 @@ enum InterruptReading {
     Turn(Box<Turn>),
     Subagents,
     Subagent {
-        root: SessionId,
+        owner: Option<SessionId>,
     },
     Watches {
-        root: SessionId,
+        owner: Option<SessionId>,
     },
     /// No work is under way: the Session is Working only because it owes a
     /// Turn to this Prompt, which it has admitted and not delivered.
@@ -374,10 +376,12 @@ impl SessionStore {
         let prompt = match state.interrupt_reading(session_id)? {
             InterruptReading::Turn(turn) => return Ok(InterruptTarget::Turn(turn)),
             InterruptReading::Subagents => return Ok(InterruptTarget::Subagents),
-            InterruptReading::Subagent { root } => {
-                return Ok(InterruptTarget::Subagent { root });
+            InterruptReading::Subagent { owner } => {
+                return Ok(InterruptTarget::Subagent { owner });
             }
-            InterruptReading::Watches { root } => return Ok(InterruptTarget::Watches { root }),
+            InterruptReading::Watches { owner } => {
+                return Ok(InterruptTarget::Watches { owner });
+            }
             InterruptReading::UndeliveredPrompt(prompt) => prompt,
         };
         let prompt_id = prompt.id;
@@ -398,22 +402,6 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
-    /// The Session whose Provider actor holds `session_id`'s conversation:
-    /// its root ancestor. The walk stops where the chain leaves the store: a
-    /// Subagent severed from its lineage has no actor left to reach, and the
-    /// caller finds nothing to stop under whatever Session the walk ends on.
-    fn root_of(&self, session_id: SessionId) -> SessionId {
-        let mut root = session_id;
-        while let Some(parent) = self
-            .sessions
-            .get(&root)
-            .and_then(|record| record.snapshot.session.parent)
-        {
-            root = parent;
-        }
-        root
-    }
-
     /// The reading itself, taken off a locked store so both the question that
     /// only looks and the one that acts ask it of the same state.
     fn interrupt_reading(
@@ -424,19 +412,24 @@ impl SessionStoreState {
             .sessions
             .get(&session_id)
             .ok_or(InterruptSessionError::SessionNotFound)?;
-        if record.snapshot.session.parent.is_some() {
-            let root = self.root_of(session_id);
-            // A Subagent whose own work has settled, with nothing below it
-            // Working either, can only be Monitoring: its Watches outlive it,
-            // and stopping them — its subtree's, never those of the Sessions
-            // above — is the whole interrupt (ADR 0030). Anything still
-            // Working is that Subagent to stop.
+        let owner = self.actor_owner_of(session_id);
+        if owner != Some(session_id) {
+            // The Session's conversation rides an ancestor's Provider actor,
+            // as a native Subagent's does, so what the interrupt reaches is
+            // that one Subagent, through that actor. A Subagent whose own
+            // work has settled, with nothing below it Working either, can
+            // only be Monitoring: its Watches outlive it, and stopping them —
+            // its subtree's, never those of the Sessions above — is the whole
+            // interrupt (ADR 0030). Anything still Working is that Subagent
+            // to stop.
             let session = &record.snapshot.session;
             if session.working_since.is_none() && session.monitoring_since.is_some() {
-                return Ok(InterruptReading::Watches { root });
+                return Ok(InterruptReading::Watches { owner });
             }
-            return Ok(InterruptReading::Subagent { root });
+            return Ok(InterruptReading::Subagent { owner });
         }
+        // From here the Session owns the Provider actor its work runs on, so
+        // whatever the interrupt stops, it stops through that actor.
         if let Some(turn) = record
             .snapshot
             .turns
@@ -472,7 +465,7 @@ impl SessionStoreState {
         if record.snapshot.session.monitoring_since.is_some() {
             // Only Watches are left, and nothing a Turn owns: stopping them
             // is the whole interrupt (ADR 0030).
-            return Ok(InterruptReading::Watches { root: session_id });
+            return Ok(InterruptReading::Watches { owner });
         }
         Err(InterruptSessionError::NothingToInterrupt)
     }
