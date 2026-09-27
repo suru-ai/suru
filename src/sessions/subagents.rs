@@ -16,7 +16,7 @@ use crate::protocol::{
     SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 use crate::provider::ProviderSubagentId;
-use crate::storage::StoredSubagentIdentity;
+use crate::storage::{PersistedSession, StoredSubagentIdentity};
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore,
@@ -175,12 +175,14 @@ impl SessionStore {
                 resume_states: HashMap::new(),
                 subagent_identity: Some(identity.clone()),
                 // A native Subagent's conversation rides its spawner's actor.
-                own_provider_actor: false,
+                brokered: false,
                 watches: HashMap::new(),
             },
         );
-        self.storage
-            .created(persisted_summary, snapshot, Some(identity));
+        self.storage.created(PersistedSession {
+            subagent_identity: Some(identity),
+            ..PersistedSession::created(persisted_summary, snapshot)
+        });
         // The child begins working the moment it exists, which the listed
         // root's Working reading has to carry. Its total is derived on the
         // same terms, so both readings above it are answered from the same

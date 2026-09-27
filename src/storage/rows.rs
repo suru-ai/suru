@@ -148,6 +148,7 @@ pub(super) struct SessionRow {
     revision: i64,
     parent_session_id: Option<String>,
     context_fill: Option<String>,
+    brokered: bool,
 }
 
 #[derive(Insertable, Queryable, Selectable)]
@@ -292,6 +293,7 @@ impl StoredRows {
             snapshot,
             resume_states: _,
             subagent_identity,
+            brokered,
         } = persisted;
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
@@ -301,7 +303,7 @@ impl StoredRows {
             .enumerate()
             .map(|(order, item)| (transcript_identity(*item), order))
             .collect::<HashMap<_, _>>();
-        let session = SessionRow::from_parts(summary, snapshot.revision)?;
+        let session = SessionRow::from_parts(summary, snapshot.revision, brokered)?;
         let prompts = snapshot
             .prompts
             .into_iter()
@@ -370,6 +372,7 @@ impl SessionRow {
     fn from_parts(
         summary: SessionSummary,
         revision: SessionRevision,
+        brokered: bool,
     ) -> Result<Self, StorageError> {
         let session_id = summary.session.id;
         Ok(Self {
@@ -409,6 +412,7 @@ impl SessionRow {
                 .as_ref()
                 .map(|fill| encode(session_id, "Context Fill", fill))
                 .transpose()?,
+            brokered,
         })
     }
 
@@ -500,6 +504,13 @@ impl SessionRow {
 
     pub(super) fn is_child(&self) -> bool {
         self.parent_session_id.is_some()
+    }
+
+    /// Whether the row is a brokered Subagent's Session, read apart from the
+    /// summary because it is a fact about where the Session's Provider work
+    /// runs rather than anything a reader is shown.
+    pub(super) fn brokered(&self) -> bool {
+        self.brokered
     }
 
     pub(super) fn parent_id(&self) -> Result<Option<SessionId>, StorageError> {

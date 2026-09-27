@@ -190,6 +190,7 @@ impl SessionStore {
                 snapshot: record.snapshot.clone(),
                 resume_states: record.resume_states.clone(),
                 subagent_identity: record.subagent_identity.clone(),
+                brokered: record.brokered,
             })?;
         }
         // A Prompt owed a Turn is owed it by the process that admitted it, and
@@ -424,8 +425,9 @@ pub(super) fn restored_record(
         summary: persisted.summary,
         resume_states: persisted.resume_states,
         subagent_identity: persisted.subagent_identity,
-        // Nothing stored yet gives a Subagent's Session an actor of its own.
-        own_provider_actor: false,
+        // A brokered Subagent's Session keeps the actor of its own it was
+        // spawned with, so a restart routes its Provider work as before.
+        brokered: persisted.brokered,
         updates,
         next_prompt_order,
         steer_targets: Default::default(),

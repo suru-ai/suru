@@ -7,8 +7,8 @@ use super::{SessionStore, restoration_tests::persisted};
 use crate::{
     protocol::{
         AgentSelection, ApprovalPosture, ApprovalPostureApplication, ClaudePermissionMode,
-        EffectiveSettings, ModelId, ProviderId, SessionApprovalPosture, SessionId, SessionListItem,
-        SessionSnapshot,
+        CodexApprovalPolicy, CodexSandboxMode, EffectiveSettings, ModelId, ProviderId,
+        SessionApprovalPosture, SessionId, SessionListItem, SessionSnapshot,
     },
     storage::{PersistedSession, StorageRepository, StorageWriter},
 };
@@ -46,7 +46,7 @@ async fn deferred_store(
     let repository = StorageRepository::open(workspace).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
     for record in records {
-        sink.created(record.summary, record.snapshot, record.subagent_identity);
+        sink.created(record);
     }
     writer.shutdown().await.unwrap();
     let restored = repository.load_sessions().await.unwrap();
@@ -206,4 +206,65 @@ async fn reconciling_one_session_refreshes_its_tree_and_no_other() {
         "an unrelated root is not this reconcile's to refresh"
     );
     writer.shutdown().await.unwrap();
+}
+
+/// A brokered Subagent owns its Provider actor across a restart: the next
+/// process reads it back brokered, so hydration leaves it the posture its
+/// spawn gave it for its own Provider rather than handing it its spawner's,
+/// as it would a native Subagent's riding the spawner's actor (ADR 0035).
+#[tokio::test]
+async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_and_posture() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = stale(directory.path(), None);
+    let root_id = root.snapshot.session.id;
+    let mut child = PersistedSession {
+        brokered: true,
+        ..persisted(directory.path(), Some(root_id))
+    };
+    let codex = SessionApprovalPosture {
+        value: ApprovalPosture::Codex {
+            approval_policy: CodexApprovalPolicy::Never,
+            sandbox_mode: CodexSandboxMode::WorkspaceWrite,
+        },
+        pinned: false,
+        application: ApprovalPostureApplication::Applied,
+    };
+    child.snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5.5"),
+        options: Vec::new(),
+    });
+    child.snapshot.session.approval_posture = Some(codex);
+    child.summary.session = child.snapshot.session.clone();
+    let child_id = child.snapshot.session.id;
+    let (repository, writer, store) = deferred_store(directory.path(), vec![root, child]).await;
+
+    assert_eq!(
+        store.actor_owner(child_id),
+        Some(child_id),
+        "a brokered Subagent owns its actor before its history is read"
+    );
+    store.hydrate(child_id).await.unwrap();
+    assert_eq!(store.actor_owner(child_id), Some(child_id), "and after");
+    assert_eq!(
+        snapshot(&store, child_id).session.approval_posture,
+        Some(codex),
+        "its posture is its own, not its Claude spawner's"
+    );
+    assert_eq!(
+        snapshot(&store, root_id).session.approval_posture,
+        Some(claude_posture(ClaudePermissionMode::Default)),
+        "while its spawner catches up with the Settings as ever"
+    );
+
+    writer.shutdown().await.unwrap();
+    assert!(
+        repository
+            .session(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .brokered,
+        "and the next process reads it back brokered again"
+    );
 }

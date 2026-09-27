@@ -21,9 +21,9 @@ use super::{SessionRecord, SessionStore, SessionStoreState};
 impl SessionRecord {
     /// Whether this Session owns the Provider actor its conversation runs on:
     /// a top-level Session always does, and a Subagent's Session does only
-    /// when it was given an actor of its own.
+    /// when it is a brokered Subagent's, given an actor of its own.
     pub(super) fn owns_provider_actor(&self) -> bool {
-        self.snapshot.session.parent.is_none() || self.own_provider_actor
+        self.snapshot.session.parent.is_none() || self.brokered
     }
 }
 
@@ -122,17 +122,13 @@ mod tests {
         (store, writer)
     }
 
-    /// Gives a Subagent's Session a Provider actor of its own, as a brokered
-    /// Subagent's will be given one.
-    fn give_own_actor(store: &SessionStore, session_id: SessionId) {
-        store
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .get_mut(&session_id)
-            .expect("the Session is held")
-            .own_provider_actor = true;
+    /// A Subagent's Session as a brokered Subagent's is stored: spawned
+    /// through the Broker, with a Provider actor of its own.
+    fn brokered(workspace: &std::path::Path, parent: SessionId) -> PersistedSession {
+        PersistedSession {
+            brokered: true,
+            ..persisted(workspace, Some(parent))
+        }
     }
 
     #[tokio::test]
@@ -163,13 +159,12 @@ mod tests {
         let top_level_id = top_level.snapshot.session.id;
         let native = persisted(directory.path(), Some(top_level_id));
         let native_id = native.snapshot.session.id;
-        let owning = persisted(directory.path(), Some(native_id));
+        let owning = brokered(directory.path(), native_id);
         let owning_id = owning.snapshot.session.id;
         let below = persisted(directory.path(), Some(owning_id));
         let below_id = below.snapshot.session.id;
         let (store, writer) =
             restored(directory.path(), vec![top_level, native, owning, below]).await;
-        give_own_actor(&store, owning_id);
 
         assert_eq!(store.actor_owner(top_level_id), Some(top_level_id));
         assert_eq!(
@@ -201,15 +196,30 @@ mod tests {
         let owning_id = owning.snapshot.session.id;
         let below = persisted(directory.path(), Some(owning_id));
         let below_id = below.snapshot.session.id;
-        let (store, writer) =
-            restored(directory.path(), vec![top_level, native, owning, below]).await;
+        let (store, writer) = restored(
+            directory.path(),
+            vec![
+                top_level.clone(),
+                native.clone(),
+                owning.clone(),
+                below.clone(),
+            ],
+        )
+        .await;
 
         assert_eq!(
             store.state.lock().unwrap().actor_subtree(top_level_id),
             [top_level_id, native_id, owning_id, below_id],
             "with one actor, it reaches the whole subtree"
         );
-        give_own_actor(&store, owning_id);
+        writer.shutdown().await.unwrap();
+
+        let owning = PersistedSession {
+            brokered: true,
+            ..owning
+        };
+        let (store, writer) =
+            restored(directory.path(), vec![top_level, native, owning, below]).await;
         {
             let state = store.state.lock().unwrap();
             assert_eq!(

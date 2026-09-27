@@ -16,7 +16,7 @@ use crate::protocol::{
     SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
 };
 
-use crate::storage::StorageSink;
+use crate::storage::{PersistedSession, StorageSink};
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState, StoreOutcome,
@@ -522,12 +522,14 @@ impl SessionStore {
                 resume_states: HashMap::new(),
                 subagent_identity: None,
                 // A top-level Session owns its actor by having no parent.
-                own_provider_actor: false,
+                brokered: false,
                 watches: HashMap::new(),
             },
         );
-        self.storage
-            .created(persisted_summary, snapshot.clone(), None);
+        self.storage.created(PersistedSession::created(
+            persisted_summary,
+            snapshot.clone(),
+        ));
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });
         Ok(StoreOutcome::Created(snapshot))
     }

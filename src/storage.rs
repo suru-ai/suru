@@ -38,7 +38,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260926000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260927000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -57,6 +57,7 @@ diesel::table! {
         revision -> BigInt,
         parent_session_id -> Nullable<Text>,
         context_fill -> Nullable<Text>,
+        brokered -> Bool,
     }
 }
 
@@ -155,6 +156,26 @@ pub(crate) struct PersistedSession {
     /// Set exactly on a Subagent's child Session: the Provider's own identity
     /// for the Subagent it is, stored with it from its spawn.
     pub(crate) subagent_identity: Option<StoredSubagentIdentity>,
+    /// Whether the Session is a brokered Subagent's, which gives it a
+    /// Provider actor of its own (ADR 0035). Fixed at the spawn and stored
+    /// with the Session, so the next process routes its Provider work the way
+    /// this one did.
+    pub(crate) brokered: bool,
+}
+
+impl PersistedSession {
+    /// A Session just created, before its Provider has kept anything for it:
+    /// no Resume State, and — until the caller says otherwise — nothing its
+    /// spawn fixed about it, as for a top-level Session.
+    pub(crate) fn created(summary: SessionSummary, snapshot: SessionSnapshot) -> Self {
+        Self {
+            summary,
+            snapshot,
+            resume_states: HashMap::new(),
+            subagent_identity: None,
+            brokered: false,
+        }
+    }
 }
 
 /// The Provider's own identity for the Subagent a child Session is — Claude's
@@ -596,6 +617,7 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
         let parent = row.parent_id().ok().flatten();
         deferred.parents.insert(unreadable.summary.id, parent);
         let turns = by_session.remove(&row.id).unwrap_or_default();
+        let brokered = row.brokered();
         let result = (|| {
             let (mut summary, revision) = row.into_summary_and_revision()?;
             let turns = turns
@@ -628,6 +650,7 @@ fn load_sessions(database_path: &Path) -> Result<RestoredSessions, StorageError>
                 snapshot,
                 resume_states: HashMap::new(),
                 subagent_identity: None,
+                brokered,
             })
         })();
         match result {
@@ -657,6 +680,7 @@ fn load_session(
     row: SessionRow,
 ) -> Result<PersistedSession, StorageError> {
     let stored_session_id = row.id.clone();
+    let brokered = row.brokered();
     let (mut summary, revision) = row.into_summary_and_revision()?;
     let prompt_rows = prompts::table
         .filter(prompts::session_id.eq(&stored_session_id))
@@ -776,6 +800,7 @@ fn load_session(
         snapshot,
         resume_states,
         subagent_identity: subagent_identity_row.map(ProviderSubagentIdentityRow::into_identity),
+        brokered,
     })
 }
 

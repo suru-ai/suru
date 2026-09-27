@@ -14,15 +14,13 @@ use std::{
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, SessionChange, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-        SessionUpdate, WorkspaceId,
+        AgentSelection, SessionChange, SessionId, SessionStatus, SessionSummary, SessionUpdate,
+        WorkspaceId,
     },
     session_projection::apply_update,
 };
 
-use super::{
-    PersistedSession, StorageError, StorageRepository, StoredResumeState, StoredSubagentIdentity,
-};
+use super::{PersistedSession, StorageError, StorageRepository, StoredResumeState};
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
@@ -293,21 +291,13 @@ impl StorageSink {
     }
 
     /// Records a Session just created — a Subagent's child Session together
-    /// with the Provider's identity for it, which lands in the same flush.
-    pub(crate) fn created(
-        &self,
-        summary: SessionSummary,
-        snapshot: SessionSnapshot,
-        subagent_identity: Option<StoredSubagentIdentity>,
-    ) {
+    /// with what its spawn fixed about it, the Provider's identity for a
+    /// native one or that a brokered one is brokered, which lands in the same
+    /// flush.
+    pub(crate) fn created(&self, persisted: PersistedSession) {
         let _ = self
             .commands
-            .send(WriterCommand::Create(Box::new(PersistedSession {
-                summary,
-                snapshot,
-                resume_states: HashMap::new(),
-                subagent_identity,
-            })));
+            .send(WriterCommand::Create(Box::new(persisted)));
     }
 
     /// Records catalog-only metadata. Fire-and-forget on the same terms as
