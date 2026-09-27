@@ -15,8 +15,8 @@ use crate::{
         ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         ProviderUnavailability, SessionId, TurnStatus,
     },
-    provider::{BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator},
-    sessions::{BrokeredReadError, BrokeredSubagentReading, SessionStore},
+    provider::{BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator},
+    sessions::{BrokeredReadError, BrokeredSpawnCap, BrokeredSubagentReading, SessionStore},
 };
 
 /// One Tool the Broker offers. A new Tool is a variant here, its description
@@ -180,7 +180,9 @@ shape {\"session_id\": \"...\"}, the id of the Subagent's own Session. The \
 Subagent stands as a row in your Transcript while it works and once it \
 settles. A Provider that is turned off or cannot be used now, a Model it does \
 not offer, or an option value the Model does not take is refused, saying what \
-was wrong.";
+was wrong. So is a spawn that would pass the user's limits on how deep \
+Subagents spawned this way nest or how many work at once beneath the top-level \
+Session; it is never queued.";
 
 const READ_SUBAGENT_DESCRIPTION: &str = "\
 Read how a Subagent spawned with spawn_subagent is doing — one you spawned, or \
@@ -292,7 +294,7 @@ impl BrokerTools {
                             delegation: spawn.prompt,
                         },
                     )
-                    .map_err(ToolRefusal)?;
+                    .map_err(spawn_refusal)?;
                 Ok(json!({ "session_id": session_id }))
             }
             BrokerTool::ReadSubagent => self.read_subagent(call),
@@ -319,6 +321,43 @@ impl BrokerTools {
             .map_err(|error| read_refusal(error, subagent))?;
         Ok(serde_json::to_value(SubagentReadout::from(reading))
             .expect("a Subagent's reading always serializes"))
+    }
+}
+
+/// What a refused spawn tells the delegating Agent. A cap is named with the
+/// Setting that pins it and what the Agent may do instead, so it waits or
+/// reconsiders rather than believing work has begun.
+fn spawn_refusal(refusal: BrokeredSpawnRefusal) -> ToolRefusal {
+    match refusal {
+        BrokeredSpawnRefusal::Refused(reason) => ToolRefusal(reason),
+        BrokeredSpawnRefusal::Capped(BrokeredSpawnCap::Depth { max_depth, depth }) => {
+            ToolRefusal(format!(
+                "Suru's Broker lets Subagents stand at most {max_depth} {sessions} deep, counting \
+                 the top-level Session as the first (`broker.maxDepth`), and one spawned here \
+                 would stand {depth} deep, so nothing was spawned. Do this work yourself, or ask \
+                 the user to raise the Setting.",
+                sessions = if max_depth == 1 {
+                    "Session"
+                } else {
+                    "Sessions"
+                },
+            ))
+        }
+        BrokeredSpawnRefusal::Capped(BrokeredSpawnCap::Concurrency {
+            max_concurrent_subagents,
+            working,
+        }) => ToolRefusal(format!(
+            "Suru's Broker lets at most {max_concurrent_subagents} brokered {subagents} work at \
+             once beneath a top-level Session (`broker.maxConcurrentSubagents`), and {working} \
+             {are} working now, so nothing was spawned. Wait for one to settle, or ask the user \
+             to raise the Setting.",
+            subagents = if max_concurrent_subagents == 1 {
+                "Subagent"
+            } else {
+                "Subagents"
+            },
+            are = if working == 1 { "is" } else { "are" },
+        )),
     }
 }
 
@@ -1436,5 +1475,53 @@ mod tests {
             );
         }
         assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    /// A cap is refused in words naming the Setting that pins it — one the
+    /// schema declares, so the Agent may send the user straight to it — and
+    /// read naturally at a cap of one.
+    #[test]
+    fn a_spawn_past_a_cap_is_refused_naming_the_setting_that_pins_it() {
+        let depth = spawn_refusal(BrokeredSpawnRefusal::Capped(BrokeredSpawnCap::Depth {
+            max_depth: 1,
+            depth: 2,
+        }))
+        .to_string();
+        assert_eq!(
+            depth,
+            "Suru's Broker lets Subagents stand at most 1 Session deep, counting the top-level \
+             Session as the first (`broker.maxDepth`), and one spawned here would stand 2 deep, \
+             so nothing was spawned. Do this work yourself, or ask the user to raise the Setting."
+        );
+        let concurrency = spawn_refusal(BrokeredSpawnRefusal::Capped(
+            BrokeredSpawnCap::Concurrency {
+                max_concurrent_subagents: 1,
+                working: 1,
+            },
+        ))
+        .to_string();
+        assert_eq!(
+            concurrency,
+            "Suru's Broker lets at most 1 brokered Subagent work at once beneath a top-level \
+             Session (`broker.maxConcurrentSubagents`), and 1 is working now, so nothing was \
+             spawned. Wait for one to settle, or ask the user to raise the Setting."
+        );
+        for (refusal, key) in [
+            (&depth, "broker.maxDepth"),
+            (&concurrency, "broker.maxConcurrentSubagents"),
+        ] {
+            assert!(refusal.contains(&format!("`{key}`")), "{refusal}");
+            assert!(
+                crate::settings::SCHEMA
+                    .iter()
+                    .any(|descriptor| descriptor.key == key),
+                "the refusal names {key}, which the schema declares"
+            );
+        }
+        assert_eq!(
+            spawn_refusal(BrokeredSpawnRefusal::Refused("Not today.".to_owned())).to_string(),
+            "Not today.",
+            "any other refusal is passed on in the words it came in"
+        );
     }
 }

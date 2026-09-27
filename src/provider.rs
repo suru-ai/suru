@@ -35,7 +35,8 @@ pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{
-    BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator, ProviderUpdateGate,
+    BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator,
+    ProviderUpdateGate,
 };
 
 /// What one successful Provider catalog discovery found. Models are the

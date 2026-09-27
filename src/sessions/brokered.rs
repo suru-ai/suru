@@ -26,13 +26,13 @@ use std::fmt;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityStatus, AgentSelection, Message, MessageRole, SessionChange, SessionId,
-    SessionSnapshot, SessionTimestamp, Turn, TurnId, TurnStatus,
+    Activity, ActivityStatus, AgentSelection, BrokerSettings, Message, MessageRole, SessionChange,
+    SessionId, SessionSnapshot, SessionTimestamp, Turn, TurnId, TurnStatus,
 };
 use crate::storage::StorageSink;
 
 use super::{
-    SessionStore, SessionStoreState,
+    SessionRecord, SessionStore, SessionStoreState,
     posture::brokered_subagent_posture,
     projection::active_turn_id,
     subagents::{
@@ -78,6 +78,10 @@ pub(crate) enum BrokeredSpawnError {
     /// The calling Session is not one the store holds ready: deleted, or its
     /// history still unread.
     CallerNotFound,
+    /// The spawn would pass a cap the Broker's Settings put on brokered
+    /// Subagents, so nothing of it was created — and nothing of it waits for
+    /// room to be made.
+    Capped(BrokeredSpawnCap),
     Storage(String),
 }
 
@@ -86,9 +90,38 @@ impl fmt::Display for BrokeredSpawnError {
         match self {
             Self::CallerNotFound => formatter
                 .write_str("the Session calling the Broker no longer exists on this Suru server"),
+            Self::Capped(BrokeredSpawnCap::Depth { max_depth, .. }) => write!(
+                formatter,
+                "it would stand deeper than the {max_depth} Sessions `broker.maxDepth` allows"
+            ),
+            Self::Capped(BrokeredSpawnCap::Concurrency {
+                max_concurrent_subagents,
+                ..
+            }) => write!(
+                formatter,
+                "{max_concurrent_subagents} brokered Subagents already work beneath its \
+                 top-level Session, as many as `broker.maxConcurrentSubagents` allows"
+            ),
             Self::Storage(message) => write!(formatter, "Suru could not record it: {message}"),
         }
     }
+}
+
+/// A cap the Broker's Settings put on brokered Subagents, which a spawn would
+/// pass: it is refused rather than queued, with what the delegating Agent
+/// needs to be told why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokeredSpawnCap {
+    /// The Subagent would stand `depth` Sessions deep — its top-level Session
+    /// counting as the first — deeper than `broker.maxDepth` allows.
+    Depth { max_depth: u32, depth: usize },
+    /// `working` brokered Subagents already work beneath the caller's
+    /// top-level Session: as many as `broker.maxConcurrentSubagents` allows,
+    /// or more where the cap was lowered after they were spawned.
+    Concurrency {
+        max_concurrent_subagents: u32,
+        working: usize,
+    },
 }
 
 /// How a brokered Subagent stands, as the Agents above it read it through the
@@ -134,6 +167,14 @@ impl SessionStore {
     /// from the caller's Agent. It owns a Provider actor of its own, and
     /// acts under the Approval Posture [`brokered_subagent_posture`] gives it.
     ///
+    /// A spawn that would pass either of the Broker's caps is refused before
+    /// anything is created: one placing the Subagent deeper than
+    /// `broker.maxDepth`, or one made while as many brokered Subagents as
+    /// `broker.maxConcurrentSubagents` allows already work beneath the
+    /// caller's top-level Session. The count is taken under the same lock the
+    /// spawn is made in, so spawns racing each other cannot both slip under
+    /// the cap; see [`SessionStoreState::brokered_spawn_cap`].
+    ///
     /// The row that stands for it joins the caller's working Turn in the same
     /// lock, so no reader sees the child without its row or the row without
     /// the child. A caller with no Turn working — its Turn settled while its
@@ -157,10 +198,13 @@ impl SessionStore {
         if state.is_deferred(caller) {
             return Err(BrokeredSpawnError::CallerNotFound);
         }
-        let record = state
-            .sessions
-            .get(&caller)
-            .ok_or(BrokeredSpawnError::CallerNotFound)?;
+        if !state.sessions.contains_key(&caller) {
+            return Err(BrokeredSpawnError::CallerNotFound);
+        }
+        if let Some(cap) = state.brokered_spawn_cap(caller, &settings.broker) {
+            return Err(BrokeredSpawnError::Capped(cap));
+        }
+        let record = &state.sessions[&caller];
         let holding = match active_turn_id(&record.snapshot)
             .map_err(|error| BrokeredSpawnError::Storage(error.to_string()))?
         {
@@ -311,6 +355,57 @@ pub(super) fn repaired_settlements(changes: &[SessionChange]) -> Vec<TurnId> {
 }
 
 impl SessionStoreState {
+    /// The cap a brokered spawn under `caller` would pass, read against the
+    /// Broker's Settings `broker`, or `None` where there is room for it.
+    ///
+    /// Depth counts Sessions from the top-level Session down, whatever route
+    /// spawned each, since a tree's shape is the same whoever spawned into it:
+    /// the top-level Session stands one deep and the Subagent would stand one
+    /// deeper than `caller`. A tree too deep is refused first, since waiting
+    /// makes no room there.
+    ///
+    /// Concurrency counts the brokered Subagents working anywhere beneath the
+    /// caller's top-level Session — its own, and every Subagent's at any
+    /// depth — each by its own latest Turn, so a settled Subagent frees its
+    /// slot even while work it delegated goes on, and that work counts for
+    /// itself. A native Subagent is not counted: Suru cannot refuse its
+    /// Provider's spawns, so it cannot hold them to the cap either.
+    fn brokered_spawn_cap(
+        &self,
+        caller: SessionId,
+        broker: &BrokerSettings,
+    ) -> Option<BrokeredSpawnCap> {
+        let line = self
+            .ancestors(caller)
+            .map(|(session_id, _)| session_id)
+            .collect::<Vec<_>>();
+        let depth = line.len() + 1;
+        if depth > broker.max_depth as usize {
+            return Some(BrokeredSpawnCap::Depth {
+                max_depth: broker.max_depth,
+                depth,
+            });
+        }
+        // The line's last Session heads the tree: the top-level Session, or
+        // — for a line restoration left broken — the highest Session held.
+        let top_level = *line.last()?;
+        let working = self
+            .actor_owners_beneath(top_level)
+            .into_iter()
+            .filter(|session_id| {
+                self.sessions.get(session_id).is_some_and(|record| {
+                    record.is_brokered_subagent() && record.is_at_work_itself()
+                })
+            })
+            .count();
+        (working >= broker.max_concurrent_subagents as usize).then_some(
+            BrokeredSpawnCap::Concurrency {
+                max_concurrent_subagents: broker.max_concurrent_subagents,
+                working,
+            },
+        )
+    }
+
     /// Carries what a commit to a brokered Subagent's Session did to one of
     /// its Turns onto the row that Turn's stretch of work stands as: the
     /// Model its Provider confirmed for the Turn, and — once the Turn settles
@@ -543,6 +638,18 @@ impl SessionStoreState {
             Some((status, duration_ms)) if status != ActivityStatus::Active => duration_ms,
             _ => turn.worked_ms(),
         }
+    }
+}
+
+impl SessionRecord {
+    /// Whether this Session's own Agent is at work: its latest Turn has not
+    /// Settled. A Subagent whose latest Turn has Settled is a settled one
+    /// (CONTEXT.md: Subagent), whatever still works beneath it.
+    fn is_at_work_itself(&self) -> bool {
+        self.snapshot
+            .turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Active)
     }
 }
 

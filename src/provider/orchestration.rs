@@ -37,11 +37,11 @@ use crate::protocol::{
     TurnId, TurnStatus,
 };
 use crate::sessions::{
-    ApprovalPostureUpdate, BrokeredSpawn, DelegatingAgent, DeliveredDelegation, DeliveredTurn,
-    DeliveredTurnStatus, InterruptSessionError, InterruptTarget, OpenInterventions,
-    ProviderTurnOutcome, SessionStore, StoredSubagent, TrailingCommandOutput,
-    command_output_changes, earliest_pending_prompt, message_content_changes, opening_subagent_row,
-    reasoning_content_changes,
+    ApprovalPostureUpdate, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError, DelegatingAgent,
+    DeliveredDelegation, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
+    InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore, StoredSubagent,
+    TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
+    message_content_changes, opening_subagent_row, reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::StoredSubagentIdentity;
@@ -125,6 +125,17 @@ pub(crate) struct BrokeredSubagentRequest {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) delegation: String,
+}
+
+/// Why a brokered spawn was refused, for the Broker to tell the delegating
+/// Agent.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BrokeredSpawnRefusal {
+    /// The spawn would pass a cap the Broker's Settings put on brokered
+    /// Subagents. Nothing of it was created, and nothing waits for room.
+    Capped(BrokeredSpawnCap),
+    /// Any other reason, already in words the delegating Agent reads.
+    Refused(String),
 }
 
 struct ProviderActors {
@@ -1244,27 +1255,35 @@ impl ProviderOrchestrator {
     ///
     /// Refused, in words the delegating Agent reads, for a Provider this
     /// server does not host or the user has turned off, and an empty
-    /// Delegation.
+    /// Delegation; and refused with the cap it would pass, for a spawn past
+    /// one of the Broker's caps, which the store holds it to.
     pub(crate) fn spawn_brokered_subagent(
         &self,
         caller: SessionId,
         request: BrokeredSubagentRequest,
-    ) -> Result<SessionId, String> {
+    ) -> Result<SessionId, BrokeredSpawnRefusal> {
         let provider = request.selection.provider.clone();
         let runtime = self
             .runtimes
             .iter()
             .find(|runtime| runtime.provider_id() == provider)
             .cloned()
-            .ok_or_else(|| format!("Provider `{provider}` is not hosted by this Suru server."))?;
+            .ok_or_else(|| {
+                BrokeredSpawnRefusal::Refused(format!(
+                    "Provider `{provider}` is not hosted by this Suru server."
+                ))
+            })?;
         if !self.is_enabled(&provider) {
-            return Err(format!(
+            return Err(BrokeredSpawnRefusal::Refused(format!(
                 "Provider `{provider}` is turned off in Suru's Settings; ask the user to turn \
                  `provider.{provider}.enabled` back on, or choose another Provider."
-            ));
+            )));
         }
-        let delegation = delegation_text(&request.delegation)
-            .ok_or_else(|| "The prompt is empty: say what the Subagent is to do.".to_owned())?;
+        let delegation = delegation_text(&request.delegation).ok_or_else(|| {
+            BrokeredSpawnRefusal::Refused(
+                "The prompt is empty: say what the Subagent is to do.".to_owned(),
+            )
+        })?;
         let delivered = delegation.content.clone();
         let spawned = self
             .sessions
@@ -1277,7 +1296,12 @@ impl ProviderOrchestrator {
                     delegation,
                 },
             )
-            .map_err(|error| format!("Suru could not spawn the Subagent: {error}."))?;
+            .map_err(|error| match error {
+                BrokeredSpawnError::Capped(cap) => BrokeredSpawnRefusal::Capped(cap),
+                error => BrokeredSpawnRefusal::Refused(format!(
+                    "Suru could not spawn the Subagent: {error}."
+                )),
+            })?;
         let input = delegated_prompt(&spawned.delegator, &delivered);
         let started = self
             .sessions
