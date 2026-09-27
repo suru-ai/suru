@@ -94,7 +94,10 @@ raised one:
   `{"name": "capture", "status": "connected", "source": "dynamic"}`.
 - **Deferred Tools:** in 2.1.283 the server's Tools sit behind `ToolSearch`.
   Before its first use of a Tool, the Model called `ToolSearch` with
-  `select:mcp__capture__echo_context`.
+  `select:mcp__capture__echo_context`. A native `ToolSearch` call will
+  therefore precede each first use of a Broker Tool. #411's projection guard
+  must not mistake it for a Broker call, and #414's instruction note should
+  name the Broker's Tools so the Agent selects them.
 
 ## Decision
 

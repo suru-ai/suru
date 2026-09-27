@@ -2,8 +2,10 @@
 
 Captured 2026-09-27 against GitHub Copilot CLI **1.0.88** (`/usr/bin/copilot`,
 signed in), through the pinned `github-copilot-sdk` **1.0.15-preview.3**, with
-Model `gpt-5-mini`. `examples/broker_harness_capture.rs copilot slow` started a
-CLI through the SDK, as Suru's Copilot Provider does, and created one Session:
+Model `gpt-5-mini`. The official SDK checkout was at
+`d106d29dc6c5112da2abdae59008571b6692f12b`. `examples/broker_harness_capture.rs
+copilot slow` started a CLI through the SDK, as Suru's Copilot Provider does,
+and created one Session:
 
 ```rust
 SessionConfig::default()
@@ -20,10 +22,12 @@ SessionConfig::default()
     .with_permission_handler(/* logs each request, approves it once */)
 ```
 
-It then asked the Model to call `slow_tool` once with the given `seconds`. The
-endpoint answered each call at once with a `text/event-stream`. It either
-stayed silent until the result, or sent `notifications/progress` against the
-call's `progressToken` on the given schedule. Every call carried
+The capture's working directory, a fresh `tempfile::tempdir()` for each run,
+reads `/tmp/workspace` here, and the endpoint's ephemeral port reads `<port>`.
+The capture then asked the Model to call `slow_tool` once with the given
+`seconds`. The endpoint answered each call at once with a `text/event-stream`.
+It either stayed silent until the result, or sent `notifications/progress`
+against the call's `progressToken` on the given schedule. Every call carried
 `_meta: {"progressToken": 1}`. The SDK's per-server `timeout` is documented only
 as "Optional timeout in milliseconds for tool calls to this server", and
 `copilot mcp add --help` documents `--timeout <ms>` with no default.

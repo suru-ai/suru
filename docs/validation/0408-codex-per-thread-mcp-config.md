@@ -32,12 +32,15 @@ Source references are to the Codex checkout at `8f195c93`.
 }
 ```
 
+The capture's working directory, a fresh `tempfile::tempdir()` for each run,
+reads `/tmp/workspace` here, and the endpoint's ephemeral port reads `<port>`.
 Each `config` key is a dotted path, applied the way a `-c` override is
 (`config/src/overrides.rs`), so `mcp_servers.capture` names one server table.
 
-- **Run 2:** the `thread/resume` sent the same object plus `threadId`, with
-  token `capture-token-resume` and `tool_timeout_sec: 90.0`, to a new
-  app-server.
+- **Run 2:** the `thread/resume`, sent to a new app-server, carried `threadId`
+  and every field above but `ephemeral`, which `thread/resume` does not take.
+  Its server entry differed only in token `capture-token-resume` and
+  `tool_timeout_sec: 90.0`.
 - **Run 4:** the launch-time comparison started `codex app-server` with these
   overrides, and a `thread/start` whose `config` carried only the reasoning
   effort:
