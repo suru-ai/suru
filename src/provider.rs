@@ -229,6 +229,15 @@ pub(crate) fn humanized_wire_id(value: &str) -> String {
     }
 }
 
+/// How a resume's row describes it when the Provider's resume carries a message and no summary
+/// of it (ADR 0031): the first non-empty line of the Delegation, or nothing when it has none.
+pub(crate) fn first_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
 pub type ProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
 pub type ProviderEventStream =
@@ -747,7 +756,11 @@ pub enum ProviderEvent {
     /// existing Session and adding the row that stands for this stretch of
     /// its work. One the owning Session delegates after its Turn settled
     /// begins a Continuation there to hold that row, whatever else is owed,
-    /// which the Provider settles at its own boundary like any other. The
+    /// which the Provider settles at its own boundary like any other. One a
+    /// Subagent delegated but that reaches its Subagent only once the
+    /// delegating one has settled begins a Continuation of the delegating
+    /// Subagent's Session instead, which holds the row and settles at once
+    /// (ADR 0033). The
     /// identity finds that Session even when an earlier process spawned the
     /// Subagent, because it is stored with the Session. `description` is what
     /// the resume asked for; the Subagent's Title stays what its spawn said,

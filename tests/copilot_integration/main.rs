@@ -28,6 +28,7 @@ mod monitoring;
 mod resume;
 mod skills;
 mod steering;
+mod subagent_resumes;
 mod subagent_steers;
 mod subagents;
 mod support;

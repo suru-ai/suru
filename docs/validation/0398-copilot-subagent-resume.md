@@ -65,7 +65,7 @@ carried it, so it is not relied on.
 `session.idle` is deferred while any agent runs (`AssistantIdleData` docs), so
 it bounds every resumed run from above.
 
-## Adapter behavior (decided, not yet implemented)
+## Adapter behavior
 
 - A `user.message` carrying the `agentId` of a Subagent whose stretch has
   settled is a resume, whatever its `delivery`: `ProviderEvent::SubagentResumed`
@@ -81,7 +81,8 @@ it bounds every resumed run from above.
   previous run ended.
 - `agent_idle` notifications project nothing.
 
-Implementation is tracked in the follow-up issue linked from #398.
+Implemented in #404. The replays in `tests/copilot_integration/subagent_resumes.rs`
+cover this capture and #397's two.
 
 ## Capture and sanitizing
 

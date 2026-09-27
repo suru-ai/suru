@@ -506,7 +506,9 @@ impl SubagentRoutes {
     /// events take. The route is taken out while its event projects, because a
     /// nested spawn inserts the grandchild's route into this same table mid-
     /// projection. A Terminal projection settles the routed Turn, so the route
-    /// has nothing left to receive and stays out.
+    /// has nothing left to receive and stays out. An event for a Subagent with
+    /// no route lands nowhere — unless it is a resume that Subagent delegated,
+    /// which still stands in its Transcript ([`Self::resume_from_settled`]).
     fn project_event(
         &mut self,
         sessions: &SessionStore,
@@ -522,6 +524,28 @@ impl SubagentRoutes {
             return;
         }
         let Some(mut route) = self.routes.remove(subagent) else {
+            if let ProviderEvent::SubagentResumed {
+                subagent_id,
+                name,
+                description,
+                delegation,
+            } = event
+                && let Some(Err(error)) = updates.apply(|| {
+                    self.resume_from_settled(
+                        sessions,
+                        subagent,
+                        subagent_id,
+                        &name,
+                        &description,
+                        delegation.as_deref(),
+                    )
+                })
+            {
+                tracing::warn!(
+                    delegator = subagent.as_str(),
+                    "a settled Subagent's resume could not be recorded: {error:#}"
+                );
+            }
             return;
         };
         let projection = project_provider_event(
@@ -871,6 +895,52 @@ impl SubagentRoutes {
             },
         );
         Ok(())
+    }
+
+    /// Resumes a Subagent on behalf of a delegating Subagent that has settled
+    /// (ADR 0033): Copilot delivers a message a sibling sent while it worked
+    /// only once the recipient's stretch has ended, by which time the sibling
+    /// may have settled, and the resume still stands in the sibling's
+    /// Transcript. A Continuation of the sibling's Session holds its row and
+    /// settles at once, because the sibling works in it no further and no
+    /// Provider boundary is coming to settle it; the resumed Subagent keeps
+    /// the Sessions above it Working as any resume does. A resume from a
+    /// Subagent this connection never named has no Transcript to stand in,
+    /// and lands nowhere like any other of its unrouted events.
+    fn resume_from_settled(
+        &mut self,
+        sessions: &SessionStore,
+        delegator: &ProviderSubagentId,
+        subagent: ProviderSubagentId,
+        name: &str,
+        description: &str,
+        delegation: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(identity) = self.identities.get(delegator) else {
+            tracing::debug!(
+                delegator = delegator.as_str(),
+                "discarding a resume delegated by a Subagent Suru holds no Session for"
+            );
+            return Ok(());
+        };
+        let delegating_session = identity.session_id;
+        let turn_id = sessions.begin_subagent_turn(delegating_session, None)?;
+        let resumed = self.resume(
+            sessions,
+            (delegating_session, turn_id),
+            subagent,
+            name,
+            description,
+            delegation,
+        );
+        sessions.finish_provider_turn(
+            delegating_session,
+            turn_id,
+            ProviderTurnOutcome::Completed {
+                trailing_output: TrailingCommandOutput::new(),
+            },
+        )?;
+        resumed
     }
 
     /// Wakes a settled Subagent its own Watch woke (ADR 0030): the next Turn

@@ -2200,6 +2200,161 @@ async fn a_resume_arriving_with_no_turn_active_and_nothing_owed_begins_a_continu
     fixture.server.shutdown().await.expect("shut down server");
 }
 
+/// A resume a Subagent delegated can reach its Subagent only after the
+/// delegating one has settled — Copilot delivers a sibling's `write_agent`
+/// once the recipient's stretch has ended (ADR 0033). It still stands in the
+/// delegating Subagent's Transcript: a Continuation of that Session holds its
+/// row and settles at once, while the resumed Subagent works on in its own.
+#[tokio::test]
+async fn a_resume_a_settled_subagent_delegated_stands_in_a_continuation_of_its_session() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-settled-sibling-resume-test").await;
+    let writer = ProviderSubagentId::new("task-1");
+    let writer_id = spawned_and_settled(&fixture, &writer, "first-model").await;
+    let reviewer = ProviderSubagentId::new("task-2");
+    for event in [
+        ProviderEvent::SubagentStarted {
+            subagent_id: reviewer.clone(),
+            name: "Review".to_owned(),
+            description: "Review the map".to_owned(),
+            delegation: None,
+        },
+        ProviderEvent::SubagentCompleted {
+            subagent_id: reviewer.clone(),
+            status: ProviderSubagentStatus::Completed,
+        },
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+
+    fixture
+        .provider_session
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::Subagent(reviewer.clone()),
+            ProviderEvent::SubagentResumed {
+                subagent_id: writer.clone(),
+                name: "Explore".to_owned(),
+                description: "Tighten the map".to_owned(),
+                delegation: Some("Tighten the second section.".to_owned()),
+            },
+        )
+        .await;
+
+    let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        subagent_rows(&parent).len(),
+        2,
+        "the parent holds only the two spawns"
+    );
+    let reviewer_id = subagent_rows(&parent)
+        .into_iter()
+        .find_map(|row| match row {
+            Activity::Subagent {
+                name, session_id, ..
+            } if name == "Review" => Some(*session_id),
+            _ => None,
+        })
+        .expect("the reviewer's spawn stands in the parent");
+    let reviewer_session = read_session(fixture.server.descriptor(), reviewer_id).await;
+    let [_, continuation] = reviewer_session.turns.as_slice() else {
+        panic!(
+            "the resume begins a Turn in the settled reviewer's Session, got {:?}",
+            reviewer_session.turns
+        );
+    };
+    assert_eq!(continuation.prompt_id, None, "no Prompt began it");
+    assert_eq!(
+        continuation.status,
+        TurnStatus::Completed,
+        "the reviewer works no further in it, so it settles at once"
+    );
+    assert!(
+        reviewer_session
+            .messages
+            .iter()
+            .all(|message| message.turn_id != continuation.id),
+        "nothing delegated the Continuation itself"
+    );
+    let Activity::Subagent {
+        turn_id,
+        status,
+        name,
+        description,
+        session_id,
+        ..
+    } = the_subagent_row(&reviewer_session)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *turn_id, continuation.id,
+        "the row stands in the Continuation"
+    );
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(name, "Explore");
+    assert_eq!(description, "Tighten the map");
+    assert_eq!(
+        *session_id, writer_id,
+        "the row leads into the writer's one Session"
+    );
+
+    let writer_session = read_session(fixture.server.descriptor(), writer_id).await;
+    let [_, resumed] = writer_session.turns.as_slice() else {
+        panic!(
+            "the resume begins the writer's second Turn, got {:?}",
+            writer_session.turns
+        );
+    };
+    assert_eq!(resumed.status, TurnStatus::Active);
+    let delegation = writer_session
+        .messages
+        .iter()
+        .find(|message| message.turn_id == resumed.id)
+        .expect("the resumed Turn opens with its Delegation");
+    assert_eq!(
+        delegation.role,
+        MessageRole::Delegation(Delegator {
+            session_id: reviewer_id,
+            name: Some("Review".to_owned()),
+        }),
+        "the Delegation names the settled reviewer that sent it"
+    );
+    assert_eq!(delegation.content, "Tighten the second section.");
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: writer.clone(),
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    let reviewer_session = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        reviewer_id,
+        "the resume's row settles with its stretch",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent {
+                    status: ActivityStatus::Completed,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    assert_eq!(reviewer_session.turns.len(), 2);
+    let writer_session = read_session(fixture.server.descriptor(), writer_id).await;
+    assert_eq!(writer_session.turns[1].status, TurnStatus::Completed);
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
 /// A resume Suru cannot place — no Session it holds carries the identity, as
 /// for a Subagent spawned before identities were stored — is recorded as a
 /// new Subagent of its own rather than dropped or failing the Turn.

@@ -53,7 +53,7 @@ use crate::{
     provider::{
         AttributedProviderEvent, MeteredCost, ProviderActivityId, ProviderCommandStatus,
         ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-        ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus,
+        ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus, first_line,
         harness::ProcessGuard,
         reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
@@ -1926,7 +1926,7 @@ fn project_collab_call_completed(
                 ResumeClaim {
                     delegator: spawner.clone(),
                     name: GENERIC_SUBAGENT_NAME.to_owned(),
-                    description: prompt.as_deref().map(first_line).unwrap_or_default(),
+                    description: prompt.as_deref().and_then(first_line).unwrap_or_default(),
                     delegation: prompt.clone(),
                 },
             ));
@@ -1965,16 +1965,6 @@ fn project_user_message(
             delegation: text,
         },
     }]
-}
-
-/// A resume's description: the first line of what the delegation said, since
-/// Codex's `sendInput` carries a prompt and no summary of it (ADR 0031).
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 /// The Subagent's name off Codex's agent path — the path's last segment, the

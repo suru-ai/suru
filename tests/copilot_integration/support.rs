@@ -10,8 +10,9 @@ use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
-        CreateSessionRequest, DerivationErrand, InitialPrompt, Message, MessageRole, ModelCatalog,
-        PromptId, ProviderId, ProviderModelCatalog, SessionId, SessionSnapshot, TurnId, TurnStatus,
+        Activity, CreateSessionRequest, Delegator, DerivationErrand, InitialPrompt, Message,
+        MessageRole, ModelCatalog, PromptId, ProviderId, ProviderModelCatalog, SessionId,
+        SessionSnapshot, TranscriptItem, TurnId, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, RunningServer, ServerConfig},
@@ -817,4 +818,95 @@ pub async fn session_where(
 /// the Errand's own Copilot Session interleaving with its own.
 pub fn titling_turned_off() -> tempfile::TempDir {
     config_root_pinning(&DerivationErrand::Off)
+}
+
+/// A timeline replaying a sanitized live capture — one timeline entry per line — as the scripted
+/// CLI's output for the Prompt, keeping only the lines `keep` accepts.
+///
+/// The captures ran under approve-all, so each `permission.requested` was answered the moment it
+/// was asked. Replayed with no one to answer it, it opens an Approval whose settle races the
+/// timeline, which is nothing to do with what the captures record, so the permission entries are
+/// left out.
+pub fn replay_capture(capture: &str, keep: impl Fn(&str) -> bool) -> String {
+    capture
+        .lines()
+        .filter(|line| {
+            !line.trim().is_empty() && !line.contains(r#""type":"permission."#) && keep(line)
+        })
+        .map(|line| format!("      raw_event '{}'\n", line.replace('\'', r"'\''")))
+        .collect()
+}
+
+/// `snapshot`'s Transcript, in order, as lines naming each Turn by its place and each item by
+/// what a reader meets: a Message by who it is from and what it says, an Activity by its kind and
+/// what it ran or was asked. `parent` is the Session a Delegation from the parent names.
+pub fn transcript_outline(snapshot: &SessionSnapshot, parent: Option<SessionId>) -> Vec<String> {
+    let turn = |turn_id| {
+        snapshot
+            .turns
+            .iter()
+            .position(|turn| turn.id == turn_id)
+            .expect("every item stands in one of the Session's Turns")
+    };
+    snapshot
+        .transcript
+        .iter()
+        .map(|item| match item {
+            TranscriptItem::Message { message_id } => {
+                let message = snapshot
+                    .messages
+                    .iter()
+                    .find(|message| message.id == *message_id)
+                    .expect("the Transcript names a Message the Session holds");
+                let from = match &message.role {
+                    MessageRole::Delegation(Delegator { session_id, name }) => {
+                        if Some(*session_id) == parent {
+                            "delegation from the parent".to_owned()
+                        } else {
+                            format!("delegation from {}", name.as_deref().unwrap_or("?"))
+                        }
+                    }
+                    role => format!("{role:?}"),
+                };
+                format!(
+                    "turn {}: {from}: {}",
+                    turn(message.turn_id),
+                    message.content
+                )
+            }
+            TranscriptItem::Activity { activity_id } => {
+                let activity = snapshot
+                    .activities
+                    .iter()
+                    .find(|activity| activity.id() == *activity_id)
+                    .expect("the Transcript names an Activity the Session holds");
+                let what = match activity {
+                    Activity::Command { command, .. } => format!("command {command}"),
+                    Activity::Subagent {
+                        name,
+                        description,
+                        status,
+                        ..
+                    } => format!("subagent {name} ({description}) {status:?}"),
+                    Activity::Reasoning { .. } => "reasoning".to_owned(),
+                    other => format!("{other:?}"),
+                };
+                format!("turn {}: {what}", turn(activity.turn_id()))
+            }
+        })
+        .collect()
+}
+
+/// The child Sessions `parent`'s Subagent rows lead into, by the name each row gives.
+pub fn subagent_children(parent: &SessionSnapshot) -> Vec<(String, SessionId)> {
+    parent
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Subagent {
+                name, session_id, ..
+            } => Some((name.clone(), *session_id)),
+            _ => None,
+        })
+        .collect()
 }

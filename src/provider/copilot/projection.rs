@@ -9,29 +9,37 @@
 //! produced it, so orchestration lands a subagent's work in the Subagent's own child Session
 //! rather than the parent's Transcript.
 //!
-//! The `subagent.*` lifecycle is where Subagents begin and end: `subagent.started` opens the
-//! Subagent under the instance identity its work is attributed with, and `subagent.completed` or
-//! `subagent.failed` — addressed by the spawning tool call — settles it. The spawning tool
-//! execution itself projects no Command row while the Subagent row answers for the delegation
-//! ([`SPAWN_TOOL`]). Main-conversation content outside a Turn Suru is running is
-//! dropped unless owed a Continuation; context snapshots can refresh idle Sessions.
-//! Events that contradict the recorded state fail the Session, and everything else
-//! becomes the Provider events a Session consumes.
+//! The `subagent.*` lifecycle is where Subagents are spawned and their first stretch ends:
+//! `subagent.started` opens the Subagent under the instance identity its work is attributed with,
+//! and `subagent.completed` or `subagent.failed` — addressed by the spawning tool call — settles
+//! that stretch. The spawning tool execution itself projects no Command row while the Subagent row
+//! answers for the delegation ([`SPAWN_TOOL`]). Main-conversation content outside a Turn Suru is
+//! running is dropped unless owed a Continuation; context snapshots can refresh idle Sessions.
+//! Events that contradict the recorded state fail the Session, and everything else becomes the
+//! Provider events a Session consumes.
 //!
 //! Only the agent Message is strict about that: a Message the Transcript shows the reader as the
 //! answer must be the answer. Reasoning and Tool work report on how the answer was reached, so a
 //! Copilot report the projection cannot make sense of costs the reader that report rather than the
 //! Turn it belongs to.
 //!
-//! A Delegation sent to a Subagent still working — through `write_agent`, by the main agent or by
-//! a sibling Subagent — **steers** it once Copilot delivers it into the working stretch (ADR
-//! 0032): the Subagent's `user.message` with `delivery: "steering"` stands in its current Turn, at
-//! the point it arrives, as a Delegation Message from the Agent its `source` names
-//! ([`CopilotCorrelation::project_subagent_message`]). The send itself is no work of the sender's,
-//! so its `write_agent` execution projects nothing in the sender's Transcript
-//! ([`WRITE_AGENT_TOOL`]). The CLI verified against, 1.0.87, never delivers a `write_agent` that
-//! way, though: it queues each one until the stretch has ended, which is no steer
-//! (docs/validation/0397-copilot-subagent-steer.md).
+//! A Delegation sent through `write_agent` — by the main agent or by a sibling Subagent — reaches
+//! the Subagent as a `user.message` under its instance identity, reported when the Subagent
+//! consumes it, and attributed to the Agent its `source` names
+//! ([`CopilotCorrelation::project_subagent_message`]). Delivered into a working stretch
+//! (`delivery: "steering"`) it **steers** that stretch, standing in the Subagent's current Turn at
+//! the point it arrives (ADR 0032). The CLIs verified against, 1.0.87 and 1.0.88, never deliver
+//! one that way, though: a message sent while the Subagent works is queued until its stretch has
+//! ended, and one sent afterwards starts a run at once. Either way Copilot runs the settled agent
+//! again on its own context with no second `subagent.started`, which **resumes** it (ADR 0033): a
+//! new Turn in the Subagent's Session, opened by the message as its Delegation, whatever the
+//! `delivery` says (docs/validation/0397-copilot-subagent-steer.md,
+//! docs/validation/0398-copilot-subagent-resume.md). Nothing closes the resumed run either, so it
+//! settles where the agent loop exits: the Subagent's `assistant.turn_end` after a model message
+//! requesting no tools, with the next message it consumes and the loop's idle as backstops. The
+//! `agent_idle` notification Copilot sometimes raises for it settles nothing. The send itself is
+//! no work of the sender's, so its `write_agent` execution projects nothing in the sender's
+//! Transcript ([`WRITE_AGENT_TOOL`]).
 //!
 //! A Suru Turn spans one stretch of Copilot's agentic loop: it opens when the Prompt is delivered
 //! and settles on the session-level idle signal, not on the per-model-call `assistant.turn_end`.
@@ -40,7 +48,8 @@
 //! settle as rather than settling it: a Turn that settled early would leave its own trailing idle
 //! to be read against whichever Turn had opened by the time it was projected.
 //!
-//! The idle speaks only for the main conversation: a Subagent's streams live past it, which is
+//! The idle speaks only for the main conversation — and for any resumed Subagent run still open,
+//! which Copilot closes with nothing else: a spawned Subagent's streams live past it, which is
 //! what lets a Subagent outlive the Turn (ADR 0015). Main output arriving after the settle, owed
 //! to Subagents still working or just settled, begins a Continuation stretch that the loop's next
 //! idle settles — unless a Prompt settles the Continuation first, in which case that stretch's
@@ -89,7 +98,7 @@ use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
     ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
-    ReportedTurnMetering, concise_remote_message, exclusive_count,
+    ReportedTurnMetering, concise_remote_message, exclusive_count, first_line,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     reported_count,
@@ -105,9 +114,9 @@ pub(super) struct CopilotCorrelation {
     /// idle of its own. Each owed idle is swallowed rather than read against the Turn that
     /// Prompt began.
     stale_stretches: u32,
-    /// Each working Subagent's own open streams, by the agent instance identity its events are
-    /// attributed with.
-    subagents: HashMap<String, ConversationStreams>,
+    /// Each working Subagent's current stretch and the streams it has open, by the agent instance
+    /// identity its events are attributed with.
+    subagents: HashMap<String, WorkingSubagent>,
     /// The Subagent each spawning tool call opened: `subagent.completed` and `subagent.failed`
     /// name the spawn's tool call rather than the instance their own envelope names.
     spawns: HashMap<String, String>,
@@ -115,10 +124,11 @@ pub(super) struct CopilotCorrelation {
     /// settle: the Subagent row answers for the delegation, so the spawn's own execution stays
     /// withheld however late it is reported — before its `subagent.started` or after the settle.
     delegations: HashSet<String>,
-    /// Every Subagent instance ever opened on this timeline, kept past its settle: a steer names
-    /// the Agent that sent it by instance identity, and a sibling may settle before the Subagent
-    /// it wrote to receives what it sent.
-    agents: HashSet<String>,
+    /// Every Subagent instance ever opened on this timeline, kept past its settle: a message
+    /// Copilot delivers to a settled Subagent resumes it (ADR 0033), and names the Agent that sent
+    /// it by instance identity — a sibling that may have settled before the Subagent it wrote to
+    /// received what it sent.
+    agents: HashMap<String, KnownSubagent>,
     /// Whether a Subagent has settled since a Turn last began — or a detached shell's completion
     /// woke the loop while no Turn was running. The output a completion provokes arrives only
     /// after the settle, so every settle leaves a Continuation owed to whatever that output turns
@@ -179,6 +189,64 @@ impl ActiveTurn {
     }
 }
 
+/// One stretch of a Subagent's work still going: how it began, which says what settles it, and what
+/// the Subagent's conversation still has open in it.
+struct WorkingSubagent {
+    stretch: Stretch,
+    streams: ConversationStreams,
+}
+
+impl WorkingSubagent {
+    fn new(stretch: Stretch) -> Self {
+        Self {
+            stretch,
+            streams: ConversationStreams::default(),
+        }
+    }
+}
+
+/// How a working Subagent's stretch began.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stretch {
+    /// Its spawn, which Copilot settles itself with `subagent.completed` or `subagent.failed`.
+    Spawned,
+    /// A resume (ADR 0033), which Copilot opens with the message it delivers and closes with
+    /// nothing, so it settles where the agent loop exits: at the `assistant.turn_end` that follows
+    /// a model message requesting no tools. `answered` records that the latest model message
+    /// requested none, which makes the next turn end the exit.
+    Resumed { answered: bool },
+}
+
+impl Stretch {
+    fn is_resumed(self) -> bool {
+        matches!(self, Self::Resumed { .. })
+    }
+
+    /// Whether the next turn end is where the stretch's loop exits: only a resume's, and only
+    /// once its latest model message requested no tools.
+    fn exits_at_turn_end(self) -> bool {
+        self == Self::Resumed { answered: true }
+    }
+
+    /// Records what the latest model message asked of the loop. A spawn keeps no such record:
+    /// Copilot settles it itself.
+    fn answer(&mut self, no_tools: bool) {
+        if let Self::Resumed { answered } = self {
+            *answered = no_tools;
+        }
+    }
+}
+
+/// What the projection keeps of a Subagent past its settle, for the resume that may run it again:
+/// the name its rows carry, what its spawn was asked to do — the description of a resume whose
+/// message carries nothing to read — and the Model it last ran on, which Copilot reports only at
+/// spawn and which carries into the resumed Turn.
+struct KnownSubagent {
+    name: String,
+    description: String,
+    model: Option<String>,
+}
+
 /// What one conversation on the timeline still has open — the main agent's inside its Turn, or a
 /// Subagent's for as long as the Subagent runs.
 #[derive(Default)]
@@ -212,8 +280,9 @@ const SPAWN_TOOL: &str = "task";
 /// The tool an Agent sends a message to another agent's loop with — the main agent to a Subagent,
 /// or one Subagent to a sibling. Its execution is not work of its own either: what it sends is a
 /// Delegation, which stands in the Subagent that receives it where that Subagent received it —
-/// as a steer, when Copilot delivers it into the working stretch — and never in the sender's
-/// Transcript, so the execution projects nothing, whatever it came to.
+/// as a steer, when Copilot delivers it into the working stretch, or opening the Turn it resumes
+/// the settled Subagent into — and never in the sender's Transcript, whose only trace of it is a
+/// resume's row, so the execution projects nothing, whatever it came to.
 const WRITE_AGENT_TOOL: &str = "write_agent";
 
 /// A Command Copilot is still running, and the output it has streamed so far — against which the
@@ -257,7 +326,7 @@ impl CopilotCorrelation {
             subagents: HashMap::new(),
             spawns: HashMap::new(),
             delegations: HashSet::new(),
-            agents: HashSet::new(),
+            agents: HashMap::new(),
             late_settle_owes_continuation: false,
             watches: HashSet::new(),
             watched_shells: HashSet::new(),
@@ -364,11 +433,17 @@ impl CopilotCorrelation {
             if !self.owes_late_output() {
                 return None;
             }
-            self.turn = Some(ActiveTurn::continuation());
-            self.context_continuation = true;
-            self.late_settle_owes_continuation = false;
+            self.begin_continuation();
         }
         self.turn.as_mut().map(|turn| &mut turn.streams)
+    }
+
+    /// Begins the Continuation stretch that main work arriving with no Turn active lands in, which
+    /// the loop's next idle settles.
+    fn begin_continuation(&mut self) {
+        self.turn = Some(ActiveTurn::continuation());
+        self.context_continuation = true;
+        self.late_settle_owes_continuation = false;
     }
 }
 
@@ -741,17 +816,35 @@ fn project_session_event(
     // whether or not the main conversation has a Turn open — a Subagent outlives the Turn that
     // spawned it (ADR 0015). One attributed to an instance no Subagent holds lands nowhere.
     if let Some(subagent) = event.agent_id.clone() {
-        if event.parsed_type() == SessionEventType::UserMessage {
-            return Ok(correlation.project_subagent_message(&subagent, &event));
+        match event.parsed_type() {
+            SessionEventType::UserMessage => {
+                return Ok(correlation.project_subagent_message(&subagent, &event));
+            }
+            SessionEventType::AssistantTurnEnd => {
+                return Ok(correlation.project_subagent_turn_end(&subagent));
+            }
+            _ => {}
         }
-        let Some(streams) = correlation.subagents.get_mut(&subagent) else {
+        let Some(working) = correlation.subagents.get_mut(&subagent) else {
             return Ok(Vec::new());
         };
+        if event.parsed_type() == SessionEventType::AssistantMessage {
+            let no_tools = reported::<AssistantMessageData>(&event).is_some_and(|message| {
+                message
+                    .tool_requests
+                    .is_none_or(|requests| requests.is_empty())
+            });
+            working.stretch.answer(no_tools);
+        }
+        let streams = &mut working.streams;
         if event.parsed_type() == SessionEventType::AssistantUsage {
             let model = reported::<AssistantUsageData>(&event)
                 .and_then(|usage| (!usage.model.is_empty()).then_some(usage.model));
             let mut projected = Vec::new();
             if let Some(model) = model {
+                if let Some(known) = correlation.agents.get_mut(&subagent) {
+                    known.model = Some(model.clone());
+                }
                 projected.push(attributed(
                     None,
                     ProviderEvent::SubagentModelChanged {
@@ -784,11 +877,15 @@ fn project_session_event(
         }
         SessionEventType::SessionIdle => {
             let idle: SessionIdleData = decode(&event)?;
-            Ok(correlation
-                .project_session_idle(idle.aborted.unwrap_or(false))
-                .into_iter()
-                .map(|projected| attributed(None, projected))
-                .collect())
+            let aborted = idle.aborted.unwrap_or(false);
+            let mut projected = correlation.project_resumes_stopped(aborted);
+            projected.extend(
+                correlation
+                    .project_session_idle(aborted)
+                    .into_iter()
+                    .map(|projected| attributed(None, projected)),
+            );
+            Ok(projected)
         }
         SessionEventType::AssistantUsage => {
             if correlation.open_main_streams().is_none() {
@@ -982,11 +1079,10 @@ impl CopilotCorrelation {
             return Vec::new();
         }
         self.subagents
-            .insert(subagent.clone(), ConversationStreams::default());
+            .insert(subagent.clone(), WorkingSubagent::new(Stretch::Spawned));
         self.spawns
             .insert(started.tool_call_id.clone(), subagent.clone());
         self.delegations.insert(started.tool_call_id.clone());
-        self.agents.insert(subagent.clone());
         // Copilot's display name is the readable one, but a spawn made through its task tool
         // writes the invocation's description there, leaving the configured name the stable one.
         let name = if started.agent_display_name.is_empty() {
@@ -995,6 +1091,14 @@ impl CopilotCorrelation {
             started.agent_display_name
         };
         let model = started.model.filter(|model| !model.is_empty());
+        self.agents.insert(
+            subagent.clone(),
+            KnownSubagent {
+                name: name.clone(),
+                description: started.agent_description.clone(),
+                model: model.clone(),
+            },
+        );
         let delegation = self.spawn_prompt(spawner.as_deref(), &started.tool_call_id);
         let mut projected = vec![attributed(
             spawner.as_deref(),
@@ -1021,7 +1125,7 @@ impl CopilotCorrelation {
     /// the conversation that ran it — a Subagent's own, or the main agent's.
     fn spawn_prompt(&self, spawner: Option<&str>, tool_call_id: &str) -> Option<String> {
         let streams = match spawner {
-            Some(subagent) => self.subagents.get(subagent)?,
+            Some(subagent) => &self.subagents.get(subagent)?.streams,
             None => &self.turn.as_ref()?.streams,
         };
         streams.commands.get(tool_call_id)?.spawn_prompt.clone()
@@ -1033,57 +1137,158 @@ impl CopilotCorrelation {
     fn spawning_conversation(&self, tool_call_id: &str) -> Option<String> {
         self.subagents
             .iter()
-            .find(|(_, streams)| streams.commands.contains_key(tool_call_id))
+            .find(|(_, working)| working.streams.commands.contains_key(tool_call_id))
             .map(|(subagent, _)| subagent.clone())
     }
 
-    /// Reads a message Copilot delivered to a Subagent's own loop. One delivered into the stretch
-    /// the Subagent is working (`delivery: "steering"`) is a steer: a Delegation standing at the
-    /// point the Subagent received it, which is where this event arrives. It is attributed to the
-    /// Agent that sent it, named by `source` — `agent-<id>` names a sibling Subagent by its
-    /// instance identity, and every other origin, the main agent's `agent-<session id>` among
-    /// them, is the owning Session's.
+    /// Reads a message Copilot delivered to a Subagent's own loop, which Copilot reports when the
+    /// Subagent consumes it. Whoever sent it, it is attributed to the Agent `source` names —
+    /// `agent-<id>` names a sibling Subagent by its instance identity, and every other origin, the
+    /// main agent's `agent-<session id>` among them, is the owning Session's.
     ///
-    /// No other delivery steers. An `idle` one begins a run: the spawn's own prompt, which the
-    /// spawning tool call already carried in as the Delegation opening the Subagent's Turn. A
-    /// `queued` one waits for the stretch to end and runs as its own afterward — which is how
-    /// Copilot 1.0.87 delivers every `write_agent` to a working Subagent, the message arriving
-    /// only after the stretch's `subagent.completed`
-    /// (docs/validation/0397-copilot-subagent-steer.md). A message for a Subagent not working
-    /// stands nowhere, like the rest of its output.
+    /// One delivered into the stretch a working Subagent is in (`delivery: "steering"`) is a
+    /// steer: a Delegation standing at the point the Subagent received it, which is where this
+    /// event arrives (ADR 0032). The CLIs verified against never deliver a `write_agent` that way
+    /// (docs/validation/0397-copilot-subagent-steer.md).
+    ///
+    /// Any other message a working spawn receives is its own prompt, which the spawning tool call
+    /// already carried in as the Delegation opening its Turn: Copilot holds every later send back
+    /// until the stretch ends, so no other message reaches a spawn while it works. Every message a settled Subagent consumes runs it again on its own context — whatever
+    /// its `delivery`: `queued` when it was sent during the stretch and held until that stretch's
+    /// `subagent.completed`, `idle` when it was sent afterwards — so it is a resume (ADR 0033),
+    /// opening the new Turn as its Delegation ([`Self::project_resumed`]). Its arrival is also
+    /// proof the previous run ended, so it settles a resume of that Subagent still open before it
+    /// begins the next. A message for an instance no Subagent holds stands nowhere.
     fn project_subagent_message(
-        &self,
+        &mut self,
         subagent: &str,
         event: &SessionEvent,
     ) -> Vec<AttributedProviderEvent> {
-        if !self.subagents.contains_key(subagent) {
-            return Vec::new();
-        }
         let Some(message) = reported::<UserMessageData>(event) else {
             return Vec::new();
         };
-        if message.delivery != Some(UserMessageDelivery::Steering)
-            || message.content.trim().is_empty()
-        {
-            return Vec::new();
-        }
+        // A Subagent that queued a copy of its own send to itself is not its own sender: the
+        // resume that copy begins is the owning Session's.
         let sender = message
             .source
             .as_deref()
             .and_then(|source| source.strip_prefix("agent-"))
-            .filter(|sender| self.agents.contains(*sender));
-        vec![attributed(
-            sender,
-            ProviderEvent::SubagentSteered {
-                subagent_id: ProviderSubagentId::new(subagent),
-                delegation: message.content,
-            },
-        )]
+            .filter(|sender| *sender != subagent && self.agents.contains_key(*sender))
+            .map(str::to_owned);
+        match self.subagents.get(subagent).map(|working| working.stretch) {
+            Some(_) if message.delivery == Some(UserMessageDelivery::Steering) => {
+                if message.content.trim().is_empty() {
+                    return Vec::new();
+                }
+                vec![attributed(
+                    sender.as_deref(),
+                    ProviderEvent::SubagentSteered {
+                        subagent_id: ProviderSubagentId::new(subagent),
+                        delegation: message.content,
+                    },
+                )]
+            }
+            Some(Stretch::Spawned) => Vec::new(),
+            Some(Stretch::Resumed { .. }) => {
+                let mut projected =
+                    self.project_stretch_settled(subagent, ProviderSubagentStatus::Completed);
+                projected.extend(self.project_resumed(subagent, sender, message.content));
+                projected
+            }
+            None => self.project_resumed(subagent, sender, message.content),
+        }
     }
 
-    /// Settles the Subagent the spawning tool call names, closing whatever its streams leave open
-    /// — the split-held Reasoning title above all — before the settle itself drops the routes.
-    /// A settle for a spawn never opened lands nowhere, like any other unrouted Subagent event.
+    /// Resumes a settled Subagent with the message it consumed (ADR 0033): routes its work to it
+    /// again, in a stretch its loop's exit settles, and reports the resume from the Agent that
+    /// sent it, the message opening the resumed Turn as its Delegation and its first line
+    /// describing the stretch's row. The Model the Subagent last ran on carries into that Turn,
+    /// because Copilot reports a Subagent's Model only at spawn. A resume the owning Session
+    /// delegates while no Turn is running begins a Continuation to hold its row, which the loop's
+    /// next idle settles. An instance no Subagent ever held has nothing to resume.
+    fn project_resumed(
+        &mut self,
+        subagent: &str,
+        sender: Option<String>,
+        content: String,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(known) = self.agents.get(subagent) else {
+            return Vec::new();
+        };
+        let delegation = (!content.trim().is_empty()).then_some(content);
+        let description = delegation
+            .as_deref()
+            .and_then(first_line)
+            .unwrap_or_else(|| known.description.clone());
+        let (name, model) = (known.name.clone(), known.model.clone());
+        if sender.is_none() && self.turn.is_none() {
+            self.begin_continuation();
+        }
+        self.subagents.insert(
+            subagent.to_owned(),
+            WorkingSubagent::new(Stretch::Resumed { answered: false }),
+        );
+        let mut projected = vec![attributed(
+            sender.as_deref(),
+            ProviderEvent::SubagentResumed {
+                subagent_id: ProviderSubagentId::new(subagent),
+                name,
+                description,
+                delegation,
+            },
+        )];
+        if let Some(model) = model {
+            projected.push(attributed(
+                None,
+                ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(subagent),
+                    model: crate::protocol::ModelId::new(model),
+                },
+            ));
+        }
+        projected
+    }
+
+    /// Settles a resumed Subagent's stretch where its agent loop exits: the turn end following a
+    /// model message that requested no tools. Like any Subagent settle, the output it provokes in
+    /// the loop that reads it arrives only afterwards, so it leaves a Continuation owed to it. A
+    /// spawn's turn ends settle nothing: Copilot settles a spawn itself.
+    fn project_subagent_turn_end(&mut self, subagent: &str) -> Vec<AttributedProviderEvent> {
+        let exits = self
+            .subagents
+            .get(subagent)
+            .is_some_and(|working| working.stretch.exits_at_turn_end());
+        if !exits {
+            return Vec::new();
+        }
+        self.late_settle_owes_continuation = true;
+        self.project_stretch_settled(subagent, ProviderSubagentStatus::Completed)
+    }
+
+    /// Settles every resumed stretch still open when the loop goes idle — interrupted, when the
+    /// idle is an abort's — since Copilot defers the idle while any agent runs. Spawns are
+    /// Copilot's own to settle.
+    fn project_resumes_stopped(&mut self, aborted: bool) -> Vec<AttributedProviderEvent> {
+        let mut resumed = self
+            .subagents
+            .iter()
+            .filter(|(_, working)| working.stretch.is_resumed())
+            .map(|(subagent, _)| subagent.clone())
+            .collect::<Vec<_>>();
+        resumed.sort_unstable();
+        let status = if aborted {
+            ProviderSubagentStatus::Interrupted
+        } else {
+            ProviderSubagentStatus::Completed
+        };
+        resumed
+            .iter()
+            .flat_map(|subagent| self.project_stretch_settled(subagent, status))
+            .collect()
+    }
+
+    /// Settles the Subagent the spawning tool call names. A settle for a spawn never opened lands
+    /// nowhere, like any other unrouted Subagent event.
     fn project_subagent_settled(
         &mut self,
         tool_call_id: &str,
@@ -1092,15 +1297,29 @@ impl CopilotCorrelation {
         let Some(subagent) = self.spawns.remove(tool_call_id) else {
             return Vec::new();
         };
-        let mut streams = self.subagents.remove(&subagent).unwrap_or_default();
-        let mut projected: Vec<AttributedProviderEvent> =
-            settle_open_streams(&mut streams, &self.delegations)
-                .into_iter()
-                .map(|event| attributed(Some(&subagent), event))
-                .collect();
         // The output this completion provokes arrives only after the settle, so the settle
         // leaves a Continuation owed to it (ADR 0015).
         self.late_settle_owes_continuation = true;
+        self.project_stretch_settled(&subagent, status)
+    }
+
+    /// Settles the stretch a Subagent is working, closing whatever its streams leave open — the
+    /// split-held Reasoning title above all — before the settle itself drops the routes.
+    fn project_stretch_settled(
+        &mut self,
+        subagent: &str,
+        status: ProviderSubagentStatus,
+    ) -> Vec<AttributedProviderEvent> {
+        let mut streams = self
+            .subagents
+            .remove(subagent)
+            .map(|working| working.streams)
+            .unwrap_or_default();
+        let mut projected: Vec<AttributedProviderEvent> =
+            settle_open_streams(&mut streams, &self.delegations)
+                .into_iter()
+                .map(|event| attributed(Some(subagent), event))
+                .collect();
         projected.push(attributed(
             None,
             ProviderEvent::SubagentCompleted {
@@ -3441,32 +3660,18 @@ mod tests {
     }
 
     #[test]
-    fn a_steering_message_for_a_subagent_not_working_stands_nowhere() {
+    fn a_message_for_an_instance_no_subagent_holds_stands_nowhere() {
         let mut correlation = with_subagent();
-        project_attributed(
-            &mut correlation,
-            agent_event(
-                "agent-1",
-                "subagent.completed",
-                json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher" }),
-            ),
-        );
-        assert!(
-            project_attributed(
-                &mut correlation,
-                delivered_message("agent-1", "steering", None, "Too late."),
-            )
-            .is_empty(),
-            "a settled Subagent has no working Turn for a steer to stand in"
-        );
-        assert!(
-            project_attributed(
-                &mut correlation,
-                delivered_message("agent-9", "steering", None, "Who?"),
-            )
-            .is_empty(),
-            "an instance no Subagent holds has no Turn at all"
-        );
+        for delivery in ["steering", "queued", "idle"] {
+            assert!(
+                project_attributed(
+                    &mut correlation,
+                    delivered_message("agent-9", delivery, None, "Who?"),
+                )
+                .is_empty(),
+                "an instance no Subagent holds has no Session for a `{delivery}` message to reach"
+            );
+        }
     }
 
     #[test]
@@ -3570,6 +3775,398 @@ mod tests {
         assert_eq!(
             project(&mut correlation, "session.idle", json!({})),
             [ProviderEvent::TurnCompleted]
+        );
+    }
+
+    /// The main agent's own identity as a sender: `agent-<its Copilot Session id>`, which names
+    /// no Subagent.
+    const MAIN_AGENT: &str = "agent-94bf4cb4-74ac-43d9-8903-038759ca8a86";
+
+    /// A correlation whose Turn spawned `agent-1`, whose stretch has since settled.
+    fn with_settled_subagent() -> CopilotCorrelation {
+        let mut correlation = with_subagent();
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "subagent.completed",
+                json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        correlation
+    }
+
+    fn resumed(subagent: &str, description: &str, delegation: Option<&str>) -> ProviderEvent {
+        ProviderEvent::SubagentResumed {
+            subagent_id: ProviderSubagentId::new(subagent),
+            name: "Researcher".to_owned(),
+            description: description.to_owned(),
+            delegation: delegation.map(str::to_owned),
+        }
+    }
+
+    fn settled(subagent: &str, status: ProviderSubagentStatus) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentCompleted {
+                subagent_id: ProviderSubagentId::new(subagent),
+                status,
+            },
+        }
+    }
+
+    /// The model message `agent` closes one agent-loop turn with: one requesting `tools`, or with
+    /// none, the answer that exits the loop.
+    fn loop_message(agent: &str, message_id: &str, content: &str, tools: &[&str]) -> SessionEvent {
+        let requests = tools
+            .iter()
+            .map(|tool| json!({ "toolCallId": tool, "name": "bash", "arguments": {} }))
+            .collect::<Vec<_>>();
+        agent_event(
+            agent,
+            "assistant.message",
+            json!({ "messageId": message_id, "content": content, "toolRequests": requests }),
+        )
+    }
+
+    fn turn_end(agent: &str, turn_id: &str) -> SessionEvent {
+        agent_event(agent, "assistant.turn_end", json!({ "turnId": turn_id }))
+    }
+
+    #[test]
+    fn a_message_a_settled_subagent_consumes_resumes_it_whatever_its_delivery() {
+        for delivery in ["queued", "idle", "steering"] {
+            let mut correlation = with_settled_subagent();
+            assert_eq!(
+                project_attributed(
+                    &mut correlation,
+                    delivered_message(
+                        "agent-1",
+                        delivery,
+                        Some(MAIN_AGENT),
+                        "Also say PINEAPPLE.\nThen stop."
+                    ),
+                ),
+                [AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: resumed(
+                        "agent-1",
+                        "Also say PINEAPPLE.",
+                        Some("Also say PINEAPPLE.\nThen stop."),
+                    ),
+                }],
+                "a `{delivery}` message the settled Subagent consumed runs it again: the main \
+                 agent's resume, opened by the message, described by its first line"
+            );
+            assert_eq!(
+                project_attributed(
+                    &mut correlation,
+                    agent_event(
+                        "agent-1",
+                        "assistant.message",
+                        json!({ "messageId": "r1", "content": "PINEAPPLE" }),
+                    ),
+                ),
+                [
+                    ProviderEvent::AgentMessageStarted,
+                    ProviderEvent::AgentMessageDelta {
+                        content: "PINEAPPLE".to_owned(),
+                    },
+                    ProviderEvent::AgentMessageCompleted,
+                ]
+                .map(|event| AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event,
+                }),
+                "the resume routes the Subagent's work to it again"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_a_sibling_sent_is_that_siblings_even_once_it_settled() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(&mut correlation, spawn_started("agent-2", "t-sibling"));
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-2",
+                "subagent.completed",
+                json!({ "toolCallId": "t-sibling", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "queued", Some("agent-agent-2"), "Say MANGO."),
+            ),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-2"),
+                event: resumed("agent-1", "Say MANGO.", Some("Say MANGO.")),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_resume_carries_the_model_the_subagent_last_ran_on() {
+        let mut correlation = with_subagent();
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "assistant.usage",
+                json!({ "model": "gpt-5.6-luna", "inputTokens": 10, "outputTokens": 2 }),
+            ),
+        );
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "subagent.completed",
+                json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "idle", Some(MAIN_AGENT), "Once more."),
+            ),
+            [
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: resumed("agent-1", "Once more.", Some("Once more.")),
+                },
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new("agent-1"),
+                        model: crate::protocol::ModelId::new("gpt-5.6-luna"),
+                    },
+                },
+            ],
+            "Copilot reports a Subagent's Model change only at spawn, so it follows the resume"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_carries_nothing_to_read_is_described_as_the_subagent_was() {
+        let mut correlation = with_settled_subagent();
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "queued", None, "  "),
+            ),
+            [AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: resumed("agent-1", "Scout the workspace", None),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_spawns_own_prompt_is_no_resume() {
+        let mut correlation = with_subagent();
+        assert!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "idle", Some(MAIN_AGENT), "Scout the workspace."),
+            )
+            .is_empty(),
+            "the spawn's prompt arrives before the Subagent has worked, and its spawn already \
+             carried it in"
+        );
+    }
+
+    #[test]
+    fn a_resumed_turn_settles_at_the_turn_end_after_a_message_requesting_no_tools() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "idle", Some(MAIN_AGENT), "Run it again."),
+        );
+        project_attributed(
+            &mut correlation,
+            loop_message("agent-1", "r1", "", &["t-bash"]),
+        );
+        assert!(
+            project_attributed(&mut correlation, turn_end("agent-1", "0")).is_empty(),
+            "a model message requesting tools keeps the loop going"
+        );
+        project_attributed(
+            &mut correlation,
+            loop_message("agent-1", "r2", "Done.", &[]),
+        );
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "assistant.reasoning",
+                json!({ "reasoningId": "rs1", "content": "Wrapping up." }),
+            ),
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, turn_end("agent-1", "1")),
+            [settled("agent-1", ProviderSubagentStatus::Completed)],
+            "the loop exits at the turn end after an answer requesting no tools"
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                loop_message("agent-1", "r3", "Late.", &[])
+            )
+            .is_empty(),
+            "the settled Subagent is routed no longer"
+        );
+        assert!(
+            project_attributed(&mut correlation, turn_end("agent-1", "2")).is_empty(),
+            "and its stretch settles once"
+        );
+    }
+
+    #[test]
+    fn a_spawns_turn_end_settles_nothing() {
+        let mut correlation = with_subagent();
+        project_attributed(
+            &mut correlation,
+            loop_message("agent-1", "s1", "Found it.", &[]),
+        );
+        assert!(
+            project_attributed(&mut correlation, turn_end("agent-1", "0")).is_empty(),
+            "Copilot settles a spawn's stretch itself, with `subagent.completed`"
+        );
+    }
+
+    #[test]
+    fn a_later_message_settles_a_resume_still_open_before_beginning_the_next() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "queued", Some(MAIN_AGENT), "First."),
+        );
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "assistant.message_delta",
+                json!({ "messageId": "r1", "deltaContent": "Half" }),
+            ),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "queued", Some(MAIN_AGENT), "Second."),
+            ),
+            [
+                AttributedProviderEvent {
+                    attribution: subagent("agent-1"),
+                    event: ProviderEvent::AgentMessageCompleted,
+                },
+                settled("agent-1", ProviderSubagentStatus::Completed),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: resumed("agent-1", "Second.", Some("Second.")),
+                },
+            ],
+            "Copilot delivers the next message only once the previous run has ended"
+        );
+    }
+
+    #[test]
+    fn the_loops_idle_settles_a_resume_still_open() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "queued", Some(MAIN_AGENT), "Again."),
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, event("session.idle", json!({}))),
+            [
+                settled("agent-1", ProviderSubagentStatus::Completed),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::TurnCompleted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_aborted_idle_settles_a_resume_interrupted() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "queued", Some(MAIN_AGENT), "Again."),
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                event("session.idle", json!({ "aborted": true }))
+            ),
+            [
+                settled("agent-1", ProviderSubagentStatus::Interrupted),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::TurnInterrupted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resume_the_main_agent_sends_with_no_turn_running_begins_a_continuation() {
+        let mut correlation = with_settled_subagent();
+        project(&mut correlation, "session.idle", json!({}));
+        assert!(!correlation.is_turn_running());
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                delivered_message("agent-1", "idle", Some(MAIN_AGENT), "Again."),
+            ),
+            [AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: resumed("agent-1", "Again.", Some("Again.")),
+            }]
+        );
+        assert!(
+            correlation.is_turn_running(),
+            "the resume's row stands in a Continuation the loop's next idle settles"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, event("session.idle", json!({}))),
+            [
+                settled("agent-1", ProviderSubagentStatus::Completed),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::TurnCompleted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_idle_notification_projects_nothing() {
+        let mut correlation = with_settled_subagent();
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "queued", Some(MAIN_AGENT), "Again."),
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "system.notification",
+                json!({
+                    "content": "<system_notification>\nAgent \"researcher\" has finished.\n</system_notification>",
+                    "kind": {
+                        "type": "agent_idle",
+                        "agentId": "agent-1",
+                        "agentType": "task",
+                        "description": "Scout the workspace",
+                        "displayName": "Researcher",
+                    },
+                }),
+            )
+            .is_empty(),
+            "Copilot names a resumed agent idle in some runs and not others, so it settles nothing"
         );
     }
 }
