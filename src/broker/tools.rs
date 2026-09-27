@@ -13,9 +13,10 @@ use crate::{
         AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ProviderUnavailability,
+        ProviderUnavailability, SessionId, TurnStatus,
     },
     provider::{BrokeredSubagentRequest, ProviderOrchestrator},
+    sessions::{BrokeredReadError, BrokeredSubagentReading, SessionStore},
 };
 
 /// One Tool the Broker offers. A new Tool is a variant here, its description
@@ -24,11 +25,13 @@ use crate::{
 pub(super) enum BrokerTool {
     ListProviders,
     SpawnSubagent,
+    ReadSubagent,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 2] = [Self::ListProviders, Self::SpawnSubagent];
+    pub(super) const ALL: [Self; 3] =
+        [Self::ListProviders, Self::SpawnSubagent, Self::ReadSubagent];
 
     pub(super) fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
@@ -38,6 +41,7 @@ impl BrokerTool {
         match self {
             Self::ListProviders => "list_providers",
             Self::SpawnSubagent => "spawn_subagent",
+            Self::ReadSubagent => "read_subagent",
         }
     }
 
@@ -45,6 +49,7 @@ impl BrokerTool {
         match self {
             Self::ListProviders => "List Providers",
             Self::SpawnSubagent => "Spawn Subagent",
+            Self::ReadSubagent => "Read Subagent",
         }
     }
 
@@ -55,6 +60,7 @@ impl BrokerTool {
         match self {
             Self::ListProviders => LIST_PROVIDERS_DESCRIPTION,
             Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
+            Self::ReadSubagent => READ_SUBAGENT_DESCRIPTION,
         }
     }
 
@@ -104,6 +110,17 @@ impl BrokerTool {
                 "required": ["provider", "model", "name", "description", "prompt"],
                 "additionalProperties": false,
             }),
+            Self::ReadSubagent => json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The session_id spawn_subagent answered with.",
+                    },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            }),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -114,7 +131,7 @@ impl BrokerTool {
     /// Whether the Tool only reads, changing nothing Suru holds.
     pub(super) fn is_read_only(self) -> bool {
         match self {
-            Self::ListProviders => true,
+            Self::ListProviders | Self::ReadSubagent => true,
             Self::SpawnSubagent => false,
         }
     }
@@ -157,6 +174,21 @@ settles. A Provider that is turned off or cannot be used now, a Model it does \
 not offer, or an option value the Model does not take is refused, saying what \
 was wrong.";
 
+const READ_SUBAGENT_DESCRIPTION: &str = "\
+Read how a Subagent spawned with spawn_subagent is doing — one you spawned, or \
+one a Subagent beneath you spawned: whether it still works, how long it has \
+worked, and what it last wrote. Takes \"id\", the session_id spawn_subagent \
+answered with. Answers with JSON of the shape {\"session_id\": \"...\", \
+\"status\": \"...\", \"duration_ms\": ..., \"message\": ...}, describing \
+the Subagent's latest stretch of work: \"status\" is \"working\" while it \
+works, and once it settles \"completed\", \"failed\" or \"stopped\"; \
+\"duration_ms\" is how long that stretch has worked so far, or worked in all \
+once settled, and null where Suru never learned when it ended; and \
+\"message\" is the latest Message the Subagent wrote in that stretch, in full \
+— its final answer once settled — or null when it has written none. An id \
+naming no Subagent spawned with spawn_subagent by you or by a Subagent beneath \
+you is refused.";
+
 /// One call of a Tool: who is calling, and the arguments as the Agent sent
 /// them.
 pub(super) struct ToolCall {
@@ -185,13 +217,19 @@ impl ToolRefusal {
 pub(crate) struct BrokerTools {
     model_catalog: ModelCatalogService,
     providers: ProviderOrchestrator,
+    sessions: SessionStore,
 }
 
 impl BrokerTools {
-    pub(crate) fn new(model_catalog: ModelCatalogService, providers: ProviderOrchestrator) -> Self {
+    pub(crate) fn new(
+        model_catalog: ModelCatalogService,
+        providers: ProviderOrchestrator,
+        sessions: SessionStore,
+    ) -> Self {
         Self {
             model_catalog,
             providers,
+            sessions,
         }
     }
 
@@ -236,6 +274,111 @@ impl BrokerTools {
                     .map_err(ToolRefusal)?;
                 Ok(json!({ "session_id": session_id }))
             }
+            BrokerTool::ReadSubagent => self.read_subagent(call),
+        }
+    }
+
+    /// Answers `read_subagent`: how the brokered Subagent the call names
+    /// stands, read for the calling Agent, which may read only the brokered
+    /// Subagents beneath it.
+    fn read_subagent(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
+        let subagent = named_subagent(BrokerTool::ReadSubagent, &call.arguments, &["id"])?;
+        let reading = self
+            .sessions
+            .read_brokered_subagent(call.caller.session_id(), subagent)
+            .map_err(|error| read_refusal(error, subagent))?;
+        Ok(serde_json::to_value(SubagentReadout::from(reading))
+            .expect("a Subagent's reading always serializes"))
+    }
+}
+
+/// The brokered Subagent a call names by its `id` argument — the Session id
+/// `spawn_subagent` answered with — having refused any argument `tool` does
+/// not take, as `takes` lists them.
+fn named_subagent(
+    tool: BrokerTool,
+    arguments: &Map<String, Value>,
+    takes: &[&str],
+) -> Result<SessionId, ToolRefusal> {
+    let name = tool.name();
+    if let Some(unknown) = arguments
+        .keys()
+        .find(|argument| !takes.contains(&argument.as_str()))
+    {
+        return Err(ToolRefusal::new(format!(
+            "{name} takes no argument `{unknown}`; it takes {}.",
+            listed(takes.iter().copied())
+        )));
+    }
+    match arguments.get("id") {
+        None | Some(Value::Null) => Err(ToolRefusal::new(format!(
+            "{name} needs `id`, the session_id spawn_subagent answered with."
+        ))),
+        Some(id) => serde_json::from_value(id.clone()).map_err(|_| {
+            ToolRefusal::new(format!(
+                "{name}'s `id` must be the session_id spawn_subagent answered with; {id} is \
+                 not one."
+            ))
+        }),
+    }
+}
+
+/// Why `read_subagent` could not read `subagent`, in words the calling Agent
+/// reads.
+fn read_refusal(error: BrokeredReadError, subagent: SessionId) -> ToolRefusal {
+    ToolRefusal::new(match error {
+        BrokeredReadError::CallerNotFound => {
+            "The Session calling the Broker no longer exists on this Suru server.".to_owned()
+        }
+        BrokeredReadError::NoSuchSession => format!(
+            "Suru holds no Session `{subagent}`; pass the session_id spawn_subagent answered with."
+        ),
+        BrokeredReadError::NotBrokeredBeneathCaller => format!(
+            "`{subagent}` is not a Subagent spawned with spawn_subagent by you or by a Subagent \
+             beneath you; read_subagent reads only those."
+        ),
+    })
+}
+
+/// What `read_subagent` answers.
+#[derive(Debug, Serialize)]
+struct SubagentReadout {
+    session_id: SessionId,
+    status: SubagentStatus,
+    duration_ms: Option<u64>,
+    message: Option<String>,
+}
+
+impl From<BrokeredSubagentReading> for SubagentReadout {
+    fn from(reading: BrokeredSubagentReading) -> Self {
+        Self {
+            session_id: reading.session_id,
+            status: SubagentStatus::from(reading.status),
+            duration_ms: reading.duration_ms,
+            message: reading.message,
+        }
+    }
+}
+
+/// How a Subagent's latest stretch of work stands, spelled as
+/// `read_subagent`'s description spells it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SubagentStatus {
+    Working,
+    Completed,
+    Failed,
+    /// Interrupted: stopped rather than finishing or failing.
+    Stopped,
+}
+
+impl From<TurnStatus> for SubagentStatus {
+    fn from(status: TurnStatus) -> Self {
+        match status {
+            TurnStatus::Active => Self::Working,
+            TurnStatus::Completed => Self::Completed,
+            TurnStatus::Failed => Self::Failed,
+            TurnStatus::Interrupted => Self::Stopped,
         }
     }
 }
@@ -1045,6 +1188,58 @@ mod tests {
             ),
         ] {
             let refusal = SpawnArguments::read(&arguments(value))
+                .expect_err("the arguments are refused")
+                .to_string();
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn the_read_description_names_every_status_a_subagent_may_stand_at() {
+        for status in [
+            TurnStatus::Active,
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::Interrupted,
+        ] {
+            let spelled = serde_json::to_value(SubagentStatus::from(status))
+                .expect("a status serializes")
+                .to_string();
+            assert!(
+                READ_SUBAGENT_DESCRIPTION.contains(&spelled),
+                "read_subagent's description names {spelled}"
+            );
+        }
+        for field in ["session_id", "status", "duration_ms", "message"] {
+            assert!(
+                READ_SUBAGENT_DESCRIPTION.contains(&format!("\"{field}\"")),
+                "read_subagent's description gives the shape of {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_names_its_subagent_by_the_id_spawn_answered_with() {
+        let id = SessionId::new();
+        assert_eq!(
+            named_subagent(
+                BrokerTool::ReadSubagent,
+                &options(json!({ "id": id })),
+                &["id"]
+            ),
+            Ok(id)
+        );
+        for (arguments, says) in [
+            (json!({}), "read_subagent needs `id`"),
+            (json!({ "id": null }), "read_subagent needs `id`"),
+            (json!({ "id": 7 }), "`id` must be the session_id"),
+            (json!({ "id": "Researcher" }), "`id` must be the session_id"),
+            (
+                json!({ "id": id, "tail": 3 }),
+                "read_subagent takes no argument `tail`; it takes `id`.",
+            ),
+        ] {
+            let refusal = named_subagent(BrokerTool::ReadSubagent, &options(arguments), &["id"])
                 .expect_err("the arguments are refused")
                 .to_string();
             assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");

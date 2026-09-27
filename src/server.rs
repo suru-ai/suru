@@ -684,10 +684,11 @@ pub async fn spawn_with_source_control(
         broker_access.clone(),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
-    // through the same orchestrator every other Session's runs on.
+    // through the same orchestrator every other Session's runs on, and one
+    // reading a Subagent reads it from the same Session store.
     let broker_routes = broker::router(
         broker_access,
-        BrokerTools::new(model_catalog.clone(), providers.clone()),
+        BrokerTools::new(model_catalog.clone(), providers.clone(), sessions.clone()),
         provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a

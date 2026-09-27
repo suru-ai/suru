@@ -46,7 +46,9 @@ const INSTRUCTIONS: &str = "\
 Suru's Broker offers Tools for working across every Provider Suru hosts, \
 beside the Tools your own Provider gives you. Call list_providers to learn \
 which Providers, Models and Model Options may be chosen, and spawn_subagent to \
-delegate a piece of work to a Subagent on any of them.";
+delegate a piece of work to a Subagent on any of them. \
+Call read_subagent with the session_id spawn_subagent answered with to learn \
+how that Subagent is doing and read what it last wrote.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 

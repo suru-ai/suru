@@ -49,7 +49,9 @@ mod watches;
 mod workspace_icon;
 mod workspaces;
 
-pub(crate) use brokered::{BrokeredSpawn, DelegatingAgent};
+pub(crate) use brokered::{
+    BrokeredReadError, BrokeredSpawn, BrokeredSubagentReading, DelegatingAgent,
+};
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
 };

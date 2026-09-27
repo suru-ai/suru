@@ -17,13 +17,17 @@
 //! token — stands in a Continuation of the caller's Session begun to hold it
 //! (CONTEXT.md: Subagent), which settles as it is begun because nothing else
 //! ever would (ADR 0033).
+//!
+//! The Agent that spawned a brokered Subagent, and every Agent above it, reads
+//! how it stands through the Broker: its latest Turn's outcome, how long that
+//! Turn has worked, and the latest Message it wrote there.
 
 use std::fmt;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityStatus, AgentSelection, MessageRole, SessionChange, SessionId,
-    SessionSnapshot, Turn, TurnId, TurnStatus,
+    Activity, ActivityStatus, AgentSelection, Message, MessageRole, SessionChange, SessionId,
+    SessionSnapshot, SessionTimestamp, Turn, TurnId, TurnStatus,
 };
 use crate::storage::StorageSink;
 
@@ -82,6 +86,38 @@ impl fmt::Display for BrokeredSpawnError {
             Self::Storage(message) => write!(formatter, "Suru could not record it: {message}"),
         }
     }
+}
+
+/// How a brokered Subagent stands, as the Agents above it read it through the
+/// Broker. The Subagent itself never Settles, so this is its Session's latest
+/// Turn: the stretch of work it is doing, or the one it last settled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BrokeredSubagentReading {
+    pub(crate) session_id: SessionId,
+    /// The latest Turn's status: `Active` while the Subagent works, and
+    /// otherwise the outcome that Turn settled with.
+    pub(crate) status: TurnStatus,
+    /// How long the latest Turn has worked so far, or — once settled — how
+    /// long it worked, as the row its stretch stands as says; `None` where
+    /// Suru never learned when its work ended (ADR 0029).
+    pub(crate) duration_ms: Option<u64>,
+    /// The latest Message the Subagent wrote in that Turn, whole: its final
+    /// one once the Turn has settled. `None` when it has written none there.
+    pub(crate) message: Option<String>,
+}
+
+/// Why a brokered Subagent could not be read for the Agent asking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokeredReadError {
+    /// The calling Session is not one the store holds ready: deleted, or its
+    /// history still unread.
+    CallerNotFound,
+    /// No Session goes by the id asked for.
+    NoSuchSession,
+    /// The Session named is no brokered Subagent beneath the caller: a native
+    /// Subagent, the caller itself or a Session above or beside it, or one in
+    /// another tree altogether.
+    NotBrokeredBeneathCaller,
 }
 
 impl SessionStore {
@@ -173,6 +209,33 @@ impl SessionStore {
             turn_id: spawned.turn_id,
             delegator,
         })
+    }
+
+    /// Reads how the brokered Subagent `subagent` stands, for the Agent of
+    /// `caller`: the outcome of its Session's latest Turn — or that it still
+    /// works there — how long that Turn has worked, and the latest Message it
+    /// wrote in it. Only a brokered Subagent beneath the caller is read: one
+    /// the caller's Agent spawned, or one spawned by a Subagent beneath it, at
+    /// any depth (see [`SessionStoreState::is_brokered_beneath`]).
+    pub(crate) fn read_brokered_subagent(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+    ) -> Result<BrokeredSubagentReading, BrokeredReadError> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if state.is_deferred(caller) || !state.sessions.contains_key(&caller) {
+            return Err(BrokeredReadError::CallerNotFound);
+        }
+        if !state.sessions.contains_key(&subagent) {
+            return Err(BrokeredReadError::NoSuchSession);
+        }
+        if !state.is_brokered_beneath(subagent, caller) {
+            return Err(BrokeredReadError::NotBrokeredBeneathCaller);
+        }
+        Ok(state.brokered_subagent_reading(subagent, SessionTimestamp::now()))
     }
 }
 
@@ -381,6 +444,135 @@ impl SessionStoreState {
         }
         changes
     }
+
+    /// Whether `subagent` is a brokered Subagent beneath `caller`: its own
+    /// Session a brokered Subagent's, and `caller` somewhere up the line of
+    /// Sessions that spawned it — its spawner, or its spawner's, at any depth.
+    /// A brokered Subagent is its tree's to reach only from above: not from
+    /// itself, nor a sibling, nor another tree. A Session whose history is
+    /// still unread lies in no tree the caller's hydrated history reaches,
+    /// since a tree hydrates whole.
+    pub(super) fn is_brokered_beneath(&self, subagent: SessionId, caller: SessionId) -> bool {
+        if self.is_deferred(subagent)
+            || !self
+                .sessions
+                .get(&subagent)
+                .is_some_and(|record| record.is_brokered_subagent())
+        {
+            return false;
+        }
+        let mut current = subagent;
+        // A line longer than the store holds Sessions has looped back on
+        // itself, which bounds the walk without remembering where it has been.
+        for _ in 0..self.sessions.len() {
+            let Some(spawner) = self
+                .sessions
+                .get(&current)
+                .and_then(|record| record.snapshot.session.parent)
+            else {
+                return false;
+            };
+            if spawner == caller {
+                return true;
+            }
+            current = spawner;
+        }
+        false
+    }
+
+    /// How the brokered Subagent `subagent`, which the caller has found held,
+    /// stands `now`: see [`BrokeredSubagentReading`]. Its spawn opened its
+    /// Session with a Turn, so it always has one; were it ever without, it
+    /// would read as still owed the work it was spawned for.
+    fn brokered_subagent_reading(
+        &self,
+        subagent: SessionId,
+        now: SessionTimestamp,
+    ) -> BrokeredSubagentReading {
+        let snapshot = &self.sessions[&subagent].snapshot;
+        let Some(latest) = snapshot.turns.last() else {
+            return BrokeredSubagentReading {
+                session_id: subagent,
+                status: TurnStatus::Active,
+                duration_ms: None,
+                message: None,
+            };
+        };
+        let duration_ms = match latest.status {
+            TurnStatus::Active => latest
+                .started_at
+                .map(|started| now.0.saturating_sub(started.0)),
+            TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted => {
+                self.settled_duration(subagent, snapshot, latest)
+            }
+        };
+        BrokeredSubagentReading {
+            session_id: subagent,
+            status: latest.status,
+            duration_ms,
+            message: latest_agent_message(snapshot, latest.id)
+                .map(|message| message.content.clone()),
+        }
+    }
+
+    /// How long a brokered Subagent's settled `turn` worked, as the row its
+    /// stretch stands as says — the latest row leading into `subagent` in the
+    /// Session whose Agent delegated it — since that is the time the reader
+    /// of the delegating Transcript is shown: from the Turn's beginning to its
+    /// settling, or unsaid where a restart settled it and nothing timed its
+    /// end (ADR 0029). A Turn no Delegation opened stands as no row, and one
+    /// whose row never followed it has none to say, so each is timed from the
+    /// Turn itself.
+    fn settled_duration(
+        &self,
+        subagent: SessionId,
+        snapshot: &SessionSnapshot,
+        turn: &Turn,
+    ) -> Option<u64> {
+        let span = || {
+            turn.settled_at
+                .zip(turn.started_at)
+                .and_then(|(settled, started)| settled.0.checked_sub(started.0))
+        };
+        let row = delegating_session(snapshot, turn.id)
+            .and_then(|holder| self.sessions.get(&holder))
+            .and_then(|holder| {
+                holder
+                    .snapshot
+                    .activities
+                    .iter()
+                    .rev()
+                    .find_map(|activity| match activity {
+                        Activity::Subagent {
+                            session_id,
+                            status,
+                            duration_ms,
+                            ..
+                        } if *session_id == subagent => Some((*status, *duration_ms)),
+                        _ => None,
+                    })
+            });
+        match row {
+            Some((status, duration_ms)) if status != ActivityStatus::Active => duration_ms,
+            _ => span(),
+        }
+    }
+}
+
+/// The latest Message the Agent of `snapshot`'s Session wrote in Turn
+/// `turn_id` — its final one there, once the Turn has settled — as the Session
+/// holds it, whole. A Message begun but still empty says nothing yet, so the
+/// one before it stands. This is what `read_subagent` answers with, and what a
+/// Subagent Report excerpts.
+pub(crate) fn latest_agent_message(
+    snapshot: &SessionSnapshot,
+    turn_id: TurnId,
+) -> Option<&Message> {
+    snapshot.messages.iter().rev().find(|message| {
+        message.turn_id == turn_id
+            && message.role == MessageRole::Agent
+            && !message.content.is_empty()
+    })
 }
 
 /// The Session whose Agent delegated the stretch of work `turn_id` is: the
