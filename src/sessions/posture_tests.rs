@@ -269,52 +269,63 @@ async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_a
     );
 }
 
+fn codex_posture(
+    approval_policy: CodexApprovalPolicy,
+    sandbox_mode: CodexSandboxMode,
+) -> ApprovalPosture {
+    ApprovalPosture::Codex {
+        approval_policy,
+        sandbox_mode,
+    }
+}
+
 /// A brokered Subagent on its spawner's Provider acts under its spawner's
-/// posture verbatim, a pin included; one on another Provider takes that
-/// Provider's own Setting until ADR 0036's table replaces it. Either is
+/// posture verbatim, a pin included; one on another Provider takes the value
+/// ADR 0036's table gives for its spawner's, the pin still carried. Either is
 /// recorded as applied, since no Provider runs for the child yet.
 #[test]
-fn a_brokered_subagents_posture_is_its_spawners_on_its_provider_and_the_setting_on_another() {
+fn a_brokered_subagents_posture_is_its_spawners_on_its_provider_and_the_tables_on_another() {
     let spawner = SessionApprovalPosture {
         value: ApprovalPosture::Claude {
-            permission_mode: ClaudePermissionMode::BypassPermissions,
+            permission_mode: ClaudePermissionMode::Auto,
         },
         pinned: true,
         application: ApprovalPostureApplication::Applying,
     };
     let mut settings = EffectiveSettings::default();
     settings.provider.codex.approval_policy = CodexApprovalPolicy::Untrusted;
+    let spawned = |spawner, provider: &str| {
+        super::posture::brokered_subagent_posture(spawner, &ProviderId::new(provider), &settings)
+    };
 
     assert_eq!(
-        super::posture::brokered_subagent_posture(
-            Some(spawner),
-            &ProviderId::new("claude"),
-            &settings
-        ),
+        spawned(Some(spawner), "claude"),
         Some(SessionApprovalPosture {
             application: ApprovalPostureApplication::Applied,
             ..spawner
-        })
+        }),
+        "auto, which the table would read as acceptEdits, stands verbatim on Claude"
     );
     assert_eq!(
-        super::posture::brokered_subagent_posture(
-            Some(spawner),
-            &ProviderId::new("codex"),
-            &settings
-        ),
+        spawned(Some(spawner), "codex"),
         Some(SessionApprovalPosture {
-            value: ApprovalPosture::Codex {
-                approval_policy: CodexApprovalPolicy::Untrusted,
-                sandbox_mode: CodexSandboxMode::WorkspaceWrite,
-            },
-            pinned: false,
+            value: codex_posture(
+                CodexApprovalPolicy::OnRequest,
+                CodexSandboxMode::WorkspaceWrite
+            ),
+            pinned: true,
             application: ApprovalPostureApplication::Applied,
-        })
+        }),
+        "on Codex it is Codex's value at auto's level rather than Codex's own Setting"
     );
     assert_eq!(
-        super::posture::brokered_subagent_posture(None, &ProviderId::new("claude"), &settings)
-            .map(|posture| posture.value),
+        spawned(None, "claude").map(|posture| posture.value),
         ApprovalPosture::for_provider(&ProviderId::new("claude"), &settings),
         "a spawner with no posture leaves the child its own Provider's Setting"
+    );
+    assert_eq!(
+        spawned(Some(spawner), "gemini"),
+        None,
+        "and a Provider with no native posture Suru can name holds none"
     );
 }

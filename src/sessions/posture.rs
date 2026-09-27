@@ -5,8 +5,11 @@ use crate::protocol::{
     SessionApprovalPosture, SessionChange, SessionId, UpdateApprovalPostureRequest,
 };
 
+mod table;
+
 use super::{SessionStore, SessionStoreState};
 use crate::storage::StorageSink;
+use table::PostureLevel;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApprovalPostureMutationError {
@@ -260,33 +263,86 @@ impl SessionStore {
     }
 }
 
-/// The Approval Posture a brokered Subagent acts under from its spawn. On its
-/// spawner's Provider it takes the spawner's posture verbatim, as a native
-/// Subagent does (CONTEXT.md: Approval Posture). On another Provider it takes
-/// that Provider's own Setting for now: ADR 0036's table between the
-/// Providers' values replaces that arm, and the inheritance pass
-/// ([`SessionStoreState::inherit_tree_postures`]) — which passes over a
-/// brokered Subagent today, since it owns its actor — is where the table
-/// re-derives the child's reading whenever the spawner's changes.
-///
-/// No Provider runs for the child yet, so the value is recorded as applied:
-/// whatever Provider starts for it starts under it.
+/// The Approval Posture a brokered Subagent on `provider` acts under from its
+/// spawn: [`derived_posture`] read from its spawner's, recorded as applied,
+/// since no Provider runs for the child yet and whatever Provider starts for
+/// it starts under it.
 pub(super) fn brokered_subagent_posture(
     spawner: Option<SessionApprovalPosture>,
     provider: &ProviderId,
     settings: &EffectiveSettings,
 ) -> Option<SessionApprovalPosture> {
-    match spawner {
-        Some(spawner) if spawner.value.provider() == *provider => Some(SessionApprovalPosture {
-            application: ApprovalPostureApplication::Applied,
-            ..spawner
-        }),
-        _ => {
-            ApprovalPosture::for_provider(provider, settings).map(|value| SessionApprovalPosture {
+    derived_posture(spawner.as_ref(), provider, settings)
+        .map(|held| held.reading(None, PostureDelivery::Settled))
+}
+
+/// What a brokered Subagent on `provider` holds, read from its spawner's
+/// posture (CONTEXT.md: Approval Posture). On its spawner's Provider that is
+/// the spawner's posture verbatim, a pin included, as a native Subagent's is.
+/// On another it is the rough equivalent ADR 0036's table gives for the
+/// spawner's value, still carrying the spawner's pin, so the reading says of
+/// the whole tree whether it runs under an override or follows the Settings.
+///
+/// A spawner with no posture Suru can name — its Provider has none — or a
+/// Provider the table has no column for leaves the child its own Provider's
+/// Setting, as a top-level Session on that Provider reads it.
+fn derived_posture(
+    spawner: Option<&SessionApprovalPosture>,
+    provider: &ProviderId,
+    settings: &EffectiveSettings,
+) -> Option<HeldPosture> {
+    spawner
+        .and_then(|spawner| {
+            let value = if spawner.value.provider() == *provider {
+                Some(spawner.value)
+            } else {
+                PostureLevel::of(spawner.value).canonical(provider)
+            }?;
+            Some(HeldPosture {
+                value,
+                pinned: spawner.pinned,
+            })
+        })
+        .or_else(|| {
+            ApprovalPosture::for_provider(provider, settings).map(|value| HeldPosture {
                 value,
                 pinned: false,
-                application: ApprovalPostureApplication::Applied,
             })
+        })
+}
+
+/// A posture a Session is to hold, as far as its value and whether it is
+/// pinned go: how far it has reached the Provider it governs is the Session's
+/// own reading to say.
+#[derive(Clone, Copy)]
+struct HeldPosture {
+    value: ApprovalPosture,
+    pinned: bool,
+}
+
+impl HeldPosture {
+    /// The reading of a Session that held `current` and now holds this. A
+    /// value it held already keeps whatever application it had reached,
+    /// except that a Settled delivery closes an Applying one; a new value is
+    /// Applying where a live Provider is owed it, and applied at once where
+    /// none exists to owe it to.
+    fn reading(
+        self,
+        current: Option<&SessionApprovalPosture>,
+        delivery: PostureDelivery,
+    ) -> SessionApprovalPosture {
+        let (application, _) = application_for_desired(current, self.value, false);
+        let application = match delivery {
+            PostureDelivery::Owed => application,
+            PostureDelivery::Settled if application == ApprovalPostureApplication::Applying => {
+                ApprovalPostureApplication::Applied
+            }
+            PostureDelivery::Settled => application,
+        };
+        SessionApprovalPosture {
+            value: self.value,
+            pinned: self.pinned,
+            application,
         }
     }
 }
