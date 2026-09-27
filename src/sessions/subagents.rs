@@ -12,10 +12,10 @@ use tokio::sync::broadcast;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, AgentSelection, Delegator, Message, MessageId, MessageRole, MessageStatus,
-    ModelAvailability, PromptOrder, ProviderId, Session, SessionApprovalPosture, SessionChange,
-    SessionId, SessionRevision, SessionSnapshot, SessionStandingInputs, SessionStatus,
-    SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AgentSelection, Delegator, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, PromptOrder, ProviderId, Session,
+    SessionApprovalPosture, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStandingInputs, SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 use crate::provider::ProviderSubagentId;
 use crate::storage::{PersistedSession, StorageSink, StoredSubagentIdentity};
@@ -297,6 +297,29 @@ pub(super) struct ChildSession {
     pub(super) approval_posture: Option<SessionApprovalPosture>,
     pub(super) delegation: Option<NormalizedText>,
     pub(super) route: SubagentRoute,
+}
+
+/// The row a stretch of a Subagent's work stands as in the Turn that
+/// delegated it, as the stretch opens — a spawn's or a resume's, whichever
+/// route the Subagent took: working, leading into the Subagent's own Session,
+/// and saying no Model until its Provider confirms one and no duration until
+/// the stretch settles.
+pub(crate) fn opening_subagent_row(
+    turn_id: TurnId,
+    name: String,
+    description: String,
+    session_id: SessionId,
+) -> Activity {
+    Activity::Subagent {
+        id: ActivityId::new(),
+        turn_id,
+        status: ActivityStatus::Active,
+        name,
+        description,
+        model: None,
+        session_id,
+        duration_ms: None,
+    }
 }
 
 /// A Subagent's Title: what its spawn described it doing, or its name where

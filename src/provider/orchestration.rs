@@ -40,7 +40,7 @@ use crate::sessions::{
     ApprovalPostureUpdate, BrokeredSpawn, DelegatingAgent, DeliveredDelegation, DeliveredTurn,
     DeliveredTurnStatus, InterruptSessionError, InterruptTarget, OpenInterventions,
     ProviderTurnOutcome, SessionStore, StoredSubagent, TrailingCommandOutput,
-    command_output_changes, earliest_pending_prompt, message_content_changes,
+    command_output_changes, earliest_pending_prompt, message_content_changes, opening_subagent_row,
     reasoning_content_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -4613,22 +4613,9 @@ fn add_subagent_row(
     description: String,
     session_id: SessionId,
 ) -> anyhow::Result<ActivityId> {
-    let activity_id = ActivityId::new();
-    sessions.publish_agent_output(
-        owner_session_id,
-        SessionChange::ActivityAdded {
-            activity: Activity::Subagent {
-                id: activity_id,
-                turn_id,
-                status: ActivityStatus::Active,
-                name: name.to_owned(),
-                description,
-                model: None,
-                session_id,
-                duration_ms: None,
-            },
-        },
-    )?;
+    let activity = opening_subagent_row(turn_id, name.to_owned(), description, session_id);
+    let activity_id = activity.id();
+    sessions.publish_agent_output(owner_session_id, SessionChange::ActivityAdded { activity })?;
     Ok(activity_id)
 }
 

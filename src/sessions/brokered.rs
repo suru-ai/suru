@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::ansi::NormalizedText;
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentSelection, MessageRole, SessionChange, SessionId,
+    Activity, ActivityStatus, AgentSelection, MessageRole, SessionChange, SessionId,
     SessionSnapshot, Turn, TurnId, TurnStatus,
 };
 use crate::storage::StorageSink;
@@ -24,7 +24,7 @@ use super::{
     SessionStore, SessionStoreState,
     posture::brokered_subagent_posture,
     projection::active_turn_id,
-    subagents::{ChildSession, SubagentRoute, delegator, subagent_title},
+    subagents::{ChildSession, SubagentRoute, delegator, opening_subagent_row, subagent_title},
 };
 
 /// What a delegating Agent asked the Broker to spawn, checked against the
@@ -140,17 +140,12 @@ impl SessionStore {
             },
         );
         let row = SessionChange::ActivityAdded {
-            activity: Activity::Subagent {
-                id: ActivityId::new(),
-                turn_id: delegating_turn,
-                status: ActivityStatus::Active,
-                name: spawn.name,
-                description: spawn.description,
-                // Unknown until the child's own Provider confirms one.
-                model: None,
-                session_id: spawned.session_id,
-                duration_ms: None,
-            },
+            activity: opening_subagent_row(
+                delegating_turn,
+                spawn.name,
+                spawn.description,
+                spawned.session_id,
+            ),
         };
         if let Err(error) = state.commit(&self.storage, caller, vec![row]) {
             // A child with no row would work on where no reader could reach
