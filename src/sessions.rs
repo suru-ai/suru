@@ -553,17 +553,13 @@ impl SessionStore {
         // Every Provider actor holding a conversation the deletion takes
         // closes with it: the deleted Session's own — a top-level Session
         // owns one even when its history was unreadable and the store holds
-        // no record to ask — and that of any Subagent below it with an actor
-        // of its own.
-        let mut actor_owners = vec![session_id];
-        for owner in doomed
-            .iter()
-            .filter_map(|doomed_id| state.actor_owner_of(*doomed_id))
-        {
-            if !actor_owners.contains(&owner) {
-                actor_owners.push(owner);
-            }
-        }
+        // no record to ask — and that of every brokered Subagent beneath it,
+        // each on an actor of its own (ADR 0035). A native Subagent's
+        // conversation rides one of those, and an unreadable Session below
+        // never ran on one.
+        let actor_owners = std::iter::once(session_id)
+            .chain(state.actor_owners_beneath(session_id))
+            .collect();
         for doomed_id in doomed.iter().rev() {
             self.storage
                 .deleted(*doomed_id)
