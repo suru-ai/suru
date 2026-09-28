@@ -182,8 +182,9 @@ impl ServerTimings {
         self
     }
 
-    /// Sets how long after it was last uploaded or bound an Attachment
-    /// outlives the deletion of the last Session referencing it.
+    /// Sets how long after it was last uploaded or bound an Attachment is
+    /// left in place even once no Session references it, before a Session's
+    /// deletion or the orphan sweep may reclaim it.
     pub fn with_attachment_grace(mut self, grace: Duration) -> Self {
         self.attachment_grace = grace;
         self
@@ -597,6 +598,11 @@ pub async fn spawn_with_source_control(
         .load_sessions()
         .await
         .context("load persisted Sessions")?;
+    // Uploads no stored Prompt or Message came to bind are reclaimed once
+    // their grace period has passed; a failed sweep leaves them for the next.
+    if let Err(error) = repository.sweep_orphaned_attachments().await {
+        tracing::warn!("could not sweep orphaned Attachments at startup: {error}");
+    }
     let persisted_landing_agent_selection = repository
         .landing_agent_selection()
         .await

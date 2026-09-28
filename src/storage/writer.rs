@@ -100,8 +100,14 @@ impl StorageWriter {
             })
             .collect::<HashMap<_, _>>();
         let task = thread::spawn(move || {
+            // Whether a command arrived since the writer last went idle: the
+            // idle flush ending each burst of work sweeps orphaned
+            // Attachments once, and a quiet tick after it sweeps nothing.
+            let mut worked = false;
             loop {
-                match receiver.recv_timeout(IDLE_FLUSH_DELAY) {
+                let received = receiver.recv_timeout(IDLE_FLUSH_DELAY);
+                worked |= received.is_ok();
+                match received {
                     Ok(WriterCommand::Hydrate(persisted)) => {
                         sessions
                             .entry(persisted.snapshot.session.id)
@@ -243,6 +249,16 @@ impl StorageWriter {
                     }
                     Err(std_mpsc::RecvTimeoutError::Timeout) => {
                         flush_sessions(&repository, &mut sessions, None)?;
+                        // Every Session held here has landed its joins, so an
+                        // Attachment none is joined to is bound by no stored
+                        // Prompt or Message. A failed sweep leaves its
+                        // orphans for the next one.
+                        if std::mem::take(&mut worked)
+                            && let Err(error) =
+                                super::attachment_table::sweep_orphaned_attachments(&repository)
+                        {
+                            tracing::warn!("could not sweep orphaned Attachments: {error}");
+                        }
                     }
                 }
             }

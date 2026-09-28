@@ -168,8 +168,10 @@ diesel::table! {
 #[derive(Clone)]
 pub(crate) struct StorageRepository {
     database_path: Arc<PathBuf>,
-    /// How long after it was last uploaded or bound an Attachment outlives
-    /// the deletion of the last Session referencing it.
+    /// How long after it was last uploaded or bound an Attachment is left in
+    /// place, whether or not any Session references it: neither the deletion
+    /// of the last Session referencing it nor the orphan sweep reclaims it
+    /// sooner.
     attachment_grace: std::time::Duration,
     /// Where the time an Attachment's grace is measured by is read.
     clock: crate::clock::ServerClock,
@@ -344,7 +346,7 @@ impl StorageRepository {
     }
 
     /// Leaves an Attachment in place for `grace` after it was last uploaded
-    /// or bound, even once the last Session referencing it is deleted.
+    /// or bound, even once no Session references it.
     pub(crate) fn with_attachment_grace(mut self, grace: std::time::Duration) -> Self {
         self.attachment_grace = grace;
         self
@@ -583,8 +585,7 @@ impl StorageRepository {
     fn delete_session(&self, session_id: SessionId) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
         let id = session_id.to_string();
-        let referenced_before = attachment_table::millis(self.clock.now())
-            .saturating_sub(i64::try_from(self.attachment_grace.as_millis()).unwrap_or(i64::MAX));
+        let referenced_before = self.grace_cutoff();
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
                 let joined = attachment_table::session_attachment_ids(connection, &id)?;

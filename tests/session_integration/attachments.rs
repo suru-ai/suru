@@ -1056,7 +1056,6 @@ async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_i
     let descriptor = server.descriptor().clone();
     let own = uploaded(&descriptor, png(10, 10)).await;
     let shared = uploaded(&descriptor, gif(20, 20)).await;
-    let unbound = uploaded(&descriptor, webp(30, 30)).await;
 
     let text = "[Image 1] beside [Image 2]";
     let deleted = settled_session(
@@ -1087,11 +1086,6 @@ async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_i
         fetch(&descriptor, &shared.id).await.status(),
         StatusCode::OK,
         "an Attachment another Session binds stays"
-    );
-    assert_eq!(
-        fetch(&descriptor, &unbound.id).await.status(),
-        StatusCode::OK,
-        "an upload no Session has bound yet stays"
     );
     let remaining = crate::support::read_session(&descriptor, kept).await;
     assert_eq!(remaining.prompts[0].attachments[0].attachment_id, shared.id);
@@ -1282,6 +1276,128 @@ async fn admitting_a_prompt_restarts_the_grace_period_of_the_attachments_it_bind
     }
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// Waits for a sweep to reclaim `attachment`, which the idle flush ending the
+/// writer's next burst of work runs.
+async fn wait_until_swept(descriptor: &RuntimeDescriptor, attachment: &AttachmentDescriptor) {
+    timeout(PROGRESS_DEADLINE, async {
+        while fetch(descriptor, &attachment.id).await.status() != StatusCode::NOT_FOUND {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a sweep reclaims the orphaned Attachment");
+}
+
+#[tokio::test]
+async fn an_idle_flush_sweeps_uploads_no_prompt_binds_once_past_their_grace_period() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (server, clock) = spawn_with_manual_clock(state_dir.path(), "attachment-sweep-test").await;
+    let descriptor = server.descriptor().clone();
+    let orphan = uploaded(&descriptor, png(10, 10)).await;
+    clock.advance(2 * MINUTE);
+    let young = uploaded(&descriptor, gif(20, 20)).await;
+
+    // The first upload is past its grace period now and the second is not.
+    // Neither is bound: its label was deleted, or its Prompt refused.
+    clock.advance(HOUR - MINUTE);
+    let session_id =
+        settled_session(&descriptor, workspace.path(), "Begin plainly", Vec::new()).await;
+    wait_until_swept(&descriptor, &orphan).await;
+    assert_eq!(
+        fetched(&descriptor, &young.id).await,
+        ("image/gif".to_owned(), gif(20, 20)),
+        "an upload within its grace period survives the sweep"
+    );
+
+    let text = "Now [Image 1]";
+    let bindings = vec![bound(&young, text, "[Image 1]")];
+    let prompt = admitted(
+        &descriptor,
+        session_id,
+        text,
+        bindings.clone(),
+        PromptDelivery::Queue,
+    )
+    .await;
+    assert_eq!(
+        prompt.attachments, bindings,
+        "the upload that survived is bound"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_sweep_never_reclaims_an_attachment_a_stored_prompt_binds_however_old() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (server, clock) =
+        spawn_with_manual_clock(state_dir.path(), "attachment-sweep-bound-test").await;
+    let descriptor = server.descriptor().clone();
+    let kept = uploaded(&descriptor, png(10, 10)).await;
+    let orphan = uploaded(&descriptor, gif(20, 20)).await;
+    let text = "Keep [Image 1]";
+    let bindings = vec![bound(&kept, text, "[Image 1]")];
+    let session_id = settled_session(&descriptor, workspace.path(), text, bindings.clone()).await;
+
+    clock.advance(1000 * HOUR);
+    settled_session(&descriptor, workspace.path(), "Begin plainly", Vec::new()).await;
+    wait_until_swept(&descriptor, &orphan).await;
+
+    assert_eq!(
+        fetched(&descriptor, &kept.id).await,
+        ("image/png".to_owned(), png(10, 10)),
+        "an Attachment a stored Prompt binds is never swept"
+    );
+    let snapshot = crate::support::read_session(&descriptor, session_id).await;
+    assert_eq!(snapshot.prompts[0].attachments, bindings);
+    assert_eq!(snapshot.attachments, vec![kept]);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn server_start_sweeps_uploads_no_stored_prompt_binds_once_past_their_grace_period() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "attachment-start-sweep-test";
+    let timings = ServerTimings::default().with_attachment_grace(HOUR);
+    let original = spawn_with_timings(state_dir.path(), channel, timings.clone()).await;
+    let descriptor = original.descriptor().clone();
+    let orphan = uploaded(&descriptor, png(10, 10)).await;
+    let kept = uploaded(&descriptor, gif(20, 20)).await;
+    let text = "Keep [Image 1]";
+    let bindings = vec![bound(&kept, text, "[Image 1]")];
+    let session_id = settled_session(&descriptor, workspace.path(), text, bindings.clone()).await;
+    original.shutdown().await.expect("stop original server");
+
+    // The Server comes back after both uploads have passed their grace period.
+    let (clock, hand) = ServerClock::manual();
+    hand.advance(HOUR + MINUTE);
+    let replacement =
+        spawn_with_timings(state_dir.path(), channel, timings.with_clock(clock)).await;
+    let descriptor = replacement.descriptor().clone();
+
+    assert_eq!(
+        fetch(&descriptor, &orphan.id).await.status(),
+        StatusCode::NOT_FOUND,
+        "the sweep at start reclaims the upload no stored Prompt binds"
+    );
+    assert_eq!(
+        fetched(&descriptor, &kept.id).await,
+        ("image/gif".to_owned(), gif(20, 20)),
+        "the sweep at start keeps the Attachment a stored Prompt binds"
+    );
+    let restored = crate::support::read_session(&descriptor, session_id).await;
+    assert_eq!(restored.prompts[0].attachments, bindings);
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
 }
 
 /// The composer's own paste, answered by a real upload through the managed

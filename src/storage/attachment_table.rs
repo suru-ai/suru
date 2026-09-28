@@ -4,11 +4,18 @@
 //! Messages bind them, and described without their bytes to the Sessions that
 //! bind them. The bytes are read back only when something asks for them (ADR
 //! 0037). An Attachment's age, which decides whether it may be reclaimed, is
-//! measured from that last reference.
+//! measured from that last reference; one no Session is joined to is swept
+//! once that age passes the grace period.
 
 use std::collections::{BTreeSet, HashSet};
 
-use diesel::{SqliteConnection, dsl::exists, prelude::*};
+use diesel::{
+    SqliteConnection,
+    dsl::{exists, not},
+    prelude::*,
+    query_builder::BoxedDeleteStatement,
+    sqlite::Sqlite,
+};
 
 use crate::protocol::{AttachmentDescriptor, AttachmentId, AttachmentKind, SessionTimestamp};
 
@@ -27,7 +34,7 @@ struct AttachmentRow {
 }
 
 /// A moment as the `referenced_at` column stores it.
-pub(super) fn millis(moment: SessionTimestamp) -> i64 {
+fn millis(moment: SessionTimestamp) -> i64 {
     i64::try_from(moment.0).unwrap_or(i64::MAX)
 }
 
@@ -138,6 +145,42 @@ impl StorageRepository {
         })
         .await
     }
+
+    /// Sweeps orphaned Attachments: see [`sweep_orphaned_attachments`].
+    pub(crate) async fn sweep_orphaned_attachments(&self) -> Result<usize, StorageError> {
+        let repository = self.clone();
+        on_blocking_task("sweep Attachments", move || {
+            sweep_orphaned_attachments(&repository)
+        })
+        .await
+    }
+
+    /// The latest an Attachment may have last been referenced and still be
+    /// reclaimed now: the grace period ago.
+    pub(super) fn grace_cutoff(&self) -> i64 {
+        millis(self.clock.now())
+            .saturating_sub(i64::try_from(self.attachment_grace.as_millis()).unwrap_or(i64::MAX))
+    }
+}
+
+/// Deletes every Attachment no stored Prompt or Message binds — one no
+/// Session is joined to — that was last uploaded or bound no later than the
+/// grace period ago, and answers how many it deleted. Run where every Session
+/// held in memory has landed its joins, it leaves only an upload whose Prompt
+/// is still in admission unjoined, and admission stamped that one referenced
+/// within the grace period.
+pub(super) fn sweep_orphaned_attachments(
+    repository: &StorageRepository,
+) -> Result<usize, StorageError> {
+    let referenced_before = repository.grace_cutoff();
+    let mut connection = super::connect(&repository.database_path)?;
+    let swept = delete_unjoined(referenced_before)
+        .execute(&mut connection)
+        .map_err(|error| StorageError::WriteAttachment(error.to_string()))?;
+    if swept > 0 {
+        tracing::info!(swept, "swept Attachments no stored Prompt or Message binds");
+    }
+    Ok(swept)
 }
 
 /// The descriptors the named Attachments that are stored were uploaded as, in
@@ -242,21 +285,31 @@ pub(super) fn delete_unjoined_attachments(
     if attachment_ids.is_empty() {
         return Ok(());
     }
-    diesel::delete(
-        attachments::table
-            .filter(attachments::id.eq_any(attachment_ids))
-            .filter(attachments::referenced_at.le(referenced_before))
-            .filter(diesel::dsl::not(exists(session_attachments::table.filter(
-                session_attachments::attachment_id.eq(attachments::id),
-            )))),
-    )
-    .execute(connection)?;
+    delete_unjoined(referenced_before)
+        .filter(attachments::id.eq_any(attachment_ids))
+        .execute(connection)?;
     Ok(())
+}
+
+/// The deletion of every Attachment no Session is joined to that was last
+/// referenced no later than `referenced_before`.
+fn delete_unjoined(
+    referenced_before: i64,
+) -> BoxedDeleteStatement<'static, Sqlite, attachments::table> {
+    diesel::delete(attachments::table)
+        .filter(attachments::referenced_at.le(referenced_before))
+        .filter(not(exists(session_attachments::table.filter(
+            session_attachments::attachment_id.eq(attachments::id),
+        ))))
+        .into_boxed()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::storage::{connect, sessions};
 
     #[tokio::test]
     async fn referencing_attachments_describes_those_stored() {
@@ -289,5 +342,97 @@ mod tests {
             .await
             .expect("reference one Attachment twice");
         assert_eq!(all, vec![descriptor]);
+    }
+
+    async fn stored(repository: &StorageRepository, width: u8) -> AttachmentId {
+        let bytes = [b"GIF89a".as_slice(), &[width, 0, 1, 0, 0, 0, 0, 0]].concat();
+        let descriptor = crate::attachments::describe(&bytes).expect("describe fixture");
+        let id = descriptor.id.clone();
+        repository
+            .store_attachment(descriptor, bytes)
+            .await
+            .expect("store fixture");
+        id
+    }
+
+    #[tokio::test]
+    async fn sweeping_deletes_only_attachments_no_session_joins_once_past_their_grace() {
+        const MINUTE: Duration = Duration::from_secs(60);
+        const HOUR: Duration = Duration::from_secs(60 * 60);
+        let directory = tempfile::tempdir().expect("create data directory");
+        let (clock, hand) = crate::clock::ServerClock::manual();
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("open repository")
+            .with_attachment_grace(HOUR)
+            .with_clock(clock);
+        let orphan = stored(&repository, 1).await;
+        let joined = stored(&repository, 2).await;
+        hand.advance(2 * MINUTE);
+        let young = stored(&repository, 3).await;
+        let mut connection = connect(&repository.database_path).expect("connect");
+        diesel::insert_into(sessions::table)
+            .values((
+                sessions::id.eq("joining-session"),
+                sessions::title.eq("fixture"),
+                sessions::created_at.eq(0),
+                sessions::updated_at.eq(0),
+                sessions::workspace.eq("{}"),
+                sessions::agent_selection_availability.eq("unavailable"),
+                sessions::status.eq("idle"),
+                sessions::revision.eq(0),
+                sessions::brokered.eq(false),
+            ))
+            .execute(&mut connection)
+            .expect("store a Session to join");
+        join_session_attachments(
+            &mut connection,
+            "joining-session",
+            &[joined.as_str().to_owned()],
+        )
+        .expect("join the Session to an Attachment");
+        let all = || vec![orphan.clone(), joined.clone(), young.clone()];
+
+        hand.advance(HOUR - MINUTE);
+        assert_eq!(
+            repository
+                .sweep_orphaned_attachments()
+                .await
+                .expect("sweep"),
+            1,
+            "only the unjoined Attachment past its grace period is swept"
+        );
+        assert_eq!(
+            repository
+                .stored_attachments(all())
+                .await
+                .expect("find Attachments"),
+            HashSet::from([joined.clone(), young.clone()])
+        );
+
+        hand.advance(2 * MINUTE);
+        assert_eq!(
+            repository
+                .sweep_orphaned_attachments()
+                .await
+                .expect("sweep again"),
+            1,
+            "the younger unjoined Attachment goes once its grace period passes"
+        );
+        assert_eq!(
+            repository
+                .stored_attachments(all())
+                .await
+                .expect("find Attachments"),
+            HashSet::from([joined.clone()]),
+            "a joined Attachment stays however old"
+        );
+        assert_eq!(
+            repository
+                .sweep_orphaned_attachments()
+                .await
+                .expect("sweep with nothing to reclaim"),
+            0
+        );
     }
 }
