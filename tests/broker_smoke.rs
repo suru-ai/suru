@@ -2,18 +2,20 @@
 
 //! The Broker end to end against the installed, signed-in CLIs (spec #407): a
 //! real Claude Session's Agent spawns a real Codex Subagent through the Broker,
-//! the Subagent's Turn settles, and its Subagent Report wakes the Claude Agent
-//! into a Continuation where it answers.
+//! and hears back from it — through its Subagent Report, waking the Claude
+//! Agent into a Continuation, and through a wait on it held open for longer
+//! than Claude's idle window for a silent call.
 //!
 //! Every other Broker test drives Suru against Provider doubles and scripted
-//! stand-ins; this one is the check that the real harnesses do what those
+//! stand-ins; these are the check that the real harnesses do what those
 //! doubles were written to: that Claude loads the Broker from its MCP config,
 //! finds its Tools, and calls them unasked, at whichever MCP revision it
 //! negotiates with the Broker; that Codex takes the Broker on its thread and
-//! runs a brokered Subagent at the posture derived for it; and that Claude
-//! answers a Report as a Turn of its own. It spends real Model calls, so it
-//! runs only when asked twice — the ignore attribute and `SURU_BROKER_SMOKE=1`
-//! — and skips when Suru finds either CLI not installed or not signed in:
+//! runs a brokered Subagent at the posture derived for it; that Claude answers
+//! a Report as a Turn of its own; and that a long Broker call survives Claude's
+//! timers. They spend real Model calls, so they run only when asked twice —
+//! the ignore attribute and `SURU_BROKER_SMOKE=1` — and skip when Suru finds
+//! either CLI not installed or not signed in:
 //!
 //! ```text
 //! SURU_BROKER_SMOKE=1 cargo nextest run --test broker_smoke --run-ignored ignored-only --no-capture
@@ -21,7 +23,7 @@
 //!
 //! `SURU_CLAUDE_PATH` and `SURU_CODEX_PATH` name other binaries, as they do for
 //! Suru itself, and `SURU_LOG` writes the Server's own tracing to stderr. What
-//! it asserts, and the versions it last passed against, are recorded in
+//! they assert, and the versions they last passed against, are recorded in
 //! `docs/validation/0421-broker-smoke.md`.
 
 #[path = "support/mod.rs"]
@@ -47,11 +49,11 @@ use tokio::time::{Duration, Instant, timeout};
 
 const GATE: &str = "SURU_BROKER_SMOKE";
 
-/// What the smoke asks of the Claude Agent. It names the Broker but none of
-/// its Tools, which the Agent learns from the note Suru appends to its system
-/// prompt. The Subagent sleeps before it answers so that its Report reaches a
-/// Claude Agent whose Turn has settled — the Continuation this smoke is about —
-/// rather than steering the Turn that spawned it.
+/// What the Report smoke asks of the Claude Agent. It names the Broker but
+/// none of its Tools, which the Agent learns from the note Suru appends to its
+/// system prompt. The Subagent sleeps before it answers so that its Report
+/// reaches a Claude Agent whose Turn has settled — the Continuation that smoke
+/// is about — rather than steering the Turn that spawned it.
 const REPORT_PROMPT: &str = "Using Suru's Broker, spawn one Subagent on the codex Provider, on \
 that Provider's default Model, named echo. Tell it to run the shell command `sleep 8` and then \
 reply with exactly the word PONG and nothing else. Do not do its task yourself, and do not wait \
@@ -59,18 +61,55 @@ for it or check on it: once it is spawned, end your turn straight away. Suru wil
 Report as a new message; when it arrives, answer with the single word DONE followed by the \
 Subagent's reply.";
 
-/// The Subagent's name, as the Prompt gives it.
+/// How long the wait smoke's Subagent sleeps: past the 300 s after which
+/// Claude aborts an HTTP MCP call that has sent nothing
+/// (`docs/validation/0408-claude-http-mcp-long-calls.md`, run 4), so the
+/// Agent's wait on it has to outlast Claude's idle window.
+const SUBAGENT_SLEEP_SECONDS: u64 = 330;
+
+/// The `timeout_seconds` the wait smoke's Agent waits with: longer than the
+/// Subagent sleeps, so the wait answers because the Subagent settled.
+const WAIT_TIMEOUT_SECONDS: u64 = 400;
+
+/// What the wait smoke asks of the Claude Agent: to hold one Broker call open
+/// for as long as the Subagent sleeps, and to say so plainly should the call
+/// fail, so a call Claude cut short is told apart from one that answered.
+fn wait_prompt() -> String {
+    format!(
+        "Using Suru's Broker, spawn one Subagent on the codex Provider, on that Provider's \
+         default Model, named echo. Tell it to run the shell command `sleep \
+         {SUBAGENT_SLEEP_SECONDS}`, which takes over five minutes, to wait for that command to \
+         finish, and only then to reply with exactly the word PONG and nothing else. Do not do \
+         its task yourself. Once it is spawned, call wait_subagents on it with timeout_seconds \
+         {WAIT_TIMEOUT_SECONDS} and wait for that call to answer, calling nothing else \
+         meanwhile. When it answers with the Subagent settled, reply with the single word DONE \
+         followed by the Subagent's reply, and end your turn. If the call fails or times out \
+         instead, reply with WAIT FAILED followed by the error it gave, and end your turn \
+         without calling it again."
+    )
+}
+
+/// What the wait smoke's Agent says when its wait did not answer.
+const WAIT_FAILED: &str = "WAIT FAILED";
+
+/// The Subagent's name, as both Prompts give it.
 const SUBAGENT_NAME: &str = "echo";
 
 /// The Claude Model the delegating Agent runs on: the cheapest the CLI offers,
 /// which is capable enough to find a deferred Tool and follow the Prompt.
 const PARENT_MODEL: &str = "haiku";
 
-/// How long each live stretch — the spawn, the Subagent's work, the Report's
-/// Continuation — may take before the smoke calls it a failure. It is a failure deadline for real CLIs calling real
+/// How long each live stretch of the Report smoke — the spawn, the
+/// Subagent's work, the Report's Continuation — may take before the smoke
+/// calls it a failure. It is a failure deadline for real CLIs calling real
 /// Models, not an expected wait: every wait returns the moment what it waits
 /// for arrives.
 const LIVE_STEP_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long the whole of the wait smoke may take, from its Session's creation:
+/// its Subagent's sleep, and the minutes either side of it that real CLIs
+/// take to start, spawn, and answer.
+const WAIT_SMOKE_DEADLINE: Duration = Duration::from_secs(600);
 
 /// How long a Session may stand at rest — nothing in it Working, every Turn
 /// settled — without changing before a smoke waiting on it for something else
@@ -208,6 +247,119 @@ async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_i
     );
     drop(parent);
     drop(child);
+    live.finish().await;
+}
+
+/// The Broker call Claude holds open longest is a wait on a Subagent. This
+/// smoke holds one open for longer than Claude aborts a silent HTTP MCP call,
+/// at whichever MCP revision Claude negotiated with the Broker, while the
+/// Broker reports progress on it: the call answers once the Subagent settles,
+/// and the Agent acts on the answer in the very Turn that waited.
+///
+/// It waits for that answer, not for the Turn to settle. The Subagent's Report
+/// reaches the Agent as the wait answers, steering the Turn still in its Broker
+/// call, and whether a steer the CLI folds into its running loop settles the
+/// Turn is a question of Suru's Claude steer accounting rather than of the call
+/// (`docs/validation/0421-broker-smoke.md`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "set SURU_BROKER_SMOKE=1 to use the installed, signed-in Claude and Codex binaries"]
+async fn a_claude_agents_wait_on_a_codex_subagent_outlasts_claudes_idle_window() {
+    let Some(mut live) = Live::start("broker-wait-smoke").await else {
+        return;
+    };
+    let deadline = Instant::now() + WAIT_SMOKE_DEADLINE;
+    let (created, prompt_id) = live.create_claude_session(&wait_prompt()).await;
+    let parent_id = created.session.id;
+    let mut parent = Watched::subscribe(&live.client, parent_id, "the Claude Session").await;
+
+    let (spawned, child_id) =
+        brokered_spawn(&mut live, &mut parent, prompt_id, left_before(deadline)).await;
+    let spawned_at = Instant::now();
+    let waiting_turn = spawned.turns[0].id;
+    live.say(format!(
+        "the Claude Agent spawned {child_id} through the Broker"
+    ));
+    let delegated_child = delegated(&mut live, &created, child_id, left_before(deadline)).await;
+    drop(delegated_child);
+
+    // The Turn that spawned the Subagent waits on it, and answers once the wait does — or says
+    // the wait failed, which ends the smoke there. It fails, or is interrupted, never.
+    let answered = parent
+        .read_until_unless(
+            &mut live.client,
+            left_before(deadline),
+            "the Claude Agent's wait on its Subagent answers, and the Agent acts on it",
+            |snapshot| {
+                let answer = agent_text_in(snapshot, waiting_turn);
+                answer.contains("DONE") && answer.contains("PONG")
+            },
+            |snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Agent && message.content.contains(WAIT_FAILED)
+                    })
+                    .map(|message| format!("said its wait failed: {:?}", message.content))
+            },
+        )
+        .await;
+    let waited = spawned_at.elapsed();
+    let answer = agent_text_in(&answered, waiting_turn);
+    live.say(format!(
+        "the Claude Agent answered {answer:?} in the Turn that waited, {:.1}s after the spawn",
+        waited.as_secs_f64()
+    ));
+    assert!(
+        waited >= Duration::from_secs(SUBAGENT_SLEEP_SECONDS),
+        "the answer came once the Subagent had slept, not before: {}",
+        describe(&answered)
+    );
+    let (row_status, _) = row_of(&answered, child_id).expect("the row still stands");
+    assert_eq!(
+        row_status,
+        ActivityStatus::Completed,
+        "the Subagent the Agent waited on settled Completed: {}",
+        describe(&answered)
+    );
+    let waiting = answered
+        .turns
+        .iter()
+        .find(|turn| turn.id == waiting_turn)
+        .expect("the Turn that waited still stands");
+    assert!(
+        matches!(waiting.status, TurnStatus::Active | TurnStatus::Completed),
+        "the Turn that waited is neither failed nor interrupted: {}",
+        describe(&answered)
+    );
+
+    // The Subagent slept as long as it was told to, so the call it answered was that long.
+    let child_settled = live
+        .client
+        .read_session(child_id)
+        .await
+        .expect("read the Codex Subagent's Session");
+    let (child_model, child_reply) = settled_with_pong(&child_settled);
+    let child_turn = &child_settled.turns[0];
+    let (Some(began), Some(settled)) = (child_turn.started_at, child_turn.settled_at) else {
+        panic!(
+            "the Subagent's Turn says when it worked: {}",
+            describe(&child_settled)
+        );
+    };
+    assert!(
+        settled.0 - began.0 >= SUBAGENT_SLEEP_SECONDS * 1_000,
+        "the Subagent slept out its {SUBAGENT_SLEEP_SECONDS} s before it answered: {}",
+        describe(&child_settled)
+    );
+    live.say(format!(
+        "the Codex Subagent worked {:.1}s on {} and answered {child_reply:?}",
+        (settled.0 - began.0) as f64 / 1_000.0,
+        child_model.model
+    ));
+
+    settled_in_the_tree(&live, parent_id, child_id, &child_model.model).await;
+    drop(parent);
     live.finish().await;
 }
 
@@ -357,6 +509,11 @@ impl Live {
             began.elapsed().as_secs_f64()
         );
     }
+}
+
+/// How long is left before `deadline`.
+fn left_before(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 /// Waits for the Claude Agent to spawn its Subagent through the Broker:
