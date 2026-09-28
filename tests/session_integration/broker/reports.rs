@@ -695,6 +695,89 @@ async fn interrupting_the_parent_reports_nothing_of_the_subagents_it_stopped() {
 }
 
 #[tokio::test]
+async fn a_report_wakes_a_brokered_subagent_under_the_posture_derived_for_it() {
+    use super::posture::{claude, codex_unrestricted, pin};
+    use suru::protocol::ClaudePermissionMode;
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-report-derived-posture", None).await;
+    let descriptor = delegating.descriptor.clone();
+    pin(
+        &descriptor,
+        delegating.caller,
+        claude(ClaudePermissionMode::BypassPermissions),
+    )
+    .await;
+    delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let start = next_start(&mut delegating.hosted.codex).await;
+    assert_eq!(start.approval_posture(), Some(&codex_unrestricted()));
+    let child_handoff = start
+        .broker()
+        .cloned()
+        .expect("a brokered Subagent is handed the Broker too");
+    let mut child_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: codex_selection("high"),
+    });
+    next_turn(
+        &mut child_provider,
+        "the Delegation reaches the Subagent's Provider",
+    )
+    .await
+    .succeed();
+
+    // The Codex Subagent delegates in its turn and settles, and what it
+    // delegated settles after it.
+    let mut child_client = McpClient::handed(&child_handoff);
+    child_client.initialize().await;
+    let grandchild_id = child_client
+        .spawn_subagent(researcher("claude", "haiku", json!({})))
+        .await;
+    let (grandchild_provider, _) = run_child(
+        &mut delegating.hosted.claude,
+        default_selection(&claude_models()),
+    )
+    .await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let woken = next_turn(
+        &mut child_provider,
+        "the grandchild's Report wakes the idle Subagent's own Provider",
+    )
+    .await;
+    assert_eq!(
+        woken
+            .reports()
+            .iter()
+            .map(|report| report.subagent)
+            .collect::<Vec<_>>(),
+        [grandchild_id]
+    );
+    assert_eq!(
+        woken.approval_posture(),
+        Some(&codex_unrestricted()),
+        "the Continuation runs under the posture derived for the Subagent from its \
+         bypassPermissions spawner, not under Codex's own Setting"
+    );
+    woken.succeed();
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn a_report_reaching_a_continuation_opened_for_late_output_waits_to_wake_the_agent_once_it_settles()
  {
     use super::posture::{claude, pin};
