@@ -45,7 +45,7 @@ mod worktree_picker;
 pub use crate::terminal::{
     CellSize, GraphicsProtocol, TerminalColor, TerminalColorProbe, TerminalFacts,
 };
-pub use attachment_preview::Thumbnail;
+pub use attachment_preview::{Thumbnail, ThumbnailRequest};
 pub use clipboard::{ClipboardContent, ClipboardRead, PasteId};
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;

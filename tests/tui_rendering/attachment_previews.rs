@@ -18,7 +18,7 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CellSize, ClipboardRead,
-        GraphicsProtocol, SemanticCommandId, TerminalFacts, Thumbnail,
+        GraphicsProtocol, SemanticCommandId, TerminalFacts, Thumbnail, ThumbnailRequest,
     },
 };
 
@@ -120,36 +120,69 @@ fn session_with_message(
 const TWO: &str = "Compare [Image 1] with [Image 2]";
 const FOUR: &str = "All of [Image 1] [Image 2] [Image 3] [Image 4]";
 
-/// Answers every thumbnail the last frame asked for, as the run loop would
-/// once the fetch and the decode came back, with a square thumbnail made
-/// for the cell size and protocol the fetch was asked for. Answers which
-/// Attachments were asked for, in order.
-fn answer_fetches(application: &mut Application) -> Vec<AttachmentId> {
-    let mut fetched = Vec::new();
-    loop {
-        match application.take_attachment_fetch() {
-            ApplicationTransition::FetchAttachment {
-                attachment_id,
-                cell_size,
-                protocol,
-                ..
-            } => {
-                let thumbnail =
-                    Thumbnail::from_image(DynamicImage::new_rgba8(120, 120), cell_size, protocol)
-                        .expect("make a thumbnail from pixels");
-                application
-                    .handle_event(ApplicationEvent::AttachmentThumbnail {
-                        attachment_id: attachment_id.clone(),
-                        cell_size,
-                        thumbnail,
-                    })
-                    .expect("answer the fetch");
-                fetched.push(attachment_id);
-            }
-            ApplicationTransition::Continue => return fetched,
-            other => panic!("a frame asks only for thumbnails, not {other:?}"),
+/// One fetch a frame asked for: the request its answer names, and what it
+/// asked about.
+struct Fetch {
+    request: ThumbnailRequest,
+    attachment_id: AttachmentId,
+    cell_size: CellSize,
+}
+
+/// Every fetch the last frame asked for, unanswered, in the order asked.
+fn take_fetches(application: &mut Application) -> Vec<Fetch> {
+    std::iter::from_fn(|| match application.take_attachment_fetch() {
+        ApplicationTransition::FetchAttachment {
+            request,
+            attachment_id,
+            cell_size,
+            ..
+        } => Some(Fetch {
+            request,
+            attachment_id,
+            cell_size,
+        }),
+        ApplicationTransition::Continue => None,
+        other => panic!("a frame asks only for thumbnails, not {other:?}"),
+    })
+    .collect()
+}
+
+/// Answers `fetch` as the run loop would once the fetch and the decode came
+/// back: with a square thumbnail made for the cell size it was asked for, or
+/// with the failure of either.
+fn answer(application: &mut Application, fetch: &Fetch, succeeded: bool) {
+    let event = if succeeded {
+        ApplicationEvent::AttachmentThumbnail {
+            request: fetch.request,
+            attachment_id: fetch.attachment_id.clone(),
+            cell_size: fetch.cell_size,
+            thumbnail: Thumbnail::from_image(
+                DynamicImage::new_rgba8(120, 120),
+                fetch.cell_size,
+                GraphicsProtocol::Kitty,
+            )
+            .expect("make a thumbnail from pixels"),
         }
-    }
+    } else {
+        ApplicationEvent::AttachmentThumbnailFailed {
+            request: fetch.request,
+            attachment_id: fetch.attachment_id.clone(),
+            cell_size: fetch.cell_size,
+        }
+    };
+    application.handle_event(event).expect("answer the fetch");
+}
+
+/// Answers every thumbnail the last frame asked for with a square one.
+/// Answers which Attachments were asked for, in order.
+fn answer_fetches(application: &mut Application) -> Vec<AttachmentId> {
+    take_fetches(application)
+        .into_iter()
+        .map(|fetch| {
+            answer(application, &fetch, true);
+            fetch.attachment_id
+        })
+        .collect()
 }
 
 /// Draws a frame, answers the fetches it asked for, and draws again: the
@@ -507,47 +540,136 @@ fn the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive() {
     );
     assert!(draws_no_image(&waiting));
 
-    answer_fetches(&mut application);
+    // The first to arrive draws the strip: its thumbnail in its slot, and
+    // the line of the one still coming in the slot its thumbnail will take —
+    // a 320×200 image's, twenty columns — cut to fit.
+    let fetches = take_fetches(&mut application);
+    answer(&mut application, &fetches[0], true);
+    let first = rendered_application_frame(&application, WIDTH, HEIGHT);
+    let (start, block) = message_block(&first, TWO);
+    assert_eq!(block.len(), 1 + STRIP_ROWS, "the layout does not move");
+    let left = column_of(&first, start, "┃").expect("the gutter is drawn") + 2;
+    assert_eq!(
+        thumbnails_on(&first, start + 1),
+        vec![(left, THUMBNAIL_COLUMNS)],
+        "{:#?}",
+        readable_rows(&first)
+    );
+    assert_eq!(
+        block[1],
+        format!(
+            "┃ {} Image 2 · GIF · 320×",
+            "#".repeat(usize::from(THUMBNAIL_COLUMNS))
+        )
+    );
+
+    answer(&mut application, &fetches[1], true);
     let arrived = rendered_application_frame(&application, WIDTH, HEIGHT);
     let (start, block) = message_block(&arrived, TWO);
     assert_eq!(block.len(), 1 + STRIP_ROWS, "the layout does not move");
     assert_eq!(thumbnails_on(&arrived, start + 1).len(), 2);
     assert!(!readable_rows(&arrived).join("\n").contains("Image 1 ·"));
+    assert!(!readable_rows(&arrived).join("\n").contains("Image 2 ·"));
 }
 
 #[test]
-fn a_failed_fetch_leaves_the_dimmed_lines_standing() {
+fn a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail() {
     let workspace = workspace_dir();
     let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     rendered_application_frame(&application, WIDTH, HEIGHT);
-    let ApplicationTransition::FetchAttachment {
-        attachment_id,
-        cell_size,
-        ..
-    } = application.take_attachment_fetch()
-    else {
-        panic!("the frame asks for a thumbnail");
-    };
-    application
-        .handle_event(ApplicationEvent::AttachmentThumbnailFailed {
-            attachment_id,
-            cell_size,
-        })
-        .expect("answer the failed fetch");
-    answer_fetches(&mut application);
+    let fetches = take_fetches(&mut application);
+    answer(&mut application, &fetches[0], false);
+    answer(&mut application, &fetches[1], true);
 
+    // The failed 1280×720 image keeps a slot as wide as its thumbnail would
+    // have been — twenty-two columns — with its line cut to fit, and the
+    // other's thumbnail stands beside it.
     let buffer = rendered_application_frame(&application, WIDTH, HEIGHT);
-    assert!(draws_no_image(&buffer));
-    let (_, block) = message_block(&buffer, TWO);
-    assert_eq!(block.len(), 1 + STRIP_ROWS);
-    assert!(block[1].contains("Image 1 · PNG"), "{block:#?}");
+    let (start, block) = message_block(&buffer, TWO);
+    assert_eq!(block.len(), 1 + STRIP_ROWS, "{:#?}", readable_rows(&buffer));
+    let left = column_of(&buffer, start, "┃").expect("the gutter is drawn") + 2;
+    assert!(
+        block[1].starts_with("┃ Image 1 · PNG · 1280×7 #"),
+        "{block:#?}"
+    );
+    for y in start + 1..=start + 6 {
+        assert_eq!(
+            thumbnails_on(&buffer, y),
+            vec![(left + 23, THUMBNAIL_COLUMNS)],
+            "row {y}: {:#?}",
+            readable_rows(&buffer)
+        );
+    }
     rendered_application_frame(&application, WIDTH, HEIGHT);
     assert_eq!(
         application.take_attachment_fetch(),
         ApplicationTransition::Continue,
         "a failed fetch is not retried"
     );
+}
+
+#[test]
+fn when_every_fetch_fails_the_dimmed_lines_stand() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    for fetch in take_fetches(&mut application) {
+        answer(&mut application, &fetch, false);
+    }
+
+    let buffer = rendered_application_frame(&application, WIDTH, HEIGHT);
+    assert!(draws_no_image(&buffer));
+    let (_, block) = message_block(&buffer, TWO);
+    assert_eq!(block.len(), 1 + STRIP_ROWS);
+    assert_eq!(block[1], "┃ Image 1 · PNG · 1280×720 · 312 KiB");
+    assert_eq!(block[2], "┃ Image 2 · GIF · 320×200 · 312 KiB");
+    assert_eq!(
+        application.take_attachment_fetch(),
+        ApplicationTransition::Continue
+    );
+}
+
+#[test]
+fn a_reply_to_a_fetch_since_replaced_never_lands_in_its_place() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let first = session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    let stale = take_fetches(&mut application);
+
+    // Away to another Session and back, before the first fetches answer: the
+    // cache was dropped, and the Attachments are asked for afresh.
+    let other = failed_session_snapshot(
+        SessionId::new(),
+        suru::protocol::PromptId::new(),
+        "Another Session",
+        workspace.path(),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(other))
+        .expect("open another Session");
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(first))
+        .expect("return to the first Session");
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    let fresh = take_fetches(&mut application);
+    assert_eq!(fresh[0].attachment_id, stale[0].attachment_id);
+
+    answer(&mut application, &stale[0], false);
+    answer(&mut application, &fresh[0], true);
+    answer(&mut application, &stale[1], true);
+    let buffer = rendered_application_frame(&application, WIDTH, HEIGHT);
+    let (start, block) = message_block(&buffer, TWO);
+    let left = column_of(&buffer, start, "┃").expect("the gutter is drawn") + 2;
+    assert_eq!(
+        thumbnails_on(&buffer, start + 1),
+        vec![(left, THUMBNAIL_COLUMNS)],
+        "the fresh answer stands, and neither stale one lands: {block:#?}"
+    );
+    assert!(block[1].contains("Image 2 · GIF"), "{block:#?}");
 }
 
 /// The block #429 draws: the text, then one dimmed line per Attachment.
@@ -692,6 +814,53 @@ fn a_drafts_thumbnails_stand_through_the_session_its_prompt_begins() {
 }
 
 #[test]
+fn turning_the_outlook_drops_the_landings_thumbnails() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    type_text(&mut application, "Look at ");
+    paste_image(&mut application, screenshot());
+    let drawn = frame_with_thumbnails(&mut application);
+    assert!(!draws_no_image(&drawn));
+
+    turn_to_studio(&mut application);
+    let turned = rendered_application_frame(&application, WIDTH, HEIGHT);
+    assert!(
+        draws_no_image(&turned),
+        "the Landing of another Outlook holds none of this one's thumbnails: {:#?}",
+        readable_rows(&turned)
+    );
+    let ApplicationTransition::FetchAttachment {
+        origin,
+        attachment_id,
+        ..
+    } = application.take_attachment_fetch()
+    else {
+        panic!("the draft's thumbnail is asked for again");
+    };
+    assert_eq!(origin, Outlook::Remote("studio".to_owned()));
+    assert_eq!(attachment_id, screenshot().id);
+}
+
+#[test]
+fn a_thumbnail_goes_with_the_label_deleted_from_the_draft() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    type_text(&mut application, "Look at ");
+    paste_image(&mut application, screenshot());
+    assert!(!draws_no_image(&frame_with_thumbnails(&mut application)));
+
+    // Backspace takes the space after the label, then the label whole.
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+
+    // Pasting the very image again finds no thumbnail held for it.
+    paste_image(&mut application, screenshot());
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    assert_eq!(answer_fetches(&mut application), vec![screenshot().id]);
+}
+
+#[test]
 fn a_thumbnail_fetch_goes_to_the_open_sessions_origin() {
     let workspace = workspace_dir();
     let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
@@ -702,6 +871,7 @@ fn a_thumbnail_fetch_goes_to_the_open_sessions_origin() {
         attachment_id,
         cell_size,
         protocol,
+        ..
     } = application.take_attachment_fetch()
     else {
         panic!("the frame asks for a thumbnail");
@@ -754,6 +924,33 @@ fn press(
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, modifiers)))
         .expect("deliver a key press")
+}
+
+/// Turns the Outlook toward the Remote named `studio`, through the Connect
+/// picker as a reader does.
+fn turn_to_studio(application: &mut Application) {
+    invoke(application, SemanticCommandId::ConnectOpen);
+    application
+        .handle_event(ApplicationEvent::RemotesListed(vec![
+            suru::protocol::Remote {
+                name: "studio".to_owned(),
+                fingerprint: "studio-fingerprint".to_owned(),
+                addresses: vec!["10.0.0.8:7777".parse().expect("parse the Remote address")],
+                status: suru::protocol::RemoteStatus::Available,
+            },
+        ]))
+        .expect("list the paired Remotes");
+    application
+        .handle_event(ApplicationEvent::RemoteProbed {
+            name: "studio".to_owned(),
+            result: Ok(suru::protocol::RemoteHealth {
+                protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
+                status: suru::protocol::RemoteStatus::Available,
+            }),
+        })
+        .expect("probe the Remote");
+    press(application, KeyCode::Down, KeyModifiers::NONE);
+    press(application, KeyCode::Enter, KeyModifiers::NONE);
 }
 
 fn type_text(application: &mut Application, text: &str) {

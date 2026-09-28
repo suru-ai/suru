@@ -39,7 +39,9 @@ use crate::{
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
     aside::{Aside, AsidePresentation, AsidePress},
-    attachment_preview::{AttachmentPreviews, PreviewMode, Thumbnail},
+    attachment_preview::{
+        AttachmentPreviews, PreviewMode, PreviewScope, Thumbnail, ThumbnailRequest,
+    },
     clipboard::{ClipboardRead, PasteId},
     clipboard_paste::ClipboardPastes,
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
@@ -3262,9 +3264,10 @@ impl TuiState {
         self.ensure_interaction(reference.clone());
         // The Aside answers for the claim at once, from what it says.
         self.aside
-            .stand_in_for(reference, prompt.text.trim().to_owned(), true);
+            .stand_in_for(reference.clone(), prompt.text.trim().to_owned(), true);
         // The draft's thumbnails are the claim's own Prompt's.
-        self.attachment_previews.carry_to(Some(session_id));
+        self.attachment_previews
+            .carry_to(PreviewScope::Session(reference));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.creation_transition(prompt)
     }
@@ -3276,6 +3279,47 @@ impl TuiState {
             self.outlook.clone(),
             self.provisional.as_ref()?.session_id,
         ))
+    }
+
+    /// Every Attachment bound where a strip of thumbnails may show it: by the
+    /// open Session's Prompts and Messages, by the Prompts this client sent it
+    /// that it has not echoed yet, by the Provisional Session's Prompt, and by
+    /// the draft in view.
+    fn bound_attachments(&self) -> HashSet<crate::protocol::AttachmentId> {
+        let mut bound = HashSet::new();
+        if let Some(session) = &self.session {
+            let snapshot = session.snapshot();
+            let prompts = snapshot
+                .prompts
+                .iter()
+                .flat_map(|prompt| &prompt.attachments);
+            let messages = snapshot
+                .messages
+                .iter()
+                .flat_map(|message| &message.attachments);
+            bound.extend(
+                prompts
+                    .chain(messages)
+                    .map(|binding| binding.attachment_id.clone()),
+            );
+            bound.extend(
+                self.provisional_prompts(snapshot.session.id)
+                    .into_iter()
+                    .flat_map(|prompt| prompt.attachments)
+                    .map(|binding| binding.attachment_id),
+            );
+        }
+        if let Some(provisional) = &self.provisional {
+            bound.extend(
+                provisional
+                    .prompt
+                    .attachments
+                    .iter()
+                    .map(|binding| binding.attachment_id.clone()),
+            );
+        }
+        bound.extend(self.composers.bound_attachments(&self.composer_key()));
+        bound
     }
 
     /// Whether the Worktree the Landing intends has already been made for the
@@ -4030,9 +4074,10 @@ pub enum ApplicationEvent {
         paste: PasteId,
         reason: String,
     },
-    /// The thumbnail a [`ApplicationTransition::FetchAttachment`] asked for,
-    /// made at `cell_size`.
+    /// The thumbnail the [`ApplicationTransition::FetchAttachment`] naming
+    /// `request` asked for, made at `cell_size`.
     AttachmentThumbnail {
+        request: ThumbnailRequest,
         attachment_id: AttachmentId,
         cell_size: CellSize,
         thumbnail: Thumbnail,
@@ -4040,6 +4085,7 @@ pub enum ApplicationEvent {
     /// The fetch or the decode behind a thumbnail failed, so the Attachment's
     /// dimmed line stands in its place for as long as the Session is open.
     AttachmentThumbnailFailed {
+        request: ThumbnailRequest,
         attachment_id: AttachmentId,
         cell_size: CellSize,
     },
@@ -4304,8 +4350,10 @@ pub enum ApplicationTransition {
     /// Fetch an Attachment's bytes from `origin` and make its thumbnail at
     /// `cell_size` for `protocol`, off the UI thread, answering with
     /// [`ApplicationEvent::AttachmentThumbnail`] or
-    /// [`ApplicationEvent::AttachmentThumbnailFailed`].
+    /// [`ApplicationEvent::AttachmentThumbnailFailed`], either naming
+    /// `request`.
     FetchAttachment {
+        request: ThumbnailRequest,
         origin: Outlook,
         attachment_id: AttachmentId,
         cell_size: CellSize,
@@ -4530,34 +4578,38 @@ impl Application {
     }
 
     /// Keeps the thumbnails held to the open Session's, presented as the
-    /// Setting and the terminal allow. Read from state after every event
-    /// rather than at each place a Session opens, so no route into another
-    /// Session can keep the last one's thumbnails.
+    /// Setting and the terminal allow, and to the Attachments it and the
+    /// draft in view still bind. Read from state after every event rather
+    /// than at each place a Session opens or a draft changes, so no route
+    /// into another Session can keep the last one's thumbnails and no image
+    /// deleted from a draft keeps its own.
     fn hold_attachment_previews(&mut self) {
         let scope = self
             .state
             .route
-            .as_ref()
-            .map(|route| route.session_id)
-            .or_else(|| {
-                self.state
-                    .provisional
-                    .as_ref()
-                    .map(|provisional| provisional.session_id)
-            });
+            .clone()
+            .or_else(|| self.state.provisional_reference())
+            .map_or_else(
+                || PreviewScope::Landing(self.state.outlook.clone()),
+                PreviewScope::Session,
+            );
         let mode = PreviewMode::of(
             self.state.settings().transcript.image_previews,
             self.terminal_facts.graphics,
             self.terminal_facts.cell_size,
         );
         self.state.attachment_previews.hold_for(scope, mode);
+        if self.state.attachment_previews.holds_any() {
+            let bound = self.state.bound_attachments();
+            self.state.attachment_previews.retain_bound(&bound);
+        }
     }
 
     /// The next thumbnail the last frame drew a strip for and none is held or
     /// coming for, as the fetch that makes it; `Continue` once there is none.
     /// A caller that draws frames drains this after each one.
     pub fn take_attachment_fetch(&mut self) -> ApplicationTransition {
-        let Some((attachment_id, cell_size, protocol)) =
+        let Some((request, attachment_id, cell_size, protocol)) =
             self.state.attachment_previews.take_fetch()
         else {
             return ApplicationTransition::Continue;
@@ -4568,6 +4620,7 @@ impl Application {
             .as_ref()
             .map_or_else(|| self.state.outlook.clone(), |route| route.origin.clone());
         ApplicationTransition::FetchAttachment {
+            request,
             origin,
             attachment_id,
             cell_size,
@@ -4650,22 +4703,27 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentThumbnail {
+                request,
                 attachment_id,
                 cell_size,
                 thumbnail,
             } => {
-                self.state
-                    .attachment_previews
-                    .receive(attachment_id, cell_size, Some(thumbnail));
+                self.state.attachment_previews.receive(
+                    request,
+                    attachment_id,
+                    cell_size,
+                    Some(thumbnail),
+                );
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentThumbnailFailed {
+                request,
                 attachment_id,
                 cell_size,
             } => {
                 self.state
                     .attachment_previews
-                    .receive(attachment_id, cell_size, None);
+                    .receive(request, attachment_id, cell_size, None);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
@@ -6994,7 +7052,7 @@ impl Application {
             // So does it carry on the thumbnails the claim held.
             self.state
                 .attachment_previews
-                .carry_to(Some(session.session_id));
+                .carry_to(PreviewScope::Session(session));
         }
         if let Some(claim) = claim.filter(ProvisionalSession::interrupt_intent)
             && let Some(session) = self.state.session_reference.clone()

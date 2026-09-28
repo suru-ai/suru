@@ -939,15 +939,19 @@ impl RunLoop {
                 );
             }
             ApplicationTransition::FetchAttachment {
+                request,
                 origin,
                 attachment_id,
                 cell_size,
                 protocol,
             } => spawn_thumbnail(
                 self.client.session_commands_for(origin),
-                attachment_id,
-                cell_size,
-                protocol,
+                ThumbnailAsked {
+                    request,
+                    attachment_id,
+                    cell_size,
+                    protocol,
+                },
                 self.channels.thumbnails.clone(),
             ),
             ApplicationTransition::CreateSession(request) => {
@@ -2416,18 +2420,25 @@ fn spawn_attachment_upload(
     });
 }
 
+/// What one thumbnail fetch was asked for, all of which its answer names or
+/// is made by.
+struct ThumbnailAsked {
+    request: crate::tui::ThumbnailRequest,
+    attachment_id: crate::protocol::AttachmentId,
+    cell_size: crate::terminal::CellSize,
+    protocol: crate::terminal::GraphicsProtocol,
+}
+
 /// Fetches an Attachment's bytes and makes its thumbnail, answering with it or
 /// with the failure that leaves the Attachment's dimmed line standing.
 fn spawn_thumbnail(
     commands: SessionCommandClient,
-    attachment_id: crate::protocol::AttachmentId,
-    cell_size: crate::terminal::CellSize,
-    protocol: crate::terminal::GraphicsProtocol,
+    asked: ThumbnailAsked,
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(async move {
-        let fetched = commands.fetch_attachment(&attachment_id).await;
-        let answer = thumbnail_answer(attachment_id, cell_size, protocol, fetched).await;
+        let fetched = commands.fetch_attachment(&asked.attachment_id).await;
+        let answer = thumbnail_answer(asked, fetched).await;
         let _ = answers.send(answer);
     });
 }
@@ -2435,13 +2446,17 @@ fn spawn_thumbnail(
 /// What a thumbnail fetch answers once its bytes are in, or are not: the
 /// thumbnail, decoded and encoded on a blocking worker rather than the run
 /// loop's thread, or its failure, which is the Log's to record and no Notice's
-/// (ADR 0038).
+/// (ADR 0038). Either names the request that asked, which alone may take it.
 async fn thumbnail_answer(
-    attachment_id: crate::protocol::AttachmentId,
-    cell_size: crate::terminal::CellSize,
-    protocol: crate::terminal::GraphicsProtocol,
+    asked: ThumbnailAsked,
     fetched: Result<(String, Vec<u8>)>,
 ) -> ApplicationEvent {
+    let ThumbnailAsked {
+        request,
+        attachment_id,
+        cell_size,
+        protocol,
+    } = asked;
     let made = match fetched {
         Ok((_, bytes)) => tokio::task::spawn_blocking(move || {
             crate::tui::Thumbnail::decode(&bytes, cell_size, protocol)
@@ -2453,6 +2468,7 @@ async fn thumbnail_answer(
     };
     match made {
         Ok(thumbnail) => ApplicationEvent::AttachmentThumbnail {
+            request,
             attachment_id,
             cell_size,
             thumbnail,
@@ -2460,6 +2476,7 @@ async fn thumbnail_answer(
         Err(error) => {
             tracing::warn!("could not make a thumbnail of Attachment {attachment_id}: {error:#}");
             ApplicationEvent::AttachmentThumbnailFailed {
+                request,
                 attachment_id,
                 cell_size,
             }
@@ -5368,10 +5385,10 @@ mod thumbnail_tests {
     use crate::{
         protocol::AttachmentId,
         terminal::{CellSize, GraphicsProtocol},
-        tui::ApplicationEvent,
+        tui::{ApplicationEvent, ThumbnailRequest},
     };
 
-    use super::thumbnail_answer;
+    use super::{ThumbnailAsked, thumbnail_answer};
 
     const CELL: CellSize = CellSize {
         width: 10,
@@ -5386,17 +5403,23 @@ mod thumbnail_tests {
         bytes.into_inner()
     }
 
+    const REQUEST: ThumbnailRequest = ThumbnailRequest::by_hand(7);
+
+    fn asked(attachment_id: &AttachmentId) -> ThumbnailAsked {
+        ThumbnailAsked {
+            request: REQUEST,
+            attachment_id: attachment_id.clone(),
+            cell_size: CELL,
+            protocol: GraphicsProtocol::Kitty,
+        }
+    }
+
     #[tokio::test]
     async fn fetched_bytes_become_a_thumbnail_and_a_refused_or_undecodable_fetch_a_failure() {
         let id = AttachmentId::new("screenshot-hash");
-        let made = thumbnail_answer(
-            id.clone(),
-            CELL,
-            GraphicsProtocol::Kitty,
-            Ok(("image/png".to_owned(), png())),
-        )
-        .await;
+        let made = thumbnail_answer(asked(&id), Ok(("image/png".to_owned(), png()))).await;
         let ApplicationEvent::AttachmentThumbnail {
+            request,
             attachment_id,
             cell_size,
             thumbnail,
@@ -5404,7 +5427,11 @@ mod thumbnail_tests {
         else {
             panic!("a PNG makes a thumbnail: {made:?}");
         };
-        assert_eq!((attachment_id, cell_size), (id.clone(), CELL));
+        assert_eq!(
+            (request, attachment_id, cell_size),
+            (REQUEST, id.clone(), CELL),
+            "the answer names the request that asked"
+        );
         assert_eq!((thumbnail.columns(), thumbnail.rows()), (12, 6));
 
         // Refused for its size by the fetch itself, or unreadable once in:
@@ -5418,12 +5445,15 @@ mod thumbnail_tests {
                 b"\x89PNG\r\n\x1a\ntruncated".to_vec(),
             )),
         ] {
-            let answer = thumbnail_answer(id.clone(), CELL, GraphicsProtocol::Kitty, fetched).await;
+            let answer = thumbnail_answer(asked(&id), fetched).await;
             assert!(
                 matches!(
                     &answer,
-                    ApplicationEvent::AttachmentThumbnailFailed { attachment_id, cell_size }
-                        if *attachment_id == id && *cell_size == CELL
+                    ApplicationEvent::AttachmentThumbnailFailed {
+                        request,
+                        attachment_id,
+                        cell_size,
+                    } if *request == REQUEST && *attachment_id == id && *cell_size == CELL
                 ),
                 "{answer:?}"
             );

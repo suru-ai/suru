@@ -4464,10 +4464,10 @@ fn push_user_message(
         }
         AttachmentRows::Strip(strip) => {
             let start = lines.len();
-            // Until the thumbnails are ready their lines fill the strip's
-            // first rows, cut to its height, and blank rows the rest; once
-            // they are, every row is blank and the frame draws over them.
-            if !strip.is_ready() {
+            // Until a thumbnail is ready their lines fill the strip's first
+            // rows, cut to its height, and blank rows the rest; once one is,
+            // every row is blank and the frame draws the strip over them.
+            if !strip.draws_thumbnails() {
                 for line in strip.lines() {
                     push_message_block(
                         lines,

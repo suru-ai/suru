@@ -277,6 +277,17 @@ impl ComposerMemory {
         self.attachments.insert(descriptor.id.clone(), descriptor);
     }
 
+    /// Every Attachment the draft under `key` binds.
+    pub(super) fn bound_attachments(&self, key: &ComposerKey) -> Vec<AttachmentId> {
+        self.composers.get(key).map_or_else(Vec::new, |composer| {
+            composer
+                .bindings
+                .attachments()
+                .map(|(_, attachment)| attachment.attachment_id().clone())
+                .collect()
+        })
+    }
+
     /// How the Attachments the draft binds present beside its text: one line
     /// per Attachment, in text order, describing what its label stands for,
     /// or a strip of their thumbnails where `previews` may draw one.

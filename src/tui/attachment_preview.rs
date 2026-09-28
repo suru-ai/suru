@@ -15,9 +15,13 @@
 //! formats, scales them to a strip's height at the probed cell size, and
 //! encodes them for the protocol through ratatui-image, which is told the
 //! protocol and cell size rather than probing for either. The cache holds the
-//! open Session's Attachments only, keyed by id and cell size.
+//! thumbnails of the Attachments the open Session and the draft in view bind,
+//! keyed by id and cell size.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use anyhow::{Context, bail};
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
@@ -38,7 +42,7 @@ use super::{
     text_binding::TextBindings,
 };
 use crate::{
-    protocol::{AttachmentDescriptor, AttachmentId, SessionId},
+    protocol::{AttachmentDescriptor, AttachmentId, AttachmentKind, Outlook, SessionReference},
     terminal::{CellSize, GraphicsProtocol},
     theme::Theme,
 };
@@ -115,7 +119,7 @@ impl Thumbnail {
         }
         let (width, height) = thumbnail_pixels(image.width(), image.height(), cell_size);
         let scaled = image.resize_exact(width, height, FilterType::Triangle);
-        let columns = cells(width, cell_size.width).min(THUMBNAIL_MAX_COLUMNS);
+        let columns = thumbnail_columns(image.width(), image.height(), cell_size);
         let rows = cells(height, cell_size.height).min(STRIP_ROWS);
         let area = Rect::new(0, 0, columns, rows);
         // Suru never draws under a multiplexer, so nothing is wrapped for one.
@@ -168,6 +172,17 @@ fn cells(pixels: u32, cell: u16) -> u16 {
     u16::try_from(pixels.div_ceil(u32::from(cell)))
         .unwrap_or(u16::MAX)
         .max(1)
+}
+
+/// The columns a thumbnail of a `width` by `height` image takes at
+/// `cell_size`: what a slot is sized by before its thumbnail is ready, so the
+/// strip does not move when it arrives.
+fn thumbnail_columns(width: u32, height: u32, cell_size: CellSize) -> u16 {
+    cells(
+        thumbnail_pixels(width, height, cell_size).0,
+        cell_size.width,
+    )
+    .min(THUMBNAIL_MAX_COLUMNS)
 }
 
 /// A Kitty image id unlikely to collide with another program's in the same
@@ -229,51 +244,92 @@ impl AttachmentRows {
     }
 }
 
-/// One strip: every Attachment a Prompt or Message binds, the lines that
-/// describe them, and whether the thumbnails it shows are ready.
+/// One strip: a slot for every Attachment a Prompt or Message binds, and
+/// whether any thumbnail it shows is ready to draw.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct AttachmentStrip {
-    /// Every Attachment bound beside the text, in text order.
-    attachments: Vec<AttachmentId>,
-    /// The dimmed line describing each, which fill the strip's first rows
-    /// until its thumbnails are ready.
-    lines: Vec<String>,
-    /// Whether the thumbnail of every Attachment the strip shows is ready.
-    ready: bool,
+    /// One per Attachment bound beside the text, in text order.
+    slots: Vec<StripSlot>,
+    /// Whether any thumbnail the strip shows is ready: until one is, the
+    /// dimmed lines fill its first rows, and once one is, every slot stands
+    /// in the strip — its thumbnail where that is ready, and its dimmed line
+    /// where that is still coming or never will.
+    draws_thumbnails: bool,
+}
+
+/// One Attachment's place in a strip.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct StripSlot {
+    attachment_id: AttachmentId,
+    /// The dimmed line describing it.
+    line: String,
+    /// Its size in pixels, where the Session described it, which sizes the
+    /// slot until its thumbnail is ready.
+    pixels: Option<(u32, u32)>,
 }
 
 impl AttachmentStrip {
-    /// The Attachments the strip draws thumbnails of; it counts the rest.
-    pub(super) fn shown(&self) -> &[AttachmentId] {
-        &self.attachments[..self.attachments.len().min(STRIP_THUMBNAILS)]
-    }
-
-    pub(super) fn attachments(&self) -> &[AttachmentId] {
-        &self.attachments
+    /// The Attachments the strip draws slots for; it counts the rest.
+    pub(super) fn shown(&self) -> impl Iterator<Item = &AttachmentId> {
+        self.slots
+            .iter()
+            .take(STRIP_THUMBNAILS)
+            .map(|slot| &slot.attachment_id)
     }
 
     /// The dimmed lines, one per Attachment, standing in the strip's rows
-    /// while its thumbnails are not ready.
-    pub(super) fn lines(&self) -> &[String] {
-        &self.lines
+    /// while none of its thumbnails is ready.
+    pub(super) fn lines(&self) -> impl Iterator<Item = &str> {
+        self.slots.iter().map(|slot| slot.line.as_str())
     }
 
-    pub(super) fn is_ready(&self) -> bool {
-        self.ready
+    pub(super) fn draws_thumbnails(&self) -> bool {
+        self.draws_thumbnails
+    }
+}
+
+/// Which fetch a thumbnail answers. A reply is taken only by the fetch that
+/// asked for it, so one asked for before the cache was dropped and filled
+/// again never lands in the place of the fetch that replaced it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ThumbnailRequest(u64);
+
+impl ThumbnailRequest {
+    /// A request made by hand, for a test that answers one without a cache
+    /// having asked.
+    #[cfg(test)]
+    pub(super) const fn by_hand(request: u64) -> Self {
+        Self(request)
+    }
+}
+
+/// Whose Attachments the cache holds thumbnails of: one Session, known by its
+/// identity and Origin together, since a Session id on another Origin is
+/// another Session, or the Landing of one Outlook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PreviewScope {
+    Landing(Outlook),
+    Session(SessionReference),
+}
+
+impl Default for PreviewScope {
+    fn default() -> Self {
+        Self::Landing(Outlook::Local)
     }
 }
 
 /// Where a thumbnail stands in the cache for the open Session.
 #[derive(Clone)]
 enum Entry {
-    /// Asked for, and not answered yet: one fetch per Attachment at a time.
-    Fetching,
+    /// Asked for by this request, and not answered yet: one fetch per
+    /// Attachment at a time.
+    Fetching(ThumbnailRequest),
     Ready(Thumbnail),
     /// The fetch or the decode failed, so the dimmed line stands for good.
     Failed,
 }
 
-/// A strip whose thumbnails are ready, reserved at a place in the frame and
+/// A strip that draws thumbnails, reserved at a place in the frame and
 /// waiting on the frame's end to learn whether it may be drawn there.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ReservedStrip {
@@ -285,7 +341,7 @@ pub(super) struct ReservedStrip {
     /// The area that shows the strip: the Transcript's rows, or the
     /// composer's.
     pub(super) viewport: Rect,
-    pub(super) attachments: Vec<AttachmentId>,
+    pub(super) strip: AttachmentStrip,
 }
 
 /// What one frame learned about strips: which Attachments it wanted
@@ -307,12 +363,13 @@ struct PreviewFrame {
 #[derive(Clone, Default)]
 pub(super) struct AttachmentPreviews {
     mode: PreviewMode,
-    /// The Session whose Attachments the cache holds; `None` is the Landing.
-    scope: Option<SessionId>,
+    scope: PreviewScope,
     thumbnails: HashMap<(AttachmentId, CellSize), Entry>,
     /// Moves whenever what a strip presents could have changed, so the
     /// Transcript's cached view knows to look again.
     generation: u64,
+    /// The last fetch asked for; never reused, whatever the cache drops.
+    requests: u64,
     frame: RefCell<PreviewFrame>,
 }
 
@@ -332,7 +389,7 @@ impl AttachmentPreviews {
     /// Holds only `scope`'s thumbnails, presented as `mode` says: opening
     /// another Session, returning to the Landing, a cell size changing, or
     /// the Setting being turned drops every thumbnail held.
-    pub(super) fn hold_for(&mut self, scope: Option<SessionId>, mode: PreviewMode) {
+    pub(super) fn hold_for(&mut self, scope: PreviewScope, mode: PreviewMode) {
         if self.scope == scope && self.mode == mode {
             return;
         }
@@ -346,8 +403,22 @@ impl AttachmentPreviews {
     /// a Landing draft's to the claim its Prompt begins, and a claim's to the
     /// Session that answers it. A Session being born is not another Session,
     /// so nothing it already showed is fetched again.
-    pub(super) fn carry_to(&mut self, scope: Option<SessionId>) {
+    pub(super) fn carry_to(&mut self, scope: PreviewScope) {
         self.scope = scope;
+    }
+
+    /// Whether any thumbnail is held or coming, which is all that makes
+    /// [`Self::retain_bound`] worth asking.
+    pub(super) fn holds_any(&self) -> bool {
+        !self.thumbnails.is_empty()
+    }
+
+    /// Lets go of every thumbnail no longer bound where it is shown — by the
+    /// open Session's Prompts and Messages, or by the draft in view — such as
+    /// that of an image pasted and then deleted from a draft. Nothing a strip
+    /// draws is let go, so nothing on screen changes.
+    pub(super) fn retain_bound(&mut self, bound: &HashSet<AttachmentId>) {
+        self.thumbnails.retain(|(id, _), _| bound.contains(id));
     }
 
     /// Changes whenever a strip might present differently, which is what a
@@ -363,22 +434,32 @@ impl AttachmentPreviews {
         bindings: &TextBindings,
         describe: impl Fn(&AttachmentId) -> Option<&'a AttachmentDescriptor>,
     ) -> AttachmentRows {
-        let lines = bindings.attachment_lines(describe);
+        let lines = bindings.attachment_lines(&describe);
         if lines.is_empty() || self.mode == PreviewMode::Lines {
             return AttachmentRows::Lines(lines);
         }
-        let attachments = bindings
+        let slots = bindings
             .attachments()
-            .map(|(_, attachment)| attachment.attachment_id().clone())
+            .zip(lines)
+            .map(|((_, attachment), line)| {
+                let attachment_id = attachment.attachment_id().clone();
+                let pixels = describe(&attachment_id).map(|descriptor| match descriptor.kind {
+                    AttachmentKind::Image { width, height } => (width, height),
+                });
+                StripSlot {
+                    attachment_id,
+                    line,
+                    pixels,
+                }
+            })
             .collect::<Vec<_>>();
-        let ready = attachments
+        let draws_thumbnails = slots
             .iter()
             .take(STRIP_THUMBNAILS)
-            .all(|id| self.thumbnail(id).is_some());
+            .any(|slot| self.thumbnail(&slot.attachment_id).is_some());
         AttachmentRows::Strip(AttachmentStrip {
-            attachments,
-            lines,
-            ready,
+            slots,
+            draws_thumbnails,
         })
     }
 
@@ -429,9 +510,11 @@ impl AttachmentPreviews {
     }
 
     /// The next Attachment the last frame wanted a thumbnail of and none is
-    /// held or coming for, marked as coming, with the cell size and protocol
-    /// its thumbnail is made for.
-    pub(super) fn take_fetch(&mut self) -> Option<(AttachmentId, CellSize, GraphicsProtocol)> {
+    /// held or coming for, marked as coming, with the request its answer must
+    /// name and the cell size and protocol its thumbnail is made for.
+    pub(super) fn take_fetch(
+        &mut self,
+    ) -> Option<(ThumbnailRequest, AttachmentId, CellSize, GraphicsProtocol)> {
         let frame = self.frame.get_mut();
         let PreviewMode::Strips {
             cell_size,
@@ -446,8 +529,10 @@ impl AttachmentPreviews {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.thumbnails.entry((id.clone(), cell_size))
             {
-                entry.insert(Entry::Fetching);
-                return Some((id, cell_size, protocol));
+                self.requests = self.requests.wrapping_add(1);
+                let request = ThumbnailRequest(self.requests);
+                entry.insert(Entry::Fetching(request));
+                return Some((request, id, cell_size, protocol));
             }
         }
         None
@@ -455,14 +540,20 @@ impl AttachmentPreviews {
 
     /// Takes a fetch's answer: the thumbnail, or `None` where the fetch or
     /// the decode failed. An answer nothing is still waiting on — one for a
-    /// Session no longer open, or a cell size no longer current — is dropped.
+    /// Session no longer open, a cell size no longer current, or a request
+    /// another has replaced since — is dropped.
     pub(super) fn receive(
         &mut self,
+        request: ThumbnailRequest,
         id: AttachmentId,
         cell_size: CellSize,
         thumbnail: Option<Thumbnail>,
     ) {
-        let Some(entry @ Entry::Fetching) = self.thumbnails.get_mut(&(id, cell_size)) else {
+        let Some(entry) = self
+            .thumbnails
+            .get_mut(&(id, cell_size))
+            .filter(|entry| matches!(entry, Entry::Fetching(asked) if *asked == request))
+        else {
             return;
         };
         *entry = thumbnail.map_or(Entry::Failed, Entry::Ready);
@@ -482,8 +573,13 @@ impl AttachmentPreviews {
 
     /// Draws every strip this frame reserved that is wholly in view and
     /// uncovered, now that everything else has been drawn; the rest keep the
-    /// blank rows they were reserved as.
+    /// blank rows they were reserved as. A slot whose thumbnail is ready draws
+    /// it, and one whose thumbnail is still coming or never will draws its
+    /// dimmed line in its place, so no Attachment's failure hides another's.
     pub(super) fn draw(&self, buffer: &mut Buffer, theme: &Theme) {
+        let PreviewMode::Strips { cell_size, .. } = self.mode else {
+            return;
+        };
         let mut frame = self.frame.borrow_mut();
         let PreviewFrame {
             reserved,
@@ -491,37 +587,47 @@ impl AttachmentPreviews {
             targets,
             ..
         } = &mut *frame;
-        for strip in reserved.iter() {
-            let Some(area) =
-                drawable_strip_area(strip.top, strip.left, strip.width, strip.viewport, covers)
-            else {
+        for reservation in reserved.iter() {
+            let Some(area) = drawable_strip_area(
+                reservation.top,
+                reservation.left,
+                reservation.width,
+                reservation.viewport,
+                covers,
+            ) else {
                 continue;
             };
-            let Some(thumbnails) = strip
-                .attachments
+            let strip = &reservation.strip;
+            let slots = strip
+                .slots
                 .iter()
                 .take(STRIP_THUMBNAILS)
-                .map(|id| self.thumbnail(id).map(|thumbnail| (id, thumbnail)))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            let layout = lay_out_strip(
-                area,
-                &thumbnails
-                    .iter()
-                    .map(|(_, thumbnail)| thumbnail.columns)
-                    .collect::<Vec<_>>(),
-                strip.attachments.len(),
-            );
-            for (index, cell) in layout.thumbnails.iter().enumerate() {
-                let (id, thumbnail) = thumbnails[index];
-                let drawn = Rect {
-                    height: thumbnail.rows,
-                    ..*cell
-                };
-                Image::new(&thumbnail.protocol).render(drawn, buffer);
-                targets.push((drawn, id.clone()));
+                .map(|slot| (slot, self.thumbnail(&slot.attachment_id)))
+                .collect::<Vec<_>>();
+            let columns = slots
+                .iter()
+                .map(|(slot, thumbnail)| match (thumbnail, slot.pixels) {
+                    (Some(thumbnail), _) => thumbnail.columns,
+                    (None, Some((width, height))) => thumbnail_columns(width, height, cell_size),
+                    (None, None) => u16::try_from(slot.line.width())
+                        .unwrap_or(u16::MAX)
+                        .clamp(1, THUMBNAIL_MAX_COLUMNS),
+                })
+                .collect::<Vec<_>>();
+            let layout = lay_out_strip(area, &columns, strip.slots.len());
+            for (cell, (slot, thumbnail)) in layout.thumbnails.iter().zip(&slots) {
+                match thumbnail {
+                    Some(thumbnail) => {
+                        let drawn = Rect {
+                            height: thumbnail.rows,
+                            ..*cell
+                        };
+                        Image::new(&thumbnail.protocol).render(drawn, buffer);
+                        targets.push((drawn, slot.attachment_id.clone()));
+                    }
+                    None => Paragraph::new(Line::styled(slot.line.as_str(), theme.text.subdued))
+                        .render(Rect { height: 1, ..*cell }, buffer),
+                }
             }
             if let Some((cell, more)) = layout.more {
                 draw_more_cell(buffer, cell, more, theme);
@@ -558,15 +664,15 @@ pub(super) fn drawable_strip_area(
 /// Where the parts of a drawable strip stand.
 #[derive(Debug, Eq, PartialEq)]
 struct StripLayout {
-    /// One cell per thumbnail drawn, a strip's height tall, from the left.
+    /// One cell per slot drawn, a strip's height tall, from the left.
     thumbnails: Vec<Rect>,
     /// The `+N more` cell and its N, where any Attachment went undrawn.
     more: Option<(Rect, usize)>,
 }
 
-/// Lays thumbnails of `columns` wide out across `area` from the left, as many
-/// as fit whole beside the `+N more` cell counting every Attachment of
-/// `total` left undrawn.
+/// Lays slots of `columns` wide out across `area` from the left, as many as
+/// fit whole beside the `+N more` cell counting every Attachment of `total`
+/// left undrawn.
 fn lay_out_strip(area: Rect, columns: &[u16], total: usize) -> StripLayout {
     let fits = |count: usize| {
         let thumbnails = columns[..count]
@@ -783,58 +889,177 @@ mod tests {
         assert_eq!(all.more, None);
     }
 
+    const STRIPS: PreviewMode = PreviewMode::Strips {
+        cell_size: CELL,
+        protocol: GraphicsProtocol::Kitty,
+    };
+
+    fn square() -> Thumbnail {
+        Thumbnail::from_image(
+            DynamicImage::ImageRgba8(ImageBuffer::new(120, 120)),
+            CELL,
+            GraphicsProtocol::Kitty,
+        )
+        .expect("make a thumbnail")
+    }
+
+    /// Two Attachments bound as `[Image 1]` and `[Image 2]`, the first
+    /// described as a 1280×720 image and the second not described at all.
+    fn two_attachments(previews: &AttachmentPreviews) -> AttachmentStrip {
+        let described = AttachmentDescriptor {
+            id: AttachmentId::new("screenshot-hash"),
+            kind: AttachmentKind::Image {
+                width: 1280,
+                height: 720,
+            },
+            mime_type: "image/png".to_owned(),
+            byte_length: 1024,
+        };
+        let mut bindings = TextBindings::default();
+        bindings.bind_attachment(0..9, described.id.clone(), "[Image 1]".to_owned());
+        bindings.bind_attachment(
+            10..19,
+            AttachmentId::new("diagram-hash"),
+            "[Image 2]".to_owned(),
+        );
+        let AttachmentRows::Strip(strip) =
+            previews.rows(&bindings, |id| (*id == described.id).then_some(&described))
+        else {
+            panic!("previews on present a strip");
+        };
+        strip
+    }
+
+    /// Asks for every thumbnail `strip` shows, as a frame drawing it would.
+    fn fetches(
+        previews: &mut AttachmentPreviews,
+        strip: &AttachmentStrip,
+    ) -> Vec<ThumbnailRequest> {
+        previews.begin_frame();
+        previews.want(strip);
+        std::iter::from_fn(|| previews.take_fetch().map(|(request, ..)| request)).collect()
+    }
+
     #[test]
     fn a_press_on_a_drawn_thumbnail_invokes_attachment_open_on_its_attachment() {
-        let screenshot = AttachmentId::new("screenshot-hash");
-        let diagram = AttachmentId::new("diagram-hash");
         let mut previews = AttachmentPreviews::default();
-        previews.hold_for(
-            None,
-            PreviewMode::Strips {
-                cell_size: CELL,
-                protocol: GraphicsProtocol::Kitty,
-            },
-        );
+        previews.hold_for(PreviewScope::default(), STRIPS);
+        let waiting = two_attachments(&previews);
+        let requests = fetches(&mut previews, &waiting);
+        assert_eq!(requests.len(), 2);
+        let ids = waiting.shown().cloned().collect::<Vec<_>>();
+        for (request, id) in requests.into_iter().zip(&ids) {
+            previews.receive(request, id.clone(), CELL, Some(square()));
+        }
+
         let viewport = Rect::new(0, 0, 60, 10);
-        let strip = ReservedStrip {
+        previews.begin_frame();
+        previews.reserve(ReservedStrip {
             top: 2,
             left: 4,
             width: 50,
             viewport,
-            attachments: vec![screenshot.clone(), diagram.clone()],
-        };
-        let mut bindings = TextBindings::default();
-        bindings.bind_attachment(0..9, screenshot.clone(), "[Image 1]".to_owned());
-        bindings.bind_attachment(10..19, diagram.clone(), "[Image 2]".to_owned());
-        let AttachmentRows::Strip(waiting) = previews.rows(&bindings, |_| None) else {
-            panic!("previews on present a strip");
-        };
-        previews.begin_frame();
-        previews.want(&waiting);
-        while let Some((id, cell_size, _)) = previews.take_fetch() {
-            let thumbnail = Thumbnail::from_image(
-                DynamicImage::ImageRgba8(ImageBuffer::new(120, 120)),
-                cell_size,
-                GraphicsProtocol::Kitty,
-            )
-            .expect("make a thumbnail");
-            previews.receive(id, cell_size, Some(thumbnail));
-        }
-
-        previews.begin_frame();
-        previews.reserve(strip);
+            strip: two_attachments(&previews),
+        });
         previews.draw(&mut Buffer::empty(viewport), &Theme::system());
         assert_eq!(
             previews.press_at(Position::new(4, 2)),
-            Some(SemanticCommandId::AttachmentOpen.on_attachment(screenshot))
+            Some(SemanticCommandId::AttachmentOpen.on_attachment(ids[0].clone()))
         );
         assert_eq!(
             previews.press_at(Position::new(4 + 13 + 11, 7)),
-            Some(SemanticCommandId::AttachmentOpen.on_attachment(diagram))
+            Some(SemanticCommandId::AttachmentOpen.on_attachment(ids[1].clone()))
         );
         // The gap between them, and the rows beneath, open nothing.
         assert_eq!(previews.press_at(Position::new(16, 3)), None);
         assert_eq!(previews.press_at(Position::new(4, 8)), None);
+    }
+
+    #[test]
+    fn a_slot_whose_thumbnail_failed_draws_its_line_beside_one_that_is_ready() {
+        let mut previews = AttachmentPreviews::default();
+        previews.hold_for(PreviewScope::default(), STRIPS);
+        let waiting = two_attachments(&previews);
+        assert!(!waiting.draws_thumbnails());
+        let requests = fetches(&mut previews, &waiting);
+        let ids = waiting.shown().cloned().collect::<Vec<_>>();
+        previews.receive(requests[0], ids[0].clone(), CELL, None);
+        previews.receive(requests[1], ids[1].clone(), CELL, Some(square()));
+        let strip = two_attachments(&previews);
+        assert!(
+            strip.draws_thumbnails(),
+            "one ready thumbnail draws the strip"
+        );
+
+        let viewport = Rect::new(0, 0, 60, STRIP_ROWS);
+        let mut buffer = Buffer::empty(viewport);
+        previews.begin_frame();
+        previews.reserve(ReservedStrip {
+            top: 0,
+            left: 0,
+            width: 60,
+            viewport,
+            strip,
+        });
+        previews.draw(&mut buffer, &Theme::system());
+        // The failed slot is as wide as its 1280×720 thumbnail would be — 22
+        // columns — and draws its line cut to that width.
+        let line = (0..22).map(|x| buffer[(x, 0)].symbol()).collect::<String>();
+        assert_eq!(line, "Image 1 · PNG · 1280×7");
+        assert!(buffer[(23, 0)].symbol().contains('\u{10EEEE}'));
+        assert!((24..35).all(|x| buffer[(x, 0)].skip));
+        assert_eq!(previews.press_at(Position::new(3, 0)), None);
+    }
+
+    #[test]
+    fn a_reply_to_a_replaced_request_is_dropped() {
+        let mut previews = AttachmentPreviews::default();
+        previews.hold_for(PreviewScope::default(), STRIPS);
+        let strip = two_attachments(&previews);
+        let first = fetches(&mut previews, &strip)[0];
+        let id = strip.shown().next().cloned().expect("a slot");
+        // The cache is dropped and filled again before the first reply lands.
+        previews.hold_for(
+            PreviewScope::Landing(Outlook::Remote("studio".to_owned())),
+            STRIPS,
+        );
+        previews.hold_for(PreviewScope::default(), STRIPS);
+        let second = fetches(&mut previews, &strip)[0];
+        assert_ne!(first, second);
+
+        previews.receive(first, id.clone(), CELL, None);
+        previews.receive(second, id.clone(), CELL, Some(square()));
+        assert!(previews.thumbnail(&id).is_some(), "the fresh reply stands");
+        previews.receive(first, id.clone(), CELL, None);
+        assert!(
+            previews.thumbnail(&id).is_some(),
+            "and a stale one moves nothing"
+        );
+    }
+
+    #[test]
+    fn the_same_session_id_on_another_origin_holds_none_of_the_thumbnails() {
+        let session_id = crate::protocol::SessionId::new();
+        let mut previews = AttachmentPreviews::default();
+        previews.hold_for(
+            PreviewScope::Session(SessionReference::new(Outlook::Local, session_id)),
+            STRIPS,
+        );
+        let strip = two_attachments(&previews);
+        let request = fetches(&mut previews, &strip)[0];
+        let id = strip.shown().next().cloned().expect("a slot");
+        previews.receive(request, id.clone(), CELL, Some(square()));
+        assert!(previews.thumbnail(&id).is_some());
+
+        previews.hold_for(
+            PreviewScope::Session(SessionReference::new(
+                Outlook::Remote("studio".to_owned()),
+                session_id,
+            )),
+            STRIPS,
+        );
+        assert!(previews.thumbnail(&id).is_none());
+        assert!(!previews.holds_any());
     }
 
     #[test]

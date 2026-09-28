@@ -4464,14 +4464,14 @@ fn render_session_surface(
     );
     for strip in &window.strips {
         state.attachment_previews.want(&strip.strip);
-        if strip.strip.is_ready() {
+        if strip.strip.draws_thumbnails() {
             state.attachment_previews.reserve(ReservedStrip {
                 top: i32::from(content_top)
                     .saturating_add(i32::try_from(strip.top).unwrap_or(i32::MIN)),
                 left: transcript_area.x.saturating_add(strip.left),
                 width: strip.width,
                 viewport,
-                attachments: strip.strip.attachments().to_vec(),
+                strip: strip.strip.clone(),
             });
         }
     }
@@ -5081,31 +5081,27 @@ fn render_composer(
     );
     frame.render_widget(paragraph.style(text_style).scroll((scroll, 0)), text_area);
     let lines = match attachments {
-        AttachmentRows::Lines(lines) => lines.as_slice(),
+        AttachmentRows::Lines(lines) => {
+            lines.iter().map(|line| Line::from(line.as_str())).collect()
+        }
         AttachmentRows::Strip(strip) => {
             previews.want(strip);
-            if strip.is_ready() {
+            if strip.draws_thumbnails() {
                 previews.reserve(ReservedStrip {
                     top: i32::from(attachment_area.y),
                     left: attachment_area.x,
                     width: attachment_area.width,
                     viewport: attachment_area,
-                    attachments: strip.attachments().to_vec(),
+                    strip: strip.clone(),
                 });
-                &[]
+                Vec::new()
             } else {
-                strip.lines()
+                strip.lines().map(Line::from).collect()
             }
         }
     };
     frame.render_widget(
-        Paragraph::new(
-            lines
-                .iter()
-                .map(|line| Line::from(line.as_str()))
-                .collect::<Vec<_>>(),
-        )
-        .style(theme.text.subdued),
+        Paragraph::new(lines).style(theme.text.subdued),
         attachment_area,
     );
     Position::new(
