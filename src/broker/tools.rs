@@ -277,8 +277,10 @@ settle. A message the Subagent is stopped before receiving is refused, saying \
 so. A refused message reaches no one.";
 
 const WAIT_SUBAGENTS_DESCRIPTION: &str = "\
-Wait until a Subagent spawned with spawn_subagent settles, when you need its \
-result before you can go on. Takes \"ids\", the session_ids of the Subagents \
+Wait until a Subagent spawned with spawn_subagent settles, when you must have \
+its result before your turn ends. When you have nothing left to do but wait, \
+end your turn instead: a Subagent's settling reaches you as a new message that \
+wakes you if your turn has ended. Takes \"ids\", the session_ids of the Subagents \
 to wait on — ones you spawned, or ones a Subagent beneath you spawned — and \
 \"timeout_seconds\", how long to wait at most: 60 unless you say, and never \
 less than 10 nor more than 600, a timeout outside those kept at the nearest. \

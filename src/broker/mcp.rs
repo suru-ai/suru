@@ -52,8 +52,11 @@ which Providers, Models and Model Options may be chosen, and spawn_subagent to \
 delegate a piece of work to a Subagent on any of them. \
 Call read_subagent with the session_id spawn_subagent answered with to learn \
 how that Subagent is doing and read what it last wrote, send_to_subagent to \
-send it more work, and wait_subagents when you need its result before you can \
-go on. Call stop_subagent to stop one whose work you no longer need.";
+send it more work, and stop_subagent to stop one whose work you no longer need. \
+When a Subagent settles, Suru reports it to you as a new message that wakes you \
+if your turn has ended, so once you have nothing left to do but wait on one, \
+end your turn. Call wait_subagents only when you must have a Subagent's result \
+before your turn ends.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 
