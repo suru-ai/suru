@@ -16,6 +16,7 @@ mod aside_neighbours;
 mod attachment_previews;
 mod commands;
 mod composer;
+mod composer_lifecycle;
 mod connecting;
 mod content_width;
 mod icon_picker;

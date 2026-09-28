@@ -39,6 +39,7 @@ use crate::{
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
     aside::{Aside, AsidePresentation, AsidePress},
+    attachment_check::{AttachmentCheckId, AttachmentChecks},
     attachment_preview::{
         AttachmentPreviews, PreviewMode, PreviewScope, Thumbnail, ThumbnailRequest,
     },
@@ -65,7 +66,7 @@ use super::{
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
-    notice::{ApplicationNotice, Notice, PasteFailure},
+    notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -77,6 +78,7 @@ use super::{
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
     subagent_picker::{SubagentPicker, working_subagents},
+    text_binding::{BoundAttachment, attachment_name},
     theme_picker::ThemePicker,
     transcript::{
         FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptDisclosure,
@@ -526,6 +528,9 @@ pub struct TuiState {
     /// The pastes from the clipboard still waiting on a read or an upload,
     /// each bound for the draft it was asked for.
     clipboard_pastes: ClipboardPastes,
+    /// The checks still waiting on whether the Attachments a history recall
+    /// brought into a draft are stored, each bound for that draft.
+    attachment_checks: AttachmentChecks,
     pub(super) approvals: super::approval::ApprovalPanel,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
@@ -872,6 +877,7 @@ impl TuiState {
             checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
             clipboard_pastes: ClipboardPastes::default(),
+            attachment_checks: AttachmentChecks::default(),
             approvals: super::approval::ApprovalPanel::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
@@ -1190,6 +1196,9 @@ impl TuiState {
             .cloned()
             .unwrap_or(Some(fallback_execution_directory));
         self.leave_session_route();
+        // After the route is left, which may hand the Landing back a Prompt
+        // written for the Server just turned away from.
+        self.leave_landing_attachments_behind();
         self.session_events_blocked = true;
         self.pending_submission = None;
         self.pending_steers.clear();
@@ -1372,8 +1381,79 @@ impl TuiState {
         }
     }
 
-    fn restore_composer_history(&mut self, restore: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
-        self.edit_composer_without_completion(restore);
+    /// Walks composer history, and asks whether any Attachment a Prompt
+    /// recalled from it binds is still stored on the Server the draft goes
+    /// to. The recalled draft stands bound meanwhile.
+    fn restore_composer_history(
+        &mut self,
+        restore: impl FnOnce(&mut ComposerMemory, ComposerKey) -> Vec<BoundAttachment>,
+    ) -> ApplicationTransition {
+        let draft = self.composer_key();
+        let mut recalled = Vec::new();
+        self.edit_composer_without_completion(|composers, key| {
+            recalled = restore(composers, key);
+        });
+        if recalled.is_empty() {
+            return ApplicationTransition::Continue;
+        }
+        let origin = self.draft_origin(&draft);
+        let (check, attachments) = self.attachment_checks.begin(draft, recalled);
+        ApplicationTransition::CheckAttachments {
+            check,
+            origin,
+            attachments,
+        }
+    }
+
+    /// The Server a draft's Prompt goes to, and so the one its Attachments
+    /// are uploaded to: its Session's Origin, or the Outlook's for the
+    /// Landing.
+    fn draft_origin(&self, draft: &ComposerKey) -> Outlook {
+        match draft {
+            ComposerKey::Session(session) => session.origin.clone(),
+            ComposerKey::Landing => self.outlook.clone(),
+        }
+    }
+
+    /// Demotes the labels of the Landing draft's Attachments to plain text,
+    /// with a Notice naming them, once the Outlook has turned away from the
+    /// Server they were pasted to: a Prompt from the Landing begins a Session
+    /// on the new Outlook, which never stored them. Uploads still on their way
+    /// there, and checks asked of the old Server, are abandoned with them.
+    fn leave_landing_attachments_behind(&mut self) {
+        let draft = ComposerKey::Landing;
+        self.clipboard_pastes.abandon_uploads_into(&draft);
+        self.attachment_checks.forget(&draft);
+        let demoted = self.composers.demote_attachments(&draft, |_| true);
+        self.report_demoted_attachments(&demoted, AttachmentDemotion::LeftBehind);
+    }
+
+    /// Says which Attachments a draft's labels no longer bind, and why: their
+    /// ids to the Log, and their names in a Notice. A label is the reader's
+    /// own words, so the Log never carries it.
+    fn report_demoted_attachments(
+        &mut self,
+        demoted: &[BoundAttachment],
+        demotion: AttachmentDemotion,
+    ) {
+        if demoted.is_empty() {
+            return;
+        }
+        let ids = demoted
+            .iter()
+            .map(|bound| bound.attachment_id().to_string())
+            .collect::<Vec<_>>();
+        tracing::warn!(
+            ?demotion,
+            attachment_ids = ?ids,
+            "a draft's Attachment labels were demoted to plain text"
+        );
+        let names = demoted
+            .iter()
+            .map(|bound| attachment_name(bound.label()))
+            .collect::<Vec<_>>();
+        self.application_notice
+            .receive_demoted_attachments(&names, demotion);
     }
 
     fn edit_composer_without_completion(
@@ -4089,6 +4169,12 @@ pub enum ApplicationEvent {
         attachment_id: AttachmentId,
         cell_size: CellSize,
     },
+    /// Which of a check's Attachments their Server no longer stores, or why
+    /// it could not be asked.
+    AttachmentsChecked {
+        check: AttachmentCheckId,
+        result: std::result::Result<Vec<AttachmentId>, String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4358,6 +4444,14 @@ pub enum ApplicationTransition {
         attachment_id: AttachmentId,
         cell_size: CellSize,
         protocol: GraphicsProtocol,
+    },
+    /// Ask `origin` whether it still stores each of `attachments`, which a
+    /// Prompt recalled from composer history binds, without fetching their
+    /// bytes, and answer with [`ApplicationEvent::AttachmentsChecked`].
+    CheckAttachments {
+        check: AttachmentCheckId,
+        origin: Outlook,
+        attachments: Vec<AttachmentId>,
     },
     OpenHyperlink(String),
     RemovePeer(String),
@@ -4694,6 +4788,10 @@ impl Application {
             }
             ApplicationEvent::AttachmentUploaded { paste, descriptor } => {
                 self.receive_uploaded_attachment(paste, descriptor);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AttachmentsChecked { check, result } => {
+                self.receive_attachment_check(check, result);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentUploadFailed { paste, reason } => {
@@ -5882,9 +5980,11 @@ impl Application {
             CommandId::MoveCursorLineEnd => self
                 .state
                 .navigate_composer(|composers, key| composers.move_line_end(key)),
-            CommandId::HistoryPrevious => self
-                .state
-                .restore_composer_history(|composers, key| composers.history_previous(key)),
+            CommandId::HistoryPrevious => {
+                return self
+                    .state
+                    .restore_composer_history(|composers, key| composers.history_previous(key));
+            }
             // Down serves the composer first — caret movement within the
             // draft, then the history walk — and the Subagent Picker takes
             // exactly the key's one free meaning: Down at rest, which today
@@ -5895,7 +5995,8 @@ impl Application {
                 if self.state.composer_down_is_inert() {
                     self.state.open_subagent_picker();
                 } else {
-                    self.state
+                    return self
+                        .state
                         .restore_composer_history(|composers, key| composers.history_next(key));
                 }
             }
@@ -7236,6 +7337,44 @@ impl Application {
             .edit_draft_without_completion(draft, |composers, key| {
                 composers.insert_attachment(key, descriptor);
             });
+    }
+
+    /// Answers a check of a recall's Attachments in the draft it was asked
+    /// for: each label the recall bound whose Attachment the Server no longer
+    /// stores is demoted to plain text, and a Notice names them. A check that
+    /// could not be made leaves the draft bound, for admission to judge; one
+    /// whose labels are gone from the draft since changes nothing.
+    fn receive_attachment_check(
+        &mut self,
+        check: AttachmentCheckId,
+        result: std::result::Result<Vec<AttachmentId>, String>,
+    ) {
+        let Some(pending) = self.state.attachment_checks.finish(check) else {
+            return;
+        };
+        let missing = match result {
+            Ok(missing) => missing,
+            Err(reason) => {
+                tracing::warn!(
+                    ?check,
+                    %reason,
+                    "could not check whether a recalled Prompt's Attachments are still stored; \
+                     their labels stay bound"
+                );
+                return;
+            }
+        };
+        if missing.is_empty() || !self.state.composers.has_draft(&pending.draft) {
+            return;
+        }
+        let mut demoted = Vec::new();
+        self.state
+            .edit_draft_without_completion(pending.draft.clone(), |composers, key| {
+                demoted =
+                    composers.demote_attachments(&key, |bound| pending.demotes(bound, &missing));
+            });
+        self.state
+            .report_demoted_attachments(&demoted, AttachmentDemotion::NoLongerStored);
     }
 
     /// Says why a paste inserted nothing, and keeps the whole of it in the Log.

@@ -10,7 +10,7 @@ use ratatui::layout::{Position, Rect};
 
 use super::{
     attachment_preview::{AttachmentPreviews, AttachmentRows},
-    text_binding::{SkillIssue, TextBinding, TextBindings, UnitEdge, image_label},
+    text_binding::{BoundAttachment, SkillIssue, TextBinding, TextBindings, UnitEdge, image_label},
     text_layout::{CursorTarget, RowDirection, TextLayout},
 };
 
@@ -64,9 +64,10 @@ struct ComposerState {
     // Vertical movement preserves the painted terminal column even when an
     // intervening Row is too short to reach it.
     preferred_display_column: Option<u16>,
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
     history_position: Option<usize>,
-    history_scratch: Option<String>,
+    /// The draft set aside when the history walk began, bound as it was.
+    history_scratch: Option<HistoryEntry>,
     /// The rejected Prompt this draft was restored from, whose id it is sent
     /// again under for as long as its text and bindings are unchanged.
     retry: Option<InitialPrompt>,
@@ -75,6 +76,24 @@ struct ComposerState {
     /// The highest `N` any `[Image N]` label in this draft has used, so a
     /// label deleted is never reused before the draft is submitted or cleared.
     highest_image_number: u32,
+}
+
+/// What composer history keeps of a Prompt, or of a draft set aside for one:
+/// its text with everything bound to spans of it, so recalling it brings its
+/// Skill Invocations and Attachments back with its words.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HistoryEntry {
+    text: String,
+    bindings: TextBindings,
+}
+
+impl HistoryEntry {
+    fn from_prompt(prompt: &InitialPrompt) -> Self {
+        Self {
+            text: prompt.text.clone(),
+            bindings: TextBindings::from_prompt(prompt),
+        }
+    }
 }
 
 /// What a composer draws over its text: each binding without an issue in its
@@ -414,18 +433,38 @@ impl ComposerMemory {
         }
     }
 
-    pub(super) fn history_previous(&mut self, key: ComposerKey) {
+    /// Moves up a painted Row, or back through history, answering the
+    /// Attachments a Prompt recalled from history brings into the draft.
+    pub(super) fn history_previous(&mut self, key: ComposerKey) -> Vec<BoundAttachment> {
         let width = self.layout_width(key.clone());
         let composer = self.composers.entry(key).or_default();
         composer.selection_anchor = None;
-        composer.history_previous(width);
+        composer.history_previous(width)
     }
 
-    pub(super) fn history_next(&mut self, key: ComposerKey) {
+    /// Moves down a painted Row, or forward through history, answering the
+    /// Attachments a Prompt recalled from history brings into the draft. The
+    /// draft set aside when the walk began comes back as it was, and is not
+    /// a recall.
+    pub(super) fn history_next(&mut self, key: ComposerKey) -> Vec<BoundAttachment> {
         let width = self.layout_width(key.clone());
         let composer = self.composers.entry(key).or_default();
         composer.selection_anchor = None;
-        composer.history_next(width);
+        composer.history_next(width)
+    }
+
+    /// Drops the binding of each Attachment `demote` picks from the draft
+    /// under `key`, leaving its label standing as plain text, and answers the
+    /// bindings dropped in text order.
+    pub(super) fn demote_attachments(
+        &mut self,
+        key: &ComposerKey,
+        demote: impl Fn(&BoundAttachment) -> bool,
+    ) -> Vec<BoundAttachment> {
+        self.composers
+            .get_mut(key)
+            .map(|composer| composer.demote_attachments(demote))
+            .unwrap_or_default()
     }
 
     /// Whether Down would do nothing in this composer: the caret already rests
@@ -458,7 +497,7 @@ impl ComposerMemory {
         if composer.text.is_empty() {
             composer.admission_failed(prompt);
         } else {
-            composer.push_history(prompt.text.clone());
+            composer.push_history(HistoryEntry::from_prompt(prompt));
         }
     }
 
@@ -508,7 +547,10 @@ impl ComposerMemory {
             for entry in landing.history {
                 recovered.push_history(entry);
             }
-            recovered.push_history(landing.text);
+            recovered.push_history(HistoryEntry {
+                text: landing.text,
+                bindings: landing.bindings,
+            });
         }
         self.composers.insert(ComposerKey::Landing, recovered);
     }
@@ -706,52 +748,74 @@ impl ComposerState {
         true
     }
 
-    fn history_previous(&mut self, width: u16) {
-        if self.move_vertical(width, RowDirection::Previous) {
-            return;
-        }
-        if self.history.is_empty() {
-            return;
+    fn history_previous(&mut self, width: u16) -> Vec<BoundAttachment> {
+        if self.move_vertical(width, RowDirection::Previous) || self.history.is_empty() {
+            return Vec::new();
         }
         let position = self.history_position.map_or_else(
             || {
-                self.history_scratch = Some(self.text.clone());
+                self.history_scratch = Some(HistoryEntry {
+                    text: self.text.clone(),
+                    bindings: self.bindings.clone(),
+                });
                 self.history.len() - 1
             },
             |position| position.saturating_sub(1),
         );
         self.history_position = Some(position);
-        self.text.clone_from(&self.history[position]);
-        self.bindings.clear();
-        self.cursor = self.text.len();
-        self.prefer_previous_row = false;
-        self.preferred_display_column = None;
+        self.restore(self.history[position].clone())
     }
 
     fn down_is_inert(&self, width: u16) -> bool {
         self.vertical_target(width, RowDirection::Next).is_none() && self.history_position.is_none()
     }
 
-    fn history_next(&mut self, width: u16) {
+    fn history_next(&mut self, width: u16) -> Vec<BoundAttachment> {
         if self.move_vertical(width, RowDirection::Next) {
-            return;
+            return Vec::new();
         }
         let Some(position) = self.history_position else {
-            return;
+            return Vec::new();
         };
         if position + 1 < self.history.len() {
             let next = position + 1;
             self.history_position = Some(next);
-            self.text.clone_from(&self.history[next]);
-            self.bindings.clear();
+            self.restore(self.history[next].clone())
         } else {
             self.history_position = None;
-            self.text = self.history_scratch.take().unwrap_or_default();
-            self.bindings.clear();
+            let scratch = self.history_scratch.take().unwrap_or_default();
+            self.restore(scratch);
+            Vec::new()
         }
+    }
+
+    /// Puts `entry` in the draft's place, cursor at its end, and answers the
+    /// Attachments it binds. A label number it uses is never reused by a
+    /// later paste into the draft.
+    fn restore(&mut self, entry: HistoryEntry) -> Vec<BoundAttachment> {
+        self.text = entry.text;
+        self.bindings = entry.bindings;
+        self.highest_image_number = self
+            .highest_image_number
+            .max(self.bindings.highest_image_number());
         self.cursor = self.text.len();
         self.prefer_previous_row = false;
         self.preferred_display_column = None;
+        self.bindings
+            .attachments()
+            .map(|(_, attachment)| attachment.clone())
+            .collect()
+    }
+
+    fn demote_attachments(
+        &mut self,
+        demote: impl Fn(&BoundAttachment) -> bool,
+    ) -> Vec<BoundAttachment> {
+        let demoted = self.bindings.drop_attachments(demote);
+        if !demoted.is_empty() {
+            self.invalidate_retry_after_edit();
+        }
+        demoted
     }
 
     fn clear(&mut self) {
@@ -785,7 +849,10 @@ impl ComposerState {
 
     fn admission_failed(&mut self, prompt: &InitialPrompt) {
         if !self.text.is_empty() {
-            self.push_history(self.text.clone());
+            self.push_history(HistoryEntry {
+                text: self.text.clone(),
+                bindings: self.bindings.clone(),
+            });
         }
         self.text.clone_from(&prompt.text);
         self.selection_anchor = None;
@@ -799,7 +866,7 @@ impl ComposerState {
     }
 
     fn admission_reconciled(&mut self, prompt: &InitialPrompt) {
-        self.push_history(prompt.text.clone());
+        self.push_history(HistoryEntry::from_prompt(prompt));
         if self
             .retry
             .as_ref()
@@ -810,7 +877,7 @@ impl ComposerState {
     }
 
     fn late_admission_reconciled(&mut self, prompt: &InitialPrompt) -> bool {
-        self.push_history(prompt.text.clone());
+        self.push_history(HistoryEntry::from_prompt(prompt));
         let restored_was_current = self
             .retry
             .as_ref()
@@ -862,9 +929,9 @@ impl ComposerState {
         }
     }
 
-    fn push_history(&mut self, text: String) {
-        if !text.is_empty() && self.history.last() != Some(&text) {
-            self.history.push(text);
+    fn push_history(&mut self, entry: HistoryEntry) {
+        if !entry.text.is_empty() && self.history.last() != Some(&entry) {
+            self.history.push(entry);
         }
     }
 }

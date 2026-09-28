@@ -92,6 +92,23 @@ impl TextBindings {
             .collect()
     }
 
+    /// Drops the binding of each Attachment `drop` picks, leaving its label
+    /// in the text as plain text, and answers what was dropped in text order.
+    pub(in crate::tui) fn drop_attachments(
+        &mut self,
+        drop: impl Fn(&BoundAttachment) -> bool,
+    ) -> Vec<BoundAttachment> {
+        let mut dropped = Vec::new();
+        self.0.retain(|binding| match &binding.kind {
+            BindingKind::Attachment(attachment) if drop(attachment) => {
+                dropped.push(attachment.clone());
+                false
+            }
+            _ => true,
+        });
+        dropped
+    }
+
     /// The highest `N` among the `[Image N]` labels bound beside the text, or
     /// zero with none.
     pub(in crate::tui) fn highest_image_number(&self) -> u32 {
@@ -115,17 +132,23 @@ fn image_label_number(label: &str) -> Option<u32> {
         .ok()
 }
 
-/// The one line that describes an Attachment beneath the text its label
-/// stands in: the label without its brackets, the format, the dimensions, and
-/// the size, as in `Image 1 · PNG · 1280×720 · 312 KiB`.
-fn attachment_line(label: &str, descriptor: &AttachmentDescriptor) -> String {
-    let name = label
+/// What a reader calls the Attachment `label` stands for: the label without
+/// its brackets, as in `Image 1`.
+pub(in crate::tui) fn attachment_name(label: &str) -> &str {
+    label
         .strip_prefix('[')
         .and_then(|label| label.strip_suffix(']'))
-        .unwrap_or(label);
+        .unwrap_or(label)
+}
+
+/// The one line that describes an Attachment beneath the text its label
+/// stands in: its name, the format, the dimensions, and the size, as in
+/// `Image 1 · PNG · 1280×720 · 312 KiB`.
+fn attachment_line(label: &str, descriptor: &AttachmentDescriptor) -> String {
     let crate::protocol::AttachmentKind::Image { width, height } = descriptor.kind;
     format!(
-        "{name} · {} · {width}×{height} · {}",
+        "{} · {} · {width}×{height} · {}",
+        attachment_name(label),
         format_name(&descriptor.mime_type),
         byte_size(descriptor.byte_length)
     )

@@ -26,7 +26,7 @@ use crate::support::{
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
 
-fn press(
+pub(crate) fn press(
     application: &mut Application,
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -36,19 +36,19 @@ fn press(
         .expect("deliver a key press")
 }
 
-fn ctrl_v(application: &mut Application) -> ApplicationTransition {
+pub(crate) fn ctrl_v(application: &mut Application) -> ApplicationTransition {
     press(application, KeyCode::Char('v'), KeyModifiers::CONTROL)
 }
 
 /// Presses Ctrl+V and answers the paste it began.
-fn read_clipboard(application: &mut Application) -> PasteId {
+pub(crate) fn read_clipboard(application: &mut Application) -> PasteId {
     match ctrl_v(application) {
         ApplicationTransition::ReadClipboard(paste) => paste,
         other => panic!("Ctrl+V in the composer reads the clipboard, not {other:?}"),
     }
 }
 
-fn answer_read(
+pub(crate) fn answer_read(
     application: &mut Application,
     paste: PasteId,
     read: ClipboardRead,
@@ -58,11 +58,16 @@ fn answer_read(
         .expect("answer the clipboard read")
 }
 
-fn png(tag: &str) -> Vec<u8> {
+pub(crate) fn png(tag: &str) -> Vec<u8> {
     [b"\x89PNG\r\n\x1a\n".as_slice(), tag.as_bytes()].concat()
 }
 
-fn descriptor(tag: &str, width: u32, height: u32, byte_length: u64) -> AttachmentDescriptor {
+pub(crate) fn descriptor(
+    tag: &str,
+    width: u32,
+    height: u32,
+    byte_length: u64,
+) -> AttachmentDescriptor {
     AttachmentDescriptor {
         id: AttachmentId::new(format!("{tag}-hash")),
         kind: AttachmentKind::Image { width, height },
@@ -74,7 +79,11 @@ fn descriptor(tag: &str, width: u32, height: u32, byte_length: u64) -> Attachmen
 /// Pastes an image the whole way: Ctrl+V, the clipboard holding `tag`'s
 /// PNG, and the Server storing it as `stored`. Answers what the upload was
 /// asked to reach.
-fn paste_image(application: &mut Application, tag: &str, stored: AttachmentDescriptor) -> Outlook {
+pub(crate) fn paste_image(
+    application: &mut Application,
+    tag: &str,
+    stored: AttachmentDescriptor,
+) -> Outlook {
     let paste = read_clipboard(application);
     let ApplicationTransition::UploadAttachment {
         paste: uploading,
@@ -98,13 +107,13 @@ fn paste_image(application: &mut Application, tag: &str, stored: AttachmentDescr
     origin
 }
 
-fn submit(application: &mut Application, command: CommandId) -> ApplicationTransition {
+pub(crate) fn submit(application: &mut Application, command: CommandId) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::Command(command))
         .expect("submit the draft")
 }
 
-fn bound(tag: &str, label: &str, span: std::ops::Range<usize>) -> AttachmentBinding {
+pub(crate) fn bound(tag: &str, label: &str, span: std::ops::Range<usize>) -> AttachmentBinding {
     AttachmentBinding {
         attachment_id: AttachmentId::new(format!("{tag}-hash")),
         label: label.to_owned(),
@@ -112,7 +121,7 @@ fn bound(tag: &str, label: &str, span: std::ops::Range<usize>) -> AttachmentBind
     }
 }
 
-fn composer_row(application: &Application) -> String {
+pub(crate) fn composer_row(application: &Application) -> String {
     rendered_application_rows(application)
         .into_iter()
         .find(|row| row.contains("[Image"))

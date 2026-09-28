@@ -7,7 +7,8 @@
 //! only what a reader needs to know something went wrong and where to look —
 //! so it collapses the whole set into one line: the loudest failures first,
 //! whole files ahead of single keys, the keys merely counted, and a pointer to
-//! the Log for the rest. A failed paste says why in a Notice of its own.
+//! the Log for the rest. A failed paste says why in a Notice of its own, as
+//! does a draft whose Attachment labels were demoted to plain text.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -40,6 +41,9 @@ pub(super) struct ApplicationNotice {
     dismissed: Vec<NoticeIdentity>,
     settings_diagnostics: Vec<SettingsDiagnostic>,
     theme_diagnostics: Vec<ThemeDiagnostic>,
+    /// How many times a draft's Attachment labels have been demoted, which
+    /// tells each demotion's Notice apart from the last.
+    demotions: u64,
 }
 
 impl ApplicationNotice {
@@ -85,6 +89,25 @@ impl ApplicationNotice {
             NoticeIdentity::PasteFailed { paste, failure },
             SettingsDiagnosticSeverity::Error,
             summary,
+        );
+    }
+
+    /// Reports the Attachments, named as the reader knows them, whose labels
+    /// a draft now carries as plain text, and why. Each demotion is its own
+    /// condition, so dismissing one never silences the next.
+    pub(super) fn receive_demoted_attachments(
+        &mut self,
+        names: &[&str],
+        demotion: AttachmentDemotion,
+    ) {
+        if names.is_empty() {
+            return;
+        }
+        self.demotions += 1;
+        self.raise(
+            NoticeIdentity::AttachmentsDemoted(self.demotions),
+            SettingsDiagnosticSeverity::Warning,
+            demotion.summary(names),
         );
     }
 
@@ -173,6 +196,43 @@ pub(super) enum NoticeIdentity {
         paste: PasteId,
         failure: PasteFailure,
     },
+    AttachmentsDemoted(u64),
+}
+
+/// Why a draft's Attachment labels were demoted to plain text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttachmentDemotion {
+    /// The Server the draft goes to no longer stores them: a Prompt recalled
+    /// from history bound them, and they were reclaimed since.
+    NoLongerStored,
+    /// They were pasted to the Server the Outlook has since turned away from.
+    LeftBehind,
+}
+
+impl AttachmentDemotion {
+    /// The Notice's words for `names`, as in `Image 1 is no longer on the
+    /// Server; its label stays as text`.
+    fn summary(self, names: &[&str]) -> String {
+        let one = names.len() == 1;
+        let names = match names {
+            [only] => (*only).to_owned(),
+            [first, second] => format!("{first} and {second}"),
+            [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+            [] => String::new(),
+        };
+        let what = match (self, one) {
+            (Self::NoLongerStored, true) => "is no longer on the Server",
+            (Self::NoLongerStored, false) => "are no longer on the Server",
+            (Self::LeftBehind, true) => "is on another Server",
+            (Self::LeftBehind, false) => "are on another Server",
+        };
+        let labels = if one {
+            "its label stays"
+        } else {
+            "their labels stay"
+        };
+        format!("{names} {what}; {labels} as text")
+    }
 }
 
 /// Why a paste from the clipboard inserted nothing.
@@ -341,4 +401,50 @@ fn file_name(diagnostic: &NoticeDiagnostic<'_>) -> String {
         .unwrap_or(diagnostic.file.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_demotion_names_each_image_and_agrees_with_how_many_there_are() {
+        assert_eq!(
+            AttachmentDemotion::NoLongerStored.summary(&["Image 2"]),
+            "Image 2 is no longer on the Server; its label stays as text"
+        );
+        assert_eq!(
+            AttachmentDemotion::NoLongerStored.summary(&["Image 1", "Image 3"]),
+            "Image 1 and Image 3 are no longer on the Server; their labels stay as text"
+        );
+        assert_eq!(
+            AttachmentDemotion::LeftBehind.summary(&["Image 1"]),
+            "Image 1 is on another Server; its label stays as text"
+        );
+        assert_eq!(
+            AttachmentDemotion::LeftBehind.summary(&["Image 1", "Image 2", "Image 4"]),
+            "Image 1, Image 2, and Image 4 are on another Server; their labels stay as text"
+        );
+    }
+
+    #[test]
+    fn each_demotion_raises_its_own_notice_after_the_last_was_dismissed() {
+        let mut notice = ApplicationNotice::default();
+        notice.receive_demoted_attachments(&[], AttachmentDemotion::NoLongerStored);
+        assert!(notice.showing().is_none(), "nothing demoted says nothing");
+
+        notice.receive_demoted_attachments(&["Image 1"], AttachmentDemotion::NoLongerStored);
+        notice
+            .showing()
+            .expect("the demotion is shown")
+            .mark_shown();
+        assert!(notice.dismiss());
+        notice.receive_demoted_attachments(&["Image 1"], AttachmentDemotion::NoLongerStored);
+        assert!(
+            notice
+                .showing()
+                .is_some_and(|shown| shown.text(120).contains("Image 1 is no longer")),
+            "the same image demoted again is a new condition"
+        );
+    }
 }

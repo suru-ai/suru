@@ -57,6 +57,13 @@ impl ClipboardPastes {
         self.pending.remove(&paste).map(|pending| pending.draft)
     }
 
+    /// Abandons every upload on its way into `draft`, whose answer would
+    /// bind an Attachment on a Server that draft no longer goes to.
+    pub(super) fn abandon_uploads_into(&mut self, draft: &ComposerKey) {
+        self.pending
+            .retain(|_, pending| !(pending.uploading && &pending.draft == draft));
+    }
+
     /// How many uploads are on their way into `draft`.
     pub(super) fn uploads_into(&self, draft: &ComposerKey) -> usize {
         self.pending

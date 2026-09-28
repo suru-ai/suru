@@ -503,8 +503,9 @@ struct TaskChannels {
     workspaces: UnboundedSender<WorkspaceResolutionResult>,
     origin_catalog: UnboundedSender<OriginCatalogEvent>,
     subagent_trees: UnboundedSender<SubagentTreeDelivery>,
-    /// What each paste's clipboard read and image upload answered.
-    pastes: UnboundedSender<ApplicationEvent>,
+    /// What each paste's clipboard read and image upload answered, and each
+    /// check of whether a recalled Prompt's Attachments are still stored.
+    attachments: UnboundedSender<ApplicationEvent>,
     /// The thumbnail each Attachment fetch made, or its failure.
     thumbnails: UnboundedSender<ApplicationEvent>,
 }
@@ -555,7 +556,7 @@ async fn run_loop(
     let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
     let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subagent_trees, mut subagent_tree_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (pastes, mut paste_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (attachments, mut attachment_rx) = tokio::sync::mpsc::unbounded_channel();
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
@@ -579,7 +580,7 @@ async fn run_loop(
             workspaces,
             origin_catalog,
             subagent_trees,
-            pastes,
+            attachments,
             thumbnails,
         },
         reconnect_grace: Vec::new(),
@@ -643,7 +644,7 @@ async fn run_loop(
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             tree = subagent_tree_rx.recv() => run.receive_subagent_tree(tree)?,
-            paste = paste_rx.recv() => run.receive_paste(paste)?,
+            answer = attachment_rx.recv() => run.receive_attachment_answer(answer)?,
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
@@ -782,8 +783,11 @@ impl RunLoop {
             .follow_subagent_tree(&self.client, wanted, &self.channels.subagent_trees);
     }
 
-    fn receive_paste(&mut self, answer: Option<ApplicationEvent>) -> Result<ControlFlow<Exit>> {
-        let answer = answer.ok_or_else(|| anyhow!("paste task channel stopped"))?;
+    fn receive_attachment_answer(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Attachment task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -925,7 +929,7 @@ impl RunLoop {
                 });
             }
             ApplicationTransition::ReadClipboard(paste) => {
-                let answers = self.channels.pastes.clone();
+                let answers = self.channels.attachments.clone();
                 self.clipboard_reader.read(move |read| {
                     let _ = answers.send(ApplicationEvent::ClipboardRead { paste, read });
                 });
@@ -935,7 +939,19 @@ impl RunLoop {
                     self.client.session_commands_for(origin),
                     paste,
                     png,
-                    self.channels.pastes.clone(),
+                    self.channels.attachments.clone(),
+                );
+            }
+            ApplicationTransition::CheckAttachments {
+                check,
+                origin,
+                attachments,
+            } => {
+                spawn_attachment_check(
+                    self.client.session_commands_for(origin),
+                    check,
+                    attachments,
+                    self.channels.attachments.clone(),
                 );
             }
             ApplicationTransition::FetchAttachment {
@@ -1398,6 +1414,7 @@ impl RunLoop {
             | ApplicationTransition::ReadClipboard(_)
             | ApplicationTransition::UploadAttachment { .. }
             | ApplicationTransition::FetchAttachment { .. }
+            | ApplicationTransition::CheckAttachments { .. }
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::RemoveRemote(_)
@@ -2482,6 +2499,36 @@ async fn thumbnail_answer(
             }
         }
     }
+}
+
+/// Asks whether each Attachment a recalled Prompt binds is still stored, and
+/// answers the check with those that are not, or with why it could not ask.
+fn spawn_attachment_check(
+    commands: SessionCommandClient,
+    check: crate::tui::AttachmentCheckId,
+    attachments: Vec<crate::protocol::AttachmentId>,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = missing_attachments(&commands, attachments)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = answers.send(ApplicationEvent::AttachmentsChecked { check, result });
+    });
+}
+
+/// Those of `attachments` the Server no longer stores, in the order asked.
+async fn missing_attachments(
+    commands: &SessionCommandClient,
+    attachments: Vec<crate::protocol::AttachmentId>,
+) -> Result<Vec<crate::protocol::AttachmentId>> {
+    let mut missing = Vec::new();
+    for attachment in attachments {
+        if !commands.attachment_exists(&attachment).await? {
+            missing.push(attachment);
+        }
+    }
+    Ok(missing)
 }
 
 /// The words a failed upload is shown in: the Server's own when it refused,

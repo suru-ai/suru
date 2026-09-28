@@ -23,7 +23,7 @@ use crate::{
     theme::Theme,
 };
 
-pub(super) use attachment::image_label;
+pub(super) use attachment::{BoundAttachment, attachment_name, image_label};
 pub(super) use skill::{SkillIssue, skill_invocation_can_start};
 
 /// One typed thing bound to the span of text that stands for it.
@@ -428,6 +428,27 @@ mod tests {
         let mut without_one = lowered.clone();
         without_one.attachments.pop();
         assert!(!TextBindings::from_prompt(&lowered).are_carried_by(&without_one));
+    }
+
+    #[test]
+    fn dropping_an_attachment_leaves_its_label_unbound_and_every_other_binding() {
+        let text = "[Image 1] $review [Image 2]";
+        let mut carried = prompt(text, vec![invocation("review", 10..17)]);
+        carried.attachments = vec![attached("[Image 1]", 0..9), attached("[Image 2]", 18..27)];
+        let mut bindings = TextBindings::from_prompt(&carried);
+
+        let dropped = bindings.drop_attachments(|attachment| attachment.label() == "[Image 1]");
+        assert_eq!(
+            dropped
+                .iter()
+                .map(BoundAttachment::label)
+                .collect::<Vec<_>>(),
+            vec!["[Image 1]"]
+        );
+        assert_eq!(spans(&bindings), vec![10..17, 18..27]);
+        assert_eq!(bindings.highest_image_number(), 2);
+        assert_eq!(bindings.unit_after(0), None, "the label is plain text now");
+        assert!(bindings.drop_attachments(|_| false).is_empty());
     }
 
     #[test]

@@ -829,16 +829,15 @@ fn turning_the_outlook_drops_the_landings_thumbnails() {
         "the Landing of another Outlook holds none of this one's thumbnails: {:#?}",
         readable_rows(&turned)
     );
-    let ApplicationTransition::FetchAttachment {
-        origin,
-        attachment_id,
-        ..
-    } = application.take_attachment_fetch()
-    else {
-        panic!("the draft's thumbnail is asked for again");
-    };
-    assert_eq!(origin, Outlook::Remote("studio".to_owned()));
-    assert_eq!(attachment_id, screenshot().id);
+    // The image was pasted to the Server turned away from, so the draft's
+    // label stays as text there and no thumbnail is asked of the new one.
+    assert_eq!(
+        application.take_attachment_fetch(),
+        ApplicationTransition::Continue
+    );
+    let rows = readable_rows(&turned).join("\n");
+    assert!(rows.contains("Look at [Image 1]"), "{rows}");
+    assert!(rows.contains("Image 1 is on another Server"), "{rows}");
 }
 
 #[test]
