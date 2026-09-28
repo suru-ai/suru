@@ -693,3 +693,89 @@ async fn interrupting_the_parent_reports_nothing_of_the_subagents_it_stopped() {
         .await
         .expect("shut down server");
 }
+
+#[tokio::test]
+async fn a_report_reaching_a_continuation_opened_for_late_output_waits_to_wake_the_agent_once_it_settles()
+ {
+    use super::posture::{claude, pin};
+    use suru::protocol::ClaudePermissionMode;
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-report-late-output", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, child_provider) = spawn_working_child(&mut delegating).await;
+    settle_callers_turn(
+        &delegating,
+        "the caller's Turn settles while its Subagent works",
+    )
+    .await;
+
+    // The parent's Provider works on for the Subagent still working, and
+    // that output opens a Continuation of its own: no Turn Suru began on the
+    // Provider, so none a harness could take a steer into.
+    write_agent_message(
+        &delegating.caller_provider,
+        "Still waiting on the Researcher.",
+    )
+    .await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the late output opens a Continuation",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Active,
+    )
+    .await;
+
+    // The Subagent settles while that Continuation is open. A change the
+    // parent's Provider answers, asked for after the Subagent's Report came to
+    // wait, has the parent's actor take up everything sent it before.
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let caller = row_settles(&descriptor, delegating.caller, child_id).await;
+    let expected = report_of(&caller, child_id, SubagentReportOutcome::Completed, None);
+    pin(
+        &descriptor,
+        delegating.caller,
+        claude(ClaudePermissionMode::AcceptEdits),
+    )
+    .await;
+    assert!(
+        delegating.caller_provider.try_next_steer().is_none(),
+        "no Report is steered into a Continuation opened for late output"
+    );
+    assert!(delegating.caller_provider.try_next_turn().is_none());
+
+    // Its Provider's boundary settles it, and the Report then wakes the
+    // Agent into a Continuation of its own.
+    delegating
+        .caller_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let woken = next_turn(
+        &mut delegating.caller_provider,
+        "the waiting Report wakes the parent once the late output's Continuation settles",
+    )
+    .await;
+    assert_eq!(woken.reports(), [expected]);
+    assert!(!woken.has_prompt());
+    woken.succeed();
+    let continuing = read_until(
+        &descriptor,
+        delegating.caller,
+        "the parent works in the Continuation its Report woke",
+        |snapshot| snapshot.turns.len() == 3,
+    )
+    .await;
+    assert_eq!(continuing.turns[1].status, TurnStatus::Completed);
+    assert!(continuing.turns[2].is_continuation());
+    assert_eq!(continuing.turns[2].status, TurnStatus::Active);
+    assert!(delegating.caller_provider.try_next_steer().is_none());
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}

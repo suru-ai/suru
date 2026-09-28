@@ -3026,12 +3026,22 @@ async fn run_provider_session(
             // A Report reaching an Agent whose Turn still works steers that
             // Turn, as a steer Prompt would, and begins nothing. A Turn being
             // interrupted is left to settle: what the user stopped is not
-            // steered, and the Reports wait for the next Turn.
+            // steered, and the Reports wait for the next Turn. A Continuation
+            // opened for late output is no Turn its Provider began for Suru —
+            // Suru opened it for output owed to Subagents — so no harness has
+            // a Turn to steer there: rather than a steer bound to be refused,
+            // the Reports wait, and wake the Agent once that Continuation
+            // settles, unless a Prompt settles it first and carries them at
+            // the head of its own Turn.
             ActorInput::Command(Some(ProviderCommand::DeliverReports { .. })) => {
                 let current = active
                     .as_ref()
                     .expect("Provider input is handled while a Turn is active");
                 if current.interruption_acknowledged {
+                    continue;
+                }
+                if current.continuation == Some(ContinuationExecution::LateOutput) {
+                    reports_owed = true;
                     continue;
                 }
                 let reports = sessions.take_held_reports(session_id);

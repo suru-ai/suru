@@ -28,7 +28,7 @@ use crate::{
     support::read_session,
 };
 
-fn claude(permission_mode: ClaudePermissionMode) -> ApprovalPosture {
+pub(super) fn claude(permission_mode: ClaudePermissionMode) -> ApprovalPosture {
     ApprovalPosture::Claude { permission_mode }
 }
 
@@ -40,7 +40,7 @@ fn codex(approval_policy: CodexApprovalPolicy, sandbox_mode: CodexSandboxMode) -
 }
 
 /// Codex's level-4 value: nothing asks, everything is allowed.
-fn codex_unrestricted() -> ApprovalPosture {
+pub(super) fn codex_unrestricted() -> ApprovalPosture {
     codex(
         CodexApprovalPolicy::Never,
         CodexSandboxMode::DangerFullAccess,
@@ -90,7 +90,7 @@ async fn set_posture(
 
 /// Pins `posture` on `session_id` as a client does, and answers with the
 /// reading the Server gives back.
-async fn pin(
+pub(super) async fn pin(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
     posture: ApprovalPosture,
