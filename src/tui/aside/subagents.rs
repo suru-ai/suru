@@ -1,6 +1,7 @@
 //! The Subagents Section: the tree of Sessions the open Session belongs to,
 //! its top-level Session first and every Subagent beneath the Session that
-//! spawned it, in spawn order.
+//! spawned it — working branches ahead of settled ones, newest spawn first —
+//! headed by how many Subagents there are and how many of them work.
 
 use ratatui::{
     style::Style,
@@ -187,6 +188,8 @@ impl Section for SubagentsSection {
             header: SectionHeader {
                 name: self.name(),
                 count: Some(tree.subagent_count()),
+                // Nothing working goes unsaid rather than counted as none.
+                active: Some(tree.working_count()).filter(|active| *active > 0),
             },
             rows,
             current,
@@ -219,6 +222,7 @@ impl SubagentsSection {
             header: SectionHeader {
                 name: self.name(),
                 count: Some(0),
+                active: None,
             },
             rows: vec![unpointable(line)],
             current: Some(0),
@@ -233,6 +237,7 @@ impl SubagentsSection {
             header: SectionHeader {
                 name: self.name(),
                 count: None,
+                active: None,
             },
             rows,
             current: None,

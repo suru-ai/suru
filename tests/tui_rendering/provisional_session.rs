@@ -971,7 +971,7 @@ mod aside {
         assert_eq!(
             aside_rows(&application)[..4],
             [
-                "Subagents 1",
+                "Subagents 1 (1 active)",
                 "Rename the widget",
                 "└ ⠋ Find the widget",
                 "    Explore",

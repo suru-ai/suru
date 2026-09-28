@@ -8,7 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     time::{Duration, Instant},
 };
@@ -24,8 +24,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::managed_client::SubagentTreeEvent;
 use crate::protocol::{
-    AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference, SessionTimestamp,
-    SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot, SubagentTreeTopLevel,
+    ActivityStatus, AsideVisibility, EffectiveSettings, Outlook, SessionId, SessionReference,
+    SessionTimestamp, SubagentTreeChange, SubagentTreeEntry, SubagentTreeSnapshot,
+    SubagentTreeTopLevel,
 };
 use crate::theme::Theme;
 
@@ -41,7 +42,8 @@ mod section;
 mod subagents;
 
 use section::{
-    Section, SectionContext, SectionRowKey, SectionView, SubagentTreeView, built_in_sections,
+    Section, SectionContext, SectionHeader, SectionRowKey, SectionView, SubagentTreeView,
+    built_in_sections,
 };
 
 /// How long a tree not yet in hand is drawn blank before it says Loading: the
@@ -647,7 +649,12 @@ impl Aside {
                 Err(message) => {
                     // A failing Section is drawn as failed, in its own place,
                     // and the Sections around it go on as they were.
-                    lines.push(header_line(section.name(), None, content.width, theme));
+                    let header = SectionHeader {
+                        name: section.name(),
+                        count: None,
+                        active: None,
+                    };
+                    lines.push(header_line(&header, content.width, theme));
                     lines.push(Line::styled(
                         truncate_to_width(
                             &format!("Could not show: {message}"),
@@ -665,7 +672,7 @@ impl Aside {
                 animates: section_animates,
             } = view;
             animates |= section_animates;
-            lines.push(header_line(header.name, header.count, content.width, theme));
+            lines.push(header_line(&header, content.width, theme));
             // The window keeps its anchor in view: the focused entry while
             // the keys stand on one here, the open Session's entry otherwise.
             // It scrolls a row at a time, however many lines a row takes.
@@ -806,14 +813,21 @@ fn furthest_offset(heights: &[usize], room: usize) -> usize {
     0
 }
 
-/// A Section's header: its name, and its count beside it where it knows one.
-fn header_line(name: &str, count: Option<usize>, width: u16, theme: &Theme) -> Line<'static> {
+/// A Section's header: its name, its count beside it where it knows one,
+/// and how many of those are working, in the working Marker's colour.
+fn header_line(header: &SectionHeader, width: u16, theme: &Theme) -> Line<'static> {
     let mut spans = vec![Span::styled(
-        truncate_to_width(name, usize::from(width)),
+        truncate_to_width(header.name, usize::from(width)),
         theme.text.primary,
     )];
-    if let Some(count) = count {
+    if let Some(count) = header.count {
         spans.push(Span::styled(format!(" {count}"), theme.text.subdued));
+    }
+    if let Some(active) = header.active {
+        spans.push(Span::styled(
+            format!(" ({active} active)"),
+            theme.accent.primary,
+        ));
     }
     Line::from(spans)
 }
@@ -870,7 +884,7 @@ pub(super) struct SubagentTreeReading {
     origin: Outlook,
     top_level: SubagentTreeTopLevel,
     /// Every Subagent, in the order the subscription announced them; the
-    /// tree order is read from each entry's parent and spawn order.
+    /// tree order is read from each entry's parent, status, and spawn order.
     subagents: Vec<SubagentTreeEntry>,
 }
 
@@ -1013,11 +1027,47 @@ impl SubagentTreeReading {
             .find(|entry| entry.session_id == session_id)
     }
 
+    /// How many Subagents, at any depth, are working now.
+    pub(super) fn working_count(&self) -> usize {
+        self.subagents
+            .iter()
+            .filter(|entry| entry.status == ActivityStatus::Active)
+            .count()
+    }
+
+    /// The Sessions whose branch holds work still going: every working
+    /// Subagent, and each Session above it.
+    fn live_branches(&self) -> HashSet<SessionId> {
+        let parents = self
+            .subagents
+            .iter()
+            .map(|entry| (entry.session_id, entry.parent_session_id))
+            .collect::<HashMap<_, _>>();
+        let mut live = HashSet::new();
+        for entry in &self.subagents {
+            if entry.status != ActivityStatus::Active {
+                continue;
+            }
+            // A Session already marked had the Sessions above it marked with
+            // it, which also ends a walk that runs round a cycle.
+            let mut session = entry.session_id;
+            while live.insert(session) {
+                let Some(parent) = parents.get(&session) else {
+                    break;
+                };
+                session = *parent;
+            }
+        }
+        live
+    }
+
     /// Every Subagent depth-first: each after the Session that spawned it,
-    /// its own descendants after it, and siblings in spawn order. An entry
-    /// never moves because its work settled, since nothing here reads its
-    /// status.
+    /// its own descendants after it. Among siblings, a branch with work still
+    /// going anywhere in it comes before the settled ones, and within each
+    /// the most recently spawned comes first, so a branch moves down when
+    /// the last work in it settles and back up when any of it works again.
     pub(super) fn depth_first(&self) -> Vec<TreeEntry<'_>> {
+        let live = self.live_branches();
         let mut children: HashMap<SessionId, Vec<&SubagentTreeEntry>> = HashMap::new();
         for entry in &self.subagents {
             children
@@ -1026,10 +1076,15 @@ impl SubagentTreeReading {
                 .push(entry);
         }
         for siblings in children.values_mut() {
-            siblings.sort_by_key(|entry| entry.spawn_order);
+            siblings.sort_by_key(|entry| {
+                (
+                    std::cmp::Reverse(live.contains(&entry.session_id)),
+                    std::cmp::Reverse(entry.spawn_order),
+                )
+            });
         }
         let mut ordered = Vec::with_capacity(self.subagents.len());
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::new();
         // Each frame: the siblings still to visit at one level, and the
         // continuation guides above that level.
         let mut stack: Vec<(std::vec::IntoIter<&SubagentTreeEntry>, Vec<bool>)> = vec![(
@@ -1067,7 +1122,6 @@ impl SubagentTreeReading {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ActivityStatus;
 
     fn entry(session_id: SessionId, parent: SessionId, spawn_order: u32) -> SubagentTreeEntry {
         SubagentTreeEntry {
@@ -1273,9 +1327,9 @@ mod tests {
                 .map(|entry| (entry.entry.session_id, entry.guides()))
                 .collect::<Vec<_>>(),
             vec![
-                (first, "├ ".to_owned()),
-                (nested, "│ └ ".to_owned()),
-                (second, "└ ".to_owned()),
+                (second, "├ ".to_owned()),
+                (first, "└ ".to_owned()),
+                (nested, "  └ ".to_owned()),
             ]
         );
         assert_eq!(
@@ -1283,9 +1337,51 @@ mod tests {
                 .iter()
                 .map(|entry| entry.continuation_guides())
                 .collect::<Vec<_>>(),
-            vec!["│ │ ".to_owned(), "│     ".to_owned(), "    ".to_owned()],
+            vec!["│   ".to_owned(), "  │ ".to_owned(), "      ".to_owned()],
             "beneath its first line an entry carries its branch's rule on to the sibling \
              after it, and hangs the rule its own spawns branch from where its Marker stood"
+        );
+    }
+
+    #[test]
+    fn siblings_run_working_branches_first_then_newest_spawn_first() {
+        let top = SessionId::new();
+        let [oldest, settled_parent, working, newest, deep] =
+            std::array::from_fn(|_| SessionId::new());
+        let settled = |mut entry: SubagentTreeEntry| {
+            entry.status = ActivityStatus::Completed;
+            entry
+        };
+        let reading = SubagentTreeReading::new(
+            Outlook::Local,
+            SubagentTreeSnapshot {
+                revision: crate::protocol::SubagentTreeRevision::INITIAL,
+                top_level: SubagentTreeTopLevel {
+                    session_id: top,
+                    title: "Delegate".to_owned(),
+                    working_since: None,
+                    monitoring_since: None,
+                    needs_intervention: false,
+                },
+                subagents: vec![
+                    settled(entry(oldest, top, 0)),
+                    settled(entry(settled_parent, top, 1)),
+                    entry(working, top, 2),
+                    settled(entry(newest, top, 3)),
+                    entry(deep, settled_parent, 0),
+                ],
+            },
+        );
+
+        assert_eq!(
+            reading
+                .depth_first()
+                .iter()
+                .map(|entry| entry.entry.session_id)
+                .collect::<Vec<_>>(),
+            vec![working, settled_parent, deep, newest, oldest],
+            "a branch with work still going anywhere in it stands before the settled \
+             ones, the most recently spawned first within each"
         );
     }
 }

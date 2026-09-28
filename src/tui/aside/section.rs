@@ -56,12 +56,13 @@ pub(in crate::tui) enum SubagentTreeView<'a> {
     StandIn { title: &'a str, working: bool },
 }
 
-/// A Section's header: its name, and how many things it holds where it
-/// knows.
+/// A Section's header: its name, how many things it holds where it knows,
+/// and how many of those are working where any are.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::tui) struct SectionHeader {
     pub(in crate::tui) name: &'static str,
     pub(in crate::tui) count: Option<usize>,
+    pub(in crate::tui) active: Option<usize>,
 }
 
 /// One drawn row, and what choosing it does. A row is one entry however many

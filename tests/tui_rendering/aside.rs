@@ -259,7 +259,7 @@ fn entries_run_depth_first_over_two_lines_with_guides_marker_title_name_and_a_fi
     assert_eq!(
         rows[..8],
         [
-            "Subagents 3",
+            "Subagents 3 (1 active)",
             "Map every seam",
             "├ ✓ Map the provider seams",
             "│ │ Explore               12s",
@@ -268,10 +268,61 @@ fn entries_run_depth_first_over_two_lines_with_guides_marker_title_name_and_a_fi
             "└ ✓ Weigh the options",
             "    Plan",
         ],
-        "the top-level Session heads the tree; each Subagent follows its spawner in \
-         spawn order over two lines, its Marker and Title first and its name and time \
+        "the top-level Session heads the tree; each Subagent follows its spawner, the \
+         branch still working ahead of the settled one, over two lines, its Marker and Title first and its name and time \
          beneath, the guides running on through the second line to the entries it \
          spawned; and a settle with no known duration leaves the time blank: {rows:#?}"
+    );
+}
+
+/// The foreground `needle` is drawn in on the Aside row at `row`.
+fn aside_colour(application: &Application, row: usize, needle: &str) -> Option<Color> {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let line = aside_rows(application, WIDTH)[row].clone();
+    let column = line.find(needle)?;
+    let x = WIDTH - ASIDE_WIDTH
+        + 2
+        + u16::try_from(line[..column].chars().count()).expect("column fits");
+    buffer
+        .cell((x, u16::try_from(row).expect("row fits")))?
+        .fg
+        .into()
+}
+
+#[test]
+fn the_header_counts_the_working_subagents_at_every_depth_in_the_working_colour() {
+    let workspace = workspace_dir();
+    let (mut application, tree) = tree_open_at_top(workspace.path());
+    let rows = aside_rows(&application, WIDTH);
+    assert_eq!(
+        rows[0], "Subagents 3 (1 active)",
+        "the nested working Subagent is counted beside the total: {rows:#?}"
+    );
+    let marker_row = rows
+        .iter()
+        .position(|row| row.contains("Check the mapped seams"))
+        .expect("the working entry is drawn");
+    assert_eq!(
+        aside_colour(&application, 0, "(1 active)"),
+        aside_colour(&application, marker_row, "⠋"),
+        "the working count wears the working Marker's colour"
+    );
+
+    change(
+        &mut application,
+        tree.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: tree.review,
+            status: ActivityStatus::Completed,
+            worked_ms: Some(3_000),
+            working_since: None,
+            monitoring_since: None,
+        },
+    );
+    assert_eq!(
+        aside_rows(&application, WIDTH)[0],
+        "Subagents 3",
+        "with nothing working the header says the total alone"
     );
 }
 
@@ -559,7 +610,7 @@ fn the_open_entry_is_highlighted_by_its_title_alone() {
 }
 
 #[test]
-fn a_settle_never_moves_an_entry() {
+fn the_last_settle_in_a_branch_moves_it_behind_newer_settled_siblings() {
     let workspace = workspace_dir();
     let (mut application, tree) = tree_open_at_top(workspace.path());
     deliver_tree(
@@ -578,20 +629,21 @@ fn a_settle_never_moves_an_entry() {
     assert_eq!(
         rows[2..8],
         [
-            "├ ✓ Map the provider seams",
-            "│ │ Explore               12s",
-            "│ └ × Check the mapped seams",
-            "│     Review · Failed      3s",
-            "└ ✓ Weigh the options",
-            "    Plan",
+            "├ ✓ Weigh the options",
+            "│   Plan",
+            "└ ✓ Map the provider seams",
+            "  │ Explore               12s",
+            "  └ × Check the mapped seams",
+            "      Review · Failed      3s",
         ],
-        "the settled entry wears its outcome — named beside its name, since a stop \
-         wears the same glyph — and final time where it stood: {rows:#?}"
+        "with nothing in it working, the branch falls in behind its newer settled \
+         sibling, and the settled entry wears its outcome — named beside its name, \
+         since a stop wears the same glyph — and its final time: {rows:#?}"
     );
 }
 
 #[test]
-fn a_late_spawn_stands_beneath_its_spawner() {
+fn a_late_spawn_stands_beneath_its_spawner_ahead_of_older_siblings() {
     let workspace = workspace_dir();
     let (mut application, tree) = tree_open_at_top(workspace.path());
     let probe = SessionId::new();
@@ -611,18 +663,18 @@ fn a_late_spawn_stands_beneath_its_spawner() {
     );
 
     let rows = aside_rows(&application, WIDTH);
-    assert_eq!(rows[0], "Subagents 4");
+    assert_eq!(rows[0], "Subagents 4 (2 active)");
     assert_eq!(
         rows[4..10],
         [
-            "│ ├ ⠋ Check the mapped seams",
-            "│ │   Review",
-            "│ └ ⠋ Probe a seam",
-            "│     Probe",
+            "│ ├ ⠋ Probe a seam",
+            "│ │   Probe",
+            "│ └ ⠋ Check the mapped seams",
+            "│     Review",
             "└ ✓ Weigh the options",
             "    Plan",
         ],
-        "{rows:#?}"
+        "working alike, the newer spawn stands ahead of its older sibling: {rows:#?}"
     );
 }
 
@@ -1215,7 +1267,7 @@ fn a_tree_that_cannot_be_read_says_so_until_a_session_of_it_is_opened_again() {
     );
     assert_eq!(
         aside_rows(&application, WIDTH)[..2],
-        ["Subagents 3", "Map every seam"],
+        ["Subagents 3 (1 active)", "Map every seam"],
         "the retried subscription's tree is taken"
     );
 }
@@ -1522,16 +1574,7 @@ fn entry_lines(application: &Application, name: &str) -> [String; 2] {
 
 /// The colour "Needs Intervention" is drawn in on the Aside row at `row`.
 fn needs_intervention_colour(application: &Application, row: usize) -> Option<Color> {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let line = aside_rows(application, WIDTH)[row].clone();
-    let column = line.find("Needs Intervention")?;
-    let x = WIDTH - ASIDE_WIDTH
-        + 2
-        + u16::try_from(line[..column].chars().count()).expect("column fits");
-    buffer
-        .cell((x, u16::try_from(row).expect("row fits")))?
-        .fg
-        .into()
+    aside_colour(application, row, "Needs Intervention")
 }
 
 fn change(application: &mut Application, through: SessionId, change: SubagentTreeChange) {
@@ -1620,9 +1663,10 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
     assert_eq!(
         entry_lines(&application, "Explore"),
         [
-            "├ ✓ Map the provider seams",
-            "│ │ Explore               12s"
-        ]
+            "└ ✓ Map the provider seams",
+            "  │ Explore               12s"
+        ],
+        "settled, the older branch stands after its newer sibling"
     );
     assert!(!application.wants_spinner());
 
@@ -1641,8 +1685,8 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
     let resumed = entry_lines(&application, "Explore");
     assert!(
         resumed[0].starts_with("├ ⠋ ") && resumed[1].ends_with(" 12s"),
-        "working again, the entry wears the Working Marker and counts up from its earlier \
-         Turns' time: {resumed:?}"
+        "working again, the entry moves back ahead of its settled sibling, wears the \
+         Working Marker, and counts up from its earlier Turns' time: {resumed:?}"
     );
     assert!(
         application.wants_spinner(),
@@ -1672,10 +1716,11 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
     assert_eq!(
         settled,
         [
-            "├ × Map the provider seams",
-            "│ │ Explore · Failed   1m 17s"
+            "└ × Map the provider seams",
+            "  │ Explore · Failed   1m 17s"
         ],
-        "settled again, it wears the latest Turn's outcome over all its Turns' time"
+        "settled again, it falls back behind its newer sibling and wears the latest \
+         Turn's outcome over all its Turns' time"
     );
     advance_session_clock(&now, 60_000);
     assert_eq!(
@@ -1703,8 +1748,8 @@ fn a_settled_entry_whose_end_went_unlearned_leaves_its_time_blank() {
     );
 
     assert_eq!(
-        aside_rows(&application, WIDTH)[4..6],
-        ["│ └ × Check the mapped seams", "│     Review · Failed"],
+        entry_lines(&application, "Review"),
+        ["  └ × Check the mapped seams", "      Review · Failed"],
         "no time stands beside it, the Marker saying enough"
     );
 }
@@ -1793,7 +1838,7 @@ fn a_monitoring_subagent_says_so_in_its_times_place_and_the_top_level_counts_its
 
     let explore = entry_lines(&application, "Explore");
     assert!(
-        explore[0].starts_with("├ ✓ ") && explore[1].ends_with(" monitoring"),
+        explore[0].starts_with("└ ✓ ") && explore[1].ends_with(" monitoring"),
         "the settled Marker stays, and monitoring stands in its time's place: {explore:?}"
     );
     assert!(
@@ -2096,9 +2141,10 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["└ × Weigh the options", "  │ Plan · Failed          1s"],
-        "nor does a spawn below it, or its own settle, whose spawn now hangs from \
-         the rule its second line carries"
+        ["├ × Weigh the options", "│ │ Plan · Failed          1s"],
+        "nor does a spawn below it, which moves its now working branch ahead of the \
+         older one, or its own settle, whose spawn now hangs from the rule its second \
+         line carries"
     );
 
     // A fresh tree without the focused entry hands focus to the nearest
@@ -2114,8 +2160,11 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["  └ ⠋ Check the mapped seams", "      Review"],
-        "the last entry left, standing nearest where Plan stood"
+        [
+            "└ ✓ Map the provider seams",
+            "  │ Explore               12s"
+        ],
+        "the entry now standing where Plan stood"
     );
 }
 
@@ -2169,8 +2218,9 @@ fn clicking_an_entry_opens_it_without_raising_row_focus() {
     );
 }
 
-/// A top-level Session with forty Subagents of its own, far more than the
-/// column holds.
+/// A top-level Session with forty settled Subagents of its own, far more
+/// than the column holds. The newest spawn is drawn first, so the Tasks are
+/// numbered, and `children` listed, in the order they are drawn.
 fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
     let children = (0..40).map(|_| SessionId::new()).collect::<Vec<_>>();
     let snapshot = SubagentTreeSnapshot {
@@ -2189,7 +2239,7 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
                 entry(
                     *child,
                     top,
-                    u32::try_from(order).expect("fits"),
+                    u32::try_from(39 - order).expect("fits"),
                     ("Agent", &format!("Task {order:02}")),
                     ActivityStatus::Completed,
                     None,
