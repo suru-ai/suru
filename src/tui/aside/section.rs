@@ -62,7 +62,7 @@ pub(in crate::tui) enum SubagentTreeView<'a> {
 pub(in crate::tui) struct SectionHeader {
     pub(in crate::tui) name: &'static str,
     pub(in crate::tui) count: Option<usize>,
-    pub(in crate::tui) active: Option<usize>,
+    pub(in crate::tui) working: Option<usize>,
 }
 
 /// One drawn row, and what choosing it does. A row is one entry however many

@@ -652,7 +652,7 @@ impl Aside {
                     let header = SectionHeader {
                         name: section.name(),
                         count: None,
-                        active: None,
+                        working: None,
                     };
                     lines.push(header_line(&header, content.width, theme));
                     lines.push(Line::styled(
@@ -823,9 +823,9 @@ fn header_line(header: &SectionHeader, width: u16, theme: &Theme) -> Line<'stati
     if let Some(count) = header.count {
         spans.push(Span::styled(format!(" {count}"), theme.text.subdued));
     }
-    if let Some(active) = header.active {
+    if let Some(working) = header.working {
         spans.push(Span::styled(
-            format!(" ({active} active)"),
+            format!(" ({working} active)"),
             theme.accent.primary,
         ));
     }

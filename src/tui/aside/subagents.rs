@@ -189,7 +189,7 @@ impl Section for SubagentsSection {
                 name: self.name(),
                 count: Some(tree.subagent_count()),
                 // Nothing working goes unsaid rather than counted as none.
-                active: Some(tree.working_count()).filter(|active| *active > 0),
+                working: Some(tree.working_count()).filter(|working| *working > 0),
             },
             rows,
             current,
@@ -222,7 +222,7 @@ impl SubagentsSection {
             header: SectionHeader {
                 name: self.name(),
                 count: Some(0),
-                active: None,
+                working: None,
             },
             rows: vec![unpointable(line)],
             current: Some(0),
@@ -237,7 +237,7 @@ impl SubagentsSection {
             header: SectionHeader {
                 name: self.name(),
                 count: None,
-                active: None,
+                working: None,
             },
             rows,
             current: None,
