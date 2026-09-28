@@ -282,9 +282,10 @@ impl Drop for ClipboardReader {
 #[cfg(target_os = "linux")]
 mod wsl {
     use std::ffi::OsString;
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    use std::thread;
+    use std::io::{self, Read};
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -296,10 +297,18 @@ mod wsl {
     /// or two.
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// The status the script exits with when the Windows clipboard holds no
+    /// image. PowerShell exits 1 of its own accord when a command fails, so
+    /// only this status reads as nothing to paste.
+    const NO_IMAGE_EXIT: i32 = 3;
+
     /// Writes the Windows clipboard's image to standard output as base64 PNG,
-    /// and exits 1 when it holds none.
-    const SCRIPT: &str = "$image = Get-Clipboard -Format Image; \
-        if ($image -eq $null) { exit 1 }; \
+    /// and exits [`NO_IMAGE_EXIT`] when it holds none. Any error stops the
+    /// script there, so PowerShell exits otherwise and says why on standard
+    /// error.
+    const SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+        $image = Get-Clipboard -Format Image; \
+        if ($image -eq $null) { exit 3 }; \
         $stream = New-Object System.IO.MemoryStream; \
         $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png); \
         [Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))";
@@ -395,27 +404,25 @@ mod wsl {
             self
         }
 
-        /// The Windows clipboard's image bytes, none where it holds no image,
-        /// or why PowerShell could not hand them over, in words short enough
-        /// to show.
+        /// The Windows clipboard's image bytes, none where the script answers
+        /// that it holds no image, or why PowerShell could not hand them over,
+        /// in words short enough to show. Any other status, a signal, or an
+        /// answer that is not an image fails the read.
         fn run(&self) -> Result<Option<Vec<u8>>, String> {
             let program = self.program.to_string_lossy();
             let mut child = Command::new(&self.program)
                 .args(&self.args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|error| {
                     format!("{program} could not be started for the Windows clipboard: {error}")
                 })?;
-            let mut stdout = child.stdout.take().expect("standard output is piped");
-            // Drained beside the wait, so an image larger than the pipe's
+            // Both drained beside the wait, so an image larger than the pipe's
             // buffer cannot stall the process that is writing it.
-            let output = thread::spawn(move || {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes).map(|_| bytes)
-            });
+            let output = drain(child.stdout.take().expect("standard output is piped"));
+            let complaint = drain(child.stderr.take().expect("standard error is piped"));
             let deadline = Instant::now() + self.timeout;
             let status = loop {
                 match child.try_wait() {
@@ -436,8 +443,11 @@ mod wsl {
                     }
                 }
             };
-            if !status.success() {
+            if status.code() == Some(NO_IMAGE_EXIT) {
                 return Ok(None);
+            }
+            if !status.success() {
+                return Err(failure(&program, status, complaint));
             }
             let unreadable =
                 || format!("{program}'s answer for the Windows clipboard could not be read");
@@ -448,13 +458,51 @@ mod wsl {
             let encoded = String::from_utf8_lossy(&output);
             let encoded = encoded.trim();
             if encoded.is_empty() {
-                return Ok(None);
+                return Err(format!(
+                    "{program} answered nothing for the Windows clipboard"
+                ));
             }
             STANDARD.decode(encoded).map(Some).map_err(|error| {
                 format!(
                     "{program} answered the Windows clipboard with an undecodable image: {error}"
                 )
             })
+        }
+    }
+
+    /// Reads `pipe` to its end on a thread of its own.
+    fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    }
+
+    /// How PowerShell ended without answering, followed by the first line it
+    /// wrote to standard error where it wrote one; the rest goes to the Log.
+    fn failure(
+        program: &str,
+        status: ExitStatus,
+        complaint: JoinHandle<io::Result<Vec<u8>>>,
+    ) -> String {
+        let ended = match (status.code(), status.signal()) {
+            (Some(code), _) => format!("exited with status {code}"),
+            (None, Some(signal)) => format!("was terminated by signal {signal}"),
+            (None, None) => format!("ended with {status}"),
+        };
+        let reason = format!("{program} {ended} on the Windows clipboard");
+        let complaint = complaint.join().ok().and_then(Result::ok);
+        let complaint = String::from_utf8_lossy(complaint.as_deref().unwrap_or_default());
+        let first = complaint
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty());
+        match first {
+            Some(first) => {
+                tracing::debug!(stderr = %complaint.trim(), "{reason}");
+                format!("{reason}: {first}")
+            }
+            None => reason,
         }
     }
 
@@ -564,14 +612,23 @@ mod wsl {
             );
         }
 
+        fn no_image() -> String {
+            format!("exit {NO_IMAGE_EXIT}")
+        }
+
         #[test]
-        fn powershell_hands_over_its_image_as_base64_and_exits_one_without_one() {
+        fn powershell_hands_over_its_image_as_base64_and_exits_three_without_one() {
+            assert!(
+                SCRIPT.contains(&format!("{{ {} }}", no_image())),
+                "the script answers no image as it is recognized"
+            );
+
             let png = [PNG_SIGNATURE, b"pixels"].concat();
             let script = format!("printf '%s' '{}'", STANDARD.encode(&png));
             let mut windows = PowerShellClipboard::command("sh", &["-c", &script]);
             assert_eq!(windows.image(), Ok(Some(NativeImage::Encoded(png))));
 
-            let mut windows = PowerShellClipboard::command("sh", &["-c", "exit 1"]);
+            let mut windows = PowerShellClipboard::command("sh", &["-c", &no_image()]);
             assert_eq!(windows.image(), Ok(None));
 
             let mut windows = PowerShellClipboard::command("suru-no-such-powershell", &[]);
@@ -588,6 +645,87 @@ mod wsl {
             assert!(
                 error.starts_with("sh answered the Windows clipboard with an undecodable image"),
                 "{error}"
+            );
+        }
+
+        #[test]
+        fn the_image_powershell_hands_over_pastes_before_the_native_text() {
+            let png = [PNG_SIGNATURE, b"windows"].concat();
+            let script = format!("printf '%s' '{}'", STANDARD.encode(&png));
+            let mut source = ImageFallback::new(
+                Scripted::text("native text"),
+                PowerShellClipboard::command("sh", &["-c", &script]),
+            );
+            assert_eq!(read_clipboard(&mut source), ClipboardRead::Image { png });
+        }
+
+        #[test]
+        fn powershell_finding_no_image_leaves_the_native_text_or_nothing() {
+            let mut source = ImageFallback::new(
+                Scripted::text("native text"),
+                PowerShellClipboard::command("sh", &["-c", &no_image()]),
+            );
+            assert_eq!(
+                read_clipboard(&mut source),
+                ClipboardRead::Text("native text".to_owned())
+            );
+
+            let mut source = ImageFallback::new(
+                Scripted::empty(),
+                PowerShellClipboard::command("sh", &["-c", &no_image()]),
+            );
+            assert_eq!(read_clipboard(&mut source), ClipboardRead::Empty);
+        }
+
+        #[test]
+        fn powershell_failing_says_why_rather_than_reading_as_empty() {
+            let failed = |script: &str| {
+                let mut source = ImageFallback::new(
+                    Scripted::empty(),
+                    PowerShellClipboard::command("sh", &["-c", script]),
+                );
+                read_clipboard(&mut source)
+            };
+
+            assert_eq!(
+                failed(
+                    "printf '\\nGet-Clipboard : The clipboard is busy.\\nAt line:1 char:10\\n' >&2; \
+                     exit 2"
+                ),
+                ClipboardRead::Failed {
+                    reason: "sh exited with status 2 on the Windows clipboard: \
+                             Get-Clipboard : The clipboard is busy."
+                        .to_owned()
+                },
+                "the first line PowerShell wrote to standard error says why"
+            );
+            assert_eq!(
+                failed("exit 1"),
+                ClipboardRead::Failed {
+                    reason: "sh exited with status 1 on the Windows clipboard".to_owned()
+                },
+                "PowerShell's own failure is not taken for a clipboard without an image"
+            );
+            assert_eq!(
+                failed("true"),
+                ClipboardRead::Failed {
+                    reason: "sh answered nothing for the Windows clipboard".to_owned()
+                },
+                "an answer that is neither an image nor its absence fails"
+            );
+        }
+
+        #[test]
+        fn powershell_ended_by_a_signal_fails_the_read() {
+            let mut source = ImageFallback::new(
+                Scripted::empty(),
+                PowerShellClipboard::command("sh", &["-c", "kill -KILL $$"]),
+            );
+            assert_eq!(
+                read_clipboard(&mut source),
+                ClipboardRead::Failed {
+                    reason: "sh was terminated by signal 9 on the Windows clipboard".to_owned()
+                }
             );
         }
 
