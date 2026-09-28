@@ -7,7 +7,7 @@ edition = "2024"
 suru-build-id = { path = "crates/suru-build-id" }
 async-trait = "0.1"
 anyhow = "1.0.99"
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
 axum = "0.8.4"
 base64 = "0.22.1"
 blake3 = "1.8.2"
@@ -23,6 +23,8 @@ fs2 = "0.4.3"
 futures-util = "0.3.31"
 hostname = "0.4.1"
 if-addrs = "0.15.0"
+# Encodes a clipboard image's pixels to PNG before upload; other decoders arrive with previews.
+image = { version = "0.25", default-features = false, features = ["png"] }
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 pulldown-cmark = "0.13.4"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }

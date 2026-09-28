@@ -38,6 +38,8 @@ use crate::{
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
     aside::{Aside, AsidePresentation, AsidePress},
+    clipboard::{ClipboardRead, PasteId},
+    clipboard_paste::ClipboardPastes,
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
@@ -59,7 +61,7 @@ use super::{
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
-    notice::{ApplicationNotice, Notice},
+    notice::{ApplicationNotice, Notice, PasteFailure},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -517,6 +519,9 @@ pub struct TuiState {
     checkout_states:
         HashMap<(Outlook, crate::protocol::CheckoutId), crate::protocol::CheckoutSummary>,
     pub(super) composers: ComposerMemory,
+    /// The pastes from the clipboard still waiting on a read or an upload,
+    /// each bound for the draft it was asked for.
+    clipboard_pastes: ClipboardPastes,
     pub(super) approvals: super::approval::ApprovalPanel,
     pub(super) questionnaires: super::questionnaire::QuestionnairePanels,
     session_interactions: HashMap<SessionReference, SessionInteraction>,
@@ -859,6 +864,7 @@ impl TuiState {
             outlook_execution_checkouts: HashMap::new(),
             checkout_states: HashMap::new(),
             composers: ComposerMemory::default(),
+            clipboard_pastes: ClipboardPastes::default(),
             approvals: super::approval::ApprovalPanel::default(),
             questionnaires: super::questionnaire::QuestionnairePanels::default(),
             session_interactions: HashMap::new(),
@@ -1337,6 +1343,25 @@ impl TuiState {
 
     fn paste_into_composer(&mut self, text: &str) {
         self.edit_composer_without_completion(|composers, key| composers.insert(key, text));
+    }
+
+    /// Pastes `text` into `draft` as a bracketed paste into it would.
+    fn paste_into_draft(&mut self, draft: ComposerKey, text: &str) {
+        self.edit_draft_without_completion(draft, |composers, key| composers.insert(key, text));
+    }
+
+    /// Edits `draft` as the composer with the keys is edited, or, where the
+    /// reader has since moved to another, quietly in its place.
+    fn edit_draft_without_completion(
+        &mut self,
+        draft: ComposerKey,
+        edit: impl FnOnce(&mut ComposerMemory, ComposerKey),
+    ) {
+        if draft == self.composer_key() {
+            self.edit_composer_without_completion(edit);
+        } else {
+            edit(&mut self.composers, draft);
+        }
     }
 
     fn restore_composer_history(&mut self, restore: impl FnOnce(&mut ComposerMemory, ComposerKey)) {
@@ -3975,6 +4000,22 @@ pub enum ApplicationEvent {
         request_id: u64,
         result: std::result::Result<crate::protocol::ResolvedWorkspace, String>,
     },
+    /// What the host clipboard held when a paste read it.
+    ClipboardRead {
+        paste: PasteId,
+        read: ClipboardRead,
+    },
+    /// A pasted image's upload stored it as this Attachment.
+    AttachmentUploaded {
+        paste: PasteId,
+        descriptor: crate::protocol::AttachmentDescriptor,
+    },
+    /// A pasted image's upload was refused, or never reached its Server, in
+    /// words the reader can be shown.
+    AttachmentUploadFailed {
+        paste: PasteId,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4221,6 +4262,18 @@ pub enum ApplicationTransition {
     /// Issue a fresh Invite containing exactly the addresses the reader chose.
     IssueInvite(crate::protocol::IssueInviteRequest),
     CopyToClipboard(super::ClipboardContent),
+    /// Read the host clipboard for a paste, off the UI thread, and answer
+    /// with [`ApplicationEvent::ClipboardRead`].
+    ReadClipboard(PasteId),
+    /// Upload a pasted image's PNG bytes to `origin` — through this Client's
+    /// own Server, which carries them on to a Remote — and answer with
+    /// [`ApplicationEvent::AttachmentUploaded`] or
+    /// [`ApplicationEvent::AttachmentUploadFailed`].
+    UploadAttachment {
+        paste: PasteId,
+        origin: Outlook,
+        png: Vec<u8>,
+    },
     OpenHyperlink(String),
     RemovePeer(String),
     /// End the Pairing with the named Remote, which the reader confirmed by
@@ -4496,6 +4549,19 @@ impl Application {
             }
             ApplicationEvent::ReconnectGraceElapsed(outlook) => {
                 Ok(self.elapse_reconnect_grace(&outlook))
+            }
+            ApplicationEvent::ClipboardRead { paste, read } => {
+                Ok(self.receive_clipboard_read(paste, read))
+            }
+            ApplicationEvent::AttachmentUploaded { paste, descriptor } => {
+                self.receive_uploaded_attachment(paste, descriptor);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AttachmentUploadFailed { paste, reason } => {
+                if self.state.clipboard_pastes.finish(paste).is_some() {
+                    self.paste_failed(paste, super::clipboard_paste::refused(reason));
+                }
+                Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
             ApplicationEvent::OriginCatalog { outlook, event } => {
@@ -6905,6 +6971,109 @@ impl Application {
         self.state.begin_provisional_session(prompt)
     }
 
+    /// Asks for the host clipboard to be read into the composer that has the
+    /// keys. Anywhere else the command does nothing, as Ctrl+V always has.
+    fn paste_from_clipboard(&mut self) -> ApplicationTransition {
+        if self.state.overlay_owns_input()
+            || self.state.reconnect_overlay_visible()
+            || self.state.open_subagent_parent().is_some()
+            || !matches!(self.state.command_mode, CommandMode::Composer)
+        {
+            return ApplicationTransition::Continue;
+        }
+        let draft = self.state.composer_key();
+        self.state.composers.keep_draft(draft.clone());
+        ApplicationTransition::ReadClipboard(self.state.clipboard_pastes.begin(draft))
+    }
+
+    /// Answers a paste's read of the clipboard in the draft it was asked for:
+    /// text pastes there as a bracketed paste would, and an image goes on to
+    /// be uploaded unless it could never be attached.
+    fn receive_clipboard_read(
+        &mut self,
+        paste: PasteId,
+        read: ClipboardRead,
+    ) -> ApplicationTransition {
+        let Some(draft) = self.state.clipboard_pastes.draft(paste).cloned() else {
+            return ApplicationTransition::Continue;
+        };
+        if !self.state.composers.has_draft(&draft) {
+            self.state.clipboard_pastes.finish(paste);
+            return ApplicationTransition::Continue;
+        }
+        let png = match read {
+            ClipboardRead::Image { png } => png,
+            ClipboardRead::Text(text) => {
+                self.state.clipboard_pastes.finish(paste);
+                if !text.is_empty() {
+                    self.state.paste_into_draft(draft, &text);
+                }
+                return ApplicationTransition::Continue;
+            }
+            ClipboardRead::Empty => {
+                self.state.clipboard_pastes.finish(paste);
+                return ApplicationTransition::Continue;
+            }
+            ClipboardRead::Unsupported { format } => {
+                self.state.clipboard_pastes.finish(paste);
+                self.paste_failed(paste, super::clipboard_paste::unsupported(&format));
+                return ApplicationTransition::Continue;
+            }
+            ClipboardRead::Failed { reason } => {
+                self.state.clipboard_pastes.finish(paste);
+                self.paste_failed(paste, super::clipboard_paste::unreadable(&reason));
+                return ApplicationTransition::Continue;
+            }
+        };
+        if let Some(refusal) = super::clipboard_paste::refuse_image(
+            &png,
+            self.state.composers.attachment_count(draft.clone()),
+            self.state.clipboard_pastes.uploads_into(&draft),
+        ) {
+            self.state.clipboard_pastes.finish(paste);
+            self.paste_failed(paste, refusal);
+            return ApplicationTransition::Continue;
+        }
+        self.state.clipboard_pastes.begin_upload(paste);
+        let origin = match &draft {
+            ComposerKey::Session(session) => session.origin.clone(),
+            ComposerKey::Landing => self.state.outlook.clone(),
+        };
+        ApplicationTransition::UploadAttachment { paste, origin, png }
+    }
+
+    /// Writes an uploaded image's label into the draft it was pasted into.
+    fn receive_uploaded_attachment(
+        &mut self,
+        paste: PasteId,
+        descriptor: crate::protocol::AttachmentDescriptor,
+    ) {
+        let Some(draft) = self.state.clipboard_pastes.finish(paste) else {
+            return;
+        };
+        if !self.state.composers.has_draft(&draft) {
+            return;
+        }
+        if let Some(refusal) = super::clipboard_paste::refuse_binding(
+            self.state.composers.attachment_count(draft.clone()),
+        ) {
+            self.paste_failed(paste, refusal);
+            return;
+        }
+        self.state
+            .edit_draft_without_completion(draft, |composers, key| {
+                composers.insert_attachment(key, descriptor);
+            });
+    }
+
+    /// Says why a paste inserted nothing, and keeps the whole of it in the Log.
+    fn paste_failed(&mut self, paste: PasteId, (failure, summary): (PasteFailure, String)) {
+        tracing::warn!(?paste, ?failure, reason = %summary, "paste from the clipboard inserted nothing");
+        self.state
+            .application_notice
+            .receive_paste_failure(paste, failure, summary);
+    }
+
     /// One Origin's loss has outlived its grace, so it becomes the reader's to
     /// see: a banner above the composer for a Remote, and the whole-frame
     /// modal for this machine's own Server.
@@ -7678,6 +7847,7 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::ComposerClipboardPaste => Ok(self.paste_from_clipboard()),
             SemanticCommandId::ApplicationExit => Ok(ApplicationTransition::Exit),
             SemanticCommandId::ConnectOpen => {
                 self.state.connect_overlay.open();

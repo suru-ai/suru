@@ -47,6 +47,9 @@ pub enum SemanticCommandId {
 
     ApplicationExit,
     ComposerPlaceCursor,
+    /// Pastes what the host clipboard holds into the composer: an image as an
+    /// Attachment, text as a bracketed paste of it would, and nothing else.
+    ComposerClipboardPaste,
     PointerClick,
     PointerDrag,
     HyperlinkOpen,
@@ -399,6 +402,7 @@ impl SemanticCommandId {
             Self::TextSelectionWord => "text_selection.word",
             Self::TextSelectionLine => "text_selection.line",
             Self::ComposerPlaceCursor => "composer.cursor.place",
+            Self::ComposerClipboardPaste => "composer.clipboard.paste",
             Self::ApplicationExit => "application.exit",
             Self::ThemeList => "theme.list",
             Self::ModelList => "model.list",
@@ -1563,6 +1567,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         description: "Focus the composer and place its insertion point at a text offset",
         slash: None,
         keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ComposerClipboardPaste,
+        title: "Paste from Clipboard",
+        // Reading the clipboard is the Client's own; an image's upload that
+        // cannot reach its Server fails with a Notice like any other refusal,
+        // and text still pastes.
+        reach: SemanticReach::Client,
+        description: "Paste the clipboard into the composer, attaching an image",
+        slash: None,
+        keybinding: Some(SemanticKeybinding {
+            prefix: None,
+            code: KeyCode::Char('v'),
+            modifiers: KeyModifiers::CONTROL,
+            label: "Ctrl+V",
+        }),
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarLeave,

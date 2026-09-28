@@ -1,5 +1,39 @@
-//! The paired representations of one selected fragment.
+//! The paired representations of one selected fragment, and what a reading
+//! of the host clipboard for a paste finds there.
 use pulldown_cmark::{Event, Parser, Tag, TagEnd, html};
+
+/// One paste from the host clipboard, followed from the read the Application
+/// asks for to the upload an image goes on to, so each answer reaches the
+/// draft it was asked for.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PasteId(u64);
+
+impl PasteId {
+    pub(super) fn after(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl Default for PasteId {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+/// What reading the host clipboard for a paste found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardRead {
+    /// An image, already encoded as PNG on this client.
+    Image { png: Vec<u8> },
+    /// Text, which pastes as a bracketed paste of it would.
+    Text(String),
+    /// Neither an image nor text.
+    Empty,
+    /// An image in a format that cannot be attached, named as readers know it.
+    Unsupported { format: String },
+    /// The clipboard could not be read, and why.
+    Failed { reason: String },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardContent {

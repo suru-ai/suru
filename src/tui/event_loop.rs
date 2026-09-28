@@ -56,6 +56,7 @@ use crate::terminal::{
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
+mod clipboard_reader;
 mod clipboard_thread;
 pub(super) mod frame_backend;
 
@@ -502,6 +503,8 @@ struct TaskChannels {
     workspaces: UnboundedSender<WorkspaceResolutionResult>,
     origin_catalog: UnboundedSender<OriginCatalogEvent>,
     subagent_trees: UnboundedSender<SubagentTreeDelivery>,
+    /// What each paste's clipboard read and image upload answered.
+    pastes: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -510,6 +513,8 @@ struct TaskChannels {
 struct RunLoop {
     client: ManagedClient,
     application: Application,
+    /// Reads the host clipboard for pastes, off this thread.
+    clipboard_reader: clipboard_reader::ClipboardReader,
     tasks: SessionTasks,
     channels: TaskChannels,
     /// One grace period per Origin presently recovering, in the order they
@@ -548,6 +553,7 @@ async fn run_loop(
     let (workspaces, mut workspace_rx) = tokio::sync::mpsc::unbounded_channel();
     let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subagent_trees, mut subagent_tree_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pastes, mut paste_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -556,6 +562,9 @@ async fn run_loop(
     let mut run = RunLoop {
         client,
         application,
+        clipboard_reader: clipboard_reader::ClipboardReader::new(
+            clipboard_reader::native_clipboard_source,
+        ),
         tasks: SessionTasks::default(),
         channels: TaskChannels {
             submissions,
@@ -567,6 +576,7 @@ async fn run_loop(
             workspaces,
             origin_catalog,
             subagent_trees,
+            pastes,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -627,6 +637,7 @@ async fn run_loop(
             workspace = workspace_rx.recv() => run.receive_workspace_result(workspace)?,
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             tree = subagent_tree_rx.recv() => run.receive_subagent_tree(tree)?,
+            paste = paste_rx.recv() => run.receive_paste(paste)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -635,6 +646,7 @@ async fn run_loop(
         };
         if let ControlFlow::Break(exit) = step {
             clipboard.shutdown();
+            run.clipboard_reader.shutdown();
             delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
             return leave_run_loop(terminal, &run.application, exit);
         }
@@ -670,6 +682,7 @@ async fn run_loop(
             };
             if let ControlFlow::Break(exit) = step {
                 clipboard.shutdown();
+                run.clipboard_reader.shutdown();
                 delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
                 return leave_run_loop(terminal, &run.application, exit);
             }
@@ -760,6 +773,13 @@ impl RunLoop {
         let wanted = self.application.subagent_tree_request();
         self.tasks
             .follow_subagent_tree(&self.client, wanted, &self.channels.subagent_trees);
+    }
+
+    fn receive_paste(&mut self, answer: Option<ApplicationEvent>) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("paste task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
     }
 
     fn receive_subagent_tree(
@@ -877,6 +897,20 @@ impl RunLoop {
                     };
                     let _ = results.send(result);
                 });
+            }
+            ApplicationTransition::ReadClipboard(paste) => {
+                let answers = self.channels.pastes.clone();
+                self.clipboard_reader.read(move |read| {
+                    let _ = answers.send(ApplicationEvent::ClipboardRead { paste, read });
+                });
+            }
+            ApplicationTransition::UploadAttachment { paste, origin, png } => {
+                spawn_attachment_upload(
+                    self.client.session_commands_for(origin),
+                    paste,
+                    png,
+                    self.channels.pastes.clone(),
+                );
             }
             ApplicationTransition::CreateSession(request) => {
                 let outlook = self.application.outlook().clone();
@@ -1319,6 +1353,8 @@ impl RunLoop {
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite(_)
             | ApplicationTransition::CopyToClipboard(_)
+            | ApplicationTransition::ReadClipboard(_)
+            | ApplicationTransition::UploadAttachment { .. }
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::RemoveRemote(_)
@@ -2316,6 +2352,40 @@ fn spawn_peer_removal(
             .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
         let _ = results.send(result);
     });
+}
+
+/// Uploads a pasted image and answers the paste with what the Server stored
+/// it as, or why it did not.
+fn spawn_attachment_upload(
+    commands: SessionCommandClient,
+    paste: crate::tui::PasteId,
+    png: Vec<u8>,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands.upload_attachment(png).await {
+            Ok(descriptor) => ApplicationEvent::AttachmentUploaded { paste, descriptor },
+            Err(error) => {
+                tracing::warn!("could not upload a pasted image: {error:#}");
+                ApplicationEvent::AttachmentUploadFailed {
+                    paste,
+                    reason: upload_failure_reason(&error),
+                }
+            }
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+/// The words a failed upload is shown in: the Server's own when it refused,
+/// and a plain account where it could not be asked at all.
+fn upload_failure_reason(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<crate::protocol::SessionError>()
+        .map_or_else(
+            || "Could not upload the image".to_owned(),
+            |refusal| refusal.message.clone(),
+        )
 }
 
 fn spawn_session_creation(
@@ -5168,6 +5238,32 @@ mod reconnect_grace_tests {
             )
             .await
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_upload_tests {
+    use crate::protocol::{SessionError, SessionErrorCode};
+
+    use super::upload_failure_reason;
+
+    #[test]
+    fn a_refused_upload_is_worded_as_the_server_refused_it_and_any_other_failure_plainly() {
+        let refused = anyhow::Error::new(SessionError {
+            code: SessionErrorCode::UnsupportedAttachment,
+            message: "Only PNG, JPEG, GIF, and WebP images can be attached".to_owned(),
+        })
+        .context("Attachment upload");
+        assert_eq!(
+            upload_failure_reason(&refused),
+            "Only PNG, JPEG, GIF, and WebP images can be attached"
+        );
+
+        let unreachable = anyhow::anyhow!("connection refused").context("send Attachment upload");
+        assert_eq!(
+            upload_failure_reason(&unreachable),
+            "Could not upload the image"
         );
     }
 }

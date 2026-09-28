@@ -9,11 +9,13 @@ use std::{
 use ratatui::layout::{Position, Rect};
 
 use super::{
-    text_binding::{SkillIssue, TextBinding, TextBindings},
+    text_binding::{SkillIssue, TextBinding, TextBindings, UnitEdge, attachment_line, image_label},
     text_layout::{CursorTarget, RowDirection, TextLayout},
 };
 
-use crate::protocol::{InitialPrompt, PromptId, SessionReference, SkillDescriptor};
+use crate::protocol::{
+    AttachmentDescriptor, AttachmentId, InitialPrompt, PromptId, SessionReference, SkillDescriptor,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ComposerKey {
@@ -34,6 +36,10 @@ pub(super) enum SelectionMotion {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ComposerMemory {
     composers: HashMap<ComposerKey, ComposerState>,
+    /// What each Attachment this client uploaded was stored as, for the line
+    /// that describes it beneath any draft whose text binds it. An id names
+    /// the same bytes wherever it is bound, so one record serves every draft.
+    attachments: HashMap<AttachmentId, AttachmentDescriptor>,
     frame: RefCell<Option<ComposerFrame>>,
 }
 
@@ -64,6 +70,9 @@ struct ComposerState {
     retry: Option<InitialPrompt>,
     bindings: TextBindings,
     skill_issues: Vec<SkillIssue>,
+    /// The highest `N` any `[Image N]` label in this draft has used, so a
+    /// label deleted is never reused before the draft is submitted or cleared.
+    highest_image_number: u32,
 }
 
 /// What a composer draws over its text: each binding without an issue in its
@@ -110,6 +119,8 @@ impl ComposerMemory {
     pub(super) fn select(&mut self, key: ComposerKey, anchor: usize, focus: usize) {
         let composer = self.composer_mut(key);
         if composer.text.is_char_boundary(anchor) && composer.text.is_char_boundary(focus) {
+            let anchor = composer.bindings.unit_boundary(anchor, UnitEdge::Nearer);
+            let focus = composer.bindings.unit_boundary(focus, UnitEdge::Nearer);
             composer.selection_anchor = (anchor != focus).then_some(anchor);
             composer.cursor = focus;
             composer.prefer_previous_row = false;
@@ -174,8 +185,11 @@ impl ComposerMemory {
     pub(super) fn place_cursor(&mut self, key: ComposerKey, target: CursorTarget) {
         let composer = self.composer_mut(key);
         if composer.text.is_char_boundary(target.offset) {
-            composer.cursor = target.offset;
-            composer.prefer_previous_row = target.prefer_previous_row;
+            let offset = composer
+                .bindings
+                .unit_boundary(target.offset, UnitEdge::Nearer);
+            composer.cursor = offset;
+            composer.prefer_previous_row = target.prefer_previous_row && offset == target.offset;
         }
     }
 
@@ -231,6 +245,54 @@ impl ComposerMemory {
 
     pub(super) fn is_empty(&self, key: ComposerKey) -> bool {
         self.text(key).is_empty()
+    }
+
+    /// Keeps a draft under `key`, empty where nothing was written there yet,
+    /// so work begun for it can tell later whether it is still there.
+    pub(super) fn keep_draft(&mut self, key: ComposerKey) {
+        self.composers.entry(key).or_default();
+    }
+
+    /// Whether a draft is still kept under `key`: one discarded with its
+    /// Session, or carried to the Session its Prompt began, is gone, and
+    /// nothing arriving for it may make it again.
+    pub(super) fn has_draft(&self, key: &ComposerKey) -> bool {
+        self.composers.contains_key(key)
+    }
+
+    /// How many Attachments the draft's text binds.
+    pub(super) fn attachment_count(&self, key: ComposerKey) -> usize {
+        self.composers
+            .get(&key)
+            .map_or(0, |composer| composer.bindings.attachments().count())
+    }
+
+    /// Writes the next `[Image N]` label and a space where the draft's cursor
+    /// stands, bound to the Attachment `descriptor` describes.
+    pub(super) fn insert_attachment(&mut self, key: ComposerKey, descriptor: AttachmentDescriptor) {
+        self.composer_mut(key)
+            .insert_attachment(descriptor.id.clone());
+        self.attachments.insert(descriptor.id.clone(), descriptor);
+    }
+
+    /// One line per Attachment the draft binds, in text order, describing
+    /// what its label stands for.
+    pub(super) fn attachment_lines(&self, key: ComposerKey) -> Vec<String> {
+        let Some(composer) = self.composers.get(&key) else {
+            return Vec::new();
+        };
+        composer
+            .bindings
+            .attachments()
+            .map(|(_, attachment)| {
+                self.attachments
+                    .get(attachment.attachment_id())
+                    .map_or_else(
+                        || attachment.label().to_owned(),
+                        |descriptor| attachment_line(attachment.label(), descriptor),
+                    )
+            })
+            .collect()
     }
 
     pub(super) fn insert(&mut self, key: ComposerKey, text: &str) {
@@ -469,9 +531,12 @@ impl ComposerState {
         self.skill_issues = self.bindings.resolve_skills(&self.text, catalog);
     }
 
+    /// The selected text, taking whole any unit either end reaches into.
     fn selected_range(&self) -> Option<Range<usize>> {
         let anchor = self.selection_anchor?;
-        let range = anchor.min(self.cursor)..anchor.max(self.cursor);
+        let range = self
+            .bindings
+            .covering_units(anchor.min(self.cursor)..anchor.max(self.cursor));
         (!range.is_empty() && self.text.get(range.clone()).is_some()).then_some(range)
     }
 
@@ -510,6 +575,21 @@ impl ComposerState {
         true
     }
 
+    fn insert_attachment(&mut self, attachment_id: AttachmentId) {
+        let number = self
+            .highest_image_number
+            .max(self.bindings.highest_image_number())
+            + 1;
+        self.highest_image_number = number;
+        let label = image_label(number);
+        let range = self.selected_range().unwrap_or(self.cursor..self.cursor);
+        let start = range.start;
+        if self.replace(range, &format!("{label} ")) {
+            let span = start..start + label.len();
+            self.bindings.bind_attachment(span, attachment_id, label);
+        }
+    }
+
     fn delete_backward(&mut self) {
         if let Some(range) = self.selected_range() {
             self.replace(range, "");
@@ -517,6 +597,10 @@ impl ComposerState {
         }
         if self.cursor == 0 {
             self.selection_anchor = None;
+            return;
+        }
+        if let Some(unit) = self.bindings.unit_before(self.cursor) {
+            self.replace(unit, "");
             return;
         }
         let previous = self.text[..self.cursor]
@@ -535,6 +619,10 @@ impl ComposerState {
             self.selection_anchor = None;
             return;
         }
+        if let Some(unit) = self.bindings.unit_after(self.cursor) {
+            self.replace(unit, "");
+            return;
+        }
         let next = self.text[self.cursor..]
             .char_indices()
             .nth(1)
@@ -546,6 +634,10 @@ impl ComposerState {
         if self.cursor == 0 {
             return;
         }
+        if let Some(unit) = self.bindings.unit_before(self.cursor) {
+            self.cursor = unit.start;
+            return;
+        }
         self.cursor = self.text[..self.cursor]
             .char_indices()
             .next_back()
@@ -554,6 +646,10 @@ impl ComposerState {
 
     fn move_right(&mut self) {
         if self.cursor == self.text.len() {
+            return;
+        }
+        if let Some(unit) = self.bindings.unit_after(self.cursor) {
+            self.cursor = unit.end;
             return;
         }
         self.cursor = self.text[self.cursor..]
@@ -578,8 +674,12 @@ impl ComposerState {
         let Some((target, column)) = self.vertical_target(width, direction) else {
             return false;
         };
-        self.cursor = target.offset;
-        self.prefer_previous_row = target.prefer_previous_row;
+        let edge = match direction {
+            RowDirection::Previous => UnitEdge::Start,
+            RowDirection::Next => UnitEdge::End,
+        };
+        self.cursor = self.bindings.unit_boundary(target.offset, edge);
+        self.prefer_previous_row = target.prefer_previous_row && self.cursor == target.offset;
         self.preferred_display_column = Some(column);
         true
     }
@@ -641,11 +741,13 @@ impl ComposerState {
         self.retry = None;
         self.bindings.clear();
         self.skill_issues.clear();
+        self.highest_image_number = 0;
     }
 
     fn begin_submission(&mut self) -> InitialPrompt {
         let text = std::mem::take(&mut self.text);
         let bindings = std::mem::take(&mut self.bindings);
+        self.highest_image_number = 0;
         let id = self
             .retry
             .as_ref()
@@ -666,6 +768,7 @@ impl ComposerState {
         self.text.clone_from(&prompt.text);
         self.selection_anchor = None;
         self.bindings = TextBindings::from_prompt(prompt);
+        self.highest_image_number = self.bindings.highest_image_number();
         self.skill_issues.clear();
         self.cursor = self.text.len();
         self.history_position = None;
@@ -694,6 +797,7 @@ impl ComposerState {
             self.text.clear();
             self.selection_anchor = None;
             self.bindings.clear();
+            self.highest_image_number = 0;
             self.skill_issues.clear();
             self.cursor = 0;
             self.history_position = None;

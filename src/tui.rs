@@ -4,6 +4,7 @@ mod approval;
 mod approval_posture_picker;
 mod aside;
 mod clipboard;
+mod clipboard_paste;
 mod commands;
 mod completion;
 mod composer;
@@ -43,7 +44,7 @@ mod worktree_picker;
 pub use crate::terminal::{
     CellSize, GraphicsProtocol, TerminalColor, TerminalColorProbe, TerminalFacts,
 };
-pub use clipboard::ClipboardContent;
+pub use clipboard::{ClipboardContent, ClipboardRead, PasteId};
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;
 pub use event_loop::run;

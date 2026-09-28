@@ -3721,11 +3721,13 @@ fn render_landing(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
+    let attachments = state.composers.attachment_lines(key.clone());
     let composer_height = composer_block_height(
         area.height,
         72_u16.min(content.width),
         composer_text,
         composer_cursor,
+        attachments.len(),
     );
     let error = state
         .submission_error
@@ -3784,6 +3786,7 @@ fn render_landing(
             text: composer_text,
             cursor: composer_cursor,
             bindings: &bindings,
+            attachments: &attachments,
         },
         state.composer_border_style(theme),
         theme,
@@ -3845,8 +3848,14 @@ fn render_opening_session(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
-    let desired_composer_height =
-        composer_block_height(area.height, content_width, composer_text, composer_cursor);
+    let attachments = state.composers.attachment_lines(key.clone());
+    let desired_composer_height = composer_block_height(
+        area.height,
+        content_width,
+        composer_text,
+        composer_cursor,
+        attachments.len(),
+    );
     // What the Session view keeps below its Transcript and above its composer:
     // the footer's row and the Transcript's bottom margin, plus the one row of
     // Transcript the layout never squeezes away. The shell holds them all
@@ -3896,6 +3905,7 @@ fn render_opening_session(
             text: composer_text,
             cursor: composer_cursor,
             bindings: &bindings,
+            attachments: &attachments,
         },
         state.composer_border_style(theme),
         theme,
@@ -4154,10 +4164,17 @@ fn render_session_surface(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
+    let attachments = state.composers.attachment_lines(key.clone());
     let desired_composer_height = if subagent_view {
         1
     } else {
-        composer_block_height(area.height, content_width, composer_text, composer_cursor)
+        composer_block_height(
+            area.height,
+            content_width,
+            composer_text,
+            composer_cursor,
+            attachments.len(),
+        )
     };
     let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext {
         session_id,
@@ -4501,6 +4518,7 @@ fn render_session_surface(
                 text: composer_text,
                 cursor: composer_cursor,
                 bindings: &bindings,
+                attachments: &attachments,
             },
             state.composer_border_style(theme),
             theme,
@@ -4915,6 +4933,8 @@ struct ComposerContent<'a> {
     text: &'a str,
     cursor: usize,
     bindings: &'a ComposerBindings,
+    /// One line per Attachment the draft binds, drawn beneath its text.
+    attachments: &'a [String],
 }
 
 fn render_composer(
@@ -4930,6 +4950,7 @@ fn render_composer(
         text,
         cursor,
         bindings,
+        attachments,
     } = content;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4937,22 +4958,61 @@ fn render_composer(
         .border_style(style);
     let content_area = block.inner(area);
     let content_width = composer_content_width(area.width);
-    let content_height = area.height.saturating_sub(2).max(1);
+    // The Attachment lines stand still beneath the text as it scrolls, and
+    // give way before the text's last row does.
+    let attachment_rows = u16::try_from(attachments.len())
+        .unwrap_or(u16::MAX)
+        .min(content_area.height.saturating_sub(1));
+    let text_area = Rect {
+        height: content_area.height.saturating_sub(attachment_rows),
+        ..content_area
+    };
+    let attachment_area = Rect {
+        y: text_area.bottom(),
+        height: attachment_rows,
+        ..content_area
+    };
+    let content_height = area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(attachment_rows)
+        .max(1);
     let layout = TextLayout::new(text, content_width);
     let (cursor_row, cursor_column) =
         layout.cursor_position_with_affinity(cursor, memory.prefers_previous_row(key.clone()));
     let scroll = cursor_row.saturating_sub(content_height.saturating_sub(1));
-    memory.record_frame(key, content_area, scroll);
-    let paragraph = if text.is_empty() {
-        Paragraph::new(Span::styled(
-            "Type a prompt, run a /command, use a $skill",
-            theme.form_field.placeholder,
-        ))
+    memory.record_frame(key, text_area, scroll);
+    let (paragraph, text_style) = if text.is_empty() {
+        (
+            Paragraph::new(Span::styled(
+                "Type a prompt, run a /command, use a $skill",
+                theme.form_field.placeholder,
+            )),
+            Style::default(),
+        )
     } else {
-        Paragraph::new(wrapped_composer_lines(&layout, bindings, theme))
-            .style(theme.form_field.text)
+        (
+            Paragraph::new(wrapped_composer_lines(&layout, bindings, theme)),
+            theme.form_field.text,
+        )
     };
-    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
+    frame.render_widget(
+        Paragraph::new(Text::default())
+            .style(text_style)
+            .block(block),
+        area,
+    );
+    frame.render_widget(paragraph.style(text_style).scroll((scroll, 0)), text_area);
+    frame.render_widget(
+        Paragraph::new(
+            attachments
+                .iter()
+                .map(|line| Line::from(line.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .style(theme.text.subdued),
+        attachment_area,
+    );
     Position::new(
         area.x
             .saturating_add(1)
@@ -5109,12 +5169,23 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
     );
 }
 
-fn composer_block_height(terminal_height: u16, width: u16, text: &str, cursor: usize) -> u16 {
+/// The rows a composer block asks for: its text's rows up to a third of the
+/// terminal, one row per Attachment line beneath them, and its two borders.
+fn composer_block_height(
+    terminal_height: u16,
+    width: u16,
+    text: &str,
+    cursor: usize,
+    attachment_lines: usize,
+) -> u16 {
     let layout = TextLayout::new(text, composer_content_width(width));
     let cursor_rows = layout.cursor_position(cursor).0.saturating_add(1);
     let desired = layout.row_count().max(cursor_rows).max(1);
     let cap = (terminal_height / 3).max(1);
-    desired.min(cap).saturating_add(2)
+    desired
+        .min(cap)
+        .saturating_add(u16::try_from(attachment_lines).unwrap_or(u16::MAX))
+        .saturating_add(2)
 }
 
 /// The columns a Prompt's text is laid out over inside a composer block of

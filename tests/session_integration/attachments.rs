@@ -7,6 +7,7 @@ use crate::{
     provider_support::ControlledProvider,
     support::{
         controlled_selection, create_session, read_session_at_least_revision, read_session_until,
+        receive_managed_client_initial_state,
     },
 };
 use eventsource_stream::Eventsource;
@@ -1081,4 +1082,127 @@ async fn admitting_a_prompt_restarts_the_grace_period_of_the_attachments_it_bind
     }
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// The composer's own paste, answered by a real upload through the managed
+/// client, builds a Prompt the Server admits exactly as it was bound.
+#[tokio::test]
+async fn a_prompt_the_composer_builds_around_a_pasted_image_is_admitted_as_bound() {
+    use suru::{
+        managed_client::{ManagedClient, ManagedClientConfig},
+        protocol::Outlook,
+        tui::{
+            Application, ApplicationEvent, ApplicationTransition, ClipboardRead, CommandId,
+            SemanticCommandId, TerminalFacts,
+        },
+    };
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let _server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-composer-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "attachment-composer-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+
+    let mut application = Application::new(workspace.path(), TerminalFacts::default());
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Compare ".to_owned(),
+        )))
+        .expect("type the Prompt");
+    let ApplicationTransition::ReadClipboard(paste) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ComposerClipboardPaste,
+        )))
+        .expect("paste from the clipboard")
+    else {
+        panic!("a paste reads the clipboard");
+    };
+    let clipboard_png = png(1280, 720);
+    let ApplicationTransition::UploadAttachment {
+        paste,
+        origin,
+        png: pasted,
+    } = application
+        .handle_event(ApplicationEvent::ClipboardRead {
+            paste,
+            read: ClipboardRead::Image {
+                png: clipboard_png.clone(),
+            },
+        })
+        .expect("answer the clipboard read")
+    else {
+        panic!("a clipboard image is uploaded");
+    };
+    assert_eq!(origin, Outlook::Local);
+    let stored = client
+        .outlook(origin.clone())
+        .upload_attachment(pasted)
+        .await
+        .expect("upload the pasted image");
+    assert_eq!(stored.id, content_hash(&clipboard_png));
+    assert_eq!(
+        stored.kind,
+        AttachmentKind::Image {
+            width: 1280,
+            height: 720
+        }
+    );
+    application
+        .handle_event(ApplicationEvent::AttachmentUploaded {
+            paste,
+            descriptor: stored.clone(),
+        })
+        .expect("answer the upload");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the Prompt")
+    else {
+        panic!("the Landing's Prompt begins a Session");
+    };
+    assert_eq!(request.prompt.text, "Compare [Image 1] ");
+    assert_eq!(
+        request.prompt.attachments,
+        vec![bound(&stored, &request.prompt.text, "[Image 1]")]
+    );
+
+    let created = client
+        .outlook(origin)
+        .create_session(request.clone())
+        .await
+        .expect("the Server admits the composer's Prompt");
+    assert_eq!(created.prompts[0].text, request.prompt.text);
+    assert_eq!(created.prompts[0].attachments, request.prompt.attachments);
+
+    assert_eq!(
+        client
+            .fetch_attachment(&stored.id)
+            .await
+            .expect("fetch the stored bytes"),
+        ("image/png".to_owned(), clipboard_png)
+    );
+
+    // A refusal reaches the client as the Server's own words.
+    let mut oversized = png(1, 1);
+    oversized.resize(5 * MEBIBYTE + 1024, 0);
+    let error = client
+        .upload_attachment(oversized)
+        .await
+        .expect_err("an image over the cap is refused");
+    let refusal = error
+        .downcast_ref::<SessionError>()
+        .expect("the refusal is the Server's");
+    assert_eq!(refusal.code, SessionErrorCode::AttachmentTooLarge);
+    assert_eq!(
+        refusal.message,
+        "An image may be at most 5 MiB, and this one is 5.1 MiB"
+    );
 }

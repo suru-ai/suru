@@ -1,4 +1,5 @@
-//! The Notice the Application carries when startup found configuration problems.
+//! The Notice the Application carries when startup found configuration
+//! problems, or when something the reader asked of the Client itself failed.
 //!
 //! The server hands every client the startup diagnostics on the
 //! effective-settings snapshot, each one already naming its file, its key path,
@@ -6,7 +7,7 @@
 //! only what a reader needs to know something went wrong and where to look —
 //! so it collapses the whole set into one line: the loudest failures first,
 //! whole files ahead of single keys, the keys merely counted, and a pointer to
-//! the Log for the rest.
+//! the Log for the rest. A failed paste says why in a Notice of its own.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -19,7 +20,7 @@ use crate::{
     theme::{Theme, ThemeDiagnostic},
 };
 
-use super::slots::truncate_to_width;
+use super::{clipboard::PasteId, slots::truncate_to_width};
 
 /// Leads the Notice so severity reads before the words do.
 const ERROR_GLYPH: &str = "×";
@@ -65,25 +66,56 @@ impl ApplicationNotice {
     /// Theme. The pin remains valid configuration; only this Client's
     /// resolution falls back for the run.
     pub(super) fn receive_theme_fallback(&mut self, name: &str) {
-        let identity = NoticeIdentity::ThemeFallback(name.to_owned());
+        self.raise(
+            NoticeIdentity::ThemeFallback(name.to_owned()),
+            SettingsDiagnosticSeverity::Warning,
+            format!("Theme {name:?} was not found; using System"),
+        );
+    }
+
+    /// Reports why a paste inserted nothing. Each paste is its own condition,
+    /// so dismissing one failure never silences the next.
+    pub(super) fn receive_paste_failure(
+        &mut self,
+        paste: PasteId,
+        failure: PasteFailure,
+        summary: String,
+    ) {
+        self.raise(
+            NoticeIdentity::PasteFailed { paste, failure },
+            SettingsDiagnosticSeverity::Error,
+            summary,
+        );
+    }
+
+    /// Raises a runtime condition's Notice, joining any Notice already
+    /// showing, unless the reader already dismissed that very condition.
+    fn raise(
+        &mut self,
+        identity: NoticeIdentity,
+        severity: SettingsDiagnosticSeverity,
+        summary: String,
+    ) {
         if self.dismissed.contains(&identity) {
             return;
         }
-        let fallback = format!("Theme {name:?} was not found; using System");
         match self.showing.as_mut() {
             Some(notice) => {
                 if notice.identities.contains(&identity) {
                     return;
                 }
                 notice.summary.push_str("; ");
-                notice.summary.push_str(&fallback);
+                notice.summary.push_str(&summary);
                 notice.identities.push(identity);
+                if severity == SettingsDiagnosticSeverity::Error {
+                    notice.severity = severity;
+                }
                 notice.shown.set(false);
             }
             None => {
                 self.showing = Some(Notice {
-                    severity: SettingsDiagnosticSeverity::Warning,
-                    summary: fallback,
+                    severity,
+                    summary,
                     identities: vec![identity],
                     shown: Cell::new(false),
                 });
@@ -137,6 +169,25 @@ pub(super) enum NoticeIdentity {
     StartupDiagnostics,
     ThemeFile(ThemeDiagnostic),
     ThemeFallback(String),
+    PasteFailed {
+        paste: PasteId,
+        failure: PasteFailure,
+    },
+}
+
+/// Why a paste from the clipboard inserted nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PasteFailure {
+    /// The clipboard could not be read.
+    Unreadable,
+    /// The image is larger than one Attachment may be.
+    TooLarge,
+    /// The image is in a format that cannot be attached.
+    UnsupportedFormat,
+    /// The draft already binds as many Attachments as a Prompt may carry.
+    TooMany,
+    /// The Server refused the upload, or could not be reached for it.
+    Refused,
 }
 
 #[derive(Clone, Copy)]

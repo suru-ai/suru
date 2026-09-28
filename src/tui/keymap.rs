@@ -39,6 +39,12 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
                 _ => None,
             }
         }
+        // Windows Terminal before 1.25 answers Ctrl+V over an image-only
+        // clipboard with an empty bracketed paste, so an empty paste reads the
+        // clipboard itself.
+        InputEvent::Paste(text) if text.is_empty() => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ComposerClipboardPaste,
+        )),
         InputEvent::Paste(text) => Some(CommandId::PasteText(text)),
         _ => None,
     }
