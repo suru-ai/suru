@@ -1556,10 +1556,12 @@ fn attachment_bindings_round_trip_beside_the_prompt_text_and_stay_off_the_wire_w
 
 #[test]
 fn a_preparation_prompt_carries_its_attachment_bindings_and_keeps_them_off_the_wire_when_absent() {
-    assert_eq!(
-        PROTOCOL_VERSION, 68,
-        "a preparation Prompt carrying Attachment bindings changes the wire"
-    );
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 68,
+            "a preparation Prompt carrying Attachment bindings changes the wire"
+        );
+    }
     let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     let request = PrepareCheckoutRequest {
         id: PreparationId(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360fa")),
@@ -2109,5 +2111,32 @@ fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model
             .materialize_agent_selection(Some(&unavailable))
             .is_err(),
         "unavailable same-Model choices remain an explicit error"
+    );
+}
+
+#[test]
+fn a_session_error_names_its_code_in_a_header_as_its_body_does() {
+    assert_eq!(
+        PROTOCOL_VERSION, 69,
+        "the Attachment HEAD route, and a Session error's code in a header, change the wire"
+    );
+    assert_eq!(
+        suru::protocol::SESSION_ERROR_CODE_HEADER,
+        "x-suru-error-code"
+    );
+    for code in [
+        SessionErrorCode::AttachmentNotFound,
+        SessionErrorCode::RemoteNotFound,
+        SessionErrorCode::InvalidCommand,
+    ] {
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            serde_json::Value::String(code.wire_name()),
+            "the header names {code:?} as its body does"
+        );
+    }
+    assert_eq!(
+        SessionErrorCode::AttachmentNotFound.wire_name(),
+        "attachment_not_found"
     );
 }

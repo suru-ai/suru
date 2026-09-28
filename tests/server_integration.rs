@@ -3330,6 +3330,72 @@ async fn removing_a_remote_that_never_answers_forgets_it_here_all_the_same() {
     pair.shutdown().await;
 }
 
+/// Whether a Remote stores an Attachment is asked through the local Server's
+/// proxy, and a body-less Not Found keeps the reason the Remote gave for it.
+/// A Remote this Server no longer knows is a reason of the proxy's own, never
+/// taken for a missing Attachment.
+#[tokio::test]
+async fn an_attachment_check_through_the_proxy_keeps_the_reason_for_a_not_found() {
+    let pair = paired_servers("attachment-head-proxy").await;
+    let stored = pair
+        .serving_client
+        .upload_attachment(support::attachments::png(16, 16))
+        .await
+        .expect("upload an Attachment to the Serving Server");
+    let unknown = suru::protocol::AttachmentId::new("0".repeat(64));
+
+    let remote = pair
+        .connecting_client
+        .outlook(suru::protocol::Outlook::Remote("workstation".to_owned()));
+    assert!(
+        remote
+            .attachment_exists(&stored.id)
+            .await
+            .expect("ask the Remote through the proxy")
+    );
+    assert!(
+        !remote
+            .attachment_exists(&unknown)
+            .await
+            .expect("ask the Remote after an unknown Attachment")
+    );
+
+    let descriptor = pair.connecting.descriptor();
+    let head = |remote: &str, id: &suru::protocol::AttachmentId| {
+        reqwest::Client::new()
+            .head(format!(
+                "{}/v1/remotes/{remote}/v1/attachments/{id}",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .send()
+    };
+    let missing = head("workstation", &unknown).await.expect("send HEAD");
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.headers()[suru::protocol::SESSION_ERROR_CODE_HEADER],
+        "attachment_not_found",
+        "the Remote's reason comes back through the proxy"
+    );
+    let unpaired = head("no-such-machine", &stored.id)
+        .await
+        .expect("send HEAD");
+    assert_eq!(unpaired.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        unpaired.headers()[suru::protocol::SESSION_ERROR_CODE_HEADER],
+        "remote_not_found"
+    );
+    pair.connecting_client
+        .outlook(suru::protocol::Outlook::Remote(
+            "no-such-machine".to_owned(),
+        ))
+        .attachment_exists(&stored.id)
+        .await
+        .expect_err("a Remote this Server does not know says nothing of the Attachment");
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn removing_an_unknown_remote_is_a_not_found_error() {
     let pair = paired_servers("remote-removal-unknown").await;

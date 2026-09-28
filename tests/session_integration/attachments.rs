@@ -24,9 +24,10 @@ use suru::{
     protocol::{
         AdmitPromptRequest, AgentId, AgentIdentity, AttachmentBinding, AttachmentDescriptor,
         AttachmentId, AttachmentKind, CreateSessionRequest, InitialPrompt, Message, MessageRole,
-        Prompt, PromptDelivery, PromptId, PromptStatus, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
-        SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionRevision, SessionSnapshot, SessionUpdate, TextSpan,
+        Prompt, PromptDelivery, PromptId, PromptStatus, RuntimeDescriptor,
+        SESSION_ERROR_CODE_HEADER, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange,
+        SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionUpdate,
+        TextSpan,
     },
     provider::{ProviderAttachment, ProviderEvent},
     server::{self, ManualClock, ServerClock, ServerConfig, ServerTimings},
@@ -401,6 +402,10 @@ async fn a_head_of_an_attachment_answers_whether_it_is_stored_without_its_bytes(
         bytes.len().to_string().as_str()
     );
     assert!(
+        stored.headers().get(SESSION_ERROR_CODE_HEADER).is_none(),
+        "a stored Attachment is no error"
+    );
+    assert!(
         stored
             .bytes()
             .await
@@ -411,12 +416,22 @@ async fn a_head_of_an_attachment_answers_whether_it_is_stored_without_its_bytes(
     let unknown = content_hash(b"never uploaded");
     let missing = head(&descriptor, &unknown).await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.headers()[SESSION_ERROR_CODE_HEADER],
+        "attachment_not_found",
+        "a body-less Not Found still says why"
+    );
     assert!(
         missing
             .bytes()
             .await
             .expect("read the HEAD answer")
             .is_empty()
+    );
+    // A fetch's refusal names its code in the header as in its body.
+    assert_eq!(
+        fetch(&descriptor, &unknown).await.headers()[SESSION_ERROR_CODE_HEADER],
+        "attachment_not_found"
     );
     let unauthenticated = reqwest::Client::new()
         .head(format!(

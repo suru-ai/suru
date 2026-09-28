@@ -242,14 +242,7 @@ impl PairingFailure {
     }
 
     fn response(self) -> Response {
-        (
-            self.status(),
-            Json(SessionError {
-                code: self.code,
-                message: self.message,
-            }),
-        )
-            .into_response()
+        crate::server::session_error_response(self.status(), self.code, self.message)
     }
 }
 

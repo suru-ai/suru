@@ -19,14 +19,15 @@ use crate::{
         CheckoutStateChanged, CreateSessionRequest, Health, InterruptOutcome, InvitePreview,
         IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
         PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
-        RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown,
-        SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
-        SessionError, SessionId, SessionListItem, SessionMonitoringChanged,
-        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
-        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
-        SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
-        UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceIconChanged, WorkspaceId,
+        RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor, SESSION_ERROR_CODE_HEADER,
+        ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
+        SessionDeleted, SessionError, SessionErrorCode, SessionId, SessionListItem,
+        SessionMonitoringChanged, SessionSettlementChanged, SessionSnapshot,
+        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
+        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation,
+        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+        WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -1106,9 +1107,10 @@ impl SessionCommandClient {
     }
 
     /// Whether the Server stores an Attachment under `attachment_id`, asked
-    /// with a `HEAD` of its fetch route so none of its bytes are sent. A
-    /// `HEAD` answer has no body to name why it was refused, so every Not
-    /// Found reads as the Attachment not being stored there.
+    /// with a `HEAD` of its fetch route so none of its bytes are sent. Only a
+    /// Not Found whose code header says `attachment_not_found` means it is
+    /// not stored there: any other refusal, a Remote this Server no longer
+    /// knows among them, is an error, so the Attachment is not taken for gone.
     pub(crate) async fn attachment_exists(&self, attachment_id: &AttachmentId) -> Result<bool> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
@@ -1126,10 +1128,19 @@ impl SessionCommandClient {
         if status.is_success() {
             return Ok(true);
         }
-        if status == reqwest::StatusCode::NOT_FOUND {
+        let code = response
+            .headers()
+            .get(SESSION_ERROR_CODE_HEADER)
+            .and_then(|code| code.to_str().ok())
+            .unwrap_or("none");
+        if status == reqwest::StatusCode::NOT_FOUND
+            && code == SessionErrorCode::AttachmentNotFound.wire_name()
+        {
             return Ok(false);
         }
-        Err(anyhow!("Attachment check failed with HTTP {status}"))
+        Err(anyhow!(
+            "Attachment check failed with HTTP {status} (error code {code})"
+        ))
     }
 
     pub(crate) async fn update_agent_selection(
@@ -1759,11 +1770,17 @@ mod tests {
         }
 
         async fn client() -> (SessionCommandClient, tokio::task::JoinHandle<()>) {
+            fixture_client(Router::new().route("/v1/attachments/{id}", get(answer))).await
+        }
+
+        /// A client of a fixture Server answering with `app`.
+        pub(super) async fn fixture_client(
+            app: Router,
+        ) -> (SessionCommandClient, tokio::task::JoinHandle<()>) {
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .expect("bind the Attachment fixture");
             let address = listener.local_addr().expect("read the fixture address");
-            let app = Router::new().route("/v1/attachments/{id}", get(answer));
             let server = tokio::spawn(async move {
                 axum::serve(listener, app)
                     .await
@@ -1810,6 +1827,64 @@ mod tests {
                         .to_string()
                         .contains("larger than an Attachment may be"),
                     "{id}: {refused:#}"
+                );
+            }
+            server.abort();
+        }
+    }
+
+    mod attachment_check {
+        use axum::{
+            Router,
+            extract::Path,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::head,
+        };
+
+        use super::attachment_fetch::fixture_client;
+        use crate::protocol::{AttachmentId, SESSION_ERROR_CODE_HEADER};
+
+        /// Answers a `HEAD` of `/v1/attachments/{id}` as the id names: stored,
+        /// not stored, a Remote the proxy no longer knows, a Not Found that
+        /// does not say why, and a failure.
+        async fn answer(Path(id): Path<String>) -> Response {
+            match id.as_str() {
+                "stored" => StatusCode::OK.into_response(),
+                "swept" => (
+                    StatusCode::NOT_FOUND,
+                    [(SESSION_ERROR_CODE_HEADER, "attachment_not_found")],
+                )
+                    .into_response(),
+                "unpaired" => (
+                    StatusCode::NOT_FOUND,
+                    [(SESSION_ERROR_CODE_HEADER, "remote_not_found")],
+                )
+                    .into_response(),
+                "silent" => StatusCode::NOT_FOUND.into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+
+        #[tokio::test]
+        async fn only_a_not_found_naming_the_attachment_reads_as_not_stored() {
+            let (client, server) =
+                fixture_client(Router::new().route("/v1/attachments/{id}", head(answer))).await;
+            let exists = |id: &str| {
+                let client = client.clone();
+                let id = AttachmentId::new(id);
+                async move { client.attachment_exists(&id).await }
+            };
+
+            assert!(exists("stored").await.expect("a stored Attachment answers"));
+            assert!(!exists("swept").await.expect("a missing Attachment answers"));
+            for id in ["unpaired", "silent", "broken"] {
+                let error = exists(id)
+                    .await
+                    .expect_err("a refusal not about the Attachment is no answer");
+                assert!(
+                    error.to_string().contains("Attachment check failed"),
+                    "{id}: {error:#}"
                 );
             }
             server.abort();

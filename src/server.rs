@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path as AxumPath, Query, Request, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post, put},
 };
@@ -35,14 +35,15 @@ use crate::protocol::{
     InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId,
     MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
     RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_SNAPSHOT_EVENT,
-    SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT,
-    SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown,
-    SessionCatalogRevision, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionUpdate, SetSessionIconRequest, SetWorkspaceIconRequest,
-    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-    SkillCatalogRequest, SkillPromptDelivery, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
-    UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
+    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest,
+    SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, SubagentTreeRevision,
+    SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
+    ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -3516,13 +3517,19 @@ fn prompt_conflict_response() -> Response {
     )
 }
 
-fn session_error_response(
+/// A Session error as every route answers one: its code and message in the
+/// body, and its code again in [`SESSION_ERROR_CODE_HEADER`], which a body-less
+/// answer keeps.
+pub(crate) fn session_error_response(
     status: StatusCode,
     code: SessionErrorCode,
     message: impl Into<String>,
 ) -> Response {
+    let code_header = HeaderValue::from_str(&code.wire_name())
+        .expect("a Session error code's wire name is a valid header value");
     (
         status,
+        [(SESSION_ERROR_CODE_HEADER, code_header)],
         Json(SessionError {
             code,
             message: message.into(),

@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 68;
+pub const PROTOCOL_VERSION: u32 = 69;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -22,6 +22,10 @@ pub use crate::questionnaire::{
 };
 pub use attachment::*;
 pub use source_control::*;
+/// The response header naming a [`SessionError`]'s code beside its body, so
+/// an answer that carries no body, such as one to a `HEAD`, still says why it
+/// was refused.
+pub const SESSION_ERROR_CODE_HEADER: &str = "x-suru-error-code";
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
@@ -3711,6 +3715,17 @@ pub enum SessionErrorCode {
 pub struct SessionError {
     pub code: SessionErrorCode,
     pub message: String,
+}
+
+impl SessionErrorCode {
+    /// The name this code travels under, in a Session error's body and in its
+    /// [`SESSION_ERROR_CODE_HEADER`].
+    pub fn wire_name(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(name)) => name,
+            _ => unreachable!("a unit variant serializes as its name"),
+        }
+    }
 }
 
 impl std::fmt::Display for SessionError {
