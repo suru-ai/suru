@@ -12,13 +12,14 @@ use suru::{
     logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent, stop_server},
     protocol::{
-        AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, CodexApprovalPolicy,
-        CodexSandboxMode, CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest,
-        LifecycleState, ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION,
-        PromptDelivery, PromptId, ProviderId, RedeemInviteRequest, RemoteRemoval, RemoteStatus,
+        AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, AttachmentBinding,
+        AttachmentDescriptor, AttachmentId, AttachmentKind, CodexApprovalPolicy, CodexSandboxMode,
+        CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest, LifecycleState,
+        ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION, PromptDelivery,
+        PromptId, ProviderId, RedeemInviteRequest, RemoteRemoval, RemoteStatus,
         ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
-        SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason,
+        SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, TextSpan,
         UpdateApprovalPostureRequest,
     },
     provider::ProviderEvent,
@@ -1359,6 +1360,159 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
 
     drop(events);
     pair.wire.wait_for_connections(0).await;
+    pair.shutdown().await;
+}
+
+/// A PNG header padded out to `length` bytes: an image as far as the Server
+/// ever reads one.
+fn padded_png(length: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    bytes.extend(1280_u32.to_be_bytes());
+    bytes.extend(720_u32.to_be_bytes());
+    bytes.resize(length, 0);
+    bytes
+}
+
+#[tokio::test]
+async fn remote_proxy_uploads_fetches_and_binds_attachments_on_the_serving_server() {
+    let pair = paired_servers_with_runtime(
+        "remote-attachments",
+        false,
+        Some(std::sync::Arc::new(
+            failing_provider_support::FailingProviderRuntime,
+        )),
+    )
+    .await;
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let descriptor = pair.connecting.descriptor();
+    let serving = pair.serving.descriptor();
+    let http = reqwest::Client::new();
+    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+
+    // Far past the ordinary command cap, which only the upload route exceeds.
+    let image = padded_png(3 * 1024 * 1024);
+    let uploaded = http
+        .post(format!("{remote_api}/v1/attachments"))
+        .bearer_auth(&descriptor.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(image.clone())
+        .send()
+        .await
+        .expect("upload through the local proxy");
+    assert_eq!(uploaded.status(), reqwest::StatusCode::CREATED);
+    let attachment = uploaded
+        .json::<AttachmentDescriptor>()
+        .await
+        .expect("decode the Remote's Attachment descriptor");
+    assert_eq!(
+        attachment,
+        AttachmentDescriptor {
+            id: AttachmentId::new(blake3::hash(&image).to_hex().to_string()),
+            kind: AttachmentKind::Image {
+                width: 1280,
+                height: 720
+            },
+            mime_type: "image/png".to_owned(),
+            byte_length: image.len() as u64,
+        }
+    );
+    let fetch = |base_url: String, token: String| {
+        let http = http.clone();
+        let id = attachment.id.clone();
+        async move {
+            http.get(format!("{base_url}/v1/attachments/{id}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send Attachment fetch")
+        }
+    };
+    assert_eq!(
+        fetch(serving.base_url.clone(), serving.token.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "the Serving Server stores the upload"
+    );
+    assert_eq!(
+        fetch(descriptor.base_url.clone(), descriptor.token.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the connecting Server stores nothing of it"
+    );
+    let fetched = fetch(remote_api.clone(), descriptor.token.clone()).await;
+    assert_eq!(fetched.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        fetched.headers()[reqwest::header::CONTENT_TYPE],
+        "image/png",
+        "the proxy carries the sniffed type"
+    );
+    assert_eq!(fetched.bytes().await.expect("read fetched bytes"), image);
+
+    let binding = AttachmentBinding {
+        attachment_id: attachment.id.clone(),
+        label: "[Image 1]".to_owned(),
+        span: TextSpan { start: 0, end: 9 },
+    };
+    let created = http
+        .post(format!("{remote_api}/v1/sessions"))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "[Image 1]".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: vec![binding.clone()],
+            },
+        })
+        .send()
+        .await
+        .expect("create a Remote Session through the local proxy")
+        .error_for_status()
+        .expect("Remote Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode Remote Session");
+    assert_eq!(created.prompts[0].attachments, vec![binding]);
+
+    // Every other route keeps its own cap through the proxy.
+    let oversized = http
+        .post(format!(
+            "{remote_api}/v1/sessions/{}/prompts",
+            created.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "x".repeat(96 * 1024),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+            delivery: PromptDelivery::Queue,
+        })
+        .send()
+        .await
+        .expect("send an oversized Prompt through the local proxy");
+    assert_eq!(oversized.status(), reqwest::StatusCode::BAD_REQUEST);
+    let refusal = oversized
+        .json::<SessionError>()
+        .await
+        .expect("decode the Remote's refusal");
+    assert_eq!(
+        refusal,
+        SessionError {
+            code: SessionErrorCode::InvalidCommand,
+            message: "Prompt admission command body is too large".to_owned(),
+        }
+    );
+
     pair.shutdown().await;
 }
 
