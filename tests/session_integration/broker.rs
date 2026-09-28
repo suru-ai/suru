@@ -28,9 +28,9 @@ use suru::{
         BrokerHandoff, ContextFillReport, ProviderErrand, ProviderEvent, ProviderSubagentId,
         ProviderSubagentStatus,
     },
-    server::{self, RunningServer, ServerConfig},
+    server::{self, RunningServer, ServerConfig, ServerTimings},
 };
-use tokio::time::timeout;
+use tokio::time::{Duration, timeout};
 
 use crate::{
     provider_support::{
@@ -52,6 +52,7 @@ mod late_output;
 mod limits;
 mod posture;
 mod reports;
+mod send_wait;
 mod watches;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {
@@ -247,10 +248,29 @@ struct HostedProviders {
     workspace: tempfile::TempDir,
 }
 
+/// How long one of the seconds a wait's `timeout_seconds` counts lasts on the
+/// Servers these tests host: long enough that a wait still waiting outlasts
+/// anything a test does meanwhile — its default of 60 seconds is six — and
+/// short enough that none is waited out at production scale.
+const WAIT_SECOND: Duration = Duration::from_millis(100);
+
+/// How often a wait still waiting reports progress on those Servers.
+const WAIT_PROGRESS_EVERY: Duration = Duration::from_millis(5);
+
 async fn host_providers(
     state_dir: &Path,
     channel: &str,
     config_dir: Option<&Path>,
+) -> HostedProviders {
+    host_providers_timed(state_dir, channel, config_dir, WAIT_SECOND).await
+}
+
+/// [`host_providers`] with each of a wait's seconds lasting `wait_second`.
+async fn host_providers_timed(
+    state_dir: &Path,
+    channel: &str,
+    config_dir: Option<&Path>,
+    wait_second: Duration,
 ) -> HostedProviders {
     let (claude_runtime, claude) =
         ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
@@ -265,13 +285,16 @@ async fn host_providers(
     if let Some(config_dir) = config_dir {
         config = config.with_config_dir(config_dir);
     }
-    let server = server::spawn_with_providers(
+    let server = server::spawn_with_providers_and_timings(
         config,
         vec![
             claude_runtime.clone(),
             codex_runtime.clone(),
             copilot_runtime.clone(),
         ],
+        ServerTimings::default()
+            .with_broker_wait_second(wait_second)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY),
     )
     .await
     .expect("spawn server");
@@ -950,7 +973,17 @@ struct Delegating {
 }
 
 async fn delegating(state_dir: &Path, channel: &str, config_dir: Option<&Path>) -> Delegating {
-    let mut hosted = host_providers(state_dir, channel, config_dir).await;
+    delegating_timed(state_dir, channel, config_dir, WAIT_SECOND).await
+}
+
+/// [`delegating`] on a Server whose waits count seconds of `wait_second`.
+async fn delegating_timed(
+    state_dir: &Path,
+    channel: &str,
+    config_dir: Option<&Path>,
+    wait_second: Duration,
+) -> Delegating {
+    let mut hosted = host_providers_timed(state_dir, channel, config_dir, wait_second).await;
     let descriptor = hosted.server.descriptor().clone();
     let workspace = hosted.workspace.path().to_owned();
     let (caller, handoff, caller_provider) = start_session(

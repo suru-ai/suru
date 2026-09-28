@@ -201,3 +201,140 @@ async fn json_rpc_response(response: reqwest::Response, id: u64) -> Value {
         .find(|message| message["id"] == json!(id))
         .unwrap_or_else(|| panic!("the event stream carries the response to {id}: {body}"))
 }
+
+/// What a Tool call answered, with every progress notification the Broker sent
+/// against the call's `progressToken` before its answer, in the order they
+/// came.
+pub struct Observed {
+    pub result: Value,
+    pub progress: Vec<Value>,
+}
+
+impl Observed {
+    /// The answer's structured content, having checked the call was not
+    /// refused.
+    pub fn answer(&self, tool: &str) -> Value {
+        assert_ne!(
+            self.result["isError"],
+            json!(true),
+            "{tool} answers: {}",
+            self.result
+        );
+        self.result["structuredContent"].clone()
+    }
+}
+
+impl McpClient {
+    /// `send_to_subagent`'s answer for sending `message` to `id`, read from
+    /// the structured content the call carries.
+    pub async fn send_to_subagent(&mut self, id: SessionId, message: &str) -> Value {
+        self.observe_tool(
+            "send_to_subagent",
+            json!({ "id": id, "message": message }),
+            None,
+            None,
+        )
+        .await
+        .answer("send_to_subagent")
+    }
+
+    /// `wait_subagents`' answer for `arguments`, asked for without progress.
+    pub async fn wait_subagents(&mut self, arguments: Value) -> Value {
+        self.observe_tool("wait_subagents", arguments, None, None)
+            .await
+            .answer("wait_subagents")
+    }
+
+    /// Calls `wait_subagents` asking for progress against `progress_token`,
+    /// reading its answer as it streams: each progress notification is sent
+    /// on `progress_seen` the moment it arrives — so a test may act while the
+    /// wait still waits — and all of them are handed back beside the answer.
+    pub async fn wait_subagents_observing(
+        &mut self,
+        arguments: Value,
+        progress_token: &str,
+        progress_seen: &tokio::sync::mpsc::UnboundedSender<Value>,
+    ) -> Observed {
+        self.observe_tool(
+            "wait_subagents",
+            arguments,
+            Some(progress_token),
+            Some(progress_seen),
+        )
+        .await
+    }
+
+    /// Calls `name`, asking for progress against `progress_token` where one
+    /// is given, and reads the answer as it streams. A plain JSON answer
+    /// carries no progress.
+    async fn observe_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        progress_token: Option<&str>,
+        progress_seen: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> Observed {
+        let mut params = json!({ "name": name, "arguments": arguments });
+        if let Some(token) = progress_token {
+            params["_meta"] = json!({ "progressToken": token });
+        }
+        let (id, message) = self.request_message("tools/call", params);
+        let mut response = self.post(&message).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name} is answered");
+        let is_stream = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
+        if !is_stream {
+            let answer: Value = response.json().await.expect("decode JSON-RPC response");
+            return Observed {
+                result: answered(name, answer),
+                progress: Vec::new(),
+            };
+        }
+        let mut progress = Vec::new();
+        let mut buffered = String::new();
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .expect("read the event stream")
+                .unwrap_or_else(|| panic!("the event stream ends with the answer to {name}"));
+            buffered.push_str(&String::from_utf8_lossy(&chunk).replace("\r\n", "\n"));
+            while let Some(end) = buffered.find("\n\n") {
+                let event = buffered[..end].to_owned();
+                buffered.drain(..end + 2);
+                let data = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let Ok(message) = serde_json::from_str::<Value>(&data) else {
+                    continue;
+                };
+                if message["method"] == json!("notifications/progress") {
+                    if let Some(seen) = progress_seen {
+                        let _ = seen.send(message["params"].clone());
+                    }
+                    progress.push(message["params"].clone());
+                } else if message["id"] == json!(id) {
+                    return Observed {
+                        result: answered(name, message),
+                        progress,
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// The result a JSON-RPC response to a call of `tool` carries, failing the
+/// test on a protocol error.
+fn answered(tool: &str, answer: Value) -> Value {
+    answer
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("{tool} was answered with an error: {answer}"))
+}
