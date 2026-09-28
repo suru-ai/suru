@@ -573,7 +573,18 @@ impl TerminalInputParser {
                 RawInputState::Csi { raw }
                     if !(self.expecting_replies && is_awaited_csi_reply(raw)) =>
                 {
-                    ordinary.append(raw);
+                    // termina holds a bare introducer for more that is not
+                    // coming, so it is resolved here as the chord that sent it.
+                    if raw == b"\x1b[" {
+                        output.push(TerminalInput::Event(crossterm::event::Event::Key(
+                            crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Char('['),
+                                crossterm::event::KeyModifiers::ALT,
+                            ),
+                        )));
+                    } else {
+                        ordinary.append(raw);
+                    }
                     self.state = RawInputState::Ground;
                 }
                 // Only an ambiguous Alt chord expires. Once a reply's prefix is
@@ -713,11 +724,14 @@ enum CsiReply {
     Other,
 }
 
-/// Whether `raw` has begun the device attributes or the cell size, the CSI
-/// replies the probe awaits. Only the parser's CSI state holds `raw`, and it
+/// Whether `raw` may still become the device attributes or the cell size,
+/// the CSI replies the probe awaits: from the bare `ESC [` on, before either
+/// has identified itself. Only the parser's CSI state holds `raw`, and it
 /// holds nothing but a prefix of a reply or of a bracketed paste marker.
 fn is_awaited_csi_reply(raw: &[u8]) -> bool {
-    raw.starts_with(b"\x1b[?") || raw.starts_with(b"\x1b[6;")
+    [b"\x1b[?".as_slice(), b"\x1b[6;".as_slice()]
+        .iter()
+        .any(|prefix| prefix.starts_with(raw) || raw.starts_with(prefix))
 }
 
 /// Recognizes the primary device attributes, `CSI ? Ps ; … c`, and the cell
@@ -1983,6 +1997,84 @@ mod tests {
             vec![TerminalInput::Graphics(GraphicsReply::DeviceAttributes {
                 sixel: true
             })]
+        );
+    }
+
+    #[test]
+    fn a_csi_split_before_its_reply_is_identified_survives_an_idle_boundary() {
+        for (first, rest, expected) in [
+            (
+                b"\x1b[6".as_slice(),
+                b";20;10t".as_slice(),
+                GraphicsReply::CellSize(CELL),
+            ),
+            (
+                b"\x1b[".as_slice(),
+                b"?62;4c".as_slice(),
+                GraphicsReply::DeviceAttributes { sixel: true },
+            ),
+            (
+                b"\x1b[".as_slice(),
+                b"6;20;10t".as_slice(),
+                GraphicsReply::CellSize(CELL),
+            ),
+        ] {
+            let mut parser = TerminalInputParser::default();
+            parser.expect_replies();
+
+            assert_eq!(parser.parse(first, false), vec![]);
+            assert_eq!(
+                parser.parse(rest, false),
+                vec![TerminalInput::Graphics(expected)],
+                "{}",
+                String::from_utf8_lossy(first).escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_completing_a_held_csi_prefix_during_the_reply_window_is_still_that_key() {
+        for (first, rest, expected) in [
+            (
+                b"\x1b[".as_slice(),
+                b"A".as_slice(),
+                key(KeyCode::Up, KeyModifiers::NONE),
+            ),
+            (
+                b"\x1b[6".as_slice(),
+                b"~".as_slice(),
+                key(KeyCode::PageDown, KeyModifiers::NONE),
+            ),
+            (
+                b"\x1b[6;".as_slice(),
+                b"5~".as_slice(),
+                key(KeyCode::PageDown, KeyModifiers::CONTROL),
+            ),
+        ] {
+            let mut parser = TerminalInputParser::default();
+            parser.expect_replies();
+
+            assert_eq!(parser.parse(first, false), vec![]);
+            assert_eq!(
+                parser.parse(rest, false),
+                vec![expected],
+                "{}",
+                String::from_utf8_lossy(first).escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_csi_introducer_is_alt_bracket_once_the_reply_window_closes() {
+        let mut parser = TerminalInputParser::default();
+        parser.expect_replies();
+        assert_eq!(parser.parse(b"\x1b[", false), vec![]);
+
+        parser.stop_expecting_replies();
+
+        assert_eq!(
+            parser.parse(&[], false),
+            vec![key(KeyCode::Char('['), KeyModifiers::ALT)]
         );
     }
 
