@@ -8,13 +8,14 @@ use suru::protocol::{
     Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
     ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
     ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
-    ModelOptionValue, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
-    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
-    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
-    ViewSessionRequest, Workspace,
+    ModelOptionValue, PROTOCOL_VERSION, PreparationId, PreparationPrompt, PrepareCheckoutRequest,
+    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
+    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
+    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
+    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
+    Workspace,
 };
 use uuid::Uuid;
 
@@ -1554,6 +1555,56 @@ fn attachment_bindings_round_trip_beside_the_prompt_text_and_stay_off_the_wire_w
 }
 
 #[test]
+fn a_preparation_prompt_carries_its_attachment_bindings_and_keeps_them_off_the_wire_when_absent() {
+    assert_eq!(
+        PROTOCOL_VERSION, 68,
+        "a preparation Prompt carrying Attachment bindings changes the wire"
+    );
+    let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let request = PrepareCheckoutRequest {
+        id: PreparationId(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360fa")),
+        source: suru::protocol::ExecutionDirectory {
+            path: PathBuf::from("workspace"),
+        },
+        prompt: PreparationPrompt {
+            text: "[Image 1] fix flicker".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: vec![AttachmentBinding {
+                attachment_id: AttachmentId::new(hash),
+                label: "[Image 1]".to_owned(),
+                span: TextSpan { start: 0, end: 9 },
+            }],
+        },
+        provider: ProviderId::new("codex"),
+    };
+    let encoded = serde_json::to_value(&request).expect("encode the preparation request");
+
+    assert_eq!(
+        encoded["prompt"],
+        json!({
+            "text": "[Image 1] fix flicker",
+            "skill_invocations": [],
+            "attachments": [{
+                "attachment_id": hash,
+                "label": "[Image 1]",
+                "span": { "start": 0, "end": 9 }
+            }]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<PrepareCheckoutRequest>(encoded)
+            .expect("decode the preparation request"),
+        request
+    );
+
+    let plain = json!({ "text": "Fix flicker", "skill_invocations": [] });
+    let decoded = serde_json::from_value::<PreparationPrompt>(plain.clone())
+        .expect("a preparation Prompt without bindings decodes");
+    assert!(decoded.attachments.is_empty());
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), plain);
+}
+
+#[test]
 fn an_attachment_descriptor_carries_a_typed_kind_and_never_the_bytes() {
     let descriptor = AttachmentDescriptor {
         id: AttachmentId::new("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
@@ -1586,10 +1637,12 @@ fn an_attachment_descriptor_carries_a_typed_kind_and_never_the_bytes() {
 
 #[test]
 fn a_snapshot_and_its_updates_describe_the_attachments_its_session_binds() {
-    assert_eq!(
-        PROTOCOL_VERSION, 67,
-        "describing Attachments in snapshots and updates changes the wire"
-    );
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 67,
+            "describing Attachments in snapshots and updates changes the wire"
+        )
+    };
     let screenshot = AttachmentDescriptor {
         id: AttachmentId::new("1d0a0cbb1f6f3c12f06c8d9bd8d5cc3b16ce8f8eafa4fdb8ea3a2cc02b64a1d4"),
         kind: AttachmentKind::Image {

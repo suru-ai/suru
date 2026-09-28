@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use suru::{
     managed_client::ManagedEvent,
     protocol::*,
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, ClipboardRead, CommandId,
+        SemanticCommandId,
+    },
 };
 
 struct Layout {
@@ -1545,6 +1548,78 @@ fn managed_preparation_carries_explicit_skill_names_directly_to_destination_admi
         SkillId::new("source-review"),
         "the client preserves the request; the Server owns destination rebinding"
     );
+}
+
+#[test]
+fn managed_preparation_carries_attachment_bindings_for_the_server_to_name_the_worktree_without() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    let ApplicationTransition::ReadClipboard(paste) = app
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ComposerClipboardPaste,
+        )))
+        .unwrap()
+    else {
+        panic!("a paste reads the clipboard")
+    };
+    let ApplicationTransition::UploadAttachment { paste, .. } = app
+        .handle_event(ApplicationEvent::ClipboardRead {
+            paste,
+            read: ClipboardRead::Image {
+                png: b"\x89PNG\r\n\x1a\nflicker".to_vec(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("a clipboard image is uploaded")
+    };
+    app.handle_event(ApplicationEvent::AttachmentUploaded {
+        paste,
+        descriptor: AttachmentDescriptor {
+            id: AttachmentId::new("flicker-hash"),
+            kind: AttachmentKind::Image {
+                width: 16,
+                height: 16,
+            },
+            mime_type: "image/png".to_owned(),
+            byte_length: 16,
+        },
+    })
+    .unwrap();
+    type_terminal_text(&mut app, "fix flicker");
+
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("a Prompt with an image prepares its Worktree")
+    };
+    let bindings = vec![AttachmentBinding {
+        attachment_id: AttachmentId::new("flicker-hash"),
+        label: "[Image 1]".to_owned(),
+        span: TextSpan { start: 0, end: 9 },
+    }];
+    assert_eq!(request.prompt.text, "[Image 1] fix flicker");
+    assert_eq!(
+        request.prompt.attachments, bindings,
+        "the Server is told which text is a label, so the Worktree is never named from it"
+    );
+
+    let result = prepared(&layout, &request);
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
+        .unwrap()
+    else {
+        panic!("the prepared Worktree admits the Prompt")
+    };
+    assert_eq!(create.prompt.attachments, bindings);
 }
 
 #[test]

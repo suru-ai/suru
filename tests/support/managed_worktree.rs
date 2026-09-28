@@ -40,6 +40,7 @@ pub async fn prepare(client: &ManagedClient, source: &Path, provider: &str) -> P
             prompt: PreparationPrompt {
                 text: "Native prepared startup".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new(provider),
         })

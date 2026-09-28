@@ -2,7 +2,7 @@
 //! one fragment that is both a valid Git ref component and a portable
 //! directory name on every platform. The fragment names the location beneath
 //! the managed container and, behind [`BRANCH_PREFIX`], the branch.
-use crate::protocol::{SkillInvocation, skill_marker_matches};
+use crate::protocol::{AttachmentBinding, SkillInvocation, skill_marker_matches};
 
 /// The fixed prefix of every branch Suru creates for a Managed Worktree.
 pub const BRANCH_PREFIX: &str = "suru/";
@@ -110,15 +110,17 @@ pub fn numbered(fragment: &str) -> impl Iterator<Item = String> + '_ {
         .chain((2..=NAME_ATTEMPTS).map(move |number| format!("{fragment}-{number}")))
 }
 
-/// A Prompt's text with the markers of its bound Skill Invocations removed by
-/// their recorded spans, so a Skill's name never names the work. Unbound
-/// `$tokens` carry no span and stay ordinary text. Each marker is replaced by
-/// a space so the words around it stay apart.
-pub(crate) fn without_skill_markers(
+/// A Prompt's text with the markers of its bound Skill Invocations and the
+/// labels of its Attachments removed by their recorded spans, so neither a
+/// Skill's name nor a label such as `[Image 1]` names the work. Unbound
+/// `$tokens` and labels carry no span and stay ordinary text. Each span is
+/// replaced by a space so the words around it stay apart.
+pub(crate) fn without_bound_spans(
     text: &str,
     skill_invocations: &[SkillInvocation],
+    attachments: &[AttachmentBinding],
 ) -> Result<String, String> {
-    let mut spans = Vec::with_capacity(skill_invocations.len());
+    let mut spans = Vec::with_capacity(skill_invocations.len() + attachments.len());
     for invocation in skill_invocations {
         let span = invocation.span.range();
         if !text
@@ -132,13 +134,20 @@ pub(crate) fn without_skill_markers(
         }
         spans.push(span);
     }
+    for attachment in attachments {
+        let span = attachment.span.range();
+        if text.get(span.clone()) != Some(attachment.label.as_str()) {
+            return Err("An Attachment label is not bound where it stands in the text".to_owned());
+        }
+        spans.push(span);
+    }
     spans.sort_by_key(|span| span.start);
     spans.dedup();
     let mut unmarked = String::with_capacity(text.len());
     let mut next = 0;
     for span in spans {
         if span.start < next {
-            return Err("Skill Invocation markers overlap".to_owned());
+            return Err("Skill Invocation markers and Attachment labels overlap".to_owned());
         }
         unmarked.push_str(&text[next..span.start]);
         unmarked.push(' ');
@@ -274,18 +283,19 @@ mod tests {
     #[test]
     fn bound_skill_markers_are_removed_by_span_and_unbound_tokens_remain() {
         let text = "$grill-with-docs fix$it $unbound then $Grill-With-Docs";
-        let unmarked = without_skill_markers(
+        let unmarked = without_bound_spans(
             text,
             &[
                 bound("grill-with-docs", 0, 16),
                 bound("grill-with-docs", 38, 54),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(name_fragment(&unmarked), "fix-unbound");
         assert!(unmarked.contains("$unbound"));
         assert_eq!(
-            without_skill_markers("$a$b", &[bound("a", 0, 2), bound("b", 2, 4)]).unwrap(),
+            without_bound_spans("$a$b", &[bound("a", 0, 2), bound("b", 2, 4)], &[]).unwrap(),
             "  "
         );
     }
@@ -297,8 +307,59 @@ mod tests {
             bound("review", 1, 7),
             bound("explain", 0, 7),
         ] {
-            assert!(without_skill_markers("$review this", &[invocation]).is_err());
+            assert!(without_bound_spans("$review this", &[invocation], &[]).is_err());
         }
-        assert!(without_skill_markers("é$review", &[bound("review", 1, 8)]).is_err());
+        assert!(without_bound_spans("é$review", &[bound("review", 1, 8)], &[]).is_err());
+    }
+
+    fn labelled(text: &str, label: &str) -> AttachmentBinding {
+        let start = text.find(label).expect("the label stands in the text");
+        AttachmentBinding {
+            attachment_id: crate::protocol::AttachmentId::new(label),
+            label: label.to_owned(),
+            span: TextSpan::from(start..start + label.len()),
+        }
+    }
+
+    #[test]
+    fn attachment_labels_are_removed_by_span_and_unbound_labels_remain() {
+        let text = "[Image 1] fix flicker";
+        let unlabelled = without_bound_spans(text, &[], &[labelled(text, "[Image 1]")]).unwrap();
+        assert_eq!(name_fragment(&unlabelled), "fix-flicker");
+        assert_eq!(
+            name_fragment(&without_bound_spans(text, &[], &[]).unwrap()),
+            "image-1-fix-flicker",
+            "a label no binding names is ordinary text"
+        );
+
+        let text = "$review [Image 2] against [Image 1]";
+        let unmarked = without_bound_spans(
+            text,
+            &[bound("review", 0, 7)],
+            &[labelled(text, "[Image 2]"), labelled(text, "[Image 1]")],
+        )
+        .unwrap();
+        assert_eq!(name_fragment(&unmarked), "against");
+    }
+
+    #[test]
+    fn a_label_its_span_does_not_read_is_refused() {
+        let text = "[Image 1] fix flicker";
+        let mut misplaced = labelled(text, "[Image 1]");
+        misplaced.span = TextSpan { start: 1, end: 10 };
+        assert!(without_bound_spans(text, &[], &[misplaced]).is_err());
+        assert!(
+            without_bound_spans(
+                "$review",
+                &[bound("review", 0, 7)],
+                &[AttachmentBinding {
+                    attachment_id: crate::protocol::AttachmentId::new("overlap"),
+                    label: "review".to_owned(),
+                    span: TextSpan { start: 1, end: 7 },
+                }],
+            )
+            .is_err(),
+            "a label overlapping a Skill marker is refused"
+        );
     }
 }

@@ -187,6 +187,7 @@ async fn fail_preparation(
             prompt: PreparationPrompt {
                 text: text.into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new("controlled"),
         })
@@ -1518,6 +1519,7 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
             prompt: PreparationPrompt {
                 text: "Reclaim after restart".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new("controlled"),
         })
@@ -1848,6 +1850,7 @@ async fn an_unmerged_recorded_branch_is_retained() {
             prompt: PreparationPrompt {
                 text: "Unmerged".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new("controlled"),
         })
@@ -2055,6 +2058,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
             prompt: PreparationPrompt {
                 text: "retry metadata retirement".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new("controlled"),
         })
@@ -2158,6 +2162,7 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
         prompt: PreparationPrompt {
             text: "unfinished preparation".into(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
         provider: ProviderId::new("controlled"),
     };
@@ -2250,6 +2255,7 @@ async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repos
             prompt: PreparationPrompt {
                 text: "old failed preparation".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
             provider: ProviderId::new("controlled"),
         })
@@ -2419,6 +2425,7 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
         prompt: PreparationPrompt {
             text: "failed Session shell".into(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
         provider: ProviderId::new("controlled"),
     };

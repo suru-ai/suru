@@ -71,6 +71,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
         prompt: PreparationPrompt {
             text: "Remote preparation".into(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
         provider: ProviderId::new("controlled"),
     };

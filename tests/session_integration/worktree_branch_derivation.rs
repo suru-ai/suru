@@ -304,6 +304,7 @@ impl Fixture {
                 prompt: PreparationPrompt {
                     text: text.to_owned(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
                 provider: ProviderId::new(PROVIDER),
             })

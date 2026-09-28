@@ -73,6 +73,7 @@ fn request(root: &Path, text: &str) -> PrepareCheckoutRequest {
         prompt: PreparationPrompt {
             text: text.to_owned(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
         provider: ProviderId::new("controlled"),
     }
@@ -375,6 +376,7 @@ async fn local_names_leave_out_filler_and_bound_skills_but_keep_unbound_tokens_a
     invoking.prompt = PreparationPrompt {
         text: "An edited Prompt naming other work".to_owned(),
         skill_invocations: vec![],
+        attachments: Vec::new(),
     };
     let retried = prepare(server.descriptor(), &invoking).await;
     assert_eq!(retried.error, None);
@@ -392,6 +394,58 @@ async fn local_names_leave_out_filler_and_bound_skills_but_keep_unbound_tokens_a
     assert!(refused.text().await.unwrap().contains("explain"));
     assert!(!container.join("review-naming").exists());
     assert!(!container.join("naming").exists());
+    assert!(provider.try_next_start().is_none());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_names_leave_out_bound_attachment_labels_but_keep_unbound_ones_as_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = suru::paths::canonical(temp.path()).unwrap();
+    let main = root.join("main");
+    committed(&main);
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(root.join("state"), "local-attachment-names").unwrap(),
+        runtime,
+    )
+    .await
+    .unwrap();
+    let container = main.join(".suru-worktrees");
+    let label = |start: u32| AttachmentBinding {
+        attachment_id: AttachmentId::new("flicker-hash"),
+        label: "[Image 1]".to_owned(),
+        span: TextSpan {
+            start,
+            end: start + 9,
+        },
+    };
+
+    let mut labelled = request(&main, "[Image 1] fix flicker");
+    labelled.prompt.attachments = vec![label(0)];
+    let named = prepare(server.descriptor(), &labelled).await;
+    assert_eq!(named.error, None);
+    let (branch, destination) = planned(&named, &container);
+    assert_eq!(branch, "suru/fix-flicker");
+    assert_eq!(destination, container.join("fix-flicker"));
+
+    // The same label left unbound is ordinary text.
+    let unbound = prepare(
+        server.descriptor(),
+        &request(&main, "[Image 1] tidy the parser"),
+    )
+    .await;
+    assert_eq!(unbound.error, None);
+    let (branch, _) = planned(&unbound, &container);
+    assert_eq!(branch, "suru/image-1-tidy-parser");
+
+    // A label its span does not read is refused before anything is made.
+    let mut misbound = request(&main, "Fix [Image 1] naming");
+    misbound.prompt.attachments = vec![label(0)];
+    let refused = prepare_response(server.descriptor(), &misbound).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!container.join("fix-naming").exists());
+    assert!(!container.join("fix-image-1-naming").exists());
     assert!(provider.try_next_start().is_none());
     server.shutdown().await.unwrap();
 }

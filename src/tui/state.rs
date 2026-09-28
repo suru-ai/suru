@@ -3312,10 +3312,11 @@ impl TuiState {
         }
         if let Some(request) = &mut self.new_worktree {
             // The owning Server names the Worktree from the Prompt as bound,
-            // leaving out its Skill markers itself.
+            // leaving out its Skill markers and Attachment labels itself.
             request.prompt = crate::protocol::PreparationPrompt {
                 text: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
             };
             if let Some(selection) = &self.landing_agent_selection {
                 request.provider = selection.provider.clone();

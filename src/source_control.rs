@@ -445,7 +445,8 @@ impl SourceControlService {
         self.adapter.checkpoint(at, plan).await
     }
     /// Plan the Worktree a preparation request asks for, named from its first
-    /// Prompt without the markers of that Prompt's bound Skill Invocations.
+    /// Prompt without the markers of that Prompt's bound Skill Invocations or
+    /// the labels of its Attachments.
     pub(crate) async fn plan_checkout(
         &self,
         request: &crate::protocol::PrepareCheckoutRequest,
@@ -457,9 +458,10 @@ impl SourceControlService {
         ),
         String,
     > {
-        let name = naming::name_fragment(&naming::without_skill_markers(
+        let name = naming::name_fragment(&naming::without_bound_spans(
             &request.prompt.text,
             &request.prompt.skill_invocations,
+            &request.prompt.attachments,
         )?);
         let source = self.resolve(&request.source.path, None).await;
         let repository = source
