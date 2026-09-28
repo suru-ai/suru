@@ -1078,4 +1078,50 @@ mod tests {
             assert!(!buffer[(0, y)].skip && !buffer[(13, y)].skip, "row {y}");
         }
     }
+
+    #[test]
+    fn an_iterm2_or_sixel_thumbnail_holds_its_image_in_its_first_cell_and_skips_every_other() {
+        // iTerm2 erases the area row by row, climbs back to its top, and
+        // places the picture without moving the cursor; Sixel is one DCS
+        // string. Either stands whole in the area's top-left cell.
+        let iterm2 = format!(
+            "{}\x1b[6A\x1b]1337;File=inline=1;",
+            "\x1b[12X\x1b[1B".repeat(6)
+        );
+        for (protocol, opens, closes) in [
+            (GraphicsProtocol::Iterm2, iterm2.as_str(), "\x07"),
+            (GraphicsProtocol::Sixel, "\x1bP", "\x1b\\"),
+        ] {
+            let thumbnail = Thumbnail::from_image(
+                DynamicImage::ImageRgba8(ImageBuffer::new(120, 120)),
+                CELL,
+                protocol,
+            )
+            .unwrap_or_else(|error| panic!("make a {protocol} thumbnail: {error:#}"));
+            assert_eq!((thumbnail.columns(), thumbnail.rows()), (12, 6));
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 20, STRIP_ROWS));
+            Image::new(&thumbnail.protocol).render(Rect::new(1, 0, 12, STRIP_ROWS), &mut buffer);
+
+            let image = &buffer[(1, 0)];
+            assert!(
+                image.symbol().starts_with(opens) && image.symbol().ends_with(closes),
+                "{protocol}: {:?}",
+                image.symbol()
+            );
+            assert!(!image.skip, "{protocol}");
+            for y in 0..STRIP_ROWS {
+                for x in (1..13).filter(|x| (*x, y) != (1, 0)) {
+                    let cell = &buffer[(x, y)];
+                    assert!(
+                        cell.skip && cell.symbol() == " ",
+                        "{protocol} at ({x}, {y})"
+                    );
+                }
+                assert!(
+                    !buffer[(0, y)].skip && !buffer[(13, y)].skip,
+                    "{protocol} row {y}"
+                );
+            }
+        }
+    }
 }

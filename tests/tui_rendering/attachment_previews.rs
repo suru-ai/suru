@@ -1,15 +1,18 @@
 //! Thumbnails of Attachments in a terminal that speaks the Kitty graphics
-//! protocol: a strip six rows tall beneath a user Message's text, inside its
-//! gutter block, and above the composer's text, drawn only whole and
-//! uncovered and otherwise left blank at its reserved height. The run loop's
-//! fetches are answered here as it would answer them, with thumbnails made
-//! from pixels, so no network or decoder runs.
+//! protocol, iTerm2 inline images, or Sixel: a strip six rows tall beneath a
+//! user Message's text, inside its gutter block, and above the composer's
+//! text, drawn only whole and uncovered and otherwise left blank at its
+//! reserved height. Every protocol reserves and skips the same cells, so the
+//! scenarios that draw run once for each; only the mark ratatui-image leaves
+//! in a thumbnail's area differs. The run loop's fetches are answered here as
+//! it would answer them, with thumbnails made from pixels for the protocol
+//! the fetch names, so no network or decoder runs.
 
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use image::DynamicImage;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use suru::{
     managed_client::SessionEvent,
     protocol::{
@@ -43,11 +46,66 @@ const THUMBNAIL_COLUMNS: u16 = 12;
 /// The placeholder Kitty's Unicode placements are drawn with.
 const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
 
-fn kitty() -> TerminalFacts {
-    TerminalFacts::unprobed(true)
-        .with_cell_size(Some(CELL))
-        .with_graphics_answer(GraphicsProtocol::Kitty)
+/// What opens an iTerm2 inline image, once its area has been erased.
+const ITERM2_IMAGE: &str = "\x1b]1337;File=inline=1;";
+
+/// What opens and closes the DCS string a Sixel image is drawn with.
+const SIXEL_OPENS: &str = "\x1bP";
+const SIXEL_CLOSES: &str = "\x1b\\";
+
+/// A terminal whose probe answered for each of `protocols`, at a known cell
+/// size, so the probe's own preference selects among them.
+fn answering(protocols: &[GraphicsProtocol]) -> TerminalFacts {
+    protocols.iter().fold(
+        TerminalFacts::unprobed(true).with_cell_size(Some(CELL)),
+        |facts, protocol| facts.with_graphics_answer(*protocol),
+    )
 }
+
+fn kitty() -> TerminalFacts {
+    answering(&[GraphicsProtocol::Kitty])
+}
+
+/// Runs each scenario named once for every protocol, as a test of its own in
+/// a module named for the protocol.
+macro_rules! in_every_protocol {
+    ($($scenario:ident),+ $(,)?) => {
+        mod kitty {
+            $(#[test]
+            fn $scenario() {
+                super::$scenario(super::GraphicsProtocol::Kitty);
+            })+
+        }
+
+        mod iterm2 {
+            $(#[test]
+            fn $scenario() {
+                super::$scenario(super::GraphicsProtocol::Iterm2);
+            })+
+        }
+
+        mod sixel {
+            $(#[test]
+            fn $scenario() {
+                super::$scenario(super::GraphicsProtocol::Sixel);
+            })+
+        }
+    };
+}
+
+in_every_protocol!(
+    a_messages_thumbnails_stand_in_six_rows_beneath_its_text_inside_the_gutter,
+    the_composer_stands_its_thumbnails_in_six_rows_above_its_text,
+    four_attachments_show_three_thumbnails_and_a_more_cell,
+    a_strip_partly_scrolled_off_leaves_its_rows_blank,
+    a_strip_under_a_picker_or_a_dialog_leaves_its_rows_blank,
+    a_strip_beside_the_sidebar_is_still_drawn,
+    the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive,
+    a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail,
+    when_every_fetch_fails_the_dimmed_lines_stand,
+    with_the_setting_off_the_dimmed_lines_stand_without_reserving_rows,
+    a_thumbnail_fetch_goes_to_the_open_sessions_origin_for_the_selected_protocol,
+);
 
 fn descriptor(tag: &str, mime_type: &str, width: u32, height: u32) -> AttachmentDescriptor {
     AttachmentDescriptor {
@@ -92,7 +150,17 @@ fn session_with_message(
     described: &[AttachmentDescriptor],
 ) -> SessionSnapshot {
     let workspace = workspace_dir();
-    let (_, mut snapshot) = enter_session(application, workspace.path());
+    session_in_with_message(application, workspace.path(), text, described)
+}
+
+/// As [`session_with_message`], for a Session working in `workspace`.
+fn session_in_with_message(
+    application: &mut Application,
+    workspace: &std::path::Path,
+    text: &str,
+    described: &[AttachmentDescriptor],
+) -> SessionSnapshot {
+    let (_, mut snapshot) = enter_session(application, workspace);
     let attachments = described
         .iter()
         .enumerate()
@@ -126,6 +194,7 @@ struct Fetch {
     request: ThumbnailRequest,
     attachment_id: AttachmentId,
     cell_size: CellSize,
+    protocol: GraphicsProtocol,
 }
 
 /// Every fetch the last frame asked for, unanswered, in the order asked.
@@ -135,11 +204,13 @@ fn take_fetches(application: &mut Application) -> Vec<Fetch> {
             request,
             attachment_id,
             cell_size,
+            protocol,
             ..
         } => Some(Fetch {
             request,
             attachment_id,
             cell_size,
+            protocol,
         }),
         ApplicationTransition::Continue => None,
         other => panic!("a frame asks only for thumbnails, not {other:?}"),
@@ -148,8 +219,8 @@ fn take_fetches(application: &mut Application) -> Vec<Fetch> {
 }
 
 /// Answers `fetch` as the run loop would once the fetch and the decode came
-/// back: with a square thumbnail made for the cell size it was asked for, or
-/// with the failure of either.
+/// back: with a square thumbnail made for the cell size and protocol it was
+/// asked for, or with the failure of either.
 fn answer(application: &mut Application, fetch: &Fetch, succeeded: bool) {
     let event = if succeeded {
         ApplicationEvent::AttachmentThumbnail {
@@ -159,7 +230,7 @@ fn answer(application: &mut Application, fetch: &Fetch, succeeded: bool) {
             thumbnail: Thumbnail::from_image(
                 DynamicImage::new_rgba8(120, 120),
                 fetch.cell_size,
-                GraphicsProtocol::Kitty,
+                fetch.protocol,
             )
             .expect("make a thumbnail from pixels"),
         }
@@ -206,16 +277,85 @@ fn row_of(buffer: &Buffer, needle: &str) -> u16 {
         .unwrap_or_else(|| panic!("{needle:?} is drawn: {:#?}", readable_rows(buffer)))
 }
 
+/// What ratatui-image leaves in one cell of a thumbnail's area.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mark {
+    /// One row of Kitty's Unicode placeholders, standing for the whole row.
+    KittyRow,
+    /// A whole iTerm2 inline image.
+    Iterm2Image,
+    /// A whole Sixel image.
+    SixelImage,
+    /// Skipped, so nothing is written over the image there.
+    Skipped,
+    /// No part of an image: text, a border, or a blank cell.
+    Unmarked,
+}
+
+fn mark_of(cell: &Cell) -> Mark {
+    let symbol = cell.symbol();
+    if cell.skip {
+        Mark::Skipped
+    } else if symbol.contains(KITTY_PLACEHOLDER) {
+        Mark::KittyRow
+    } else if symbol.contains(ITERM2_IMAGE) {
+        Mark::Iterm2Image
+    } else if symbol.starts_with(SIXEL_OPENS) && symbol.ends_with(SIXEL_CLOSES) {
+        Mark::SixelImage
+    } else {
+        Mark::Unmarked
+    }
+}
+
+/// How ratatui-image marks the cell `column` across and `row` down a
+/// thumbnail's area for `protocol`: Kitty puts each row's placeholders in
+/// that row's first cell, iTerm2 and Sixel put the whole image in the area's
+/// top-left cell, and every other cell of the area is skipped.
+fn expected_mark(protocol: GraphicsProtocol, column: u16, row: u16) -> Mark {
+    match (protocol, column, row) {
+        (GraphicsProtocol::Kitty, 0, _) => Mark::KittyRow,
+        (GraphicsProtocol::Iterm2, 0, 0) => Mark::Iterm2Image,
+        (GraphicsProtocol::Sixel, 0, 0) => Mark::SixelImage,
+        _ => Mark::Skipped,
+    }
+}
+
+/// Asserts that a square thumbnail's area, from `left` and `top`, is marked
+/// exactly as ratatui-image marks one for `protocol`, and that the cells
+/// either side of each of its rows are no part of it.
+fn assert_thumbnail_at(buffer: &Buffer, protocol: GraphicsProtocol, left: u16, top: u16) {
+    for row in 0..STRIP_ROWS as u16 {
+        let y = top + row;
+        let marks = (0..THUMBNAIL_COLUMNS)
+            .map(|column| mark_of(&buffer[(left + column, y)]))
+            .collect::<Vec<_>>();
+        let expected = (0..THUMBNAIL_COLUMNS)
+            .map(|column| expected_mark(protocol, column, row))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marks,
+            expected,
+            "{protocol} row {y}: {:#?}",
+            readable_rows(buffer)
+        );
+        assert_eq!(
+            [left - 1, left + THUMBNAIL_COLUMNS].map(|x| mark_of(&buffer[(x, y)])),
+            [Mark::Unmarked; 2],
+            "{protocol} row {y}"
+        );
+    }
+}
+
 /// A row's text with every thumbnail cell read as `#`, so it can be
 /// compared and printed.
 fn row_text(buffer: &Buffer, y: u16) -> String {
     (0..buffer.area.width)
         .map(|x| {
             let cell = &buffer[(x, y)];
-            if cell.symbol().contains(KITTY_PLACEHOLDER) || cell.skip {
-                "#"
-            } else {
+            if mark_of(cell) == Mark::Unmarked {
                 cell.symbol()
+            } else {
+                "#"
             }
         })
         .collect()
@@ -227,13 +367,14 @@ fn readable_rows(buffer: &Buffer) -> Vec<String> {
         .collect()
 }
 
-/// Each thumbnail row `y` draws: the column its Kitty placeholder stands in
-/// and how many columns it spans, counting the skipped cells after it.
+/// Each thumbnail row `y` draws: the column its area starts in, and how many
+/// columns it spans, counting the skipped cells after its first — whether
+/// that first cell holds the image, one row of it, or is skipped itself.
 fn thumbnails_on(buffer: &Buffer, y: u16) -> Vec<(u16, u16)> {
     let mut thumbnails = Vec::new();
     let mut x = 0;
     while x < buffer.area.width {
-        if buffer[(x, y)].symbol().contains(KITTY_PLACEHOLDER) {
+        if mark_of(&buffer[(x, y)]) != Mark::Unmarked {
             let skipped = (x + 1..buffer.area.width)
                 .take_while(|column| buffer[(*column, y)].skip)
                 .count();
@@ -247,12 +388,13 @@ fn thumbnails_on(buffer: &Buffer, y: u16) -> Vec<(u16, u16)> {
     thumbnails
 }
 
-/// Whether the frame draws no image at all: no placeholder, no skipped cell.
+/// Whether the frame draws no image at all: no image, no row of
+/// placeholders, no skipped cell.
 fn draws_no_image(buffer: &Buffer) -> bool {
     buffer
         .content()
         .iter()
-        .all(|cell| !cell.skip && !cell.symbol().contains(KITTY_PLACEHOLDER))
+        .all(|cell| mark_of(cell) == Mark::Unmarked)
 }
 
 /// The rows of the user Message block whose first row carries `first`, from
@@ -275,10 +417,12 @@ fn message_block(buffer: &Buffer, first: &str) -> (u16, Vec<String>) {
     (start, rows)
 }
 
-#[test]
-fn a_messages_thumbnails_stand_in_six_rows_beneath_its_text_inside_the_gutter() {
+fn a_messages_thumbnails_stand_in_six_rows_beneath_its_text_inside_the_gutter(
+    protocol: GraphicsProtocol,
+) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
 
     rendered_application_frame(&application, WIDTH, HEIGHT);
@@ -310,19 +454,78 @@ fn a_messages_thumbnails_stand_in_six_rows_beneath_its_text_inside_the_gutter() 
                 (left, THUMBNAIL_COLUMNS),
                 (left + THUMBNAIL_COLUMNS + 1, THUMBNAIL_COLUMNS)
             ],
-            "row {y}: {:#?}",
+            "{protocol} row {y}: {:#?}",
             readable_rows(&buffer)
         );
         assert_eq!(buffer[(gutter, y)].symbol(), "┃");
     }
+    assert_thumbnail_at(&buffer, protocol, left, start + 1);
+    assert_thumbnail_at(&buffer, protocol, left + THUMBNAIL_COLUMNS + 1, start + 1);
     // The dimmed lines have given way to the strip.
     assert!(!readable_rows(&buffer).join("\n").contains("Image 1 ·"));
 }
 
+/// Every frame a strip of two thumbnails passes through, drawn in a terminal
+/// that speaks `protocol`, with each cell of a thumbnail's area read as `#`:
+/// waiting on its thumbnails, drawn, scrolled part way off at every height,
+/// covered by a dialog, and with the Setting turned off.
+fn frames_through_every_state(
+    workspace: &std::path::Path,
+    protocol: GraphicsProtocol,
+) -> Vec<Vec<String>> {
+    let mut application =
+        connected_application_with_terminal_facts(workspace, answering(&[protocol]));
+    session_in_with_message(&mut application, workspace, TWO, &[screenshot(), diagram()]);
+    let mut frames = vec![readable_rows(&rendered_application_frame(
+        &application,
+        WIDTH,
+        HEIGHT,
+    ))];
+    answer_fetches(&mut application);
+    frames.extend(
+        (8..=HEIGHT)
+            .map(|height| readable_rows(&rendered_application_frame(&application, WIDTH, height))),
+    );
+    invoke(&mut application, SemanticCommandId::SettingsOpen);
+    frames.push(readable_rows(&rendered_application_frame(
+        &application,
+        WIDTH,
+        20,
+    )));
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    let mut settings = EffectiveSettings::default();
+    settings.transcript.image_previews = false;
+    deliver_settings(&mut application, settings);
+    frames.push(readable_rows(&rendered_application_frame(
+        &application,
+        WIDTH,
+        HEIGHT,
+    )));
+    frames
+}
+
 #[test]
-fn the_composer_stands_its_thumbnails_in_six_rows_above_its_text() {
+fn iterm2_and_sixel_reserve_and_cover_the_same_cells_as_kitty_in_every_state() {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let kitty = frames_through_every_state(workspace.path(), GraphicsProtocol::Kitty);
+    let strip = "#".repeat(usize::from(THUMBNAIL_COLUMNS));
+    assert!(
+        kitty.concat().iter().any(|row| row.contains(&strip)),
+        "some frame draws the strip"
+    );
+    for protocol in [GraphicsProtocol::Iterm2, GraphicsProtocol::Sixel] {
+        let frames = frames_through_every_state(workspace.path(), protocol);
+        for (state, (frame, kittys)) in frames.iter().zip(&kitty).enumerate() {
+            assert_eq!(frame, kittys, "{protocol}, frame {state}");
+        }
+        assert_eq!(frames.len(), kitty.len());
+    }
+}
+
+fn the_composer_stands_its_thumbnails_in_six_rows_above_its_text(protocol: GraphicsProtocol) {
+    let workspace = workspace_dir();
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     type_text(&mut application, "Look at ");
     paste_image(&mut application, screenshot());
 
@@ -349,17 +552,18 @@ fn the_composer_stands_its_thumbnails_in_six_rows_above_its_text() {
         assert_eq!(
             thumbnails_on(&buffer, y),
             vec![(border + 2, THUMBNAIL_COLUMNS)],
-            "row {y}: {:#?}",
+            "{protocol} row {y}: {:#?}",
             readable_rows(&buffer)
         );
     }
+    assert_thumbnail_at(&buffer, protocol, border + 2, top);
     assert!(row_text(&buffer, text + 1).contains('└'));
 }
 
-#[test]
-fn four_attachments_show_three_thumbnails_and_a_more_cell() {
+fn four_attachments_show_three_thumbnails_and_a_more_cell(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(
         &mut application,
         FOUR,
@@ -386,8 +590,11 @@ fn four_attachments_show_three_thumbnails_and_a_more_cell() {
                 (left + THUMBNAIL_COLUMNS + 1, THUMBNAIL_COLUMNS),
                 (third, THUMBNAIL_COLUMNS),
             ],
-            "row {y}"
+            "{protocol} row {y}"
         );
+    }
+    for x in [left, left + THUMBNAIL_COLUMNS + 1, third] {
+        assert_thumbnail_at(&buffer, protocol, x, start + 1);
     }
     let more = row_of(&buffer, "+1 more");
     assert!(
@@ -405,10 +612,10 @@ fn four_attachments_show_three_thumbnails_and_a_more_cell() {
     );
 }
 
-#[test]
-fn a_strip_partly_scrolled_off_leaves_its_rows_blank() {
+fn a_strip_partly_scrolled_off_leaves_its_rows_blank(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     frame_with_thumbnails(&mut application);
 
@@ -441,10 +648,10 @@ fn a_strip_partly_scrolled_off_leaves_its_rows_blank() {
     assert!(!draws_no_image(&whole));
 }
 
-#[test]
-fn a_strip_under_a_picker_or_a_dialog_leaves_its_rows_blank() {
+fn a_strip_under_a_picker_or_a_dialog_leaves_its_rows_blank(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     frame_with_thumbnails(&mut application);
 
@@ -492,10 +699,10 @@ fn a_strip_under_a_picker_or_a_dialog_leaves_its_rows_blank() {
     );
 }
 
-#[test]
-fn a_strip_beside_the_sidebar_is_still_drawn() {
+fn a_strip_beside_the_sidebar_is_still_drawn(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     frame_with_thumbnails(&mut application);
 
@@ -513,10 +720,12 @@ fn a_strip_beside_the_sidebar_is_still_drawn() {
     );
 }
 
-#[test]
-fn the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive() {
+fn the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive(
+    protocol: GraphicsProtocol,
+) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
 
     let waiting = rendered_application_frame(&application, WIDTH, HEIGHT);
@@ -555,6 +764,7 @@ fn the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive() {
         "{:#?}",
         readable_rows(&first)
     );
+    assert_thumbnail_at(&first, protocol, left, start + 1);
     assert_eq!(
         block[1],
         format!(
@@ -572,10 +782,12 @@ fn the_dimmed_lines_stand_in_the_reserved_rows_until_the_thumbnails_arrive() {
     assert!(!readable_rows(&arrived).join("\n").contains("Image 2 ·"));
 }
 
-#[test]
-fn a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail() {
+fn a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail(
+    protocol: GraphicsProtocol,
+) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     rendered_application_frame(&application, WIDTH, HEIGHT);
     let fetches = take_fetches(&mut application);
@@ -597,10 +809,11 @@ fn a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail() {
         assert_eq!(
             thumbnails_on(&buffer, y),
             vec![(left + 23, THUMBNAIL_COLUMNS)],
-            "row {y}: {:#?}",
+            "{protocol} row {y}: {:#?}",
             readable_rows(&buffer)
         );
     }
+    assert_thumbnail_at(&buffer, protocol, left + 23, start + 1);
     rendered_application_frame(&application, WIDTH, HEIGHT);
     assert_eq!(
         application.take_attachment_fetch(),
@@ -609,10 +822,10 @@ fn a_failed_fetch_leaves_its_line_in_its_slot_beside_the_others_thumbnail() {
     );
 }
 
-#[test]
-fn when_every_fetch_fails_the_dimmed_lines_stand() {
+fn when_every_fetch_fails_the_dimmed_lines_stand(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     rendered_application_frame(&application, WIDTH, HEIGHT);
     for fetch in take_fetches(&mut application) {
@@ -689,36 +902,40 @@ fn trimmed_block(buffer: &Buffer) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn with_the_setting_off_or_no_protocol_the_dimmed_lines_stand_without_reserving_rows() {
+fn with_the_setting_off_the_dimmed_lines_stand_without_reserving_rows(protocol: GraphicsProtocol) {
     let workspace = workspace_dir();
-
-    let mut off = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut off =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     let mut settings = EffectiveSettings::default();
     settings.transcript.image_previews = false;
     deliver_settings(&mut off, settings);
     session_with_message(&mut off, TWO, &[screenshot(), diagram()]);
     let buffer = rendered_application_frame(&off, WIDTH, HEIGHT);
-    assert_eq!(trimmed_block(&buffer), dimmed_block());
+    assert_eq!(trimmed_block(&buffer), dimmed_block(), "{protocol}");
     assert!(draws_no_image(&buffer));
     assert_eq!(off.take_attachment_fetch(), ApplicationTransition::Continue);
-
-    let mut unprobed =
-        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::default());
-    session_with_message(&mut unprobed, TWO, &[screenshot(), diagram()]);
-    let buffer = rendered_application_frame(&unprobed, WIDTH, HEIGHT);
-    assert_eq!(trimmed_block(&buffer), dimmed_block());
-    assert_eq!(
-        unprobed.take_attachment_fetch(),
-        ApplicationTransition::Continue
-    );
 
     // Turning the Setting back on reserves the strip again.
     let mut settings = EffectiveSettings::default();
     settings.transcript.image_previews = true;
     deliver_settings(&mut off, settings);
     let buffer = rendered_application_frame(&off, WIDTH, HEIGHT);
-    assert_eq!(trimmed_block(&buffer).len(), 1 + STRIP_ROWS);
+    assert_eq!(trimmed_block(&buffer).len(), 1 + STRIP_ROWS, "{protocol}");
+}
+
+#[test]
+fn with_no_protocol_the_dimmed_lines_stand_without_reserving_rows() {
+    let workspace = workspace_dir();
+    let mut unprobed =
+        connected_application_with_terminal_facts(workspace.path(), TerminalFacts::default());
+    session_with_message(&mut unprobed, TWO, &[screenshot(), diagram()]);
+    let buffer = rendered_application_frame(&unprobed, WIDTH, HEIGHT);
+    assert_eq!(trimmed_block(&buffer), dimmed_block());
+    assert!(draws_no_image(&buffer));
+    assert_eq!(
+        unprobed.take_attachment_fetch(),
+        ApplicationTransition::Continue
+    );
 }
 
 #[test]
@@ -859,17 +1076,19 @@ fn a_thumbnail_goes_with_the_label_deleted_from_the_draft() {
     assert_eq!(answer_fetches(&mut application), vec![screenshot().id]);
 }
 
-#[test]
-fn a_thumbnail_fetch_goes_to_the_open_sessions_origin() {
+fn a_thumbnail_fetch_goes_to_the_open_sessions_origin_for_the_selected_protocol(
+    protocol: GraphicsProtocol,
+) {
     let workspace = workspace_dir();
-    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    let mut application =
+        connected_application_with_terminal_facts(workspace.path(), answering(&[protocol]));
     session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
     rendered_application_frame(&application, WIDTH, HEIGHT);
     let ApplicationTransition::FetchAttachment {
         origin,
         attachment_id,
         cell_size,
-        protocol,
+        protocol: asked,
         ..
     } = application.take_attachment_fetch()
     else {
@@ -878,7 +1097,41 @@ fn a_thumbnail_fetch_goes_to_the_open_sessions_origin() {
     assert_eq!(origin, Outlook::Local);
     assert_eq!(attachment_id, screenshot().id);
     assert_eq!(cell_size, CELL);
-    assert_eq!(protocol, GraphicsProtocol::Kitty);
+    assert_eq!(asked, protocol);
+}
+
+#[test]
+fn a_terminal_answering_for_several_protocols_draws_with_the_one_preferred() {
+    use GraphicsProtocol::{Iterm2, Kitty, Sixel};
+    for (answered, preferred) in [
+        (&[Sixel, Kitty][..], Kitty),
+        (&[Sixel, Iterm2][..], Iterm2),
+        (&[Sixel, Iterm2, Kitty][..], Kitty),
+    ] {
+        let workspace = workspace_dir();
+        let mut application =
+            connected_application_with_terminal_facts(workspace.path(), answering(answered));
+        session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
+        rendered_application_frame(&application, WIDTH, HEIGHT);
+        let fetches = take_fetches(&mut application);
+        assert_eq!(
+            fetches
+                .iter()
+                .map(|fetch| fetch.protocol)
+                .collect::<Vec<_>>(),
+            vec![preferred; 2],
+            "answering {answered:?}"
+        );
+        for fetch in &fetches {
+            answer(&mut application, fetch, true);
+        }
+
+        let buffer = rendered_application_frame(&application, WIDTH, HEIGHT);
+        let (start, _) = message_block(&buffer, TWO);
+        let left = column_of(&buffer, start, "┃").expect("the gutter is drawn") + 2;
+        assert_thumbnail_at(&buffer, preferred, left, start + 1);
+        assert_thumbnail_at(&buffer, preferred, left + THUMBNAIL_COLUMNS + 1, start + 1);
+    }
 }
 
 #[test]
