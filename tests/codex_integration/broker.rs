@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::provider_support::ControlledProvider;
+use crate::provider_support::{ControlledProvider, ControlledProviderSession};
 use crate::server_support::{PROGRESS_DEADLINE, broker::McpClient};
 use crate::support::{ScriptedCodex, receive_initial_state};
 use serde_json::{Value, json};
@@ -30,11 +30,11 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, ApprovalPosture,
-        ClaudePermissionMode, CreateSessionRequest, InitialPrompt, ModelAvailability,
+        ClaudePermissionMode, CreateSessionRequest, InitialPrompt, MessageRole, ModelAvailability,
         ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
         TurnStatus,
     },
-    provider::{CodexRuntime, SubagentReport, SubagentReportOutcome},
+    provider::{CodexRuntime, ProviderEvent, SubagentReport, SubagentReportOutcome},
     server::{self, RunningServer, ServerConfig},
 };
 use tokio::time::timeout;
@@ -713,9 +713,13 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
 }
 
 /// An app-server whose Session's Turn spawns a native Subagent on a thread of its own, through a
-/// collab spawn, and leaves both working: neither the parent thread's Turn nor the child thread
-/// Suru attaches ever completes. Every request is answered by the id it came with, since the Model
-/// Catalog's discovery runs a process of its own.
+/// collab spawn, and leaves both working: the parent thread's Turn never completes, and the child
+/// thread Suru attaches works in its own native turn until the test releases it, when that turn
+/// completes. The release is awaited beside the read loop — which keeps answering meanwhile — and
+/// only while this app-server runs. A `turn/start` on the child's thread, handing it input of
+/// Suru's own, begins a native turn there whose input arrives on the thread as it would from Codex,
+/// and in which the child answers and completes. Every request is answered by the id it came with,
+/// since the Model Catalog's discovery runs a process of its own.
 const NATIVE_CHILD_WORKING: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
@@ -730,6 +734,15 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
+    *'"method":"turn/start"'*'"threadId":"child-thread"'*)
+      input=$(printf '%s' "$line" | sed -En 's/.*"input":\[\{"type":"text","text":("([^"\\]|\\.)*")\}\].*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"child-report-turn"}}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-report-turn","status":"inProgress","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-report-turn","item":{"type":"userMessage","id":"child-input","content":[{"type":"text","text":'"$input"'}]}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-report-turn","item":{"type":"agentMessage","id":"child-answer","text":""}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-report-turn","item":{"type":"agentMessage","id":"child-answer","text":"The Researcher found the Claude seam."}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-report-turn","status":"completed","items":[]}}}'
+      ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"inProgress","senderThreadId":"root-thread","receiverThreadIds":[],"agentsStates":{}}}}'
@@ -737,6 +750,16 @@ while IFS= read -r line; do
       ;;
     *'"method":"thread/resume"'*)
       printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-child"}}'
+      if [ -z "$attached" ]; then
+        attached=1
+        printf '%s\n' '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"inProgress","items":[]}}}'
+        (
+          while [ ! -e "$CODEX_FIXTURE_RELEASE" ] && kill -0 $$ 2>/dev/null; do sleep 0.01; done
+          if [ -e "$CODEX_FIXTURE_RELEASE" ]; then
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
+          fi
+        ) &
+      fi
       ;;
   esac
 done
@@ -762,176 +785,359 @@ async fn session_where(
     .unwrap_or_else(|_| panic!("{what}"))
 }
 
+/// A Codex Session on [`NATIVE_CHILD_WORKING`] whose collab spawn has opened a native Subagent's
+/// Session and attached its thread, on a Server hosting Claude's double beside it for the Subagents
+/// the Broker spawns, with what a thread's MCP client needs to reach the Broker.
+struct NativeCodexChild {
+    codex: ScriptedCodex,
+    server: RunningServer,
+    client: ManagedClient,
+    claude: ControlledProvider,
+    session_id: SessionId,
+    native_id: SessionId,
+    native_name: String,
+    endpoint: String,
+    authorization: String,
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+}
+
+impl NativeCodexChild {
+    async fn open(channel: &'static str) -> Self {
+        let codex = ScriptedCodex::new(NATIVE_CHILD_WORKING);
+        let (claude_runtime, claude) = ControlledProvider::with_provider(
+            ProviderId::new("claude"),
+            vec![ModelDescriptor {
+                provider: ProviderId::new("claude"),
+                id: ModelId::new("opus"),
+                display_name: "Opus".to_owned(),
+                description: String::new(),
+                is_default: true,
+                availability: ModelAvailability::Available,
+                options: Vec::new(),
+            }],
+        );
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let server = server::spawn_with_providers(
+            ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+            vec![
+                Arc::new(CodexRuntime::new(codex.executable())),
+                claude_runtime,
+            ],
+        )
+        .await
+        .expect("spawn server");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        receive_initial_state(&mut client).await;
+        let session_id = client
+            .create_session(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: Some(AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-fixture"),
+                    options: Vec::new(),
+                }),
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Map the crates".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .expect("create the Codex Session")
+            .session
+            .id;
+        let parent = session_where(
+            &client,
+            session_id,
+            "the collab spawn opens the native Subagent's row",
+            |snapshot| {
+                snapshot
+                    .activities
+                    .iter()
+                    .any(|activity| matches!(activity, Activity::Subagent { .. }))
+            },
+        )
+        .await;
+        let Some(Activity::Subagent {
+            session_id: native_id,
+            name: native_name,
+            ..
+        }) = parent
+            .activities
+            .iter()
+            .find(|activity| matches!(activity, Activity::Subagent { .. }))
+        else {
+            unreachable!()
+        };
+        let (native_id, native_name) = (*native_id, native_name.clone());
+        codex.wait_for_method("thread/resume").await;
+
+        // Every thread reaches the Broker the parent thread was handed, under its token.
+        let thread_start = codex
+            .requests()
+            .into_iter()
+            .find(|request| request["method"] == "thread/start")
+            .expect("Suru starts the parent's thread")["params"]
+            .clone();
+        let broker = broker_server(&thread_start, "thread/start");
+        let endpoint = broker["url"]
+            .as_str()
+            .expect("the Broker's endpoint")
+            .to_owned();
+        let authorization = broker["http_headers"]["Authorization"]
+            .as_str()
+            .expect("the parent thread's token")
+            .to_owned();
+        Self {
+            codex,
+            server,
+            client,
+            claude,
+            session_id,
+            native_id,
+            native_name,
+            endpoint,
+            authorization,
+            _state_dir: state_dir,
+            _workspace: workspace,
+        }
+    }
+
+    /// The MCP client the thread `thread` is, naming itself in every call as Codex does.
+    async fn thread_client(&self, thread: &str) -> McpClient {
+        let mut client = McpClient::presenting(&self.endpoint, Some(self.authorization.clone()))
+            .with_call_meta(json!({ "threadId": thread, "sessionId": "root-thread" }));
+        client.initialize().await;
+        client
+    }
+
+    /// The brokered Subagent's own Provider on Claude's double, started and handed its
+    /// Delegation, which it answers with.
+    async fn run_brokered(&mut self) -> (ControlledProviderSession, String) {
+        let start = timeout(PROGRESS_DEADLINE, self.claude.next_start())
+            .await
+            .expect("the brokered Subagent's Provider is asked to start");
+        let mut provider = start.succeed(AgentIdentity {
+            agent: AgentId::new("claude-agent"),
+            selection: AgentSelection {
+                provider: ProviderId::new("claude"),
+                model: ModelId::new("opus"),
+                options: Vec::new(),
+            },
+        });
+        let turn = timeout(PROGRESS_DEADLINE, provider.next_turn())
+            .await
+            .expect("the Delegation reaches the brokered Subagent's Provider");
+        let delegation = turn.prompt().to_owned();
+        turn.succeed();
+        (provider, delegation)
+    }
+
+    async fn shutdown(self) {
+        drop(self.client);
+        self.server.shutdown().await.expect("shut down server");
+    }
+}
+
+/// `spawn_subagent`'s arguments for a Subagent named `name` on Claude's Opus.
+fn claude_researcher(name: &str) -> Value {
+    json!({
+        "provider": "claude",
+        "model": "opus",
+        "name": name,
+        "description": "Survey the Claude seam",
+        "prompt": "Find where Claude plugs into Suru.",
+    })
+}
+
 #[tokio::test]
 async fn a_native_subagents_thread_calling_the_broker_is_attributed_to_the_subagents_session() {
-    let codex = ScriptedCodex::new(NATIVE_CHILD_WORKING);
-    let opus = AgentSelection {
-        provider: ProviderId::new("claude"),
-        model: ModelId::new("opus"),
-        options: Vec::new(),
-    };
-    let (claude_runtime, mut claude) = ControlledProvider::with_provider(
-        ProviderId::new("claude"),
-        vec![ModelDescriptor {
-            provider: ProviderId::new("claude"),
-            id: ModelId::new("opus"),
-            display_name: "Opus".to_owned(),
-            description: String::new(),
-            is_default: true,
-            availability: ModelAvailability::Available,
-            options: Vec::new(),
-        }],
-    );
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let channel = "codex-broker-native-attribution";
-    let server = server::spawn_with_providers(
-        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
-        vec![
-            Arc::new(CodexRuntime::new(codex.executable())),
-            claude_runtime,
-        ],
-    )
-    .await
-    .expect("spawn server");
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
-    receive_initial_state(&mut client).await;
-    let session_id = client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: Some(AgentSelection {
-                provider: ProviderId::new("codex"),
-                model: ModelId::new("gpt-fixture"),
-                options: Vec::new(),
-            }),
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "Map the crates".to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .await
-        .expect("create the Codex Session")
-        .session
-        .id;
-    let parent = session_where(
-        &client,
-        session_id,
-        "the collab spawn opens the native Subagent's row",
-        |snapshot| {
-            snapshot
-                .activities
-                .iter()
-                .any(|activity| matches!(activity, Activity::Subagent { .. }))
-        },
-    )
-    .await;
-    let Some(Activity::Subagent {
-        session_id: native_id,
-        name: native_name,
-        ..
-    }) = parent
-        .activities
-        .iter()
-        .find(|activity| matches!(activity, Activity::Subagent { .. }))
-    else {
-        unreachable!()
-    };
-    let native_id = *native_id;
-    let delegator = format!("the Subagent \"{native_name}\"");
-    codex.wait_for_method("thread/resume").await;
+    let mut native = NativeCodexChild::open("codex-broker-native-attribution").await;
+    let mut child_thread = native.thread_client("child-thread").await;
+    let mut root_thread = native.thread_client("root-thread").await;
 
-    // Both threads reach the Broker the parent thread was handed, under its token.
-    let thread_start = codex
-        .requests()
-        .into_iter()
-        .find(|request| request["method"] == "thread/start")
-        .expect("Suru starts the parent's thread")["params"]
-        .clone();
-    let broker = broker_server(&thread_start, "thread/start");
-    let endpoint = broker["url"].as_str().expect("the Broker's endpoint");
-    let authorization = broker["http_headers"]["Authorization"]
-        .as_str()
-        .expect("the parent thread's token")
-        .to_owned();
-    let mut child_thread = McpClient::presenting(endpoint, Some(authorization.clone()))
-        .with_call_meta(json!({ "threadId": "child-thread", "sessionId": "root-thread" }));
-    child_thread.initialize().await;
-    let mut root_thread = McpClient::presenting(endpoint, Some(authorization))
-        .with_call_meta(json!({ "threadId": "root-thread", "sessionId": "root-thread" }));
-    root_thread.initialize().await;
-    let researcher = |name: &str| {
-        json!({
-            "provider": "claude",
-            "model": "opus",
-            "name": name,
-            "description": "Survey the Claude seam",
-            "prompt": "Find where Claude plugs into Suru.",
-        })
-    };
-
-    let childs = child_thread.spawn_subagent(researcher("Researcher")).await;
+    let childs = child_thread
+        .spawn_subagent(claude_researcher("Researcher"))
+        .await;
     assert_eq!(
-        client
+        native
+            .client
             .read_session(childs)
             .await
             .expect("read the brokered Subagent")
             .session
             .parent,
-        Some(native_id),
+        Some(native.native_id),
         "the child thread's spawn is recorded beneath the native Subagent's Session"
     );
-    let native = client
-        .read_session(native_id)
+    let native_session = native
+        .client
+        .read_session(native.native_id)
         .await
         .expect("read the native Subagent");
     assert!(
-        native.activities.iter().any(|activity| matches!(
+        native_session.activities.iter().any(|activity| matches!(
             activity,
             Activity::Subagent { session_id, .. } if *session_id == childs
         )),
         "whose Transcript holds its row: {:?}",
-        native.activities
+        native_session.activities
     );
-    let start = timeout(PROGRESS_DEADLINE, claude.next_start())
-        .await
-        .expect("the brokered Subagent's Provider is asked to start");
-    let mut provider = start.succeed(AgentIdentity {
-        agent: AgentId::new("claude-agent"),
-        selection: opus,
-    });
-    let turn = timeout(PROGRESS_DEADLINE, provider.next_turn())
-        .await
-        .expect("the Delegation reaches the brokered Subagent's Provider");
+    let (provider, delegation) = native.run_brokered().await;
     assert_eq!(
-        turn.prompt(),
+        delegation,
         format!(
-            "Delegated to you through Suru by {delegator}.\n\nFind where Claude plugs into Suru."
+            "Delegated to you through Suru by the Subagent \"{}\".\n\nFind where Claude plugs \
+             into Suru.",
+            native.native_name
         ),
         "the Delegation names the native Subagent as the Agent that sent it"
     );
-    turn.succeed();
 
-    let parents = root_thread.spawn_subagent(researcher("Scout")).await;
+    let parents = root_thread.spawn_subagent(claude_researcher("Scout")).await;
     assert_eq!(
-        client
+        native
+            .client
             .read_session(parents)
             .await
             .expect("read the brokered Subagent")
             .session
             .parent,
-        Some(session_id),
+        Some(native.session_id),
         "while the parent thread's own spawn is the Session's"
     );
 
-    drop(client);
-    server.shutdown().await.expect("shut down server");
+    native.shutdown().await;
+    drop(provider);
+}
+
+#[tokio::test]
+async fn a_report_to_a_settled_native_subagent_leaves_as_a_turn_start_on_its_thread() {
+    let mut native = NativeCodexChild::open("codex-broker-native-report").await;
+    let mut child_thread = native.thread_client("child-thread").await;
+    let childs = child_thread
+        .spawn_subagent(claude_researcher("Researcher"))
+        .await;
+    let (provider, _) = native.run_brokered().await;
+
+    // The native Subagent's own turn completes while the Subagent it delegated to works on.
+    native.codex.release();
+    session_where(
+        &native.client,
+        native.native_id,
+        "the native Subagent's stretch of work settles",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Completed,
+    )
+    .await;
+
+    // The brokered Subagent answers and settles, which it reports to the native Subagent.
+    const ANSWER: &str = "Claude plugs in through its stream-json process.";
+    for event in [
+        ProviderEvent::AgentMessageStarted,
+        ProviderEvent::AgentMessageDelta {
+            content: ANSWER.to_owned(),
+        },
+        ProviderEvent::AgentMessageCompleted,
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider.emit_and_wait_until_observed(event).await;
+    }
+
+    // It wakes the native Subagent into a Continuation of its own Session, which the child thread
+    // completes having answered.
+    let woken = session_where(
+        &native.client,
+        native.native_id,
+        "the Report wakes the native Subagent into a Continuation that settles",
+        |snapshot| {
+            snapshot
+                .turns
+                .get(1)
+                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+        },
+    )
+    .await;
+    let Some(Activity::Subagent { duration_ms, .. }) = woken.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == childs),
+    ) else {
+        panic!("the native Subagent's Transcript holds the brokered Subagent's row");
+    };
+    let report = SubagentReport::new(
+        childs,
+        "Researcher",
+        SubagentReportOutcome::Completed,
+        *duration_ms,
+        Some(ANSWER),
+    )
+    .to_string();
+    let requests = native.codex.requests();
+    let reporting = requests
+        .iter()
+        .position(|request| {
+            request["method"] == "turn/start" && request["params"]["threadId"] == "child-thread"
+        })
+        .expect("the Report leaves as a turn/start on the child's thread");
+    let turn_start = &requests[reporting]["params"];
+    assert_eq!(
+        turn_start["input"],
+        json!([{ "type": "text", "text": report }]),
+        "whose whole input is the Report as Suru words it: {turn_start}"
+    );
+    assert!(
+        ["model", "effort", "summary"]
+            .iter()
+            .all(|setting| turn_start.get(setting).is_none()),
+        "naming no Model, effort or Reasoning summary, so the Subagent goes on as its spawn set \
+         it running: {turn_start}"
+    );
+    assert!(
+        requests[..reporting]
+            .iter()
+            .filter(|request| request["method"] == "thread/resume")
+            .count()
+            == 2,
+        "the settled child's thread is attached again first, so the turn it begins streams \
+         here: {:?}",
+        native.codex.methods()
+    );
+    assert_eq!(woken.turns[1].prompt_id, None, "a Continuation");
+    assert_eq!(
+        woken
+            .messages
+            .iter()
+            .filter(|message| message.turn_id == woken.turns[1].id)
+            .map(|message| (message.role.clone(), message.content.as_str()))
+            .collect::<Vec<_>>(),
+        [(MessageRole::Agent, "The Researcher found the Claude seam.")],
+        "holding what the child thread did, and nothing for the Report its turn began with"
+    );
+    assert!(
+        woken
+            .activities
+            .iter()
+            .all(|activity| activity.turn_id() != woken.turns[1].id),
+        "no row stands for the Report"
+    );
+    let parent = native
+        .client
+        .read_session(native.session_id)
+        .await
+        .expect("read the Codex Session");
+    assert_eq!(
+        (parent.turns.len(), parent.activities.len()),
+        (1, 1),
+        "and the Codex Session's own Transcript gains nothing"
+    );
+
+    native.shutdown().await;
     drop(provider);
 }
