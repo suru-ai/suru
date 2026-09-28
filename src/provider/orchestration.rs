@@ -1,8 +1,14 @@
 mod approvals;
+mod delegations;
 mod questionnaires;
 mod watch_outcomes;
 
 use approvals::{DecisionDeliveries, LiveApprovals};
+pub(crate) use delegations::{BrokeredDelivery, BrokeredSendRefusal};
+use delegations::{
+    PendingDelegation, open_resume, refuse_while_stopping, refuse_withdrawn, run_delegated_turn,
+    steer_with_delegation,
+};
 use questionnaires::{LiveQuestionnaires, QuestionnaireDeliveries};
 use watch_outcomes::{HeldWatchOutcomes, WatchOutcome};
 
@@ -82,8 +88,9 @@ const SUBAGENT_CONNECTION_LOST_MESSAGE: &str =
 const SUBAGENT_FAILED_MESSAGE: &str =
     "Provider execution failed: the Provider reported this Subagent failing.";
 
-/// The failure a delegated Turn settles with when its Delegation reaches the
-/// Subagent's actor while another Turn is running there.
+/// The failure a spawn's delegated Turn settles with when its Delegation
+/// reaches the Subagent's actor while another Turn is running there, which a
+/// spawn — the first thing its actor is asked — never finds.
 const DELEGATION_WHILE_WORKING_MESSAGE: &str =
     "Provider execution failed: the Subagent was already working when this Delegation arrived.";
 
@@ -235,6 +242,12 @@ enum ProviderCommand {
         turn_id: TurnId,
         input: ProviderPrompt,
     },
+    /// Deliver a Delegation an Agent sent the brokered Subagent whose Session
+    /// this actor owns after its spawn, and answer how it was delivered
+    /// (ADR 0032): into the Turn a Delegation began, which its Provider still
+    /// works, as a steer; and otherwise as the opening of a resume — once any
+    /// Continuation still open has settled, its Provider work interrupted.
+    DeliverDelegation(PendingDelegation),
     SteerPrompt,
     /// Hand the Subagent Reports waiting in the store for `target` to its
     /// Agent (ADR 0035): the Session this actor owns — whose Turn at work is
@@ -2106,6 +2119,9 @@ async fn run_provider_session(
     let mut decision_deliveries = DecisionDeliveries::default();
     let mut deferred_prompt_id = None;
     let mut pending_turn_starts = VecDeque::new();
+    // Delegations that wait to begin a resume until the Continuation they
+    // found open has settled, in the order they arrived.
+    let mut pending_delegations: VecDeque<PendingDelegation> = VecDeque::new();
     // Whether Subagent Reports a working Turn could not take were put back to
     // wait, to be delivered again once that Turn settles — waking the Agent
     // then, unless a Prompt begins the next Turn first and takes them itself.
@@ -2142,6 +2158,10 @@ async fn run_provider_session(
                             .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
                         ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                     }
+                    _ = std::future::ready(()), if !pending_delegations.is_empty() => {
+                        let pending = pending_delegations.pop_front().expect("pending Delegation");
+                        ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending)))
+                    }
                     _ = std::future::ready(()), if reports_owed => {
                         reports_owed = false;
                         ActorInput::Command(Some(ProviderCommand::DeliverReports {
@@ -2155,6 +2175,8 @@ async fn run_provider_session(
                 .or_else(|| deferred_prompt_id.take())
             {
                 ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+            } else if let Some(pending) = pending_delegations.pop_front() {
+                ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending)))
             } else {
                 tokio::select! {
                     biased;
@@ -2409,31 +2431,39 @@ async fn run_provider_session(
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
                 ProviderCommand::StartDelegation { turn_id, input } => {
-                    match begin_delegated_turn(
+                    let begun = run_delegated_turn(
                         &connector,
                         &mut provider,
                         &mut subagents,
                         &mut shutdown,
+                        &mut active,
                         turn_id,
                         input,
                     )
-                    .await
-                    {
-                        DelegatedTurnStart::Began => {
-                            active = Some(ActiveProviderTurn::new_delegated(turn_id));
-                            subagents.late_settle_owes_continuation = false;
-                            // A Watch that woke the Agent heads the Turn it
-                            // next works in, whatever began it.
-                            release_watch_outcomes(
-                                &sessions,
-                                &updates,
-                                &mut subagents,
-                                session_id,
-                                turn_id,
-                            );
-                        }
-                        DelegatedTurnStart::Settled => {}
-                        DelegatedTurnStart::Stopping => break 'actor,
+                    .await;
+                    if begun.is_break() {
+                        break 'actor;
+                    }
+                    continue;
+                }
+                // With no Turn working, a Delegation sent after the spawn
+                // begins a resume (ADR 0031, 0032).
+                ProviderCommand::DeliverDelegation(pending) => {
+                    let Some((turn_id, input)) = open_resume(&connector, pending) else {
+                        continue;
+                    };
+                    let begun = run_delegated_turn(
+                        &connector,
+                        &mut provider,
+                        &mut subagents,
+                        &mut shutdown,
+                        &mut active,
+                        turn_id,
+                        input,
+                    )
+                    .await;
+                    if begun.is_break() {
+                        break 'actor;
                     }
                     continue;
                 }
@@ -2870,6 +2900,17 @@ async fn run_provider_session(
                 command = commands.recv() => ActorInput::Command(command),
             }
         };
+        // A stop reaching the Subagent withdraws the Delegations waiting to
+        // resume it once its Continuation settles: what the stop ends is not
+        // begun again behind it. Only a brokered Subagent's actor holds any,
+        // and it is asked for no Prompt, so this is a stop from outside the
+        // actor — never the interrupt one of them asks for below.
+        if matches!(
+            input,
+            ActorInput::Command(Some(ProviderCommand::InterruptSession { .. }))
+        ) {
+            pending_delegations.drain(..).for_each(refuse_withdrawn);
+        }
         // A native Continuation must release its Provider Turn before the
         // next Prompt starts one. Reuse the normal interrupt path and wait
         // for its terminal event; a local settle alone leaves Codex busy.
@@ -2880,6 +2921,19 @@ async fn run_provider_session(
                 }) =>
             {
                 pending_turn_starts.push_back(prompt_id);
+                let (response, _) = oneshot::channel();
+                ActorInput::Command(Some(ProviderCommand::InterruptSession { response }))
+            }
+            // So does a Delegation's resume, which a Continuation the
+            // Provider runs is no Delegation's to steer: it waits for the
+            // Continuation to settle.
+            ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending)))
+                if active.as_ref().is_some_and(|turn| {
+                    turn.continuation == Some(ContinuationExecution::ProviderTurn)
+                        && !turn.interruption_acknowledged
+                }) =>
+            {
+                pending_delegations.push_back(pending);
                 let (response, _) = oneshot::channel();
                 ActorInput::Command(Some(ProviderCommand::InterruptSession { response }))
             }
@@ -2989,9 +3043,56 @@ async fn run_provider_session(
                 let _ = response.send(updated);
             }
 
-            // A Delegation begins a Turn only in a brokered Subagent's
-            // Session, whose actor its spawn starts idle, so one arriving
-            // while a Turn runs here has nothing to begin over: its Turn fails
+            // A Delegation sent after the spawn reaches the Turn at work here
+            // as a steer when a Delegation began it (ADR 0032). A Continuation
+            // is no Delegation's to steer: one Suru opened for late output
+            // settles at once, as worked, and one whose stop is under way
+            // settles when its Provider says, and the resume begins after
+            // either — while a Delegation's Turn already being stopped is
+            // steered by nothing, the Provider stopping it first.
+            ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending))) => {
+                let current = active
+                    .as_mut()
+                    .expect("Provider input is handled while a Turn is active");
+                match current.continuation {
+                    None if current.interruption_acknowledged => refuse_while_stopping(pending),
+                    None => {
+                        let steered = steer_with_delegation(
+                            &sessions,
+                            &updates,
+                            provider_session.as_ref(),
+                            &mut shutdown,
+                            session_id,
+                            current.turn_id,
+                            pending,
+                        )
+                        .await;
+                        if steered.is_break() {
+                            break 'actor;
+                        }
+                    }
+                    Some(ContinuationExecution::LateOutput)
+                        if !current.interruption_acknowledged =>
+                    {
+                        let trailing_output = current.take_trailing_output();
+                        let Some(_) = updates.apply(|| {
+                            sessions.finish_provider_turn(
+                                session_id,
+                                current.turn_id,
+                                ProviderTurnOutcome::Completed { trailing_output },
+                            )
+                        }) else {
+                            break;
+                        };
+                        active = None;
+                        pending_delegations.push_front(pending);
+                    }
+                    Some(_) => pending_delegations.push_back(pending),
+                }
+            }
+            // A spawn's Delegation begins its Turn on the actor the spawn
+            // started, before anything else reaches it, so one arriving while
+            // a Turn runs here has nothing to begin over: its Turn fails
             // where a reader sees it rather than waiting on nothing.
             ActorInput::Command(Some(ProviderCommand::StartDelegation { turn_id, .. })) => {
                 if active

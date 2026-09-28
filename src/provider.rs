@@ -36,8 +36,8 @@ pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{
-    BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator,
-    ProviderUpdateGate,
+    BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
+    BrokeredSubagentRequest, ProviderOrchestrator, ProviderUpdateGate,
 };
 pub use report::{SubagentReport, SubagentReportOutcome};
 
