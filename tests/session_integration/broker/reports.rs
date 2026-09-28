@@ -14,12 +14,13 @@ use suru::provider::{SubagentReport, SubagentReportOutcome};
 use super::*;
 
 /// The answer the Subagents below settle with.
-const ANSWER: &str = "Three seams: ProviderRuntime, ProviderSession and the Broker's Tools.";
+pub(super) const ANSWER: &str =
+    "Three seams: ProviderRuntime, ProviderSession and the Broker's Tools.";
 
 /// The Report `caller` is owed for `child`'s latest settled row, as its row
 /// reads: the Subagent by the name the spawn gave it, how its stretch settled
 /// and after how long, and its final Message.
-fn report_of(
+pub(super) fn report_of(
     caller: &SessionSnapshot,
     child: SessionId,
     outcome: SubagentReportOutcome,
@@ -130,7 +131,7 @@ async fn active_again(descriptor: &RuntimeDescriptor, session_id: SessionId) {
 }
 
 /// Everything `snapshot`'s Transcript holds that stands in Turn `turn_id`.
-fn held_in(snapshot: &SessionSnapshot, turn_id: suru::protocol::TurnId) -> usize {
+pub(super) fn held_in(snapshot: &SessionSnapshot, turn_id: suru::protocol::TurnId) -> usize {
     snapshot
         .messages
         .iter()

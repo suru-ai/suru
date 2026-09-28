@@ -151,9 +151,6 @@ pub struct ControlledProviderSession {
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
     subagent_stops: mpsc::UnboundedReceiver<SubagentStop>,
     watches_stops: mpsc::UnboundedReceiver<WatchesStop>,
-    // Read once a native Subagent can delegate through the Broker, which is
-    // the only way one receives a Subagent Report (#420).
-    #[allow(dead_code)]
     subagent_deliveries: mpsc::UnboundedReceiver<SubagentDelivery>,
     posture_updates: mpsc::UnboundedReceiver<PostureUpdate>,
     gate_posture_updates: Arc<AtomicBool>,
@@ -221,9 +218,7 @@ pub struct SubagentStop {
 
 /// Input Suru delivered to one native Subagent by the identity the double
 /// minted for it — a Subagent Report to a native Subagent that delegated
-/// through the Broker — held until the test answers it. Nothing reaches it
-/// until a native Subagent can delegate through the Broker (#420).
-#[allow(dead_code)]
+/// through the Broker — held until the test answers it.
 pub struct SubagentDelivery {
     subagent_id: ProviderSubagentId,
     input: ProviderInput,
@@ -765,7 +760,6 @@ impl ControlledProviderSession {
 
     /// The next input Suru delivers to one of this Provider's native
     /// Subagents by identity.
-    #[allow(dead_code)]
     pub async fn next_subagent_delivery(&mut self) -> SubagentDelivery {
         self.subagent_deliveries
             .recv()
@@ -938,7 +932,6 @@ impl WatchesStop {
     }
 }
 
-#[allow(dead_code)]
 impl SubagentDelivery {
     /// The Provider identity the delivery named, as the test minted it.
     pub fn subagent(&self) -> &str {
