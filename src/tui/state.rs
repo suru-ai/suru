@@ -599,7 +599,7 @@ pub struct TuiState {
     /// its answer belongs where the draft it hands back is: both wait here
     /// until the Landing is next drawn.
     deferred_refusal: Option<DeferredRefusal>,
-    /// Why the open route could not hydrate, if its newest attachment failed.
+    /// Why the open route could not hydrate, if its newest attach failed.
     ///
     /// This is client presentation, not Session history: it never enters a
     /// snapshot, Activity, Turn, or protocol event. Keeping it beside the
@@ -995,9 +995,9 @@ impl TuiState {
         self.sync_composer_completion();
     }
 
-    fn abandon_pending_attachment(&mut self) {
-        self.sidebar.abandon_attachment();
-        self.session_picker.abandon_attachment();
+    fn abandon_pending_attach(&mut self) {
+        self.sidebar.abandon_attach();
+        self.session_picker.abandon_attach();
     }
 
     /// Carries the reader into `target` at once, before anything of it has
@@ -2853,7 +2853,7 @@ impl TuiState {
 
     /// Whether activating the open Sidebar row means retry rather than merely
     /// handing the keys back. Only a failed optimistic shell has that meaning:
-    /// an attachment still in flight must not be duplicated, and a hydrated
+    /// an attach still in flight must not be duplicated, and a hydrated
     /// Session is already open.
     fn open_session_can_retry(&self) -> bool {
         self.opening_error.is_some()
@@ -3895,8 +3895,8 @@ pub enum ApplicationEvent {
         operation_id: AgentSelectionOperationId,
         error: String,
     },
-    SessionAttachmentFailed(String),
-    OriginSessionAttachmentFailed {
+    SessionAttachFailed(String),
+    OriginSessionAttachFailed {
         reference: SessionReference,
         error: String,
     },
@@ -4182,7 +4182,7 @@ pub enum ApplicationTransition {
     /// Report a root Session as Viewed without changing the main-view route.
     /// Produced when its Turn Settles while it is already open.
     ViewSession(SessionReference),
-    /// Report a listed root Session as Viewed while beginning its attachment.
+    /// Report a listed root Session as Viewed while beginning its attach.
     /// Keeping this distinct from `AttachSession` makes Subagent navigation
     /// incapable of accidentally reporting a child as Viewed.
     ViewAndAttachSession(SessionReference),
@@ -4546,28 +4546,28 @@ impl Application {
                 }
                 self.attach_session(reference, snapshot)
             }
-            ApplicationEvent::SessionAttachmentFailed(error) => {
+            ApplicationEvent::SessionAttachFailed(error) => {
                 if self.state.sidebar.is_attaching()
                     || (self.state.route.is_some() && self.state.session.is_none())
                 {
                     // The target remains the route and the refusal belongs to
                     // its main content, not to the listing that led there.
-                    Ok(self.fail_open_session_attachment(error))
+                    Ok(self.fail_open_session_attach(error))
                 } else {
                     Ok(Self::session_picker_listing_transition(
-                        self.state.session_picker.fail_attachment(error),
+                        self.state.session_picker.fail_attach(error),
                     ))
                 }
             }
-            ApplicationEvent::OriginSessionAttachmentFailed { reference, error } => {
+            ApplicationEvent::OriginSessionAttachFailed { reference, error } => {
                 if reference.origin != self.state.outlook {
                     return Ok(ApplicationTransition::Continue);
                 }
                 if self.state.route.as_ref() == Some(&reference) && self.state.session.is_none() {
-                    Ok(self.fail_open_session_attachment(error))
+                    Ok(self.fail_open_session_attach(error))
                 } else {
                     Ok(Self::session_picker_listing_transition(
-                        self.state.session_picker.fail_attachment(error),
+                        self.state.session_picker.fail_attach(error),
                     ))
                 }
             }
@@ -6226,7 +6226,7 @@ impl Application {
                 };
             }
             CommandId::SelectSession => {
-                let Some(target) = self.state.session_picker.begin_attachment() else {
+                let Some(target) = self.state.session_picker.begin_attach() else {
                     return ApplicationTransition::Continue;
                 };
                 if target.origin == self.state.outlook {
@@ -6324,7 +6324,7 @@ impl Application {
                     }
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
-                    // attachment follows it.
+                    // attach follows it.
                     SidebarActivation::Attach {
                         session,
                         workspace,
@@ -7089,7 +7089,7 @@ impl Application {
             self.state.session_picker.close();
         }
         if answers_sidebar {
-            self.state.sidebar.finish_attachment();
+            self.state.sidebar.finish_attach();
         }
         Ok(if views_root {
             ApplicationTransition::ViewSession(reference)
@@ -7098,9 +7098,9 @@ impl Application {
         })
     }
 
-    fn fail_open_session_attachment(&mut self, error: String) -> ApplicationTransition {
+    fn fail_open_session_attach(&mut self, error: String) -> ApplicationTransition {
         self.state.fail_opening_session(error);
-        self.state.sidebar.fail_attachment();
+        self.state.sidebar.fail_attach();
         ApplicationTransition::Continue
     }
 
@@ -8348,7 +8348,7 @@ impl Application {
             self.state.confirmed_agent_selection = None;
         }
         self.state.session_events_blocked = detached;
-        self.state.abandon_pending_attachment();
+        self.state.abandon_pending_attach();
         self.state.sync_composer_completion();
         // Detaching whether or not a Session was on screen: a Session being
         // opened is one the reader is on their way to, and the Landing is

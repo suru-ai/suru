@@ -2252,24 +2252,24 @@ impl Sidebar {
     /// The Session the Sidebar asked for is on screen. The keys went to its
     /// composer when the reader chose it, so nothing moves here — and a
     /// reader who has since come back to the column keeps them.
-    pub(super) fn finish_attachment(&mut self) {
+    pub(super) fn finish_attach(&mut self) {
         self.attaching = None;
     }
 
     /// The client left the Session the Sidebar was opening, for the Landing or
-    /// for another Workspace. The attachment behind it has been let go of, so
+    /// for another Workspace. The attach behind it has been let go of, so
     /// the Sidebar stops waiting on an answer that is never coming, without
     /// reporting a refusal that never happened. Turning toward another Outlook
     /// leaves it through [`Self::adopt_outlook`], which puts the whole column
     /// down rather than only what it was opening.
-    pub(super) fn abandon_attachment(&mut self) {
+    pub(super) fn abandon_attach(&mut self) {
         self.attaching = None;
     }
 
-    /// The server refused the attachment. The reader keeps the keys and the
+    /// The server refused the attach. The reader keeps the keys and the
     /// list; the open shell owns the refusal because it is where the reader
     /// went, while the listing remains a valid route back to a retry.
-    pub(super) fn fail_attachment(&mut self) {
+    pub(super) fn fail_attach(&mut self) {
         self.attaching = None;
     }
 

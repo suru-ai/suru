@@ -245,14 +245,14 @@ impl SessionPicker {
         self.confirming_delete = None;
     }
 
-    /// The client left the Session the picker was opening. The attachment
+    /// The client left the Session the picker was opening. The attach
     /// behind it has been let go of, so the picker stops waiting on an answer
     /// that is never coming.
-    pub(super) fn abandon_attachment(&mut self) {
+    pub(super) fn abandon_attach(&mut self) {
         self.attaching = None;
     }
 
-    pub(super) fn fail_attachment(&mut self, error: String) -> SessionPickerListing {
+    pub(super) fn fail_attach(&mut self, error: String) -> SessionPickerListing {
         self.listing.report_error(error);
         self.begin_listing()
     }
@@ -376,7 +376,7 @@ impl SessionPicker {
         self.move_selection(10);
     }
 
-    pub(super) fn begin_attachment(&mut self) -> Option<SessionReference> {
+    pub(super) fn begin_attach(&mut self) -> Option<SessionReference> {
         if self.is_loading() {
             return None;
         }

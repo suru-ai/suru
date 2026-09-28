@@ -595,7 +595,7 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
 }
 
 #[test]
-fn a_remote_session_row_carries_its_origin_into_attachment() {
+fn a_remote_session_row_carries_its_origin_into_its_attach() {
     let mut application = Application::default();
     type_terminal_text(&mut application, "/connect");
     press(&mut application, KeyCode::Enter);

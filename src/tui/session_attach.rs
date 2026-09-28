@@ -1,4 +1,4 @@
-//! Correlating Session attachment with the reader's newest navigation.
+//! Correlating a Session attach with the reader's newest navigation.
 //!
 //! Attaching a Session is asynchronous: the client asks, and a snapshot and a
 //! live subscription come back some time later. A reader does not wait for it.
@@ -6,7 +6,7 @@
 //! Landing, or move to a different Workspace — and every one of those is them
 //! saying which Session they are on now.
 //!
-//! So attachment work carries the Session it is for and the attempt that
+//! So attach work carries the Session it is for and the attempt that
 //! started it, and only the answer to the question the reader is still asking
 //! is allowed to land. Everything else is work they walked away from: its
 //! snapshot must not become the open Session, its subscription must not be
@@ -22,12 +22,12 @@ use crate::protocol::SessionReference;
 /// Session it is for — which is what tells the reader's second attempt at a
 /// Session apart from the first one they abandoned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct AttachmentOperationId(u64);
+pub(super) struct AttachOperationId(u64);
 
-/// Whether a finished attachment is still the one the reader is waiting on.
+/// Whether a finished attach is still the one the reader is waiting on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
-pub(super) enum AttachmentOutcome {
+pub(super) enum AttachOutcome {
     /// The reader is still on this one: apply it, and adopt the subscription
     /// it carries.
     Current,
@@ -36,43 +36,43 @@ pub(super) enum AttachmentOutcome {
     Superseded,
 }
 
-impl AttachmentOutcome {
+impl AttachOutcome {
     pub(super) const fn is_current(self) -> bool {
         matches!(self, Self::Current)
     }
 }
 
-/// The one Session attachment the reader is waiting on, if any.
+/// The one Session attach the reader is waiting on, if any.
 ///
 /// There is only ever one: navigating supersedes rather than queues, because
 /// the reader's newest choice is the only one that can still be right. The
-/// attachment already in flight is let go of the moment a newer one starts,
-/// and a pending attachment is let go of outright when the client leaves for
+/// attach already in flight is let go of the moment a newer one starts,
+/// and a pending attach is let go of outright when the client leaves for
 /// the Landing, another Workspace, or another Outlook, or when it shuts down.
 #[derive(Default)]
-pub(super) struct SessionAttachment {
-    /// How many attachments this client has started, which is where the next
+pub(super) struct SessionAttach {
+    /// How many attaches this client has started, which is where the next
     /// attempt's identity comes from.
     operations: u64,
-    pending: Option<PendingAttachment>,
+    pending: Option<PendingAttach>,
 }
 
-/// Attachment work in flight, and the identity its result has to match.
-struct PendingAttachment {
-    operation: AttachmentOperationId,
+/// Attach work in flight, and the identity its result has to match.
+struct PendingAttach {
+    operation: AttachOperationId,
     task: JoinHandle<()>,
 }
 
-/// Letting go of attachment work stops it. Dropping the coordinator — which
+/// Letting go of attach work stops it. Dropping the coordinator — which
 /// is what leaving the run loop does — is the same act as abandoning it, so
 /// shutdown needs no separate path to keep a late result from landing.
-impl Drop for PendingAttachment {
+impl Drop for PendingAttach {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-impl SessionAttachment {
+impl SessionAttach {
     /// Starts attaching `target`, superseding whatever was already in flight.
     ///
     /// `spawn` is handed the operation identity to carry back with its result,
@@ -81,34 +81,34 @@ impl SessionAttachment {
     pub(super) fn begin(
         &mut self,
         target: SessionReference,
-        spawn: impl FnOnce(SessionReference, AttachmentOperationId) -> JoinHandle<()>,
+        spawn: impl FnOnce(SessionReference, AttachOperationId) -> JoinHandle<()>,
     ) {
         self.operations += 1;
-        let operation = AttachmentOperationId(self.operations);
+        let operation = AttachOperationId(self.operations);
         let task = spawn(target, operation);
-        self.pending = Some(PendingAttachment { operation, task });
+        self.pending = Some(PendingAttach { operation, task });
     }
 
-    /// Lets go of a pending attachment, stopping the work and invalidating its
+    /// Lets go of a pending attach, stopping the work and invalidating its
     /// result. What the reader is on is theirs to say, and they have said it.
     pub(super) fn abandon(&mut self) {
         self.pending = None;
     }
 
-    /// Answers what a finished attachment may do, and forgets it once it is
+    /// Answers what a finished attach may do, and forgets it once it is
     /// the one that was being waited on.
     ///
     /// The attempt's identity is the whole of the correlation: it is never
     /// reused, so it already says which Session the work was for and which of
     /// the reader's choices asked for it.
-    pub(super) fn settle(&mut self, operation: AttachmentOperationId) -> AttachmentOutcome {
+    pub(super) fn settle(&mut self, operation: AttachOperationId) -> AttachOutcome {
         if self.pending.as_ref().map(|pending| pending.operation) != Some(operation) {
-            return AttachmentOutcome::Superseded;
+            return AttachOutcome::Superseded;
         }
         // Letting go of finished work stops nothing: the task's last act was
         // reporting this result, so the abort its drop asks for is a no-op.
         self.pending = None;
-        AttachmentOutcome::Current
+        AttachOutcome::Current
     }
 }
 
@@ -116,25 +116,25 @@ impl SessionAttachment {
 mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-    use super::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
+    use super::{AttachOperationId, AttachOutcome, SessionAttach};
     use crate::protocol::{Outlook, SessionId, SessionReference};
 
     fn session() -> SessionReference {
         SessionReference::new(Outlook::Local, SessionId::new())
     }
 
-    /// Attachment work that never answers by itself, so the only way a test
+    /// Attach work that never answers by itself, so the only way a test
     /// sees it end is something stopping it. Dropping the parked future — what
     /// aborting the task does — reports the attempt that was let go of.
-    struct ParkedAttachments {
-        stopped: UnboundedSender<AttachmentOperationId>,
-        letting_go: UnboundedReceiver<AttachmentOperationId>,
+    struct ParkedAttaches {
+        stopped: UnboundedSender<AttachOperationId>,
+        letting_go: UnboundedReceiver<AttachOperationId>,
     }
 
     /// Reports its attempt when the work holding it is dropped.
     struct StopWitness {
-        stopped: UnboundedSender<AttachmentOperationId>,
-        operation: AttachmentOperationId,
+        stopped: UnboundedSender<AttachOperationId>,
+        operation: AttachOperationId,
     }
 
     impl Drop for StopWitness {
@@ -143,7 +143,7 @@ mod tests {
         }
     }
 
-    impl ParkedAttachments {
+    impl ParkedAttaches {
         fn new() -> Self {
             let (stopped, letting_go) = unbounded_channel();
             Self {
@@ -152,16 +152,16 @@ mod tests {
             }
         }
 
-        /// Starts an attachment to `target` whose work parks forever, and
+        /// Starts an attach to `target` whose work parks forever, and
         /// answers with the attempt identity the coordinator gave it — which
         /// is otherwise only ever seen by the work itself.
         fn begin(
             &self,
-            attachment: &mut SessionAttachment,
+            attach: &mut SessionAttach,
             target: &SessionReference,
-        ) -> AttachmentOperationId {
+        ) -> AttachOperationId {
             let mut started = None;
-            attachment.begin(target.clone(), |_, operation| {
+            attach.begin(target.clone(), |_, operation| {
                 started = Some(operation);
                 let witness = StopWitness {
                     stopped: self.stopped.clone(),
@@ -172,12 +172,12 @@ mod tests {
                     std::future::pending::<()>().await;
                 })
             });
-            started.expect("beginning an attachment starts its work")
+            started.expect("beginning an attach starts its work")
         }
 
-        /// Waits for the next attachment whose work was stopped. Parked work
+        /// Waits for the next attach whose work was stopped. Parked work
         /// only ends this way, so nothing here waits on elapsed time.
-        async fn stopped(&mut self) -> AttachmentOperationId {
+        async fn stopped(&mut self) -> AttachOperationId {
             self.letting_go
                 .recv()
                 .await
@@ -189,62 +189,59 @@ mod tests {
     /// becomes the open Session and whose subscription the run loop adopts:
     /// B's answer is refused where C's is taken, however they are ordered.
     #[tokio::test]
-    async fn opening_a_newer_session_supersedes_the_attachment_already_in_flight() {
-        let mut attachment = SessionAttachment::default();
-        let mut parked = ParkedAttachments::new();
+    async fn opening_a_newer_session_supersedes_the_attach_already_in_flight() {
+        let mut attach = SessionAttach::default();
+        let mut parked = ParkedAttaches::new();
         let (b, c) = (session(), session());
 
-        let attaching_b = parked.begin(&mut attachment, &b);
-        let attaching_c = parked.begin(&mut attachment, &c);
+        let attaching_b = parked.begin(&mut attach, &b);
+        let attaching_c = parked.begin(&mut attach, &c);
 
         assert_eq!(
             parked.stopped().await,
             attaching_b,
-            "opening C left B's attachment running"
+            "opening C left B's attach running"
         );
         assert_eq!(
-            attachment.settle(attaching_b),
-            AttachmentOutcome::Superseded,
+            attach.settle(attaching_b),
+            AttachOutcome::Superseded,
             "B's snapshot and subscription arrived after the reader opened C"
         );
         assert_eq!(
-            attachment.settle(attaching_c),
-            AttachmentOutcome::Current,
-            "refusing B's answer cost C the attachment the reader is waiting on"
+            attach.settle(attaching_c),
+            AttachOutcome::Current,
+            "refusing B's answer cost C the attach the reader is waiting on"
         );
     }
 
     /// Opening the Landing and moving to another Workspace both leave the
-    /// Session behind, and neither leaves anything for an attachment to land
+    /// Session behind, and neither leaves anything for an attach to land
     /// on.
     #[tokio::test]
-    async fn leaving_the_session_behind_abandons_the_attachment_in_flight() {
-        let mut attachment = SessionAttachment::default();
-        let mut parked = ParkedAttachments::new();
+    async fn leaving_the_session_behind_abandons_the_attach_in_flight() {
+        let mut attach = SessionAttach::default();
+        let mut parked = ParkedAttaches::new();
 
-        let attaching_b = parked.begin(&mut attachment, &session());
-        attachment.abandon();
+        let attaching_b = parked.begin(&mut attach, &session());
+        attach.abandon();
 
         assert_eq!(
             parked.stopped().await,
             attaching_b,
-            "leaving the Session behind left its attachment running"
+            "leaving the Session behind left its attach running"
         );
-        assert_eq!(
-            attachment.settle(attaching_b),
-            AttachmentOutcome::Superseded
-        );
+        assert_eq!(attach.settle(attaching_b), AttachOutcome::Superseded);
     }
 
     /// Nothing is left running once the client is gone, so a result cannot
     /// outlive the run loop that would have applied it.
     #[tokio::test]
-    async fn shutting_down_stops_the_attachment_in_flight() {
-        let mut attachment = SessionAttachment::default();
-        let mut parked = ParkedAttachments::new();
+    async fn shutting_down_stops_the_attach_in_flight() {
+        let mut attach = SessionAttach::default();
+        let mut parked = ParkedAttaches::new();
 
-        let attaching = parked.begin(&mut attachment, &session());
-        drop(attachment);
+        let attaching = parked.begin(&mut attach, &session());
+        drop(attach);
 
         assert_eq!(parked.stopped().await, attaching);
     }
@@ -254,38 +251,38 @@ mod tests {
     /// is why the Session's own identity cannot be the correlation.
     #[tokio::test]
     async fn a_second_attempt_at_a_session_refuses_the_first_attempts_result() {
-        let mut attachment = SessionAttachment::default();
-        let parked = ParkedAttachments::new();
+        let mut attach = SessionAttach::default();
+        let parked = ParkedAttaches::new();
         let b = session();
 
-        let first = parked.begin(&mut attachment, &b);
-        let second = parked.begin(&mut attachment, &b);
+        let first = parked.begin(&mut attach, &b);
+        let second = parked.begin(&mut attach, &b);
 
-        assert_eq!(attachment.settle(first), AttachmentOutcome::Superseded);
-        assert_eq!(attachment.settle(second), AttachmentOutcome::Current);
+        assert_eq!(attach.settle(first), AttachOutcome::Superseded);
+        assert_eq!(attach.settle(second), AttachOutcome::Current);
     }
 
     /// A stale failure is refused the same way a stale success is, and refusing
-    /// it leaves the attachment the reader is waiting on still pending — the
+    /// it leaves the attach the reader is waiting on still pending — the
     /// error belongs to work they walked away from.
     #[tokio::test]
-    async fn a_stale_failure_is_refused_and_leaves_the_newer_attachment_pending() {
-        let mut attachment = SessionAttachment::default();
-        let parked = ParkedAttachments::new();
+    async fn a_stale_failure_is_refused_and_leaves_the_newer_attach_pending() {
+        let mut attach = SessionAttach::default();
+        let parked = ParkedAttaches::new();
         let (b, c) = (session(), session());
 
-        let attaching_b = parked.begin(&mut attachment, &b);
-        let attaching_c = parked.begin(&mut attachment, &c);
+        let attaching_b = parked.begin(&mut attach, &b);
+        let attaching_c = parked.begin(&mut attach, &c);
 
         assert_eq!(
-            attachment.settle(attaching_b),
-            AttachmentOutcome::Superseded,
+            attach.settle(attaching_b),
+            AttachOutcome::Superseded,
             "B's failure landed after the reader opened C"
         );
         assert_eq!(
-            attachment.settle(attaching_c),
-            AttachmentOutcome::Current,
-            "refusing B's failure dropped the attachment to C"
+            attach.settle(attaching_c),
+            AttachOutcome::Current,
+            "refusing B's failure dropped the attach to C"
         );
     }
 }

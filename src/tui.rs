@@ -3,7 +3,6 @@
 mod approval;
 mod approval_posture_picker;
 mod aside;
-mod attachment;
 mod clipboard;
 mod commands;
 mod completion;
@@ -22,6 +21,7 @@ mod questionnaire;
 mod render;
 mod selection;
 mod serve_overlay;
+mod session_attach;
 mod session_listing;
 mod session_picker;
 mod settings_panel;

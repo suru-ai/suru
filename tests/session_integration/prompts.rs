@@ -881,7 +881,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         .expect("observer receives snapshot")
         .expect("observer snapshot is valid")
     else {
-        panic!("attachment must begin with a Session snapshot");
+        panic!("the attach must begin with a Session snapshot");
     };
     assert_eq!(before_interrupt.session.status, SessionStatus::Active);
 

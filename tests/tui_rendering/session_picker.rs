@@ -1,4 +1,4 @@
-//! The session picker: ordering, search, scope, attachment, and deletion.
+//! The session picker: ordering, search, scope, attach, and deletion.
 
 use crate::support::{
     connected_application, connected_application_homed, enter_active_session,
@@ -319,7 +319,7 @@ fn session_picker_selection_opens_the_target_optimistically_and_keeps_the_old_dr
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             )))
-            .expect("begin target attachment"),
+            .expect("begin target attach"),
         ApplicationTransition::ViewAndAttachSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             target_id,
@@ -330,7 +330,7 @@ fn session_picker_selection_opens_the_target_optimistically_and_keeps_the_old_dr
     assert!(!opening.contains("Long-running work"));
 
     application
-        .handle_event(ApplicationEvent::SessionAttachmentFailed(
+        .handle_event(ApplicationEvent::SessionAttachFailed(
             "target disappeared".to_owned(),
         ))
         .expect("refresh point-in-time Session status");
@@ -366,7 +366,7 @@ fn session_picker_selection_opens_the_target_optimistically_and_keeps_the_old_dr
             KeyCode::Enter,
             KeyModifiers::NONE,
         )))
-        .expect("retry target attachment");
+        .expect("retry target attach");
     let target_snapshot = failed_session_snapshot(
         target_id,
         PromptId::new(),
@@ -1248,7 +1248,7 @@ fn session_picker_scroll_window_keeps_the_current_session_visible() {
 }
 
 #[test]
-fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
+fn unreadable_session_picker_rows_remain_navigable_without_attaching() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
     let mut sessions = vec![session_summary(
@@ -1290,7 +1290,7 @@ fn unreadable_session_picker_rows_remain_navigable_without_attachment() {
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             )))
-            .expect("unreadable Session has no attachment action"),
+            .expect("unreadable Session has no attach action"),
         ApplicationTransition::Continue
     );
 }

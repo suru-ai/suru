@@ -2791,7 +2791,7 @@ fn enter_attaches_the_selected_session_in_place() {
 /// Opening a Session is asynchronous, and the reader does not wait for it.
 /// Leaving for the Landing is them saying they are not going after all, so the
 /// client reports that it has let go — the run loop's cue to stop the
-/// attachment it started and refuse whatever it answers with.
+/// attach it started and refuse whatever it answers with.
 #[test]
 fn leaving_for_the_landing_while_a_session_is_opening_reports_the_client_letting_go() {
     let workspace = workspace_dir();
@@ -5269,7 +5269,7 @@ fn a_left_press_on_a_row_suru_cannot_read_does_nothing() {
     assert_eq!(
         press_line(&mut application, MouseButton::Left, "Broken work"),
         ApplicationTransition::Continue,
-        "the press starts no attachment that is guaranteed to fail"
+        "the press starts no attach that is guaranteed to fail"
     );
     assert!(
         selected_sidebar_text(&application).is_empty(),
@@ -6081,7 +6081,7 @@ fn enter_on_a_foreign_row_turns_then_opens_it_without_disturbing_everywhere() {
             session: SessionReference::new(Outlook::Remote("studio".to_owned()), foreign),
             catalog_origins,
         },
-        "the Outlook turn and attachment are one ordered client transition"
+        "the Outlook turn and attach are one ordered client transition"
     );
 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
@@ -8591,11 +8591,11 @@ fn local_session(session_id: SessionId) -> SessionReference {
 
 fn fail_opening_session(application: &mut Application, target: SessionId, error: &str) {
     application
-        .handle_event(ApplicationEvent::OriginSessionAttachmentFailed {
+        .handle_event(ApplicationEvent::OriginSessionAttachFailed {
             reference: local_session(target),
             error: error.to_owned(),
         })
-        .expect("fail the optimistic Session attachment");
+        .expect("fail the optimistic Session attach");
 }
 
 #[test]
@@ -8623,7 +8623,7 @@ fn opening_a_session_carries_the_reader_into_it_before_its_snapshot_lands() {
 }
 
 #[test]
-fn opening_a_sidebar_session_yields_a_viewed_request_with_its_attachment() {
+fn opening_a_sidebar_session_yields_a_viewed_request_with_its_attach() {
     let workspace = workspace_dir();
     let (open, target) = (SessionId::new(), SessionId::new());
     let mut application = reading_one_and_listing_another(workspace.path(), open, target);
@@ -8632,7 +8632,7 @@ fn opening_a_sidebar_session_yields_a_viewed_request_with_its_attachment() {
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
         ApplicationTransition::ViewAndAttachSession(local_session(target)),
-        "optimistic opening reports Viewed as it begins the attachment"
+        "optimistic opening reports Viewed as it begins the attach"
     );
 }
 
@@ -8808,7 +8808,7 @@ fn the_quiet_threshold_requests_one_wakeup_without_polling() {
 }
 
 #[test]
-fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_error() {
+fn attach_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_error() {
     let workspace = workspace_dir();
     let (open, target) = (SessionId::new(), SessionId::new());
     let (mut application, now) = opening_clock(reading_one_and_listing_another(
@@ -8825,7 +8825,7 @@ fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_
     fail_opening_session(
         &mut application,
         target,
-        "the remote transport refused attachment because the Session disappeared",
+        "the remote transport refused to attach because the Session disappeared",
     );
     type_terminal_text(&mut application, " and remains focused");
 
@@ -8837,8 +8837,8 @@ fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_
         "the failed shell immediately uses the Transcript error language: {screen}"
     );
     assert!(
-        screen.contains("attachment because the Session disappeared"),
-        "the attachment detail wraps instead of being truncated: {screen}"
+        screen.contains("attach because the Session disappeared"),
+        "the attach detail wraps instead of being truncated: {screen}"
     );
     assert_eq!(
         buffer
@@ -8885,7 +8885,7 @@ fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_
         !rendered_application_rows_at(&application, WIDE, 20)
             .iter()
             .any(|row| sidebar_column(row).contains("remote transport")),
-        "the client-local attachment error does not become a Sidebar listing error"
+        "the client-local attach error does not become a Sidebar listing error"
     );
     assert!(
         !screen.contains("Loading"),
@@ -8894,7 +8894,7 @@ fn attachment_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_
     assert_eq!(
         application.opening_loading_wakeup(),
         None,
-        "the failed attachment asks for no further presentation wakeup"
+        "the failed attach asks for no further presentation wakeup"
     );
 }
 
@@ -8918,7 +8918,7 @@ fn enter_on_the_failed_open_row_retries_with_a_fresh_quiet_window() {
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
         ApplicationTransition::ViewAndAttachSession(local_session(target)),
-        "Enter on the failed target dispatches another correlated attachment"
+        "Enter on the failed target dispatches another correlated attach"
     );
 
     let main = main_view(&application);
@@ -8986,7 +8986,7 @@ fn a_pointer_press_on_the_failed_open_row_retries_without_taking_keyboard_focus(
     assert_eq!(
         press_line(&mut application, MouseButton::Left, WANTED),
         ApplicationTransition::ViewAndAttachSession(local_session(target)),
-        "pressing the failed target row retries its attachment"
+        "pressing the failed target row retries its attach"
     );
     assert!(
         !main_view(&application).contains("Could not load Session"),

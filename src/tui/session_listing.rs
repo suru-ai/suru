@@ -664,7 +664,7 @@ impl SessionListing {
     }
 
     /// Reports a failure that did not come from a listing request — an
-    /// attachment the server refused, say — beside the Sessions on show.
+    /// attach the server refused, say — beside the Sessions on show.
     pub(super) fn report_error(&mut self, error: String) {
         self.current_origin_mut().error = Some(error);
     }
@@ -1016,9 +1016,9 @@ mod tests {
         let request = listing.refresh();
         listing.load(&request, vec![summary("Listed", 1)]);
 
-        listing.report_error("the server refused the attachment".to_owned());
+        listing.report_error("the server refused the attach".to_owned());
 
-        assert_eq!(listing.error(), Some("the server refused the attachment"));
+        assert_eq!(listing.error(), Some("the server refused the attach"));
         assert_eq!(
             titles(&listing),
             vec!["Listed"],

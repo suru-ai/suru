@@ -1102,7 +1102,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             )))
-            .expect("unreadable Session owns no attachment action"),
+            .expect("unreadable Session owns no attach action"),
         ApplicationTransition::Continue
     );
 

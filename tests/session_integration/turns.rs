@@ -966,7 +966,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
         .expect("observer receives snapshot")
         .expect("observer snapshot is valid")
     else {
-        panic!("attachment must begin with a Session snapshot");
+        panic!("the attach must begin with a Session snapshot");
     };
 
     for event in [
@@ -1000,7 +1000,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
                 .expect("observer stream remains open")
                 .expect("Session update is valid")
             else {
-                panic!("attachment sends exactly one Session snapshot");
+                panic!("the attach sends exactly one Session snapshot");
             };
             if update.changes.iter().any(|change| {
                 matches!(
@@ -1082,7 +1082,7 @@ async fn a_provider_actor_ending_settles_the_command_it_left_in_flight() {
         .expect("observer receives snapshot")
         .expect("observer snapshot is valid")
     else {
-        panic!("attachment must begin with a Session snapshot");
+        panic!("the attach must begin with a Session snapshot");
     };
 
     for event in [

@@ -43,8 +43,8 @@ use termina::Terminal as _;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::ClipboardContent;
-use super::attachment::{AttachmentOperationId, AttachmentOutcome, SessionAttachment};
 use super::commands::SemanticCommandId;
+use super::session_attach::{AttachOperationId, AttachOutcome, SessionAttach};
 use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
@@ -104,9 +104,9 @@ enum Exit {
 struct SessionTasks {
     subscription: Option<SessionSubscription>,
     subscribing: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
-    /// The Session attachment the reader is waiting on, correlated so that
+    /// The Session attach the reader is waiting on, correlated so that
     /// only their newest choice can land.
-    attachment: SessionAttachment,
+    session_attach: SessionAttach,
     /// One in-flight Session listing per surface and Origin: the picker and
     /// Sidebar list at once, while Everywhere lets the Sidebar ask several
     /// Servers concurrently. A fresh request supersedes only that exact
@@ -132,9 +132,9 @@ impl SessionTasks {
     /// Drops the live subscription along with any attempt to re-establish it,
     /// so nothing reconnects to a Session left behind.
     ///
-    /// Attachment is left alone: this is also the housekeeping a client with
-    /// no Session open does, and a reader attaching one from the Landing has
-    /// no Session open yet.
+    /// A Session attach is left alone: this is also the housekeeping a client
+    /// with no Session open does, and a reader attaching one from the Landing
+    /// has no Session open yet.
     fn detach(&mut self) {
         self.end_subscription();
         self.abort_subscribing();
@@ -142,11 +142,11 @@ impl SessionTasks {
 
     /// The reader left the Session they were on — for the Landing, another
     /// Workspace, or another Outlook. Nothing that was being loaded for them
-    /// is still an answer to where they are, so the attachment goes with the
-    /// subscription.
+    /// is still an answer to where they are, so the Session attach goes with
+    /// the subscription.
     fn leave_session(&mut self) {
         self.detach();
-        self.attachment.abandon();
+        self.session_attach.abandon();
     }
 
     fn abort_subscribing(&mut self) {
@@ -359,7 +359,7 @@ impl SessionTasks {
         }
     }
 
-    /// Attaches to `reference`, superseding whatever attachment was already in
+    /// Attaches to `reference`, superseding whatever attach was already in
     /// flight: the Session the reader just chose is the one they are waiting
     /// on. The live subscription is left alone until the target hydrates, so
     /// the Session on screen keeps its stream throughout.
@@ -370,15 +370,15 @@ impl SessionTasks {
         results: &UnboundedSender<SessionPickerResult>,
     ) {
         let results = results.clone();
-        self.attachment.begin(reference, |target, operation| {
-            spawn_session_attachment(commands, target, operation, results)
+        self.session_attach.begin(reference, |target, operation| {
+            spawn_session_attach(commands, target, operation, results)
         });
     }
 
-    /// Whether a finished attachment is still the one the reader is waiting
+    /// Whether a finished attach is still the one the reader is waiting
     /// on, forgetting it when it is.
-    fn settle_attachment(&mut self, operation: AttachmentOperationId) -> AttachmentOutcome {
-        self.attachment.settle(operation)
+    fn settle_attach(&mut self, operation: AttachOperationId) -> AttachOutcome {
+        self.session_attach.settle(operation)
     }
 
     fn finish_listing_sessions(&mut self, request: &SessionListRequest) {
@@ -1814,13 +1814,13 @@ impl RunLoop {
     ) -> Result<ControlFlow<Exit>> {
         let result =
             result.ok_or_else(|| anyhow!("Session picker task channel stopped unexpectedly"))?;
-        // An attachment the reader moved on from is dropped whole, before
+        // An attach the reader moved on from is dropped whole, before
         // anything reads it: its snapshot never becomes the open Session, its
         // subscription goes with it rather than replacing the one still on
         // screen, and its failure is never drawn at them.
         if let SessionPickerResult::Attached { operation, .. }
-        | SessionPickerResult::AttachmentFailed { operation, .. } = &result
-            && !self.tasks.settle_attachment(*operation).is_current()
+        | SessionPickerResult::AttachFailed { operation, .. } = &result
+            && !self.tasks.settle_attach(*operation).is_current()
         {
             return Ok(ControlFlow::Continue(()));
         }
@@ -1835,9 +1835,7 @@ impl RunLoop {
             SessionPickerResult::ListingFailed { request, .. } => {
                 self.application.awaits_listing(request)
             }
-            SessionPickerResult::Attached { .. } | SessionPickerResult::AttachmentFailed { .. } => {
-                true
-            }
+            SessionPickerResult::Attached { .. } | SessionPickerResult::AttachFailed { .. } => true,
         };
         match result {
             SessionPickerResult::Listed { request, sessions } => {
@@ -1868,12 +1866,15 @@ impl RunLoop {
                 }
                 return Ok(self.dispatch_transition(transition));
             }
-            SessionPickerResult::AttachmentFailed {
+            SessionPickerResult::AttachFailed {
                 reference, error, ..
             } => {
-                let transition = self.application.handle_event(
-                    ApplicationEvent::OriginSessionAttachmentFailed { reference, error },
-                )?;
+                let transition =
+                    self.application
+                        .handle_event(ApplicationEvent::OriginSessionAttachFailed {
+                            reference,
+                            error,
+                        })?;
                 return Ok(self.dispatch_transition(transition));
             }
         }
@@ -2617,13 +2618,13 @@ enum SessionPickerResult {
     },
     Attached {
         reference: SessionReference,
-        operation: AttachmentOperationId,
+        operation: AttachOperationId,
         snapshot: Box<SessionSnapshot>,
         subscription: SessionSubscription,
     },
-    AttachmentFailed {
+    AttachFailed {
         reference: SessionReference,
-        operation: AttachmentOperationId,
+        operation: AttachOperationId,
         error: String,
     },
 }
@@ -2675,10 +2676,10 @@ fn spawn_session_listing(
 /// Attaches `reference`, reporting the `operation` that asked for it on both
 /// the answer and the refusal so the run loop can tell the navigation the
 /// reader is still waiting on from the one they left.
-fn spawn_session_attachment(
+fn spawn_session_attach(
     commands: SessionCommandClient,
     reference: SessionReference,
-    operation: AttachmentOperationId,
+    operation: AttachOperationId,
     results: UnboundedSender<SessionPickerResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2700,7 +2701,7 @@ fn spawn_session_attachment(
             })
         }
         .await
-        .unwrap_or_else(|error| SessionPickerResult::AttachmentFailed {
+        .unwrap_or_else(|error| SessionPickerResult::AttachFailed {
             reference,
             operation,
             error: error.to_string(),
@@ -2965,7 +2966,7 @@ fn spawn_session_operation(
 /// Reports a root Session open without coupling navigation to the request's
 /// answer. The catalog stream carries the authoritative Viewed moment back to
 /// every client, including this one; a transient reporting failure must not
-/// cancel an attachment that can still succeed.
+/// cancel an attach that can still succeed.
 fn spawn_session_view(commands: SessionCommandClient, session: SessionReference) {
     tokio::spawn(async move {
         if let Err(error) = commands

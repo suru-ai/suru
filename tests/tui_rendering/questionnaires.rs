@@ -702,7 +702,7 @@ fn catalog_discards_only_unavailable_hidden_drafts_and_ignores_older_availabilit
         }),
     ))
     .unwrap();
-    // Reopen a stale snapshot to prove the catalog, not merely reattachment, removed Q1.
+    // Reopen a stale snapshot to prove the catalog, not merely reattaching, removed Q1.
     app.handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
         .unwrap();
     invoke(&mut app, SemanticCommandId::QuestionnaireOpen);

@@ -271,7 +271,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
         .expect("Session snapshot arrives")
         .expect("Session snapshot is valid");
     let SessionEvent::Snapshot(authoritative) = &session_event else {
-        panic!("Session attachment begins with an authoritative snapshot");
+        panic!("Session attach begins with an authoritative snapshot");
     };
     assert_eq!(authoritative.session.id, created.session.id);
     let authoritative = authoritative.clone();

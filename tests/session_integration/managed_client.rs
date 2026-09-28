@@ -1,4 +1,4 @@
-//! The managed client: attachment, reconnection, deletion, and stream recovery.
+//! The managed client: Session attach, reconnection, deletion, and stream recovery.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
@@ -177,12 +177,12 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id(), created.session.id);
 
-    let mut attachment = client
+    let mut subscription = client
         .attach_session(created.session.id)
         .await
         .expect("attach to known Session ID");
     assert_eq!(
-        attachment
+        subscription
             .next()
             .await
             .expect("attached Session event arrives")
@@ -190,7 +190,7 @@ async fn managed_client_can_discover_read_and_attach_to_a_known_session() {
         SessionEvent::snapshot(settled)
     );
 
-    drop(attachment);
+    drop(subscription);
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
@@ -415,12 +415,12 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
     )
     .await;
 
-    let mut first_attachment = client
+    let mut first_subscription = client
         .attach_session(first.session.id)
         .await
         .expect("attach first Session");
     assert!(matches!(
-        first_attachment.next().await,
+        first_subscription.next().await,
         Some(Ok(SessionEvent::Snapshot(_)))
     ));
     let prompt_id = PromptId::new();
@@ -474,17 +474,17 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
         .await
         .expect("start active Turn");
     assert!(matches!(
-        first_attachment.next().await,
+        first_subscription.next().await,
         Some(Ok(SessionEvent::Updated(_)))
     ));
 
-    drop(first_attachment);
-    let mut second_attachment = client
+    drop(first_subscription);
+    let mut second_subscription = client
         .attach_session(second.session.id)
         .await
-        .expect("switch attachment to second Session");
+        .expect("switch subscription to second Session");
     assert!(matches!(
-        second_attachment.next().await,
+        second_subscription.next().await,
         Some(Ok(SessionEvent::Snapshot(_)))
     ));
     let still_active = client
@@ -502,7 +502,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
         TurnStatus::Active
     );
 
-    drop(second_attachment);
+    drop(second_subscription);
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
@@ -576,21 +576,21 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         SessionRevision(2),
     )
     .await;
-    let mut first_attachment = first_client
+    let mut first_subscription = first_client
         .attach_session(shared.session.id)
         .await
         .expect("attach first client to shared Session");
-    let mut second_attachment = second_client
+    let mut second_subscription = second_client
         .attach_session(shared.session.id)
         .await
         .expect("attach second client to shared Session");
 
-    let first_projection = first_attachment
+    let first_projection = first_subscription
         .next()
         .await
         .expect("first client receives shared Session")
         .expect("first shared Session snapshot is valid");
-    let second_projection = second_attachment
+    let second_projection = second_subscription
         .next()
         .await
         .expect("second client receives shared Session")
@@ -601,12 +601,12 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     );
     assert_eq!(second_projection, first_projection);
 
-    let mut isolated_attachment = second_client
+    let mut isolated_subscription = second_client
         .attach_session(isolated.session.id)
         .await
         .expect("attach second client to isolated Session");
     assert_eq!(
-        isolated_attachment
+        isolated_subscription
             .next()
             .await
             .expect("isolated Session snapshot arrives")
@@ -680,12 +680,12 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
         SessionRevision(shared_settled.revision.0 + 1)
     );
 
-    let first_update = first_attachment
+    let first_update = first_subscription
         .next()
         .await
         .expect("first client receives Session update")
         .expect("first client Session update is valid");
-    let second_update = second_attachment
+    let second_update = second_subscription
         .next()
         .await
         .expect("second client receives Session update")
@@ -693,7 +693,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     assert_eq!(first_update, SessionEvent::Updated(update.clone()));
     assert_eq!(second_update, first_update);
     assert!(
-        timeout(Duration::from_millis(100), isolated_attachment.next())
+        timeout(Duration::from_millis(100), isolated_subscription.next())
             .await
             .is_err(),
         "an update for the shared Session must not appear on another Session stream"
@@ -720,9 +720,9 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
     assert_eq!(updated_summary.session.status, SessionStatus::Active);
     assert!(updated_summary.updated_at > updated_summary.created_at);
 
-    drop(isolated_attachment);
-    drop(second_attachment);
-    drop(first_attachment);
+    drop(isolated_subscription);
+    drop(second_subscription);
+    drop(first_subscription);
     drop(second_client);
     drop(first_client);
     server.shutdown().await.expect("shut down server");
@@ -818,7 +818,7 @@ async fn managed_session_stream_classifies_body_failures_as_recoverable() {
 }
 
 #[tokio::test]
-async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disconnect() {
+async fn managed_subscription_rehydrates_before_live_deltas_after_same_server_disconnect() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let session_id = SessionId::new();
@@ -852,13 +852,13 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
     .await
     .expect("connect managed client to fixture server");
     receive_managed_client_initial_state(&mut client).await;
-    let mut attachment = client
+    let mut subscription = client
         .attach_session(session_id)
         .await
         .expect("attach to fixture Session");
 
     assert_eq!(
-        attachment
+        subscription
             .next()
             .await
             .expect("initial Session snapshot arrives")
@@ -866,15 +866,15 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
         SessionEvent::snapshot(initial)
     );
     assert_eq!(
-        timeout(PROGRESS_DEADLINE, attachment.next())
+        timeout(PROGRESS_DEADLINE, subscription.next())
             .await
-            .expect("attachment reconnects")
+            .expect("subscription reconnects")
             .expect("fresh Session snapshot arrives")
             .expect("fresh Session snapshot is valid"),
         SessionEvent::snapshot(current)
     );
     assert_eq!(
-        attachment
+        subscription
             .next()
             .await
             .expect("live Session delta arrives")
@@ -882,7 +882,7 @@ async fn managed_attachment_rehydrates_before_live_deltas_after_same_server_disc
         SessionEvent::Updated(update)
     );
 
-    drop(attachment);
+    drop(subscription);
     drop(client);
     drop(fixture);
 }
