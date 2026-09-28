@@ -55,6 +55,7 @@ const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
+const TRANSCRIPT_IMAGE_PREVIEWS: &str = "transcript.imagePreviews";
 const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
 // Scoped to Titles and Icons alone rather than Errand-wide, so a compaction
 // Errand arriving later gets its own key and turning these off can never
@@ -95,6 +96,8 @@ pub enum SettingGroup {
     Appearance,
     /// Settings that configure no Provider.
     General,
+    /// Settings governing how a Transcript is drawn.
+    Transcript,
     /// Settings scoped to one Provider, which the panel presents beside the
     /// Provider they configure rather than in a flat list.
     Providers,
@@ -608,6 +611,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptCommandAutoExpand { value } => {
             *value == Some(settings.transcript.command_auto_expand)
         }
+        SettingMutation::TranscriptImagePreviews { value } => {
+            *value == Some(settings.transcript.image_previews)
+        }
         SettingMutation::SessionContentWidth { value } => {
             *value == Some(settings.session.content_width)
         }
@@ -792,7 +798,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: TRANSCRIPT_DEFAULT_FOLD_POSTURE,
         label: "Default Fold posture",
         description: "How a Session view opens: folded to its markers, or expanded in full",
-        group: SettingGroup::General,
+        group: SettingGroup::Transcript,
         scope: SettingScope::Client,
         values: SettingValues::Fixed(&[
             SettingChoice {
@@ -819,7 +825,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: TRANSCRIPT_REASONING_VISIBILITY,
         label: "Reasoning visibility",
         description: "Whether a Transcript hides Reasoning or draws it",
-        group: SettingGroup::General,
+        group: SettingGroup::Transcript,
         scope: SettingScope::Client,
         values: SettingValues::Fixed(&[
             SettingChoice {
@@ -846,7 +852,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         key: TRANSCRIPT_COMMAND_AUTO_EXPAND,
         label: "Command auto-expansion",
         description: "When an Active Command grows into its live output tail",
-        group: SettingGroup::General,
+        group: SettingGroup::Transcript,
         scope: SettingScope::Client,
         values: SettingValues::Open {
             named: &[SettingChoice {
@@ -871,6 +877,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |command_auto_expand| {
                 settings.transcript.command_auto_expand = command_auto_expand;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: TRANSCRIPT_IMAGE_PREVIEWS,
+        label: "Image previews",
+        description: "Whether an image Attachment is drawn as a picture where the terminal can draw one",
+        group: SettingGroup::Transcript,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "true",
+                build_mutation: || SettingMutation::TranscriptImagePreviews { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                build_mutation: || SettingMutation::TranscriptImagePreviews { value: Some(false) },
+            },
+        ]),
+        reset: SettingMutation::TranscriptImagePreviews { value: None },
+        apply: |settings, value| {
+            apply_value(value, |image_previews| {
+                settings.transcript.image_previews = image_previews;
             })
         },
     },
@@ -1742,6 +1771,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptCommandAutoExpand { value } => {
             (TRANSCRIPT_COMMAND_AUTO_EXPAND, pinned(value))
         }
+        SettingMutation::TranscriptImagePreviews { value } => {
+            (TRANSCRIPT_IMAGE_PREVIEWS, pinned(value))
+        }
         SettingMutation::SessionContentWidth { value } => (SESSION_CONTENT_WIDTH, pinned(value)),
         SettingMutation::DerivationErrand { value } => (DERIVATION_ERRAND, pinned(value)),
         SettingMutation::SidebarInitialVisibility { value } => {
@@ -2289,6 +2321,7 @@ mod tests {
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),
+                "one of true or false".to_owned(),
                 "one of \"fill\" or an integer of at least 50".to_owned(),
                 // A Setting the schema can only partly enumerate names what it
                 // can and describes the rest, in the same breath.

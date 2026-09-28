@@ -432,6 +432,91 @@ async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default
     server.shutdown().await.expect("shut down server");
 }
 
+/// Image previews are drawn wherever the terminal can draw them unless the
+/// user says otherwise, and turning them off is a pin like any other: it lands
+/// in the Config Document beside what the document already held, reads back,
+/// and a reset lets the built-in default resume.
+#[tokio::test]
+async fn image_previews_default_on_pin_off_through_the_config_document_and_reset() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // Keep the Transcript's other choices exactly as written.\n",
+        "  \"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-image-previews")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-image-previews").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-image-previews").await;
+    assert!(
+        opening.settings.transcript.image_previews,
+        "previews are drawn wherever the terminal can draw them unless the user says otherwise"
+    );
+    assert_eq!(opening.pinned, ["transcript.reasoningVisibility"]);
+
+    let pinned = editor
+        .mutate_setting(SettingMutation::TranscriptImagePreviews { value: Some(false) })
+        .await
+        .expect("turn image previews off");
+    assert!(!pinned.settings.transcript.image_previews);
+    assert_eq!(
+        pinned.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "the rest of the Transcript's Settings stand"
+    );
+    let mut pinned_keys = pinned.pinned.clone();
+    pinned_keys.sort();
+    assert_eq!(
+        pinned_keys,
+        ["transcript.imagePreviews", "transcript.reasoningVisibility"]
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, pinned);
+    }
+    let document = config_document(config_dir.path());
+    assert!(
+        document.contains("\"imagePreviews\": false"),
+        "the pin lands in the Config Document: {document}"
+    );
+    assert!(
+        document.contains("// Keep the Transcript's other choices exactly as written.")
+            && document.contains("\"reasoningVisibility\": \"shown\""),
+        "and leaves the rest of it alone: {document}"
+    );
+
+    let reset = editor
+        .mutate_setting(SettingMutation::TranscriptImagePreviews { value: None })
+        .await
+        .expect("reset image previews");
+    assert!(
+        reset.settings.transcript.image_previews,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(reset.pinned, ["transcript.reasoningVisibility"]);
+    let document = config_document(config_dir.path());
+    assert!(
+        !document.contains("imagePreviews"),
+        "the reset takes the pin back out: {document}"
+    );
+    assert!(
+        document.contains("// Keep the Transcript's other choices exactly as written.")
+            && document.contains("\"reasoningVisibility\": \"shown\""),
+        "and leaves the rest of the document alone: {document}"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn command_auto_expansion_pins_a_millisecond_delay_and_resets_to_off() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

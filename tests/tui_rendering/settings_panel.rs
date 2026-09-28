@@ -213,6 +213,14 @@ fn open_experimental_tab(application: &mut Application) {
     press(application, KeyCode::Left, KeyModifiers::NONE);
 }
 
+/// The panel as it opens, on the Transcript tab. Reached by its label rather
+/// than by walking the bar, so arriving here never passes through the
+/// Providers and the read they begin.
+fn open_transcript_tab(application: &mut Application) {
+    open_panel(application);
+    click_tab(application, "Transcript");
+}
+
 /// The Providers tab, plus the catalog listing entering it asks for — which is
 /// how a test answers the read the panel has just begun.
 fn read_providers_tab(application: &mut Application) -> ModelListRequest {
@@ -357,7 +365,7 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
         "leader+, opens the settings panel"
     );
     assert!(
-        panel.contains("Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
+        panel.contains("Enter choose · Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
         "the footer teaches the keys the panel answers to, tab switching included: {panel}"
     );
     assert!(
@@ -368,7 +376,7 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     let closed = rendered_application_rows(&application).join("\n");
     assert!(
-        !closed.contains("Default Fold posture"),
+        !closed.contains("Session content width"),
         "Esc closes the panel: {closed}"
     );
 
@@ -377,7 +385,7 @@ fn the_leader_key_and_the_slash_command_both_open_the_panel_and_escape_closes_it
     assert!(
         rendered_application_rows(&application)
             .join("\n")
-            .contains("Default Fold posture"),
+            .contains("Session content width"),
         "the /settings slash entry opens the same panel"
     );
 }
@@ -401,7 +409,7 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
     assert!(
         rendered_application_rows(&application)
             .join("\n")
-            .contains("Default Fold posture"),
+            .contains("Session content width"),
         "and lists that tab's Settings"
     );
 
@@ -431,11 +439,19 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let transcript = rendered_application_buffer(&application, 80, 15);
+    assert_eq!(
+        styling(&transcript, "Transcript"),
+        active,
+        "Transcript follows Appearance"
+    );
+
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     let source_control = rendered_application_buffer(&application, 80, 15);
     assert_eq!(
         styling(&source_control, "Source Control"),
         active,
-        "Source Control follows Appearance"
+        "Source Control follows Transcript"
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
@@ -461,6 +477,77 @@ fn the_tab_bar_names_every_tab_and_left_and_right_switch_between_them_with_wrap(
         active,
         "Left before the first tab wraps to the last"
     );
+}
+
+/// Everything that governs how a Transcript is drawn keeps company on one tab,
+/// image previews among it: on by default, since whether the terminal can
+/// draw one is probed rather than guessed, and nowhere else in the panel.
+#[test]
+fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_transcript_settings() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    assert!(
+        EffectiveSettings::default().transcript.image_previews,
+        "previews are drawn wherever the terminal can draw them unless the reader says otherwise"
+    );
+    open_transcript_tab(&mut application);
+
+    let transcript = rendered_application_buffer(&application, 80, 15);
+    assert_ne!(
+        styling(&transcript, "Transcript"),
+        styling(&transcript, "General"),
+        "the Transcript tab is drawn as the active one"
+    );
+    let previews = row(&application, "Image previews");
+    assert!(
+        previews.contains("true") && previews.contains("[default]"),
+        "image previews ride their built-in default: {previews:?}"
+    );
+    for label in [
+        "Default Fold posture",
+        "Reasoning visibility",
+        "Command auto-expansion",
+    ] {
+        assert!(
+            has_row(&application, label),
+            "the Transcript tab presents {label}"
+        );
+    }
+    focus_setting(&mut application, "transcript.imagePreviews");
+    assert_eq!(focused_key(&application), "transcript.imagePreviews");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::TranscriptImagePreviews {
+            value: Some(false),
+        }),
+        "Space turns previews off"
+    );
+    for key in [
+        "transcript.defaultFoldPosture",
+        "transcript.reasoningVisibility",
+        "transcript.commandAutoExpand",
+        "transcript.imagePreviews",
+    ] {
+        let descriptor = suru::settings::SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == key)
+            .expect("the Transcript Setting is in the schema");
+        assert_eq!(descriptor.group, SettingGroup::Transcript, "{key}");
+        assert_eq!(descriptor.scope, SettingScope::Client, "{key}");
+    }
+
+    click_tab(&mut application, "General");
+    for label in [
+        "Default Fold posture",
+        "Reasoning visibility",
+        "Command auto-expansion",
+        "Image previews",
+    ] {
+        assert!(
+            !has_row(&application, label),
+            "a Transcript Setting is not also a General one: {label}"
+        );
+    }
 }
 
 #[test]
@@ -641,7 +728,7 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
         "the focused Setting names the key a Config Document would spell"
     );
     assert!(
-        !has_row(&application, "Default Fold posture") && !has_row(&application, "Codex"),
+        !has_row(&application, "Session content width") && !has_row(&application, "Codex"),
         "the Experimental tab lists its own Settings and nobody else's"
     );
     for label in ["Serving", "Serving port", "Serving bind address"] {
@@ -671,7 +758,7 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
         "an experimental Setting is not also a General one"
     );
     assert!(
-        has_row(&application, "Default Fold posture"),
+        has_row(&application, "Session content width"),
         "and the General tab keeps every Setting it had"
     );
 }
@@ -925,7 +1012,7 @@ fn clicking_a_tab_label_switches_to_that_tab() {
         "clicking back to General reads nothing"
     );
     assert!(
-        has_row(&application, "Default Fold posture"),
+        has_row(&application, "Session content width"),
         "and lists the Settings that configure no Provider"
     );
 }
@@ -937,11 +1024,11 @@ fn clicking_a_tab_label_switches_to_that_tab() {
 fn clicking_a_row_selects_it_without_changing_a_value() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
     assert_eq!(
         focused_key(&application),
         "transcript.defaultFoldPosture",
-        "the panel opens focused on its top row"
+        "the tab opens focused on its top row"
     );
 
     assert_eq!(
@@ -1017,7 +1104,7 @@ fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
 fn panel_clicks_keep_prose_and_chrome_inert_and_dismiss_outside() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     let buffer = rendered_application_buffer(&application, 80, 15);
     let (tabs_column, tabs_row) = text_position(&buffer, "Providers");
@@ -1062,14 +1149,14 @@ fn panel_clicks_keep_prose_and_chrome_inert_and_dismiss_outside() {
 }
 
 #[test]
-fn the_general_tab_lists_every_setting_that_configures_no_provider() {
+fn the_transcript_tab_marks_each_setting_pinned_or_riding_its_default() {
     let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
         opening_at(FoldPosture::Expanded),
         &["transcript.defaultFoldPosture"],
     );
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     let fold = row(&application, "Default Fold posture");
     assert!(
@@ -1090,7 +1177,7 @@ fn the_general_tab_lists_every_setting_that_configures_no_provider() {
         !rendered_application_rows(&application)
             .join("\n")
             .contains("Codex"),
-        "a Provider is the Providers tab's business, not General's"
+        "a Provider is the Providers tab's business, not the Transcript's"
     );
 }
 
@@ -1275,6 +1362,13 @@ fn entering_the_providers_tab_reads_availability_every_time() {
             ApplicationTransition::Continue
         ),
         "crossing Source Control reads no Provider"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Left, KeyModifiers::NONE),
+            ApplicationTransition::Continue
+        ),
+        "crossing Transcript reads no Provider"
     );
     assert!(
         matches!(
@@ -1915,7 +2009,7 @@ fn each_tab_keeps_its_own_selected_row_while_the_panel_is_open() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
-    focus_setting(&mut application, "transcript.reasoningVisibility");
+    focus_setting(&mut application, "sidebar.initialScope");
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     focus_setting(&mut application, "provider.copilot.enabled");
@@ -1923,7 +2017,7 @@ fn each_tab_keeps_its_own_selected_row_while_the_panel_is_open() {
     press(&mut application, KeyCode::Left, KeyModifiers::NONE);
     assert_eq!(
         focused_key(&application),
-        "transcript.reasoningVisibility",
+        "sidebar.initialScope",
         "General is where the reader left it"
     );
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
@@ -1946,7 +2040,7 @@ fn reopening_the_panel_starts_at_the_first_tab_and_its_top_row() {
     open_panel(&mut application);
     assert_eq!(
         focused_key(&application),
-        "transcript.defaultFoldPosture",
+        "session.contentWidth",
         "the panel opens on the first tab's top row, remembering nothing"
     );
     let reopened = rendered_application_buffer(&application, 80, 15);
@@ -1961,7 +2055,7 @@ fn reopening_the_panel_starts_at_the_first_tab_and_its_top_row() {
 fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     let transition = press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
@@ -2427,7 +2521,7 @@ fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
         },
         &["transcript.reasoningVisibility"],
     );
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
     focus_setting(&mut application, "transcript.reasoningVisibility");
 
     assert_eq!(
@@ -2515,12 +2609,12 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
 fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
         ApplicationTransition::Continue,
-        "Enter edited a General Setting"
+        "Enter edited a Transcript Setting"
     );
     assert!(
         row(&application, "Default Fold posture").contains("folded [default]"),
@@ -2540,7 +2634,7 @@ fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing(
         "a key that does nothing takes nothing away, the standing complaint included"
     );
 
-    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    click_tab(&mut application, "Providers");
     focus_setting(&mut application, "provider.codex.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
@@ -2565,7 +2659,7 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
         opening_at(FoldPosture::Expanded),
         &["transcript.defaultFoldPosture"],
     );
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -2590,7 +2684,7 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
 fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
 
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -2740,7 +2834,7 @@ fn a_click_lands_on_the_row_the_window_drew_there() {
 fn a_click_at_a_terminal_too_small_to_draw_the_panel_changes_nothing() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_panel(&mut application);
+    open_transcript_tab(&mut application);
     let rows = rendered_application_rows(&application);
     let listed_row = row_index(&rows, "Reasoning visibility") as u16;
     let column = label_column(&application, "Reasoning visibility") as u16;

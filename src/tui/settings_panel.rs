@@ -69,6 +69,7 @@ pub(super) enum SettingsTab {
     #[default]
     General,
     Appearance,
+    Transcript,
     Providers,
     SourceControl,
     Experimental,
@@ -81,6 +82,7 @@ impl SettingsTab {
         Self::General,
         Self::Providers,
         Self::Appearance,
+        Self::Transcript,
         Self::SourceControl,
         Self::Experimental,
     ];
@@ -89,6 +91,7 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Appearance => "Appearance",
+            Self::Transcript => "Transcript",
             Self::Providers => "Providers",
             Self::SourceControl => "Source Control",
             Self::Experimental => "Experimental",
@@ -100,6 +103,7 @@ impl SettingsTab {
         match self {
             Self::General => SettingGroup::General,
             Self::Appearance => SettingGroup::Appearance,
+            Self::Transcript => SettingGroup::Transcript,
             Self::Providers => SettingGroup::Providers,
             Self::SourceControl => SettingGroup::SourceControl,
             Self::Experimental => SettingGroup::Experimental,
@@ -777,6 +781,7 @@ impl SettingsPanel {
         match tab {
             SettingsTab::General
             | SettingsTab::Appearance
+            | SettingsTab::Transcript
             | SettingsTab::SourceControl
             | SettingsTab::Experimental => SCHEMA
                 .iter()

@@ -802,12 +802,28 @@ impl<'de> Deserialize<'de> for CommandAutoExpand {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptSettings {
     pub default_fold_posture: FoldPosture,
     pub reasoning_visibility: ReasoningVisibility,
     pub command_auto_expand: CommandAutoExpand,
+    /// Whether an image Attachment is previewed as a picture where the
+    /// terminal can draw one. On by default, because whether it can is probed
+    /// rather than guessed; off, or where it cannot, the Attachment's dimmed
+    /// line stands in for it.
+    pub image_previews: bool,
+}
+
+impl Default for TranscriptSettings {
+    fn default() -> Self {
+        Self {
+            default_fold_posture: FoldPosture::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
+            command_auto_expand: CommandAutoExpand::default(),
+            image_previews: true,
+        }
+    }
 }
 
 /// Which Agent Selection derives a Session's Title and a Workspace's Icon,
@@ -1719,6 +1735,9 @@ pub enum SettingMutation {
     },
     TranscriptCommandAutoExpand {
         value: Option<CommandAutoExpand>,
+    },
+    TranscriptImagePreviews {
+        value: Option<bool>,
     },
     SessionContentWidth {
         value: Option<SessionContentWidth>,
