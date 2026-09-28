@@ -19,13 +19,15 @@
 //! Provider connection was handed, and allowlists the Broker's Tools ([`super::broker`]). A
 //! relaunch after a restart is a new Provider connection, so it is handed a fresh token; a respawn
 //! for a Selection change stays on the connection and the token it holds. A Prompt is
-//! delivered as a stream-json user message; the Turn's output streams back through
-//! [`super::projection`] and the CLI's terminal result message Settles it.
+//! delivered as a stream-json user message, under a uuid the CLI reports the message's fate by;
+//! the Turn's output streams back through [`super::projection`] and the CLI's terminal result
+//! message Settles it.
 //!
 //! Steering and interrupting act on the Turn the child is running, which nothing on this wire
 //! names: a steer is simply another user message on the running loop's stdin, and the interrupt is
 //! a Session-level control request. Both therefore refuse a Session with no Turn running rather
-//! than acting on whatever came next, and both read what is running from [`super::turn_in_flight`].
+//! than acting on whatever came next, and both read what is running from [`super::turn_in_flight`],
+//! which also decides which result Settles a steered Turn.
 //!
 //! The background work an interrupt stops first is the running child's own: the CLI keeps its task
 //! roster per process, runs that work in the process group Suru stops as a whole, and announces
@@ -568,11 +570,11 @@ impl ProviderSession for ClaudeSession {
                 .running
                 .as_ref()
                 .expect("a Turn runs on the child that was just spawned for it");
-            self.turn.begin_turn(input.selection);
+            let uuid = self.turn.begin_turn(input.selection);
             self.context.ready();
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&prompt))
+                .send(&UserMessageEnvelope::text(&uuid, &prompt))
                 .await
                 .map_err(|error| {
                     // The Prompt never reached the CLI, so the Turn it would have begun is not
@@ -601,20 +603,22 @@ impl ProviderSession for ClaudeSession {
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
             // answer it as a Turn of its own that Suru never began. A Turn only ever runs on a
-            // spawned child, so a Session without one is running none either.
+            // spawned child, so a Session without one is running none either. Whether the loop
+            // folds the steer in at its next tool round or answers it with a loop of its own is
+            // the CLI's to report, under the uuid the steer is written with.
             let slot = self.child.lock().await;
             let Some(child) = slot.running.as_ref() else {
                 return Err(no_live_turn("steer"));
             };
-            if !self.turn.accept_steer() {
+            let Some(uuid) = self.turn.accept_steer() else {
                 return Err(no_live_turn("steer"));
-            }
+            };
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&text))
+                .send(&UserMessageEnvelope::text(&uuid, &text))
                 .await
                 .map_err(|error| {
-                    self.turn.withdraw_prompt();
+                    self.turn.withdraw_steer(&uuid);
                     claude_error_context(CONTEXT, error)
                 })
         })

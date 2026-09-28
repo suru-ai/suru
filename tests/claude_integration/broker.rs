@@ -15,7 +15,8 @@
 
 use crate::server_support::broker::McpClient;
 use crate::support::{
-    Launch, LiveTurn, McpConfigFile, conversation_fixture, hosting, opened_session, settled_session,
+    CLAUDE_MODELS, Launch, LiveTurn, McpConfigFile, ScriptedClaude, conversation_fixture,
+    discovery_arms, hosting, opened_session, settled_session,
 };
 use serde_json::{Value, json};
 use suru::{
@@ -26,11 +27,51 @@ use suru::{
     provider::{ClaudeRuntime, SubagentReport, SubagentReportOutcome},
 };
 
-/// One agent Message and the terminal result that Settles the Turn.
-const ANSWERED: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Done"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+/// One agent Message and the terminal result that Settles the Turn, from a loop the message began
+/// at rest: the CLI reports it `queued` and at once `started`, and `completed` after that loop's
+/// result (docs/validation/0407-claude-folded-steer.md, case B).
+const ANSWERED: &str = r#"      lifecycle "$uuid" queued
+      lifecycle "$uuid" started
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Done"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":5,"num_turns":1,"result":"Done","terminal_reason":"completed","session_id":"prov-session"}'
+      lifecycle "$uuid" completed
 "#;
+
+/// A parent whose Agent waits on its Subagent in a Broker call, and a Subagent that answers its
+/// Delegation — one fixture for both, since both are launches of the same CLI, told apart by what
+/// they are handed. The parent's loop calls `wait_subagents` and holds; the Report that the
+/// Subagent's settling writes to the parent's stdin arrives while that call runs, and the loop
+/// folds it into its next request once the call answers, so one `result` answers the Prompt and
+/// the Report (docs/validation/0421-broker-smoke.md, run 5; 0407-claude-folded-steer.md, case A).
+fn waiting_parent_and_answering_child() -> String {
+    format!(
+        r#"    *'"type":"user"'*'Subagent Report from Suru'*)
+      lifecycle "$uuid" queued
+      emit '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_wait","content":[{{"type":"text","text":"{{\"settled\":[{{\"status\":\"completed\"}}]}}"}}],"is_error":false}}]}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      lifecycle "$uuid" started
+      emit '{{"type":"stream_event","event":{{"type":"message_start","message":{{"role":"assistant"}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":"DONE Done"}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      lifecycle "$uuid" completed
+      emit '{{"type":"result","subtype":"success","is_error":false,"duration_ms":335410,"num_turns":6,"result":"DONE Done","terminal_reason":"completed","session_id":"prov-session"}}'
+      lifecycle "$prompt" completed
+      ;;
+    *'"type":"user"'*'Survey the seams'*)
+{ANSWERED}      ;;
+    *'"type":"user"'*)
+      prompt=$uuid
+      lifecycle "$prompt" queued
+      lifecycle "$prompt" started
+      emit '{{"type":"stream_event","event":{{"type":"message_start","message":{{"role":"assistant"}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"toolu_wait","name":"mcp__suru__wait_subagents","input":{{}}}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"message_stop"}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      ;;
+"#
+    )
+}
 
 /// The Broker's entry in an MCP config, which must be the only server the file names: the user's
 /// own servers come from their own settings, never from a file Suru wrote.
@@ -335,4 +376,98 @@ async fn a_report_leaves_as_a_stdin_user_message_waking_the_idle_parent() {
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_report_folded_into_a_turn_waiting_in_a_broker_call_settles_it_on_the_one_result() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        waiting_parent_and_answering_child()
+    ));
+    let live = LiveTurn::start(
+        ClaudeRuntime::new(claude.executable()),
+        "claude-broker-report-steer",
+        "Delegate the work and wait for it",
+    )
+    .await;
+    let parent_id = live.session_id;
+    let parent_launch = claude.wait_for_launch_carrying("--session-id").await;
+    let server = broker_server(&claude.mcp_config_of(&parent_launch)).clone();
+    let mut broker = McpClient::presenting(
+        server["url"].as_str().expect("the Broker's URL"),
+        server["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+
+    // The working parent's Agent spawns a Claude Subagent, whose own process answers its
+    // Delegation and settles while the parent's loop is still inside its wait.
+    let child_id = broker
+        .spawn_subagent(json!({
+            "provider": "claude",
+            "model": "haiku",
+            "options": {},
+            "name": "Researcher",
+            "description": "Survey the seams",
+            "prompt": "Survey the seams.",
+        }))
+        .await;
+
+    let settled = settled_session(&live.client, parent_id, 0).await;
+    assert_eq!(
+        settled.turns[0].status,
+        TurnStatus::Completed,
+        "the one result the loop answered the Prompt and the folded Report with Settles the Turn"
+    );
+    assert_eq!(
+        settled.turns.len(),
+        1,
+        "the Report steered the working Turn rather than waking a Continuation"
+    );
+    let Some(Activity::Subagent { turn_id, .. }) = settled.activities.iter().find(
+        |activity| matches!(activity, Activity::Subagent { session_id, .. } if *session_id == child_id),
+    ) else {
+        panic!("the parent's Transcript holds the Subagent's row");
+    };
+    assert_eq!(*turn_id, settled.turns[0].id, "in the Turn that spawned it");
+    assert_eq!(
+        settled
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Agent)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["DONE Done"]
+    );
+
+    let parent_messages = claude
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("type").and_then(Value::as_str) == Some("user"))
+        .filter(|request| {
+            request
+                .pointer("/message/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.contains("Survey the seams"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent_messages.len(),
+        2,
+        "the parent's process was handed its Prompt and then the Report: {parent_messages:?}"
+    );
+    assert!(
+        parent_messages[1]["message"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Subagent Report from Suru")),
+        "the Report steered the running loop as a stdin user message: {parent_messages:?}"
+    );
+    assert!(
+        parent_messages[1]["uuid"].is_string(),
+        "under a uuid the CLI reports its lifecycle by: {parent_messages:?}"
+    );
+
+    live.shutdown().await;
 }

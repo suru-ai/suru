@@ -101,13 +101,22 @@ emit() {
   printf '%s\n' "$1"
 }
 
+# What the CLI reports of the user message written under the uuid $1: that it reached state $2 —
+# `queued` on reading it, `started` once a loop took it up, then `completed` or `cancelled`.
+lifecycle() {
+  emit '{"type":"command_lifecycle","command_uuid":"'"$1"'","state":"'"$2"'","uuid":"frame-'"$1"'-'"$2"'","session_id":"prov-session"}'
+}
+
 "#;
 
 /// Reads one newline-delimited message at a time, records it, and dispatches it to the test's
-/// arms with the control envelope's `request_id` extracted for their replies.
+/// arms with the control envelope's `request_id` extracted for their replies, and a user message's
+/// `uuid` — the one the CLI reports the message's `lifecycle` under — as `$uuid`.
+/// Suru writes the `uuid` last in the envelope, which is the occurrence the pattern finds.
 const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CLAUDE_FIXTURE_LOG"
   request_id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
   case "$line" in
 "#;
 

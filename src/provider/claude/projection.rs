@@ -43,14 +43,18 @@
 //! does one still pending when its agent is stopped, or is started again by anything but that
 //! restart.
 //! A `result` Settles the Turn as completed, interrupted, or failed — except where a steer's own
-//! result is still to come, since the CLI answers every message queued into a running loop with a
-//! result while Suru keeps them all inside the Turn the steer joined. The result speaks only for
-//! the loop's own conversation: a subagent's streams live past it, which is what lets a Subagent
-//! outlive the Turn (ADR 0015), and the stretch the loop later runs to deliver its outcome ends
-//! with a result of its own. A fresh owning message after that boundary explicitly begins a
-//! native Continuation, including when a background Bash command woke the loop with no Subagent
-//! involved; its result and interrupt belong to that Continuation. Every block kind this slice
-//! does not present is passed over rather than failed, because the wire grows freely (ADR 0010).
+//! result is still to come. The CLI folds a message queued into a running loop into that loop at
+//! its next tool round, and answers it with the loop's one result; a message still queued when
+//! the loop ends begins a loop of its own, with a result of its own, and Suru keeps them all
+//! inside the Turn the steer joined. Which of the two befell a steer, the CLI reports in the
+//! lifecycle it gives the message under the uuid it was written with ([`super::turn_in_flight`]).
+//! The result speaks only for the loop's own conversation: a subagent's streams live past it,
+//! which is what lets a Subagent outlive the Turn (ADR 0015), and the stretch the loop later runs
+//! to deliver its outcome ends with a result of its own. A fresh owning message after that
+//! boundary explicitly begins a native Continuation, including when a background Bash command
+//! woke the loop with no Subagent involved; its result and interrupt belong to that Continuation.
+//! Every block kind this slice does not present is passed over rather than failed, because the
+//! wire grows freely (ADR 0010).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -69,8 +73,9 @@ use super::{
     transport::ConversationItem,
     turn_in_flight::TurnInFlight,
     wire::{
-        AssistantMessageSnapshot, ContentBlock, EchoedUserContent, EchoedUserMessage,
-        ResultMessage, ResultUsage, StreamEventMessage, SystemMessage,
+        AssistantMessageSnapshot, CommandLifecycle, CommandLifecycleState, ContentBlock,
+        EchoedUserContent, EchoedUserMessage, ResultMessage, ResultUsage, StreamEventMessage,
+        SystemMessage,
     },
 };
 use crate::protocol::{Cost, Usage};
@@ -570,9 +575,41 @@ impl ClaudeProjection {
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
             Some("system") => Ok(self.project_task_lifecycle(message)),
+            Some("command_lifecycle") => Ok(self.project_command_lifecycle(message)),
             // Everything else the CLI says about itself — nothing this projection presents.
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// What the CLI reports of a user message written into the Turn — its Prompt, or a steer —
+    /// under the uuid it was written with: when a loop takes it up, which is what tells the result
+    /// that answers the Turn from one ending a loop the message never joined. A message a loop
+    /// never took up and never will — dropped, or refused — once the result ending the Turn's last
+    /// loop was left waiting on it, leaves nothing else to Settle the Turn, so it Settles here, as
+    /// the completed loop it last ran.
+    fn project_command_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
+        let Ok(lifecycle) = serde_json::from_value::<CommandLifecycle>(message) else {
+            return Vec::new();
+        };
+        let settled = match lifecycle.state {
+            CommandLifecycleState::Queued | CommandLifecycleState::Other => {
+                self.turn.message_queued();
+                false
+            }
+            CommandLifecycleState::Started => {
+                self.turn.message_started(&lifecycle.command_uuid);
+                false
+            }
+            CommandLifecycleState::Completed
+            | CommandLifecycleState::Cancelled
+            | CommandLifecycleState::Discarded
+            | CommandLifecycleState::Refused => self.turn.message_ended(&lifecycle.command_uuid),
+        };
+        if !settled {
+            return Vec::new();
+        }
+        self.turn_metering = None;
+        vec![ProviderEvent::TurnCompleted.into()]
     }
 
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
@@ -1781,11 +1818,12 @@ impl ClaudeProjection {
             projected.push(ProviderEvent::TurnInterrupted);
             turn_settled = true;
         } else if result.subtype == "success" && !result.is_error {
-            // A steered Turn is answered stretch by stretch: the CLI ends every user message
-            // queued into the loop with a result of its own, and only the last one Settles the
-            // Turn that holds them all. A result no Turn waited on at all ends a stretch the
-            // loop ran on its own — waking to deliver a Subagent's outcome — and completing it
-            // is what settles the Continuation that output began, or nothing where none is open.
+            // A steered Turn may be answered stretch by stretch: a steer the loop took up at a
+            // tool round is answered by the loop's own result, but one still queued when the loop
+            // ended begins a loop of its own, and only that loop's result Settles the Turn that
+            // holds them all. A result no Turn waited on at all ends a stretch the loop ran on its
+            // own — waking to deliver a Subagent's outcome — and completing it is what settles the
+            // Continuation that output began, or nothing where none is open.
             if self.turn.result_settles_turn() || !self.turn.is_running() {
                 projected.push(ProviderEvent::TurnCompleted);
                 turn_settled = true;
@@ -3284,6 +3322,182 @@ mod tests {
             commands,
             ["ls", "cargo check"],
             "the stream around them still projects, a Subagent's work included"
+        );
+    }
+
+    /// What the CLI reports of the user message written under `uuid`.
+    fn lifecycle(uuid: &str, state: &str) -> Value {
+        json!({
+            "type": "command_lifecycle",
+            "command_uuid": uuid,
+            "state": state,
+            "uuid": format!("frame-{uuid}-{state}"),
+            "session_id": "conversation-1",
+        })
+    }
+
+    /// The owning conversation's next model request opening.
+    fn owning_message_start() -> Value {
+        json!({
+            "type": "stream_event",
+            "event": {"type": "message_start"},
+            "parent_tool_use_id": null,
+        })
+    }
+
+    /// Only the Turn boundaries among `events`: where a loop began a Continuation, and where a
+    /// Turn Settled.
+    fn boundaries(events: &[AttributedProviderEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event.event {
+                ProviderEvent::ContinuationStarted { .. } => Some("continuation started"),
+                ProviderEvent::TurnCompleted => Some("turn completed"),
+                ProviderEvent::TurnInterrupted => Some("turn interrupted"),
+                ProviderEvent::TurnFailed { .. } => Some("turn failed"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A projection whose Turn's Prompt a loop has taken up, as the CLI reports it: the Prompt's
+    /// uuid, and the projection.
+    fn prompted_projection() -> (ClaudeProjection, String) {
+        let mut projection = fresh_projection();
+        let prompt = projection.turn.begin_turn(selection());
+        let taken_up = project(
+            &mut projection,
+            &[
+                lifecycle(&prompt, "queued"),
+                lifecycle(&prompt, "started"),
+                owning_message_start(),
+            ],
+        );
+        assert!(boundaries(&taken_up).is_empty());
+        (projection, prompt)
+    }
+
+    fn selection() -> crate::protocol::AgentSelection {
+        crate::protocol::AgentSelection {
+            provider: crate::protocol::ProviderId::new("claude"),
+            model: crate::protocol::ModelId::new("default"),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_steer_folded_in_at_a_tool_round_settles_the_turn_on_the_loops_one_result() {
+        // Claude 2.1.283, a steer written while a Bash call ran
+        // (docs/validation/0407-claude-folded-steer.md, case A).
+        let (mut projection, prompt) = prompted_projection();
+        let steer = projection
+            .turn
+            .accept_steer()
+            .expect("the running Turn takes the steer");
+        let events = project(
+            &mut projection,
+            &[
+                lifecycle(&steer, "queued"),
+                tool_result(None, "toolu_sleep"),
+                lifecycle(&steer, "started"),
+                owning_message_start(),
+                lifecycle(&steer, "completed"),
+                result_costing("result-1", "conversation-1", 0.02),
+                lifecycle(&prompt, "completed"),
+            ],
+        );
+        assert_eq!(
+            boundaries(&events),
+            ["turn completed"],
+            "the one result answers the Prompt and the steer the loop took up"
+        );
+        assert!(!projection.turn.is_running());
+    }
+
+    #[test]
+    fn a_steer_queued_past_its_loops_end_is_answered_in_the_same_turn_by_the_loop_it_begins() {
+        // Claude 2.1.283, a steer written while the loop's last request streamed its answer
+        // (docs/validation/0407-claude-folded-steer.md, case D).
+        let (mut projection, prompt) = prompted_projection();
+        let steer = projection
+            .turn
+            .accept_steer()
+            .expect("the running Turn takes the steer");
+        let first = project(
+            &mut projection,
+            &[
+                lifecycle(&steer, "queued"),
+                result_costing("result-1", "conversation-1", 0.02),
+                lifecycle(&prompt, "completed"),
+            ],
+        );
+        assert!(
+            boundaries(&first).is_empty(),
+            "the loop the steer never joined ends without ending the Turn: {first:?}"
+        );
+        let second = project(
+            &mut projection,
+            &[
+                lifecycle(&steer, "started"),
+                owning_message_start(),
+                result_costing("result-2", "conversation-1", 0.03),
+                lifecycle(&steer, "completed"),
+            ],
+        );
+        assert_eq!(
+            boundaries(&second),
+            ["turn completed"],
+            "the steer's own loop runs in the Turn it joined and Settles it"
+        );
+    }
+
+    #[test]
+    fn a_steer_dropped_after_the_turns_last_loop_ended_settles_the_turn_as_completed() {
+        let (mut projection, _prompt) = prompted_projection();
+        let steer = projection
+            .turn
+            .accept_steer()
+            .expect("the running Turn takes the steer");
+        let ended = project(
+            &mut projection,
+            &[
+                lifecycle(&steer, "queued"),
+                result_costing("result-1", "conversation-1", 0.02),
+            ],
+        );
+        assert!(boundaries(&ended).is_empty());
+        let dropped = project(&mut projection, &[lifecycle(&steer, "cancelled")]);
+        assert_eq!(
+            boundaries(&dropped),
+            ["turn completed"],
+            "no loop will ever answer the steer, so its end is the Turn's"
+        );
+        assert!(!projection.turn.is_running());
+    }
+
+    #[test]
+    fn without_a_lifecycle_a_loop_begun_after_a_steered_result_is_a_continuation() {
+        // A CLI that reports no message's fate: nothing tells a steer folded into the loop from
+        // one still queued, so the result Settles the Turn rather than wait on one that may never
+        // come.
+        let mut projection = fresh_projection();
+        projection.turn.begin_turn(selection());
+        projection
+            .turn
+            .accept_steer()
+            .expect("the running Turn takes the steer");
+        let events = project(
+            &mut projection,
+            &[
+                owning_message_start(),
+                result_costing("result-1", "conversation-1", 0.02),
+                owning_message_start(),
+                result_costing("result-2", "conversation-1", 0.03),
+            ],
+        );
+        assert_eq!(
+            boundaries(&events),
+            ["turn completed", "continuation started", "turn completed"]
         );
     }
 }

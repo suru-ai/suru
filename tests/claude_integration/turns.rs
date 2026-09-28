@@ -463,8 +463,14 @@ async fn an_errored_success_result_settles_the_turn_as_failed_with_its_text() {
 }
 
 /// A conversation whose second Prompt is answered like its first, for a Session running more than
-/// one Turn on the same child process.
+/// one Turn on the same child process. Each Prompt reaches a loop at rest, so the CLI reports it
+/// `queued` and at once `started` as a loop of its own, and `completed` only after the `result`
+/// that loop ends with (docs/validation/0407-claude-folded-steer.md, case B).
 const TWO_TURNS: &str = r#"      turns=$(( ${turns:-0} + 1 ))
+      lifecycle "$uuid" queued
+      lifecycle "$uuid" started
+      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Answer '"$turns"'"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       if [ "$turns" -eq 1 ]; then
@@ -472,6 +478,7 @@ const TWO_TURNS: &str = r#"      turns=$(( ${turns:-0} + 1 ))
       else
         emit '{"type":"result","uuid":"turn-result-2","subtype":"success","is_error":false,"duration_ms":7,"num_turns":1,"result":"","session_id":"prov-session","usage":{"input_tokens":1,"output_tokens":1},"total_cost_usd":0}'
       fi
+      lifecycle "$uuid" completed
 "#;
 
 #[tokio::test]
@@ -520,7 +527,13 @@ async fn a_second_prompt_runs_its_turn_on_the_same_long_lived_child() {
         .expect("admit a second Prompt");
     let settled = settled_session(&client, created.session.id, 1).await;
 
-    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Completed,
+        "a Prompt written to a loop at rest begins a loop whose own result Settles its Turn"
+    );
+    assert_eq!(settled.turns.len(), 2);
     let total = settled
         .total_usage()
         .expect("the cumulative report remains known");

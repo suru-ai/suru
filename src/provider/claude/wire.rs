@@ -83,7 +83,8 @@ impl ControlRequest {
 /// A Prompt on its way into the running loop, in the envelope stream-json input takes user
 /// messages in. The CLI owns the conversation's identity, so the envelope's `session_id` rides
 /// along empty and `parent_tool_use_id` marks the message as the user's own rather than a
-/// subagent's.
+/// subagent's. The `uuid` is Suru's own for the message: the CLI reports the message's fate under
+/// it as a [`CommandLifecycle`], and reports nothing for a message sent without one.
 #[derive(Serialize)]
 pub(super) struct UserMessageEnvelope<'a> {
     #[serde(rename = "type")]
@@ -91,10 +92,11 @@ pub(super) struct UserMessageEnvelope<'a> {
     message: UserMessage<'a>,
     parent_tool_use_id: Option<&'static str>,
     session_id: &'static str,
+    uuid: &'a str,
 }
 
 impl<'a> UserMessageEnvelope<'a> {
-    pub(super) fn text(prompt: &'a str) -> Self {
+    pub(super) fn text(uuid: &'a str, prompt: &'a str) -> Self {
         Self {
             kind: "user",
             message: UserMessage {
@@ -106,8 +108,40 @@ impl<'a> UserMessageEnvelope<'a> {
             },
             parent_tool_use_id: None,
             session_id: "",
+            uuid,
         }
     }
+}
+
+/// What the CLI reports of a user message sent with a `uuid`, under that uuid: it `queued` the
+/// message on reading it, `started` it when a loop took it up — at the loop's next tool round when
+/// one was running, or as a loop of its own once none was — and then ended it one way or another.
+/// Verified live against 2.1.283 (docs/validation/0407-claude-folded-steer.md); the CLI's own
+/// schema marks the frame internal, and carries it from 2.1.280 on.
+#[derive(Deserialize)]
+pub(super) struct CommandLifecycle {
+    pub(super) command_uuid: String,
+    pub(super) state: CommandLifecycleState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CommandLifecycleState {
+    Queued,
+    Started,
+    /// The loop that took the message up ended cleanly — before its `result` when the message was
+    /// folded into a loop already running, after it when the message began the loop.
+    Completed,
+    /// Dropped by an interrupt that cancelled what was queued, or taken up by a loop that was
+    /// interrupted or failed.
+    Cancelled,
+    /// The session ended with the message still queued.
+    Discarded,
+    /// Declined before it was ever queued.
+    Refused,
+    /// A state this build has not heard of, which says the CLI reports lifecycles and nothing more.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Serialize)]

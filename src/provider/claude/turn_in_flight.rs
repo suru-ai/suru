@@ -4,10 +4,20 @@
 //! Two things are known on one side of that seam and needed on the other. The Session must know
 //! whether a Turn is running at all, because steering and interrupting are Session-level requests
 //! that say nothing about the Turn they meant — and it must know what background work the agent has
-//! spawned, because an interrupt stops that before it stops the loop. The projection must know how
-//! many terminal results the Turn is still owed, because the CLI answers every user message queued
-//! into a running loop with a `result` of its own, while Suru keeps the whole stretch inside the one
-//! Turn the steer joined.
+//! spawned, because an interrupt stops that before it stops the loop. The projection must know
+//! which terminal `result` Settles the Turn, because a steer does not always add one.
+//!
+//! Every user message the Session writes into a Turn — its Prompt, and each steer — goes under a
+//! uuid minted here, and the CLI reports by that uuid when a loop takes the message up. A message
+//! queued while the loop runs is taken up at the loop's next tool round and answered by that
+//! loop's own `result`; one still queued when the loop ends begins a loop of its own once that
+//! `result` is out, which ends with a `result` of its own
+//! (docs/validation/0407-claude-folded-steer.md). So a `result` Settles the Turn unless a message
+//! written into it is still waiting for a loop to take it up, and Suru keeps the whole stretch
+//! inside the one Turn the steer joined. A CLI that has never reported a message's fate gives no
+//! such account: there every `result` Settles the Turn, and a loop a message still queued begins
+//! afterwards is a native Continuation — never a Turn left waiting on a `result` that a message
+//! folded into the loop before it will not get.
 //!
 //! The roster of background work outlives any one Turn, as the CLI's own does; it is only ever read
 //! while a Turn is in flight, because stopping that work is something only an interrupt does. It
@@ -30,9 +40,19 @@ pub(super) struct TurnInFlight {
 struct TurnState {
     /// The running CLI's selection, retained for work it resumes without a Prompt.
     selection: Option<AgentSelection>,
-    /// Terminal results the CLI still owes the running Turn: one for its Prompt or native
-    /// Continuation, and one more for every steer delivered into it. None owed means no Turn runs.
-    owed_results: usize,
+    /// Whether a Turn runs: from its Prompt, or from the native loop that began a Continuation,
+    /// until the `result` that Settles it or until it is abandoned.
+    running: bool,
+    /// The messages written into the running Turn that no loop has taken up yet, by the uuid each
+    /// was written under.
+    untaken: BTreeSet<String>,
+    /// Whether a `result` has ended the running Turn's last loop while messages written into it
+    /// were still waiting for a loop, so that until one is taken up no loop of the Turn's runs.
+    between_loops: bool,
+    /// Whether the CLI has reported the fate of any message, which is what makes a message it has
+    /// not reported taken up one to wait for. The CLI does not change under a Session, so this is
+    /// never forgotten.
+    reports_lifecycle: bool,
     /// The tasks the CLI has reported started and not yet reported settled.
     tasks: BTreeSet<String>,
     /// Of those tasks, the ones running Subagents. A Subagent is known to the rest of Suru by its
@@ -41,73 +61,128 @@ struct TurnState {
     subagents: BTreeSet<String>,
 }
 
+impl TurnState {
+    fn settle(&mut self) {
+        self.running = false;
+        self.untaken.clear();
+        self.between_loops = false;
+    }
+}
+
+/// A uuid for one user message, which the CLI reports that message's fate under.
+fn message_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl TurnInFlight {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// A Turn is beginning, and the CLI owes it the one result its Prompt will produce. Suru runs
-    /// one Turn at a time, so this is what the Turn is owed rather than something added to it: a
-    /// count left over from a Turn that ended some way this Session never heard about belongs to
-    /// nothing now.
-    pub(super) fn begin_turn(&self, selection: AgentSelection) {
+    /// A Turn is beginning, and its Prompt is to be written under the uuid this answers. Suru runs
+    /// one Turn at a time, so this replaces what was in flight rather than adding to it: a message
+    /// left over from a Turn that ended some way this Session never heard about belongs to nothing
+    /// now.
+    pub(super) fn begin_turn(&self, selection: AgentSelection) -> String {
         let mut state = self.state();
+        let uuid = message_uuid();
         state.selection = Some(selection);
-        state.owed_results = 1;
+        state.settle();
+        state.running = true;
+        state.untaken.insert(uuid.clone());
+        uuid
     }
 
     /// A fresh native message after a result begins another loop, including when a background
     /// command (rather than a Subagent) woke Claude. Its result and interrupt belong to that
-    /// loop before any of its blocks are projected.
+    /// loop before any of its blocks are projected. No message of Suru's began it, so none is
+    /// waiting on it.
     pub(super) fn begin_continuation(&self) -> Option<AgentSelection> {
         let mut state = self.state();
-        if state.owed_results != 0 {
+        if state.running {
             return None;
         }
         let selection = state.selection.clone()?;
-        state.owed_results = 1;
+        state.settle();
+        state.running = true;
         Some(selection)
     }
 
-    /// Accepts a steer into the running Turn, which will owe one result more. Answers `false` when
-    /// there is no Turn to steer, leaving the count alone.
-    pub(super) fn accept_steer(&self) -> bool {
+    /// Accepts a steer into the running Turn, answering the uuid to write it under. Answers `None`
+    /// when there is no Turn to steer.
+    pub(super) fn accept_steer(&self) -> Option<String> {
         let mut state = self.state();
-        if state.owed_results == 0 {
-            return false;
+        if !state.running {
+            return None;
         }
-        state.owed_results += 1;
-        true
+        let uuid = message_uuid();
+        state.untaken.insert(uuid.clone());
+        Some(uuid)
     }
 
-    /// Takes back a Prompt the CLI never received, so a delivery that failed on its way out leaves
-    /// the Turn waiting on nothing.
-    pub(super) fn withdraw_prompt(&self) {
-        let mut state = self.state();
-        state.owed_results = state.owed_results.saturating_sub(1);
+    /// Takes back a steer the CLI never received, so a delivery that failed on its way out leaves
+    /// the Turn waiting on nothing for it.
+    pub(super) fn withdraw_steer(&self, uuid: &str) {
+        self.state().untaken.remove(uuid);
     }
 
     pub(super) fn is_running(&self) -> bool {
-        self.state().owed_results > 0
+        self.state().running
     }
 
-    /// One terminal result arrived: `true` when it is the last the Turn was owed and so Settles it,
-    /// `false` while a steer's own result is still to come and the Turn goes on — and `false` for a
-    /// result no Turn was waiting on at all, which is the answer to a message that outlived the Turn
-    /// it was queued into and has nothing left to settle.
-    pub(super) fn result_settles_turn(&self) -> bool {
+    /// The CLI has queued a message, which says only that it reports the fate of the messages it
+    /// is sent.
+    pub(super) fn message_queued(&self) {
+        self.state().reports_lifecycle = true;
+    }
+
+    /// A loop has taken up the message written under `uuid`: folded into the loop already running,
+    /// whose `result` answers it, or begun as a loop of its own.
+    pub(super) fn message_started(&self, uuid: &str) {
         let mut state = self.state();
-        if state.owed_results == 0 {
+        state.reports_lifecycle = true;
+        if state.untaken.remove(uuid) {
+            state.between_loops = false;
+        }
+    }
+
+    /// The message written under `uuid` has ended, and one no loop took up never will. `true` when
+    /// that leaves nothing for the running Turn to wait on after the `result` that ended its last
+    /// loop, so that nothing else will ever Settle it and it Settles now.
+    pub(super) fn message_ended(&self, uuid: &str) -> bool {
+        let mut state = self.state();
+        state.reports_lifecycle = true;
+        if !state.untaken.remove(uuid) {
             return false;
         }
-        state.owed_results -= 1;
-        state.owed_results == 0
+        if state.running && state.between_loops && state.untaken.is_empty() {
+            state.settle();
+            return true;
+        }
+        false
     }
 
-    /// The Turn is over whatever it was still owed — interrupted, or failed — so nothing the CLI
-    /// writes afterwards is its to settle.
+    /// A loop ended with a successful terminal result: `true` when that Settles the Turn, `false`
+    /// while a message written into the Turn still waits for a loop of its own and the Turn goes on
+    /// — and `false` for a result no Turn was waiting on at all, which is the answer to a message
+    /// that outlived the Turn it was queued into and has nothing left to settle.
+    pub(super) fn result_settles_turn(&self) -> bool {
+        let mut state = self.state();
+        if !state.running {
+            return false;
+        }
+        if state.reports_lifecycle && !state.untaken.is_empty() {
+            state.between_loops = true;
+            return false;
+        }
+        state.settle();
+        true
+    }
+
+    /// The Turn is over whatever it was still waiting on — interrupted, or failed — so nothing the
+    /// CLI writes afterwards is its to settle.
     pub(super) fn abandon_turn(&self) {
-        self.state().owed_results = 0;
+        self.state().settle();
     }
 
     pub(super) fn task_started(&self, task_id: String) {
@@ -167,61 +242,183 @@ mod tests {
         }
     }
 
+    /// A Turn begun on a CLI that reports lifecycles, whose Prompt a loop has taken up: the
+    /// ground every steer below is written onto.
+    fn prompt_taken_up() -> std::sync::Arc<TurnInFlight> {
+        let turn = TurnInFlight::new();
+        let prompt = turn.begin_turn(selection());
+        turn.message_queued();
+        turn.message_started(&prompt);
+        turn
+    }
+
     #[test]
-    fn a_turn_settles_on_the_one_result_its_prompt_owes() {
+    fn a_turn_settles_on_the_result_that_answers_its_prompt() {
         let turn = TurnInFlight::new();
         assert!(!turn.is_running(), "a Session with no Turn runs none");
-        turn.begin_turn(selection());
+        let prompt = turn.begin_turn(selection());
         assert!(turn.is_running());
+        turn.message_queued();
+        turn.message_started(&prompt);
         assert!(turn.result_settles_turn());
         assert!(!turn.is_running());
     }
 
     #[test]
-    fn a_steered_turn_settles_only_on_the_result_its_steer_owes() {
+    fn each_message_is_written_under_a_uuid_of_its_own() {
         let turn = TurnInFlight::new();
-        turn.begin_turn(selection());
-        assert!(turn.accept_steer());
+        let prompt = turn.begin_turn(selection());
+        let first = turn.accept_steer().expect("the running Turn takes a steer");
+        let second = turn.accept_steer().expect("and another");
+        assert_ne!(prompt, first);
+        assert_ne!(first, second);
+        assert!(
+            uuid::Uuid::parse_str(&prompt).is_ok(),
+            "the CLI is handed a uuid: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_steer_folded_into_the_running_loop_is_answered_by_that_loops_one_result() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        turn.message_queued();
+        turn.message_started(&steer);
+        assert!(
+            turn.result_settles_turn(),
+            "the loop that took the steer up at its tool round answers it with its own result"
+        );
+        assert!(!turn.is_running());
+    }
+
+    #[test]
+    fn a_steer_still_queued_when_its_loop_ends_holds_the_turn_for_the_loop_it_begins() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        turn.message_queued();
         assert!(
             !turn.result_settles_turn(),
             "the stretch the steer joined ends without ending the Turn"
         );
         assert!(turn.is_running());
+        turn.message_started(&steer);
         assert!(
             turn.result_settles_turn(),
-            "the steered stretch's own result Settles the Turn"
+            "the loop the steer began Settles the Turn with its result"
         );
+    }
+
+    #[test]
+    fn a_steer_taken_up_after_the_result_it_raced_still_holds_the_turn() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        assert!(
+            !turn.result_settles_turn(),
+            "a steer the CLI has not yet reported queued is still one no loop has taken up"
+        );
+        turn.message_queued();
+        turn.message_started(&steer);
+        assert!(turn.result_settles_turn());
+    }
+
+    #[test]
+    fn a_prompt_queued_behind_a_native_loop_is_not_answered_by_that_loops_result() {
+        let turn = prompt_taken_up();
+        assert!(turn.result_settles_turn());
+        assert!(
+            turn.begin_continuation().is_some(),
+            "a background task wakes the loop"
+        );
+        assert!(
+            turn.result_settles_turn(),
+            "the woken loop's result settles its Continuation"
+        );
+
+        let prompt = turn.begin_turn(selection());
+        turn.message_queued();
+        assert!(
+            !turn.result_settles_turn(),
+            "a loop the Prompt never joined does not answer it"
+        );
+        turn.message_started(&prompt);
+        assert!(turn.result_settles_turn());
+    }
+
+    #[test]
+    fn without_a_reported_lifecycle_every_result_settles_the_turn() {
+        let turn = TurnInFlight::new();
+        turn.begin_turn(selection());
+        assert!(turn.accept_steer().is_some());
+        assert!(
+            turn.result_settles_turn(),
+            "nothing says the steer was not folded into the loop that just ended"
+        );
+        assert!(
+            turn.begin_continuation().is_some(),
+            "a loop the steer begins afterwards is a native Continuation"
+        );
+    }
+
+    #[test]
+    fn a_steer_that_ends_untaken_after_the_last_loop_settles_the_turn_then() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        turn.message_queued();
+        assert!(!turn.result_settles_turn());
+        assert!(
+            turn.message_ended(&steer),
+            "no loop will take the steer up, so nothing else will Settle the Turn"
+        );
+        assert!(!turn.is_running());
+    }
+
+    #[test]
+    fn a_steer_that_ends_untaken_while_a_loop_runs_leaves_the_result_to_settle_the_turn() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        assert!(
+            !turn.message_ended(&steer),
+            "the running loop's own result is still to come"
+        );
+        assert!(turn.is_running());
+        assert!(turn.result_settles_turn());
     }
 
     #[test]
     fn a_session_with_no_turn_running_has_nothing_to_steer() {
         let turn = TurnInFlight::new();
-        assert!(!turn.accept_steer());
+        assert!(turn.accept_steer().is_none());
         turn.begin_turn(selection());
         turn.abandon_turn();
-        assert!(!turn.accept_steer());
+        assert!(turn.accept_steer().is_none());
     }
 
     #[test]
-    fn a_steer_the_cli_never_received_leaves_the_turn_owed_what_it_was() {
-        let turn = TurnInFlight::new();
-        turn.begin_turn(selection());
-        assert!(turn.accept_steer());
-        turn.withdraw_prompt();
-        assert!(turn.result_settles_turn(), "the Turn owes only its Prompt");
+    fn a_steer_the_cli_never_received_leaves_the_turn_waiting_on_nothing_for_it() {
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
+        turn.withdraw_steer(&steer);
+        assert!(
+            turn.result_settles_turn(),
+            "the Turn waits only on its Prompt"
+        );
     }
 
     #[test]
     fn a_result_an_abandoned_turn_never_waited_on_settles_nothing() {
-        let turn = TurnInFlight::new();
-        turn.begin_turn(selection());
-        assert!(turn.accept_steer());
+        let turn = prompt_taken_up();
+        let steer = turn.accept_steer().expect("the running Turn takes a steer");
         turn.abandon_turn();
+        turn.message_started(&steer);
         assert!(
             !turn.result_settles_turn(),
             "the queued steer's own result has no Turn left to Settle"
         );
         assert!(!turn.is_running());
+        assert!(
+            !turn.message_ended(&steer),
+            "nor does the steer's end, once the Turn it joined is over"
+        );
     }
 
     #[test]

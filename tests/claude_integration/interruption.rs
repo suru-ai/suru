@@ -195,7 +195,10 @@ const STEERED_THEN_STOPPED: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
 "#;
 
 /// The interrupt lands while the loop is waiting on a tool, and the steer it never reached runs
-/// afterwards as a stretch of its own — output belonging to a Turn that has already Settled.
+/// afterwards as a stretch of its own — output belonging to a Turn that has already Settled. A live
+/// 2.1.283 CLI answers no such steer: asked to cancel what was queued, it reports the steer
+/// `cancelled` and lists it in the receipt (docs/validation/0407-claude-folded-steer.md, case F).
+/// The stretch stands for a CLI that answers one anyway, whose output must still land nowhere.
 const ABORTED_WITH_A_SURVIVING_STEER: &str = r#"      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"terminal_reason":"aborted_tools","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Bonjour"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
