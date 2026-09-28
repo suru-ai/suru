@@ -18,7 +18,7 @@ mod image_header;
 use std::{collections::HashSet, time::Duration};
 
 use crate::{
-    protocol::{AttachmentBinding, AttachmentDescriptor, AttachmentId, AttachmentKind},
+    protocol::{AttachmentBinding, AttachmentDescriptor, AttachmentId, AttachmentKind, SessionId},
     provider::ProviderAttachment,
     storage::{StorageError, StorageRepository},
 };
@@ -237,10 +237,12 @@ impl AttachmentStore {
     /// order its label first stands in the text, so a label standing twice
     /// for the same Attachment is handed over once. An Attachment that can no
     /// longer be read — reclaimed since the Prompt was admitted — is passed
-    /// over and reported to the Log rather than failing the delivery, and its
-    /// label stays in the text as it stands.
+    /// over and reported to the Log by its id and `session_id`'s rather than
+    /// failing the delivery, and its label stays in the text as it stands.
+    /// The label is the user's own words, so the Log never carries it.
     pub(crate) async fn deliverable(
         &self,
+        session_id: SessionId,
         bindings: &[AttachmentBinding],
     ) -> Vec<ProviderAttachment> {
         let mut ordered = bindings.iter().collect::<Vec<_>>();
@@ -257,14 +259,14 @@ impl AttachmentStore {
                     bytes,
                 }),
                 Ok(None) => tracing::warn!(
+                    %session_id,
                     attachment_id = %binding.attachment_id,
-                    label = binding.label,
                     "an Attachment a delivered Prompt binds is no longer stored; \
                      the Provider is handed the Prompt without it"
                 ),
                 Err(error) => tracing::error!(
+                    %session_id,
                     attachment_id = %binding.attachment_id,
-                    label = binding.label,
                     "an Attachment a delivered Prompt binds could not be read, \
                      so the Provider is handed the Prompt without it: {error}"
                 ),
@@ -514,6 +516,7 @@ mod tests {
             panic!("store the fixture");
         };
         let reclaimed = AttachmentId::new("reclaimed-since-admission");
+        let session_id = SessionId::new();
         let text = "[Image 1] then [Image 2], [Image 1] again";
         let bound = |id: &AttachmentId, label: &str, start: usize| AttachmentBinding {
             attachment_id: id.clone(),
@@ -540,7 +543,7 @@ mod tests {
             .finish();
         let delivered = {
             let _log = tracing::subscriber::set_default(subscriber);
-            store.deliverable(&bindings).await
+            store.deliverable(session_id, &bindings).await
         };
 
         assert_eq!(
@@ -556,8 +559,12 @@ mod tests {
         assert!(
             log.contains("WARN")
                 && log.contains("attachment_id=reclaimed-since-admission")
-                && log.contains("[Image 2]"),
-            "the reclaimed Attachment is reported to the Log by its id and label: {log}"
+                && log.contains(&format!("session_id={session_id}")),
+            "the reclaimed Attachment is reported to the Log by its id and its Session's: {log}"
+        );
+        assert!(
+            !log.contains("[Image"),
+            "a label is the user's words, which the Log never carries: {log}"
         );
     }
 }

@@ -2832,7 +2832,7 @@ async fn run_provider_session(
             let delivered_attachments = tokio::select! {
                 biased;
                 _ = shutdown.wait() => break 'actor,
-                loaded = attachments.deliverable(&delivered.prompt.attachments) => loaded,
+                loaded = attachments.deliverable(session_id, &delivered.prompt.attachments) => loaded,
             };
             // The Subagent Reports that waited for this Session's next Turn
             // stand at the head of its input, ahead of the Prompt.
@@ -3292,7 +3292,7 @@ async fn run_provider_session(
                 let delivered_attachments = tokio::select! {
                     biased;
                     _ = shutdown.wait() => break 'actor,
-                    loaded = attachments.deliverable(&prompt.attachments) => loaded,
+                    loaded = attachments.deliverable(session_id, &prompt.attachments) => loaded,
                 };
                 let steered = tokio::select! {
                     biased;
