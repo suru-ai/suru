@@ -337,8 +337,8 @@ fn skill_completion_replaces_only_the_query_binds_it_and_keeps_the_prompt_open()
     assert_eq!(created.prompt.skill_invocations.len(), 1);
     assert_eq!(created.prompt.skill_invocations[0].skill_id, skill.id);
     assert_eq!(created.prompt.skill_invocations[0].name, "review");
-    assert_eq!(created.prompt.skill_invocations[0].marker.start, 7);
-    assert_eq!(created.prompt.skill_invocations[0].marker.end, 14);
+    assert_eq!(created.prompt.skill_invocations[0].span.start, 7);
+    assert_eq!(created.prompt.skill_invocations[0].span.end, 14);
 }
 
 #[test]
@@ -379,11 +379,11 @@ fn exact_typed_and_pasted_skill_markers_bind_without_completion_and_keep_punctua
     assert_eq!(created.prompt.text, "Use $review, then $REVIEW.\"");
     assert_eq!(created.prompt.skill_invocations.len(), 2);
     assert_eq!(created.prompt.skill_invocations[0].name, "Review");
-    assert_eq!(created.prompt.skill_invocations[0].marker.start, 4);
-    assert_eq!(created.prompt.skill_invocations[0].marker.end, 11);
+    assert_eq!(created.prompt.skill_invocations[0].span.start, 4);
+    assert_eq!(created.prompt.skill_invocations[0].span.end, 11);
     assert_eq!(created.prompt.skill_invocations[1].name, "Review");
-    assert_eq!(created.prompt.skill_invocations[1].marker.start, 18);
-    assert_eq!(created.prompt.skill_invocations[1].marker.end, 25);
+    assert_eq!(created.prompt.skill_invocations[1].span.start, 18);
+    assert_eq!(created.prompt.skill_invocations[1].span.end, 25);
 }
 
 #[test]
@@ -427,8 +427,8 @@ fn continued_typing_recomputes_manual_markers_before_final_resolution() {
     };
     assert_eq!(created.prompt.skill_invocations.len(), 1);
     assert_eq!(created.prompt.skill_invocations[0].skill_id, lint_rust.id);
-    assert_eq!(created.prompt.skill_invocations[0].marker.start, 0);
-    assert_eq!(created.prompt.skill_invocations[0].marker.end, 8);
+    assert_eq!(created.prompt.skill_invocations[0].span.start, 0);
+    assert_eq!(created.prompt.skill_invocations[0].span.end, 8);
 
     let unicode = SkillDescriptor {
         id: SkillId::new("unicode-id"),
@@ -684,8 +684,8 @@ fn skill_bindings_follow_outside_edits_and_same_named_replacements_stay_stale() 
     };
     assert_eq!(created.prompt.text, ">Use $review now!");
     assert_eq!(created.prompt.skill_invocations.len(), 1);
-    assert_eq!(created.prompt.skill_invocations[0].marker.start, 5);
-    assert_eq!(created.prompt.skill_invocations[0].marker.end, 12);
+    assert_eq!(created.prompt.skill_invocations[0].span.start, 5);
+    assert_eq!(created.prompt.skill_invocations[0].span.end, 12);
 
     let (workspace, mut stale) = application_with_skills(vec![review], None);
     stale
@@ -2632,8 +2632,8 @@ fn deleting_half_a_bound_skill_drops_its_binding_and_rebases_the_following_skill
     assert_eq!(request.prompt.text, "iew $review");
     assert_eq!(request.prompt.skill_invocations.len(), 1);
     assert_eq!(request.prompt.skill_invocations[0].skill_id, skill.id);
-    assert_eq!(request.prompt.skill_invocations[0].marker.start, 4);
-    assert_eq!(request.prompt.skill_invocations[0].marker.end, 11);
+    assert_eq!(request.prompt.skill_invocations[0].span.start, 4);
+    assert_eq!(request.prompt.skill_invocations[0].span.end, 11);
 }
 
 #[test]

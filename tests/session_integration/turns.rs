@@ -20,7 +20,7 @@ use suru::{
         SessionApprovalPosture, SessionCatalogChange, SessionChange, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionRevision, SessionSnapshot,
         SessionStandingInputs, SessionStatus, SessionSummary, SessionUpdate, SkillId,
-        SkillInvocation, SkillMarkerSpan, TranscriptItem, TurnStatus,
+        SkillInvocation, TextSpan, TranscriptItem, TurnStatus,
     },
     provider::{
         ProviderActivityId, ProviderCommandStatus, ProviderEvent, ProviderEventAttribution,
@@ -70,16 +70,16 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
         skill_id: SkillId::new("safe-review-id"),
         name: "review".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     };
     let second_invocation = SkillInvocation {
         skill_id: SkillId::new("safe-explain-id"),
         name: "explain".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 8, end: 16 },
+        span: TextSpan { start: 8, end: 16 },
     };
     let repeated_invocation = SkillInvocation {
-        marker: SkillMarkerSpan { start: 17, end: 24 },
+        span: TextSpan { start: 17, end: 24 },
         ..invocation.clone()
     };
     let historical_invocations = vec![
@@ -114,10 +114,10 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
     assert_eq!(turn.skill_invocations().len(), 2);
     assert_eq!(turn.skill_invocations()[0].skill_id, invocation.skill_id);
     assert_eq!(
-        turn.skill_invocations()[0].marker_spans,
+        turn.skill_invocations()[0].spans,
         vec![
-            SkillMarkerSpan { start: 0, end: 7 },
-            SkillMarkerSpan { start: 17, end: 24 },
+            TextSpan { start: 0, end: 7 },
+            TextSpan { start: 17, end: 24 },
         ]
     );
     assert_eq!(
@@ -125,8 +125,8 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
         second_invocation.skill_id
     );
     assert_eq!(
-        turn.skill_invocations()[1].marker_spans,
-        vec![SkillMarkerSpan { start: 8, end: 16 }]
+        turn.skill_invocations()[1].spans,
+        vec![TextSpan { start: 8, end: 16 }]
     );
 
     turn.succeed();
@@ -1388,7 +1388,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         skill_id: SkillId::new("safe-steer-review-id"),
         name: "review".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     };
     client
         .admit_prompt(
@@ -1411,7 +1411,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
         accepted.skill_invocations(),
         &[ProviderSkillInvocation {
             skill_id: steer_invocation.skill_id.clone(),
-            marker_spans: vec![steer_invocation.marker],
+            spans: vec![steer_invocation.span],
         }]
     );
     assert_eq!(

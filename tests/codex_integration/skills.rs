@@ -13,7 +13,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, SessionSnapshot, SessionStatus, SkillCatalogStatus,
-        SkillDescriptor, SkillInvocation, SkillMarkerSpan, TurnStatus,
+        SkillDescriptor, SkillInvocation, TextSpan, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -132,7 +132,7 @@ fn invocation(skill: &SkillDescriptor, start: u32, end: u32) -> SkillInvocation 
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start, end },
+        span: TextSpan { start, end },
     }
 }
 
@@ -314,19 +314,19 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
             skill_id: review.id.clone(),
             name: review.name.clone(),
             scope: review.scope.clone(),
-            marker: SkillMarkerSpan { start: 0, end: 7 },
+            span: TextSpan { start: 0, end: 7 },
         },
         SkillInvocation {
             skill_id: explain.id.clone(),
             name: explain.name.clone(),
             scope: explain.scope.clone(),
-            marker: SkillMarkerSpan { start: 8, end: 16 },
+            span: TextSpan { start: 8, end: 16 },
         },
         SkillInvocation {
             skill_id: review.id,
             name: review.name,
             scope: review.scope,
-            marker: SkillMarkerSpan { start: 17, end: 24 },
+            span: TextSpan { start: 17, end: 24 },
         },
     ];
     let created = client

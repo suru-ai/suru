@@ -11,9 +11,9 @@ use suru::protocol::{
     PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
     SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
     SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
-    SkillDescriptor, SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery,
-    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal,
-    ViewSessionOperationId, ViewSessionRequest, Workspace,
+    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
+    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
+    ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -242,7 +242,7 @@ fn safe_skill_invocations_round_trip_beside_the_original_prompt_text() {
             skill_id: SkillId::new("01J-safe-opaque-id"),
             name: "code-review".to_owned(),
             scope: Some("Workspace".to_owned()),
-            marker: SkillMarkerSpan { start: 0, end: 12 },
+            span: TextSpan { start: 0, end: 12 },
         }],
     };
     let encoded = serde_json::to_value(&prompt).expect("encode Skill-bearing Prompt");
@@ -256,7 +256,7 @@ fn safe_skill_invocations_round_trip_beside_the_original_prompt_text() {
                 "skill_id": "01J-safe-opaque-id",
                 "name": "code-review",
                 "scope": "Workspace",
-                "marker": { "start": 0, "end": 12 }
+                "span": { "start": 0, "end": 12 }
             }]
         })
     );

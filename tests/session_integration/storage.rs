@@ -15,7 +15,7 @@ use suru::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelectionOperationId, Cost,
         CostBasis, CreateSessionRequest, InitialPrompt, LatestTurnStatus, PromptDelivery, PromptId,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, SkillMarkerSpan,
+        SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, TextSpan,
         TurnStatus, UpdateAgentSelectionRequest, Usage,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
@@ -49,7 +49,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
         skill_id: SkillId::new("safe-review-id"),
         name: "review".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     };
     let original = spawn_with_failing_provider(config.clone())
         .await

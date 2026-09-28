@@ -8,7 +8,7 @@ use super::commands::{
     AUTOCOMPLETE_LIMIT, SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor,
     fuzzy_score, slash_trigger,
 };
-use super::composer::skill_marker_start_is_valid;
+use super::text_binding::skill_invocation_can_start;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletionTrigger {
@@ -395,7 +395,7 @@ fn skill_trigger(text: &str, cursor: usize) -> Option<(&str, Range<usize>)> {
             .rev()
             .find_map(|(offset, character)| {
                 let start = token_start + offset;
-                (character == '$' && skill_marker_start_is_valid(text, start)).then_some(start)
+                (character == '$' && skill_invocation_can_start(text, start)).then_some(start)
             })?;
     let query = &text[start + 1..cursor];
     Some((query, start..cursor))

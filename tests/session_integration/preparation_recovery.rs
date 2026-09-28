@@ -368,7 +368,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     }];
     let response = create_response(server.descriptor(), &original).await;
     assert!(!response.status().is_success());

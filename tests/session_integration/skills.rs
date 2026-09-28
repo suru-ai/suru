@@ -16,7 +16,7 @@ use suru::{
         PromptDelivery, PromptId, PromptStatus, ProviderId, SessionError, SessionErrorCode,
         SessionRevision, SessionStatus, SettingMutation, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation,
-        SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
+        SkillPromptDelivery, TextSpan, TurnStatus,
     },
     server::{self, ServerConfig},
 };
@@ -158,7 +158,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
             skill_id: original.id.clone(),
             name: original.name.clone(),
             scope: original.scope.clone(),
-            marker: SkillMarkerSpan { start: 6, end: 13 },
+            span: TextSpan { start: 6, end: 13 },
         };
         let queued = first
             .admit_prompt(
@@ -319,7 +319,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
             skill_id: original.id.clone(),
             name: original.name.clone(),
             scope: original.scope.clone(),
-            marker: SkillMarkerSpan { start: 0, end: 7 },
+            span: TextSpan { start: 0, end: 7 },
         };
         let created = client
             .create_session(CreateSessionRequest {
@@ -468,7 +468,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
             skill_id: original.id.clone(),
             name: original.name.clone(),
             scope: original.scope.clone(),
-            marker: SkillMarkerSpan { start: 6, end: 13 },
+            span: TextSpan { start: 6, end: 13 },
         };
         let steer = client
             .admit_prompt(
@@ -643,7 +643,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
                         skill_id: original.id.clone(),
                         name: original.name.clone(),
                         scope: original.scope.clone(),
-                        marker: SkillMarkerSpan { start: 0, end: 7 },
+                        span: TextSpan { start: 0, end: 7 },
                     }],
                 },
                 delivery: PromptDelivery::Queue,
@@ -866,7 +866,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
                     skill_id: original.id,
                     name: original.name,
                     scope: original.scope,
-                    marker: SkillMarkerSpan { start: 0, end: 7 },
+                    span: TextSpan { start: 0, end: 7 },
                 }],
             },
         })
@@ -1168,7 +1168,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         skill_id: descriptor.id.clone(),
         name: descriptor.name.clone(),
         scope: descriptor.scope.clone(),
-        marker: SkillMarkerSpan { start: 0, end: 6 },
+        span: TextSpan { start: 0, end: 6 },
     };
     let prompt_id = PromptId::new();
     let created_response = client
@@ -1230,7 +1230,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
                     skill_id: SkillId::new("forged-id"),
                     name: "Über".to_owned(),
                     scope: Some("Workspace".to_owned()),
-                    marker: SkillMarkerSpan { start: 0, end: 6 },
+                    span: TextSpan { start: 0, end: 6 },
                 }],
             },
         })
@@ -1462,7 +1462,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
             skill_id: skill.id.clone(),
             name: skill.name.clone(),
             scope: skill.scope.clone(),
-            marker: SkillMarkerSpan { start: 6, end: 13 },
+            span: TextSpan { start: 6, end: 13 },
         };
         let admitted = client
             .admit_prompt(

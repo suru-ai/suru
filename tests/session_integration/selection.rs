@@ -15,7 +15,7 @@ use suru::{
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
         ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, PromptStatus,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, SessionChange, SessionRevision,
-        SessionSnapshot, SkillId, SkillInvocation, SkillMarkerSpan, TurnStatus,
+        SessionSnapshot, SkillId, SkillInvocation, TextSpan, TurnStatus,
         UpdateAgentSelectionRequest,
     },
     provider::{ProviderEvent, ProviderSkillInvocation},
@@ -1131,7 +1131,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
         skill_id: SkillId::new("safe-retry-id"),
         name: "retry".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 6 },
+        span: TextSpan { start: 0, end: 6 },
     };
     let created = client
         .create_session(CreateSessionRequest {
@@ -1156,7 +1156,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     assert_eq!(turn.selection(), &selection);
     let provider_invocation = ProviderSkillInvocation {
         skill_id: invocation.skill_id.clone(),
-        marker_spans: vec![invocation.marker],
+        spans: vec![invocation.span],
     };
     assert_eq!(
         turn.skill_invocations(),

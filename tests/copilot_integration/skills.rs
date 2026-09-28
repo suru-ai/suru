@@ -16,7 +16,7 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery,
         PromptId, PromptStatus, ProviderId, SessionStatus, SkillCatalogRequest, SkillCatalogStatus,
-        SkillId, SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
+        SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -380,15 +380,15 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
     let skill = catalog.skills.first().expect("review Skill is offered");
 
     let cases = [
-        ("Please $review this", SkillMarkerSpan { start: 7, end: 14 }),
-        ("$review", SkillMarkerSpan { start: 0, end: 7 }),
+        ("Please $review this", TextSpan { start: 7, end: 14 }),
+        ("$review", TextSpan { start: 0, end: 7 }),
     ];
-    for (index, (text, marker)) in cases.into_iter().enumerate() {
+    for (index, (text, span)) in cases.into_iter().enumerate() {
         let invocation = SkillInvocation {
             skill_id: skill.id.clone(),
             name: skill.name.clone(),
             scope: skill.scope.clone(),
-            marker,
+            span,
         };
         let created = client
             .create_session(CreateSessionRequest {
@@ -506,7 +506,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start: 6, end: 13 },
+        span: TextSpan { start: 6, end: 13 },
     };
     let queued = client
         .admit_prompt(
@@ -529,7 +529,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start: 6, end: 13 },
+        span: TextSpan { start: 6, end: 13 },
     };
     let steer = client
         .admit_prompt(
@@ -654,7 +654,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
                     skill_id: SkillId::new("copilot-forged"),
                     name: "review".to_owned(),
                     scope: None,
-                    marker: SkillMarkerSpan { start: 0, end: 7 },
+                    span: TextSpan { start: 0, end: 7 },
                 }],
             },
         })
@@ -718,7 +718,7 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     };
 
     let created = client
@@ -799,13 +799,13 @@ async fn copilot_rejects_two_distinct_skills_before_opening_or_invoking_a_user_s
                         skill_id: review.id.clone(),
                         name: review.name.clone(),
                         scope: review.scope.clone(),
-                        marker: SkillMarkerSpan { start: 0, end: 7 },
+                        span: TextSpan { start: 0, end: 7 },
                     },
                     SkillInvocation {
                         skill_id: explain.id.clone(),
                         name: explain.name.clone(),
                         scope: explain.scope.clone(),
-                        marker: SkillMarkerSpan { start: 8, end: 16 },
+                        span: TextSpan { start: 8, end: 16 },
                     },
                 ],
             },

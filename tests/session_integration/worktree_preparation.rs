@@ -82,7 +82,7 @@ fn bound(name: &str, start: u32, end: u32) -> SkillInvocation {
         skill_id: SkillId::new(format!("source-{name}")),
         name: name.to_owned(),
         scope: Some("Source".to_owned()),
-        marker: SkillMarkerSpan { start, end },
+        span: TextSpan { start, end },
     }
 }
 fn branch(preparation: &PreparedCheckout) -> &str {
@@ -632,8 +632,8 @@ async fn the_tui_prepares_a_worktree_named_from_its_prompt_and_starts_its_sessio
     assert_eq!(request.prompt.text, "$explain why we keep the parser slow");
     assert_eq!(request.prompt.skill_invocations.len(), 1);
     assert_eq!(
-        request.prompt.skill_invocations[0].marker,
-        SkillMarkerSpan { start: 0, end: 8 }
+        request.prompt.skill_invocations[0].span,
+        TextSpan { start: 0, end: 8 }
     );
 
     let result = prepare(descriptor, &request).await;
@@ -693,7 +693,7 @@ async fn every_provider_automatically_rebinds_selected_skill_names_to_destinatio
             skill_id: SkillId::new(format!("{provider_name}-source-explain")),
             name: "explain".to_owned(),
             scope: Some("Source checkout".to_owned()),
-            marker: SkillMarkerSpan { start: 7, end: 15 },
+            span: TextSpan { start: 7, end: 15 },
         }];
 
         let snapshot = support::create_session(server.descriptor(), &create).await;
@@ -739,13 +739,13 @@ async fn missing_or_ambiguous_destination_names_block_atomically_and_explicit_ch
             skill_id: SkillId::new("source-explain"),
             name: "explain".to_owned(),
             scope: Some("Source".to_owned()),
-            marker: SkillMarkerSpan { start: 0, end: 8 },
+            span: TextSpan { start: 0, end: 8 },
         },
         SkillInvocation {
             skill_id: SkillId::new("source-review"),
             name: "review".to_owned(),
             scope: Some("Source".to_owned()),
-            marker: SkillMarkerSpan { start: 9, end: 16 },
+            span: TextSpan { start: 9, end: 16 },
         },
     ];
     let rejected = create_response(server.descriptor(), &mixed).await;
@@ -760,7 +760,7 @@ async fn missing_or_ambiguous_destination_names_block_atomically_and_explicit_ch
         skill_id: SkillId::new("source-gone"),
         name: "gone".to_owned(),
         scope: Some("Source".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 5 },
+        span: TextSpan { start: 0, end: 5 },
     }];
     let rejected = create_response(server.descriptor(), &missing).await;
     assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
@@ -778,13 +778,13 @@ async fn missing_or_ambiguous_destination_names_block_atomically_and_explicit_ch
             skill_id: SkillId::new("source-explain"),
             name: "explain".to_owned(),
             scope: Some("Source".to_owned()),
-            marker: SkillMarkerSpan { start: 0, end: 8 },
+            span: TextSpan { start: 0, end: 8 },
         },
         SkillInvocation {
             skill_id: SkillId::new("safe-review-id"),
             name: "review".to_owned(),
             scope: Some("Workspace".to_owned()),
-            marker: SkillMarkerSpan { start: 9, end: 16 },
+            span: TextSpan { start: 9, end: 16 },
         },
     ];
     let snapshot = create_response(server.descriptor(), &corrected)

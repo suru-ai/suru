@@ -611,7 +611,7 @@ fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation], asks_branc
     let mut prompt = prompt.to_owned();
     let mut marker_starts = skill_invocations
         .iter()
-        .map(|invocation| invocation.marker.start as usize)
+        .map(|invocation| invocation.span.start as usize)
         .filter(|start| prompt.as_bytes().get(*start) == Some(&b'$'))
         .collect::<Vec<_>>();
     marker_starts.sort_unstable();

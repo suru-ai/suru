@@ -46,8 +46,7 @@ use crate::{
     protocol::{
         Activity, ActivityId, Delegator, FileChange, FoldPosture, InitialPrompt, Message,
         MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision,
-        SessionSnapshot, SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus,
-        skill_marker_matches,
+        SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -56,6 +55,7 @@ use super::{
     markdown,
     slots::{SlotText, truncate_slot_text},
     spinner,
+    text_binding::TextBindings,
     text_layout::{StyledLayout, StyledLine, StyledRow, StyledSpan, TextLayout},
 };
 
@@ -1630,7 +1630,7 @@ impl RenderUnit<'_> {
                 push_user_message(
                     projection.lines,
                     &prompt.text,
-                    &prompt.skill_invocations,
+                    &TextBindings::from_prompt(prompt),
                     theme,
                     width,
                 );
@@ -2708,13 +2708,7 @@ fn message_fingerprint(message: &Message) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     message.content.len().hash(&mut hasher);
     message.truncated.hash(&mut hasher);
-    for invocation in &message.skill_invocations {
-        invocation.skill_id.as_str().hash(&mut hasher);
-        invocation.name.hash(&mut hasher);
-        invocation.scope.hash(&mut hasher);
-        invocation.marker.start.hash(&mut hasher);
-        invocation.marker.end.hash(&mut hasher);
-    }
+    TextBindings::from_message(message).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -2938,7 +2932,7 @@ fn render_message(
         MessageRole::User => push_user_message(
             lines,
             &message.content,
-            &message.skill_invocations,
+            &TextBindings::from_message(message),
             theme,
             width,
         ),
@@ -4237,15 +4231,23 @@ pub(super) fn humanized_duration(duration_ms: u64) -> String {
 fn push_user_message(
     lines: &mut Vec<StyledLine>,
     content: &str,
-    skill_invocations: &[SkillInvocation],
+    bindings: &TextBindings,
     theme: &Theme,
     available_width: u16,
 ) {
     let content = sanitize_content(content);
     let surface = theme.surface.elevated.patch(theme.text.primary);
     let accent = theme.surface.elevated.patch(theme.accent.primary);
-    let skill_ranges = matches!(&content, std::borrow::Cow::Borrowed(_))
-        .then(|| recognized_skill_ranges(&content, skill_invocations))
+    let bound = matches!(&content, std::borrow::Cow::Borrowed(_))
+        .then(|| {
+            bindings
+                .recognized_in(&content)
+                .map(|binding| {
+                    let style = theme.surface.elevated.patch(binding.kind.style(theme));
+                    (binding.span.clone(), style)
+                })
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     push_message_block(
         lines,
@@ -4256,11 +4258,10 @@ fn push_user_message(
             surface,
         },
         |byte| {
-            if skill_ranges.iter().any(|range| range.contains(&byte)) {
-                accent
-            } else {
-                surface
-            }
+            bound
+                .iter()
+                .find(|(span, _)| span.contains(&byte))
+                .map_or(surface, |(_, style)| *style)
         },
         usize::from(available_width),
     );
@@ -4347,20 +4348,6 @@ fn push_message_block(
         }
         previous_end = row.start + row.text.len();
     }
-}
-
-fn recognized_skill_ranges(
-    content: &str,
-    skill_invocations: &[SkillInvocation],
-) -> Vec<std::ops::Range<usize>> {
-    skill_invocations
-        .iter()
-        .filter_map(|invocation| {
-            let range = invocation.marker.start as usize..invocation.marker.end as usize;
-            let marker = content.get(range.clone())?;
-            skill_marker_matches(marker, &invocation.name).then_some(range)
-        })
-        .collect()
 }
 
 fn push_message_block_row(
@@ -4850,9 +4837,9 @@ mod tests {
 
     use super::{
         ActivityProjection, CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine,
-        StyledSpan, TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds,
-        TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line,
-        push_user_message, render_activity, render_message, split_oversized_line,
+        StyledSpan, TextBindings, TextPosition, TranscriptCache, TranscriptDisclosure,
+        TranscriptFolds, TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart,
+        layout_line, push_user_message, render_activity, render_message, split_oversized_line,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -6040,7 +6027,13 @@ mod tests {
     #[test]
     fn a_user_message_moves_a_whole_word_to_the_next_row() {
         let mut lines = Vec::new();
-        push_user_message(&mut lines, "aaaa bbbbbb", &[], &Theme::system(), 12);
+        push_user_message(
+            &mut lines,
+            "aaaa bbbbbb",
+            &TextBindings::default(),
+            &Theme::system(),
+            12,
+        );
         assert_eq!(
             lines.iter().map(projected_text).collect::<Vec<_>>(),
             ["\u{2503} aaaa      ", "\u{2503} bbbbbb    "],
@@ -6051,7 +6044,13 @@ mod tests {
     #[test]
     fn a_user_message_keeps_a_column_of_air_at_its_right_edge() {
         let mut lines = Vec::new();
-        push_user_message(&mut lines, "aaaaaaaaaaaa", &[], &Theme::system(), 12);
+        push_user_message(
+            &mut lines,
+            "aaaaaaaaaaaa",
+            &TextBindings::default(),
+            &Theme::system(),
+            12,
+        );
         let rows = lines.iter().map(projected_text).collect::<Vec<_>>();
         assert_eq!(rows, ["\u{2503} aaaaaaaaa ", "\u{2503} aaa       "]);
         for row in &rows {

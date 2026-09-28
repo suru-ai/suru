@@ -120,7 +120,7 @@ pub(crate) fn without_skill_markers(
 ) -> Result<String, String> {
     let mut spans = Vec::with_capacity(skill_invocations.len());
     for invocation in skill_invocations {
-        let span = invocation.marker.start as usize..invocation.marker.end as usize;
+        let span = invocation.span.range();
         if !text
             .get(span.clone())
             .is_some_and(|marker| skill_marker_matches(marker, &invocation.name))
@@ -151,7 +151,7 @@ pub(crate) fn without_skill_markers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{SkillId, SkillMarkerSpan};
+    use crate::protocol::{SkillId, TextSpan};
 
     #[test]
     fn text_is_shaped_into_a_short_fragment_of_meaningful_words() {
@@ -267,7 +267,7 @@ mod tests {
             skill_id: SkillId::new(name),
             name: name.to_owned(),
             scope: None,
-            marker: SkillMarkerSpan { start, end },
+            span: TextSpan { start, end },
         }
     }
 

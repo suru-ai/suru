@@ -18,7 +18,7 @@ use crate::protocol::{
     AgentIdentity, AgentSelection, ApprovalPosture, Cost, CostBasis, CostCoverage,
     EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId,
     ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillId,
-    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, Usage,
+    SkillInvocation, SkillPromptDelivery, TextSpan, Usage,
 };
 
 mod claude;
@@ -551,11 +551,11 @@ impl ProviderPrompt {
                 .iter_mut()
                 .find(|existing| existing.skill_id == invocation.skill_id)
             {
-                existing.marker_spans.push(invocation.marker);
+                existing.spans.push(invocation.span);
             } else {
                 ordered.push(ProviderSkillInvocation {
                     skill_id: invocation.skill_id,
-                    marker_spans: vec![invocation.marker],
+                    spans: vec![invocation.span],
                 });
             }
         }
@@ -572,7 +572,7 @@ impl ProviderPrompt {
         let mut spans = self
             .skill_invocations
             .into_iter()
-            .flat_map(|invocation| invocation.marker_spans)
+            .flat_map(|invocation| invocation.spans)
             .collect::<Vec<_>>();
         spans.sort_by_key(|span| std::cmp::Reverse((span.start, span.end)));
 
@@ -598,12 +598,13 @@ impl ProviderPrompt {
 }
 
 /// One distinct Provider-neutral Skill Invocation, in first-appearance order,
-/// with every marker that selected it retained for Provider-specific lowering.
+/// with the span of every `$skill-name` that selected it retained for
+/// Provider-specific lowering.
 /// Native paths and command names remain inside the Provider adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSkillInvocation {
     pub skill_id: SkillId,
-    pub marker_spans: Vec<SkillMarkerSpan>,
+    pub spans: Vec<TextSpan>,
 }
 
 /// What Suru hands a Provider as its Agent's own input, to begin a Turn or to

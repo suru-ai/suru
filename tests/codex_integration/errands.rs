@@ -19,7 +19,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         CreateSessionRequest, InitialPrompt, PromptId, ProviderId, SessionId, SessionTitleChanged,
-        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, SkillMarkerSpan,
+        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, TextSpan,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -326,7 +326,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start: 0, end: 10 },
+        span: TextSpan { start: 0, end: 10 },
     };
 
     let created = client

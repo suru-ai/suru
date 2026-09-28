@@ -27,7 +27,7 @@ use super::{
     approval_posture_picker::ApprovalPostureChoice,
     aside::AsidePresentation,
     completion::CompletionRow,
-    composer::{ComposerKey, ComposerMemory, ComposerSkillMarkers},
+    composer::{ComposerBindings, ComposerKey, ComposerMemory},
     icon_picker,
     keymap::binding_label,
     model_options::ModelOptionChoiceRow,
@@ -3720,7 +3720,7 @@ fn render_landing(
     let key = ComposerKey::Landing;
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key.clone());
+    let bindings = state.composers.bindings(key.clone());
     let composer_height = composer_block_height(
         area.height,
         72_u16.min(content.width),
@@ -3783,7 +3783,7 @@ fn render_landing(
             key,
             text: composer_text,
             cursor: composer_cursor,
-            skill_markers: &skill_markers,
+            bindings: &bindings,
         },
         state.composer_border_style(theme),
         theme,
@@ -3844,7 +3844,7 @@ fn render_opening_session(
     );
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key.clone());
+    let bindings = state.composers.bindings(key.clone());
     let desired_composer_height =
         composer_block_height(area.height, content_width, composer_text, composer_cursor);
     // What the Session view keeps below its Transcript and above its composer:
@@ -3895,7 +3895,7 @@ fn render_opening_session(
             key,
             text: composer_text,
             cursor: composer_cursor,
-            skill_markers: &skill_markers,
+            bindings: &bindings,
         },
         state.composer_border_style(theme),
         theme,
@@ -4153,7 +4153,7 @@ fn render_session_surface(
     let subagent_view = snapshot.session.parent.is_some();
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
-    let skill_markers = state.composers.skill_markers(key.clone());
+    let bindings = state.composers.bindings(key.clone());
     let desired_composer_height = if subagent_view {
         1
     } else {
@@ -4500,7 +4500,7 @@ fn render_session_surface(
                 key,
                 text: composer_text,
                 cursor: composer_cursor,
-                skill_markers: &skill_markers,
+                bindings: &bindings,
             },
             state.composer_border_style(theme),
             theme,
@@ -4914,7 +4914,7 @@ struct ComposerContent<'a> {
     key: ComposerKey,
     text: &'a str,
     cursor: usize,
-    skill_markers: &'a ComposerSkillMarkers,
+    bindings: &'a ComposerBindings,
 }
 
 fn render_composer(
@@ -4929,7 +4929,7 @@ fn render_composer(
         key,
         text,
         cursor,
-        skill_markers,
+        bindings,
     } = content;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4949,7 +4949,7 @@ fn render_composer(
             theme.form_field.placeholder,
         ))
     } else {
-        Paragraph::new(wrapped_composer_lines(&layout, skill_markers, theme))
+        Paragraph::new(wrapped_composer_lines(&layout, bindings, theme))
             .style(theme.form_field.text)
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), area);
@@ -5128,7 +5128,7 @@ fn composer_content_width(width: u16) -> u16 {
 
 fn wrapped_composer_lines(
     layout: &TextLayout<'_>,
-    skill_markers: &ComposerSkillMarkers,
+    bindings: &ComposerBindings,
     theme: &Theme,
 ) -> Text<'static> {
     let lines = layout
@@ -5137,18 +5137,14 @@ fn wrapped_composer_lines(
             let mut line = Vec::<(Style, String)>::new();
             for (offset, character) in row.text.char_indices() {
                 let offset = row.start + offset;
-                let style = if skill_markers
-                    .invalid
-                    .iter()
-                    .any(|range| range.contains(&offset))
-                {
+                let style = if bindings.invalid.iter().any(|range| range.contains(&offset)) {
                     theme.feedback.error
-                } else if skill_markers
-                    .recognized
+                } else if let Some(binding) = bindings
+                    .bound
                     .iter()
-                    .any(|range| range.contains(&offset))
+                    .find(|binding| binding.span.contains(&offset))
                 {
-                    theme.accent.primary
+                    binding.kind.style(theme)
                 } else {
                     theme.form_field.text
                 };

@@ -15,8 +15,8 @@ use suru::{
         CreateSessionRequest, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
         ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
         SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionUpdate, SkillId, SkillInvocation, SkillMarkerSpan,
-        Turn, TurnId, TurnStatus,
+        SessionSnapshot, SessionStatus, SessionUpdate, SkillId, SkillInvocation, TextSpan, Turn,
+        TurnId, TurnStatus,
     },
     provider::{ProviderEvent, ProviderSkillInvocation},
     server::{self, AgentOutput, ServerConfig},
@@ -293,7 +293,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
         skill_id: SkillId::new("safe-smaller-interface-id"),
         name: "smaller-interface".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 18 },
+        span: TextSpan { start: 0, end: 18 },
     };
     let command = AdmitPromptRequest {
         prompt: InitialPrompt {
@@ -831,7 +831,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         skill_id: SkillId::new("safe-review-after-interrupt-id"),
         name: "review".to_owned(),
         scope: Some("Workspace".to_owned()),
-        marker: SkillMarkerSpan { start: 0, end: 7 },
+        span: TextSpan { start: 0, end: 7 },
     };
     let after_interrupt = first
         .admit_prompt(
@@ -1006,7 +1006,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
         queued_start.skill_invocations(),
         &[ProviderSkillInvocation {
             skill_id: queued_invocation.skill_id,
-            marker_spans: vec![queued_invocation.marker],
+            spans: vec![queued_invocation.span],
         }]
     );
     queued_start.succeed();

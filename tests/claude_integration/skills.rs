@@ -12,7 +12,7 @@ use serde_json::Value;
 use suru::protocol::{
     Activity, AdmitPromptRequest, CreateSessionRequest, InitialPrompt, MessageRole, PromptDelivery,
     PromptId, PromptStatus, ProviderId, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
-    SkillInvocation, SkillMarkerSpan, SkillPromptDelivery, TurnStatus,
+    SkillInvocation, SkillPromptDelivery, TextSpan, TurnStatus,
 };
 
 fn skill_catalog_arms() -> String {
@@ -50,7 +50,7 @@ fn invocation(skill: &SkillDescriptor, start: u32, end: u32) -> SkillInvocation 
         skill_id: skill.id.clone(),
         name: skill.name.clone(),
         scope: skill.scope.clone(),
-        marker: SkillMarkerSpan { start, end },
+        span: TextSpan { start, end },
     }
 }
 

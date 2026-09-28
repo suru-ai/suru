@@ -567,9 +567,7 @@ fn validate_skill_marker(
     prompt: &InitialPrompt,
     invocation: &SkillInvocation,
 ) -> Result<(), SkillCatalogError> {
-    let start = invocation.marker.start as usize;
-    let end = invocation.marker.end as usize;
-    let Some(marker) = prompt.text.get(start..end) else {
+    let Some(marker) = prompt.text.get(invocation.span.range()) else {
         return Err(SkillCatalogError::InvalidInvocation(format!(
             "Skill `{}` has an invalid marker range",
             invocation.name

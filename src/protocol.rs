@@ -1,6 +1,7 @@
 use std::{
     fmt,
     net::{IpAddr, Ipv6Addr},
+    ops::Range,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 64;
+pub const PROTOCOL_VERSION: u32 = 65;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
@@ -591,13 +592,30 @@ pub struct SkillCatalogRequest {
     pub execution_directory: ExecutionDirectory,
 }
 
-/// The byte range occupied by one recognized `$skill-name` marker in the
-/// original UTF-8 Prompt. The end is exclusive, matching Rust string ranges.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// The byte range of a Prompt's original UTF-8 text that stands for something
+/// bound beside that text, such as the `$skill-name` a Skill Invocation was
+/// written as. The end is exclusive, matching Rust string ranges.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SkillMarkerSpan {
+pub struct TextSpan {
     pub start: u32,
     pub end: u32,
+}
+
+impl TextSpan {
+    /// The span as byte offsets into the Prompt text.
+    pub fn range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+impl From<Range<usize>> for TextSpan {
+    fn from(range: Range<usize>) -> Self {
+        Self {
+            start: range.start as u32,
+            end: range.end as u32,
+        }
+    }
 }
 
 pub(crate) fn skill_names_equal(left: &str, right: &str) -> bool {
@@ -617,13 +635,14 @@ pub(crate) fn skill_marker_matches(marker: &str, name: &str) -> bool {
 /// remain separate records so historical presentation preserves every marker;
 /// Provider lowering may later deduplicate identities in first-appearance
 /// order.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillInvocation {
     pub skill_id: SkillId,
     pub name: String,
     pub scope: Option<String>,
-    pub marker: SkillMarkerSpan,
+    /// Where the `$skill-name` it was written as stands in the Prompt text.
+    pub span: TextSpan,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
