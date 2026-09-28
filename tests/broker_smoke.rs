@@ -8,10 +8,11 @@
 //! Every other Broker test drives Suru against Provider doubles and scripted
 //! stand-ins; this one is the check that the real harnesses do what those
 //! doubles were written to: that Claude loads the Broker from its MCP config,
-//! finds its Tools, and calls them unasked; that Codex takes the Broker on its
-//! thread and runs a brokered Subagent at the posture derived for it; and that
-//! Claude answers a Report as a Turn of its own. It spends real Model calls, so
-//! it runs only when asked twice — the ignore attribute and `SURU_BROKER_SMOKE=1`
+//! finds its Tools, and calls them unasked, at whichever MCP revision it
+//! negotiates with the Broker; that Codex takes the Broker on its thread and
+//! runs a brokered Subagent at the posture derived for it; and that Claude
+//! answers a Report as a Turn of its own. It spends real Model calls, so it
+//! runs only when asked twice — the ignore attribute and `SURU_BROKER_SMOKE=1`
 //! — and skips when Suru finds either CLI not installed or not signed in:
 //!
 //! ```text
@@ -27,7 +28,7 @@
 #[allow(dead_code)]
 mod server_support;
 
-use std::{ffi::OsStr, path::Path, process::Command, sync::Arc};
+use std::{ffi::OsStr, fmt::Display, path::Path, process::Command, sync::Arc};
 
 use server_support::{PROGRESS_DEADLINE, receive_initial_state};
 use suru::{
@@ -36,8 +37,8 @@ use suru::{
         Activity, ActivityStatus, AgentSelection, ApprovalPosture, ClaudePermissionMode,
         CodexApprovalPolicy, CodexSandboxMode, CreateSessionRequest, Delegator, ExecutionDirectory,
         InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelCatalog,
-        ModelDescriptor, PromptId, ProviderCatalogStatus, ProviderId, ProviderUnavailability,
-        SessionId, SessionSnapshot, TurnStatus,
+        ModelDescriptor, ModelId, PromptId, ProviderCatalogStatus, ProviderId,
+        ProviderUnavailability, SessionId, SessionRevision, SessionSnapshot, TurnId, TurnStatus,
     },
     provider::{ClaudeRuntime, CodexRuntime},
     server::{self, ServerConfig},
@@ -46,21 +47,17 @@ use tokio::time::{Duration, Instant, timeout};
 
 const GATE: &str = "SURU_BROKER_SMOKE";
 
-/// The Server's channel, which names nothing outside the smoke's own state
-/// directory.
-const CHANNEL: &str = "broker-installed-smoke";
-
 /// What the smoke asks of the Claude Agent. It names the Broker but none of
 /// its Tools, which the Agent learns from the note Suru appends to its system
 /// prompt. The Subagent sleeps before it answers so that its Report reaches a
 /// Claude Agent whose Turn has settled — the Continuation this smoke is about —
 /// rather than steering the Turn that spawned it.
-const PROMPT: &str = "Using Suru's Broker, spawn one Subagent on the codex Provider, on that \
-Provider's default Model, named echo. Tell it to run the shell command `sleep 8` and then reply \
-with exactly the word PONG and nothing else. Do not do its task yourself, and do not wait for it \
-or check on it: once it is spawned, end your turn straight away. Suru will bring you its Report \
-as a new message; when it arrives, answer with the single word DONE followed by the Subagent's \
-reply.";
+const REPORT_PROMPT: &str = "Using Suru's Broker, spawn one Subagent on the codex Provider, on \
+that Provider's default Model, named echo. Tell it to run the shell command `sleep 8` and then \
+reply with exactly the word PONG and nothing else. Do not do its task yourself, and do not wait \
+for it or check on it: once it is spawned, end your turn straight away. Suru will bring you its \
+Report as a new message; when it arrives, answer with the single word DONE followed by the \
+Subagent's reply.";
 
 /// The Subagent's name, as the Prompt gives it.
 const SUBAGENT_NAME: &str = "echo";
@@ -70,256 +67,42 @@ const SUBAGENT_NAME: &str = "echo";
 const PARENT_MODEL: &str = "haiku";
 
 /// How long each live stretch — the spawn, the Subagent's work, the Report's
-/// Continuation — may take before the smoke calls it a failure. It is a
-/// failure deadline for real CLIs calling real Models, not an expected wait:
-/// every wait below returns the moment what it waits for arrives.
+/// Continuation — may take before the smoke calls it a failure. It is a failure deadline for real CLIs calling real
+/// Models, not an expected wait: every wait returns the moment what it waits
+/// for arrives.
 const LIVE_STEP_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long a Session may stand at rest — nothing in it Working, every Turn
+/// settled — without changing before a smoke waiting on it for something else
+/// calls that a state nothing will now move it from. A Session passes through
+/// rest on its way to a Continuation, between the commit that settles its
+/// Subagent's row and the one that opens the Continuation the Report wakes, so
+/// rest alone is no failure; but that step takes a moment, not this long.
+const REST_GRACE: Duration = PROGRESS_DEADLINE;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "set SURU_BROKER_SMOKE=1 to use the installed, signed-in Claude and Codex binaries"]
 async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_its_report() {
-    if std::env::var_os(GATE).as_deref() != Some(OsStr::new("1")) {
-        eprintln!("skipping: set {GATE}=1 to opt in");
+    let Some(mut live) = Live::start("broker-report-smoke").await else {
         return;
-    }
-    trace_the_server_when_asked();
-    let began = Instant::now();
-    println!(
-        "claude --version: {}",
-        cli_version("SURU_CLAUDE_PATH", "claude")
-    );
-    println!(
-        "codex --version: {}",
-        cli_version("SURU_CODEX_PATH", "codex")
-    );
-
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let config_dir = tempfile::tempdir().expect("create isolated config directory");
-    // Claude's bypassPermissions derives Codex's never with danger-full-access for the Subagent
-    // (ADR 0036), so nothing in the tree asks; and no Title or Workspace Icon is derived, which
-    // would spend Model calls the smoke has no stake in.
-    std::fs::write(
-        config_dir.path().join("suru.jsonc"),
-        r#"{
-  "provider": { "claude": { "permissionMode": "bypassPermissions" } },
-  "derivation": { "errand": "off" }
-}
-"#,
-    )
-    .expect("write the Config Document");
-    let workspace = scratch_repository();
-    let server = server::spawn_with_providers(
-        ServerConfig::new(state_dir.path(), CHANNEL)
-            .expect("configure server")
-            .with_config_dir(config_dir.path()),
-        vec![
-            Arc::new(ClaudeRuntime::from_environment()),
-            Arc::new(CodexRuntime::from_environment()),
-        ],
-    )
-    .await
-    .expect("launch a Server hosting the installed Claude and Codex");
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), CHANNEL).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
-    receive_initial_state(&mut client).await;
-
-    let catalog = client
-        .refresh_models()
-        .await
-        .expect("ask both Providers what they offer");
-    if let Some(reason) = unusable(&catalog) {
-        eprintln!("skipping: {reason}");
-        drop(client);
-        shut_down(server).await;
-        return;
-    }
-    let parent_model = parent_model(&catalog);
-    let codex_default = catalog_of(&catalog, "codex")
-        .models
-        .iter()
-        .find(|model| model.is_default)
-        .map_or_else(|| "none".to_owned(), |model| model.id.to_string());
-    println!(
-        "parent Model: claude/{}; Codex's default Model: {codex_default}",
-        parent_model.id
-    );
-
-    // The Claude Session, at the posture the Config Document pinned.
-    let prompt_id = PromptId::new();
-    let created = client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: Some(AgentSelection {
-                provider: ProviderId::new("claude"),
-                model: parent_model.id.clone(),
-                options: Vec::new(),
-            }),
-            execution_directory: ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: prompt_id,
-                text: PROMPT.to_owned(),
-                skill_invocations: Vec::new(),
-            },
-        })
-        .await
-        .expect("create the Claude Session");
+    };
+    let (created, prompt_id) = live.create_claude_session(REPORT_PROMPT).await;
     let parent_id = created.session.id;
-    assert_eq!(
-        created
-            .session
-            .approval_posture
-            .as_ref()
-            .map(|posture| &posture.value),
-        Some(&ApprovalPosture::Claude {
-            permission_mode: ClaudePermissionMode::BypassPermissions,
-        }),
-        "the Claude Session follows the bypassPermissions Setting"
-    );
-    let mut parent = Watched::subscribe(&client, parent_id, "the Claude Session").await;
+    let mut parent = Watched::subscribe(&live.client, parent_id, "the Claude Session").await;
 
-    // The Agent spawns the Subagent: a brokered row in the Turn the Prompt began. An Agent
-    // whose Turn settles without one has given up, and is read as it stands then.
-    let spawned = parent
-        .read_until(
-            &mut client,
-            LIVE_STEP_DEADLINE,
-            "the Claude Agent spawns a Subagent through the Broker",
-            |snapshot| {
-                subagent_rows(snapshot).next().is_some()
-                    || snapshot
-                        .turns
-                        .first()
-                        .is_some_and(|turn| turn.status.is_terminal())
-            },
-        )
-        .await;
-    let (row_turn, child_id) = match the_subagent_row(&spawned) {
-        Activity::Subagent {
-            turn_id,
-            name,
-            session_id,
-            brokered,
-            ..
-        } => {
-            assert!(
-                brokered,
-                "the row is the Broker's, not Claude's own Agent tool's"
-            );
-            assert!(
-                name.eq_ignore_ascii_case(SUBAGENT_NAME),
-                "the row names the Subagent as the spawn did: {name}"
-            );
-            (*turn_id, *session_id)
-        }
-        _ => unreachable!("the_subagent_row answers a Subagent row"),
-    };
-    let prompt_turn = &spawned.turns[0];
-    assert_eq!(prompt_turn.prompt_id, Some(prompt_id));
-    assert_eq!(
-        row_turn, prompt_turn.id,
-        "the row stands in the Turn whose Agent spawned the Subagent"
-    );
-    println!(
-        "{:>6.1}s: the Claude Agent spawned {child_id} through the Broker",
-        began.elapsed().as_secs_f64()
-    );
-
-    // The child stands under the parent in the tree, and nowhere Sessions are listed.
-    let mut tree = client.subscribe_subagent_tree(parent_id);
-    let SubagentTreeEvent::Snapshot(tree_snapshot) = timeout(PROGRESS_DEADLINE, tree.next())
-        .await
-        .expect("the Subagent tree opens")
-        .expect("the Subagent tree stream stays open")
-    else {
-        panic!("the Subagent tree stream opens with its snapshot");
-    };
-    drop(tree);
-    assert_eq!(tree_snapshot.top_level.session_id, parent_id);
-    let entry = tree_snapshot
-        .subagents
-        .iter()
-        .find(|entry| entry.session_id == child_id)
-        .unwrap_or_else(|| panic!("the tree lists the Subagent: {tree_snapshot:?}"));
-    assert_eq!(entry.parent_session_id, parent_id);
-    assert!(entry.name.eq_ignore_ascii_case(SUBAGENT_NAME));
-    let listed = client
-        .list_sessions(None)
-        .await
-        .expect("list Sessions")
-        .iter()
-        .map(|item| item.id())
-        .collect::<Vec<_>>();
-    assert!(listed.contains(&parent_id), "the Claude Session is listed");
-    assert!(
-        !listed.contains(&child_id),
-        "a Subagent's Session is reached through its parent's tree, never listed"
-    );
-
-    // The Codex Subagent's Session, opened by the Delegation.
-    let mut child = Watched::subscribe(&client, child_id, "the Codex Subagent's Session").await;
-    let delegated = child
-        .read_until(
-            &mut client,
-            LIVE_STEP_DEADLINE,
-            "the Delegation reaches the Codex Subagent",
-            |snapshot| {
-                snapshot
-                    .messages
-                    .iter()
-                    .any(|message| matches!(message.role, MessageRole::Delegation(_)))
-            },
-        )
-        .await;
-    assert_eq!(delegated.session.parent, Some(parent_id));
-    assert_eq!(
-        delegated
-            .session
-            .agent_selection
-            .as_ref()
-            .map(|selection| selection.provider.clone()),
-        Some(ProviderId::new("codex")),
-        "the Subagent runs on the Provider the spawn chose"
-    );
-    assert_eq!(
-        delegated.session.execution_directory, created.session.execution_directory,
-        "the Subagent works in its parent's Execution Directory"
-    );
-    assert_eq!(
-        delegated
-            .session
-            .approval_posture
-            .as_ref()
-            .map(|posture| &posture.value),
-        Some(&ApprovalPosture::Codex {
-            approval_policy: CodexApprovalPolicy::Never,
-            sandbox_mode: CodexSandboxMode::DangerFullAccess,
-        }),
-        "the Subagent takes Codex's value at bypassPermissions' level (ADR 0036)"
-    );
-    let delegation = &delegated.messages[0];
-    assert_eq!(
-        delegation.role,
-        MessageRole::Delegation(Delegator {
-            session_id: parent_id,
-            name: None,
-        }),
-        "the Subagent's Transcript opens with the Delegation, from the Claude Session's Agent"
-    );
-    assert!(
-        delegation.content.contains("PONG"),
-        "the Delegation carries the task the Agent was asked to hand on: {}",
-        delegation.content
-    );
+    let (spawned, child_id) =
+        brokered_spawn(&mut live, &mut parent, prompt_id, LIVE_STEP_DEADLINE).await;
+    let prompt_turn = spawned.turns[0].clone();
+    live.say(format!(
+        "the Claude Agent spawned {child_id} through the Broker"
+    ));
+    stands_under_its_parent(&live, parent_id, child_id).await;
+    let mut child = delegated(&mut live, &created, child_id, LIVE_STEP_DEADLINE).await;
 
     // The Subagent's Turn settles, and its row with it.
     let child_settled = child
         .read_until(
-            &mut client,
+            &mut live.client,
             LIVE_STEP_DEADLINE,
             "the Codex Subagent's Turn settles",
             |snapshot| {
@@ -330,42 +113,23 @@ async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_i
             },
         )
         .await;
-    let child_turn = &child_settled.turns[0];
-    assert_eq!(
-        child_turn.status,
-        TurnStatus::Completed,
-        "{}",
-        describe(&child_settled)
-    );
-    let child_model = child_turn
-        .agent
-        .as_ref()
-        .map(|identity| identity.selection.clone())
-        .expect("the Codex Turn records the Agent that ran it");
-    assert_eq!(child_model.provider, ProviderId::new("codex"));
-    let child_reply = agent_text_in(&child_settled, child_turn.id);
-    assert!(
-        child_reply.contains("PONG"),
-        "the Subagent did what it was delegated: {child_reply:?}"
-    );
-    println!(
-        "{:>6.1}s: the Codex Subagent settled on {}: {child_reply:?}",
-        began.elapsed().as_secs_f64(),
+    let (child_model, child_reply) = settled_with_pong(&child_settled);
+    live.say(format!(
+        "the Codex Subagent settled on {}: {child_reply:?}",
         child_model.model
-    );
+    ));
 
     // The Report wakes the settled Claude Agent into a Continuation, where it answers.
     let answered = parent
         .read_until(
-            &mut client,
+            &mut live.client,
             LIVE_STEP_DEADLINE,
             "the Report wakes the Claude Agent into a Continuation that settles",
             |snapshot| {
                 row_of(snapshot, child_id)
                     .is_some_and(|(status, _)| status != ActivityStatus::Active)
                     && snapshot.turns.len() > 1
-                    && snapshot.turns.iter().all(|turn| turn.status.is_terminal())
-                    && snapshot.working_since().is_none()
+                    && at_rest(snapshot)
             },
         )
         .await;
@@ -429,22 +193,359 @@ async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_i
         "the Broker's calls, and the ToolSearch loading them, add no Command row: {}",
         describe(&answered)
     );
-    println!(
-        "{:>6.1}s: the Report woke the Claude Agent, which answered {answer:?}",
-        began.elapsed().as_secs_f64()
-    );
+    live.say(format!(
+        "the Report woke the Claude Agent, which answered {answer:?}"
+    ));
 
-    // The tree reads the Subagent settled, on the Model its Provider confirmed.
-    let mut tree = client.subscribe_subagent_tree(parent_id);
-    let SubagentTreeEvent::Snapshot(settled_tree) = timeout(PROGRESS_DEADLINE, tree.next())
+    settled_in_the_tree(&live, parent_id, child_id, &child_model.model).await;
+    assert_eq!(
+        subagent_tree(&live, parent_id)
+            .await
+            .top_level
+            .working_since,
+        None,
+        "nothing in the tree is Working any more"
+    );
+    drop(parent);
+    drop(child);
+    live.finish().await;
+}
+
+/// A Server hosting the installed Claude and Codex, and the client a smoke
+/// drives it through.
+struct Live {
+    began: Instant,
+    server: server::RunningServer,
+    client: ManagedClient,
+    parent_model: ModelId,
+    workspace: tempfile::TempDir,
+    _state_dir: tempfile::TempDir,
+    _config_dir: tempfile::TempDir,
+}
+
+impl Live {
+    /// The Server a smoke runs against, or `None` — having said why — when
+    /// the smoke is not to run here: not opted into, or either CLI not
+    /// installed or not signed in.
+    async fn start(channel: &str) -> Option<Self> {
+        if std::env::var_os(GATE).as_deref() != Some(OsStr::new("1")) {
+            eprintln!("skipping: set {GATE}=1 to opt in");
+            return None;
+        }
+        trace_the_server_when_asked();
+        let began = Instant::now();
+        println!(
+            "claude --version: {}",
+            cli_version("SURU_CLAUDE_PATH", "claude")
+        );
+        println!(
+            "codex --version: {}",
+            cli_version("SURU_CODEX_PATH", "codex")
+        );
+
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let config_dir = tempfile::tempdir().expect("create isolated config directory");
+        // Claude's bypassPermissions derives Codex's never with danger-full-access for the
+        // Subagent (ADR 0036), so nothing in the tree asks; and no Title or Workspace Icon is
+        // derived, which would spend Model calls the smoke has no stake in.
+        std::fs::write(
+            config_dir.path().join("suru.jsonc"),
+            r#"{
+  "provider": { "claude": { "permissionMode": "bypassPermissions" } },
+  "derivation": { "errand": "off" }
+}
+"#,
+        )
+        .expect("write the Config Document");
+        let workspace = scratch_repository();
+        let server = server::spawn_with_providers(
+            ServerConfig::new(state_dir.path(), channel)
+                .expect("configure server")
+                .with_config_dir(config_dir.path()),
+            vec![
+                Arc::new(ClaudeRuntime::from_environment()),
+                Arc::new(CodexRuntime::from_environment()),
+            ],
+        )
         .await
-        .expect("the Subagent tree opens")
-        .expect("the Subagent tree stream stays open")
+        .expect("launch a Server hosting the installed Claude and Codex");
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+        )
+        .await
+        .expect("connect client");
+        receive_initial_state(&mut client).await;
+
+        let catalog = client
+            .refresh_models()
+            .await
+            .expect("ask both Providers what they offer");
+        if let Some(reason) = unusable(&catalog) {
+            eprintln!("skipping: {reason}");
+            drop(client);
+            shut_down(server).await;
+            return None;
+        }
+        let parent_model = parent_model(&catalog).id.clone();
+        let codex_default = catalog_of(&catalog, "codex")
+            .models
+            .iter()
+            .find(|model| model.is_default)
+            .map_or_else(|| "none".to_owned(), |model| model.id.to_string());
+        println!("parent Model: claude/{parent_model}; Codex's default Model: {codex_default}");
+        Some(Self {
+            began,
+            server,
+            client,
+            parent_model,
+            workspace,
+            _state_dir: state_dir,
+            _config_dir: config_dir,
+        })
+    }
+
+    /// Prints `what` against how long the smoke has run, so a run's log is its
+    /// timeline.
+    fn say(&self, what: impl Display) {
+        println!("{:>6.1}s: {what}", self.began.elapsed().as_secs_f64());
+    }
+
+    /// A Claude Session in the scratch repository, begun by `prompt`, at the
+    /// posture the Config Document pinned.
+    async fn create_claude_session(&self, prompt: &str) -> (SessionSnapshot, PromptId) {
+        let prompt_id = PromptId::new();
+        let created = self
+            .client
+            .create_session(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: Some(AgentSelection {
+                    provider: ProviderId::new("claude"),
+                    model: self.parent_model.clone(),
+                    options: Vec::new(),
+                }),
+                execution_directory: ExecutionDirectory {
+                    path: self.workspace.path().to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: prompt_id,
+                    text: prompt.to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+            })
+            .await
+            .expect("create the Claude Session");
+        assert_eq!(
+            created
+                .session
+                .approval_posture
+                .as_ref()
+                .map(|posture| &posture.value),
+            Some(&ApprovalPosture::Claude {
+                permission_mode: ClaudePermissionMode::BypassPermissions,
+            }),
+            "the Claude Session follows the bypassPermissions Setting"
+        );
+        (created, prompt_id)
+    }
+
+    async fn finish(self) {
+        let began = self.began;
+        drop(self.client);
+        shut_down(self.server).await;
+        println!(
+            "{:>6.1}s: the Server shut down",
+            began.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// Waits for the Claude Agent to spawn its Subagent through the Broker:
+/// exactly one row, brokered and named as the Prompt named it, in the Turn the
+/// Prompt began. Answers with the Session as it then stood and the Subagent's
+/// Session. An Agent whose Turn settles without one has given up, and is read
+/// as it stands then.
+async fn brokered_spawn(
+    live: &mut Live,
+    parent: &mut Watched,
+    prompt_id: PromptId,
+    within: Duration,
+) -> (SessionSnapshot, SessionId) {
+    let spawned = parent
+        .read_until(
+            &mut live.client,
+            within,
+            "the Claude Agent spawns a Subagent through the Broker",
+            |snapshot| {
+                subagent_rows(snapshot).next().is_some()
+                    || snapshot
+                        .turns
+                        .first()
+                        .is_some_and(|turn| turn.status.is_terminal())
+            },
+        )
+        .await;
+    let Activity::Subagent {
+        turn_id,
+        name,
+        session_id,
+        brokered,
+        ..
+    } = the_subagent_row(&spawned)
     else {
-        panic!("the Subagent tree stream opens with its snapshot");
+        unreachable!("the_subagent_row answers a Subagent row");
     };
-    drop(tree);
-    let entry = settled_tree
+    assert!(
+        brokered,
+        "the row is the Broker's, not Claude's own Agent tool's"
+    );
+    assert!(
+        named_as_prompted(name),
+        "the row names the Subagent as the spawn did: {name}"
+    );
+    let prompt_turn = &spawned.turns[0];
+    assert_eq!(prompt_turn.prompt_id, Some(prompt_id));
+    assert_eq!(
+        *turn_id, prompt_turn.id,
+        "the row stands in the Turn whose Agent spawned the Subagent"
+    );
+    let child_id = *session_id;
+    (spawned, child_id)
+}
+
+/// Whether the Agent named its Subagent as the Prompt asked: the name there,
+/// in whatever case, and whatever the Agent wrapped around it.
+fn named_as_prompted(name: &str) -> bool {
+    name.to_lowercase().contains(SUBAGENT_NAME)
+}
+
+/// The Subagent stands under its parent in the tree, and nowhere Sessions are
+/// listed.
+async fn stands_under_its_parent(live: &Live, parent_id: SessionId, child_id: SessionId) {
+    let tree = subagent_tree(live, parent_id).await;
+    assert_eq!(tree.top_level.session_id, parent_id);
+    let entry = tree
+        .subagents
+        .iter()
+        .find(|entry| entry.session_id == child_id)
+        .unwrap_or_else(|| panic!("the tree lists the Subagent: {tree:?}"));
+    assert_eq!(entry.parent_session_id, parent_id);
+    assert!(named_as_prompted(&entry.name), "{}", entry.name);
+    let listed = live
+        .client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .iter()
+        .map(|item| item.id())
+        .collect::<Vec<_>>();
+    assert!(listed.contains(&parent_id), "the Claude Session is listed");
+    assert!(
+        !listed.contains(&child_id),
+        "a Subagent's Session is reached through its parent's tree, never listed"
+    );
+}
+
+/// Waits for the Delegation to reach the Codex Subagent, and checks the
+/// Session it opened: under the Claude Session, on Codex, in the parent's
+/// Execution Directory, at the posture derived for it, opening with the
+/// Delegation from the parent's Agent. Answers with the Subagent's Session to
+/// wait on.
+async fn delegated(
+    live: &mut Live,
+    parent: &SessionSnapshot,
+    child_id: SessionId,
+    within: Duration,
+) -> Watched {
+    let mut child =
+        Watched::subscribe(&live.client, child_id, "the Codex Subagent's Session").await;
+    let delegated = child
+        .read_until(
+            &mut live.client,
+            within,
+            "the Delegation reaches the Codex Subagent",
+            |snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message.role, MessageRole::Delegation(_)))
+            },
+        )
+        .await;
+    assert_eq!(delegated.session.parent, Some(parent.session.id));
+    assert_eq!(
+        delegated
+            .session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.provider.clone()),
+        Some(ProviderId::new("codex")),
+        "the Subagent runs on the Provider the spawn chose"
+    );
+    assert_eq!(
+        delegated.session.execution_directory, parent.session.execution_directory,
+        "the Subagent works in its parent's Execution Directory"
+    );
+    assert_eq!(
+        delegated
+            .session
+            .approval_posture
+            .as_ref()
+            .map(|posture| &posture.value),
+        Some(&ApprovalPosture::Codex {
+            approval_policy: CodexApprovalPolicy::Never,
+            sandbox_mode: CodexSandboxMode::DangerFullAccess,
+        }),
+        "the Subagent takes Codex's value at bypassPermissions' level (ADR 0036)"
+    );
+    let delegation = &delegated.messages[0];
+    assert_eq!(
+        delegation.role,
+        MessageRole::Delegation(Delegator {
+            session_id: parent.session.id,
+            name: None,
+        }),
+        "the Subagent's Transcript opens with the Delegation, from the Claude Session's Agent"
+    );
+    assert!(
+        delegation.content.contains("PONG"),
+        "the Delegation carries the task the Agent was asked to hand on: {}",
+        delegation.content
+    );
+    child
+}
+
+/// The Codex Subagent's first Turn, settled Completed with PONG in its reply:
+/// the Agent Selection that ran it, and the reply.
+fn settled_with_pong(child: &SessionSnapshot) -> (AgentSelection, String) {
+    let turn = child
+        .turns
+        .first()
+        .expect("the Subagent's Session holds its Turn");
+    assert_eq!(turn.status, TurnStatus::Completed, "{}", describe(child));
+    let selection = turn
+        .agent
+        .as_ref()
+        .map(|identity| identity.selection.clone())
+        .expect("the Codex Turn records the Agent that ran it");
+    assert_eq!(selection.provider, ProviderId::new("codex"));
+    let reply = agent_text_in(child, turn.id);
+    assert!(
+        reply.contains("PONG"),
+        "the Subagent did what it was delegated: {reply:?}"
+    );
+    (selection, reply)
+}
+
+/// The tree, read afresh, shows the Subagent settled on the Model its
+/// Provider confirmed.
+async fn settled_in_the_tree(
+    live: &Live,
+    parent_id: SessionId,
+    child_id: SessionId,
+    model: &ModelId,
+) {
+    let tree = subagent_tree(live, parent_id).await;
+    let entry = tree
         .subagents
         .iter()
         .find(|entry| entry.session_id == child_id)
@@ -452,19 +553,22 @@ async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_i
     assert_eq!(entry.status, ActivityStatus::Completed);
     assert_eq!(
         entry.model.as_ref(),
-        Some(&child_model.model),
+        Some(model),
         "the tree shows the Model the Subagent's Provider confirmed"
     );
-    assert_eq!(settled_tree.top_level.working_since, None);
+}
 
-    drop(parent);
-    drop(child);
-    drop(client);
-    shut_down(server).await;
-    println!(
-        "{:>6.1}s: the Server shut down",
-        began.elapsed().as_secs_f64()
-    );
+/// The tree `parent_id` heads, as its stream's opening snapshot gives it.
+async fn subagent_tree(live: &Live, parent_id: SessionId) -> suru::protocol::SubagentTreeSnapshot {
+    let mut tree = live.client.subscribe_subagent_tree(parent_id);
+    let SubagentTreeEvent::Snapshot(snapshot) = timeout(PROGRESS_DEADLINE, tree.next())
+        .await
+        .expect("the Subagent tree opens")
+        .expect("the Subagent tree stream stays open")
+    else {
+        panic!("the Subagent tree stream opens with its snapshot");
+    };
+    snapshot
 }
 
 /// One Session the smoke waits on, woken by each update its stream carries.
@@ -487,11 +591,8 @@ impl Watched {
         }
     }
 
-    /// Reads the Session until `wanted` holds, failing the smoke at `deadline`
-    /// — or at once, should the Session reach a state `wanted` can no longer
-    /// follow from — with the Session as it stood. The managed client's own
-    /// events are read here too, so a smoke that has no use for them never
-    /// leaves the client backed up behind them.
+    /// [`Self::read_until_unless`], with nothing about this wait in
+    /// particular that dooms it.
     async fn read_until(
         &mut self,
         client: &mut ManagedClient,
@@ -499,8 +600,28 @@ impl Watched {
         awaited: &str,
         wanted: impl Fn(&SessionSnapshot) -> bool,
     ) -> SessionSnapshot {
+        self.read_until_unless(client, deadline, awaited, wanted, |_| None)
+            .await
+    }
+
+    /// Reads the Session until `wanted` holds, failing the smoke at `deadline`
+    /// with the Session as it stood — or sooner, once it has plainly stopped
+    /// going anywhere: at once when it is [`stuck`] or `doomed` says why this
+    /// wait cannot end well, and after [`REST_GRACE`] when it has stood at
+    /// rest, unchanged, all that while. The managed client's own events are
+    /// read here too, so a smoke that has no use for them never leaves the
+    /// client backed up behind them.
+    async fn read_until_unless(
+        &mut self,
+        client: &mut ManagedClient,
+        deadline: Duration,
+        awaited: &str,
+        wanted: impl Fn(&SessionSnapshot) -> bool,
+        doomed: impl Fn(&SessionSnapshot) -> Option<String>,
+    ) -> SessionSnapshot {
         let what = self.what;
         let waited = timeout(deadline, async {
+            let mut resting: Option<(SessionRevision, Instant)> = None;
             loop {
                 let snapshot = client
                     .read_session(self.session_id)
@@ -509,12 +630,14 @@ impl Watched {
                 if wanted(&snapshot) {
                     return snapshot;
                 }
-                if let Some(stuck) = stuck(&snapshot) {
-                    panic!(
-                        "{awaited}, but {what} {stuck}: {}",
-                        describe(&snapshot)
-                    );
+                if let Some(why) = stuck(&snapshot).or_else(|| doomed(&snapshot)) {
+                    panic!("{awaited}, but {what} {why}: {}", describe(&snapshot));
                 }
+                resting = at_rest(&snapshot).then(|| match resting {
+                    Some((revision, until)) if revision == snapshot.revision => (revision, until),
+                    _ => (snapshot.revision, Instant::now() + REST_GRACE),
+                });
+                let rest_ends = resting.map_or_else(Instant::now, |(_, until)| until);
                 tokio::select! {
                     event = self.feed.next() => {
                         event
@@ -523,6 +646,13 @@ impl Watched {
                     }
                     event = client.next() => {
                         event.expect("the managed client stays connected");
+                    }
+                    () = tokio::time::sleep_until(rest_ends), if resting.is_some() => {
+                        panic!(
+                            "{awaited}, but {what} has stood at rest — nothing Working, every \
+                             Turn settled — unchanged for {REST_GRACE:?}: {}",
+                            describe(&snapshot)
+                        );
                     }
                 }
             }
@@ -542,6 +672,14 @@ impl Watched {
             }
         }
     }
+}
+
+/// Whether nothing in the Session is Working and every Turn it holds has
+/// settled: all it will do unless something wakes it.
+fn at_rest(snapshot: &SessionSnapshot) -> bool {
+    snapshot.working_since().is_none()
+        && !snapshot.turns.is_empty()
+        && snapshot.turns.iter().all(|turn| turn.status.is_terminal())
 }
 
 /// What makes a Session unable to go on as the smoke needs: a Turn that failed
@@ -605,7 +743,7 @@ fn row_of(snapshot: &SessionSnapshot, child: SessionId) -> Option<(ActivityStatu
 }
 
 /// Everything the Agent wrote in one Turn, its Messages joined.
-fn agent_text_in(snapshot: &SessionSnapshot, turn_id: suru::protocol::TurnId) -> String {
+fn agent_text_in(snapshot: &SessionSnapshot, turn_id: TurnId) -> String {
     snapshot
         .messages
         .iter()
