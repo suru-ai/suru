@@ -207,9 +207,15 @@ impl ServerHandler for BrokerServer {
             arguments: request.arguments.unwrap_or_default(),
             progress: progress_reporter(&context),
         };
-        // A call its client has gone from — cancelled, disconnected, or cut
-        // off by a Server shutting down — is answered to no one, so a wait
-        // stops waiting with it.
+        // A call whose client has gone is cancelled, and a wait stops waiting
+        // with it: while the call has answered nothing, once the transport
+        // sees the connection close; once it streams progress, when the
+        // stream's next write — progress, or the transport's keep-alive every
+        // 15 seconds — finds the connection closed and the stream is dropped;
+        // and when a stopping Server ends every stream. A client's
+        // `notifications/cancelled` comes on a request of its own, which this
+        // stateless transport ties to no call, so it cancels nothing; the
+        // wait's own timeout bounds it then.
         let answered = tokio::select! {
             answered = self.tools.call(tool, call) => answered,
             () = context.ct.cancelled() => {
@@ -352,5 +358,113 @@ mod tests {
             messages[1]["result"]["structuredContent"],
             json!({ "settled": true })
         );
+    }
+
+    /// A Tool that reports progress until its call is cancelled, and says when
+    /// it was, as a wait still waiting does.
+    struct ReportingUntilCancelled {
+        cancelled: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl ServerHandler for ReportingUntilCancelled {
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            let token = context
+                .meta
+                .get_progress_token()
+                .expect("the call asked for progress");
+            let mut progress = 0.0;
+            loop {
+                tokio::select! {
+                    () = context.ct.cancelled() => {
+                        let _ = self.cancelled.send(());
+                        return Err(ErrorData::internal_error("cancelled", None));
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                        progress += 1.0;
+                        let _ = context
+                            .peer
+                            .notify_progress(ProgressNotificationParam::new(token.clone(), progress))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A call whose answer is already streaming progress is still cancelled
+    /// once its client goes: the event stream, dropped when a write finds the
+    /// connection closed, cancels the call — which is how a wait stops waiting
+    /// for a harness that gave up on it, at the next progress or keep-alive
+    /// it writes.
+    #[tokio::test]
+    async fn a_call_streaming_progress_is_cancelled_once_its_client_goes() {
+        let (cancelled, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let transport = StreamableHttpService::new(
+            move || {
+                Ok(ReportingUntilCancelled {
+                    cancelled: cancelled.clone(),
+                })
+            },
+            Arc::new(NeverSessionManager::default()),
+            transport_config(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let address = listener.local_addr().expect("the listener has an address");
+        let app = Router::new().route(
+            BROKER_PATH,
+            any(move |request: Request| {
+                let transport = transport.clone();
+                async move { transport.handle(request).await.map(Body::new) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut response = reqwest::Client::new()
+            .post(format!("http://{address}{BROKER_PATH}"))
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait",
+                        "arguments": {},
+                        "_meta": { "progressToken": "wait-1" },
+                    },
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("reach the transport");
+        let mut streamed = String::new();
+        while !streamed.contains("notifications/progress") {
+            let chunk = response
+                .chunk()
+                .await
+                .expect("read the event stream")
+                .expect("the call streams progress before it answers");
+            streamed.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            heard.try_recv().is_err(),
+            "a call its client still reads is not cancelled"
+        );
+
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv())
+            .await
+            .expect("the call is cancelled once its client has gone")
+            .expect("the Tool says it was cancelled");
+        server.abort();
     }
 }
