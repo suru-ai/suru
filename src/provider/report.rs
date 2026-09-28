@@ -88,8 +88,9 @@ impl SubagentReport {
 
 /// The one text a Report is delivered as, whichever harness carries it: what
 /// it is and from whom, the Subagent by name and by the id the Broker's Tools
-/// take, how its stretch settled and after how long, and its final Message as
-/// far as the excerpt reaches, saying where the rest is when it was cut.
+/// take — to read the rest of what it wrote, and to send it more — how its
+/// stretch settled and after how long, and its final Message as far as the
+/// excerpt reaches, saying where the rest is when it was cut.
 impl fmt::Display for SubagentReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let settled = match self.outcome {
@@ -107,7 +108,7 @@ impl fmt::Display for SubagentReport {
         }
         write!(
             formatter,
-            ". Its session_id is {}, which read_subagent takes.",
+            ". Its session_id is {}, which read_subagent and send_to_subagent take.",
             self.subagent
         )?;
         match &self.excerpt {
@@ -196,8 +197,8 @@ mod tests {
             report.to_string(),
             format!(
                 "Subagent Report from Suru: the Subagent \"Researcher\" you delegated to through \
-                 the Broker completed after 1m 23s. Its session_id is {}, which read_subagent \
-                 takes.\n\nIts final Message:\n\nThree seams.",
+                 the Broker completed after 1m 23s. Its session_id is {}, which read_subagent and \
+                 send_to_subagent take.\n\nIts final Message:\n\nThree seams.",
                 report.subagent
             )
         );
@@ -211,8 +212,8 @@ mod tests {
             failed.to_string(),
             format!(
                 "Subagent Report from Suru: the Subagent \"Researcher\" you delegated to through \
-                 the Broker failed. Its session_id is {}, which read_subagent takes.\n\nIt wrote \
-                 no final Message.",
+                 the Broker failed. Its session_id is {}, which read_subagent and send_to_subagent \
+                 take.\n\nIt wrote no final Message.",
                 failed.subagent
             )
         );

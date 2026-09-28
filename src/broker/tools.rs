@@ -16,8 +16,8 @@ use crate::{
         ProviderUnavailability, SessionId, TurnStatus,
     },
     provider::{
-        BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator,
-        ProviderSubagentId,
+        BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
+        BrokeredSubagentRequest, ProviderOrchestrator, ProviderSubagentId,
     },
     sessions::{BrokeredReadError, BrokeredSpawnCap, BrokeredSubagentReading, SessionStore},
 };
@@ -29,15 +29,17 @@ pub(super) enum BrokerTool {
     ListProviders,
     SpawnSubagent,
     ReadSubagent,
+    SendToSubagent,
     StopSubagent,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 4] = [
+    pub(super) const ALL: [Self; 5] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
+        Self::SendToSubagent,
         Self::StopSubagent,
     ];
 
@@ -50,6 +52,7 @@ impl BrokerTool {
             Self::ListProviders => "list_providers",
             Self::SpawnSubagent => "spawn_subagent",
             Self::ReadSubagent => "read_subagent",
+            Self::SendToSubagent => "send_to_subagent",
             Self::StopSubagent => "stop_subagent",
         }
     }
@@ -59,6 +62,7 @@ impl BrokerTool {
             Self::ListProviders => "List Providers",
             Self::SpawnSubagent => "Spawn Subagent",
             Self::ReadSubagent => "Read Subagent",
+            Self::SendToSubagent => "Send to Subagent",
             Self::StopSubagent => "Stop Subagent",
         }
     }
@@ -71,6 +75,7 @@ impl BrokerTool {
             Self::ListProviders => LIST_PROVIDERS_DESCRIPTION,
             Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
             Self::ReadSubagent => READ_SUBAGENT_DESCRIPTION,
+            Self::SendToSubagent => SEND_TO_SUBAGENT_DESCRIPTION,
             Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
         }
     }
@@ -132,6 +137,22 @@ impl BrokerTool {
                 "required": ["id"],
                 "additionalProperties": false,
             }),
+            Self::SendToSubagent => json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The session_id spawn_subagent answered with.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Everything the Subagent needs to know of what it is to \
+                            do next.",
+                    },
+                },
+                "required": ["id", "message"],
+                "additionalProperties": false,
+            }),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -143,7 +164,7 @@ impl BrokerTool {
     pub(super) fn is_read_only(self) -> bool {
         match self {
             Self::ListProviders | Self::ReadSubagent => true,
-            Self::SpawnSubagent | Self::StopSubagent => false,
+            Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => false,
         }
     }
 }
@@ -201,6 +222,27 @@ once settled, and null where Suru never learned when it ended; and \
 — its final answer once settled — or null when it has written none. An id \
 naming no Subagent spawned with spawn_subagent by you or by a Subagent beneath \
 you is refused.";
+
+const SEND_TO_SUBAGENT_DESCRIPTION: &str = "\
+Send more work to a Subagent spawned with spawn_subagent — by you, or by a \
+Subagent beneath you. Takes \"id\", the session_id spawn_subagent answered \
+with, and \"message\", everything the Subagent needs to know of what it is to \
+do next. When the Subagent's work has settled, it is resumed on its own \
+conversation, with everything it learned: the message begins a new stretch of \
+its work, which stands as a new row in your Transcript leading into the same \
+Session, and you are sent its Subagent Report when that stretch settles, as \
+after a spawn. When it is still working on what it was delegated, the message \
+steers that work and reaches it there; nothing new begins and no row is \
+added. Work it took up of its own accord since it settled is stopped instead, \
+and it is resumed with the message. Answers once the message has been \
+delivered, with JSON of the shape {\"session_id\": \"...\", \"delivered\": \
+\"...\"}, where \"delivered\" is \"resumed\" or \"steered\". An id naming no \
+Subagent spawned with spawn_subagent by you or by a Subagent beneath you is \
+refused, as is an empty message. So is a resume that would pass the user's \
+limit on how many Subagents spawned this way work at once beneath the \
+top-level Session; it is never queued. A message the Subagent's work ended \
+too soon to take is refused, saying so; send it again once the Subagent has \
+settled to resume it. A refused message reaches no one.";
 
 const STOP_SUBAGENT_DESCRIPTION: &str = "\
 Stop a Subagent spawned with spawn_subagent — by you, or by a Subagent beneath \
@@ -314,8 +356,24 @@ impl BrokerTools {
                 Ok(json!({ "session_id": session_id }))
             }
             BrokerTool::ReadSubagent => self.read_subagent(call),
+            BrokerTool::SendToSubagent => {
+                let send = SendArguments::read(&call.arguments)?;
+                let delivered = self
+                    .providers
+                    .send_to_brokered_subagent(call.caller.session_id(), send.id, &send.message)
+                    .await
+                    .map_err(|refusal| send_refusal(refusal, send.id))?;
+                Ok(json!({
+                    "session_id": send.id,
+                    "delivered": match delivered {
+                        BrokeredDelivery::Resumed => "resumed",
+                        BrokeredDelivery::Steered => "steered",
+                    },
+                }))
+            }
             BrokerTool::StopSubagent => {
-                let subagent = StopArguments::read(&call.arguments)?.id;
+                let subagent =
+                    named_subagent(BrokerTool::StopSubagent, &call.arguments, &STOP_TAKES)?;
                 let stop = self
                     .providers
                     .stop_brokered_subagent(call.caller.session_id(), subagent)
@@ -334,7 +392,7 @@ impl BrokerTools {
         let reading = self
             .sessions
             .read_brokered_subagent(call.caller.session_id(), subagent)
-            .map_err(|error| read_refusal(error, subagent))?;
+            .map_err(|error| unreachable_refusal(BrokerTool::ReadSubagent, error, subagent))?;
         Ok(serde_json::to_value(SubagentReadout::from(reading))
             .expect("a Subagent's reading always serializes"))
     }
@@ -346,27 +404,34 @@ impl BrokerTools {
 fn spawn_refusal(refusal: BrokeredSpawnRefusal) -> ToolRefusal {
     match refusal {
         BrokeredSpawnRefusal::Refused(reason) => ToolRefusal(reason),
-        BrokeredSpawnRefusal::Capped(BrokeredSpawnCap::Depth { max_depth, depth }) => {
-            ToolRefusal(format!(
-                "Suru's Broker lets Subagents stand at most {max_depth} {sessions} deep, counting \
-                 the top-level Session as the first (`broker.maxDepth`), and one spawned here \
-                 would stand {depth} deep, so nothing was spawned. Do this work yourself, or ask \
-                 the user to raise the Setting.",
-                sessions = if max_depth == 1 {
-                    "Session"
-                } else {
-                    "Sessions"
-                },
-            ))
-        }
-        BrokeredSpawnRefusal::Capped(BrokeredSpawnCap::Concurrency {
+        BrokeredSpawnRefusal::Capped(cap) => cap_refusal(cap, "nothing was spawned"),
+    }
+}
+
+/// What a delegating Agent is told of `cap`, which kept what it asked for
+/// from happening — `not_done` says what did not — naming the Setting that
+/// pins the cap and what the Agent may do instead.
+fn cap_refusal(cap: BrokeredSpawnCap, not_done: &str) -> ToolRefusal {
+    match cap {
+        BrokeredSpawnCap::Depth { max_depth, depth } => ToolRefusal(format!(
+            "Suru's Broker lets Subagents stand at most {max_depth} {sessions} deep, counting the \
+             top-level Session as the first (`broker.maxDepth`), and one spawned here would stand \
+             {depth} deep, so {not_done}. Do this work yourself, or ask the user to raise the \
+             Setting.",
+            sessions = if max_depth == 1 {
+                "Session"
+            } else {
+                "Sessions"
+            },
+        )),
+        BrokeredSpawnCap::Concurrency {
             max_concurrent_subagents,
             working,
-        }) => ToolRefusal(format!(
+        } => ToolRefusal(format!(
             "Suru's Broker lets at most {max_concurrent_subagents} brokered {subagents} work at \
              once beneath a top-level Session (`broker.maxConcurrentSubagents`), and {working} \
-             {are} working now, so nothing was spawned. Wait for one to settle, or ask the user \
-             to raise the Setting.",
+             {are} working now, so {not_done}. Wait for one to settle, or ask the user to raise \
+             the Setting.",
             subagents = if max_concurrent_subagents == 1 {
                 "Subagent"
             } else {
@@ -374,6 +439,18 @@ fn spawn_refusal(refusal: BrokeredSpawnRefusal) -> ToolRefusal {
             },
             are = if working == 1 { "is" } else { "are" },
         )),
+    }
+}
+
+/// What a refused `send_to_subagent` tells the Agent that sent to
+/// `subagent`: nothing it sent reached the Subagent, and why.
+fn send_refusal(refusal: BrokeredSendRefusal, subagent: SessionId) -> ToolRefusal {
+    match refusal {
+        BrokeredSendRefusal::Unreachable(error) => {
+            unreachable_refusal(BrokerTool::SendToSubagent, error, subagent)
+        }
+        BrokeredSendRefusal::Capped(cap) => cap_refusal(cap, "the Subagent was not resumed"),
+        BrokeredSendRefusal::Refused(reason) => ToolRefusal(reason),
     }
 }
 
@@ -408,9 +485,18 @@ fn named_subagent(
     }
 }
 
-/// Why `read_subagent` could not read `subagent`, in words the calling Agent
-/// reads.
-fn read_refusal(error: BrokeredReadError, subagent: SessionId) -> ToolRefusal {
+/// Why `tool` could not reach `subagent` for the calling Agent, in words that
+/// Agent reads.
+fn unreachable_refusal(
+    tool: BrokerTool,
+    error: BrokeredReadError,
+    subagent: SessionId,
+) -> ToolRefusal {
+    let reaches_only = match tool {
+        BrokerTool::ReadSubagent => "read_subagent reads only those".to_owned(),
+        BrokerTool::SendToSubagent => "send_to_subagent sends only to those".to_owned(),
+        other => format!("{} takes only those", other.name()),
+    };
     ToolRefusal::new(match error {
         BrokeredReadError::CallerNotFound => {
             "The Session calling the Broker no longer exists on this Suru server.".to_owned()
@@ -420,7 +506,7 @@ fn read_refusal(error: BrokeredReadError, subagent: SessionId) -> ToolRefusal {
         ),
         BrokeredReadError::NotBrokeredBeneathCaller => format!(
             "`{subagent}` is not a Subagent spawned with spawn_subagent by you or by a Subagent \
-             beneath you; read_subagent reads only those."
+             beneath you; {reaches_only}."
         ),
     })
 }
@@ -496,40 +582,41 @@ fn stop_answer(subagent: SessionId, stop: BrokeredStop) -> Value {
     json!({ "session_id": subagent, "stopped": false, "reason": reason })
 }
 
-/// What `stop_subagent` was called with: the one Subagent to stop.
+/// What `stop_subagent` takes: the one Subagent to stop.
+const STOP_TAKES: [&str; 1] = ["id"];
+
+/// What `send_to_subagent` was called with: the Subagent to send to, and what
+/// it is to do next.
 #[derive(Debug, Eq, PartialEq)]
-struct StopArguments {
+struct SendArguments {
     id: SessionId,
+    message: String,
 }
 
-impl StopArguments {
-    const TAKES: [&'static str; 1] = ["id"];
+impl SendArguments {
+    const TAKES: [&'static str; 2] = ["id", "message"];
 
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        if let Some(unknown) = arguments
-            .keys()
-            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
-        {
-            return Err(ToolRefusal::new(format!(
-                "stop_subagent takes no argument `{unknown}`; it takes `id`."
-            )));
-        }
-        let id = match arguments.get("id") {
-            Some(Value::String(id)) => id,
+        let id = named_subagent(BrokerTool::SendToSubagent, arguments, &Self::TAKES)?;
+        let message = match arguments.get("message") {
+            Some(Value::String(message)) => message.clone(),
             None | Some(Value::Null) => {
-                return Err(ToolRefusal::new("stop_subagent needs `id`."));
+                return Err(ToolRefusal::new(
+                    "send_to_subagent needs `message`, what the Subagent is to do next.",
+                ));
             }
-            Some(_) => return Err(ToolRefusal::new("stop_subagent's `id` must be a string.")),
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "send_to_subagent's `message` must be a string.",
+                ));
+            }
         };
-        let id = uuid::Uuid::parse_str(id.trim()).map_err(|_| {
-            ToolRefusal::new(format!(
-                "`{id}` is not a Session id; give stop_subagent the session_id spawn_subagent \
-                 answered with."
-            ))
-        })?;
-        Ok(Self {
-            id: SessionId::from_uuid(id),
-        })
+        if message.trim().is_empty() {
+            return Err(ToolRefusal::new(
+                "send_to_subagent's `message` is empty; say what the Subagent is to do.",
+            ));
+        }
+        Ok(Self { id, message })
     }
 }
 
@@ -1135,21 +1222,23 @@ mod tests {
     #[test]
     fn stop_arguments_are_read_as_their_schema_gives_them() {
         let id = SessionId::new();
-        assert_eq!(
-            StopArguments::read(&options(json!({ "id": id }))),
-            Ok(StopArguments { id })
-        );
+        let read =
+            |arguments| named_subagent(BrokerTool::StopSubagent, &options(arguments), &STOP_TAKES);
+        assert_eq!(read(json!({ "id": id })), Ok(id));
         for (value, says) in [
-            (json!({}), "needs `id`"),
-            (json!({ "id": null }), "needs `id`"),
-            (json!({ "id": 7 }), "`id` must be a string"),
-            (json!({ "id": "the researcher" }), "is not a Session id"),
+            (json!({}), "stop_subagent needs `id`"),
+            (json!({ "id": null }), "stop_subagent needs `id`"),
+            (json!({ "id": 7 }), "`id` must be the session_id"),
+            (
+                json!({ "id": "the researcher" }),
+                "`id` must be the session_id",
+            ),
             (
                 json!({ "id": id, "force": true }),
-                "takes no argument `force`",
+                "stop_subagent takes no argument `force`; it takes `id`.",
             ),
         ] {
-            let refusal = StopArguments::read(&options(value))
+            let refusal = read(value)
                 .expect_err("the arguments are refused")
                 .to_string();
             assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
@@ -1190,7 +1279,7 @@ mod tests {
     #[test]
     fn stop_subagents_schema_requires_what_its_description_says_it_takes() {
         let schema = BrokerTool::StopSubagent.input_schema();
-        for argument in StopArguments::TAKES {
+        for argument in STOP_TAKES {
             assert!(
                 schema["properties"]
                     .as_object()
@@ -1202,7 +1291,7 @@ mod tests {
                 "the description says what {argument} is"
             );
         }
-        assert_eq!(schema["required"], json!(StopArguments::TAKES));
+        assert_eq!(schema["required"], json!(STOP_TAKES));
         assert_eq!(schema["additionalProperties"], json!(false));
         assert!(
             !BrokerTool::StopSubagent.is_read_only(),
@@ -1436,11 +1525,12 @@ mod tests {
         )
         .to_string();
         let read = BrokerTool::ReadSubagent.name();
+        let send = BrokerTool::SendToSubagent.name();
         assert!(
             report.contains(&format!(
-                "Its session_id is {subagent}, which {read} takes."
+                "Its session_id is {subagent}, which {read} and {send} take."
             )),
-            "the Report names the id the Broker's read takes: {report}"
+            "the Report names the id the Broker's read and send take: {report}"
         );
         assert!(
             report.ends_with(&format!("{read} gives the whole Message.]")),
@@ -1519,6 +1609,92 @@ mod tests {
         assert_eq!(schema["additionalProperties"], json!(false));
     }
 
+    #[test]
+    fn send_arguments_are_read_as_their_schema_gives_them() {
+        let id = SessionId::new();
+        assert_eq!(
+            SendArguments::read(&options(json!({ "id": id, "message": "Go on." }))),
+            Ok(SendArguments {
+                id,
+                message: "Go on.".to_owned(),
+            })
+        );
+        for (value, says) in [
+            (
+                json!({ "message": "Go on." }),
+                "send_to_subagent needs `id`",
+            ),
+            (json!({ "id": id }), "send_to_subagent needs `message`"),
+            (
+                json!({ "id": id, "message": 7 }),
+                "`message` must be a string",
+            ),
+            (json!({ "id": id, "message": " \n" }), "`message` is empty"),
+            (
+                json!({ "id": "Researcher", "message": "Go on." }),
+                "`id` must be the session_id",
+            ),
+            (
+                json!({ "id": id, "message": "Go on.", "urgent": true }),
+                "send_to_subagent takes no argument `urgent`; it takes `id`, `message`.",
+            ),
+        ] {
+            let refusal = SendArguments::read(&options(value))
+                .expect_err("the arguments are refused")
+                .to_string();
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
+        }
+    }
+
+    #[test]
+    fn send_describes_what_it_takes_and_the_shape_it_answers_with() {
+        let schema = BrokerTool::SendToSubagent.input_schema();
+        for argument in SendArguments::TAKES {
+            assert!(
+                schema["properties"]
+                    .as_object()
+                    .is_some_and(|properties| properties.contains_key(argument)),
+                "send_to_subagent takes {argument}"
+            );
+            assert!(
+                SEND_TO_SUBAGENT_DESCRIPTION.contains(&format!("\"{argument}\"")),
+                "send_to_subagent says what {argument} is"
+            );
+        }
+        for field in ["session_id", "delivered", "resumed", "steered"] {
+            assert!(
+                SEND_TO_SUBAGENT_DESCRIPTION.contains(&format!("\"{field}\"")),
+                "send_to_subagent gives the shape of {field}"
+            );
+        }
+        assert_eq!(schema["required"], json!(SendArguments::TAKES));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(!BrokerTool::SendToSubagent.is_read_only());
+    }
+
+    #[test]
+    fn a_subagent_out_of_reach_is_refused_saying_which_subagents_each_tool_reaches() {
+        let subagent = SessionId::new();
+        for (tool, says) in [
+            (BrokerTool::ReadSubagent, "read_subagent reads only those."),
+            (
+                BrokerTool::SendToSubagent,
+                "send_to_subagent sends only to those.",
+            ),
+        ] {
+            let refusal =
+                unreachable_refusal(tool, BrokeredReadError::NotBrokeredBeneathCaller, subagent)
+                    .to_string();
+            assert!(
+                refusal.starts_with(&format!(
+                    "`{subagent}` is not a Subagent spawned with spawn_subagent by you or by a \
+                     Subagent beneath you; "
+                )) && refusal.ends_with(says),
+                "{refusal}"
+            );
+        }
+    }
+
     /// A cap is refused in words naming the Setting that pins it — one the
     /// schema declares, so the Agent may send the user straight to it — and
     /// read naturally at a cap of one.
@@ -1547,6 +1723,18 @@ mod tests {
             "Suru's Broker lets at most 1 brokered Subagent work at once beneath a top-level \
              Session (`broker.maxConcurrentSubagents`), and 1 is working now, so nothing was \
              spawned. Wait for one to settle, or ask the user to raise the Setting."
+        );
+        let resume = send_refusal(
+            BrokeredSendRefusal::Capped(BrokeredSpawnCap::Concurrency {
+                max_concurrent_subagents: 2,
+                working: 3,
+            }),
+            SessionId::new(),
+        )
+        .to_string();
+        assert!(
+            resume.contains("and 3 are working now, so the Subagent was not resumed. Wait for one"),
+            "a resume past the cap says it did not resume: {resume}"
         );
         for (refusal, key) in [
             (&depth, "broker.maxDepth"),

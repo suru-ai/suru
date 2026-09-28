@@ -404,8 +404,11 @@ async fn stop_subagent_refuses_anything_but_a_brokered_subagent_beneath_the_call
     }
     for (arguments, says) in [
         (json!({}), "needs `id`"),
-        (json!({ "id": 7 }), "`id` must be a string"),
-        (json!({ "id": "the researcher" }), "is not a Session id"),
+        (json!({ "id": 7 }), "`id` must be the session_id"),
+        (
+            json!({ "id": "the researcher" }),
+            "`id` must be the session_id",
+        ),
         (
             json!({ "id": foreign_id, "force": true }),
             "takes no argument `force`",

@@ -51,8 +51,9 @@ beside the Tools your own Provider gives you. Call list_providers to learn \
 which Providers, Models and Model Options may be chosen, and spawn_subagent to \
 delegate a piece of work to a Subagent on any of them. \
 Call read_subagent with the session_id spawn_subagent answered with to learn \
-how that Subagent is doing and read what it last wrote. Call stop_subagent to \
-stop one whose work you no longer need.";
+how that Subagent is doing and read what it last wrote, and send_to_subagent \
+to send it more work. Call stop_subagent to stop one whose work you no longer \
+need.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 

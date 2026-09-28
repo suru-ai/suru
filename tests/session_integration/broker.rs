@@ -466,6 +466,7 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
             "list_providers",
             "spawn_subagent",
             "read_subagent",
+            "send_to_subagent",
             "stop_subagent"
         ],
         "the Broker offers the Tools it has so far, in its own order"
@@ -474,7 +475,8 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         (&tools[0], "\"providers\"", true),
         (&tools[1], "\"session_id\"", false),
         (&tools[2], "\"status\"", true),
-        (&tools[3], "\"stopped\"", false),
+        (&tools[3], "\"delivered\"", false),
+        (&tools[4], "\"stopped\"", false),
     ] {
         assert_eq!(tool["inputSchema"]["type"], json!("object"));
         assert!(
@@ -492,6 +494,16 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
     );
     assert_eq!(
         tools[2]["inputSchema"]["required"],
+        json!(["id"]),
+        "a read names the Subagent it reads"
+    );
+    assert_eq!(
+        tools[3]["inputSchema"]["required"],
+        json!(["id", "message"]),
+        "a send names the Subagent and what it sends"
+    );
+    assert_eq!(
+        tools[4]["inputSchema"]["required"],
         json!(["id"]),
         "a stop names the Subagent it stops"
     );
