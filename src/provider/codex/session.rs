@@ -879,8 +879,10 @@ impl ProviderSession for CodexSession {
     /// takes on a collab (v1) child's thread and refuses a multi-agent v2
     /// sub-agent's. A settled child begins a native turn with it, which the
     /// projection routes into the stretch Suru wakes the child into, and a
-    /// working one's running turn is steered with it; either way the input —
-    /// a Subagent Report — arrives on the thread as nothing the projection
+    /// working one's running turn is steered with it — or, where that turn
+    /// ended as the input arrived, the child begins another with it, which it
+    /// is woken into once its stretch settles. Either way the input — a
+    /// Subagent Report — arrives on the thread as nothing the projection
     /// shows (ADR 0035). It goes as `turn/start` even to a working child,
     /// rather than the `turn/steer` a working Turn of the Session's own
     /// takes: a Report a native Subagent's Provider refuses is dropped, not

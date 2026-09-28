@@ -891,12 +891,14 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         delegation: String,
     },
-    /// A settled Subagent's own Watch woke it: the same agent works on in the
-    /// same conversation, though no Agent delegated anything to it. So it is
-    /// no resume (ADR 0031) and gains no row in any Transcript: its work lands
-    /// in a Continuation of the Subagent's own Session, headed by the Watch
-    /// Outcome that woke it, and its Session Works again — and with it every
-    /// Session above it. The Provider's next `SubagentCompleted` for it settles
+    /// A settled Subagent's own Watch woke it, or input Suru handed it itself
+    /// — a Subagent Report (ADR 0035) — began a turn of its: the same agent
+    /// works on in the same conversation, though no Agent delegated anything
+    /// to it. So it is no resume (ADR 0031) and gains no row in any
+    /// Transcript: its work lands in a Continuation of the Subagent's own
+    /// Session, headed by any Watch Outcome that woke it, and its Session
+    /// Works again — and with it every Session above it. A Subagent already
+    /// woken, or still working, has nothing more to wake. The Provider's next `SubagentCompleted` for it settles
     /// that Continuation as it settles any stretch. Like the rest of a
     /// Subagent's lifecycle it names the Subagent by `subagent_id` whatever its
     /// attribution, and it is no output of any Turn of the delegating

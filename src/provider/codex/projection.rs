@@ -19,8 +19,8 @@
 //! text. A steer changes nothing in the parent's Transcript, not even the Subagent row's
 //! description. Input Suru hands a child itself — a Subagent Report to a native Subagent that
 //! delegated through the Broker (ADR 0035) — steers a working child's turn, or begins a native turn
-//! on a settled child's thread that wakes it into a stretch no Delegation began: Suru opens that
-//! stretch's Continuation itself, so it is announced nowhere, and the input stands nowhere either.
+//! on the child's thread that wakes it into a stretch no Delegation began: a Continuation of its own
+//! Session, as a Watch's wake is, with no resume and no row. The input stands nowhere either.
 //! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
 //! the recorded state fail the Session, and everything else becomes the Provider events a Session
 //! consumes.
@@ -202,15 +202,17 @@ struct AttachedChild {
     handed_wake: Option<HandedWake>,
 }
 
-/// Suru's own `turn/start` waking a settled child with input it hands the
-/// child itself (ADR 0035). The native turn that input runs in is a stretch
-/// of the child's no Delegation began: Suru opens the Continuation of the
-/// child's Session it works in once Codex takes the input, as a Watch would
-/// wake it, so the stretch opens here announcing nothing.
+/// Suru's own `turn/start` waking a child with input it hands the child
+/// itself (ADR 0035). The native turn that input runs in is a stretch of the
+/// child's no Delegation began, so it opens with no resume: it is a
+/// Continuation of the child's Session, as a Watch's wake is. A settled
+/// child's is opened by Suru as Codex takes the input; one Codex begins with
+/// the input after a working child's turn ended — Suru having found the child
+/// working — waits for that stretch to settle, and opens with the wake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HandedWake {
-    /// Sent and not yet answered: the next native turn the child begins that
-    /// no delegation claims is the one the input runs in.
+    /// Sent to a settled child and not yet answered: the next native turn the
+    /// child begins that no delegation claims is the one the input runs in.
     Requested,
     /// Answered, naming the native turn the input runs in — a new one, or one
     /// still running that Suru had already seen settle, which Codex steered
@@ -752,8 +754,19 @@ impl NativeCorrelation {
         child.in_flight = ThreadInFlight::default();
         child.opening = StretchOpening::Passed;
         child.sends.clear();
-        child.handed_input.clear();
         let stretch_turns = std::mem::take(&mut child.stretch_turns);
+        // Input Suru handed the child that Codex took into a turn of its own,
+        // begun after the one the stretch worked in ended, wakes the child
+        // there once the stretch has settled (see [`HandedWake`]). Input one
+        // of the stretch's own turns took is done with.
+        let taken_later = matches!(
+            &child.handed_wake,
+            Some(HandedWake::Took(turn_id)) if !stretch_turns.contains(turn_id)
+        );
+        if !taken_later {
+            child.handed_input.clear();
+            child.handed_wake = None;
+        }
         child.past_turns.extend(stretch_turns);
         self.settled_children
             .insert(child_thread_id.to_owned(), child);
@@ -933,11 +946,14 @@ impl NativeCorrelation {
     }
 
     /// Wakes a settled child into native turn `turn_id`, which input Suru
-    /// handed the child itself runs in (see [`HandedWake`]). Suru opens the
-    /// Continuation the stretch works in, so nothing is announced: no
-    /// Delegation began it, no Transcript gains a row, and the input stands
-    /// nowhere. The thread is followed again, and the Model the child last
-    /// ran on follows it into the new Turn until fresher evidence arrives.
+    /// handed the child itself runs in (see [`HandedWake`]). No Delegation
+    /// began the stretch, so it is no resume and gains no row: it is woken,
+    /// as a Watch wakes a Subagent, into a Continuation of its own Session —
+    /// which Suru has already opened where it found the child settled as
+    /// Codex took the input, and which the wake opens where it found the
+    /// child still working. The input stands nowhere. The thread is followed
+    /// again, and the Model the child last ran on follows it into the new
+    /// Turn until fresher evidence arrives.
     fn wake_for_handed_input(
         &mut self,
         child_thread_id: &str,
@@ -950,16 +966,18 @@ impl NativeCorrelation {
         child.delegator = None;
         child.opening = StretchOpening::Passed;
         let model = self.reopen_child(child_thread_id, child, turn_id);
-        model
-            .map(|model| AttributedProviderEvent {
-                attribution: ProviderEventAttribution::OwningSession,
-                event: ProviderEvent::SubagentModelChanged {
-                    subagent_id: ProviderSubagentId::new(child_thread_id),
-                    model,
-                },
-            })
-            .into_iter()
-            .collect()
+        let subagent_id = ProviderSubagentId::new(child_thread_id);
+        let mut woken = vec![AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentWoken {
+                subagent_id: subagent_id.clone(),
+            },
+        }];
+        woken.extend(model.map(|model| AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentModelChanged { subagent_id, model },
+        }));
+        woken
     }
 
     /// Follows a settled child's thread again for the stretch native turn
@@ -1019,7 +1037,10 @@ impl NativeCorrelation {
             .or_default();
         child.handed_input.push(text);
         // A delegation already waiting on the child's next turn resumes it
-        // there, row and all, and the input rides that turn.
+        // there, row and all, and the input rides that turn. Known race, left
+        // for a later slice: with such a claim pending no wake is marked here,
+        // yet the orchestrator still wakes the child as Codex takes the input,
+        // a Continuation the resume begun milliseconds later then settles.
         if child.claim.is_none() {
             child.handed_wake = Some(HandedWake::Requested);
         }
@@ -1027,10 +1048,19 @@ impl NativeCorrelation {
     }
 
     /// Codex took the input Suru handed the child on `child_thread_id` into
-    /// native turn `turn_id`, which — for a settled child — is the stretch it
+    /// native turn `turn_id`. For a settled child that is the stretch it
     /// wakes into, even one Suru saw settle before Codex steered the input
-    /// into it.
+    /// into it. For a working child it is the turn the stretch works in,
+    /// which the input steered — unless that turn had ended before the input
+    /// arrived and Codex began another with it, which wakes the child into a
+    /// stretch of its own once the one it worked in settles.
     pub(super) fn handed_input_taken(&mut self, child_thread_id: &str, turn_id: String) {
+        if let Some(child) = self.children.get_mut(child_thread_id) {
+            if child.latest_turn_id.as_deref() != Some(turn_id.as_str()) {
+                child.handed_wake = Some(HandedWake::Took(turn_id));
+            }
+            return;
+        }
         let Some(child) = self.settled_children.get_mut(child_thread_id) else {
             return;
         };
@@ -4692,8 +4722,19 @@ mod tests {
     const REPORT: &str = "Subagent Report from Suru: the Subagent \"Researcher\" you delegated to \
                           through the Broker completed.";
 
+    /// The settled child woken into a Continuation of its own Session, with
+    /// no resume and no row.
+    fn child_woken() -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: ProviderEventAttribution::OwningSession,
+            event: ProviderEvent::SubagentWoken {
+                subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+            },
+        }
+    }
+
     #[test]
-    fn a_report_handed_to_a_settled_child_wakes_it_into_the_turn_it_begins_announcing_nothing() {
+    fn a_report_handed_to_a_settled_child_wakes_it_into_the_turn_it_begins_with_no_resume() {
         let mut correlation = settled_child();
 
         assert!(
@@ -4705,15 +4746,18 @@ mod tests {
         correlation.note_settled_child_model(CHILD_THREAD, ModelId::new("gpt-child"));
         assert_eq!(
             project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
-            vec![AttributedProviderEvent {
-                attribution: ProviderEventAttribution::OwningSession,
-                event: ProviderEvent::SubagentModelChanged {
-                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
-                    model: ModelId::new("gpt-child"),
+            vec![
+                child_woken(),
+                AttributedProviderEvent {
+                    attribution: ProviderEventAttribution::OwningSession,
+                    event: ProviderEvent::SubagentModelChanged {
+                        subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                        model: ModelId::new("gpt-child"),
+                    },
                 },
-            }],
-            "the turn the Report begins wakes the child with no resume, since nothing delegated \
-             it and its Continuation is Suru's to open, carrying on the Model it runs on"
+            ],
+            "the turn the Report begins wakes the child into a Continuation with no resume, \
+             since nothing delegated it, carrying on the Model it runs on"
         );
         correlation.handed_input_taken(CHILD_THREAD, RESUMED_TURN.to_owned());
         assert_eq!(
@@ -4755,7 +4799,10 @@ mod tests {
                 &mut correlation,
                 child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
             ),
-            vec![child_settled(ProviderSubagentStatus::Completed)],
+            vec![
+                child_woken(),
+                child_settled(ProviderSubagentStatus::Completed)
+            ],
             "the turn's end settles the stretch the Report woke the child into, which nothing \
              else would"
         );
@@ -4805,6 +4852,108 @@ mod tests {
                 "Also list the binaries."
             )],
             "while a steer an Agent sent still stands"
+        );
+    }
+
+    #[test]
+    fn a_report_codex_begins_a_turn_with_after_a_working_childs_turn_ended_wakes_it_there() {
+        let mut correlation = working_child();
+        assert!(
+            !correlation
+                .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+                .expect("a child thread takes handed input"),
+            "a working child streams here already"
+        );
+
+        // The child's turn ended as the Report arrived, so Codex began another
+        // turn with it rather than steering the one Suru saw working.
+        correlation.handed_input_taken(CHILD_THREAD, RESUMED_TURN.to_owned());
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "the stretch the child worked in settles with its own turn"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_woken()],
+            "and the turn the Report began wakes the child into a Continuation, with no resume"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, RESUMED_TURN, REPORT)
+            ),
+            Vec::new(),
+            "the Report stands nowhere"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![on_child(ProviderEvent::AgentMessageStarted)],
+            "what the woken child does lands in its own Session"
+        );
+        let approval = project_attributed(
+            &mut correlation,
+            NativeNotification::CommandApprovalRequested {
+                id: super::super::wire::RequestId::Integer(7),
+                params: serde_json::from_value(serde_json::json!({
+                    "threadId": CHILD_THREAD,
+                    "turnId": RESUMED_TURN,
+                    "itemId": "command-in-the-woken-turn",
+                    "command": "cargo test",
+                }))
+                .expect("decode the fixture approval"),
+            },
+        );
+        let [
+            AttributedProviderEvent {
+                attribution: ProviderEventAttribution::Subagent(subagent),
+                event: ProviderEvent::ApprovalRequested { approval, .. },
+            },
+        ] = approval.as_slice()
+        else {
+            panic!("an Approval it asks for is routed to it, so it can be answered: {approval:?}");
+        };
+        assert_eq!(subagent.as_str(), CHILD_THREAD);
+        assert_eq!(
+            correlation.child_interrupt_target(CHILD_THREAD),
+            Some((CHILD_THREAD.to_owned(), Some(RESUMED_TURN.to_owned()))),
+            "a stop reaches the turn it works in"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(RESUMED_TURN, NativeTurnOutcome::Completed),
+            ),
+            vec![
+                on_child(ProviderEvent::ApprovalWithdrawn { id: approval.id }),
+                child_settled(ProviderSubagentStatus::Completed),
+            ],
+            "and that turn's end settles the Continuation, withdrawing what it left unanswered"
+        );
+    }
+
+    #[test]
+    fn a_report_a_working_childs_turn_took_leaves_the_next_turn_to_delegations() {
+        let mut correlation = working_child();
+        correlation
+            .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+            .expect("a child thread takes handed input");
+        project_attributed(&mut correlation, child_turn_started(CHILD_TURN));
+
+        // Codex steered the Report into the turn the child works in.
+        correlation.handed_input_taken(CHILD_THREAD, CHILD_TURN.to_owned());
+        project_attributed(
+            &mut correlation,
+            child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+        );
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            Vec::new(),
+            "a later turn is no wake of the Report's: it waits for a delegation to claim it"
         );
     }
 
