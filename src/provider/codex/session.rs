@@ -4,7 +4,9 @@
 //! that process's single native Turn slot: starting a Turn, steering it, interrupting it, and
 //! stopping the process once the Session is done with it. A Session handed the Broker hands it on
 //! to its thread through the per-thread `config` map, on `thread/start` and on every
-//! `thread/resume` a relaunch sends, with the token that launch was handed.
+//! `thread/resume` a relaunch sends, with the token that launch was handed, and appends the
+//! Broker's note to the developer instructions the user's own configuration sets, which it reads
+//! from that launch's app-server first.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -28,11 +30,11 @@ use super::{
     skills::CodexSkills,
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
-        CodexPosture, ModelListParams, NativeField, NativeModelList, SubagentTurnStartParams,
-        ThreadConnectionResult, ThreadResumeParams, ThreadStartParams, TurnInterruptParams,
-        TurnStartParams, TurnStartResult, TurnSteerParams, TurnSteerResult,
-        broker_developer_instructions, broker_thread_config, lower_reasoning_summary,
-        lower_turn_options, user_input_text,
+        CodexPosture, ConfigReadParams, ModelListParams, NativeConfigRead, NativeField,
+        NativeModelList, SubagentTurnStartParams, ThreadConnectionResult, ThreadResumeParams,
+        ThreadStartParams, TurnInterruptParams, TurnStartParams, TurnStartResult, TurnSteerParams,
+        TurnSteerResult, broker_developer_instructions, broker_thread_config,
+        lower_reasoning_summary, lower_turn_options, user_input_text,
     },
 };
 use crate::{
@@ -361,6 +363,23 @@ async fn start_codex_session(
     start_codex_thread(connection, request, context).await
 }
 
+/// The developer instructions the user's own Codex configuration gives a thread working in `cwd`,
+/// as the app-server that will start or resume it resolves them. A launch whose configuration
+/// cannot be read fails, as one whose thread cannot be started does, rather than start a thread
+/// that would silently lose the user's instructions to the Broker's note.
+async fn configured_developer_instructions(
+    transport: &JsonRpcTransport,
+    cwd: &str,
+) -> Result<Option<String>, ProviderError> {
+    let result = transport
+        .request("config/read", &ConfigReadParams { cwd })
+        .await
+        .map_err(|error| codex_error_context("Codex configuration read failed", error))?;
+    let read: NativeConfigRead = serde_json::from_value(result)
+        .map_err(|_| codex_error("Codex returned an invalid config/read response"))?;
+    Ok(read.config.developer_instructions)
+}
+
 async fn start_codex_thread(
     connection: CodexConnection,
     request: ProviderSessionRequest,
@@ -385,9 +404,17 @@ async fn start_codex_thread(
         .map(|state| state.thread_id);
     // The Broker goes on the thread's start and on every resume alike, carrying the token this
     // launch was handed, because Codex keeps nothing of an MCP server with the thread; and so does
-    // its note, which a resumed thread reads from the configuration it is resumed under.
+    // its note, which a resumed thread reads from the configuration it is resumed under. The note
+    // takes the place of the developer instructions the user's configuration sets, so it goes
+    // after theirs, as this launch's app-server reads them for the thread's directory.
     let config = request.broker.as_ref().map(broker_thread_config);
-    let note = request.broker.is_some().then(broker_developer_instructions);
+    let note = match request.broker {
+        Some(_) => {
+            let user = configured_developer_instructions(&transport, cwd).await?;
+            Some(broker_developer_instructions(user.as_deref()))
+        }
+        None => None,
+    };
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
         let posture = *context
             .posture

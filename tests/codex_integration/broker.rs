@@ -7,7 +7,10 @@
 //! again — with the token its own launch was handed. Both also carry a note in the thread's
 //! developer instructions saying the Broker is there: a resumed thread reads its developer
 //! instructions from the configuration it is resumed under, and a compaction rebuilds the thread's
-//! opening context from them. With the Broker turned off neither request carries anything of it.
+//! opening context from them. A thread's developer instructions take the place of those the user's
+//! own configuration sets, so each launch first asks its app-server for that configuration through
+//! `config/read` and hands the user's instructions back with the note after them. With the Broker
+//! turned off neither request carries anything of it, and no configuration is read.
 //!
 //! A Codex Subagent a Session on another Provider spawns through the Broker starts its thread under
 //! the Codex value ADR 0036's table gives for that Session's posture.
@@ -40,19 +43,24 @@ use suru::{
 use tokio::time::timeout;
 
 /// An app-server whose first process runs a Turn and then exits, so the next Turn resumes the same
-/// thread on a process of its own.
+/// thread on a process of its own. Each process answers `config/read` with `__USER_CONFIG__`, the
+/// user's own configuration as that launch finds it, and every request by the id it came with,
+/// since a launch made while the Broker is off reads no configuration.
 const LOST_THEN_RESUMED: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
-    *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"broker-thread"},"model":"gpt-fixture"}}'
+    *'"method":"config/read"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"config":__USER_CONFIG__,"origins":{}}}'
       ;;
-    *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"broker-thread"},"model":"gpt-fixture"}}'
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"broker-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-'"$attempt"'"}}}'
+      id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"turn-'"$attempt"'"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"broker-thread","turn":{"id":"turn-'"$attempt"'","status":"completed","items":[]}}}'
       if [ "$attempt" -eq 1 ]; then
         printf '%s\n' 'exited' > "$CODEX_FIXTURE_EXITED"
@@ -72,11 +80,23 @@ struct ResumedThread {
     _workspace: tempfile::TempDir,
 }
 
+/// A user's Codex configuration that sets no developer instructions.
+const NO_USER_INSTRUCTIONS: &str = "{}";
+
 impl ResumedThread {
     /// Runs a Session's first Turn, loses the app-server under it, and runs a second Turn on the
-    /// app-server that resumes the thread, under the Config Document `document`.
+    /// app-server that resumes the thread, under the Config Document `document` and a user's Codex
+    /// configuration that sets no developer instructions.
     async fn run(channel: &'static str, document: &str) -> Self {
-        let codex = ScriptedCodex::new_multiprocess(LOST_THEN_RESUMED);
+        Self::run_configured(channel, document, NO_USER_INSTRUCTIONS).await
+    }
+
+    /// As [`Self::run`], with each app-server finding the user's Codex configuration to be
+    /// `user_config`, a JSON object spliced into the stand-in's shell script.
+    async fn run_configured(channel: &'static str, document: &str, user_config: &str) -> Self {
+        let codex = ScriptedCodex::new_multiprocess(
+            &LOST_THEN_RESUMED.replace("__USER_CONFIG__", user_config),
+        );
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let config_dir = tempfile::tempdir().expect("create isolated config directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -229,6 +249,29 @@ async fn thread_start_and_thread_resume_carry_the_server_headers_timeout_and_app
     resumed.shutdown().await;
 }
 
+/// Asserts that `note` is the Broker's note as Codex's Agent is handed it.
+fn assert_is_the_broker_note(note: &str, method: &str) {
+    for tool in [
+        "mcp__suru__list_providers",
+        "mcp__suru__spawn_subagent",
+        "mcp__suru__read_subagent",
+        "mcp__suru__stop_subagent",
+    ] {
+        assert!(
+            note.contains(tool),
+            "{method}'s note names {tool} as Codex names an MCP server's Tools: {note:?}"
+        );
+    }
+    assert!(
+        note.contains("when the user names another Provider or Model"),
+        "{method}'s note says when to prefer the Broker: {note:?}"
+    );
+    assert!(
+        note.contains("Suru never re-routes them"),
+        "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
+    );
+}
+
 #[tokio::test]
 async fn thread_start_and_thread_resume_carry_the_broker_note_in_their_developer_instructions() {
     let resumed = ResumedThread::run("codex-broker-note", "{}").await;
@@ -238,24 +281,66 @@ async fn thread_start_and_thread_resume_carry_the_broker_note_in_their_developer
         let note = params["developerInstructions"]
             .as_str()
             .unwrap_or_else(|| panic!("{method} carries developer instructions: {params}"));
-        for tool in [
-            "mcp__suru__list_providers",
-            "mcp__suru__spawn_subagent",
-            "mcp__suru__read_subagent",
-            "mcp__suru__stop_subagent",
-        ] {
-            assert!(
-                note.contains(tool),
-                "{method}'s note names {tool} as Codex names an MCP server's Tools: {note:?}"
-            );
-        }
+        assert_is_the_broker_note(note, method);
         assert!(
-            note.contains("when the user names another Provider or Model"),
-            "{method}'s note says when to prefer the Broker: {note:?}"
+            !note.contains('\n'),
+            "{method} made for a user whose configuration sets no developer instructions carries \
+             the one-line note alone: {note:?}"
         );
+    }
+
+    resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_broker_note_follows_the_developer_instructions_the_users_own_configuration_sets() {
+    // Each launch finds the user's instructions as they stand then, so the resume's differ from
+    // the start's the way an edit made between launches would.
+    let resumed = ResumedThread::run_configured(
+        "codex-broker-user-instructions",
+        "{}",
+        r#"{"developer_instructions":"Launch '"$attempt"': answer in British English.\nName every file you touch."}"#,
+    )
+    .await;
+
+    let started_in = resumed.params_of("thread/start")["cwd"].clone();
+    let reads = resumed
+        .codex
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "config/read")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads.len(),
+        2,
+        "each launch reads the user's configuration afresh: {:?}",
+        resumed.codex.methods()
+    );
+    for read in &reads {
+        assert_eq!(
+            read["params"]["cwd"], started_in,
+            "the configuration read is the one a thread working where the Session works is built \
+             from, project layers included: {read}"
+        );
+    }
+
+    for (method, launch) in [("thread/start", 1), ("thread/resume", 2)] {
+        let params = resumed.params_of(method);
+        let instructions = params["developerInstructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{method} carries developer instructions: {params}"));
+        let user =
+            format!("Launch {launch}: answer in British English.\nName every file you touch.\n\n");
+        let note = instructions.strip_prefix(&user).unwrap_or_else(|| {
+            panic!(
+                "{method} keeps the user's own developer instructions, whole and first, a blank \
+                 line before the note: {instructions:?}"
+            )
+        });
+        assert_is_the_broker_note(note, method);
         assert!(
-            note.contains("Suru never re-routes them"),
-            "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
+            !note.contains("British English"),
+            "{method} carries the user's instructions once: {instructions:?}"
         );
     }
 
@@ -277,6 +362,15 @@ async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_
             "{method} made while the Broker is off tells the Agent of none: {params}"
         );
     }
+    assert!(
+        !resumed
+            .codex
+            .methods()
+            .iter()
+            .any(|method| method == "config/read"),
+        "a launch made while the Broker is off has no note to add and reads no configuration: {:?}",
+        resumed.codex.methods()
+    );
 
     resumed.shutdown().await;
 }
@@ -290,6 +384,9 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":'"$id"',"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}'
       ;;
     *'"method":"model/list"'*)
       printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
@@ -438,6 +535,10 @@ const ANSWERING_EVERY_TURN: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"model/list"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
       printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
@@ -568,6 +669,10 @@ async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
 const RUNNING_UNTIL_STEERED: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}'
       ;;
     *'"method":"model/list"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -727,6 +832,9 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":'"$id"',"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}'
       ;;
     *'"method":"model/list"'*)
       printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'

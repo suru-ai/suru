@@ -29,6 +29,9 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"model/list"'*'"cursor":null'*)
       if [ "$attempt" -gt 1 ]; then
         printf '%s\n' '{"id":2,"error":{"code":-32001,"message":"temporary catalog outage"}}'
@@ -40,10 +43,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":3,"result":{"data":[{"id":"fast-model","displayName":"Fast Fixture","description":"Has independent speed","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[{"id":"fast","name":"Fast","description":"Priority processing"}],"defaultServiceTier":null,"isDefault":false}],"nextCursor":null}}'
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-opaque","reasoningEffort":"xhigh","serviceTier":"flex-native"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-opaque","reasoningEffort":"xhigh","serviceTier":"flex-native"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
   esac
@@ -83,11 +86,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"selection rejected by fixture","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"model\"}}"},"items":[]}}}'
       ;;
   esac
@@ -101,11 +107,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"selected service tier is unavailable","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"serviceTier\"}}"},"items":[]}}}'
       ;;
   esac
@@ -119,11 +128,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"failed","error":{"message":"fixture rejected the input","codexErrorInfo":"badRequest","additionalDetails":"{\"error\":{\"param\":\"input\"}}"},"items":[]}}}'
       ;;
   esac
@@ -137,11 +149,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"provider-default"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"provider-default"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"effective-model","effort":"low","serviceTier":"flex"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
@@ -156,11 +171,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"provider-default","reasoningEffort":"medium","serviceTier":null}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"provider-default","reasoningEffort":"medium","serviceTier":null}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"native-thread","threadSettings":{"model":"provider-default","serviceTier":"fast"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;

@@ -30,11 +30,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"working-message","text":""}}}'
       printf ready > "$CODEX_FIXTURE_READY"
       ;;
@@ -43,7 +46,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"late-message","delta":"late shutdown output"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"late-message","text":"late shutdown output"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
-      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       ;;
   esac
 done
@@ -59,8 +62,11 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       printf ready > "$CODEX_FIXTURE_READY"
@@ -68,11 +74,11 @@ while IFS= read -r line; do
         while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
           sleep 0.01
         done
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       ) &
       ;;
     *'"method":"turn/interrupt"'*)
-      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       ;;
   esac
 done
@@ -89,11 +95,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"working-message","text":""}}}'
       printf ready > "$CODEX_FIXTURE_READY"
       ;;
@@ -200,6 +209,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
         [
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start",
             "turn/interrupt"

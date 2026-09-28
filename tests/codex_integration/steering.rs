@@ -15,10 +15,10 @@ use suru::{
 };
 use tokio::time::timeout;
 
-const START_TURN: &str = r#"      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'"#;
+const START_TURN: &str = r#"      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'"#;
 
 const SEQUENTIAL_QUEUE_TURNS: &str = r#"      turn_index=$((turn_index + 1))
-      response_id=$((turn_index + 2))
+      response_id=$((turn_index + 3))
       printf '{"id":%s,"result":{"turn":{"id":"native-turn-%s"}}}\n' "$response_id" "$turn_index"
       (
         while [ ! -e "$CODEX_FIXTURE_RELEASE-$turn_index" ]; do
@@ -33,10 +33,10 @@ const TERMINAL_BOUNDARY_TURNS: &str = r#"      turn_index=$((turn_index + 1))
         while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
           sleep 0.01
         done
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn-1"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-1"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
       else
-        printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-2"}}}'
+        printf '%s\n' '{"id":5,"result":{"turn":{"id":"native-turn-2"}}}'
         (
           while [ ! -e "$CODEX_FIXTURE_RELEASE-2" ]; do
             sleep 0.01
@@ -55,8 +55,11 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
 __TURN_START_ACTION__
@@ -72,15 +75,15 @@ wait
 const ACCEPT_STEER: &str = r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
         sleep 0.01
       done
-      printf '%s\n' '{"id":4,"result":{"turnId":"native-turn"}}'"#;
+      printf '%s\n' '{"id":5,"result":{"turnId":"native-turn"}}'"#;
 
-const REJECT_STEER: &str = r#"      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"fixture rejected steering"}}'"#;
+const REJECT_STEER: &str = r#"      printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"fixture rejected steering"}}'"#;
 
 const COMPLETE_THEN_ACCEPT_STEER: &str = r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
-      printf '%s\n' '{"id":4,"result":{"turnId":"native-turn"}}'"#;
+      printf '%s\n' '{"id":5,"result":{"turnId":"native-turn"}}'"#;
 
 const COMPLETE_THEN_REJECT_STEER: &str = r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
-      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"no active turn to steer"}}'"#;
+      printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"no active turn to steer"}}'"#;
 
 const LOSE_PROCESS_DURING_STEER: &str = "      exit 29";
 

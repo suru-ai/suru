@@ -75,15 +75,18 @@ const CHILD_APPROVAL_IMMEDIATE_TERMINAL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo check","cwd":"project","status":"inProgress"}}}'
       printf '%s\n' '{"id":"child-approval","method":"item/commandExecution/requestApproval","params":{"threadId":"child-thread","turnId":"child-turn","itemId":"child-command","reason":"finish the delegated check","command":"cargo check"}}'
       ;;
@@ -284,11 +287,14 @@ const COLLAB_SPAWN_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"inProgress","senderThreadId":"root-thread","receiverThreadIds":[],"agentsStates":{}}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"completed","senderThreadId":"root-thread","receiverThreadIds":["child-thread"],"prompt":"Map the crate layout","agentsStates":{"child-thread":{"status":"running"}}}}}'
       ;;
@@ -302,7 +308,7 @@ const COLLAB_SPAWN_CODEX: &str = r#"
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"agentMessage","id":"root-message","text":"The layout is mapped."}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
       sleep 0.05
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-child"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-child"}}'
       ;;
 "#;
 
@@ -454,15 +460,18 @@ const CAPPED_CHILD_COMMAND_OUTPUT_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"find the answer","cwd":"/fixture/work","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/commandExecution/outputDelta","params":{"threadId":"child-thread","turnId":"child-turn","itemId":"child-command","delta":"retained prefix\nstreamed beyond the final cap\n"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"find the answer","cwd":"/fixture/work","status":"completed","aggregatedOutput":"retained prefix\n","exitCode":0}}}'
@@ -528,16 +537,19 @@ const OUTLIVING_CHILD_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"completed","aggregatedOutput":"0 vulnerabilities\n","exitCode":0}}}'
@@ -655,7 +667,7 @@ const INTERRUPTIBLE_CONTINUATION: &str = r#"
       printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"inProgress","items":[]}}}'
       ;;
     *'"method":"turn/interrupt"'*)
-      printf '%s\n' '{"id":5,"result":{}}'
+      printf '%s\n' '{"id":6,"result":{}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"interrupted","items":[]}}}'
       ;;
 "#;
@@ -705,17 +717,17 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
     for delay_ack in [false, true] {
         let next_prompt = r#"
     *'"method":"turn/start"'*'Continue new work'*)
-      printf '%s\n' '{"id":6,"result":{"turn":{"id":"next-turn"}}}'
+      printf '%s\n' '{"id":7,"result":{"turn":{"id":"next-turn"}}}'
       printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"inProgress","items":[]}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
       ;;
 "#;
         let second_prompt = next_prompt
             .replace("Continue new work", "Then more work")
-            .replace("\"id\":6", "\"id\":7")
+            .replace("\"id\":7", "\"id\":8")
             .replace("next-turn", "last-turn");
         let second_prompt = if delay_ack {
-            second_prompt.replace("\"id\":7", "\"id\":8")
+            second_prompt.replace("\"id\":8", "\"id\":9")
         } else {
             second_prompt
         };
@@ -731,7 +743,7 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
         let interrupt_next = if delay_ack {
             r#"
     *'"method":"turn/interrupt"'*'"turnId":"next-turn"'*)
-      printf '%s\n' '{"id":7,"result":{}}'
+      printf '%s\n' '{"id":8,"result":{}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
       ;;
 "#
@@ -739,7 +751,7 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
             ""
         };
         let gate_before = if delay_ack {
-            "      printf '%s\\n' '{\"id\":5"
+            "      printf '%s\\n' '{\"id\":6"
         } else {
             "      printf '%s\\n' '{\"method\":\"turn/completed\""
         };
@@ -852,7 +864,7 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
 async fn a_continuation_selection_failure_preserves_the_error_and_delivers_queued_work() {
     let next_prompt = r#"
     *'"method":"turn/start"'*'Continue new work'*)
-      printf '%s\n' '{"id":5,"result":{"turn":{"id":"next-turn"}}}'
+      printf '%s\n' '{"id":6,"result":{"turn":{"id":"next-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -945,7 +957,7 @@ async fn continuations_keep_selection_and_usage_without_reopening_stale_or_forei
             json!({"threadId": "root-thread", "turn": {"id": turn, "status": "completed", "items": []}}),
         )
     }
-    let response = r#"      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'"#;
+    let response = r#"      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'"#;
     // App-server may announce the requested Turn before its RPC response.
     let initial = OUTLIVING_CHILD_CODEX.replace(response, &format!("{}{}\n{}{}",
         started("root-thread", "root-turn"), response, usage("root-turn", 100),
@@ -1005,19 +1017,22 @@ const NESTED_SPAWN_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-outer","kind":"started","agentThreadId":"child-thread","agentPath":"/root/planner"}}}'
       ;;
     *'"method":"thread/resume"'*'"threadId":"child-thread"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"subAgentActivity","id":"activity-inner","kind":"started","agentThreadId":"grandchild-thread","agentPath":"/root/planner/scout"}}}'
       ;;
     *'"method":"thread/resume"'*'"threadId":"grandchild-thread"'*)
-      printf '%s\n' '{"id":5,"result":{"thread":{"id":"grandchild-thread","parentThreadId":"child-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":6,"result":{"thread":{"id":"grandchild-thread","parentThreadId":"child-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"grandchild-thread","turnId":"grandchild-turn","item":{"type":"agentMessage","id":"grandchild-message","text":""}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"grandchild-thread","turnId":"grandchild-turn","item":{"type":"agentMessage","id":"grandchild-message","text":"Twelve call sites."}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"subAgentActivity","id":"inner-completed","kind":"completed","agentThreadId":"grandchild-thread","agentPath":"/root/planner/scout"}}}'
@@ -1091,22 +1106,25 @@ const CHILD_IN_FLIGHT_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
       ;;
     *'"method":"turn/interrupt"'*'"threadId":"child-thread"'*)
-      printf '%s\n' '{"id":5,"result":{}}'
+      printf '%s\n' '{"id":6,"result":{}}'
       ;;
     *'"method":"turn/interrupt"'*'"threadId":"root-thread"'*)
-      printf '%s\n' '{"id":6,"result":{}}'
+      printf '%s\n' '{"id":7,"result":{}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"interrupted","items":[]}}}'
       ;;
 "#;
@@ -1188,20 +1206,23 @@ const OUTLIVING_CHILD_TO_STOP_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
       ;;
     *'"method":"turn/interrupt"'*)
-      printf '%s\n' '{"id":5,"result":{}}'
+      printf '%s\n' '{"id":6,"result":{}}'
       ;;
 "#;
 
@@ -1293,16 +1314,19 @@ const SILENT_CHILD_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/auditor"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
       ;;
 "#;
 
@@ -1386,10 +1410,15 @@ fn arm(pattern: &str, body: &str) -> String {
     format!("    {pattern})\n{body}      ;;\n")
 }
 
-/// The arms every Session opens through: the handshake and the root thread.
+/// The arms every Session opens through: the handshake, the read of the user's configuration —
+/// which sets no developer instructions — and the root thread.
 fn opening_arms() -> String {
     [
         arm(r#"*'"method":"initialize"'*"#, &answer(json!({}))),
+        arm(
+            r#"*'"method":"config/read"'*"#,
+            &answer(json!({ "config": {}, "origins": {} })),
+        ),
         arm(
             r#"*'"method":"thread/start"'*"#,
             &answer(json!({ "thread": { "id": "root-thread" }, "model": "gpt-fixture" })),

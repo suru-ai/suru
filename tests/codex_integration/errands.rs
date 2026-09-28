@@ -96,15 +96,18 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{{"id":1,"result":{{}}}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{{"id":2,"result":{{"config":{{}},"origins":{{}}}}}}'
+      ;;
     *'"method":"model/list"'*)
       printf '%s\n' '{{"id":2,"result":{catalog}}}'
       ;;
 {additional_arms}
     *'"method":"thread/start"'*)
-      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"native-thread"}},"model":"{DEFAULT_MODEL}"}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"thread":{{"id":"native-thread"}},"model":"{DEFAULT_MODEL}"}}}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"native-turn"}}}}}}'
+      printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"native-turn"}}}}}}'
       printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"completed","items":[]}}}}}}'
       ;;
   esac

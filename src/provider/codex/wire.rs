@@ -372,7 +372,8 @@ pub(super) struct ThreadStartParams<'a> {
     pub(super) ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) config: Option<&'a ThreadConfig>,
-    /// What the thread's Agent is told beyond Codex's own instructions.
+    /// What the thread's Agent is told beyond Codex's own instructions, in place of the developer
+    /// instructions the user's configuration sets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) developer_instructions: Option<&'a str>,
 }
@@ -386,10 +387,11 @@ pub(super) struct ThreadResumeParams<'a> {
     pub(super) sandbox: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) config: Option<&'a ThreadConfig>,
-    /// What the resumed thread's Agent is told beyond Codex's own instructions. A resumed thread
-    /// reads them from the configuration it is resumed under rather than from its history, and a
-    /// compaction rebuilds its opening context from them, so a resume that carried none would lose
-    /// what the start said at the thread's first compaction.
+    /// What the resumed thread's Agent is told beyond Codex's own instructions, in place of the
+    /// developer instructions the user's configuration sets. A resumed thread reads them from the
+    /// configuration it is resumed under rather than from its history, and a compaction rebuilds
+    /// its opening context from them, so a resume that carried none would lose what the start said
+    /// at the thread's first compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) developer_instructions: Option<&'a str>,
 }
@@ -420,15 +422,49 @@ pub(super) fn broker_thread_config(handoff: &BrokerHandoff) -> ThreadConfig {
     )])
 }
 
-/// The developer instructions a thread handed the Broker is started and resumed with: the Broker's
-/// note, naming each Tool as Codex names an MCP server's Tools to its Agent —
-/// `mcp__suru__spawn_subagent`.
+/// The developer instructions a thread handed the Broker is started and resumed with: those the
+/// user's own configuration sets, `user`, and after them, a blank line apart, the Broker's note,
+/// naming each Tool as Codex names an MCP server's Tools to its Agent — `mcp__suru__spawn_subagent`.
+/// A user who sets none, or only whitespace, gets the note alone.
 ///
-/// Codex takes a thread's developer instructions in place of any the user's own configuration
-/// sets, rather than beside them, so a Session handed the Broker is started and resumed with the
-/// note alone.
-pub(super) fn broker_developer_instructions() -> String {
-    instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"))
+/// Codex takes a thread's developer instructions in place of those the user's configuration sets
+/// rather than beside them — the thread's value, where given, wins outright — so the note alone
+/// would silently take the user's away. Appending it to theirs is what keeps the note, as on every
+/// other harness, an addition to the Agent's instructions; the Session reads `user` through
+/// [`ConfigReadParams`] first.
+pub(super) fn broker_developer_instructions(user: Option<&str>) -> String {
+    let note = instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"));
+    match user.filter(|user| !user.trim().is_empty()) {
+        Some(user) => format!("{user}\n\n{note}"),
+        None => note,
+    }
+}
+
+// The user's own configuration.
+
+/// Asks the app-server for the configuration a thread working in `cwd` is built from: the user's
+/// `config.toml`, the project layers between `cwd` and its project root, and any managed layer,
+/// merged as Codex merges them for `thread/start` and `thread/resume`. Suru reads it for one value
+/// alone — the developer instructions the user sets — because a thread's own take their place, and
+/// a Session handed the Broker appends its note to them rather than dropping them
+/// ([`broker_developer_instructions`]). It is read on each launch, just before the thread is
+/// started or resumed, so an edit the user makes between launches is honored at the next.
+#[derive(Serialize)]
+pub(super) struct ConfigReadParams<'a> {
+    pub(super) cwd: &'a str,
+}
+
+/// What `config/read` answers with, as far as Suru reads it.
+#[derive(Deserialize)]
+pub(super) struct NativeConfigRead {
+    pub(super) config: NativeEffectiveConfig,
+}
+
+/// The effective configuration, keyed as `config.toml` spells it rather than in the protocol's own
+/// camel case.
+#[derive(Deserialize)]
+pub(super) struct NativeEffectiveConfig {
+    pub(super) developer_instructions: Option<String>,
 }
 
 /// One streamable-HTTP MCP server entry, in the keys Codex's configuration reads.
@@ -1436,9 +1472,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ThreadResumeParams, ThreadStartParams, broker_developer_instructions, broker_thread_config,
+        ConfigReadParams, NativeConfigRead, ThreadResumeParams, ThreadStartParams,
+        broker_developer_instructions, broker_thread_config,
     };
-    use crate::provider::BrokerHandoff;
+    use crate::{broker::instruction_note, provider::BrokerHandoff};
 
     #[test]
     fn the_broker_is_one_dotted_mcp_server_override_approved_by_default() {
@@ -1455,7 +1492,7 @@ mod tests {
                 },
             })
         );
-        let note = broker_developer_instructions();
+        let note = broker_developer_instructions(None);
         let start = serde_json::to_value(ThreadStartParams {
             cwd: "/workspace",
             approval_policy: "on-request",
@@ -1471,6 +1508,56 @@ mod tests {
             note.contains("mcp__suru__spawn_subagent"),
             "the note names the Broker's Tools as Codex does: {note}"
         );
+    }
+
+    fn codex_note() -> String {
+        instruction_note(|tool| format!("mcp__suru__{tool}"))
+    }
+
+    #[test]
+    fn the_broker_note_follows_the_users_own_developer_instructions_a_blank_line_apart() {
+        assert_eq!(
+            broker_developer_instructions(Some("Answer tersely.\nCite paths.")),
+            format!("Answer tersely.\nCite paths.\n\n{}", codex_note())
+        );
+    }
+
+    #[test]
+    fn a_user_who_sets_no_developer_instructions_is_handed_the_note_alone() {
+        for user in [None, Some(""), Some(" \n\t")] {
+            assert_eq!(
+                broker_developer_instructions(user),
+                codex_note(),
+                "{user:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configuration_is_read_for_the_threads_directory_and_answered_in_config_toml_keys() {
+        assert_eq!(
+            serde_json::to_value(ConfigReadParams { cwd: "/workspace" }).unwrap(),
+            json!({ "cwd": "/workspace" })
+        );
+        let read: NativeConfigRead = serde_json::from_value(json!({
+            "config": {
+                "model": "gpt-5.5",
+                "developer_instructions": "Answer tersely.",
+                "developerInstructions": "not how Codex keys its configuration",
+                "features": { "unknown": true },
+            },
+            "origins": {},
+        }))
+        .unwrap();
+        assert_eq!(
+            read.config.developer_instructions.as_deref(),
+            Some("Answer tersely.")
+        );
+        for config in [json!({}), json!({ "developer_instructions": null })] {
+            let read: NativeConfigRead =
+                serde_json::from_value(json!({ "config": config, "origins": {} })).unwrap();
+            assert_eq!(read.config.developer_instructions, None, "{config}");
+        }
     }
 
     #[test]

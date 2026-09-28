@@ -24,14 +24,17 @@ const SKILL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"skills/list"'*)
       printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Review the current change","path":"/private/codex/skills/review/SKILL.md","scope":"repo","enabled":true},{"name":"explain","description":"Explain the current change","path":"/private/codex/skills/explain/SKILL.md","scope":"user","enabled":true},{"name":"disabled","description":"Not offered","path":"/private/codex/skills/disabled/SKILL.md","scope":"user","enabled":false}],"errors":[]}]}}'
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"skill-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"skill-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"skill-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-thread","turn":{"id":"skill-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -39,6 +42,9 @@ const SKILL_CODEX: &str = r#"
 const CHANGING_SKILL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
       ;;
     *'"method":"skills/list"'*)
       case "$line" in
@@ -51,11 +57,11 @@ const CHANGING_SKILL_CODEX: &str = r#"
       esac
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-change-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"skill-change-thread"},"model":"gpt-fixture"}}'
       printf '%s\n' '{"method":"skills/changed","params":{}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"skill-change-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"skill-change-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-change-thread","turn":{"id":"skill-change-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -68,11 +74,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"skills/list"'*)
       printf '%s\n' '{"id":2,"result":{"data":[{"cwd":$SKILL_WORKSPACE,"skills":[{"name":"review","description":"Review the current change","path":"/private/codex/skills/review/SKILL.md","scope":"repo","enabled":true},{"name":"explain","description":"Explain the current change","path":"/private/codex/skills/explain/SKILL.md","scope":"user","enabled":true}],"errors":[]}]}}'
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"skill-operation-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"skill-operation-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
 __TURN_START_ACTION__
@@ -87,7 +96,7 @@ wait
 
 const DELIVER_SKILL_TURNS: &str = r#"      turn_index=$((turn_index + 1))
       if [ "$turn_index" -eq 1 ]; then
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"skill-operation-turn-1"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"skill-operation-turn-1"}}}'
         (
           while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
             sleep 0.01
@@ -95,14 +104,14 @@ const DELIVER_SKILL_TURNS: &str = r#"      turn_index=$((turn_index + 1))
           printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-operation-thread","turn":{"id":"skill-operation-turn-1","status":"completed","items":[]}}}'
         ) &
       else
-        printf '%s\n' '{"id":5,"result":{"turn":{"id":"skill-operation-turn-2"}}}'
+        printf '%s\n' '{"id":6,"result":{"turn":{"id":"skill-operation-turn-2"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-operation-thread","turn":{"id":"skill-operation-turn-2","status":"completed","items":[]}}}'
       fi"#;
 
 const ACCEPT_SKILL_STEER: &str =
-    r#"      printf '%s\n' '{"id":4,"result":{"turnId":"skill-operation-turn-1"}}'"#;
+    r#"      printf '%s\n' '{"id":5,"result":{"turnId":"skill-operation-turn-1"}}'"#;
 
-const REJECT_SKILL_TURN: &str = r#"      printf '%s\n' '{"id":3,"error":{"code":-32600,"message":"fixture rejected structured Skill input"}}'"#;
+const REJECT_SKILL_TURN: &str = r#"      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"fixture rejected structured Skill input"}}'"#;
 
 const UNEXPECTED_SKILL_STEER: &str = "      exit 65";
 

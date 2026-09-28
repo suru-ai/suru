@@ -21,11 +21,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       ;;
     *'"method":"turn/interrupt"'*)
 __INTERRUPT_ACTION__
@@ -34,7 +37,7 @@ __INTERRUPT_ACTION__
 done
 "#;
 
-const ACKNOWLEDGE_AND_COMPLETE_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":4,"result":{}}'
+const ACKNOWLEDGE_AND_COMPLETE_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":5,"result":{}}'
       while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
         sleep 0.01
       done
@@ -44,7 +47,7 @@ const ACKNOWLEDGE_AND_COMPLETE_INTERRUPTION: &str = r#"      printf '%s\n' '{"id
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'"#;
 
-const REJECT_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":4,"error":{"code":-32600,"message":"fixture rejected interruption"}}'"#;
+const REJECT_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"fixture rejected interruption"}}'"#;
 
 const TIME_OUT_INTERRUPTION: &str = "      sleep 10";
 

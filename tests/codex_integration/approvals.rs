@@ -26,11 +26,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"command-item","command":"cargo check","cwd":"project","status":"inProgress"}}}'
       printf '%s\n' '{"id":"command-accept","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","startedAtMs":1,"reason":"verify workspace","command":"cargo check --tests","cwd":"project/client","commandActions":[{"type":"read","command":"cat Cargo.toml","name":"Cargo.toml","path":"project/Cargo.toml"},{"type":"listFiles","command":"rg --files src","path":"src"},{"type":"search","command":"rg Approval src","query":"Approval","path":"src"},{"type":"unknown","command":"custom-tool"}]}}'
       printf '%s\n' '{"id":"command-decline","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","approvalId":"second-callback","startedAtMs":2,"reason":"repeat callback","command":"cargo check"}}'
@@ -44,7 +47,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/interrupt"'*)
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
-      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       ;;
   esac
 done
@@ -55,9 +58,10 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"id":"immediate","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","command":"cargo check"}}'
       ;;
     *'"id":"immediate","result"'*)
@@ -72,9 +76,10 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"id":"permission","method":"item/permissions/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"command-item","permissions":{"network":{"enabled":true}}}}'
       ;;
     *'"method":"turn/interrupt"'*) $INTERRUPT_RESPONSE ;;
@@ -89,6 +94,7 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":'"$id"',"result":{}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}' ;;
     *'"method":"thread/start"'*) printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
       turns=$((turns + 1))
@@ -525,7 +531,7 @@ async fn permission_interrupt_rejection_and_timeout_remain_visible_after_deliver
     for (label, response, expected_error) in [
         (
             "rejected",
-            "printf '%s\\n' '{\"id\":4,\"error\":{\"code\":-32001,\"message\":\"interrupt refused\"}}'",
+            "printf '%s\\n' '{\"id\":5,\"error\":{\"code\":-32001,\"message\":\"interrupt refused\"}}'",
             "interrupt refused",
         ),
         ("timeout", ":", "timed out"),

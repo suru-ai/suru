@@ -32,12 +32,15 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"__MODEL__"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"__MODEL__"}}'
       ;;
     *'"method":"turn/start"'*)
       turn_index=$((turn_index + 1))
-      response_id=$((turn_index + 2))
+      response_id=$((turn_index + 3))
       if [ "$turn_index" -eq 1 ]; then
         printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
         printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"other-thread","turnId":"other-turn","tokenUsage":{"total":{"totalTokens":99999,"inputTokens":99999,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":99999,"reasoningOutputTokens":0},"last":{"totalTokens":99999,"inputTokens":99999,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":99999,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
@@ -63,15 +66,18 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
       ;;
     *'"method":"turn/interrupt"'*)
-      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
       ;;
   esac
@@ -89,12 +95,15 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       turn_index=$((turn_index + 1))
-      response_id=$((turn_index + 2))
+      response_id=$((turn_index + 3))
       if [ "$turn_index" -eq 1 ]; then
         printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
         printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
@@ -117,15 +126,18 @@ const DELEGATED_METERING_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
       sleep 0.05
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"last":{"totalTokens":600,"inputTokens":500,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20},"modelContextWindow":272000}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
@@ -142,16 +154,19 @@ const LATE_CHILD_MODEL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       ;;
     *'"method":"thread/resume"'*)
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
       sleep 0.05
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":240,"inputTokens":200,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":40,"reasoningOutputTokens":10},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
@@ -166,15 +181,18 @@ const CHANGING_CHILD_MODEL_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":4,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"child-priced-fixture"}}'
       sleep 0.05
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"child-thread","turnId":"child-turn-a","tokenUsage":{"total":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"last":{"totalTokens":120,"inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":20,"reasoningOutputTokens":5},"modelContextWindow":272000}}}'
       printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"child-thread","threadSettings":{"model":"priced-fixture"}}}'
@@ -198,12 +216,15 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       turn_index=$((turn_index + 1))
-      response_id=$((turn_index + 2))
+      response_id=$((turn_index + 3))
       if [ "$turn_index" -eq 1 ]; then
         printf '{"id":%s,"result":{"turn":{"id":"native-turn-1"}}}\n' "$response_id"
         printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
@@ -228,21 +249,24 @@ const PERSISTED_METERING_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"persisted-thread"},"model":"priced-fixture"}}'
       printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
       touch "$CODEX_FIXTURE_READY"
       ;;
     *'"method":"turn/start"'*)
       if [ -e "$CODEX_FIXTURE_READY" ]; then
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn-2"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"persisted-turn-2"}}}'
         printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-2","tokenUsage":{"total":{"totalTokens":2600,"inputTokens":2150,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":450,"reasoningOutputTokens":50},"last":{"totalTokens":1250,"inputTokens":1050,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":200,"reasoningOutputTokens":0},"modelContextWindow":272000}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn-2","status":"completed","items":[]}}}'
       else
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn-1"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"persisted-turn-1"}}}'
         printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"persisted-thread","turnId":"persisted-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn-1","status":"completed","items":[]}}}'
       fi

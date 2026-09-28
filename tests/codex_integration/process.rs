@@ -23,11 +23,14 @@ const STARTUP_RETRY: &str = r#"
       fi
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"retry-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"retry-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"retry-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"retry-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"retry-thread","turn":{"id":"retry-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -36,17 +39,20 @@ const ACTIVE_PROCESS_LOSS_THEN_RESUME: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"recoverable-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"recoverable-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"recoverable-thread","turns":[{"id":"native-turn-1"}]},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"recoverable-thread","turns":[{"id":"native-turn-1"}]},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       if [ "$attempt" -eq 1 ]; then
         exit 17
       fi
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn-2"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-2"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"recoverable-thread","turnId":"native-turn-2","item":{"type":"agentMessage","id":"resumed-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"recoverable-thread","turnId":"native-turn-2","itemId":"resumed-message","delta":"Recovered context"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"recoverable-thread","turnId":"native-turn-2","item":{"type":"agentMessage","id":"resumed-message","text":"Recovered context"}}}'
@@ -58,14 +64,17 @@ const ACTIVE_PROCESS_LOSS_THEN_RESUME_REJECTION: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"rejected-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"rejected-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"error":{"code":-32001,"message":"fixture cannot resume this Thread"}}'
+      printf '%s\n' '{"id":3,"error":{"code":-32001,"message":"fixture cannot resume this Thread"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn-1"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-1"}}}'
       exit 17
       ;;
 "#;
@@ -74,20 +83,23 @@ const IDLE_PROCESS_LOSS_THEN_RESUME: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"idle-loss-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"idle-loss-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"idle-loss-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"idle-loss-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       if [ "$attempt" -eq 1 ]; then
-        printf '%s\n' '{"id":3,"result":{"turn":{"id":"idle-turn-1"}}}'
+        printf '%s\n' '{"id":4,"result":{"turn":{"id":"idle-turn-1"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"idle-loss-thread","turn":{"id":"idle-turn-1","status":"completed","items":[]}}}'
         printf '%s\n' 'exited' > "$CODEX_FIXTURE_EXITED"
         exit 17
       fi
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"idle-turn-2"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"idle-turn-2"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"idle-loss-thread","turn":{"id":"idle-turn-2","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -209,6 +221,7 @@ async fn codex_retries_startup_with_a_fresh_thread_when_no_thread_id_exists() {
             "initialize",
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start"
         ]
@@ -277,10 +290,12 @@ async fn codex_resumes_the_known_thread_after_active_process_loss() {
         [
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start",
             "initialize",
             "initialized",
+            "config/read",
             "thread/resume",
             "turn/start"
         ]
@@ -333,10 +348,12 @@ async fn codex_surfaces_resume_rejection_without_starting_an_unrelated_thread() 
         [
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start",
             "initialize",
             "initialized",
+            "config/read",
             "thread/resume"
         ]
     );
@@ -376,10 +393,12 @@ async fn codex_resumes_on_the_first_prompt_after_process_loss_while_idle() {
         [
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start",
             "initialize",
             "initialized",
+            "config/read",
             "thread/resume",
             "turn/start"
         ]
@@ -506,13 +525,14 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
     let codex = ScriptedCodex::new_multiprocess(
         r#"
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}' ;;
     *'"method":"skills/list"'*)
       cwd=$(printf '%s' "$line" | sed 's/.*"cwds":\[\(.*\)\],"forceReload".*/\1/')
       printf '%s\n' '{"id":2,"result":{"data":[{"cwd":'"$cwd"',"skills":[],"errors":[]}]}}'
       ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"prepared"},"model":"gpt-fixture"}}' ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"prepared"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"prepared-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"prepared-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"prepared","turn":{"id":"prepared-turn","status":"completed","items":[]}}}'
       ;;
     "#,

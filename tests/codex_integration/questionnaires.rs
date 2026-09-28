@@ -20,9 +20,10 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}' ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}' ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
 "#;
 fn question_request(id: Value, questions: Value) -> String {
     format!(
@@ -555,7 +556,7 @@ async fn codex_owning_turn_completion_and_explicit_interrupt_end_native_answerab
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'"#
         };
         let responses = r#"    *'"method":"turn/interrupt"'*)
-      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
       ;;
 "#;
@@ -611,7 +612,7 @@ async fn codex_child_questions_before_and_after_parent_settlement_are_answered_i
         .replace("question-item", "child-after-item");
     let responses = format!(
         r#"    *'"method":"thread/resume"'*)
-      printf '%s\n' '{{"id":4,"result":{{"thread":{{"id":"child-thread","parentThreadId":"native-thread"}},"model":"gpt-fixture"}}}}'
+      printf '%s\n' '{{"id":5,"result":{{"thread":{{"id":"child-thread","parentThreadId":"native-thread"}},"model":"gpt-fixture"}}}}'
 {before}      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"completed","items":[]}}}}}}'
 {after}      ;;
     *'"id":"child-after","result"'*)

@@ -37,11 +37,33 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":"2","result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":"3","result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"error":{"code":-32001,"message":"fixture rejected Turn startup"}}'
+      printf '%s\n' '{"id":4,"error":{"code":-32001,"message":"fixture rejected Turn startup"}}'
+      ;;
+  esac
+done
+"#;
+
+/// An app-server that cannot read the user's configuration, though it would start a thread if
+/// asked to.
+const CONFIG_READ_REJECTION: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"error":{"code":-32603,"message":"fixture cannot read config.toml"}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
   esac
 done
@@ -53,11 +75,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       exit 0
       ;;
   esac
@@ -70,11 +95,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       exit 17
       ;;
   esac
@@ -88,14 +116,17 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":"unknown-correlation","method":"future/request","params":{"ignored":true}}'
       read -r response
       printf '%s\n' "$response" >> "$CODEX_FIXTURE_LOG"
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
   esac
@@ -115,11 +146,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"id":"unsupported-correlation","method":"$CODEX_FIXTURE_METHOD","params":{"fixture":true}}'
       read -r response
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
@@ -134,11 +168,14 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"id":"abandoned-interaction","method":"item/commandExecution/requestApproval","params":{"fixture":true}}'
       exit 17
       ;;
@@ -359,6 +396,27 @@ async fn codex_launch_protocol_and_process_failures_settle_as_error_activities()
         "first second",
     )
     .await;
+}
+
+/// The Broker's note takes the place of the developer instructions the user's configuration sets
+/// unless it follows them, so a launch that cannot read them starts no thread at all.
+#[tokio::test]
+async fn a_codex_launch_that_cannot_read_the_users_configuration_starts_no_thread() {
+    let fixture = ScriptedCodex::new(CONFIG_READ_REJECTION);
+    assert_provider_failure(
+        fixture.executable(),
+        "codex-config-read-rejection",
+        "fixture cannot read config.toml",
+    )
+    .await;
+    assert!(
+        !fixture
+            .methods()
+            .iter()
+            .any(|method| method == "thread/start"),
+        "no thread starts without the user's own developer instructions: {:?}",
+        fixture.methods()
+    );
 }
 
 async fn assert_provider_failure(

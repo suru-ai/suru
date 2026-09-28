@@ -44,13 +44,16 @@ while IFS= read -r line; do
       printf '%s' '{"id":"1","result":{"userAgent":"fixture","futureField":true'
       printf '%s\n' '}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"initialized"'*)
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread","futureField":true},"model":"gpt-fixture","modelProvider":"fixture","futureField":true}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread","futureField":true},"model":"gpt-fixture","modelProvider":"fixture","futureField":true}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":"3","result":{"turn":{"id":"native-turn","status":"inProgress","futureField":true}}}'
+      printf '%s\n' '{"id":"4","result":{"turn":{"id":"native-turn","status":"inProgress","futureField":true}}}'
       while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
         sleep 0.01
       done
@@ -101,16 +104,19 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{"userAgent":"durability-fixture"}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"initialized"'*)
       ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"durable-thread"},"model":"gpt-fixture","modelProvider":"fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"durable-thread"},"model":"gpt-fixture","modelProvider":"fixture"}}'
       ;;
     *'"method":"turn/start"'*)
 "#;
 
 const COMPLETED_TURN_DURABILITY_EVENTS: &str = r#"
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"boundary durable"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":"boundary durable"}}}'
@@ -118,7 +124,7 @@ const COMPLETED_TURN_DURABILITY_EVENTS: &str = r#"
 "#;
 
 const IDLE_FLUSH_DURABILITY_EVENTS: &str = r#"
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"durable-turn","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/started","params":{"threadId":"durable-thread","turnId":"durable-turn","item":{"type":"agentMessage","id":"durable-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"coalesced "}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"tail"}}'
@@ -136,14 +142,17 @@ const PERSISTED_RESUME_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"persisted-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"persisted-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"persisted-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"persisted-thread","turn":{"id":"persisted-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -152,11 +161,14 @@ const REASONING_SUMMARY_CODEX: &str = r#"
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
     *'"method":"thread/start"'*)
-      printf '%s\n' '{"id":2,"result":{"thread":{"id":"summary-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"summary-thread"},"model":"gpt-fixture"}}'
       ;;
     *'"method":"turn/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"summary-turn"}}}'
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"summary-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"summary-thread","turn":{"id":"summary-turn","status":"completed","items":[]}}}'
       ;;
 "#;
@@ -600,7 +612,13 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
         .collect::<Vec<_>>();
     assert_eq!(
         methods,
-        ["initialize", "initialized", "thread/start", "turn/start"]
+        [
+            "initialize",
+            "initialized",
+            "config/read",
+            "thread/start",
+            "turn/start"
+        ]
     );
     assert_eq!(
         requests[0]["params"]["capabilities"]["experimentalApi"],
@@ -608,24 +626,24 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
     );
     assert_eq!(requests[1], serde_json::json!({ "method": "initialized" }));
     assert_eq!(
-        requests[2]["params"]["cwd"],
+        requests[3]["params"]["cwd"],
         suru::paths::canonical(workspace.path())
             .expect("canonicalize Workspace")
             .to_string_lossy()
             .as_ref()
     );
-    assert_eq!(requests[2]["params"]["approvalPolicy"], "on-request");
-    assert_eq!(requests[2]["params"]["sandbox"], "workspace-write");
-    assert_eq!(requests[2]["params"]["ephemeral"], false);
-    assert!(requests[2]["params"].get("model").is_none());
-    assert_eq!(requests[3]["params"]["threadId"], "native-thread");
+    assert_eq!(requests[3]["params"]["approvalPolicy"], "on-request");
+    assert_eq!(requests[3]["params"]["sandbox"], "workspace-write");
+    assert_eq!(requests[3]["params"]["ephemeral"], false);
+    assert!(requests[3]["params"].get("model").is_none());
+    assert_eq!(requests[4]["params"]["threadId"], "native-thread");
     assert_eq!(
-        requests[3]["params"]["input"],
+        requests[4]["params"]["input"],
         serde_json::json!([{ "type": "text", "text": "Explain the native harness" }])
     );
-    assert_eq!(requests[3]["params"]["model"], "gpt-fixture");
+    assert_eq!(requests[4]["params"]["model"], "gpt-fixture");
     assert_eq!(
-        requests[3]["params"]["summary"], "auto",
+        requests[4]["params"]["summary"], "auto",
         "with the Reasoning summary Setting unpinned a Turn asks for its \
          built-in default, because Codex only summarizes when asked to"
     );
@@ -980,10 +998,12 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
         [
             "initialize",
             "initialized",
+            "config/read",
             "thread/start",
             "turn/start",
             "initialize",
             "initialized",
+            "config/read",
             "thread/resume",
             "turn/start"
         ]
