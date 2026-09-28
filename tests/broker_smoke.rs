@@ -256,11 +256,11 @@ async fn a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_i
 /// Broker reports progress on it: the call answers once the Subagent settles,
 /// and the Agent acts on the answer in the very Turn that waited.
 ///
-/// It waits for that answer, not for the Turn to settle. The Subagent's Report
-/// reaches the Agent as the wait answers, steering the Turn still in its Broker
-/// call, and whether a steer the CLI folds into its running loop settles the
-/// Turn is a question of Suru's Claude steer accounting rather than of the call
-/// (`docs/validation/0421-broker-smoke.md`).
+/// The Subagent's Report reaches the Agent as the wait answers, steering the
+/// Turn still in its Broker call, and the CLI folds it into that loop's next
+/// request and answers both with one `result`. That `result` must Settle the
+/// Turn that waited, so the smoke waits past the answer for the Session to come
+/// to rest (`docs/validation/0407-claude-folded-steer.md`).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "set SURU_BROKER_SMOKE=1 to use the installed, signed-in Claude and Codex binaries"]
 async fn a_claude_agents_wait_on_a_codex_subagent_outlasts_claudes_idle_window() {
@@ -305,6 +305,7 @@ async fn a_claude_agents_wait_on_a_codex_subagent_outlasts_claudes_idle_window()
         )
         .await;
     let waited = spawned_at.elapsed();
+    let answered_at = Instant::now();
     let answer = agent_text_in(&answered, waiting_turn);
     live.say(format!(
         "the Claude Agent answered {answer:?} in the Turn that waited, {:.1}s after the spawn",
@@ -332,6 +333,40 @@ async fn a_claude_agents_wait_on_a_codex_subagent_outlasts_claudes_idle_window()
         "the Turn that waited is neither failed nor interrupted: {}",
         describe(&answered)
     );
+
+    // The Report steered the Turn that waited, and the one result the CLI answered the Prompt and
+    // the folded Report with Settles it: the Session comes to rest, rather than reading Working
+    // for as long as the smoke would let it.
+    let rested = parent
+        .read_until(
+            &mut live.client,
+            left_before(deadline),
+            "the Turn that waited settles once the Agent has answered, leaving nothing Working",
+            at_rest,
+        )
+        .await;
+    let settled_turn = rested
+        .turns
+        .iter()
+        .find(|turn| turn.id == waiting_turn)
+        .expect("the Turn that waited still stands");
+    assert_eq!(
+        settled_turn.status,
+        TurnStatus::Completed,
+        "the Turn that waited settles Completed: {}",
+        describe(&rested)
+    );
+    assert_eq!(
+        rested.turns.len(),
+        1,
+        "the Report steered the Turn that waited rather than waking a Continuation: {}",
+        describe(&rested)
+    );
+    live.say(format!(
+        "the Turn that waited settled {:?}, {:.1}s after the answer",
+        settled_turn.status,
+        answered_at.elapsed().as_secs_f64()
+    ));
 
     // The Subagent slept as long as it was told to, so the call it answered was that long.
     let child_settled = live
