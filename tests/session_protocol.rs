@@ -3,17 +3,18 @@ use std::path::PathBuf;
 use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    AgentSelection, AgentSelectionOperationId, ApprovalSubject, Cost, CostBasis,
-    CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole,
-    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-    ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
-    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
-    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
-    ViewSessionRequest, Workspace,
+    AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
+    AttachmentDescriptor, AttachmentId, AttachmentKind, Cost, CostBasis, CreateSessionRequest,
+    Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
+    ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
+    ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+    Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
+    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
+    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
+    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
+    Workspace,
 };
 use uuid::Uuid;
 
@@ -1503,6 +1504,81 @@ fn viewed_command_round_trips_with_its_operation_identity() {
         }))
         .is_err(),
         "Viewed commands reject unknown fields"
+    );
+}
+
+#[test]
+fn attachment_bindings_round_trip_beside_the_prompt_text_and_stay_off_the_wire_when_absent() {
+    let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let prompt = InitialPrompt {
+        id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
+        text: "Compare [Image 1]".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: vec![AttachmentBinding {
+            attachment_id: AttachmentId::new(hash),
+            label: "[Image 1]".to_owned(),
+            span: TextSpan { start: 8, end: 17 },
+        }],
+    };
+    let encoded = serde_json::to_value(&prompt).expect("encode Attachment-bearing Prompt");
+
+    assert_eq!(
+        encoded,
+        json!({
+            "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "text": "Compare [Image 1]",
+            "skill_invocations": [],
+            "attachments": [{
+                "attachment_id": hash,
+                "label": "[Image 1]",
+                "span": { "start": 8, "end": 17 }
+            }]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<InitialPrompt>(encoded).expect("decode Attachment-bearing Prompt"),
+        prompt
+    );
+
+    let plain = json!({
+        "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+        "text": "Nothing attached",
+        "skill_invocations": []
+    });
+    let decoded = serde_json::from_value::<InitialPrompt>(plain.clone())
+        .expect("a Prompt without bindings decodes");
+    assert!(decoded.attachments.is_empty());
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), plain);
+}
+
+#[test]
+fn an_attachment_descriptor_carries_a_typed_kind_and_never_the_bytes() {
+    let descriptor = AttachmentDescriptor {
+        id: AttachmentId::new("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+        kind: AttachmentKind::Image {
+            width: 640,
+            height: 480,
+        },
+        mime_type: "image/png".to_owned(),
+        byte_length: 4096,
+    };
+    let encoded = json!({
+        "id": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "kind": { "type": "image", "width": 640, "height": 480 },
+        "mime_type": "image/png",
+        "byte_length": 4096
+    });
+
+    assert_eq!(serde_json::to_value(&descriptor).unwrap(), encoded);
+    assert_eq!(
+        serde_json::from_value::<AttachmentDescriptor>(encoded.clone()).unwrap(),
+        descriptor
+    );
+    let mut with_bytes = encoded;
+    with_bytes["bytes"] = json!("iVBORw0KGgo=");
+    assert!(
+        serde_json::from_value::<AttachmentDescriptor>(with_bytes).is_err(),
+        "a descriptor carrying bytes is refused"
     );
 }
 
