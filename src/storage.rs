@@ -69,6 +69,7 @@ diesel::table! {
         byte_length -> BigInt,
         width -> Nullable<BigInt>,
         height -> Nullable<BigInt>,
+        created_at -> BigInt,
         referenced_at -> BigInt,
         bytes -> Binary,
     }

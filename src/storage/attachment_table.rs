@@ -1,10 +1,11 @@
-//! Attachment rows: written when their bytes are first uploaded, stamped
-//! referenced again whenever the same bytes are uploaded again or a Prompt
-//! binding them is admitted, joined to the Sessions whose stored Prompts and
-//! Messages bind them, and described without their bytes to the Sessions that
-//! bind them. The bytes are read back only when something asks for them (ADR
-//! 0037). An Attachment's age, which decides whether it may be reclaimed, is
-//! measured from that last reference.
+//! Attachment rows: written when their bytes are first uploaded, which stamps
+//! them created and referenced at once; stamped referenced again whenever the
+//! same bytes are uploaded again or a Prompt binding them is admitted, while
+//! their creation stays as first stamped; joined to the Sessions whose stored
+//! Prompts and Messages bind them; and described without their bytes to the
+//! Sessions that bind them. The bytes are read back only when something asks
+//! for them (ADR 0037). An Attachment's age, which decides whether it may be
+//! reclaimed, is measured from its last reference, not its creation.
 //!
 //! One no Session is joined to — bound by no stored Prompt or Message — is
 //! swept once that age passes the grace period. The Server sweeps once at
@@ -40,19 +41,21 @@ struct AttachmentRow {
     byte_length: i64,
     width: Option<i64>,
     height: Option<i64>,
+    created_at: i64,
     referenced_at: i64,
     bytes: Vec<u8>,
 }
 
-/// A moment as the `referenced_at` column stores it.
+/// A moment as the `created_at` and `referenced_at` columns store it.
 fn millis(moment: SessionTimestamp) -> i64 {
     i64::try_from(moment.0).unwrap_or(i64::MAX)
 }
 
 impl StorageRepository {
-    /// Stores an upload's bytes under its descriptor, or where the same bytes
-    /// already are, stamps them referenced now; answers whether this call
-    /// stored them.
+    /// Stores an upload's bytes under its descriptor, created and referenced
+    /// now, or where the same bytes already are, stamps them referenced now
+    /// and leaves when they were created; answers whether this call stored
+    /// them.
     pub(crate) async fn store_attachment(
         &self,
         descriptor: AttachmentDescriptor,
@@ -69,6 +72,7 @@ impl StorageRepository {
                     .map_err(|error| StorageError::WriteAttachment(error.to_string()))?,
                 width: Some(width.into()),
                 height: Some(height.into()),
+                created_at: now,
                 referenced_at: now,
                 bytes,
             };
@@ -393,6 +397,51 @@ mod tests {
             .await
             .expect("reference one Attachment twice");
         assert_eq!(all, vec![descriptor]);
+    }
+
+    #[tokio::test]
+    async fn uploading_the_same_bytes_again_refreshes_their_reference_but_not_their_creation() {
+        const MINUTE: Duration = Duration::from_secs(60);
+        let directory = tempfile::tempdir().expect("create data directory");
+        let (clock, hand) = crate::clock::ServerClock::manual();
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("open repository")
+            .with_clock(clock);
+        let bytes = b"GIF89a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+        let descriptor = crate::attachments::describe(&bytes).expect("describe fixture");
+        let first_uploaded = millis(repository.clock.now());
+        assert!(
+            repository
+                .store_attachment(descriptor.clone(), bytes.clone())
+                .await
+                .expect("upload")
+        );
+
+        hand.advance(10 * MINUTE);
+        assert!(
+            !repository
+                .store_attachment(descriptor.clone(), bytes)
+                .await
+                .expect("upload again"),
+            "the same bytes are stored once"
+        );
+
+        let mut connection = connect(&repository.database_path).expect("connect");
+        let (created_at, referenced_at) = attachments::table
+            .filter(attachments::id.eq(descriptor.id.as_str()))
+            .select((attachments::created_at, attachments::referenced_at))
+            .first::<(i64, i64)>(&mut connection)
+            .expect("read the Attachment's times");
+        assert_eq!(
+            created_at, first_uploaded,
+            "an Attachment was created when its bytes were first uploaded"
+        );
+        assert_eq!(
+            referenced_at,
+            millis(repository.clock.now()),
+            "uploading the bytes again references them now"
+        );
     }
 
     async fn stored(repository: &StorageRepository, width: u8) -> AttachmentId {
