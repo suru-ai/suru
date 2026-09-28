@@ -15,8 +15,8 @@ use crate::{
     support::{
         ScriptedCopilot, connect, connect_arm, connect_in, create_session_arm, current_model_arm,
         delete_session_arm, detach_session_arm, models_arm, permission_decision_arm,
-        resume_session_arm, send_arm, settled_session_on, signed_in_arm, skills_reload_arm,
-        switch_model_arm,
+        resume_session_arm, send_arm, session_models_arm, settled_session, settled_session_on,
+        signed_in_arm, skills_reload_arm, switch_model_arm,
     },
 };
 use suru::{
@@ -99,12 +99,13 @@ fn errand_send_arm(errand: &str, turn: &str) -> String {
 /// it, answering the Errand with `errand`.
 fn errand_fixture(errand: &str) -> ScriptedCopilot {
     ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
         models_arm(ERRAND_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
+        session_models_arm(),
         switch_model_arm(),
         permission_decision_arm(),
         detach_session_arm(),
@@ -389,6 +390,8 @@ async fn an_errand_answered_outside_its_schema_leaves_the_prompt_derived_title_s
     // The discarded Session is what proves the Errand ran and ended; the Title standing afterwards
     // is what proves its answer was thrown away.
     discarded_session(&copilot).await;
+    // A Working Session cannot be deleted, and the Turn beside the Errand settles on its own time.
+    settled_session(&client, session_id, 0).await;
     client
         .delete_session(session_id)
         .await
@@ -449,7 +452,7 @@ async fn an_errand_leaves_a_restart_nothing_of_its_own_to_resume() {
     // A CLI that answers a resume as well as a creation, so a Copilot Session Suru had filed a
     // Resume State for would be picked back up here — and the Errand's, if one existed, with it.
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
         models_arm(ERRAND_MODELS),
@@ -457,6 +460,7 @@ async fn an_errand_leaves_a_restart_nothing_of_its_own_to_resume() {
         resume_session_arm(),
         skills_reload_arm(),
         current_model_arm("claude-fixture", "high", "default"),
+        session_models_arm(),
         switch_model_arm(),
         permission_decision_arm(),
         detach_session_arm(),

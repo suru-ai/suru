@@ -6193,6 +6193,7 @@ running 1 test",
                     SubagentReportOutcome::Completed,
                     *duration_ms,
                     Some(answer),
+                    None,
                 )])
             )],
             "the Report reaches the native Subagent through its Provider's route to it"

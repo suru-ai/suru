@@ -422,6 +422,7 @@ async fn a_report_leaves_as_an_immediate_session_send_waking_the_idle_parent() {
         SubagentReportOutcome::Completed,
         *duration_ms,
         Some("Done."),
+        None,
     )
     .to_string();
     let reporting = copilot

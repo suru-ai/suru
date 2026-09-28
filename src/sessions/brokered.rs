@@ -141,6 +141,11 @@ pub(crate) struct BrokeredSubagentReading {
     /// The latest Message the Subagent wrote in that Turn, whole: its final
     /// one once the Turn has settled. `None` when it has written none there.
     pub(crate) message: Option<String>,
+    /// What that Turn failed with, where it failed and its Transcript says
+    /// why: the text of the error row that settled it. `None` for a Turn
+    /// still working or settled any other way, and for a failure nothing
+    /// explained.
+    pub(crate) error: Option<String>,
 }
 
 /// Why a brokered Subagent could not be read for the Agent asking.
@@ -772,17 +777,26 @@ impl SessionStoreState {
                     _ => None,
                 },
             )?;
+        let snapshot = &self.sessions[&child].snapshot;
         if repaired.contains(&turn.id) {
-            return Some(SubagentReport::new(child, name, outcome, None, None));
+            return Some(SubagentReport::new(
+                child,
+                name,
+                outcome,
+                None,
+                None,
+                turn_failure(snapshot, turn),
+            ));
         }
-        let final_message = latest_agent_message(&self.sessions[&child].snapshot, turn.id)
-            .map(|message| message.content.as_str());
+        let final_message =
+            latest_agent_message(snapshot, turn.id).map(|message| message.content.as_str());
         Some(SubagentReport::new(
             child,
             name,
             outcome,
             turn.worked_ms(),
             final_message,
+            turn_failure(snapshot, turn),
         ))
     }
 
@@ -886,6 +900,7 @@ impl SessionStoreState {
                 status: TurnStatus::Active,
                 duration_ms: None,
                 message: None,
+                error: None,
             };
         };
         let duration_ms = match latest.status {
@@ -902,6 +917,7 @@ impl SessionStoreState {
             duration_ms,
             message: latest_agent_message(snapshot, latest.id)
                 .map(|message| message.content.clone()),
+            error: turn_failure(snapshot, latest).map(str::to_owned),
         }
     }
 
@@ -976,6 +992,23 @@ pub(crate) fn latest_agent_message(
             && message.role == MessageRole::Agent
             && !message.content.is_empty()
     })
+}
+
+/// What `turn` failed with, as its Transcript says: the text of the last
+/// error row recorded in it, which is the row that settled it. `None` for a
+/// Turn that has not failed, and for one that failed with no row saying why.
+pub(crate) fn turn_failure<'a>(snapshot: &'a SessionSnapshot, turn: &Turn) -> Option<&'a str> {
+    if turn.status != TurnStatus::Failed {
+        return None;
+    }
+    snapshot
+        .activities
+        .iter()
+        .rev()
+        .find_map(|activity| match activity {
+            Activity::Error { turn_id, text, .. } if *turn_id == turn.id => Some(text.as_str()),
+            _ => None,
+        })
 }
 
 /// The Session whose Agent delegated the stretch of work `turn_id` is: the

@@ -239,6 +239,37 @@ pub fn modelless_current_model_arm() -> String {
     .to_owned()
 }
 
+/// A `session.model.list` arm answering with the Session's own catalog — empty, since Suru asks
+/// only so the CLI resolves it before a switch — and noting, for [`cold_switch_refusing_arm`],
+/// that this Session's was asked for.
+pub fn session_models_arm() -> String {
+    r#"    *'"method":"session.model.list"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      : > "$COPILOT_FIXTURE_LOG.listed-$sid"
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"list":[]}}'
+      ;;
+"#
+    .to_owned()
+}
+
+/// A `session.model.switchTo` arm judging a reasoning effort as CLI 1.0.88 does: a switch naming
+/// one on a Session whose own Models were never listed is refused as unsupported, whatever the
+/// effort and whether or not the flat catalog offers it, and accepted once they were.
+pub fn cold_switch_refusing_arm() -> String {
+    r#"    *'"method":"session.model.switchTo"'*'"reasoningEffort"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      effort=$(printf '%s' "$body" | sed -n 's/.*"reasoningEffort":"\([^"]*\)".*/\1/p')
+      model=$(printf '%s' "$body" | sed -n 's/.*"modelId":"\([^"]*\)".*/\1/p')
+      if [ -e "$COPILOT_FIXTURE_LOG.listed-$sid" ]; then
+        reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"modelId":"'"$model"'"}}'
+      else
+        reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32603,"message":"Request session.model.switchTo failed with message: Reasoning effort '\'"$effort"\'' is not supported for model '\'"$model"\''."}}'
+      fi
+      ;;
+"#
+    .to_owned()
+}
+
 /// A `session.model.switchTo` arm that accepts whatever Model the Turn asks for.
 pub fn switch_model_arm() -> String {
     r#"    *'"method":"session.model.switchTo"'*)
@@ -489,12 +520,13 @@ fn fixture_path(path: &std::path::Path) -> &str {
 /// its own beside them.
 pub fn conversation_arms() -> String {
     format!(
-        "{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
         models_arm(COPILOT_MODELS),
         create_session_arm(),
         current_model_arm("claude-fixture", "high", "default"),
+        session_models_arm(),
         switch_model_arm(),
         permission_decision_arm(),
     )

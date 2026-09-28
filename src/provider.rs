@@ -1543,6 +1543,7 @@ mod tests {
             SubagentReportOutcome::Completed,
             Some(1_000),
             Some("Done."),
+            None,
         );
         let lower = async |input: ProviderInput| {
             input

@@ -42,6 +42,11 @@ pub struct SubagentReport {
     /// How long the stretch worked, as its settled row says; `None` where
     /// Suru never learned when it ended (ADR 0029).
     pub duration_ms: Option<u64>,
+    /// What the stretch failed with, where it failed and the Subagent's
+    /// Transcript says why: the text of the error row that settled it, cut
+    /// like the excerpt. `None` for any other outcome, and for a failure
+    /// nothing explained.
+    pub error: Option<String>,
     /// The start of the final Message the Subagent wrote in the stretch, at
     /// most [`Self::EXCERPT_CHARS`] characters of it; `None` when it wrote
     /// none.
@@ -60,13 +65,15 @@ impl SubagentReport {
     /// The Report of a stretch that settled with `outcome` after
     /// `duration_ms`, excerpting `final_message` — the last Message the
     /// Subagent wrote there — to [`Self::EXCERPT_CHARS`], cut on a character
-    /// boundary.
+    /// boundary, and carrying `error` — what a failed stretch failed with —
+    /// cut the same way.
     pub fn new(
         subagent: SessionId,
         name: impl Into<String>,
         outcome: SubagentReportOutcome,
         duration_ms: Option<u64>,
         final_message: Option<&str>,
+        error: Option<&str>,
     ) -> Self {
         let (excerpt, truncated) = match final_message {
             None => (None, false),
@@ -75,11 +82,18 @@ impl SubagentReport {
                 Some((cut, _)) => (Some(message[..cut].to_owned()), true),
             },
         };
+        let error = error.map(
+            |error| match error.char_indices().nth(Self::EXCERPT_CHARS) {
+                None => error.to_owned(),
+                Some((cut, _)) => error[..cut].to_owned(),
+            },
+        );
         Self {
             subagent,
             name: name.into(),
             outcome,
             duration_ms,
+            error,
             excerpt,
             truncated,
         }
@@ -89,8 +103,9 @@ impl SubagentReport {
 /// The one text a Report is delivered as, whichever harness carries it: what
 /// it is and from whom, the Subagent by name and by the id the Broker's Tools
 /// take — to read the rest of what it wrote, and to send it more — how its
-/// stretch settled and after how long, and its final Message as far as the
-/// excerpt reaches, saying where the rest is when it was cut.
+/// stretch settled and after how long, what it failed with where it failed
+/// and the Transcript says why, and its final Message as far as the excerpt
+/// reaches, saying where the rest is when it was cut.
 impl fmt::Display for SubagentReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let settled = match self.outcome {
@@ -111,6 +126,9 @@ impl fmt::Display for SubagentReport {
             ". Its session_id is {}, which read_subagent and send_to_subagent take.",
             self.subagent
         )?;
+        if let Some(error) = &self.error {
+            write!(formatter, "\n\nIt failed with: {error}")?;
+        }
         match &self.excerpt {
             None => formatter.write_str("\n\nIt wrote no final Message."),
             Some(excerpt) => {
@@ -156,7 +174,48 @@ mod tests {
             outcome,
             Some(83_400),
             final_message,
+            None,
         )
+    }
+
+    #[test]
+    fn a_failed_report_says_what_the_stretch_failed_with_before_its_final_message() {
+        let report = SubagentReport::new(
+            SessionId::new(),
+            "Researcher",
+            SubagentReportOutcome::Failed,
+            Some(453),
+            None,
+            Some("Provider execution failed: Copilot Model selection failed: RPC error -32603."),
+        );
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "Subagent Report from Suru: the Subagent \"Researcher\" you delegated to through \
+                 the Broker failed after 0.4s. Its session_id is {}, which read_subagent and \
+                 send_to_subagent take.\n\nIt failed with: Provider execution failed: Copilot \
+                 Model selection failed: RPC error -32603.\n\nIt wrote no final Message.",
+                report.subagent
+            ),
+            "the delegating Agent learns why, not only that, its Subagent failed"
+        );
+    }
+
+    #[test]
+    fn a_long_error_is_cut_like_the_excerpt() {
+        let error = "x".repeat(SubagentReport::EXCERPT_CHARS + 1);
+        let report = SubagentReport::new(
+            SessionId::new(),
+            "Researcher",
+            SubagentReportOutcome::Failed,
+            None,
+            None,
+            Some(&error),
+        );
+        assert_eq!(
+            report.error.as_deref().map(str::len),
+            Some(SubagentReport::EXCERPT_CHARS)
+        );
     }
 
     #[test]

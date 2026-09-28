@@ -249,9 +249,10 @@ works, and once it settles \"completed\", \"failed\" or \"stopped\"; \
 \"duration_ms\" is how long that stretch has worked so far, or worked in all \
 once settled, and null where Suru never learned when it ended; and \
 \"message\" is the latest Message the Subagent wrote in that stretch, in full \
-— its final answer once settled — or null when it has written none. An id \
-naming no Subagent spawned with spawn_subagent by you or by a Subagent beneath \
-you is refused.";
+— its final answer once settled — or null when it has written none. A \
+\"failed\" stretch also carries \"error\": what it failed with, as its \
+Transcript says, where anything says why. An id naming no Subagent spawned \
+with spawn_subagent by you or by a Subagent beneath you is refused.";
 
 const SEND_TO_SUBAGENT_DESCRIPTION: &str = "\
 Send more work to a Subagent spawned with spawn_subagent — by you, or by a \
@@ -647,6 +648,10 @@ struct SubagentReadout {
     status: SubagentStatus,
     duration_ms: Option<u64>,
     message: Option<String>,
+    /// What a failed stretch failed with; left out of every other reading,
+    /// and of a failure nothing explained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl From<BrokeredSubagentReading> for SubagentReadout {
@@ -656,6 +661,7 @@ impl From<BrokeredSubagentReading> for SubagentReadout {
             status: SubagentStatus::from(reading.status),
             duration_ms: reading.duration_ms,
             message: reading.message,
+            error: reading.error,
         }
     }
 }
@@ -1748,6 +1754,7 @@ mod tests {
             SubagentReportOutcome::Completed,
             Some(1_000),
             Some(&long),
+            None,
         )
         .to_string();
         let read = BrokerTool::ReadSubagent.name();

@@ -340,6 +340,7 @@ async fn a_report_leaves_as_a_stdin_user_message_waking_the_idle_parent() {
         SubagentReportOutcome::Completed,
         *duration_ms,
         Some("Done"),
+        None,
     )
     .to_string();
     let user_messages = claude

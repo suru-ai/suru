@@ -2406,27 +2406,31 @@ async fn a_brokered_subagent_whose_turn_failed_or_was_stopped_reads_as_failed_or
         },
     )
     .await;
-    for (child, status, message) in [
-        (
-            failing,
-            "failed",
-            json!("The sandbox will not let me run the tests."),
-        ),
-        (stopped, "stopped", Value::Null),
-    ] {
-        let (_, row_duration) = row_status(&caller, child);
-        assert!(row_duration.is_some());
-        assert_eq!(
-            delegating.client.read_subagent(child).await,
-            json!({
-                "session_id": child,
-                "status": status,
-                "duration_ms": row_duration,
-                "message": message,
-            }),
-            "a {status} Subagent reads so, with its last words where it wrote any"
-        );
-    }
+    let (_, failing_duration) = row_status(&caller, failing);
+    assert!(failing_duration.is_some());
+    assert_eq!(
+        delegating.client.read_subagent(failing).await,
+        json!({
+            "session_id": failing,
+            "status": "failed",
+            "duration_ms": failing_duration,
+            "message": "The sandbox will not let me run the tests.",
+            "error": "the sandbox refused the command",
+        }),
+        "a failed Subagent reads so, with its last words and what it failed with"
+    );
+    let (_, stopped_duration) = row_status(&caller, stopped);
+    assert!(stopped_duration.is_some());
+    assert_eq!(
+        delegating.client.read_subagent(stopped).await,
+        json!({
+            "session_id": stopped,
+            "status": "stopped",
+            "duration_ms": stopped_duration,
+            "message": Value::Null,
+        }),
+        "a stopped Subagent reads so, with nothing it failed with"
+    );
 
     delegating
         .hosted
@@ -2486,6 +2490,7 @@ async fn a_brokered_subagent_a_restart_settled_reads_as_failed_with_no_duration(
             "status": "failed",
             "duration_ms": null,
             "message": "Halfway through the seams.",
+            "error": "The server stopped before this Subagent finished.",
         }),
         "but nothing timed the end of its work, so it says no duration, as its row does"
     );
@@ -2733,6 +2738,7 @@ async fn a_brokered_subagent_that_spawns_after_its_turn_settled_still_reads_as_i
         json!({
             "session_id": child_id,
             "status": "failed",
+            "error": "the sandbox refused the command",
             "duration_ms": row_duration,
             "message": FINDING,
         }),

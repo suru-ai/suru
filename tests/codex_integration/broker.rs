@@ -637,6 +637,7 @@ async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
         SubagentReportOutcome::Completed,
         *duration_ms,
         Some("Done."),
+        None,
     )
     .to_string();
     let reporting = codex
@@ -781,6 +782,7 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
         "Researcher",
         SubagentReportOutcome::Completed,
         *duration_ms,
+        None,
         None,
     )
     .to_string();
@@ -1185,6 +1187,7 @@ async fn a_report_to_a_settled_native_subagent_leaves_as_a_turn_start_on_its_thr
         SubagentReportOutcome::Completed,
         *duration_ms,
         Some(ANSWER),
+        None,
     )
     .to_string();
     let requests = native.codex.requests();

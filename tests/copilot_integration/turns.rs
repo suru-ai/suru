@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use crate::support::{
-    COPILOT_MODELS, ScriptedCopilot, agent_messages, connect, connect_arm, conversation_fixture,
-    create_session_arm, modelless_current_model_arm, models_arm, permission_decision_arm,
-    resumable_conversation_fixture, send_arm, settled_session, settled_session_on, signed_in_arm,
-    switch_model_arm, titling_turned_off,
+    COPILOT_MODELS, ScriptedCopilot, agent_messages, cold_switch_refusing_arm, connect,
+    connect_arm, conversation_fixture, create_session_arm, modelless_current_model_arm, models_arm,
+    permission_decision_arm, resumable_conversation_fixture, send_arm, session_models_arm,
+    settled_session, settled_session_on, signed_in_arm, switch_model_arm, titling_turned_off,
 };
 use serde_json::Value;
 use suru::{
@@ -368,10 +368,93 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
         [
             "session.create",
             "session.model.getCurrent",
+            "session.model.list",
             "session.model.switchTo",
             "session.send"
         ],
-        "the Model switch precedes the Prompt so the Turn runs under the chosen Selection"
+        "the Model switch precedes the Prompt so the Turn runs under the chosen Selection, and \
+         the Session's own Models are listed before it so the CLI judges the switch against them"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_switch_naming_a_reasoning_effort_is_made_only_after_the_sessions_models_are_listed() {
+    // CLI 1.0.88 judges a switch's reasoning effort against the catalog it has resolved for the
+    // Session, and resolves that catalog only when asked for it: switched cold, it refuses every
+    // effort, `none` on a Model that lists it included, so a spawn choosing one failed at once
+    // (docs/validation/copilot-cold-switch-effort.md).
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}{}{}",
+        connect_arm(),
+        signed_in_arm(),
+        models_arm(COPILOT_MODELS),
+        create_session_arm(),
+        modelless_current_model_arm(),
+        session_models_arm(),
+        cold_switch_refusing_arm(),
+        permission_decision_arm(),
+        send_arm(STREAMED_MESSAGE),
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let titling = titling_turned_off();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "copilot-cold-switch")
+            .expect("configure server")
+            .with_config_dir(titling.path()),
+        Arc::new(CopilotRuntime::new(copilot.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), "copilot-cold-switch").await;
+    client.list_models().await.expect("discover Copilot Models");
+
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: Some(selection("claude-fixture", "low", "default")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Think less, read more".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session under a chosen reasoning effort");
+
+    let settled = settled_session(&client, created.session.id, 0).await;
+    assert_eq!(
+        settled.turns[0].status,
+        TurnStatus::Completed,
+        "the switch is accepted, so the Turn runs: {:?}",
+        settled
+            .activities
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::Error { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    let switched = copilot.wait_for_request("session.model.switchTo").await;
+    assert_eq!(switched["params"]["reasoningEffort"], "low");
+    assert_eq!(
+        copilot
+            .methods()
+            .into_iter()
+            .filter(|method| method.starts_with("session.model."))
+            .collect::<Vec<_>>(),
+        [
+            "session.model.getCurrent",
+            "session.model.list",
+            "session.model.switchTo",
+        ],
+        "the Session's own Models are listed once, before the one switch"
     );
 
     server.shutdown().await.expect("shut the server down");
@@ -380,12 +463,13 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
 #[tokio::test]
 async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
         models_arm(COPILOT_MODELS),
         create_session_arm(),
         modelless_current_model_arm(),
+        session_models_arm(),
         switch_model_arm(),
         permission_decision_arm(),
         send_arm(STREAMED_MESSAGE),
@@ -436,12 +520,13 @@ async fn a_session_whose_cli_reports_no_active_model_runs_under_the_selected_one
 #[tokio::test]
 async fn a_modelless_session_with_no_chosen_selection_runs_under_the_catalog_default() {
     let copilot = ScriptedCopilot::new(&format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
         connect_arm(),
         signed_in_arm(),
         models_arm(COPILOT_MODELS),
         create_session_arm(),
         modelless_current_model_arm(),
+        session_models_arm(),
         switch_model_arm(),
         permission_decision_arm(),
         send_arm(STREAMED_MESSAGE),

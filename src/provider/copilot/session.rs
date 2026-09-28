@@ -239,6 +239,7 @@ pub(super) async fn start_copilot_session(
         execution_directory,
         interrupt_request_timeout,
         watch_events,
+        session_models_listed: tokio::sync::OnceCell::new(),
     });
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
@@ -364,6 +365,9 @@ struct CopilotSession {
     /// The Agent Selection in force on the Copilot Session — nothing until the CLI has resolved a
     /// Model — which the next Turn switches away from when it was selected under a different one.
     selection: StdMutex<Option<AgentSelection>>,
+    /// Whether the CLI has been asked for this Session's own Model catalog, which it judges a
+    /// Model switch against: see [`CopilotSession::apply_selection`].
+    session_models_listed: tokio::sync::OnceCell<()>,
     skills: CopilotSkills,
     execution_directory: PathBuf,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
@@ -450,6 +454,30 @@ impl CopilotSession {
             return Ok(());
         }
         let options = lower_selection_options(selection)?;
+        // The CLI judges a switch's reasoning effort against the catalog it has resolved for this
+        // Session, and resolves that catalog only when asked for it: switched before then, it
+        // refuses every effort as unsupported — `none` on a Model whose own listing offers it
+        // included — where the same switch once the Session's Models have been listed goes
+        // through and runs (CLI 1.0.88; docs/validation/copilot-cold-switch-effort.md). Its
+        // own hosts list first, so list once here, before the first switch. Nothing in the answer
+        // is needed: the catalog Suru offers from is the flat one, and a CLI that cannot list is
+        // left to judge the switch as it will.
+        self.session_models_listed
+            .get_or_init(|| async {
+                if let Err(error) = until_crash(
+                    &self.handle,
+                    "Copilot Session Model listing failed",
+                    self.native.rpc().model().list(),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        %error,
+                        "Copilot did not list this Session's Models before its Model switch"
+                    );
+                }
+            })
+            .await;
         until_crash(
             &self.handle,
             "Copilot Model selection failed",

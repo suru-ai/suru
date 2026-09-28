@@ -27,7 +27,14 @@ pub(super) fn report_of(
     final_message: Option<&str>,
 ) -> SubagentReport {
     let (_, duration_ms) = row_status(caller, child);
-    SubagentReport::new(child, "Researcher", outcome, duration_ms, final_message)
+    SubagentReport::new(
+        child,
+        "Researcher",
+        outcome,
+        duration_ms,
+        final_message,
+        None,
+    )
 }
 
 /// Reads `holder` until its row for `child` has settled.
@@ -460,9 +467,10 @@ async fn a_report_of_a_subagent_a_restart_settled_waits_for_the_head_of_its_pare
             SubagentReportOutcome::Failed,
             None,
             None,
+            Some("The server stopped before this Subagent finished."),
         )],
         "the restart settled the Subagent's Turn failed, which nothing timed, and its Agent is \
-         told so at the head of the parent's next Turn"
+         told so — and why — at the head of the parent's next Turn"
     );
     assert_eq!(turn.prompt(), "Where were we?");
     turn.succeed();
