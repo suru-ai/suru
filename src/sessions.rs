@@ -52,7 +52,7 @@ mod workspace_icon;
 mod workspaces;
 
 pub(crate) use brokered::{
-    BrokeredReadError, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
+    BrokeredReadError, BrokeredResumeError, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
     BrokeredSubagentReading, DelegatingAgent,
 };
 pub(crate) use output::{

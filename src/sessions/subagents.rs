@@ -116,47 +116,10 @@ impl SessionStore {
         session_id: SessionId,
         delegation: Option<DeliveredDelegation>,
     ) -> anyhow::Result<TurnId> {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .expect("Session store lock is not poisoned");
-        let record = state
-            .sessions
-            .get(&session_id)
-            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-        if !record.snapshot.session.is_subagent() {
-            return Err(anyhow!(
-                "Only a Subagent's Session begins a Turn on a resume"
-            ));
-        }
-        let mut changes = Vec::new();
-        if let Some(open) = active_turn_id(&record.snapshot)? {
-            changes.extend(settle_in_flight_changes(
-                &record.snapshot,
-                open,
-                TrailingCommandOutput::new(),
-                OpenInterventions::TurnEnded,
-            ));
-            changes.push(SessionChange::TurnStatusChanged {
-                turn_id: open,
-                status: TurnStatus::Completed,
-                settled_at: None,
-            });
-        }
-        let turn = Turn::unprompted(None);
-        let turn_id = turn.id;
-        changes.push(SessionChange::TurnAdded { turn });
-        if let Some(delegation) = delegation {
-            changes.push(SessionChange::MessageAdded {
-                message: delegation_message(
-                    turn_id,
-                    delegator(&state.sessions, delegation.delegating_session),
-                    delegation.text,
-                ),
-            });
-        }
-        state.commit(&self.storage, session_id, changes)?;
-        Ok(turn_id)
+            .expect("Session store lock is not poisoned")
+            .begin_subagent_turn(&self.storage, session_id, delegation)
     }
 
     /// Adds a steer to the Turn a Subagent is working in (ADR 0032): the
@@ -446,6 +409,54 @@ pub(super) fn subagent_title(name: &str, description: &str) -> String {
 }
 
 impl SessionStoreState {
+    /// Begins the next Turn in a Subagent's existing Session for a resume,
+    /// under the store lock the caller holds: see
+    /// [`SessionStore::begin_subagent_turn`].
+    pub(super) fn begin_subagent_turn(
+        &mut self,
+        storage: &StorageSink,
+        session_id: SessionId,
+        delegation: Option<DeliveredDelegation>,
+    ) -> anyhow::Result<TurnId> {
+        let record = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        if !record.snapshot.session.is_subagent() {
+            return Err(anyhow!(
+                "Only a Subagent's Session begins a Turn on a resume"
+            ));
+        }
+        let mut changes = Vec::new();
+        if let Some(open) = active_turn_id(&record.snapshot)? {
+            changes.extend(settle_in_flight_changes(
+                &record.snapshot,
+                open,
+                TrailingCommandOutput::new(),
+                OpenInterventions::TurnEnded,
+            ));
+            changes.push(SessionChange::TurnStatusChanged {
+                turn_id: open,
+                status: TurnStatus::Completed,
+                settled_at: None,
+            });
+        }
+        let turn = Turn::unprompted(None);
+        let turn_id = turn.id;
+        changes.push(SessionChange::TurnAdded { turn });
+        if let Some(delegation) = delegation {
+            changes.push(SessionChange::MessageAdded {
+                message: delegation_message(
+                    turn_id,
+                    delegator(&self.sessions, delegation.delegating_session),
+                    delegation.text,
+                ),
+            });
+        }
+        self.commit(storage, session_id, changes)?;
+        Ok(turn_id)
+    }
+
     /// Opens a Subagent's child Session under `parent_id`, which the caller
     /// has found held: parented to it, in its Execution Directory, Workspace
     /// and checkout, and opened with the one prompt-less Turn the Subagent's

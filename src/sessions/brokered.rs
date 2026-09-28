@@ -34,16 +34,17 @@ use crate::protocol::{
     Activity, ActivityStatus, AgentSelection, BrokerSettings, Message, MessageRole, SessionChange,
     SessionId, SessionSnapshot, SessionTimestamp, Turn, TurnId, TurnStatus,
 };
-use crate::provider::{SubagentReport, SubagentReportOutcome};
+use crate::provider::{SubagentReport, SubagentReportOutcome, first_line};
 use crate::storage::StorageSink;
 
 use super::{
     SessionRecord, SessionStore, SessionStoreState,
     posture::brokered_subagent_posture,
     projection::active_turn_id,
+    settlement::{OpenInterventions, TrailingCommandOutput, fail_turn_changes},
     subagents::{
-        ChildSession, SubagentRoute, delegator, opening_brokered_subagent_row, stretches_of_work,
-        subagent_title,
+        ChildSession, DeliveredDelegation, SubagentRoute, delegator, opening_brokered_subagent_row,
+        stretches_of_work, subagent_title,
     },
 };
 
@@ -202,21 +203,9 @@ impl SessionStore {
         if let Some(cap) = state.brokered_spawn_cap(caller, &settings.broker) {
             return Err(BrokeredSpawnError::Capped(cap));
         }
-        let record = &state.sessions[&caller];
-        let holding = match active_turn_id(&record.snapshot)
-            .map_err(|error| BrokeredSpawnError::Storage(error.to_string()))?
-        {
-            Some(working) => HoldingTurn::Working(working),
-            None => HoldingTurn::Continuation(Box::new(holding_continuation(&record.snapshot))),
-        };
-        let delegator = match delegator(&state.sessions, caller).name {
-            Some(name) => DelegatingAgent::Subagent { name },
-            None => DelegatingAgent::Session {
-                title: record.snapshot.title.clone(),
-            },
-        };
+        let delegator = state.delegating_agent(caller);
         let approval_posture = brokered_subagent_posture(
-            record.snapshot.session.approval_posture,
+            state.sessions[&caller].snapshot.session.approval_posture,
             &spawn.selection.provider,
             &settings,
         );
@@ -231,13 +220,13 @@ impl SessionStore {
                 route: SubagentRoute::Brokered,
             },
         );
-        let row = opening_brokered_subagent_row(
-            holding.turn_id(),
+        if let Err(error) = state.stand_brokered_row(
+            &self.storage,
+            caller,
             spawn.name,
             spawn.description,
             spawned.session_id,
-        );
-        if let Err(error) = state.commit(&self.storage, caller, holding.holds(row)) {
+        ) {
             // A child with no row would work on where no reader could reach
             // it, keeping the caller Working for good, so it goes too.
             state.sessions.remove(&spawned.session_id);
@@ -258,6 +247,93 @@ impl SessionStore {
         })
     }
 
+    /// Resumes the brokered Subagent `subagent` for the Agent of `caller`
+    /// with `delegation`, which that Agent sent after the spawn: a new Turn in
+    /// the Subagent's own Session, opened by the Delegation as a Message from
+    /// the caller's Agent, so the Session holds the Subagent's whole
+    /// conversation (ADR 0031); and a row of its own for that stretch of work
+    /// in the Turn the caller's Agent works in — or in a Continuation begun to
+    /// hold it, exactly as a spawn's row is held — leading into that same
+    /// Session, named as the spawn's row names the Subagent and describing
+    /// what the Delegation asks. A Turn still open in the Subagent's Session —
+    /// a Continuation its own work began — settles first, as worked, as a
+    /// Prompt settles one (CONTEXT.md: Continuation). The row follows the new
+    /// Turn from here as every brokered row does, and its settling reports to
+    /// the caller's Agent.
+    ///
+    /// Only a brokered Subagent beneath the caller is resumed, as only one is
+    /// read. A resume sets one more brokered Subagent working, so one that
+    /// would pass `broker.maxConcurrentSubagents` is refused before anything
+    /// is begun, counted as a spawn is but for the Subagent itself, which the
+    /// resume sets working again rather than adds. Depth does not apply: the
+    /// Subagent already stands where it stands.
+    ///
+    /// Nothing here reaches a Provider: the Subagent's own actor, which asked
+    /// for the resume, delivers the Delegation as the new Turn's input.
+    pub(crate) fn resume_brokered_subagent(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+        delegation: NormalizedText,
+    ) -> Result<ResumedBrokeredSubagent, BrokeredResumeError> {
+        let settings = self.settings.borrow().settings.clone();
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state
+            .reach_brokered_subagent(caller, subagent)
+            .map_err(BrokeredResumeError::Unreachable)?;
+        if let Some(cap) =
+            state.brokered_concurrency_cap(subagent, Some(subagent), &settings.broker)
+        {
+            return Err(BrokeredResumeError::Capped(cap));
+        }
+        let delegating = state.delegating_agent(caller);
+        let title = &state.sessions[&subagent].snapshot.title;
+        // The name the spawn's row carries, which every later row repeats.
+        let name = delegator(&state.sessions, subagent)
+            .name
+            .unwrap_or_else(|| title.clone());
+        let description = first_line(&delegation.content).unwrap_or_else(|| title.clone());
+        let turn_id = state
+            .begin_subagent_turn(
+                &self.storage,
+                subagent,
+                Some(DeliveredDelegation {
+                    delegating_session: caller,
+                    text: delegation,
+                }),
+            )
+            .map_err(|error| BrokeredResumeError::Storage(error.to_string()))?;
+        if let Err(error) =
+            state.stand_brokered_row(&self.storage, caller, name, description, subagent)
+        {
+            // A stretch no row stands for would work where no reader of the
+            // delegating Transcript could reach it, and report to no one, so
+            // it settles before its Provider ever hears of it.
+            let failed = fail_turn_changes(
+                &state.sessions[&subagent].snapshot,
+                turn_id,
+                TrailingCommandOutput::new(),
+                format!("Suru could not record this resume: {error}"),
+                None,
+                OpenInterventions::TurnEnded,
+            );
+            if let Err(error) = state.commit(&self.storage, subagent, failed) {
+                tracing::warn!(
+                    session_id = %subagent,
+                    "a resume whose row could not be added was not settled: {error:#}"
+                );
+            }
+            return Err(BrokeredResumeError::Storage(error.to_string()));
+        }
+        Ok(ResumedBrokeredSubagent {
+            turn_id,
+            delegator: delegating,
+        })
+    }
+
     /// Reads how the brokered Subagent `subagent` stands, for the Agent of
     /// `caller`: the outcome of its Session's latest Turn — or that it still
     /// works there — how long that Turn has worked, and the latest Message it
@@ -273,17 +349,91 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        state.reach_brokered_subagent(caller, subagent)?;
+        Ok(state.brokered_subagent_reading(subagent, SessionTimestamp::now()))
+    }
+
+    /// Whether the Agent of `caller` may reach `subagent` through the Broker —
+    /// read it, send it more, wait on it — and why not where it may not: see
+    /// [`SessionStoreState::reach_brokered_subagent`].
+    pub(crate) fn reach_brokered_subagent(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+    ) -> Result<(), BrokeredReadError> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .reach_brokered_subagent(caller, subagent)
+    }
+
+    /// The brokered Subagents the Agent of `caller` spawned — its Session's
+    /// own brokered children, whichever Agent riding its token spawned them —
+    /// that are working now, each by its own latest stretch of work, in the
+    /// order they spawned. These are what a wait naming no Subagent waits on:
+    /// a Subagent one of them spawned in turn reports to that one, not to the
+    /// caller, so it is its spawner's to wait on.
+    pub(crate) fn working_brokered_children(
+        &self,
+        caller: SessionId,
+    ) -> Result<Vec<SessionId>, BrokeredReadError> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
         if state.is_deferred(caller) || !state.sessions.contains_key(&caller) {
             return Err(BrokeredReadError::CallerNotFound);
         }
-        if !state.sessions.contains_key(&subagent) {
-            return Err(BrokeredReadError::NoSuchSession);
-        }
-        if !state.is_brokered_beneath(subagent, caller) {
-            return Err(BrokeredReadError::NotBrokeredBeneathCaller);
-        }
-        Ok(state.brokered_subagent_reading(subagent, SessionTimestamp::now()))
+        let mut working = state
+            .sessions
+            .iter()
+            .filter(|(_, record)| {
+                record.snapshot.session.parent == Some(caller)
+                    && record.is_brokered_subagent()
+                    && record.is_at_work_itself()
+            })
+            .map(|(session_id, record)| (record.summary.created_at, *session_id))
+            .collect::<Vec<_>>();
+        working.sort_by_key(|(created_at, session_id)| (*created_at, session_id.to_string()));
+        Ok(working
+            .into_iter()
+            .map(|(_, session_id)| session_id)
+            .collect())
     }
+
+    /// The Agent of `session_id` as a Delegation it sends names it to the
+    /// Subagent receiving it; see [`DelegatingAgent`].
+    pub(crate) fn delegating_agent(&self, session_id: SessionId) -> Option<DelegatingAgent> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state
+            .sessions
+            .contains_key(&session_id)
+            .then(|| state.delegating_agent(session_id))
+    }
+}
+
+/// A brokered Subagent's resume, begun in the store: the Turn the Delegation
+/// opened in the Subagent's own Session, and the Agent that sent it, as the
+/// Delegation delivered to the Subagent's Provider names it.
+pub(crate) struct ResumedBrokeredSubagent {
+    pub(crate) turn_id: TurnId,
+    pub(crate) delegator: DelegatingAgent,
+}
+
+/// Why the store could not resume a brokered Subagent for the Agent sending
+/// it more work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BrokeredResumeError {
+    /// The Subagent is none the sending Agent may reach through the Broker.
+    Unreachable(BrokeredReadError),
+    /// The resume would set more brokered Subagents working than
+    /// `broker.maxConcurrentSubagents` allows, so nothing of it was begun —
+    /// and nothing of it waits for room to be made.
+    Capped(BrokeredSpawnCap),
+    Storage(String),
 }
 
 /// The Turn a brokered Subagent's row joins in the caller's Session.
@@ -373,27 +523,38 @@ impl SessionStoreState {
         caller: SessionId,
         broker: &BrokerSettings,
     ) -> Option<BrokeredSpawnCap> {
-        let line = self
-            .ancestors(caller)
-            .map(|(session_id, _)| session_id)
-            .collect::<Vec<_>>();
-        let depth = cap_count(line.len()).saturating_add(1);
+        let depth = cap_count(self.ancestors(caller).count()).saturating_add(1);
         if depth > broker.max_depth {
             return Some(BrokeredSpawnCap::Depth {
                 max_depth: broker.max_depth,
                 depth,
             });
         }
+        self.brokered_concurrency_cap(caller, None, broker)
+    }
+
+    /// The concurrency cap `broker` puts on the tree `within` stands in,
+    /// where setting one more brokered Subagent working there would pass it:
+    /// `resuming`, when it is a settled Subagent a resume sets working again,
+    /// or otherwise one a spawn adds. The resumed Subagent is not counted
+    /// among those working, since the resume is what would set it working.
+    fn brokered_concurrency_cap(
+        &self,
+        within: SessionId,
+        resuming: Option<SessionId>,
+        broker: &BrokerSettings,
+    ) -> Option<BrokeredSpawnCap> {
         // The line's last Session heads the tree: the top-level Session, or
         // — for a line restoration left broken — the highest Session held.
-        let top_level = *line.last()?;
+        let (top_level, _) = self.ancestors(within).last()?;
         let working = cap_count(
             self.actor_owners_beneath(top_level)
                 .into_iter()
                 .filter(|session_id| {
-                    self.sessions.get(session_id).is_some_and(|record| {
-                        record.is_brokered_subagent() && record.is_at_work_itself()
-                    })
+                    Some(*session_id) != resuming
+                        && self.sessions.get(session_id).is_some_and(|record| {
+                            record.is_brokered_subagent() && record.is_at_work_itself()
+                        })
                 })
                 .count(),
         );
@@ -401,6 +562,67 @@ impl SessionStoreState {
             max_concurrent_subagents: broker.max_concurrent_subagents,
             working,
         })
+    }
+
+    /// Stands the row a stretch of the brokered Subagent `child`'s work opens
+    /// as — named `name` and describing `description` — in the Turn the Agent
+    /// of `holder` works in, which delegated that stretch; or, where that
+    /// Agent has no Turn working, in a Continuation begun to hold it and
+    /// settled in the same commit, since that Agent's Provider never learns
+    /// of it and nothing else would ever settle it (ADR 0033, 0035).
+    fn stand_brokered_row(
+        &mut self,
+        storage: &StorageSink,
+        holder: SessionId,
+        name: String,
+        description: String,
+        child: SessionId,
+    ) -> anyhow::Result<()> {
+        let snapshot = &self
+            .sessions
+            .get(&holder)
+            .ok_or_else(|| anyhow::anyhow!("Session does not exist on this server instance"))?
+            .snapshot;
+        let holding = match active_turn_id(snapshot)? {
+            Some(working) => HoldingTurn::Working(working),
+            None => HoldingTurn::Continuation(Box::new(holding_continuation(snapshot))),
+        };
+        let row = opening_brokered_subagent_row(holding.turn_id(), name, description, child);
+        self.commit(storage, holder, holding.holds(row))?;
+        Ok(())
+    }
+
+    /// The Agent of `session_id`, which the caller has found held, as a
+    /// Delegation it sends names it: by the name its rows carry when it is a
+    /// Subagent, and otherwise by its Session's Title.
+    fn delegating_agent(&self, session_id: SessionId) -> DelegatingAgent {
+        match delegator(&self.sessions, session_id).name {
+            Some(name) => DelegatingAgent::Subagent { name },
+            None => DelegatingAgent::Session {
+                title: self.sessions[&session_id].snapshot.title.clone(),
+            },
+        }
+    }
+
+    /// Whether the Agent of `caller` may reach `subagent` through the Broker:
+    /// only a brokered Subagent beneath it (see
+    /// [`SessionStoreState::is_brokered_beneath`]), and only while `caller`
+    /// itself is held.
+    fn reach_brokered_subagent(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+    ) -> Result<(), BrokeredReadError> {
+        if self.is_deferred(caller) || !self.sessions.contains_key(&caller) {
+            return Err(BrokeredReadError::CallerNotFound);
+        }
+        if !self.sessions.contains_key(&subagent) {
+            return Err(BrokeredReadError::NoSuchSession);
+        }
+        if !self.is_brokered_beneath(subagent, caller) {
+            return Err(BrokeredReadError::NotBrokeredBeneathCaller);
+        }
+        Ok(())
     }
 
     /// Carries what a commit to a brokered Subagent's Session did to one of
