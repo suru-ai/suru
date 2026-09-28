@@ -1,7 +1,10 @@
 //! Attachments: uploading an image's bytes, binding it to a label in a
 //! Prompt, and fetching the bytes back, all over the Server's HTTP API.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::server_support::{
+    PROGRESS_DEADLINE,
+    attachments::{bound, gif, jpeg, png, uploaded, webp},
+};
 use crate::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     provider_support::ControlledProvider,
@@ -22,7 +25,7 @@ use suru::{
         SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionId,
         SessionRevision, SessionSnapshot, SessionUpdate, TextSpan,
     },
-    provider::ProviderEvent,
+    provider::{ProviderAttachment, ProviderEvent},
     server::{self, ManualClock, ServerClock, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
@@ -30,41 +33,6 @@ use tokio::time::{Duration, timeout};
 const MEBIBYTE: usize = 1024 * 1024;
 const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
-
-fn png(width: u32, height: u32) -> Vec<u8> {
-    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
-    bytes.extend(13_u32.to_be_bytes());
-    bytes.extend(b"IHDR");
-    bytes.extend(width.to_be_bytes());
-    bytes.extend(height.to_be_bytes());
-    bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
-    bytes
-}
-
-fn jpeg(width: u16, height: u16) -> Vec<u8> {
-    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8];
-    bytes.extend(height.to_be_bytes());
-    bytes.extend(width.to_be_bytes());
-    bytes.extend([1, 1, 0x11, 0]);
-    bytes.extend([0xFF, 0xD9]);
-    bytes
-}
-
-fn gif(width: u16, height: u16) -> Vec<u8> {
-    let mut bytes = b"GIF89a".to_vec();
-    bytes.extend(width.to_le_bytes());
-    bytes.extend(height.to_le_bytes());
-    bytes.extend([0, 0, 0, 0x3B]);
-    bytes
-}
-
-/// An extended WebP, whose canvas stores each dimension less one.
-fn webp(width: u32, height: u32) -> Vec<u8> {
-    let mut bytes = b"RIFF\x16\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
-    bytes.extend(&(width - 1).to_le_bytes()[..3]);
-    bytes.extend(&(height - 1).to_le_bytes()[..3]);
-    bytes
-}
 
 fn content_hash(bytes: &[u8]) -> AttachmentId {
     AttachmentId::new(blake3::hash(bytes).to_hex().to_string())
@@ -83,16 +51,6 @@ async fn upload(
         .send()
         .await
         .expect("send upload")
-}
-
-async fn uploaded(descriptor: &RuntimeDescriptor, bytes: Vec<u8>) -> AttachmentDescriptor {
-    upload(descriptor, "application/octet-stream", bytes)
-        .await
-        .error_for_status()
-        .expect("upload succeeds")
-        .json()
-        .await
-        .expect("decode Attachment descriptor")
 }
 
 async fn fetch(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> reqwest::Response {
@@ -127,16 +85,6 @@ async fn refusal(response: reqwest::Response) -> (StatusCode, SessionError) {
         .await
         .expect("decode the refusal");
     (status, error)
-}
-
-/// Binds `label`, found in `text`, to the uploaded Attachment.
-fn bound(attachment: &AttachmentDescriptor, text: &str, label: &str) -> AttachmentBinding {
-    let start = text.find(label).expect("label stands in the text");
-    AttachmentBinding {
-        attachment_id: attachment.id.clone(),
-        label: label.to_owned(),
-        span: TextSpan::from(start..start + label.len()),
-    }
 }
 
 fn creation(
@@ -562,6 +510,111 @@ async fn turn_beginning_and_steer_prompts_carry_their_bindings_to_every_client()
         "a client arriving later sees every binding"
     );
     assert_eq!(rewatched.messages, snapshot.messages);
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    drop(provider_session);
+    server.shutdown().await.expect("shut down server");
+}
+
+fn delivered(label: &str, mime_type: &str, bytes: &[u8]) -> ProviderAttachment {
+    ProviderAttachment {
+        label: label.to_owned(),
+        mime_type: mime_type.to_owned(),
+        bytes: bytes.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn the_provider_receives_each_attachments_bytes_in_label_order_on_turn_start_and_steer() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "attachment-delivery-test").expect("configure server"),
+        runtime.clone(),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let screenshot_bytes = png(640, 480);
+    let photo_bytes = jpeg(1920, 1080);
+    let diagram_bytes = gif(320, 200);
+    let screenshot = uploaded(&descriptor, screenshot_bytes.clone()).await;
+    let photo = uploaded(&descriptor, photo_bytes.clone()).await;
+    let diagram = uploaded(&descriptor, diagram_bytes.clone()).await;
+
+    // Bound out of label order: the Provider is handed them in the order
+    // their labels stand in the text, which keeps its labels.
+    let initial_text = "Compare [Image 1] with [Image 2]";
+    let created = create_session(
+        &descriptor,
+        &creation(
+            workspace.path(),
+            initial_text,
+            vec![
+                bound(&photo, initial_text, "[Image 2]"),
+                bound(&screenshot, initial_text, "[Image 1]"),
+            ],
+        ),
+    )
+    .await;
+    let mut provider_session = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-attachments", "high", "fast"),
+        });
+    let turn = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the Turn reaches the Provider");
+    assert_eq!(turn.prompt(), initial_text);
+    assert_eq!(
+        turn.attachments(),
+        [
+            delivered("[Image 1]", "image/png", &screenshot_bytes),
+            delivered("[Image 2]", "image/jpeg", &photo_bytes),
+        ]
+    );
+    turn.succeed();
+
+    // A label standing twice for one Attachment reaches the Provider once,
+    // where it first stands.
+    let steer_text = "See [Image 3] beside [Image 1], and [Image 1] again";
+    let steer_bindings = {
+        let second = steer_text
+            .rfind("[Image 1]")
+            .expect("the label stands twice");
+        vec![
+            bound(&screenshot, steer_text, "[Image 1]"),
+            AttachmentBinding {
+                attachment_id: screenshot.id.clone(),
+                label: "[Image 1]".to_owned(),
+                span: TextSpan::from(second..second + "[Image 1]".len()),
+            },
+            bound(&diagram, steer_text, "[Image 3]"),
+        ]
+    };
+    admitted(
+        &descriptor,
+        created.session.id,
+        steer_text,
+        steer_bindings,
+        PromptDelivery::Steer,
+    )
+    .await;
+    let steer = timeout(PROGRESS_DEADLINE, provider_session.next_steer())
+        .await
+        .expect("the steer reaches the Provider");
+    assert_eq!(steer.prompt(), steer_text);
+    assert_eq!(
+        steer.attachments(),
+        [
+            delivered("[Image 3]", "image/gif", &diagram_bytes),
+            delivered("[Image 1]", "image/png", &screenshot_bytes),
+        ]
+    );
+    steer.succeed();
 
     provider_session.emit(ProviderEvent::TurnCompleted);
     drop(provider_session);

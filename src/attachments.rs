@@ -1,8 +1,9 @@
 //! Attachments: media a user places on a Prompt beside its text, uploaded as
 //! bytes before the Prompt is admitted and stored once, content-addressed, in
-//! the Session database (ADR 0037). This module decides what an upload is and
-//! whether a Prompt's bindings may stand; storing and serving the bytes is the
-//! storage repository's.
+//! the Session database (ADR 0037). This module decides what an upload is,
+//! whether a Prompt's bindings may stand, and what a Provider is handed of them
+//! once that Prompt is delivered; storing and serving the bytes is the storage
+//! repository's.
 //!
 //! Nothing counts references to an Attachment. An Attachment's age is measured
 //! from when it was last referenced — uploaded, first or again, or bound by a
@@ -18,6 +19,7 @@ use std::{collections::HashSet, time::Duration};
 
 use crate::{
     protocol::{AttachmentBinding, AttachmentDescriptor, AttachmentId, AttachmentKind},
+    provider::ProviderAttachment,
     storage::{StorageError, StorageRepository},
 };
 
@@ -179,7 +181,7 @@ pub(crate) fn check_bindings(
 }
 
 /// The Attachments this Server has stored, as the upload, fetch, and
-/// admission routes reach them.
+/// admission routes reach them, and as Provider delivery reads them.
 #[derive(Clone)]
 pub(crate) struct AttachmentStore {
     repository: StorageRepository,
@@ -228,6 +230,47 @@ impl AttachmentStore {
         id: AttachmentId,
     ) -> Result<Option<(String, Vec<u8>)>, StorageError> {
         self.repository.attachment_bytes(id).await
+    }
+
+    /// What a Provider is handed of a Prompt's Attachments as that Prompt is
+    /// delivered: the bytes of each one its bindings name, read now, in the
+    /// order its label first stands in the text, so a label standing twice
+    /// for the same Attachment is handed over once. An Attachment that can no
+    /// longer be read — reclaimed since the Prompt was admitted — is passed
+    /// over and reported to the Log rather than failing the delivery, and its
+    /// label stays in the text as it stands.
+    pub(crate) async fn deliverable(
+        &self,
+        bindings: &[AttachmentBinding],
+    ) -> Vec<ProviderAttachment> {
+        let mut ordered = bindings.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|binding| binding.span.start);
+        let mut seen = HashSet::new();
+        ordered.retain(|binding| seen.insert((&binding.attachment_id, &binding.label)));
+
+        let mut delivered = Vec::with_capacity(ordered.len());
+        for binding in ordered {
+            match self.fetch(binding.attachment_id.clone()).await {
+                Ok(Some((mime_type, bytes))) => delivered.push(ProviderAttachment {
+                    label: binding.label.clone(),
+                    mime_type,
+                    bytes,
+                }),
+                Ok(None) => tracing::warn!(
+                    attachment_id = %binding.attachment_id,
+                    label = binding.label,
+                    "an Attachment a delivered Prompt binds is no longer stored; \
+                     the Provider is handed the Prompt without it"
+                ),
+                Err(error) => tracing::error!(
+                    attachment_id = %binding.attachment_id,
+                    label = binding.label,
+                    "an Attachment a delivered Prompt binds could not be read, \
+                     so the Provider is handed the Prompt without it: {error}"
+                ),
+            }
+        }
+        delivered
     }
 
     /// Whether a Prompt's bindings may be admitted: sound against its text,
@@ -455,6 +498,66 @@ mod tests {
         assert_eq!(
             refusal.message(),
             "A Prompt may carry at most 10 Attachments, and this one carries 11"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_hands_over_each_stored_attachment_once_in_label_order_and_logs_a_reclaimed_one()
+     {
+        let directory = tempfile::tempdir().expect("create data directory");
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("open repository");
+        let store = AttachmentStore::new(repository);
+        let bytes = one_pixel_gif();
+        let Ok(stored) = store.upload(bytes.clone()).await else {
+            panic!("store the fixture");
+        };
+        let reclaimed = AttachmentId::new("reclaimed-since-admission");
+        let text = "[Image 1] then [Image 2], [Image 1] again";
+        let bound = |id: &AttachmentId, label: &str, start: usize| AttachmentBinding {
+            attachment_id: id.clone(),
+            label: label.to_owned(),
+            span: TextSpan::from(start..start + label.len()),
+        };
+        let bindings = [
+            bound(
+                &stored.descriptor.id,
+                "[Image 1]",
+                text.rfind("[Image 1]").unwrap(),
+            ),
+            bound(&reclaimed, "[Image 2]", text.find("[Image 2]").unwrap()),
+            bound(&stored.descriptor.id, "[Image 1]", 0),
+        ];
+
+        let log_path = directory.path().join("delivery.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Arc::new(
+                std::fs::File::create(&log_path).expect("create the Log"),
+            ))
+            .finish();
+        let delivered = {
+            let _log = tracing::subscriber::set_default(subscriber);
+            store.deliverable(&bindings).await
+        };
+
+        assert_eq!(
+            delivered,
+            [ProviderAttachment {
+                label: "[Image 1]".to_owned(),
+                mime_type: "image/gif".to_owned(),
+                bytes,
+            }],
+            "the stored Attachment is handed over once, and the reclaimed one not at all"
+        );
+        let log = std::fs::read_to_string(&log_path).expect("read the Log");
+        assert!(
+            log.contains("WARN")
+                && log.contains("attachment_id=reclaimed-since-admission")
+                && log.contains("[Image 2]"),
+            "the reclaimed Attachment is reported to the Log by its id and label: {log}"
         );
     }
 }

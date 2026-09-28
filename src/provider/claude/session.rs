@@ -479,13 +479,18 @@ impl ProviderSession for ClaudeSession {
                 .begin_turn(input.turn_id, input.selection.model.as_str());
             // Whatever the Turn begins with — a Prompt, a Delegation, or the
             // Subagent Reports that wake a Continuation — reaches the CLI as
-            // one user message on stdin, the Reports at its head.
-            let prompt = input
+            // one user message on stdin, the Reports at its head and a
+            // Prompt's images ahead of its text.
+            let (attachments, prompt) = input
                 .input
                 .lower(
                     "Claude",
-                    |reports| reports,
-                    async |prompt, head| self.skills.lower(&self.execution_directory, prompt, head),
+                    |reports| (Vec::new(), reports),
+                    async |mut prompt, head| {
+                        let attachments = std::mem::take(&mut prompt.attachments);
+                        let text = self.skills.lower(&self.execution_directory, prompt, head)?;
+                        Ok((attachments, text))
+                    },
                 )
                 .await?;
             let mut slot = self.child.lock().await;
@@ -574,7 +579,7 @@ impl ProviderSession for ClaudeSession {
             self.context.ready();
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&uuid, &prompt))
+                .send(&UserMessageEnvelope::new(&uuid, &attachments, &prompt))
                 .await
                 .map_err(|error| {
                     // The Prompt never reached the CLI, so the Turn it would have begun is not
@@ -589,16 +594,20 @@ impl ProviderSession for ClaudeSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn steering failed";
-            let text = input
+            let (attachments, text) = input
                 .input
-                .lower("Claude", |reports| reports, async |prompt, head| {
-                    if !prompt.skill_invocations.is_empty() {
-                        return Err(claude_error(
-                            "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
-                        ));
-                    }
-                    Ok(headed_text(head, prompt.text))
-                })
+                .lower(
+                    "Claude",
+                    |reports| (Vec::new(), reports),
+                    async |prompt, head| {
+                        if !prompt.skill_invocations.is_empty() {
+                            return Err(claude_error(
+                                "Claude does not support Skill Invocations for Steer Prompts; queue this Prompt instead",
+                            ));
+                        }
+                        Ok((prompt.attachments, headed_text(head, prompt.text)))
+                    },
+                )
                 .await?;
             // A steer is another user message on the running loop's stdin, and nothing about one
             // says which Turn it joins: delivered to a Session running no Turn, the CLI would
@@ -615,7 +624,7 @@ impl ProviderSession for ClaudeSession {
             };
             child
                 .transport
-                .send(&UserMessageEnvelope::text(&uuid, &text))
+                .send(&UserMessageEnvelope::new(&uuid, &attachments, &text))
                 .await
                 .map_err(|error| {
                     self.turn.withdraw_steer(&uuid);

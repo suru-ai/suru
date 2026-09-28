@@ -2721,11 +2721,21 @@ async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into
 /// Input `thread`'s `turn` drained, as Codex reports it: a `userMessage` item started and
 /// completed together, carrying `text`.
 fn user_message(thread: &str, turn: &str, id: &str, text: &str) -> String {
+    user_message_carrying(thread, turn, id, &[text_input(text)])
+}
+
+/// A text item of a `userMessage`'s content.
+fn text_input(text: &str) -> Value {
+    json!({ "type": "text", "text": text, "text_elements": [] })
+}
+
+/// The same `userMessage`, carrying the input items in `content`.
+fn user_message_carrying(thread: &str, turn: &str, id: &str, content: &[Value]) -> String {
     let message = json!({
         "type": "userMessage",
         "id": id,
         "clientId": null,
-        "content": [{ "type": "text", "text": text, "text_elements": [] }],
+        "content": content,
     });
     [
         item("started", thread, turn, message.clone()),
@@ -2763,6 +2773,15 @@ fn send_input(stage: &str, sender: &str, turn: &str, receiver: &str, prompt: &st
 /// the parent's `sendInput` then hands the running turn more, which the child drains before
 /// answering it. The child's turn ends there, and the parent's after it.
 fn steered_by_send_script() -> String {
+    steered_by_send_carrying(
+        "Count the lines too.",
+        &[text_input("Count the lines too.")],
+    )
+}
+
+/// The same, the `sendInput` handing the child the input items in `content`, which Codex previews
+/// in the call as `prompt`.
+fn steered_by_send_carrying(prompt: &str, content: &[Value]) -> String {
     let child_turn = [
         child_attached(),
         turn_started("child-thread", "child-turn"),
@@ -2783,21 +2802,16 @@ fn steered_by_send_script() -> String {
             "root-thread",
             "root-turn",
             "child-thread",
-            "Count the lines too.",
+            prompt,
         ),
         send_input(
             "completed",
             "root-thread",
             "root-turn",
             "child-thread",
-            "Count the lines too.",
+            prompt,
         ),
-        user_message(
-            "child-thread",
-            "child-turn",
-            "child-input-2",
-            "Count the lines too.",
-        ),
+        user_message_carrying("child-thread", "child-turn", "child-input-2", content),
         agent_message(
             "child-thread",
             "child-turn",
@@ -2931,6 +2945,58 @@ async fn a_send_into_a_working_childs_turn_steers_that_turn_where_the_child_drai
             .count(),
         4,
         "each Message stands once in the child's Transcript"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A native Subagent's Delegation may carry an image its delegating Agent attached, and it stands
+/// in the child's Transcript as Codex previews it: the image as a placeholder, nothing more.
+#[tokio::test]
+async fn a_send_carrying_an_image_steers_the_child_with_the_image_as_codex_previews_it() {
+    let fixture = ScriptedCodex::new_multiprocess(&steered_by_send_carrying(
+        "Count the lines too.\n[image]",
+        &[
+            text_input("Count the lines too."),
+            json!({ "type": "image", "url": "data:image/png;base64,iVBORw0KGgo=" }),
+        ],
+    ));
+    let opened = opened_session(
+        &fixture,
+        "codex-subagent-steered-by-image",
+        "Map the crates",
+    )
+    .await;
+    let session_id = opened.session_id;
+    let client = &opened.client;
+
+    let parent = settled_parent(client, session_id, 1).await;
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+    ] = subagent_rows(&parent)[..]
+    else {
+        panic!("the parent spawned one child, got {:?}", parent.activities);
+    };
+    let child = settled_session(client, *child_id, 0).await;
+    let [turn] = child.turns.as_slice() else {
+        panic!("the steer begins no second Turn, got {:?}", child.turns);
+    };
+    assert_eq!(
+        messages(&child),
+        [
+            (delegation_from(session_id), "Map the crate layout", turn.id),
+            (MessageRole::Agent, "Two crates so far.", turn.id),
+            (
+                delegation_from(session_id),
+                "Count the lines too.\n[image]",
+                turn.id
+            ),
+            (MessageRole::Agent, "Two crates, 4k lines.", turn.id),
+        ],
+        "the image stands in the Delegation as the placeholder Codex previews it by"
     );
 
     opened.server.shutdown().await.expect("shut down server");

@@ -3,14 +3,18 @@
 use std::sync::Arc;
 
 use crate::{
-    server_support::{next_skill_catalog, receive_initial_state},
+    server_support::{
+        attachments::{bound, jpeg, png, uploaded},
+        next_skill_catalog, receive_initial_state,
+    },
     support::{
         COPILOT_MODELS, ScriptedCopilot, connect_arm, create_session_arm, current_model_arm,
         delete_session_arm, detach_session_arm, models_arm, permission_decision_arm, send_arm,
         session_where, settled_session, signed_in_arm, upgradable_connect_arm,
     },
 };
-use serde_json::json;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
@@ -603,6 +607,162 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
     assert_eq!(sends[1]["params"]["mode"], "immediate");
     assert_eq!(sends[2]["params"]["prompt"], "EXPANDED QUEUE");
     assert!(sends[2]["params"].get("mode").is_none());
+
+    drop(feed);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The `session.send` attachment an image Attachment reaches Copilot as.
+fn blob(mime_type: &str, bytes: &[u8], label: &str) -> Value {
+    json!({
+        "type": "blob",
+        "data": STANDARD.encode(bytes),
+        "mimeType": mime_type,
+        "displayName": label,
+    })
+}
+
+#[tokio::test]
+async fn copilot_sends_attachments_as_named_blobs_on_the_initial_send_and_immediate_steers() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}{}{}{}{}",
+        connect_arm(),
+        signed_in_arm(),
+        models_arm(COPILOT_MODELS),
+        create_session_arm(),
+        current_model_arm("claude-fixture", "high", "default"),
+        command_catalog_arm(),
+        command_invocation_arm(),
+        held_then_queued_send_arm(),
+        permission_decision_arm(),
+        detach_session_arm(),
+        delete_session_arm(),
+    ));
+    let channel = "copilot-attachment-delivery";
+    let (_state_dir, workspace, server, mut client) = host_skills(&copilot, channel).await;
+    let catalog = fresh_catalog(&mut client, workspace.path()).await;
+    let skill = catalog.skills.first().expect("review Skill is offered");
+    let descriptor = server.descriptor().clone();
+    let screenshot_bytes = png(640, 480);
+    let photo_bytes = jpeg(1920, 1080);
+    let screenshot = uploaded(&descriptor, screenshot_bytes.clone()).await;
+    let photo = uploaded(&descriptor, photo_bytes.clone()).await;
+
+    let initial_text = "$review compare [Image 1] with [Image 2]";
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: initial_text.to_owned(),
+                skill_invocations: vec![SkillInvocation {
+                    skill_id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    scope: skill.scope.clone(),
+                    span: TextSpan { start: 0, end: 7 },
+                }],
+                // Bound out of label order: Copilot receives them in the order their labels stand.
+                attachments: vec![
+                    bound(&photo, initial_text, "[Image 2]"),
+                    bound(&screenshot, initial_text, "[Image 1]"),
+                ],
+            },
+        })
+        .await
+        .expect("create a Copilot Session with two images");
+    let mut feed = client
+        .subscribe_session(created.session.id)
+        .await
+        .expect("subscribe to the Copilot Session");
+    session_where(
+        &client,
+        &mut feed,
+        created.session.id,
+        "the Turn the images began becomes active",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Active)
+        },
+    )
+    .await;
+
+    let steer_text = "And [Image 1] once more";
+    let steer = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: steer_text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: vec![bound(&screenshot, steer_text, "[Image 1]")],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("steer the running Copilot Turn with an image");
+    session_where(
+        &client,
+        &mut feed,
+        created.session.id,
+        "the image steer is delivered",
+        |snapshot| {
+            snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == steer.id && prompt.status == PromptStatus::Delivered)
+        },
+    )
+    .await;
+    copilot.release();
+    session_where(
+        &client,
+        &mut feed,
+        created.session.id,
+        "the image Turn settles",
+        |snapshot| snapshot.session.status == SessionStatus::Idle,
+    )
+    .await;
+
+    let invokes = copilot
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "session.commands.invoke")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invokes[0]["params"]["input"], " compare [Image 1] with [Image 2]",
+        "the Skill expands the text with its labels literal"
+    );
+    let sends = copilot
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "session.send")
+        .collect::<Vec<_>>();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0]["params"]["prompt"], "EXPANDED REQUEST");
+    assert_eq!(
+        sends[0]["params"]["attachments"],
+        json!([
+            blob("image/png", &screenshot_bytes, "[Image 1]"),
+            blob("image/jpeg", &photo_bytes, "[Image 2]"),
+        ]),
+        "the initial send carries one blob per image, in label order, named by its label"
+    );
+    assert_eq!(sends[1]["params"]["prompt"], steer_text);
+    assert_eq!(sends[1]["params"]["mode"], "immediate");
+    assert_eq!(
+        sends[1]["params"]["attachments"],
+        json!([blob("image/png", &screenshot_bytes, "[Image 1]")]),
+        "the immediate-mode steer carries its image as a blob too"
+    );
 
     drop(feed);
     drop(client);

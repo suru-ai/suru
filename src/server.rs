@@ -733,6 +733,7 @@ pub async fn spawn_with_source_control(
         source_control.clone(),
         timings.checkout_skill_timeout,
         broker_access.clone(),
+        attachment_store.clone(),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, and one

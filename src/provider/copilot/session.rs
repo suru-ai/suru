@@ -20,8 +20,9 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use github_copilot_sdk::{
-    DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
+    Attachment, DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
     SessionId as CopilotSessionId, SetModelOptions,
     rpc::{CurrentModel, TasksCancelRequest},
     session::Session as NativeSession,
@@ -47,9 +48,10 @@ use crate::{
         ProviderId,
     },
     provider::{
-        AttributedProviderEvent, ProviderError, ProviderFuture, ProviderResumeState,
-        ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-        ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle, headed_text,
+        AttributedProviderEvent, ProviderAttachment, ProviderError, ProviderFuture,
+        ProviderResumeState, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+        ProviderSteerInput, ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle,
+        headed_text,
     },
 };
 
@@ -356,6 +358,24 @@ fn context_tier(choice: &ModelOptionChoiceId) -> Option<ContextTier> {
     }
 }
 
+/// `message` carrying each of a Prompt's Attachments as a blob: its bytes in base64, its type,
+/// and its label as the name Copilot shows it by. A Prompt without any sends no attachment list.
+fn with_blobs(message: MessageOptions, attachments: Vec<ProviderAttachment>) -> MessageOptions {
+    if attachments.is_empty() {
+        return message;
+    }
+    message.with_attachments(
+        attachments
+            .into_iter()
+            .map(|attachment| Attachment::Blob {
+                data: STANDARD.encode(&attachment.bytes),
+                mime_type: attachment.mime_type,
+                display_name: Some(attachment.label),
+            })
+            .collect(),
+    )
+}
+
 struct CopilotSession {
     questionnaires: Arc<super::questionnaire::CopilotQuestionnaires>,
     approvals: Arc<super::approval::CopilotApprovals>,
@@ -613,28 +633,25 @@ impl ProviderSession for CopilotSession {
                 // rather than after it stops (ADR 0035). A Prompt keeps the
                 // default delivery it always had, the Reports at its head.
                 let reports_alone = input.input.prompt.is_none();
-                let text = input
+                let message = input
                     .input
-                    .lower(
-                        "Copilot",
-                        |reports| reports,
-                        async |prompt, head| {
-                            Ok(headed_text(
-                                head,
-                                self.skills
-                                    .expand(
-                                        &self.handle,
-                                        &self.execution_directory,
-                                        &self.native,
-                                        crate::protocol::SkillPromptDelivery::Initial,
-                                        prompt,
-                                    )
-                                    .await?,
-                            ))
-                        },
-                    )
+                    .lower("Copilot", MessageOptions::new, async |mut prompt, head| {
+                        let attachments = std::mem::take(&mut prompt.attachments);
+                        let text = headed_text(
+                            head,
+                            self.skills
+                                .expand(
+                                    &self.handle,
+                                    &self.execution_directory,
+                                    &self.native,
+                                    crate::protocol::SkillPromptDelivery::Initial,
+                                    prompt,
+                                )
+                                .await?,
+                        );
+                        Ok(with_blobs(MessageOptions::new(text), attachments))
+                    })
                     .await?;
-                let message = MessageOptions::new(text);
                 let message = if reports_alone {
                     message.with_mode(DeliveryMode::Immediate)
                 } else {
@@ -666,29 +683,28 @@ impl ProviderSession for CopilotSession {
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             self.require_running_turn("steer")?;
-            let prompt = input
+            let message = input
                 .input
-                .lower(
-                    "Copilot",
-                    |reports| reports,
-                    async |prompt, head| {
-                        Ok(headed_text(
-                            head,
-                            self.skills
-                                .expand(
-                                    &self.handle,
-                                    &self.execution_directory,
-                                    &self.native,
-                                    crate::protocol::SkillPromptDelivery::Steer,
-                                    prompt,
-                                )
-                                .await?,
-                        ))
-                    },
-                )
+                .lower("Copilot", MessageOptions::new, async |mut prompt, head| {
+                    let attachments = std::mem::take(&mut prompt.attachments);
+                    let text = headed_text(
+                        head,
+                        self.skills
+                            .expand(
+                                &self.handle,
+                                &self.execution_directory,
+                                &self.native,
+                                crate::protocol::SkillPromptDelivery::Steer,
+                                prompt,
+                            )
+                            .await?,
+                    );
+                    Ok(with_blobs(MessageOptions::new(text), attachments))
+                })
                 .await?;
-            // Immediate delivery injects the Prompt into the loop already running, where Copilot's
-            // default would hold it back and run it as a Turn of its own once this one stopped.
+            // Immediate delivery injects the Prompt — its images among it — into the loop already
+            // running, where Copilot's default would hold it back and run it as a Turn of its own
+            // once this one stopped.
             //
             // Nothing here names the Turn being steered, because Copilot's send does not take one:
             // a steer that reaches the CLI after its loop has stopped falls back to that default
@@ -699,8 +715,7 @@ impl ProviderSession for CopilotSession {
             until_crash(
                 &self.handle,
                 "Copilot Turn steering failed",
-                self.native
-                    .send(MessageOptions::new(prompt).with_mode(DeliveryMode::Immediate)),
+                self.native.send(message.with_mode(DeliveryMode::Immediate)),
             )
             .await
             .map(|_message_id| ())

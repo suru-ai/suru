@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,7 +19,10 @@ use crate::{
         ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionValue, ProviderId,
         ReasoningSummaryDetail, Usage,
     },
-    provider::{BrokerHandoff, ProviderError, exclusive_count, humanized_wire_id, reported_count},
+    provider::{
+        BrokerHandoff, ProviderAttachment, ProviderError, exclusive_count, humanized_wire_id,
+        reported_count,
+    },
 };
 
 // Native user-input requests preserve both JSON-RPC and thread/Turn/item correlation.
@@ -601,19 +605,42 @@ pub(super) struct TurnInterruptParams<'a> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(super) enum UserInput {
-    Text { text: String },
-    Skill { name: String, path: PathBuf },
+    Text {
+        text: String,
+    },
+    Skill {
+        name: String,
+        path: PathBuf,
+    },
+    /// An image inline, its bytes carried in a base64 `data:` URL. Suru never
+    /// sends Codex a remote URL or a local path for one (ADR 0037).
+    Image {
+        url: String,
+    },
+}
+
+impl UserInput {
+    pub(super) fn image(attachment: &ProviderAttachment) -> Self {
+        Self::Image {
+            url: format!(
+                "data:{};base64,{}",
+                attachment.mime_type,
+                STANDARD.encode(&attachment.bytes)
+            ),
+        }
+    }
 }
 
 /// The text the `UserMessage` item a turn's `input` arrives as reads as, as
 /// [`user_message_text`] reads it: each piece on a line of its own, a Skill
-/// as Codex previews it.
+/// or an image as Codex previews it.
 pub(super) fn user_input_text(input: &[UserInput]) -> String {
     input
         .iter()
         .map(|input| match input {
             UserInput::Text { text } => text.clone(),
             UserInput::Skill { name, path } => format!("[skill:${name}]({})", path.display()),
+            UserInput::Image { .. } => "[image]".to_owned(),
         })
         .collect::<Vec<_>>()
         .join("\n")

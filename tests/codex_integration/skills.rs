@@ -4,9 +4,13 @@ use crate::server_support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
 use crate::{
-    server_support::next_skill_catalog,
+    server_support::{
+        attachments::{bound, jpeg, png, uploaded},
+        next_skill_catalog,
+    },
     support::{ScriptedCodex, receive_initial_state},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
@@ -597,6 +601,186 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
         ])
     );
 
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The `turn/start` or `turn/steer` input item an image Attachment reaches Codex as.
+fn data_url_image(mime_type: &str, bytes: &[u8]) -> Value {
+    json!({
+        "type": "image",
+        "url": format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
+    })
+}
+
+#[tokio::test]
+async fn codex_receives_attachments_as_data_url_images_after_the_text_on_start_and_steer() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let canonical_workspace =
+        suru::paths::canonical(workspace.path()).expect("canonicalize Workspace");
+    let fixture = ScriptedCodex::new(&skill_operation_script(
+        &canonical_workspace,
+        DELIVER_SKILL_TURNS,
+        ACCEPT_SKILL_STEER,
+    ));
+    let channel = "codex-attachment-delivery-test";
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let loading = client
+        .list_skills(suru::protocol::SkillCatalogRequest {
+            provider: suru::protocol::ProviderId::new("codex"),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: canonical_workspace,
+            },
+        })
+        .await
+        .expect("list Codex Skills");
+    assert!(matches!(loading.status, SkillCatalogStatus::Loading));
+    let catalog = next_skill_catalog(&mut client).await;
+    let review = catalog
+        .skills
+        .iter()
+        .find(|skill| skill.name == "review")
+        .expect("review Skill is offered");
+    let descriptor = server.descriptor().clone();
+    let screenshot_bytes = png(640, 480);
+    let photo_bytes = jpeg(1920, 1080);
+    let screenshot = uploaded(&descriptor, screenshot_bytes.clone()).await;
+    let photo = uploaded(&descriptor, photo_bytes.clone()).await;
+
+    let initial_text = "$review compare [Image 1] with [Image 2]";
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: initial_text.to_owned(),
+                skill_invocations: vec![invocation(review, 0, 7)],
+                // Bound out of label order: Codex receives them in the order their labels stand.
+                attachments: vec![
+                    bound(&photo, initial_text, "[Image 2]"),
+                    bound(&screenshot, initial_text, "[Image 1]"),
+                ],
+            },
+        })
+        .await
+        .expect("create a Codex Session with two images");
+    fixture.wait_for_method_count("turn/start", 1).await;
+    wait_for_snapshot(
+        &client,
+        created.session.id,
+        "the Turn the images began becomes active",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Active)
+        },
+    )
+    .await;
+
+    let steer_text = "And [Image 1] once more";
+    let steer = client
+        .admit_prompt(
+            created.session.id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: steer_text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: vec![bound(&screenshot, steer_text, "[Image 1]")],
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("steer the running Codex Turn with an image");
+    fixture.wait_for_method("turn/steer").await;
+    wait_for_snapshot(
+        &client,
+        created.session.id,
+        "the image steer is delivered",
+        |snapshot| {
+            snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == steer.id && prompt.status == PromptStatus::Delivered)
+        },
+    )
+    .await;
+
+    let requests = fixture.requests();
+    let start = requests
+        .iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("Codex receives the Turn start");
+    assert_eq!(
+        start["params"]["input"],
+        json!([
+            { "type": "text", "text": initial_text },
+            {
+                "type": "skill",
+                "name": "review",
+                "path": "/private/codex/skills/review/SKILL.md"
+            },
+            data_url_image("image/png", &screenshot_bytes),
+            data_url_image("image/jpeg", &photo_bytes),
+        ]),
+        "the images follow the text, in label order, as data URLs"
+    );
+    let steer_request = requests
+        .iter()
+        .find(|request| request["method"] == "turn/steer")
+        .expect("Codex receives the steer");
+    assert_eq!(
+        steer_request["params"]["input"],
+        json!([
+            { "type": "text", "text": steer_text },
+            data_url_image("image/png", &screenshot_bytes),
+        ])
+    );
+    for item in requests
+        .iter()
+        .filter(|request| request["method"] == "turn/start" || request["method"] == "turn/steer")
+        .flat_map(|request| request["params"]["input"].as_array().expect("input items"))
+    {
+        assert_ne!(
+            item["type"], "localImage",
+            "no local path ever reaches Codex"
+        );
+        if item["type"] == "image" {
+            assert!(
+                item["url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("data:")),
+                "no remote URL ever reaches Codex: {item}"
+            );
+        }
+    }
+
+    fixture.release();
+    wait_for_snapshot(
+        &client,
+        created.session.id,
+        "the image Turn settles",
+        |snapshot| snapshot.session.status == SessionStatus::Idle,
+    )
+    .await;
     drop(client);
     server.shutdown().await.expect("shut down server");
 }

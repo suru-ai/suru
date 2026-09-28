@@ -534,6 +534,9 @@ impl ProviderResumeState {
 pub struct ProviderPrompt {
     pub text: String,
     pub skill_invocations: Vec<ProviderSkillInvocation>,
+    /// The Attachments the Prompt carries, in the order their labels stand in
+    /// `text`, which keeps every label literal.
+    pub attachments: Vec<ProviderAttachment>,
 }
 
 impl ProviderPrompt {
@@ -541,10 +544,15 @@ impl ProviderPrompt {
         Self {
             text: text.into(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
-    pub(crate) fn from_user_prompt(text: String, skill_invocations: Vec<SkillInvocation>) -> Self {
+    pub(crate) fn from_user_prompt(
+        text: String,
+        skill_invocations: Vec<SkillInvocation>,
+        attachments: Vec<ProviderAttachment>,
+    ) -> Self {
         let mut ordered = Vec::<ProviderSkillInvocation>::new();
         for invocation in skill_invocations {
             if let Some(existing) = ordered
@@ -562,6 +570,7 @@ impl ProviderPrompt {
         Self {
             text,
             skill_invocations: ordered,
+            attachments,
         }
     }
 
@@ -594,6 +603,30 @@ impl ProviderPrompt {
             next_start = start;
         }
         Ok(text)
+    }
+}
+
+/// An Attachment as a Provider is handed it: the bytes, read from storage as
+/// the Prompt carrying it is delivered, the type they were sniffed as, and the
+/// label standing for it in the Prompt's text. Each adapter encodes the bytes
+/// as its harness takes them.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderAttachment {
+    pub label: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl fmt::Debug for ProviderAttachment {
+    /// Names the bytes by their length alone, so input written to the Log
+    /// never carries an image.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttachment")
+            .field("label", &self.label)
+            .field("mime_type", &self.mime_type)
+            .field("byte_length", &self.bytes.len())
+            .finish()
     }
 }
 

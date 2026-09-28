@@ -5,8 +5,11 @@
 //! is an SDK implementation detail, so drift is ours to absorb (ADR 0010). Decoding tolerates fields
 //! and control-response subtypes it does not know, because the CLI grows both freely.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::provider::ProviderAttachment;
 
 /// The envelope a control request travels in, correlated by its `request_id`.
 #[derive(Serialize)]
@@ -96,15 +99,24 @@ pub(super) struct UserMessageEnvelope<'a> {
 }
 
 impl<'a> UserMessageEnvelope<'a> {
-    pub(super) fn text(uuid: &'a str, prompt: &'a str) -> Self {
+    /// The message carrying `prompt`, with one base64 image block per Attachment ahead of its
+    /// text, in the order given. The text block stands last because the CLI reads a streamed user
+    /// message as a slash command only when its final block is text opening with one, so the
+    /// Skills lowered onto the head of the text still run natively (as t3code's adapter found).
+    pub(super) fn new(
+        uuid: &'a str,
+        attachments: &'a [ProviderAttachment],
+        prompt: &'a str,
+    ) -> Self {
         Self {
             kind: "user",
             message: UserMessage {
                 role: "user",
-                content: [UserContentBlock {
-                    kind: "text",
-                    text: prompt,
-                }],
+                content: attachments
+                    .iter()
+                    .map(UserContentBlock::image)
+                    .chain([UserContentBlock::Text { text: prompt }])
+                    .collect(),
             },
             parent_tool_use_id: None,
             session_id: "",
@@ -147,14 +159,35 @@ pub(super) enum CommandLifecycleState {
 #[derive(Serialize)]
 struct UserMessage<'a> {
     role: &'static str,
-    content: [UserContentBlock<'a>; 1],
+    content: Vec<UserContentBlock<'a>>,
 }
 
 #[derive(Serialize)]
-struct UserContentBlock<'a> {
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UserContentBlock<'a> {
+    Image { source: ImageSource<'a> },
+    Text { text: &'a str },
+}
+
+impl<'a> UserContentBlock<'a> {
+    fn image(attachment: &'a ProviderAttachment) -> Self {
+        Self::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type: &attachment.mime_type,
+                data: STANDARD.encode(&attachment.bytes),
+            },
+        }
+    }
+}
+
+/// An image's bytes as the Messages API takes them inline.
+#[derive(Serialize)]
+struct ImageSource<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    text: &'a str,
+    media_type: &'a str,
+    data: String,
 }
 
 /// A partial-message chunk of the Turn's streamed output: one Anthropic streaming event, owned by
@@ -511,7 +544,7 @@ mod tests {
     #[test]
     fn a_user_message_names_its_uuid_once_whatever_its_text_holds() {
         let text = r#"a Prompt quoting {"uuid":"decoy"}"#;
-        let line = serde_json::to_string(&UserMessageEnvelope::text("message-uuid", text))
+        let line = serde_json::to_string(&UserMessageEnvelope::new("message-uuid", &[], text))
             .expect("a user message serializes");
         assert_eq!(
             line.matches(r#""uuid":""#).count(),

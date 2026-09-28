@@ -35,6 +35,7 @@ use super::{
     ProviderSubagentStatus, ProviderTurnInput,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
+use crate::attachments::AttachmentStore;
 use crate::broker::{BrokerAccess, BrokerGrant};
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, AgentIdentity, AgentSelection, InterruptOutcome, Message,
@@ -120,6 +121,8 @@ pub(crate) struct ProviderOrchestrator {
     checkout_skill_timeout: Duration,
     /// Mints the Broker token each Provider start is handed.
     broker: BrokerAccess,
+    /// Where the bytes of a delivered Prompt's Attachments are read from.
+    attachments: AttachmentStore,
 }
 
 /// What a delegating Agent asked the Broker to spawn, its Agent Selection
@@ -311,6 +314,7 @@ struct ProviderSessionContext {
     updates: ProviderUpdateGate,
     settings: watch::Receiver<SettingsSnapshot>,
     broker: BrokerAccess,
+    attachments: AttachmentStore,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1214,6 +1218,7 @@ impl ProviderOrchestrator {
         source_control: crate::source_control::SourceControlService,
         checkout_skill_timeout: Duration,
         broker: BrokerAccess,
+        attachments: AttachmentStore,
     ) -> Self {
         assert!(
             !runtimes.is_empty(),
@@ -1239,6 +1244,7 @@ impl ProviderOrchestrator {
             checkout_guards: Default::default(),
             connected_incarnations: Default::default(),
             broker,
+            attachments,
         };
         // Every Subagent Report the store comes to hold is handed on to the
         // actor that reaches its Agent, for as long as the Server runs.
@@ -1533,6 +1539,7 @@ impl ProviderOrchestrator {
                 updates: self.updates.clone(),
                 settings: self.settings.clone(),
                 broker: self.broker.clone(),
+                attachments: self.attachments.clone(),
             },
             commands_rx,
             ProviderShutdown {
@@ -2106,6 +2113,7 @@ async fn run_provider_session(
         updates,
         settings,
         broker,
+        attachments,
     } = context;
     let _checkout_cleanup = CheckoutActorCleanup {
         session_id,
@@ -2819,10 +2827,18 @@ async fn run_provider_session(
                     .current_approval_posture_update(session_id)
                     .filter(|update| update.value == posture)
             });
+            // The Attachments' bytes are read as the Prompt is delivered, and
+            // never held anywhere longer than it takes to hand them over.
+            let delivered_attachments = tokio::select! {
+                biased;
+                _ = shutdown.wait() => break 'actor,
+                loaded = attachments.deliverable(&delivered.prompt.attachments) => loaded,
+            };
             // The Subagent Reports that waited for this Session's next Turn
             // stand at the head of its input, ahead of the Prompt.
             let reports = sessions.take_held_reports(session_id);
-            let (turn_id, input) = provider_turn_start(delivered, posture, reports.clone());
+            let (turn_id, input) =
+                provider_turn_start(delivered, delivered_attachments, posture, reports.clone());
             let started = tokio::select! {
                 biased;
                 _ = shutdown.wait() => break 'actor,
@@ -3273,6 +3289,11 @@ async fn run_provider_session(
                     });
                     continue;
                 }
+                let delivered_attachments = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break 'actor,
+                    loaded = attachments.deliverable(&prompt.attachments) => loaded,
+                };
                 let steered = tokio::select! {
                     biased;
                     _ = shutdown.wait() => break 'actor,
@@ -3280,6 +3301,7 @@ async fn run_provider_session(
                         input: ProviderInput::from_prompt(ProviderPrompt::from_user_prompt(
                             prompt.text.clone(),
                             prompt.skill_invocations.clone(),
+                            delivered_attachments,
                         )),
                     }) => steered,
                 };
@@ -4552,9 +4574,11 @@ fn fail_active_turn(
 }
 
 /// The Provider's input for the Turn a Prompt was just delivered to begin,
-/// headed by the Subagent Reports that waited for it.
+/// carrying the Attachments read for it and headed by the Subagent Reports
+/// that waited for it.
 fn provider_turn_start(
     delivered: DeliveredTurn,
+    attachments: Vec<super::ProviderAttachment>,
     approval_posture: Option<crate::protocol::ApprovalPosture>,
     reports: Vec<super::SubagentReport>,
 ) -> (TurnId, ProviderTurnInput) {
@@ -4570,6 +4594,7 @@ fn provider_turn_start(
             input: ProviderInput::from_prompt(ProviderPrompt::from_user_prompt(
                 delivered.prompt.text,
                 delivered.prompt.skill_invocations,
+                attachments,
             ))
             .headed_by(reports),
             selection,

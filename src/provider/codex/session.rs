@@ -1016,7 +1016,8 @@ struct NativeTurnStartRequest {
 
 /// A Turn's input as the items Codex takes on `turn/start` or `turn/steer`: the
 /// Subagent Reports it opens with as one text item at the head, then the
-/// Prompt's text and each Skill it invokes.
+/// Prompt's text, each Skill it invokes, and each image it carries as a data
+/// URL.
 async fn lower_input(
     skills: &CodexSkills,
     execution_directory: &std::path::Path,
@@ -1027,12 +1028,14 @@ async fn lower_input(
         .lower(
             "Codex",
             |reports| vec![UserInput::Text { text: reports }],
-            async |prompt, head| {
+            async |mut prompt, head| {
+                let attachments = std::mem::take(&mut prompt.attachments);
                 let mut lowered = head
                     .map(|text| UserInput::Text { text })
                     .into_iter()
                     .collect::<Vec<_>>();
                 lowered.extend(skills.lower(execution_directory, prompt)?);
+                lowered.extend(attachments.iter().map(UserInput::image));
                 Ok(lowered)
             },
         )

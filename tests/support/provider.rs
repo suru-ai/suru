@@ -812,6 +812,12 @@ impl PromptOperation {
         &self.begun_with().skill_invocations
     }
 
+    /// The Attachments the Prompt this Turn began with carried, bytes and
+    /// all, in the order their labels stand in its text.
+    pub fn attachments(&self) -> &[suru::provider::ProviderAttachment] {
+        &self.begun_with().attachments
+    }
+
     /// Whether a Prompt or Delegation stands in this Turn's input, beside any
     /// Reports at its head.
     pub fn has_prompt(&self) -> bool {
@@ -868,6 +874,12 @@ impl TurnSteer {
 
     pub fn skill_invocations(&self) -> &[suru::provider::ProviderSkillInvocation] {
         &self.steered_with().skill_invocations
+    }
+
+    /// The Attachments the steer Prompt carried, bytes and all, in the order
+    /// their labels stand in its text.
+    pub fn attachments(&self) -> &[suru::provider::ProviderAttachment] {
+        &self.steered_with().attachments
     }
 
     /// The Subagent Reports this steer delivered into the working Turn.
