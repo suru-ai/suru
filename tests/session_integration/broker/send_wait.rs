@@ -1053,9 +1053,11 @@ async fn a_wait_naming_no_subagent_waits_on_every_working_one_the_caller_spawned
     let (progress_seen, mut progress) = mpsc::unbounded_channel();
 
     let (observed, ()) = tokio::join!(
-        delegating
-            .client
-            .wait_subagents_observing(json!({}), "wait-every", &progress_seen),
+        delegating.client.wait_subagents_observing(
+            json!({ "timeout_seconds": 600 }),
+            "wait-every",
+            &progress_seen
+        ),
         async {
             timeout(PROGRESS_DEADLINE, progress.recv())
                 .await
@@ -1080,7 +1082,7 @@ async fn a_wait_naming_no_subagent_waits_on_every_working_one_the_caller_spawned
         json!({
             "settled": [delegating.client.read_subagent(quick_id).await],
             "timed_out": false,
-            "timeout_seconds": 60,
+            "timeout_seconds": 600,
         }),
         "it answers once either settles, with the one that did"
     );
