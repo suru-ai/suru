@@ -38,7 +38,7 @@ use crate::{
     },
     server_support::{
         PROGRESS_DEADLINE,
-        broker::{MCP_PROTOCOL_VERSION, McpClient},
+        broker::{MCP_INLINE_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, McpClient},
         read_runtime_descriptor,
     },
     subagent_tree::{changes_until, open_tree},
@@ -585,6 +585,76 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         model_discoveries(&hosted),
         asked,
         "list_providers reports Availability without re-probing any Provider"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// Claude 2.1.283 opens every MCP connection with `server/discover`, and on
+/// finding the 2026-07-28 revision among those the Broker implements speaks
+/// that revision from then on: no `initialize`, each request naming the
+/// revision in its own `_meta`. The revision requires every list result to say
+/// how long it stays fresh and who may cache it, and Claude rejects a Tool list
+/// that does not — registering none of the Broker's Tools, which its Agent then
+/// cannot find (`docs/validation/0421-broker-smoke.md`).
+#[tokio::test]
+async fn a_harness_speaking_the_2026_07_28_revision_is_answered_a_tool_list_it_can_register() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "broker-inline-lifecycle", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (_session, handoff, _provider) = start_session(
+        &descriptor,
+        &mut hosted.claude,
+        &workspace,
+        default_selection(&claude_models()),
+    )
+    .await;
+    let mut client = McpClient::handed(&handoff).speaking_inline_lifecycle();
+
+    let discovered = client.discover().await;
+    assert!(
+        discovered["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.contains(&json!(MCP_INLINE_PROTOCOL_VERSION))),
+        "the Broker offers the revision Claude goes on to speak: {discovered}"
+    );
+
+    let listed = client.request("tools/list", json!({})).await;
+    let fields = listed
+        .as_object()
+        .expect("tools/list answers an object")
+        .iter()
+        .filter(|(field, _)| *field != "tools")
+        .collect::<Vec<_>>();
+    assert!(
+        listed["ttlMs"].is_u64(),
+        "the list says how long it stays fresh, in whole milliseconds: {fields:?}"
+    );
+    assert!(
+        matches!(listed["cacheScope"].as_str(), Some("public" | "private")),
+        "the list says who may cache it: {fields:?}"
+    );
+    assert_eq!(
+        listed["tools"]
+            .as_array()
+            .expect("tools/list lists Tools")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("every Tool is named"))
+            .collect::<Vec<_>>(),
+        [
+            "list_providers",
+            "spawn_subagent",
+            "read_subagent",
+            "send_to_subagent",
+            "wait_subagents",
+            "stop_subagent"
+        ],
+    );
+    assert_eq!(
+        client.list_providers().await["providers"][0]["id"],
+        json!("claude"),
+        "and its Tools answer on that revision"
     );
 
     hosted.server.shutdown().await.expect("shut down server");

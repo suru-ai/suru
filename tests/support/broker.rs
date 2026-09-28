@@ -13,6 +13,12 @@ use suru::{protocol::SessionId, provider::BrokerHandoff};
 /// The MCP revision the client speaks, as the harnesses Suru hosts do today.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// The MCP revision Claude 2.1.283 speaks to a server whose `server/discover`
+/// offers it, as the Broker's does: no `initialize`, each request naming the
+/// revision and the client's capabilities in its own `_meta`
+/// (`docs/validation/0421-broker-smoke.md`).
+pub const MCP_INLINE_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// The MCP client a Provider harness is: JSON-RPC posted to the Broker
 /// endpoint under the bearer token its start request carried.
 pub struct McpClient {
@@ -21,6 +27,10 @@ pub struct McpClient {
     authorization: Option<String>,
     /// What every Tool call carries as its `_meta`, if anything.
     call_meta: Option<Value>,
+    /// The revision every request names, in its header and — speaking the
+    /// inline lifecycle — in its `_meta`.
+    protocol_version: &'static str,
+    inline_lifecycle: bool,
     next_id: u64,
 }
 
@@ -35,8 +45,20 @@ impl McpClient {
             endpoint: endpoint.to_owned(),
             authorization,
             call_meta: None,
+            protocol_version: MCP_PROTOCOL_VERSION,
+            inline_lifecycle: false,
             next_id: 0,
         }
+    }
+
+    /// This client, speaking the 2026-07-28 revision as Claude 2.1.283 does
+    /// once `server/discover` offers it: it opens with [`Self::discover`]
+    /// rather than [`Self::initialize`], and names the revision and its
+    /// capabilities in every request's `_meta`.
+    pub fn speaking_inline_lifecycle(mut self) -> Self {
+        self.protocol_version = MCP_INLINE_PROTOCOL_VERSION;
+        self.inline_lifecycle = true;
+        self
     }
 
     /// This client, carrying `meta` as the `_meta` of every Tool call it
@@ -54,17 +76,50 @@ impl McpClient {
             .post(&self.endpoint)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+            .header("mcp-protocol-version", self.protocol_version)
             .json(message);
         if let Some(authorization) = &self.authorization {
             request = request.header(AUTHORIZATION, authorization);
         }
+        // The revision's transport names each request's method — and a call's
+        // Tool — in headers of its own, for anything routing it to read.
+        if self.inline_lifecycle
+            && let Some(method) = message["method"].as_str()
+        {
+            request = request.header("mcp-method", method);
+            if method == "tools/call"
+                && let Some(tool) = message["params"]["name"].as_str()
+            {
+                request = request.header("mcp-name", tool);
+            }
+        }
         request.send().await.expect("reach the Broker endpoint")
     }
 
-    fn request_message(&mut self, method: &str, params: Value) -> (u64, Value) {
+    fn request_message(&mut self, method: &str, mut params: Value) -> (u64, Value) {
         self.next_id += 1;
         let id = self.next_id;
+        if self.inline_lifecycle {
+            let meta = params
+                .as_object_mut()
+                .expect("request params are an object")
+                .entry("_meta")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("a request's _meta is an object");
+            meta.insert(
+                "io.modelcontextprotocol/protocolVersion".to_owned(),
+                json!(self.protocol_version),
+            );
+            meta.insert(
+                "io.modelcontextprotocol/clientCapabilities".to_owned(),
+                json!({}),
+            );
+            meta.insert(
+                "io.modelcontextprotocol/clientInfo".to_owned(),
+                client_info(),
+            );
+        }
         (
             id,
             json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
@@ -76,7 +131,11 @@ impl McpClient {
     pub async fn request(&mut self, method: &str, params: Value) -> Value {
         let (id, message) = self.request_message(method, params);
         let response = self.post(&message).await;
-        assert_eq!(response.status(), StatusCode::OK, "{method} is answered");
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = response.text().await.unwrap_or_default();
+            panic!("{method} is answered, not refused with {status}: {body}");
+        }
         let answer = json_rpc_response(response, id).await;
         answer
             .get("result")
@@ -89,6 +148,13 @@ impl McpClient {
     pub async fn initialize_status(&mut self) -> StatusCode {
         let (_, message) = self.request_message("initialize", initialize_params());
         self.post(&message).await.status()
+    }
+
+    /// What the endpoint says of itself to a client that asks before it
+    /// speaks — the revisions it implements among them — as Claude 2.1.283
+    /// asks every server it connects to.
+    pub async fn discover(&mut self) -> Value {
+        self.request("server/discover", json!({})).await
     }
 
     /// The handshake every MCP session opens with: `initialize`, then the
@@ -172,8 +238,12 @@ fn initialize_params() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": {},
-        "clientInfo": { "name": "suru-broker-test", "version": "0" },
+        "clientInfo": client_info(),
     })
+}
+
+fn client_info() -> Value {
+    json!({ "name": "suru-broker-test", "version": "0" })
 }
 
 /// The JSON-RPC response `id` names, whether the endpoint answered with JSON

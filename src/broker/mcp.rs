@@ -26,9 +26,9 @@ use axum::{
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-        RequestMetaObject, ServerCapabilities, Tool, ToolAnnotations,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        Implementation, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, RequestMetaObject, ServerCapabilities, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -169,14 +169,27 @@ impl ServerHandler for BrokerServer {
             .with_instructions(INSTRUCTIONS)
     }
 
+    /// Every Tool the Broker serves, saying — as the 2026-07-28 revision
+    /// requires of every list — how long the list stays fresh and who may
+    /// cache it. Claude 2.1.283 speaks that revision to the Broker once
+    /// `server/discover` offers it, and registers none of the Tools from a list
+    /// that says neither (`docs/validation/0421-broker-smoke.md`); earlier
+    /// revisions carry no such fields, and their clients pass over them.
+    ///
+    /// The answer promises nothing a harness could hold on to: it is stale at
+    /// once, so a harness asks again whenever it wants the list, and it is for
+    /// the holder of the token that asked alone. rmcp answers
+    /// `server/discover` the same way.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(
-            BrokerTool::ALL.into_iter().map(described).collect(),
-        ))
+        Ok(
+            ListToolsResult::with_all_items(BrokerTool::ALL.into_iter().map(described).collect())
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private),
+        )
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
