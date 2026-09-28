@@ -236,6 +236,15 @@ impl AttachmentStore {
         self.repository.attachment_bytes(id).await
     }
 
+    /// The type an Attachment's bytes were sniffed as and their length,
+    /// where one is stored under that id, without reading the bytes.
+    pub(crate) async fn type_and_length(
+        &self,
+        id: AttachmentId,
+    ) -> Result<Option<(String, u64)>, StorageError> {
+        self.repository.attachment_type_and_length(id).await
+    }
+
     /// What a Provider is handed of a Prompt's Attachments as that Prompt is
     /// delivered: the bytes of each one its bindings name, read now, in the
     /// order its label first stands in the text, so a label standing twice

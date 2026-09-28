@@ -111,6 +111,32 @@ impl StorageRepository {
         .await
     }
 
+    /// The type an Attachment's bytes were sniffed as and how many of them
+    /// there are, where one is stored under that id, read without its bytes.
+    pub(crate) async fn attachment_type_and_length(
+        &self,
+        id: AttachmentId,
+    ) -> Result<Option<(String, u64)>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("read Attachment length", move || {
+            let mut connection = super::connect(&path)?;
+            let stored = attachments::table
+                .filter(attachments::id.eq(id.as_str()))
+                .select((attachments::mime_type, attachments::byte_length))
+                .first::<(String, i64)>(&mut connection)
+                .optional()
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            stored
+                .map(|(mime_type, byte_length)| {
+                    u64::try_from(byte_length)
+                        .map(|byte_length| (mime_type, byte_length))
+                        .map_err(|error| StorageError::Read(error.to_string()))
+                })
+                .transpose()
+        })
+        .await
+    }
+
     /// Stamps every one of the named Attachments that is stored as
     /// referenced now, in one statement, and answers what each of them that
     /// is stored was described as when it was uploaded, in id order. Once

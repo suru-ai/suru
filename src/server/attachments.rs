@@ -1,11 +1,15 @@
 //! The Attachment routes: uploading an image's bytes, fetching them back by
-//! id, and refusing a Prompt whose bindings cannot stand (ADR 0037).
+//! id, answering whether they are stored without sending them, and refusing
+//! a Prompt whose bindings cannot stand (ADR 0037).
 
 use axum::{
     Json,
     body::to_bytes,
     extract::{Path as AxumPath, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
 };
 
@@ -78,16 +82,59 @@ pub(super) async fn fetch_attachment(
             };
             ([(CONTENT_TYPE, content_type)], bytes).into_response()
         }
-        Ok(None) => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::AttachmentNotFound,
-            format!("Attachment {attachment_id} is not stored on this Server"),
-        ),
+        Ok(None) => attachment_not_found(&attachment_id),
         Err(error) => {
             tracing::warn!("Attachment could not be read: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Answers whether an Attachment is stored, with the type and length its
+/// fetch would answer, without reading or sending its bytes: what a client
+/// asks before offering a recalled Prompt's Attachments again.
+pub(super) async fn head_attachment(
+    State(state): State<AppState>,
+    AxumPath(attachment_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let attachment_id = AttachmentId::new(attachment_id);
+    match state
+        .attachments
+        .type_and_length(attachment_id.clone())
+        .await
+    {
+        Ok(Some((mime_type, byte_length))) => {
+            let Ok(content_type) = HeaderValue::from_str(&mime_type) else {
+                tracing::warn!("Attachment {attachment_id} is stored with an unusable type");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            (
+                [
+                    (CONTENT_TYPE, content_type),
+                    (CONTENT_LENGTH, HeaderValue::from(byte_length)),
+                ],
+                (),
+            )
+                .into_response()
+        }
+        Ok(None) => attachment_not_found(&attachment_id),
+        Err(error) => {
+            tracing::warn!("Attachment could not be read: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn attachment_not_found(attachment_id: &AttachmentId) -> Response {
+    session_error_response(
+        StatusCode::NOT_FOUND,
+        SessionErrorCode::AttachmentNotFound,
+        format!("Attachment {attachment_id} is not stored on this Server"),
+    )
 }
 
 /// Refuses a Prompt whose Attachment bindings cannot stand: too many of them,

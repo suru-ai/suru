@@ -418,6 +418,12 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn attachment_exists(&self, attachment_id: &AttachmentId) -> Result<bool> {
+        self.session_commands()
+            .attachment_exists(attachment_id)
+            .await
+    }
+
     pub async fn update_agent_selection(
         &self,
         session_id: SessionId,
@@ -710,6 +716,10 @@ impl OutlookClient {
         attachment_id: &AttachmentId,
     ) -> Result<(String, Vec<u8>)> {
         self.commands.fetch_attachment(attachment_id).await
+    }
+
+    pub async fn attachment_exists(&self, attachment_id: &AttachmentId) -> Result<bool> {
+        self.commands.attachment_exists(attachment_id).await
     }
 
     pub async fn update_agent_selection(
@@ -1093,6 +1103,33 @@ impl SessionCommandClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok((mime_type, bytes))
+    }
+
+    /// Whether the Server stores an Attachment under `attachment_id`, asked
+    /// with a `HEAD` of its fetch route so none of its bytes are sent. A
+    /// `HEAD` answer has no body to name why it was refused, so every Not
+    /// Found reads as the Attachment not being stored there.
+    pub(crate) async fn attachment_exists(&self, attachment_id: &AttachmentId) -> Result<bool> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .head(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/attachments/{attachment_id}"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Attachment check")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        Err(anyhow!("Attachment check failed with HTTP {status}"))
     }
 
     pub(crate) async fn update_agent_selection(

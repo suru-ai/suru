@@ -15,7 +15,10 @@ use crate::{
 };
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
-use reqwest::{StatusCode, header::CONTENT_TYPE};
+use reqwest::{
+    StatusCode,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+};
 use std::sync::Arc;
 use suru::{
     protocol::{
@@ -60,6 +63,15 @@ async fn fetch(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> reqwest::Re
         .send()
         .await
         .expect("send fetch")
+}
+
+async fn head(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> reqwest::Response {
+    reqwest::Client::new()
+        .head(format!("{}/v1/attachments/{id}", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send HEAD")
 }
 
 async fn fetched(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> (String, Vec<u8>) {
@@ -362,6 +374,92 @@ async fn an_attachment_is_fetched_by_id_with_its_sniffed_type_and_an_unknown_id_
     server.shutdown().await.expect("shut down server");
 }
 
+/// Whether an Attachment is stored is asked with a `HEAD` of its fetch
+/// route, which answers the type and length a fetch would without the bytes.
+#[tokio::test]
+async fn a_head_of_an_attachment_answers_whether_it_is_stored_without_its_bytes() {
+    use suru::{
+        managed_client::{ManagedClient, ManagedClientConfig},
+        protocol::Outlook,
+    };
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-head-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let bytes = webp(1200, 900);
+    let attachment = uploaded(&descriptor, bytes.clone()).await;
+
+    let stored = head(&descriptor, &attachment.id).await;
+    assert_eq!(stored.status(), StatusCode::OK);
+    assert_eq!(stored.headers()[CONTENT_TYPE], "image/webp");
+    assert_eq!(
+        stored.headers()[CONTENT_LENGTH],
+        bytes.len().to_string().as_str()
+    );
+    assert!(
+        stored
+            .bytes()
+            .await
+            .expect("read the HEAD answer")
+            .is_empty(),
+        "a HEAD answer carries no bytes"
+    );
+    let unknown = content_hash(b"never uploaded");
+    let missing = head(&descriptor, &unknown).await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(
+        missing
+            .bytes()
+            .await
+            .expect("read the HEAD answer")
+            .is_empty()
+    );
+    let unauthenticated = reqwest::Client::new()
+        .head(format!(
+            "{}/v1/attachments/{}",
+            descriptor.base_url, attachment.id
+        ))
+        .send()
+        .await
+        .expect("send unauthenticated HEAD");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    // The managed client asks the same way, of its own Server or through an
+    // Outlook.
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "attachment-head-test")
+            .expect("configure managed client"),
+    )
+    .await
+    .expect("connect managed client");
+    receive_managed_client_initial_state(&mut client).await;
+    assert!(
+        client
+            .attachment_exists(&attachment.id)
+            .await
+            .expect("ask after a stored Attachment")
+    );
+    assert!(
+        !client
+            .attachment_exists(&unknown)
+            .await
+            .expect("ask after an unknown Attachment")
+    );
+    assert!(
+        client
+            .outlook(Outlook::Local)
+            .attachment_exists(&attachment.id)
+            .await
+            .expect("ask through the Outlook")
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn turn_beginning_and_steer_prompts_carry_their_bindings_to_every_client() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -615,6 +713,78 @@ async fn the_provider_receives_each_attachments_bytes_in_label_order_on_turn_sta
         ]
     );
     steer.succeed();
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    drop(provider_session);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Prompt recalled from composer history is sent again with the very
+/// bindings it was first sent with: it is admitted, and its Attachments reach
+/// the Provider again, having been sent once spending nothing.
+#[tokio::test]
+async fn a_prompt_resent_with_the_same_bindings_hands_the_provider_its_attachments_again() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "attachment-resend-test").expect("configure server"),
+        runtime.clone(),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let bytes = png(640, 480);
+    let screenshot = uploaded(&descriptor, bytes.clone()).await;
+    let text = "See [Image 1]";
+    let bindings = vec![bound(&screenshot, text, "[Image 1]")];
+
+    let created = create_session(
+        &descriptor,
+        &creation(workspace.path(), text, bindings.clone()),
+    )
+    .await;
+    let session_id = created.session.id;
+    let mut provider_session = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-attachments", "high", "fast"),
+        });
+    let first = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider");
+    assert_eq!(
+        first.attachments(),
+        [delivered("[Image 1]", "image/png", &bytes)]
+    );
+    first.succeed();
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    read_session_until(&client, &descriptor, session_id, "idle", |snapshot| {
+        snapshot.session.working_since.is_none()
+    })
+    .await;
+
+    let resent = admitted(
+        &descriptor,
+        session_id,
+        text,
+        bindings.clone(),
+        PromptDelivery::Queue,
+    )
+    .await;
+    assert_eq!(resent.attachments, bindings);
+    let again = timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the resent Turn reaches the Provider");
+    assert_eq!(again.prompt(), text);
+    assert_eq!(
+        again.attachments(),
+        [delivered("[Image 1]", "image/png", &bytes)]
+    );
+    again.succeed();
 
     provider_session.emit(ProviderEvent::TurnCompleted);
     drop(provider_session);

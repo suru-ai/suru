@@ -841,7 +841,7 @@ pub async fn spawn_with_source_control(
         .route("/v1/attachments", post(attachments::upload_attachment))
         .route(
             "/v1/attachments/{attachment_id}",
-            get(attachments::fetch_attachment),
+            get(attachments::fetch_attachment).head(attachments::head_attachment),
         )
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .merge(
