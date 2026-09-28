@@ -17,16 +17,18 @@ use suru::{
     protocol::{
         AdmitPromptRequest, AgentId, AgentIdentity, AttachmentBinding, AttachmentDescriptor,
         AttachmentId, AttachmentKind, CreateSessionRequest, InitialPrompt, Message, MessageRole,
-        Prompt, PromptDelivery, PromptId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
+        Prompt, PromptDelivery, PromptId, PromptStatus, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionId,
         SessionRevision, SessionSnapshot, SessionUpdate, TextSpan,
     },
     provider::ProviderEvent,
-    server::{self, ServerConfig, ServerTimings},
+    server::{self, ManualClock, ServerClock, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
 
 const MEBIBYTE: usize = 1024 * 1024;
+const MINUTE: Duration = Duration::from_secs(60);
+const HOUR: Duration = Duration::from_secs(60 * 60);
 
 fn png(width: u32, height: u32) -> Vec<u8> {
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -774,20 +776,37 @@ async fn bindings_and_bytes_survive_a_server_restart() {
         .expect("stop replacement server");
 }
 
-/// A server whose Attachments outlive the deletion of the last Session
-/// referencing them for `grace` after their last upload.
-async fn spawn_with_attachment_grace(
+/// A server on the given timings, whose Provider fails every Turn so each
+/// Session settles as soon as its Prompt is delivered.
+async fn spawn_with_timings(
     state_dir: &std::path::Path,
     channel: &str,
-    grace: Duration,
+    timings: ServerTimings,
 ) -> server::RunningServer {
     server::spawn_with_provider_and_timings(
         ServerConfig::new(state_dir, channel).expect("configure server"),
         Arc::new(FailingProviderRuntime),
-        ServerTimings::default().with_attachment_grace(grace),
+        timings,
     )
     .await
     .expect("spawn server")
+}
+
+/// A server measuring an hour's Attachment grace by a clock the test moves.
+async fn spawn_with_manual_clock(
+    state_dir: &std::path::Path,
+    channel: &str,
+) -> (server::RunningServer, ManualClock) {
+    let (clock, hand) = ServerClock::manual();
+    let server = spawn_with_timings(
+        state_dir,
+        channel,
+        ServerTimings::default()
+            .with_attachment_grace(HOUR)
+            .with_clock(clock),
+    )
+    .await;
+    (server, hand)
 }
 
 /// Creates a Session whose first Prompt binds `bindings`, and waits for its
@@ -827,9 +846,12 @@ async fn delete_session(descriptor: &RuntimeDescriptor, session_id: SessionId) {
 async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_it_references() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server =
-        spawn_with_attachment_grace(state_dir.path(), "attachment-deletion-test", Duration::ZERO)
-            .await;
+    let server = spawn_with_timings(
+        state_dir.path(),
+        "attachment-deletion-test",
+        ServerTimings::default().with_attachment_grace(Duration::ZERO),
+    )
+    .await;
     let descriptor = server.descriptor().clone();
     let own = uploaded(&descriptor, png(10, 10)).await;
     let shared = uploaded(&descriptor, gif(20, 20)).await;
@@ -925,11 +947,10 @@ async fn deleting_a_session_within_the_grace_period_leaves_its_attachments_for_t
 
 #[tokio::test]
 async fn uploading_an_attachment_again_restarts_its_grace_period() {
-    let grace = Duration::from_millis(500);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server =
-        spawn_with_attachment_grace(state_dir.path(), "attachment-reupload-test", grace).await;
+    let (server, clock) =
+        spawn_with_manual_clock(state_dir.path(), "attachment-reupload-test").await;
     let descriptor = server.descriptor().clone();
     let again = uploaded(&descriptor, png(10, 10)).await;
     let once = uploaded(&descriptor, gif(20, 20)).await;
@@ -945,10 +966,9 @@ async fn uploading_an_attachment_again_restarts_its_grace_period() {
     )
     .await;
 
-    // Both are past their grace period once this much has passed since
-    // their upload; only one is uploaded again, as a client binding it anew
-    // would.
-    tokio::time::sleep(grace + Duration::from_millis(100)).await;
+    // Both are past their grace period now; only one is uploaded again, as a
+    // client binding it anew would.
+    clock.advance(HOUR + MINUTE);
     let reuploaded = upload(&descriptor, "image/png", png(10, 10)).await;
     assert_eq!(reuploaded.status(), StatusCode::OK);
     assert_eq!(
@@ -970,6 +990,95 @@ async fn uploading_an_attachment_again_restarts_its_grace_period() {
         StatusCode::NOT_FOUND,
         "the Attachment not uploaded again is past its grace period"
     );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn admitting_a_prompt_restarts_the_grace_period_of_the_attachments_it_binds() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (server, clock) =
+        spawn_with_manual_clock(state_dir.path(), "attachment-admission-grace-test").await;
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let admitted_again = uploaded(&descriptor, png(10, 10)).await;
+    let created_again = uploaded(&descriptor, jpeg(30, 30)).await;
+    let once = uploaded(&descriptor, gif(20, 20)).await;
+    let text = "[Image 1], [Image 2], and [Image 3]";
+    let first = settled_session(
+        &descriptor,
+        workspace.path(),
+        text,
+        vec![
+            bound(&admitted_again, text, "[Image 1]"),
+            bound(&created_again, text, "[Image 2]"),
+            bound(&once, text, "[Image 3]"),
+        ],
+    )
+    .await;
+    let later = settled_session(&descriptor, workspace.path(), "Begin plainly", Vec::new()).await;
+
+    // Every upload is past its grace period now. Neither Attachment is
+    // uploaded again: each is bound as it stands, as a Prompt recalled from
+    // history would bind it.
+    clock.advance(HOUR + MINUTE);
+    let again_text = "Again: [Image 1]";
+    let readmitted = admitted(
+        &descriptor,
+        later,
+        again_text,
+        vec![bound(&admitted_again, again_text, "[Image 1]")],
+        PromptDelivery::Queue,
+    )
+    .await;
+    read_session_until(&client, &descriptor, later, "settled again", |snapshot| {
+        snapshot.session.working_since.is_none()
+            && snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == readmitted.id && prompt.status != PromptStatus::Pending)
+    })
+    .await;
+    let recreated = settled_session(
+        &descriptor,
+        workspace.path(),
+        "[Image 1]",
+        vec![bound(&created_again, "[Image 1]", "[Image 1]")],
+    )
+    .await;
+
+    delete_session(&descriptor, first).await;
+    assert_eq!(
+        fetch(&descriptor, &once.id).await.status(),
+        StatusCode::NOT_FOUND,
+        "an Attachment no admission bound again is past its grace period"
+    );
+    for kept in [&admitted_again, &created_again] {
+        assert_eq!(fetch(&descriptor, &kept.id).await.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        user_message(
+            &crate::support::read_session(&descriptor, later).await,
+            again_text
+        )
+        .expect("the admitted Prompt's user Message stands")
+        .attachments,
+        readmitted.attachments,
+        "the later Session still carries its binding"
+    );
+
+    // With every Session that binds them gone, their admission alone keeps
+    // them: each was stamped referenced when its Prompt was admitted.
+    delete_session(&descriptor, later).await;
+    delete_session(&descriptor, recreated).await;
+    for kept in [&admitted_again, &created_again] {
+        assert_eq!(
+            fetch(&descriptor, &kept.id).await.status(),
+            StatusCode::OK,
+            "an Attachment bound within the grace period is the sweep's to reclaim"
+        );
+    }
 
     server.shutdown().await.expect("shut down server");
 }

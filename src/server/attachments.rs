@@ -92,7 +92,7 @@ pub(super) async fn fetch_attachment(
 
 /// Refuses a Prompt whose Attachment bindings cannot stand: too many of them,
 /// a label its text does not carry where it is bound, or an Attachment this
-/// Server has not stored.
+/// Server has not stored. Reads only, so it may run before any other work.
 // A rejection is the Response the handler returns as-is, which is the axum
 // idiom; boxing it would only add an allocation to every refusal.
 #[allow(clippy::result_large_err)]
@@ -100,11 +100,34 @@ pub(super) async fn check_prompt_attachments(
     state: &AppState,
     prompt: &InitialPrompt,
 ) -> Result<(), Response> {
-    match state
-        .attachments
-        .check_prompt(&prompt.text, &prompt.attachments)
-        .await
-    {
+    binding_response(
+        state
+            .attachments
+            .check_prompt(&prompt.text, &prompt.attachments)
+            .await,
+    )
+}
+
+/// Refuses a Prompt as [`check_prompt_attachments`] does, and otherwise
+/// stamps every Attachment it binds as referenced now. Runs right before the
+/// Prompt is recorded, after every await of its admission, so no Session's
+/// deletion can reclaim a bound Attachment before the flush that joins it.
+#[allow(clippy::result_large_err)]
+pub(super) async fn reference_prompt_attachments(
+    state: &AppState,
+    prompt: &InitialPrompt,
+) -> Result<(), Response> {
+    binding_response(
+        state
+            .attachments
+            .reference_prompt(&prompt.text, &prompt.attachments)
+            .await,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn binding_response(checked: Result<(), PromptAttachmentError>) -> Result<(), Response> {
+    match checked {
         Ok(()) => Ok(()),
         Err(PromptAttachmentError::Refused(refusal)) => {
             let code = match refusal {

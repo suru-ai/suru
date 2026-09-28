@@ -2484,7 +2484,7 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
         shutdown_grace: Duration::from_millis(5),
         ..ServerTimings::default()
     };
-    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+    let serving = server::spawn_with_timings(serving_config.clone(), timings.clone())
         .await
         .expect("spawn Serving Server");
     let mut serving_client = ManagedClient::connect(
@@ -2522,7 +2522,7 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     let connecting = server::spawn_with_timings(
         ServerConfig::new(connecting_state.path(), "remote-version-connecting")
             .expect("configure connecting Server"),
-        timings,
+        timings.clone(),
     )
     .await
     .expect("spawn connecting Server");
@@ -3055,7 +3055,7 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         shutdown_grace: Duration::from_millis(5),
         ..ServerTimings::default()
     };
-    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+    let serving = server::spawn_with_timings(serving_config.clone(), timings.clone())
         .await
         .expect("spawn Serving Server");
     let mut serving_client = ManagedClient::connect(
@@ -3092,7 +3092,7 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         ServerConfig::new(connecting_state.path(), "durable-pairing-connecting")
             .expect("configure connecting Server")
             .with_data_dir(connecting_data.path());
-    let connecting = server::spawn_with_timings(connecting_config.clone(), timings)
+    let connecting = server::spawn_with_timings(connecting_config.clone(), timings.clone())
         .await
         .expect("spawn connecting Server");
     let mut connecting_client = ManagedClient::connect(
@@ -3124,10 +3124,10 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
     connecting.shutdown().await.unwrap();
     serving.shutdown().await.unwrap();
 
-    let serving = server::spawn_with_timings(serving_config.clone(), timings)
+    let serving = server::spawn_with_timings(serving_config.clone(), timings.clone())
         .await
         .expect("restart Serving Server");
-    let connecting = server::spawn_with_timings(connecting_config.clone(), timings)
+    let connecting = server::spawn_with_timings(connecting_config.clone(), timings.clone())
         .await
         .expect("restart connecting Server");
     let mut serving_client = ManagedClient::connect(
@@ -3530,7 +3530,7 @@ async fn a_pinned_serving_setting_is_adopted_at_each_startup_with_the_same_ident
         shutdown_grace: Duration::from_millis(5),
         ..ServerTimings::default()
     };
-    let first = server::spawn_with_timings(config.clone(), timings)
+    let first = server::spawn_with_timings(config.clone(), timings.clone())
         .await
         .expect("spawn first Serving server");
     let first_address = first

@@ -62,11 +62,13 @@ use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 mod attachments;
 mod reclaim;
 
+pub use crate::clock::{ManualClock, ServerClock};
+
 pub type ServerConfig = RuntimeConfig;
 
 /// Wall-clock intervals the server schedules against; injectable so tests can
 /// observe periodic behavior without waiting out production-scale delays.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
     pub checkout_observation_interval: Duration,
@@ -103,10 +105,12 @@ pub struct ServerTimings {
     /// How often a Broker wait still waiting reports progress, keeping the
     /// idle window of the harness that called it open (ADR 0034).
     pub broker_wait_progress_interval: Duration,
-    /// How long after its last upload an Attachment is left in place even
-    /// once no Session references it, since a Prompt still in admission may
-    /// be about to bind it (ADR 0037).
+    /// How long after it was last uploaded or bound by an admitted Prompt an
+    /// Attachment is left in place even once no Session references it, since
+    /// a Prompt still in admission may be about to bind it (ADR 0037).
     pub attachment_grace: Duration,
+    /// Where the Server reads the time an Attachment's grace is measured by.
+    pub clock: ServerClock,
 }
 
 impl Default for ServerTimings {
@@ -127,6 +131,7 @@ impl Default for ServerTimings {
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
+            clock: ServerClock::default(),
         }
     }
 }
@@ -177,10 +182,16 @@ impl ServerTimings {
         self
     }
 
-    /// Sets how long after its last upload an Attachment outlives the
-    /// deletion of the last Session referencing it.
+    /// Sets how long after it was last uploaded or bound an Attachment
+    /// outlives the deletion of the last Session referencing it.
     pub fn with_attachment_grace(mut self, grace: Duration) -> Self {
         self.attachment_grace = grace;
+        self
+    }
+
+    /// Sets the clock an Attachment's grace is measured by.
+    pub fn with_clock(mut self, clock: ServerClock) -> Self {
+        self.clock = clock;
         self
     }
 }
@@ -580,7 +591,8 @@ pub async fn spawn_with_source_control(
     let repository = StorageRepository::open(config.data_dir())
         .await
         .context("initialize Session repository")?
-        .with_attachment_grace(timings.attachment_grace);
+        .with_attachment_grace(timings.attachment_grace)
+        .with_clock(timings.clock.clone());
     let persisted_sessions = repository
         .load_sessions()
         .await
@@ -683,7 +695,7 @@ pub async fn spawn_with_source_control(
         settings.subscribe(),
         workspace_discovery_rx.clone(),
         provider_shutdown_rx.clone(),
-        timings,
+        timings.clone(),
     );
     sessions.observe_checkouts(
         source_control.clone(),
@@ -2213,10 +2225,11 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     }
 
     // Checked again after every await above: the first check refuses a bad
-    // binding before any checkout work, and this one narrows the window in
-    // which a Session's deletion could reclaim a bound Attachment to this one
-    // read. The grace after an upload closes what remains of it (ADR 0037).
-    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+    // binding before any checkout work and reads only, while this one also
+    // stamps every bound Attachment as referenced now, which keeps a Session's
+    // deletion from reclaiming it before the flush joins it (ADR 0037).
+    if let Err(response) = attachments::reference_prompt_attachments(&state, &request.prompt).await
+    {
         return response;
     }
 
@@ -2656,10 +2669,11 @@ async fn admit_prompt(
     }
 
     // Checked again after every await above: the first check refuses a bad
-    // binding before any checkout work, and this one narrows the window in
-    // which a Session's deletion could reclaim a bound Attachment to this one
-    // read. The grace after an upload closes what remains of it (ADR 0037).
-    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+    // binding before any checkout work and reads only, while this one also
+    // stamps every bound Attachment as referenced now, which keeps a Session's
+    // deletion from reclaiming it before the flush joins it (ADR 0037).
+    if let Err(response) = attachments::reference_prompt_attachments(&state, &request.prompt).await
+    {
         return response;
     }
 

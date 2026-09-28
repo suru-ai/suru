@@ -69,7 +69,7 @@ diesel::table! {
         byte_length -> BigInt,
         width -> Nullable<BigInt>,
         height -> Nullable<BigInt>,
-        uploaded_at -> BigInt,
+        referenced_at -> BigInt,
         bytes -> Binary,
     }
 }
@@ -168,9 +168,11 @@ diesel::table! {
 #[derive(Clone)]
 pub(crate) struct StorageRepository {
     database_path: Arc<PathBuf>,
-    /// How long after its last upload an Attachment outlives the deletion of
-    /// the last Session referencing it.
+    /// How long after it was last uploaded or bound an Attachment outlives
+    /// the deletion of the last Session referencing it.
     attachment_grace: std::time::Duration,
+    /// Where the time an Attachment's grace is measured by is read.
+    clock: crate::clock::ServerClock,
 }
 
 #[derive(Clone)]
@@ -334,16 +336,23 @@ impl StorageRepository {
         let repository = Self {
             database_path: Arc::new(data_root.join(DATABASE_FILE)),
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
+            clock: crate::clock::ServerClock::default(),
         };
         let database_path = repository.database_path.as_ref().clone();
         on_blocking_task("startup", move || initialize_database(&database_path)).await?;
         Ok(repository)
     }
 
-    /// Leaves an Attachment in place for `grace` after its last upload, even
-    /// once the last Session referencing it is deleted.
+    /// Leaves an Attachment in place for `grace` after it was last uploaded
+    /// or bound, even once the last Session referencing it is deleted.
     pub(crate) fn with_attachment_grace(mut self, grace: std::time::Duration) -> Self {
         self.attachment_grace = grace;
+        self
+    }
+
+    /// Measures an Attachment's grace by `clock`.
+    pub(crate) fn with_clock(mut self, clock: crate::clock::ServerClock) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -568,19 +577,23 @@ impl StorageRepository {
     }
 
     /// Deletes a Session's rows, and with them every Attachment it references
-    /// that no other Session does and that was last uploaded longer ago than
-    /// the grace period. A younger one may be bound by a Prompt still in
-    /// admission, so it waits for the orphan sweep instead.
+    /// that no other Session does and that was last uploaded or bound longer
+    /// ago than the grace period. A younger one may be bound by a Prompt still
+    /// in admission, so it waits for the orphan sweep instead.
     fn delete_session(&self, session_id: SessionId) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
         let id = session_id.to_string();
-        let uploaded_before = attachment_table::millis(SessionTimestamp::now())
+        let referenced_before = attachment_table::millis(self.clock.now())
             .saturating_sub(i64::try_from(self.attachment_grace.as_millis()).unwrap_or(i64::MAX));
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
                 let joined = attachment_table::session_attachment_ids(connection, &id)?;
                 diesel::delete(sessions::table.filter(sessions::id.eq(&id))).execute(connection)?;
-                attachment_table::delete_unjoined_attachments(connection, &joined, uploaded_before)
+                attachment_table::delete_unjoined_attachments(
+                    connection,
+                    &joined,
+                    referenced_before,
+                )
             })
             .map_err(|error| StorageError::Write {
                 session_id,

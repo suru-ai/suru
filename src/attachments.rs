@@ -5,11 +5,12 @@
 //! storage repository's.
 //!
 //! Nothing counts references to an Attachment. An Attachment's age is measured
-//! from its last upload — uploading bytes already stored uploads them again —
-//! and one younger than [`ATTACHMENT_GRACE`] is never reclaimed, neither by a
-//! Session's deletion nor by the orphan sweep. Every client uploads an image
-//! right before binding it, so an Attachment a Prompt still in admission binds
-//! is always that young.
+//! from when it was last referenced — uploaded, first or again, or bound by a
+//! Prompt being admitted — and one younger than [`ATTACHMENT_GRACE`] is never
+//! reclaimed, neither by a Session's deletion nor by the orphan sweep.
+//! Admission stamps every Attachment its Prompt binds just before recording
+//! the Prompt, so nothing can reclaim one between that moment and the flush
+//! that joins it to the Prompt's Session.
 
 mod image_header;
 
@@ -29,8 +30,8 @@ pub(crate) const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 /// The most Attachments one Prompt may bind.
 pub(crate) const MAX_ATTACHMENTS_PER_PROMPT: usize = 10;
 
-/// How long after its last upload an Attachment is left alone, whether or
-/// not any Session still references it.
+/// How long after it was last uploaded or bound an Attachment is left alone,
+/// whether or not any Session still references it.
 pub(crate) const ATTACHMENT_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// The most bytes the upload route reads: the per-image cap with headroom, so
@@ -230,11 +231,30 @@ impl AttachmentStore {
     }
 
     /// Whether a Prompt's bindings may be admitted: sound against its text,
-    /// and each naming an Attachment this Server has stored.
+    /// and each naming an Attachment this Server has stored. Reads only.
     pub(crate) async fn check_prompt(
         &self,
         text: &str,
         bindings: &[AttachmentBinding],
+    ) -> Result<(), PromptAttachmentError> {
+        self.check_or_reference(text, bindings, false).await
+    }
+
+    /// As [`Self::check_prompt`], stamping every Attachment the bindings name
+    /// as referenced now, for the moment right before the Prompt is recorded.
+    pub(crate) async fn reference_prompt(
+        &self,
+        text: &str,
+        bindings: &[AttachmentBinding],
+    ) -> Result<(), PromptAttachmentError> {
+        self.check_or_reference(text, bindings, true).await
+    }
+
+    async fn check_or_reference(
+        &self,
+        text: &str,
+        bindings: &[AttachmentBinding],
+        reference: bool,
     ) -> Result<(), PromptAttachmentError> {
         check_bindings(text, bindings).map_err(PromptAttachmentError::Refused)?;
         if bindings.is_empty() {
@@ -243,12 +263,15 @@ impl AttachmentStore {
         let named = bindings
             .iter()
             .map(|binding| binding.attachment_id.clone())
-            .collect::<HashSet<_>>();
-        let stored = self
-            .repository
-            .stored_attachments(named.iter().cloned().collect())
-            .await
-            .map_err(PromptAttachmentError::Storage)?;
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let stored = if reference {
+            self.repository.reference_attachments(named).await
+        } else {
+            self.repository.stored_attachments(named).await
+        }
+        .map_err(PromptAttachmentError::Storage)?;
         match bindings
             .iter()
             .find(|binding| !stored.contains(&binding.attachment_id))

@@ -3,6 +3,7 @@ pub mod approval;
 mod attachments;
 mod broker;
 pub mod build_identity;
+mod clock;
 mod errands;
 mod icon_catalog;
 pub mod logging;

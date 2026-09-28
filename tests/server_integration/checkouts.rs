@@ -131,9 +131,10 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     // under the Server, and the deletion fails with a sharing violation. What
     // is under test is the observation loop, which no Provider takes part in.
     let (runtime, mut provider) = provider_support::ControlledProvider::new();
-    let server = server::spawn_with_providers_and_timings(config.clone(), vec![runtime], timings)
-        .await
-        .unwrap();
+    let server =
+        server::spawn_with_providers_and_timings(config.clone(), vec![runtime], timings.clone())
+            .await
+            .unwrap();
     let first =
         ManagedClient::connect(ManagedClientConfig::new(state.path(), "checkout-stream").unwrap())
             .await
@@ -552,7 +553,7 @@ async fn discovery_persists_branch_and_detached_recovery_before_any_catalog_inte
         ..Default::default()
     }
     .with_checkout_observation_interval(Duration::from_millis(15));
-    let server = server::spawn_with_timings(config.clone(), timings)
+    let server = server::spawn_with_timings(config.clone(), timings.clone())
         .await
         .unwrap();
     let http = reqwest::Client::new();

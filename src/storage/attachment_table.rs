@@ -1,10 +1,11 @@
-//! Attachment rows: written when their bytes are first uploaded and stamped
-//! again on every later upload of the same bytes, joined to the Sessions whose
-//! stored Prompts and Messages bind them, and read back only when something
-//! asks for the bytes (ADR 0037). An Attachment's age, which decides whether
-//! it may be reclaimed, is measured from its last upload.
+//! Attachment rows: written when their bytes are first uploaded, stamped
+//! referenced again whenever the same bytes are uploaded again or a Prompt
+//! binding them is admitted, joined to the Sessions whose stored Prompts and
+//! Messages bind them, and read back only when something asks for the bytes
+//! (ADR 0037). An Attachment's age, which decides whether it may be reclaimed,
+//! is measured from that last reference.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use diesel::{SqliteConnection, dsl::exists, prelude::*};
 
@@ -20,18 +21,18 @@ struct AttachmentRow {
     byte_length: i64,
     width: Option<i64>,
     height: Option<i64>,
-    uploaded_at: i64,
+    referenced_at: i64,
     bytes: Vec<u8>,
 }
 
-/// A moment as the `uploaded_at` column stores it.
+/// A moment as the `referenced_at` column stores it.
 pub(super) fn millis(moment: SessionTimestamp) -> i64 {
     i64::try_from(moment.0).unwrap_or(i64::MAX)
 }
 
 impl StorageRepository {
     /// Stores an upload's bytes under its descriptor, or where the same bytes
-    /// already are, stamps them uploaded again now; answers whether this call
+    /// already are, stamps them referenced now; answers whether this call
     /// stored them.
     pub(crate) async fn store_attachment(
         &self,
@@ -39,6 +40,7 @@ impl StorageRepository {
         bytes: Vec<u8>,
     ) -> Result<bool, StorageError> {
         let path = self.database_path.clone();
+        let now = millis(self.clock.now());
         on_blocking_task("store Attachment", move || {
             let AttachmentKind::Image { width, height } = descriptor.kind;
             let row = AttachmentRow {
@@ -48,7 +50,7 @@ impl StorageRepository {
                     .map_err(|error| StorageError::WriteAttachment(error.to_string()))?,
                 width: Some(width.into()),
                 height: Some(height.into()),
-                uploaded_at: millis(SessionTimestamp::now()),
+                referenced_at: now,
                 bytes,
             };
             let mut connection = super::connect(&path)?;
@@ -61,7 +63,7 @@ impl StorageRepository {
                         .execute(connection)?;
                     if inserted == 0 {
                         diesel::update(attachments::table.filter(attachments::id.eq(&row.id)))
-                            .set(attachments::uploaded_at.eq(row.uploaded_at))
+                            .set(attachments::referenced_at.eq(row.referenced_at))
                             .execute(connection)?;
                     }
                     Ok(inserted == 1)
@@ -86,6 +88,40 @@ impl StorageRepository {
                 .first::<(String, Vec<u8>)>(&mut connection)
                 .optional()
                 .map_err(|error| StorageError::Read(error.to_string()))
+        })
+        .await
+    }
+
+    /// Stamps every one of the named Attachments that is stored as
+    /// referenced now, in one statement, and answers which of them are
+    /// stored. Once stamped, an Attachment stays within its grace period for
+    /// as long as it takes the Prompt binding it to be recorded and joined.
+    pub(crate) async fn reference_attachments(
+        &self,
+        ids: Vec<AttachmentId>,
+    ) -> Result<HashSet<AttachmentId>, StorageError> {
+        let path = self.database_path.clone();
+        let now = millis(self.clock.now());
+        on_blocking_task("reference Attachments", move || {
+            let named = ids
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect::<BTreeSet<_>>();
+            let mut connection = super::connect(&path)?;
+            let referenced =
+                diesel::update(attachments::table.filter(attachments::id.eq_any(&named)))
+                    .set(attachments::referenced_at.eq(now))
+                    .execute(&mut connection)
+                    .map_err(|error| StorageError::WriteAttachment(error.to_string()))?;
+            if referenced == named.len() {
+                return Ok(ids.into_iter().collect());
+            }
+            let stored = attachments::table
+                .filter(attachments::id.eq_any(&named))
+                .select(attachments::id)
+                .load::<String>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            Ok(stored.into_iter().map(AttachmentId::new).collect())
         })
         .await
     }
@@ -160,12 +196,12 @@ pub(super) fn session_attachment_ids(
 }
 
 /// Deletes those of the given Attachments that no Session is joined to any
-/// longer and that were last uploaded no later than `uploaded_before`. An
+/// longer and that were last referenced no later than `referenced_before`. An
 /// upload no Session has bound yet is never among them.
 pub(super) fn delete_unjoined_attachments(
     connection: &mut SqliteConnection,
     attachment_ids: &[String],
-    uploaded_before: i64,
+    referenced_before: i64,
 ) -> Result<(), diesel::result::Error> {
     if attachment_ids.is_empty() {
         return Ok(());
@@ -173,11 +209,49 @@ pub(super) fn delete_unjoined_attachments(
     diesel::delete(
         attachments::table
             .filter(attachments::id.eq_any(attachment_ids))
-            .filter(attachments::uploaded_at.le(uploaded_before))
+            .filter(attachments::referenced_at.le(referenced_before))
             .filter(diesel::dsl::not(exists(session_attachments::table.filter(
                 session_attachments::attachment_id.eq(attachments::id),
             )))),
     )
     .execute(connection)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn referencing_attachments_reports_which_are_stored() {
+        let directory = tempfile::tempdir().expect("create data directory");
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("open repository");
+        let bytes = b"GIF89a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+        let descriptor = crate::attachments::describe(&bytes).expect("describe fixture");
+        assert!(
+            repository
+                .store_attachment(descriptor.clone(), bytes)
+                .await
+                .expect("store fixture")
+        );
+        let missing = AttachmentId::new("never-uploaded");
+
+        let stored = repository
+            .reference_attachments(vec![descriptor.id.clone(), missing.clone()])
+            .await
+            .expect("reference Attachments");
+        assert_eq!(stored, HashSet::from([descriptor.id.clone()]));
+        assert!(
+            !stored.contains(&missing),
+            "a missing id is reported missing"
+        );
+
+        let all = repository
+            .reference_attachments(vec![descriptor.id.clone(), descriptor.id.clone()])
+            .await
+            .expect("reference one Attachment twice");
+        assert_eq!(all, HashSet::from([descriptor.id]));
+    }
 }
