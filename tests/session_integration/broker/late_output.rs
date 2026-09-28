@@ -8,6 +8,11 @@
 //! Provider's stream trailing on after it owes nothing to the brokered
 //! Subagents the interrupt stopped, nor to those that had settled before it,
 //! so it is discarded as it always was.
+//!
+//! A brokered Subagent settling hands its delegating Agent a Subagent Report,
+//! which steers a Turn at work or wakes an idle Agent into a Continuation of
+//! its own (ADR 0035): output that follows lands there, and the debt only
+//! decides where output goes when no Report reached the Provider.
 
 use super::stops::{acknowledge_interrupt, interrupt};
 use super::*;
@@ -68,9 +73,24 @@ fn continuation_holding<'a>(snapshot: &'a SessionSnapshot, text: &str) -> &'a su
 async fn late_output_owed_by_the_parent_after_its_brokered_subagent_settles_begins_a_continuation()
 {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let mut delegating = delegating(state_dir.path(), "broker-late-output-settled", None).await;
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let mut delegating = delegating(
+        state_dir.path(),
+        "broker-late-output-settled",
+        Some(config_dir.path()),
+    )
+    .await;
     let descriptor = delegating.descriptor.clone();
     let (child_id, child_provider) = settle_parent_while_child_works(&mut delegating).await;
+    // The user turns the parent's Provider off while its Subagent works. The
+    // connection it has runs on, but no Turn begins on it — the Continuation
+    // the Subagent's Report would wake included — so the Report waits for a
+    // Turn and the Subagent's settle stays owed.
+    mutate_setting(
+        &descriptor,
+        SettingMutation::ProviderClaudeEnabled { value: Some(false) },
+    )
+    .await;
 
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
@@ -126,6 +146,10 @@ async fn late_output_owed_by_the_parent_after_its_brokered_subagent_settles_begi
         settled.working_since(),
         None,
         "nothing in the tree works any more"
+    );
+    assert!(
+        delegating.caller_provider.try_next_turn().is_none(),
+        "and the Report woke nothing on the Provider the user turned off"
     );
 
     delegating
@@ -257,10 +281,11 @@ async fn an_interrupted_parents_trailing_output_begins_no_continuation_for_its_b
     let (settled_id, settled_provider) = spawn_working_child(&mut delegating).await;
     let (stopped_id, mut stopped_provider) = spawn_working_child(&mut delegating).await;
     // One Subagent settles while the parent's Turn works on, so output is
-    // owed for it until something answers it.
+    // owed for it until something answers it; its Report steers that Turn.
     settled_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    steered_by_the_report(&mut delegating.caller_provider, settled_id).await;
     read_until(
         &descriptor,
         delegating.caller,
@@ -342,6 +367,7 @@ async fn interrupting_a_parent_whose_brokered_subagents_outlive_its_turn_leaves_
     settled_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    steered_by_the_report(&mut delegating.caller_provider, settled_id).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
@@ -445,6 +471,7 @@ async fn an_interrupt_carried_down_leaves_a_brokered_subagents_trailing_output_n
     grandchild_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    steered_by_the_report(&mut child_provider, grandchild_id).await;
     read_until(
         &descriptor,
         child_id,
@@ -494,7 +521,7 @@ async fn a_parents_stray_output_is_owed_nothing_for_the_brokered_subagent_its_br
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-late-output-grandchild", None).await;
     let descriptor = delegating.descriptor.clone();
-    delegating
+    let child_id = delegating
         .client
         .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
         .await;
@@ -522,11 +549,13 @@ async fn a_parents_stray_output_is_owed_nothing_for_the_brokered_subagent_its_br
     )
     .await;
 
-    // The Subagent settles, leaving what it delegated working, and the
-    // parent's Provider works on for the Subagent it heard settle.
+    // The Subagent settles, leaving what it delegated working, and its Report
+    // steers the parent's working Turn; the parent's Provider works on for the
+    // Subagent it heard settle.
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)

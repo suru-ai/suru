@@ -107,6 +107,9 @@ async fn deleting_the_parent_closes_both_actors_and_removes_both_sessions() {
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    // Its Report wakes the idle parent, which reads Working again until the
+    // Continuation the Report woke settles.
+    wake_for_the_report(&mut delegating.caller_provider, child_id).await;
     read_until(
         &descriptor,
         delegating.caller,

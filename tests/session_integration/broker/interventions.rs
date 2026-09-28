@@ -525,6 +525,20 @@ async fn declining_and_interrupting_a_brokered_subagents_approval_ends_its_turn_
         TurnStatus::Active,
         "the parent's Turn works on"
     );
+    // The Subagent was stopped on its own account, by its own Decision, so
+    // its Report tells the parent's working Turn it was stopped.
+    let steer = timeout(PROGRESS_DEADLINE, delegating.caller_provider.next_steer())
+        .await
+        .expect("the Subagent's Report steers the parent's working Turn");
+    assert_eq!(
+        steer
+            .reports()
+            .iter()
+            .map(|report| (report.subagent, report.outcome))
+            .collect::<Vec<_>>(),
+        [(child_id, suru::provider::SubagentReportOutcome::Stopped)]
+    );
+    steer.succeed();
     let child = read_session(&descriptor, child_id).await;
     assert_eq!(child.turns[0].status, TurnStatus::Interrupted);
     assert!(matches!(

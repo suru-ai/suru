@@ -57,6 +57,8 @@ async fn monitor_one_watch_each(
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
+    // The Subagent's Report steers the parent's Turn, still working.
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
