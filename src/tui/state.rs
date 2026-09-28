@@ -3411,6 +3411,7 @@ impl TuiState {
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
             watches: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 

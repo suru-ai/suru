@@ -520,6 +520,7 @@ pub fn failed_session_snapshot(
         watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -578,6 +579,7 @@ pub fn selected_session_snapshot(
         watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -618,6 +620,7 @@ pub fn navigable_session_snapshot(
         watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
+        attachments: Vec::new(),
     };
     for section in 1..=section_count {
         let prompt_id = PromptId::new();

@@ -14,7 +14,7 @@ use crate::{
     attachments::{
         BindingRefusal, PromptAttachmentError, UPLOAD_BODY_LIMIT, UploadError, UploadRefusal,
     },
-    protocol::{AttachmentId, InitialPrompt, SessionErrorCode},
+    protocol::{AttachmentDescriptor, AttachmentId, InitialPrompt, SessionErrorCode},
 };
 
 /// Stores the request body's bytes as an Attachment and answers with its
@@ -109,14 +109,15 @@ pub(super) async fn check_prompt_attachments(
 }
 
 /// Refuses a Prompt as [`check_prompt_attachments`] does, and otherwise
-/// stamps every Attachment it binds as referenced now. Runs right before the
+/// stamps every Attachment it binds as referenced now, answering the
+/// descriptors the Session records beside the Prompt. Runs right before the
 /// Prompt is recorded, after every await of its admission, so no Session's
 /// deletion can reclaim a bound Attachment before the flush that joins it.
 #[allow(clippy::result_large_err)]
 pub(super) async fn reference_prompt_attachments(
     state: &AppState,
     prompt: &InitialPrompt,
-) -> Result<(), Response> {
+) -> Result<Vec<AttachmentDescriptor>, Response> {
     binding_response(
         state
             .attachments
@@ -126,9 +127,9 @@ pub(super) async fn reference_prompt_attachments(
 }
 
 #[allow(clippy::result_large_err)]
-fn binding_response(checked: Result<(), PromptAttachmentError>) -> Result<(), Response> {
+fn binding_response<T>(checked: Result<T, PromptAttachmentError>) -> Result<T, Response> {
     match checked {
-        Ok(()) => Ok(()),
+        Ok(checked) => Ok(checked),
         Err(PromptAttachmentError::Refused(refusal)) => {
             let code = match refusal {
                 BindingRefusal::TooMany { .. } => SessionErrorCode::TooManyAttachments,

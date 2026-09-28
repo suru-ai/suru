@@ -777,6 +777,153 @@ async fn bindings_and_bytes_survive_a_server_restart() {
         .expect("stop replacement server");
 }
 
+/// Descriptors in the order a snapshot carries them: by id.
+fn by_id(mut descriptors: Vec<AttachmentDescriptor>) -> Vec<AttachmentDescriptor> {
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    descriptors
+}
+
+#[tokio::test]
+async fn every_client_describes_the_attachments_a_session_binds_even_after_a_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "attachment-descriptor-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let original = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let screenshot = uploaded(&descriptor, png(1280, 720)).await;
+    let diagram = uploaded(&descriptor, gif(320, 200)).await;
+    let photo = uploaded(&descriptor, webp(64, 48)).await;
+    let unbound = uploaded(&descriptor, jpeg(8, 8)).await;
+
+    // The creating client learns both from the snapshot it is answered with.
+    let text = "Compare [Image 1] with [Image 2]";
+    let created = create_session(
+        &descriptor,
+        &creation(
+            workspace.path(),
+            text,
+            vec![
+                bound(&screenshot, text, "[Image 1]"),
+                bound(&diagram, text, "[Image 2]"),
+            ],
+        ),
+    )
+    .await;
+    let session_id = created.session.id;
+    let both = by_id(vec![screenshot.clone(), diagram.clone()]);
+    assert_eq!(created.attachments, both);
+
+    // So does a second client, from the snapshot its stream leads with.
+    let (watched, mut updates) = watch_session(&descriptor, session_id).await;
+    assert_eq!(watched.attachments, both);
+    let settled = read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        session_id,
+        "settled",
+        |snapshot| snapshot.session.working_since.is_none(),
+    )
+    .await;
+    assert_eq!(settled.attachments, both);
+
+    // A Prompt binding one Attachment already described and one not yet is
+    // described ahead of its addition, and only by what the Session lacked.
+    let again = "Now [Image 1] beside [Image 2]";
+    let queued = admitted(
+        &descriptor,
+        session_id,
+        again,
+        vec![
+            bound(&screenshot, again, "[Image 1]"),
+            bound(&photo, again, "[Image 2]"),
+        ],
+        PromptDelivery::Queue,
+    )
+    .await;
+    let update = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let update = updates.next().await.expect("the Session stream stays open");
+            if update.changes.iter().any(|change| {
+                matches!(change, SessionChange::PromptAdded { prompt } if prompt.id == queued.id)
+            }) {
+                return update;
+            }
+        }
+    })
+    .await
+    .expect("the Session stream carries the queued Prompt");
+    let described = update
+        .changes
+        .iter()
+        .position(|change| {
+            change
+                == &SessionChange::AttachmentsDescribed {
+                    attachments: vec![photo.clone()],
+                }
+        })
+        .unwrap_or_else(|| panic!("the new Attachment is described: {:#?}", update.changes));
+    let added = update
+        .changes
+        .iter()
+        .position(|change| matches!(change, SessionChange::PromptAdded { .. }))
+        .expect("the Prompt is added");
+    assert!(
+        described < added,
+        "the description precedes the Prompt binding it"
+    );
+    let all = by_id(vec![screenshot.clone(), diagram.clone(), photo.clone()]);
+    let before_restart = read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        session_id,
+        "the queued Prompt's user Message",
+        |snapshot| {
+            user_message(snapshot, again).is_some() && snapshot.session.working_since.is_none()
+        },
+    )
+    .await;
+    assert_eq!(before_restart.attachments, all);
+    assert!(
+        !before_restart.attachments.contains(&unbound),
+        "an upload no Prompt binds describes nothing"
+    );
+
+    // A Session binding nothing carries nothing.
+    let plain = create_session(
+        &descriptor,
+        &creation(workspace.path(), "Nothing attached", Vec::new()),
+    )
+    .await;
+    assert!(plain.attachments.is_empty());
+    original.shutdown().await.expect("stop original server");
+
+    // A client connecting after a restart reads them from the snapshot alone.
+    let replacement = spawn_with_failing_provider(config)
+        .await
+        .expect("spawn replacement server");
+    let restored = crate::support::read_session(replacement.descriptor(), session_id).await;
+    assert_eq!(restored.attachments, all);
+    assert_eq!(restored, before_restart);
+    let (rewatched, _) = watch_session(replacement.descriptor(), session_id).await;
+    assert_eq!(rewatched.attachments, all);
+    assert!(
+        crate::support::read_session(replacement.descriptor(), plain.session.id)
+            .await
+            .attachments
+            .is_empty()
+    );
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
 /// A server on the given timings, whose Provider fails every Turn so each
 /// Session settles as soon as its Prompt is delivered.
 async fn spawn_with_timings(

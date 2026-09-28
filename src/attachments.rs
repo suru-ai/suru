@@ -237,50 +237,66 @@ impl AttachmentStore {
         text: &str,
         bindings: &[AttachmentBinding],
     ) -> Result<(), PromptAttachmentError> {
-        self.check_or_reference(text, bindings, false).await
-    }
-
-    /// As [`Self::check_prompt`], stamping every Attachment the bindings name
-    /// as referenced now, for the moment right before the Prompt is recorded.
-    pub(crate) async fn reference_prompt(
-        &self,
-        text: &str,
-        bindings: &[AttachmentBinding],
-    ) -> Result<(), PromptAttachmentError> {
-        self.check_or_reference(text, bindings, true).await
-    }
-
-    async fn check_or_reference(
-        &self,
-        text: &str,
-        bindings: &[AttachmentBinding],
-        reference: bool,
-    ) -> Result<(), PromptAttachmentError> {
         check_bindings(text, bindings).map_err(PromptAttachmentError::Refused)?;
         if bindings.is_empty() {
             return Ok(());
         }
-        let named = bindings
-            .iter()
-            .map(|binding| binding.attachment_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let stored = if reference {
-            self.repository.reference_attachments(named).await
-        } else {
-            self.repository.stored_attachments(named).await
+        let stored = self
+            .repository
+            .stored_attachments(named(bindings))
+            .await
+            .map_err(PromptAttachmentError::Storage)?;
+        refuse_unknown(bindings, |id| stored.contains(id))
+    }
+
+    /// As [`Self::check_prompt`], stamping every Attachment the bindings name
+    /// as referenced now, for the moment right before the Prompt is recorded,
+    /// and answering what each was described as when it was uploaded, once
+    /// each and in id order, for the Session to describe beside the Prompt.
+    pub(crate) async fn reference_prompt(
+        &self,
+        text: &str,
+        bindings: &[AttachmentBinding],
+    ) -> Result<Vec<AttachmentDescriptor>, PromptAttachmentError> {
+        check_bindings(text, bindings).map_err(PromptAttachmentError::Refused)?;
+        if bindings.is_empty() {
+            return Ok(Vec::new());
         }
-        .map_err(PromptAttachmentError::Storage)?;
-        match bindings
-            .iter()
-            .find(|binding| !stored.contains(&binding.attachment_id))
-        {
-            Some(unknown) => Err(PromptAttachmentError::Refused(BindingRefusal::Unknown(
-                unknown.attachment_id.clone(),
-            ))),
-            None => Ok(()),
-        }
+        let described = self
+            .repository
+            .reference_attachments(named(bindings))
+            .await
+            .map_err(PromptAttachmentError::Storage)?;
+        refuse_unknown(bindings, |id| {
+            described.iter().any(|descriptor| &descriptor.id == id)
+        })?;
+        Ok(described)
+    }
+}
+
+/// Each Attachment the bindings name, once.
+fn named(bindings: &[AttachmentBinding]) -> Vec<AttachmentId> {
+    bindings
+        .iter()
+        .map(|binding| binding.attachment_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Refuses the first binding naming an Attachment that is not `stored`.
+fn refuse_unknown(
+    bindings: &[AttachmentBinding],
+    stored: impl Fn(&AttachmentId) -> bool,
+) -> Result<(), PromptAttachmentError> {
+    match bindings
+        .iter()
+        .find(|binding| !stored(&binding.attachment_id))
+    {
+        Some(unknown) => Err(PromptAttachmentError::Refused(BindingRefusal::Unknown(
+            unknown.attachment_id.clone(),
+        ))),
+        None => Ok(()),
     }
 }
 

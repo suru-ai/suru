@@ -5761,6 +5761,7 @@ mod tests {
             watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
+            attachments: Vec::new(),
         }
     }
 

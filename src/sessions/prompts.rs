@@ -10,9 +10,9 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityId, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-    AttachmentBinding, CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus,
-    ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session,
-    SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    AttachmentBinding, AttachmentDescriptor, CreateSessionRequest, Message, MessageId, MessageRole,
+    MessageStatus, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+    Session, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
     SessionStatus, SessionSummary, SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
 };
 
@@ -258,15 +258,22 @@ impl SessionStore {
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         let path = crate::paths::canonical(&request.execution_directory.path)
             .unwrap_or_else(|_| request.execution_directory.path.clone());
-        self.create_in(request, crate::protocol::ResolvedWorkspace::directory(path))
+        self.create_in(
+            request,
+            crate::protocol::ResolvedWorkspace::directory(path),
+            Vec::new(),
+        )
     }
 
+    /// Creates a Session whose first Prompt binds the Attachments `described`
+    /// describes: what admission answered for each binding the Prompt carries.
     pub(crate) fn create_in(
         &self,
         request: CreateSessionRequest,
         location: crate::protocol::ResolvedWorkspace,
+        described: Vec<AttachmentDescriptor>,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
-        self.create_in_with_identity(request, location, None)
+        self.create_in_with_identity(request, location, described, None)
     }
 
     /// Finds the Session an already admitted creation request made. This is
@@ -373,6 +380,7 @@ impl SessionStore {
         &self,
         request: CreateSessionRequest,
         mut location: crate::protocol::ResolvedWorkspace,
+        described: Vec<AttachmentDescriptor>,
         intended_session: Option<SessionId>,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         if request.prompt.text.trim().is_empty() {
@@ -442,6 +450,8 @@ impl SessionStore {
             status: PromptStatus::Pending,
         };
         let prompt_id = prompt.id;
+        let mut attachments = Vec::with_capacity(described.len());
+        crate::session_projection::describe_attachments(&mut attachments, described);
         let snapshot = SessionSnapshot {
             title: title.clone(),
             // A Session begins with none: the Icon beside its Title arrives
@@ -479,6 +489,7 @@ impl SessionStore {
             watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
+            attachments,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
         let summary = SessionSummary {
@@ -541,10 +552,13 @@ impl SessionStore {
         Ok(StoreOutcome::Created(snapshot))
     }
 
+    /// Admits a Prompt binding the Attachments `described` describes: what
+    /// admission answered for each binding the Prompt carries.
     pub(crate) fn admit(
         &self,
         session_id: SessionId,
         request: AdmitPromptRequest,
+        described: Vec<AttachmentDescriptor>,
     ) -> Result<StoreOutcome<PromptAdmission>, AdmitPromptError> {
         if request.prompt.text.trim().is_empty() {
             return Err(AdmitPromptError::EmptyPrompt);
@@ -624,15 +638,23 @@ impl SessionStore {
         // that reading from (ADR 0024).
         let turn_start = matches!(disposition, PromptAdmissionDisposition::StartImmediately)
             .then_some(prompt.id);
+        // Every client learns what an Attachment is before any Prompt binds
+        // it, and only once for the life of the Session.
+        let undescribed = described
+            .into_iter()
+            .filter(|descriptor| record.snapshot.attachment(&descriptor.id).is_none())
+            .collect::<Vec<_>>();
+        let mut changes = Vec::with_capacity(2);
+        if !undescribed.is_empty() {
+            changes.push(SessionChange::AttachmentsDescribed {
+                attachments: undescribed,
+            });
+        }
+        changes.push(SessionChange::PromptAdded {
+            prompt: prompt.clone(),
+        });
         state
-            .commit_admission(
-                &self.storage,
-                session_id,
-                vec![SessionChange::PromptAdded {
-                    prompt: prompt.clone(),
-                }],
-                turn_start,
-            )
+            .commit_admission(&self.storage, session_id, changes, turn_start)
             .expect("admission changes preserve Session invariants");
         let record = state
             .sessions

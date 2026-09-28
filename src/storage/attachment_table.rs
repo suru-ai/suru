@@ -1,9 +1,10 @@
 //! Attachment rows: written when their bytes are first uploaded, stamped
 //! referenced again whenever the same bytes are uploaded again or a Prompt
 //! binding them is admitted, joined to the Sessions whose stored Prompts and
-//! Messages bind them, and read back only when something asks for the bytes
-//! (ADR 0037). An Attachment's age, which decides whether it may be reclaimed,
-//! is measured from that last reference.
+//! Messages bind them, and described without their bytes to the Sessions that
+//! bind them. The bytes are read back only when something asks for them (ADR
+//! 0037). An Attachment's age, which decides whether it may be reclaimed, is
+//! measured from that last reference.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -93,13 +94,14 @@ impl StorageRepository {
     }
 
     /// Stamps every one of the named Attachments that is stored as
-    /// referenced now, in one statement, and answers which of them are
-    /// stored. Once stamped, an Attachment stays within its grace period for
-    /// as long as it takes the Prompt binding it to be recorded and joined.
+    /// referenced now, in one statement, and answers what each of them that
+    /// is stored was described as when it was uploaded, in id order. Once
+    /// stamped, an Attachment stays within its grace period for as long as it
+    /// takes the Prompt binding it to be recorded and joined.
     pub(crate) async fn reference_attachments(
         &self,
         ids: Vec<AttachmentId>,
-    ) -> Result<HashSet<AttachmentId>, StorageError> {
+    ) -> Result<Vec<AttachmentDescriptor>, StorageError> {
         let path = self.database_path.clone();
         let now = millis(self.clock.now());
         on_blocking_task("reference Attachments", move || {
@@ -108,20 +110,12 @@ impl StorageRepository {
                 .map(|id| id.as_str().to_owned())
                 .collect::<BTreeSet<_>>();
             let mut connection = super::connect(&path)?;
-            let referenced =
-                diesel::update(attachments::table.filter(attachments::id.eq_any(&named)))
-                    .set(attachments::referenced_at.eq(now))
-                    .execute(&mut connection)
-                    .map_err(|error| StorageError::WriteAttachment(error.to_string()))?;
-            if referenced == named.len() {
-                return Ok(ids.into_iter().collect());
-            }
-            let stored = attachments::table
-                .filter(attachments::id.eq_any(&named))
-                .select(attachments::id)
-                .load::<String>(&mut connection)
-                .map_err(|error| StorageError::Read(error.to_string()))?;
-            Ok(stored.into_iter().map(AttachmentId::new).collect())
+            diesel::update(attachments::table.filter(attachments::id.eq_any(&named)))
+                .set(attachments::referenced_at.eq(now))
+                .execute(&mut connection)
+                .map_err(|error| StorageError::WriteAttachment(error.to_string()))?;
+            stored_descriptors(&mut connection, &named)
+                .map_err(|error| StorageError::Read(error.to_string()))
         })
         .await
     }
@@ -144,6 +138,48 @@ impl StorageRepository {
         })
         .await
     }
+}
+
+/// The descriptors the named Attachments that are stored were uploaded as, in
+/// id order, read without their bytes. A row whose kind this build cannot
+/// describe is reported to the Log and passed over.
+pub(super) fn stored_descriptors<'a>(
+    connection: &mut SqliteConnection,
+    ids: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<AttachmentDescriptor>, diesel::result::Error> {
+    let rows = attachments::table
+        .filter(attachments::id.eq_any(ids))
+        .order(attachments::id.asc())
+        .select((
+            attachments::id,
+            attachments::mime_type,
+            attachments::byte_length,
+            attachments::width,
+            attachments::height,
+        ))
+        .load::<(String, String, i64, Option<i64>, Option<i64>)>(connection)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, mime_type, byte_length, width, height)| {
+            let dimensions = width.zip(height).and_then(|(width, height)| {
+                Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+            });
+            let (Some((width, height)), Ok(byte_length)) = (dimensions, u64::try_from(byte_length))
+            else {
+                tracing::warn!(
+                    attachment_id = id,
+                    "a stored Attachment cannot be described"
+                );
+                return None;
+            };
+            Some(AttachmentDescriptor {
+                id: AttachmentId::new(id),
+                kind: AttachmentKind::Image { width, height },
+                mime_type,
+                byte_length,
+            })
+        })
+        .collect())
 }
 
 /// Joins a Session to every Attachment its stored Prompts and Messages bind,
@@ -223,7 +259,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn referencing_attachments_reports_which_are_stored() {
+    async fn referencing_attachments_describes_those_stored() {
         let directory = tempfile::tempdir().expect("create data directory");
         let repository = StorageRepository::open(directory.path())
             .await
@@ -242,16 +278,16 @@ mod tests {
             .reference_attachments(vec![descriptor.id.clone(), missing.clone()])
             .await
             .expect("reference Attachments");
-        assert_eq!(stored, HashSet::from([descriptor.id.clone()]));
-        assert!(
-            !stored.contains(&missing),
-            "a missing id is reported missing"
+        assert_eq!(
+            stored,
+            vec![descriptor.clone()],
+            "a stored id is described as it was uploaded, and a missing one not at all"
         );
 
         let all = repository
             .reference_attachments(vec![descriptor.id.clone(), descriptor.id.clone()])
             .await
             .expect("reference one Attachment twice");
-        assert_eq!(all, HashSet::from([descriptor.id]));
+        assert_eq!(all, vec![descriptor]);
     }
 }

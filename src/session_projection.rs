@@ -3,9 +3,9 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, CostDetails, CostRecord, MessageRole, MessageStatus,
-    PromptDelivery, PromptStatus, SessionChange, SessionSnapshot, SessionUpdate, TranscriptItem,
-    TurnStatus,
+    Activity, ActivityId, ActivityStatus, AttachmentDescriptor, CostDetails, CostRecord,
+    MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange, SessionSnapshot,
+    SessionUpdate, TranscriptItem, TurnStatus,
 };
 
 /// Applies `update` to `snapshot` in place. On error the snapshot may hold a
@@ -35,6 +35,9 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             }
             SessionChange::ApprovalPostureChanged { approval_posture } => {
                 next.session.approval_posture = *approval_posture;
+            }
+            SessionChange::AttachmentsDescribed { attachments } => {
+                describe_attachments(&mut next.attachments, attachments.iter().cloned());
             }
             SessionChange::PromptAdded { prompt } => {
                 if next.prompts.iter().any(|existing| existing.id == prompt.id) {
@@ -813,6 +816,21 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     Ok(())
 }
 
+/// Records descriptors among those a Session already carries, keeping one per
+/// Attachment in id order. An id names the same bytes wherever it is bound, so
+/// a descriptor arriving again only takes the place of the one it repeats.
+pub(crate) fn describe_attachments(
+    known: &mut Vec<AttachmentDescriptor>,
+    described: impl IntoIterator<Item = AttachmentDescriptor>,
+) {
+    for descriptor in described {
+        match known.binary_search_by(|existing| existing.id.cmp(&descriptor.id)) {
+            Ok(index) => known[index] = descriptor,
+            Err(index) => known.insert(index, descriptor),
+        }
+    }
+}
+
 /// Resolves the Activity a Reasoning change names, failing when the Session
 /// has no such Activity so every Reasoning arm reports the same miss the same
 /// way and is left to check only that the Activity is the kind it can act on.
@@ -856,6 +874,29 @@ mod tests {
     };
 
     use super::*;
+
+    fn image(id: &str, width: u32) -> AttachmentDescriptor {
+        AttachmentDescriptor {
+            id: crate::protocol::AttachmentId::new(id),
+            kind: crate::protocol::AttachmentKind::Image { width, height: 1 },
+            mime_type: "image/png".to_owned(),
+            byte_length: 64,
+        }
+    }
+
+    #[test]
+    fn described_attachments_are_kept_once_each_in_id_order() {
+        let mut known = vec![image("b", 2)];
+        describe_attachments(&mut known, [image("c", 3), image("a", 1), image("b", 2)]);
+        assert_eq!(known, vec![image("a", 1), image("b", 2), image("c", 3)]);
+
+        describe_attachments(&mut known, [image("a", 1)]);
+        assert_eq!(
+            known,
+            vec![image("a", 1), image("b", 2), image("c", 3)],
+            "a descriptor described again changes nothing"
+        );
+    }
 
     #[test]
     fn a_client_reads_turn_timing_and_usage_off_the_changes_the_server_committed() {
@@ -902,6 +943,7 @@ mod tests {
             watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
+            attachments: Vec::new(),
         };
 
         apply_update(

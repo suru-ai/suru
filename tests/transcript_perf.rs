@@ -69,6 +69,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
+        attachments: Vec::new(),
     };
     for section in 1..=sections {
         let prompt_id = PromptId::new();

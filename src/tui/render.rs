@@ -5529,6 +5529,7 @@ mod tests {
                     ..UsageTotal::default()
                 }),
                 total_cost: None,
+                attachments: Vec::new(),
             };
             let mut partial_zero = snapshot.clone();
             partial_zero.session.context_fill = None;
@@ -5787,6 +5788,7 @@ mod tests {
                     watches: Vec::new(),
                     subagent_usage: None,
                     total_cost: None,
+                    attachments: Vec::new(),
                 },
             )))
             .expect("hydrate test Application");
@@ -5869,6 +5871,7 @@ mod tests {
                     watches: Vec::new(),
                     subagent_usage: None,
                     total_cost: None,
+                    attachments: Vec::new(),
                 },
             )))
             .expect("hydrate test Application");

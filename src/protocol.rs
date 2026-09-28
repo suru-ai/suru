@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 66;
+pub const PROTOCOL_VERSION: u32 = 67;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -3276,9 +3276,23 @@ pub struct SessionSnapshot {
     /// them, so they ride the Session's own stream and no listing.
     #[serde(default)]
     pub watches: Vec<WatchSummary>,
+    /// What the server stores for every Attachment this Session's Prompts
+    /// and Messages bind, once each and ordered by id, so a client describes
+    /// an Attachment beneath the Message binding it from the snapshot alone.
+    /// Never the bytes: a client that wants those fetches them by id.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentDescriptor>,
 }
 
 impl SessionSnapshot {
+    /// The descriptor of the Attachment stored under `id`, where this
+    /// Session binds it and the server has described it.
+    pub fn attachment(&self, id: &AttachmentId) -> Option<&AttachmentDescriptor> {
+        self.attachments
+            .iter()
+            .find(|descriptor| &descriptor.id == id)
+    }
+
     pub fn subagent_questionnaire_count(&self) -> usize {
         self.subagent_interventions
             .iter()
@@ -3370,6 +3384,13 @@ pub enum SessionChange {
     },
     ApprovalPostureChanged {
         approval_posture: Option<SessionApprovalPosture>,
+    },
+    /// Descriptors of Attachments a Prompt about to be added binds, carried
+    /// ahead of the Prompt so no client ever holds a binding it cannot
+    /// describe. A descriptor the Session already carries may arrive again,
+    /// and changes nothing when it does.
+    AttachmentsDescribed {
+        attachments: Vec<AttachmentDescriptor>,
     },
     PromptAdded {
         prompt: Prompt,

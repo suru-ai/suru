@@ -1360,6 +1360,7 @@ mod tests {
                                 attachments: Vec::new(),
                             },
                         },
+                        Vec::new(),
                     )
                     .expect("admit a follow-up Prompt")
                 else {

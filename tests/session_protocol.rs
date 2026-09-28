@@ -8,13 +8,13 @@ use suru::protocol::{
     Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
     ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
     ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
-    ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
-    Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
-    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
-    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
-    Workspace,
+    ModelOptionValue, PROTOCOL_VERSION, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
+    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
+    ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -557,6 +557,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             ..UsageTotal::default()
         }),
         total_cost: None,
+        attachments: Vec::new(),
     };
     let expected = json!({
         "title": "",
@@ -661,7 +662,8 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "cost_is_partial": false
         },
         "total_cost": null,
-        "watches": []
+        "watches": [],
+        "attachments": []
     });
 
     assert_eq!(
@@ -1579,6 +1581,93 @@ fn an_attachment_descriptor_carries_a_typed_kind_and_never_the_bytes() {
     assert!(
         serde_json::from_value::<AttachmentDescriptor>(with_bytes).is_err(),
         "a descriptor carrying bytes is refused"
+    );
+}
+
+#[test]
+fn a_snapshot_and_its_updates_describe_the_attachments_its_session_binds() {
+    assert_eq!(
+        PROTOCOL_VERSION, 67,
+        "describing Attachments in snapshots and updates changes the wire"
+    );
+    let screenshot = AttachmentDescriptor {
+        id: AttachmentId::new("1d0a0cbb1f6f3c12f06c8d9bd8d5cc3b16ce8f8eafa4fdb8ea3a2cc02b64a1d4"),
+        kind: AttachmentKind::Image {
+            width: 1280,
+            height: 720,
+        },
+        mime_type: "image/png".to_owned(),
+        byte_length: 319_488,
+    };
+    let encoded_screenshot = json!({
+        "id": "1d0a0cbb1f6f3c12f06c8d9bd8d5cc3b16ce8f8eafa4fdb8ea3a2cc02b64a1d4",
+        "kind": { "type": "image", "width": 1280, "height": 720 },
+        "mime_type": "image/png",
+        "byte_length": 319_488
+    });
+
+    let described = SessionChange::AttachmentsDescribed {
+        attachments: vec![screenshot.clone()],
+    };
+    let encoded_change = json!({
+        "type": "attachments_described",
+        "attachments": [encoded_screenshot.clone()]
+    });
+    assert_eq!(serde_json::to_value(&described).unwrap(), encoded_change);
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(encoded_change).unwrap(),
+        described
+    );
+
+    let snapshot = serde_json::from_value::<SessionSnapshot>(json!({
+        "title": "",
+        "session": serde_json::to_value(Session {
+            checkout: None,
+            context_fill: None,
+            id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: PathBuf::from("/work/suru"),
+            },
+            workspace: Workspace::directory(PathBuf::from("/work/suru")),
+            agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
+            status: SessionStatus::Idle,
+            working_since: None,
+            monitoring_since: None,
+            parent: None,
+        })
+        .unwrap(),
+        "revision": 1,
+        "prompts": [],
+        "turns": [],
+        "messages": [],
+        "activities": [],
+        "transcript": [],
+        "attachments": [encoded_screenshot.clone()]
+    }))
+    .expect("a snapshot carries the descriptors its Session binds");
+    assert_eq!(snapshot.attachments, vec![screenshot.clone()]);
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap()["attachments"],
+        json!([encoded_screenshot])
+    );
+    assert_eq!(
+        snapshot.attachment(&screenshot.id),
+        Some(&screenshot),
+        "a client finds a bound Attachment's descriptor by its id"
+    );
+    assert_eq!(snapshot.attachment(&AttachmentId::new("never-bound")), None);
+
+    let mut bare = serde_json::to_value(&snapshot).unwrap();
+    bare.as_object_mut()
+        .expect("the encoded snapshot is an object")
+        .remove("attachments");
+    assert!(
+        serde_json::from_value::<SessionSnapshot>(bare)
+            .expect("a snapshot binding nothing may leave the list out")
+            .attachments
+            .is_empty()
     );
 }
 

@@ -2228,17 +2228,20 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
     // binding before any checkout work and reads only, while this one also
     // stamps every bound Attachment as referenced now, which keeps a Session's
     // deletion from reclaiming it before the flush joins it (ADR 0037).
-    if let Err(response) = attachments::reference_prompt_attachments(&state, &request.prompt).await
-    {
-        return response;
-    }
+    let described = match attachments::reference_prompt_attachments(&state, &request.prompt).await {
+        Ok(described) => described,
+        Err(response) => return response,
+    };
 
     let admission = if let Some(plan) = &preparation {
-        state
-            .sessions
-            .create_in_with_identity(request, location, Some(plan.intended_session))
+        state.sessions.create_in_with_identity(
+            request,
+            location,
+            described,
+            Some(plan.intended_session),
+        )
     } else {
-        state.sessions.create_in(request, location)
+        state.sessions.create_in(request, location, described)
     };
     match admission {
         Ok(StoreOutcome::Created(mut snapshot)) => {
@@ -2672,10 +2675,10 @@ async fn admit_prompt(
     // binding before any checkout work and reads only, while this one also
     // stamps every bound Attachment as referenced now, which keeps a Session's
     // deletion from reclaiming it before the flush joins it (ADR 0037).
-    if let Err(response) = attachments::reference_prompt_attachments(&state, &request.prompt).await
-    {
-        return response;
-    }
+    let described = match attachments::reference_prompt_attachments(&state, &request.prompt).await {
+        Ok(described) => described,
+        Err(response) => return response,
+    };
 
     // Recovery and catalog refresh await external work. Admission must use the
     // current Turn state, and the actor repeats this check at native steering.
@@ -2694,7 +2697,7 @@ async fn admit_prompt(
         );
     }
 
-    match state.sessions.admit(session_id, request) {
+    match state.sessions.admit(session_id, request, described) {
         Ok(StoreOutcome::Created(admission)) => {
             match admission.disposition {
                 PromptAdmissionDisposition::StartImmediately => {

@@ -185,6 +185,7 @@ fn child_with_working_subagent(
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },
         ],
+        attachments: Vec::new(),
     };
     (snapshot, grandchild_id)
 }

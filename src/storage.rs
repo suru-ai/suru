@@ -699,6 +699,7 @@ fn load_sessions(repository: StorageRepository) -> Result<RestoredSessions, Stor
                 watches: Vec::new(),
                 subagent_usage: None,
                 total_cost: None,
+                attachments: Vec::new(),
             };
             summary.total_usage = snapshot.total_usage();
             Ok::<_, StorageError>(PersistedSession {
@@ -815,6 +816,24 @@ fn load_session(
         }))
         .collect::<Vec<_>>();
     transcript.sort_unstable_by_key(|(order, _)| *order);
+    // What each bound Attachment was uploaded as, and never its bytes, which
+    // only a Provider delivery or a client's fetch reads, by id.
+    let bound = prompts
+        .iter()
+        .flat_map(|prompt| &prompt.attachments)
+        .chain(
+            decoded_messages
+                .iter()
+                .flat_map(|(message, _)| &message.attachments),
+        )
+        .map(|binding| binding.attachment_id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let attachments = if bound.is_empty() {
+        Vec::new()
+    } else {
+        attachment_table::stored_descriptors(connection, &bound)
+            .map_err(|error| StorageError::Read(error.to_string()))?
+    };
     let snapshot = SessionSnapshot {
         title: summary.title.clone(),
         icon: summary.icon.clone(),
@@ -841,6 +860,7 @@ fn load_session(
         watches: Vec::new(),
         subagent_usage: None,
         total_cost: None,
+        attachments,
     };
     // Working is reconstructed across the complete Session tree after every
     // stored Session has been loaded; one row cannot see that subtree here.

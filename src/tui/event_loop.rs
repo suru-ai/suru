@@ -4710,6 +4710,7 @@ mod tests {
                     watches: Vec::new(),
                     subagent_usage: None,
                     total_cost: None,
+                    attachments: Vec::new(),
                 }))
                 .unwrap();
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

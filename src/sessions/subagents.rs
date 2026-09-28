@@ -532,6 +532,7 @@ impl SessionStoreState {
             watches: Vec::new(),
             subagent_usage: None,
             total_cost: None,
+            attachments: Vec::new(),
         };
         let summary = SessionSummary {
             checkout_state: None,

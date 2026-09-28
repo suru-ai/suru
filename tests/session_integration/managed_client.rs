@@ -971,6 +971,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },
         ],
+        attachments: Vec::new(),
     }
 }
 

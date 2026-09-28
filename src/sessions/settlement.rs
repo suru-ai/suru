@@ -717,6 +717,7 @@ mod tests {
                 .collect(),
             messages,
             activities,
+            attachments: Vec::new(),
         }
     }
 
