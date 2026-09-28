@@ -76,6 +76,21 @@ struct ComposerState {
     /// The highest `N` any `[Image N]` label in this draft has used, so a
     /// label deleted is never reused before the draft is submitted or cleared.
     highest_image_number: u32,
+    generation: DraftGeneration,
+}
+
+/// Which content a draft holds: renewed whenever the draft is replaced or
+/// reset whole — a history walk, a clear, a submission, a Prompt handed back
+/// — and kept through the reader's edits. Work begun for one content, such as
+/// a check of a recall's Attachments, answers only the content it was begun
+/// for, and never one a draft under the same key holds later.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DraftGeneration(uuid::Uuid);
+
+impl DraftGeneration {
+    fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
 }
 
 /// What composer history keeps of a Prompt, or of a draft set aside for one:
@@ -453,6 +468,27 @@ impl ComposerMemory {
         composer.history_next(width)
     }
 
+    /// Which content the draft under `key` holds, where one is kept.
+    pub(super) fn generation(&self, key: &ComposerKey) -> Option<DraftGeneration> {
+        self.composers.get(key).map(|composer| composer.generation)
+    }
+
+    /// Drops every Attachment binding the draft under `key` keeps — in its
+    /// text, in the draft set aside for a history walk, and in each history
+    /// entry — leaving their labels as plain text, as an Outlook turned away
+    /// from the Server they were uploaded to calls for. Skill Invocations
+    /// stay bound. Answers those dropped from the draft's text, in text
+    /// order, and then those dropped from history and the set-aside draft.
+    pub(super) fn leave_attachments_behind(
+        &mut self,
+        key: &ComposerKey,
+    ) -> (Vec<BoundAttachment>, Vec<BoundAttachment>) {
+        self.composers
+            .get_mut(key)
+            .map(ComposerState::leave_attachments_behind)
+            .unwrap_or_default()
+    }
+
     /// Drops the binding of each Attachment `demote` picks from the draft
     /// under `key`, leaving its label standing as plain text, and answers the
     /// bindings dropped in text order.
@@ -793,6 +829,7 @@ impl ComposerState {
     /// Attachments it binds. A label number it uses is never reused by a
     /// later paste into the draft.
     fn restore(&mut self, entry: HistoryEntry) -> Vec<BoundAttachment> {
+        self.generation = DraftGeneration::fresh();
         self.text = entry.text;
         self.bindings = entry.bindings;
         self.highest_image_number = self
@@ -818,7 +855,17 @@ impl ComposerState {
         demoted
     }
 
+    fn leave_attachments_behind(&mut self) -> (Vec<BoundAttachment>, Vec<BoundAttachment>) {
+        let in_draft = self.demote_attachments(|_| true);
+        let mut elsewhere = Vec::new();
+        for entry in self.history.iter_mut().chain(self.history_scratch.as_mut()) {
+            elsewhere.extend(entry.bindings.drop_attachments(|_| true));
+        }
+        (in_draft, elsewhere)
+    }
+
     fn clear(&mut self) {
+        self.generation = DraftGeneration::fresh();
         self.text.clear();
         self.selection_anchor = None;
         self.cursor = 0;
@@ -831,6 +878,7 @@ impl ComposerState {
     }
 
     fn begin_submission(&mut self) -> InitialPrompt {
+        self.generation = DraftGeneration::fresh();
         let text = std::mem::take(&mut self.text);
         let bindings = std::mem::take(&mut self.bindings);
         self.highest_image_number = 0;
@@ -854,6 +902,7 @@ impl ComposerState {
                 bindings: self.bindings.clone(),
             });
         }
+        self.generation = DraftGeneration::fresh();
         self.text.clone_from(&prompt.text);
         self.selection_anchor = None;
         self.bindings = TextBindings::from_prompt(prompt);
@@ -883,6 +932,7 @@ impl ComposerState {
             .as_ref()
             .is_some_and(|retry| retry.id == prompt.id && self.text == retry.text);
         if restored_was_current {
+            self.generation = DraftGeneration::fresh();
             self.text.clear();
             self.selection_anchor = None;
             self.bindings.clear();

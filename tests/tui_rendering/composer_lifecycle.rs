@@ -365,6 +365,152 @@ fn a_check_answered_after_its_label_was_edited_away_or_that_failed_changes_nothi
     );
 }
 
+/// Whether the composer shows `label` bound, with the dimmed line beneath
+/// it, and no Notice says its image is gone.
+fn stands_bound(application: &Application, line: &str) -> bool {
+    let rows = rendered_application_rows(application).join("\n");
+    label_is_accented(application, "[Image 1]")
+        && rows.contains(line)
+        && !rows.contains("no longer on the Server")
+}
+
+#[test]
+fn a_check_answered_once_the_draft_was_cleared_leaves_a_fresh_paste_of_the_image_bound() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    send_a_prompt_with_an_image(&mut application, workspace.path());
+    let check = recall(&mut application);
+
+    // Cleared, the draft counts its labels from 1 again, and the same image
+    // pasted anew stands as the very label and id the recall bound.
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::ClearOrExit))
+        .expect("clear the draft");
+    paste_image(&mut application, "wide", wide());
+    answer_check(
+        &mut application,
+        check,
+        Ok(vec![AttachmentId::new("wide-hash")]),
+    );
+    assert!(stands_bound(&application, LINE));
+    let ApplicationTransition::AdmitPrompt { request, .. } =
+        submit(&mut application, CommandId::SubmitSteer)
+    else {
+        panic!("the fresh paste is admitted");
+    };
+    assert_eq!(
+        request.prompt.attachments,
+        vec![bound("wide", "[Image 1]", 0..9)]
+    );
+}
+
+#[test]
+fn a_check_answered_once_the_recall_was_sent_leaves_a_fresh_paste_of_the_image_bound() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    send_a_prompt_with_an_image(&mut application, workspace.path());
+    let check = recall(&mut application);
+    let ApplicationTransition::AdmitPrompt { request, .. } =
+        submit(&mut application, CommandId::SubmitSteer)
+    else {
+        panic!("the recalled Prompt is admitted");
+    };
+    assert_eq!(
+        request.prompt.attachments,
+        vec![bound("wide", "[Image 1]", 4..13)]
+    );
+
+    paste_image(&mut application, "wide", wide());
+    answer_check(
+        &mut application,
+        check,
+        Ok(vec![AttachmentId::new("wide-hash")]),
+    );
+    assert!(stands_bound(&application, LINE));
+}
+
+/// Leaves the Landing with "Old [Image 1]" bound to `wide` as its draft and
+/// "Newer [Image 1]" bound to `tall` in its history: the Landing's Prompt is
+/// refused after the reader went back to the Landing and wrote there, so the
+/// refused Prompt comes back as the draft and what they wrote waits in
+/// history.
+fn landing_with_an_image_in_its_draft_and_its_history(application: &mut Application) {
+    type_terminal_text(application, "Old ");
+    paste_image(application, "wide", wide());
+    let ApplicationTransition::CreateSession(request) = submit(application, CommandId::SubmitSteer)
+    else {
+        panic!("the Landing's Prompt begins a Session");
+    };
+    invoke(application, SemanticCommandId::SessionNew);
+    type_terminal_text(application, "Newer ");
+    paste_image(application, "tall", tall());
+    application
+        .handle_event(ApplicationEvent::SessionCreationFailed {
+            prompt_id: request.prompt.id,
+            code: None,
+            error: "Provider unavailable".to_owned(),
+        })
+        .expect("refuse the Session");
+    let rows = draft_rows(application).join("\n");
+    assert!(rows.contains("Old [Image 1]"), "{rows}");
+}
+
+fn tall() -> suru::protocol::AttachmentDescriptor {
+    descriptor("tall", 90, 1600, 2_411_725)
+}
+
+#[test]
+fn turning_the_outlook_leaves_the_landings_history_and_set_aside_draft_unbound_too() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    landing_with_an_image_in_its_draft_and_its_history(&mut application);
+
+    // Up sets the draft aside and recalls the history entry.
+    let ApplicationTransition::CheckAttachments { attachments, .. } =
+        key(&mut application, KeyCode::Up)
+    else {
+        panic!("the recall asks after its Attachment");
+    };
+    assert_eq!(attachments, vec![AttachmentId::new("tall-hash")]);
+
+    // The Notice names what the draft shows; the draft set aside and the
+    // history lose their bindings as quietly.
+    turn_toward_studio(&mut application);
+    let rows = rendered_application_rows(&application).join("\n");
+    assert!(
+        rows.contains("! Image 1 is on another Server; its label stays as text"),
+        "{rows}"
+    );
+    assert!(rows.contains("Newer [Image 1]"), "{rows}");
+    assert!(!label_is_accented(&application, "[Image 1]"));
+
+    // Down brings back the draft set aside, its label as text.
+    assert_eq!(
+        key(&mut application, KeyCode::Down),
+        ApplicationTransition::Continue
+    );
+    let rows = draft_rows(&application).join("\n");
+    assert!(rows.contains("Old [Image 1]"), "{rows}");
+    assert!(!rows.contains("Image 1 ·"), "{rows}");
+    assert!(!label_is_accented(&application, "[Image 1]"));
+
+    // A recall after the turn brings no Attachment back, and asks nothing.
+    assert_eq!(
+        key(&mut application, KeyCode::Up),
+        ApplicationTransition::Continue
+    );
+    let rows = draft_rows(&application).join("\n");
+    assert!(rows.contains("Newer [Image 1]"), "{rows}");
+    assert!(!label_is_accented(&application, "[Image 1]"));
+    let ApplicationTransition::CreateSession(request) =
+        submit(&mut application, CommandId::SubmitSteer)
+    else {
+        panic!("the Landing's Prompt begins a Session on the Remote");
+    };
+    assert_eq!(request.prompt.text, "Newer [Image 1] ");
+    assert!(request.prompt.attachments.is_empty());
+}
+
 #[test]
 fn turning_the_outlook_leaves_a_landing_drafts_attachments_behind_as_plain_text() {
     let workspace = workspace_dir();

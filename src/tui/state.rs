@@ -1397,7 +1397,11 @@ impl TuiState {
             return ApplicationTransition::Continue;
         }
         let origin = self.draft_origin(&draft);
-        let (check, attachments) = self.attachment_checks.begin(draft, recalled);
+        let generation = self
+            .composers
+            .generation(&draft)
+            .expect("a recall leaves its draft kept");
+        let (check, attachments) = self.attachment_checks.begin(draft, generation, recalled);
         ApplicationTransition::CheckAttachments {
             check,
             origin,
@@ -1415,16 +1419,31 @@ impl TuiState {
         }
     }
 
-    /// Demotes the labels of the Landing draft's Attachments to plain text,
-    /// with a Notice naming them, once the Outlook has turned away from the
-    /// Server they were pasted to: a Prompt from the Landing begins a Session
-    /// on the new Outlook, which never stored them. Uploads still on their way
-    /// there, and checks asked of the old Server, are abandoned with them.
+    /// Demotes the labels of the Landing's Attachments to plain text once
+    /// the Outlook has turned away from the Server they were pasted to: a
+    /// Prompt from the Landing begins a Session on the new Outlook, which
+    /// never stored them. That goes for the draft, the draft set aside for a
+    /// history walk, and every history entry; a Notice names those the draft
+    /// shows, and the Log has the ids of all of them. Uploads still on their
+    /// way there, and checks asked of the old Server, are abandoned with them.
     fn leave_landing_attachments_behind(&mut self) {
         let draft = ComposerKey::Landing;
         self.clipboard_pastes.abandon_uploads_into(&draft);
         self.attachment_checks.forget(&draft);
-        let demoted = self.composers.demote_attachments(&draft, |_| true);
+        let (demoted, elsewhere) = self.composers.leave_attachments_behind(&draft);
+        if !elsewhere.is_empty() {
+            let mut ids = elsewhere
+                .iter()
+                .map(|bound| bound.attachment_id().to_string())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            tracing::info!(
+                attachment_ids = ?ids,
+                "the Landing's history no longer binds Attachments on the Server \
+                 the Outlook turned away from"
+            );
+        }
         self.report_demoted_attachments(&demoted, AttachmentDemotion::LeftBehind);
     }
 
@@ -7364,7 +7383,12 @@ impl Application {
                 return;
             }
         };
-        if missing.is_empty() || !self.state.composers.has_draft(&pending.draft) {
+        // A draft that has held other content since — cleared, sent, handed
+        // a Prompt back, or walked to another entry — owes this answer
+        // nothing, even where a paste since binds the same image.
+        if missing.is_empty()
+            || self.state.composers.generation(&pending.draft) != Some(pending.generation)
+        {
             return;
         }
         let mut demoted = Vec::new();

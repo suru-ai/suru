@@ -10,7 +10,10 @@ use std::collections::HashMap;
 
 use crate::protocol::AttachmentId;
 
-use super::{composer::ComposerKey, text_binding::BoundAttachment};
+use super::{
+    composer::{ComposerKey, DraftGeneration},
+    text_binding::BoundAttachment,
+};
 
 /// One check of whether a recall's Attachments are still stored, so its
 /// answer reaches the draft it was asked for.
@@ -30,29 +33,34 @@ pub(super) struct AttachmentChecks {
     pending: HashMap<AttachmentCheckId, PendingCheck>,
 }
 
-/// What a check was asked for: the draft the recall landed in, and the
-/// Attachments it brought there, each with the label it stood as.
+/// What a check was asked for: the draft the recall landed in and the
+/// content the recall gave it, and the Attachments it brought there, each
+/// with the label it stood as.
 #[derive(Clone, Debug)]
 pub(super) struct PendingCheck {
     pub(super) draft: ComposerKey,
+    pub(super) generation: DraftGeneration,
     pub(super) recalled: Vec<BoundAttachment>,
 }
 
 impl PendingCheck {
     /// Whether `bound` is one of the recall's own bindings naming an
     /// Attachment in `missing`. A label pasted since, even of the same bytes,
-    /// is its own and is never demoted by an answer about the recall.
+    /// is its own and is never demoted by an answer about the recall; nor is
+    /// anything in a draft that has held other content since.
     pub(super) fn demotes(&self, bound: &BoundAttachment, missing: &[AttachmentId]) -> bool {
         missing.contains(bound.attachment_id()) && self.recalled.contains(bound)
     }
 }
 
 impl AttachmentChecks {
-    /// Starts a check of the Attachments `recalled` brought into `draft`,
-    /// answering its id and each Attachment to ask about, once each.
+    /// Starts a check of the Attachments `recalled` brought into `draft`
+    /// when it came to hold `generation`, answering its id and each
+    /// Attachment to ask about, once each.
     pub(super) fn begin(
         &mut self,
         draft: ComposerKey,
+        generation: DraftGeneration,
         recalled: Vec<BoundAttachment>,
     ) -> (AttachmentCheckId, Vec<AttachmentId>) {
         let check = self.next;
@@ -63,7 +71,14 @@ impl AttachmentChecks {
                 attachments.push(bound.attachment_id().clone());
             }
         }
-        self.pending.insert(check, PendingCheck { draft, recalled });
+        self.pending.insert(
+            check,
+            PendingCheck {
+                draft,
+                generation,
+                recalled,
+            },
+        );
         (check, attachments)
     }
 
