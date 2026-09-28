@@ -20,7 +20,7 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, AppearanceMode, AppearanceSettings, AsideSettings, AsideVisibility,
-        AutoReclaim, AutoSettle, CodexSettings, CopilotSettings, DerivationErrand,
+        AutoReclaim, AutoSettle, BrokerSettings, CodexSettings, CopilotSettings, DerivationErrand,
         DerivationSettings, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog,
         ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
@@ -712,10 +712,12 @@ fn the_broker_setting_stands_under_the_experimental_tab_and_is_on_by_default() {
 }
 
 /// The limits on brokered Subagents stand beside the Broker under the
-/// Experimental tab, each at its built-in cap until the reader pins another,
-/// and each is cycled one count on as any other Setting is.
+/// Experimental tab, each at its built-in cap until the reader pins another.
+/// A cap is typed rather than cycled, as a side column's width is: Space has
+/// no list to step through, and Enter opens the numeric editor on the cap in
+/// force, where the reader types the count Enter pins.
 #[test]
-fn the_broker_limits_stand_under_the_experimental_tab_at_their_default_caps() {
+fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_experimental_tab(&mut application);
@@ -744,16 +746,64 @@ fn the_broker_limits_stand_under_the_experimental_tab_at_their_default_caps() {
     focus_setting(&mut application, "broker.maxDepth");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxDepth { value: Some(4) }),
-        "Space steps the depth limit one Session deeper"
+        ApplicationTransition::Continue,
+        "a typed cap has no list for Space to step through"
     );
-    focus_setting(&mut application, "broker.maxConcurrentSubagents");
+    assert!(
+        row(&application, "Broker depth limit").contains("3 [default]"),
+        "so Space leaves the depth limit where it was"
+    );
     assert_eq!(
-        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "opening an editor is local presentation state"
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Sessions deep") && rendered.contains("› 3"),
+        "Enter opens the numeric editor on the depth cap in force: {rendered}"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "10");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxDepth { value: Some(10) }),
+        "Enter pins the depth the reader typed"
+    );
+
+    focus_setting(&mut application, "broker.maxConcurrentSubagents");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        rendered.contains("Subagents at once") && rendered.contains("› 6"),
+        "Enter opens the numeric editor on the concurrency cap in force: {rendered}"
+    );
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "20");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
         ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxConcurrentSubagents {
-            value: Some(7),
+            value: Some(20),
         }),
-        "and the concurrency limit one Subagent more"
+        "and the concurrency the reader typed"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        EffectiveSettings {
+            broker: BrokerSettings {
+                max_depth: 10,
+                max_concurrent_subagents: 20,
+                ..BrokerSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["broker.maxDepth", "broker.maxConcurrentSubagents"],
+    );
+    assert!(
+        row(&application, "Broker depth limit").contains("10 [pinned]")
+            && row(&application, "Broker concurrency limit").contains("20 [pinned]"),
+        "each row reads the count the refreshed snapshot pinned"
     );
 
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
@@ -761,6 +811,74 @@ fn the_broker_limits_stand_under_the_experimental_tab_at_their_default_caps() {
         !has_row(&application, "Broker depth limit")
             && !has_row(&application, "Broker concurrency limit"),
         "an experimental Setting is not also a General one"
+    );
+}
+
+/// A typed cap is held to its Setting's bound before anything is pinned: none
+/// at all, or more than the count the Broker keeps can hold, leaves the editor
+/// open saying which end was passed, the largest count it can hold is pinned
+/// like any other, and Esc leaves the cap where it was.
+#[test]
+fn a_broker_limit_outside_its_bound_stays_in_the_editor_and_escape_discards_the_edit() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_experimental_tab(&mut application);
+    focus_setting(&mut application, "broker.maxConcurrentSubagents");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "0");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a cap of none pins nothing"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("minimum: 1"),
+        "and the editor stays open naming the least cap it takes"
+    );
+
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "4294967296");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a cap past what the count holds pins nothing"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("maximum: 4294967295"),
+        "and the editor stays open naming the most it can hold"
+    );
+
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "5");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxConcurrentSubagents {
+            value: Some(u32::MAX),
+        }),
+        "the largest count the Broker keeps is pinned like any other"
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "9");
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "cancelling pins nothing"
+    );
+    let rendered = rendered_application_rows(&application).join("\n");
+    assert!(
+        !rendered.contains("Subagents at once"),
+        "Esc closes the editor: {rendered}"
+    );
+    assert!(
+        row(&application, "Broker concurrency limit").contains("6 [default]"),
+        "and leaves the cap where it was"
     );
 }
 

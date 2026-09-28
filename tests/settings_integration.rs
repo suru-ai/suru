@@ -1961,56 +1961,130 @@ async fn broker_max_concurrent_subagents_defaults_to_six_pins_through_the_config
     server.shutdown().await.unwrap();
 }
 
-/// A Broker cap counts from one, and a Config Document asking for a count the
-/// Setting does not offer — none at all, or more than it names — is ignored
-/// with a diagnostic spelling out every count it does, the rest of the
-/// document still applying.
+/// A Broker cap is typed rather than chosen from a list, so like the side
+/// columns' widths it has no product-level maximum: a Config Document may ask
+/// for as many as the count the Broker keeps can hold, and as few as one — a
+/// tree of the top-level Session alone, or one brokered Subagent at a time.
 #[tokio::test]
-async fn a_broker_cap_the_setting_does_not_offer_is_ignored_naming_the_counts_it_does() {
+async fn broker_caps_load_without_a_product_level_maximum_and_pin_down_to_one() {
     let state_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
-        r#"{"broker": {"enabled": false, "maxDepth": 0, "maxConcurrentSubagents": 13}}"#,
+        r#"{"broker": {"maxConcurrentSubagents": 4294967295, "maxDepth": 1000000}}"#,
     )
     .unwrap();
     let server = server::spawn(
-        ServerConfig::new(state_dir.path(), "settings-broker-caps-invalid")
+        ServerConfig::new(state_dir.path(), "settings-broker-caps-unbounded")
             .unwrap()
             .with_config_dir(config_dir.path()),
     )
     .await
     .unwrap();
-    let (client, snapshot) = attach(state_dir.path(), "settings-broker-caps-invalid").await;
-    assert!(
-        !snapshot.settings.broker.enabled,
-        "the rest of the document applies"
+    let (client, opening) = attach(state_dir.path(), "settings-broker-caps-unbounded").await;
+    assert_eq!(opening.settings.broker.max_depth, 1_000_000);
+    assert_eq!(
+        opening.settings.broker.max_concurrent_subagents,
+        u32::MAX,
+        "the largest count the Broker keeps is a cap like any other"
     );
-    assert_eq!(snapshot.pinned, ["broker.enabled"]);
-    assert_eq!(snapshot.settings.broker.max_depth, 3);
-    assert_eq!(snapshot.settings.broker.max_concurrent_subagents, 6);
-    let diagnostic = |key: &str| {
-        snapshot
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.key.as_deref() == Some(key))
-            .unwrap_or_else(|| panic!("{key} is diagnosed: {:?}", snapshot.diagnostics))
-    };
-    let depth = diagnostic("broker.maxDepth");
-    assert!(
-        depth.message.contains("one of 1, 2, 3, 4, 5, or 6"),
-        "{depth:?}"
+    assert_eq!(
+        opening.pinned,
+        ["broker.maxConcurrentSubagents", "broker.maxDepth"]
     );
-    let concurrency = diagnostic("broker.maxConcurrentSubagents");
-    assert!(
-        concurrency
-            .message
-            .contains("one of 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12"),
-        "{concurrency:?}"
+    assert_eq!(opening.diagnostics, []);
+
+    let depth = client
+        .mutate_setting(SettingMutation::BrokerMaxDepth { value: Some(1) })
+        .await
+        .unwrap();
+    assert_eq!(depth.settings.broker.max_depth, 1);
+    let concurrency = client
+        .mutate_setting(SettingMutation::BrokerMaxConcurrentSubagents { value: Some(1) })
+        .await
+        .unwrap();
+    assert_eq!(concurrency.settings.broker.max_concurrent_subagents, 1);
+    assert_eq!(
+        concurrency.pinned,
+        ["broker.maxConcurrentSubagents", "broker.maxDepth"]
     );
-    assert_eq!(snapshot.diagnostics.len(), 2);
+    assert_eq!(
+        config_document(config_dir.path()),
+        r#"{"broker": {"maxConcurrentSubagents": 1, "maxDepth": 1}}"#,
+        "each pin replaces only its own count"
+    );
     drop(client);
     server.shutdown().await.unwrap();
+}
+
+/// A Broker cap counts from one up to what the count it is kept in holds, so a
+/// Config Document asking for none, for less than none, for part of one, for
+/// something that is not a number, or for more than that count can hold is
+/// ignored — each cap alone, with a diagnostic naming the bound — while the
+/// rest of the document still applies.
+#[tokio::test]
+async fn a_broker_cap_outside_its_bound_is_ignored_alone_naming_the_bound() {
+    for (case, invalid) in [
+        ("zero", "0"),
+        ("negative", "-1"),
+        ("fraction", "2.5"),
+        ("word", r#""three""#),
+        ("past-u32", "4294967296"),
+        ("absurd", "100000000000000000000"),
+    ] {
+        let state_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("suru.jsonc"),
+            format!(
+                r#"{{"broker": {{"enabled": false, "maxConcurrentSubagents": {invalid}, "maxDepth": {invalid}}}}}"#
+            ),
+        )
+        .unwrap();
+        let channel = format!("settings-broker-caps-invalid-{case}");
+        let server = server::spawn(
+            ServerConfig::new(state_dir.path(), &channel)
+                .unwrap()
+                .with_config_dir(config_dir.path()),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = attach(state_dir.path(), &channel).await.1;
+        assert!(
+            !snapshot.settings.broker.enabled,
+            "{case} ignores only the invalid caps"
+        );
+        assert_eq!(snapshot.pinned, ["broker.enabled"], "{case}");
+        assert_eq!(
+            snapshot.settings.broker.max_depth, 3,
+            "{case} keeps the built-in depth cap"
+        );
+        assert_eq!(
+            snapshot.settings.broker.max_concurrent_subagents, 6,
+            "{case} keeps the built-in concurrency cap"
+        );
+        let [concurrency, depth] = snapshot.diagnostics.as_slice() else {
+            panic!(
+                "{case} should diagnose each cap once: {:?}",
+                snapshot.diagnostics
+            );
+        };
+        for (diagnostic, key) in [
+            (concurrency, "broker.maxConcurrentSubagents"),
+            (depth, "broker.maxDepth"),
+        ] {
+            assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+            assert_eq!(diagnostic.key.as_deref(), Some(key), "{case}");
+            assert_eq!(
+                diagnostic.message,
+                "ignored because its value is not an integer from 1 to 4294967295",
+                "{case} names the bound {key} takes"
+            );
+        }
+
+        server.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

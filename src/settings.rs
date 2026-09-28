@@ -20,6 +20,7 @@ use std::{
     ffi::OsStr,
     fmt, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::IntErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -389,34 +390,61 @@ const SERVING_PORT_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
     },
 );
 
-/// The choices of a Setting that counts something, each spelled as the whole
-/// number a Config Document pins and pinned through `$variant`, in the order
-/// given — which is the order a reader cycles them.
-macro_rules! count_choices {
-    ($variant:ident: $($count:literal),+ $(,)?) => {
-        &[$(SettingChoice {
-            value: stringify!($count),
-            build_mutation: || SettingMutation::$variant { value: Some($count) },
-        }),+]
-    };
+/// The least a Broker cap counts: a tree of the top-level Session alone, or one
+/// brokered Subagent at a time. A cap is typed rather than chosen from a list,
+/// and like the side columns' widths it is bounded below alone: Suru sets it no
+/// maximum of its own. Its one ceiling is the most the `u32` the Broker counts
+/// in can hold, which the Setting names — as the Serving port names the most a
+/// port can be — so a count pinned past it is told so, rather than told of a
+/// minimum it met.
+const MINIMUM_BROKER_CAP: u32 = 1;
+
+/// What either Broker cap accepts, both ends of its bound named.
+const BROKER_CAP_ACCEPTS: &str = "an integer from 1 to 4294967295";
+
+fn validate_broker_cap(value: &str) -> Result<u64, &'static str> {
+    match value.parse::<u32>() {
+        Ok(cap) if cap >= MINIMUM_BROKER_CAP => Ok(u64::from(cap)),
+        Err(error) if *error.kind() == IntErrorKind::PosOverflow => Err("maximum: 4294967295"),
+        // A cap of none, and no cap typed at all, both fall short of the least.
+        _ => Err("minimum: 1"),
+    }
 }
 
-// Each Broker cap counts from one — a tree of the top-level Session alone, or
-// one brokered Subagent at a time — up to twice its built-in default. A cap
-// exists to bound spending, so it has a ceiling of its own, and a Setting whose
-// every value is named up front is one a reader cycles in a few presses and
-// one a diagnostic can spell out whole.
-const BROKER_MAX_DEPTH_CHOICES: &[SettingChoice] = count_choices!(BrokerMaxDepth: 1, 2, 3, 4, 5, 6);
-const BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES: &[SettingChoice] = count_choices!(
-    BrokerMaxConcurrentSubagents: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+/// Takes a Broker cap from a Config Document, refusing one below the least cap
+/// or past the most the count it is kept in can hold.
+fn broker_cap(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|cap| u32::try_from(cap).ok())
+        .filter(|cap| *cap >= MINIMUM_BROKER_CAP)
+}
+
+/// The count an accepted edit pins: the numeric editor only hands its pin what
+/// [`validate_broker_cap`] took, which parsed as the `u32` a cap is kept in.
+fn accepted_broker_cap(cap: u64) -> u32 {
+    u32::try_from(cap).expect("an accepted Broker cap fits the u32 it is kept in")
+}
+
+const BROKER_MAX_DEPTH_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Sessions deep",
+    |settings| u64::from(settings.broker.max_depth),
+    validate_broker_cap,
+    |depth| depth.to_string(),
+    |depth| SettingMutation::BrokerMaxDepth {
+        value: Some(accepted_broker_cap(depth)),
+    },
 );
 
-/// Writes a count from a Config Document, refusing any the Setting's `choices`
-/// do not name: a Fixed Setting holds only what it can say, so a count outside
-/// its choices is diagnosed rather than quietly taken.
-fn apply_count(value: &Value, choices: &[SettingChoice], write: impl FnOnce(u32)) -> bool {
-    choices.iter().any(|choice| choice.pinned_value() == *value) && apply_value(value, write)
-}
+const BROKER_MAX_CONCURRENT_SUBAGENTS_NUMERIC: NumericSettingChoice = NumericSettingChoice::new(
+    "Subagents at once",
+    |settings| u64::from(settings.broker.max_concurrent_subagents),
+    validate_broker_cap,
+    |count| count.to_string(),
+    |count| SettingMutation::BrokerMaxConcurrentSubagents {
+        value: Some(accepted_broker_cap(count)),
+    },
+);
 
 impl SettingValues {
     /// The values the schema names, which is everything a Fixed Setting accepts
@@ -1509,12 +1537,19 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many Sessions deep the Broker may spawn Subagents, the top-level Session counting as one",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
-        values: SettingValues::Fixed(BROKER_MAX_DEPTH_CHOICES),
+        values: SettingValues::Open {
+            named: &[],
+            accepts: BROKER_CAP_ACCEPTS,
+            spell: |settings| BROKER_MAX_DEPTH_NUMERIC.spell(u64::from(settings.broker.max_depth)),
+            chosen_at: Some(SettingChoiceSurface::Numeric(BROKER_MAX_DEPTH_NUMERIC)),
+        },
         reset: SettingMutation::BrokerMaxDepth { value: None },
         apply: |settings, value| {
-            apply_count(value, BROKER_MAX_DEPTH_CHOICES, |depth| {
-                settings.broker.max_depth = depth;
-            })
+            let Some(depth) = broker_cap(value) else {
+                return false;
+            };
+            settings.broker.max_depth = depth;
+            true
         },
     },
     SettingDescriptor {
@@ -1523,12 +1558,24 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many brokered Subagents may work at once beneath one top-level Session",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
-        values: SettingValues::Fixed(BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES),
+        values: SettingValues::Open {
+            named: &[],
+            accepts: BROKER_CAP_ACCEPTS,
+            spell: |settings| {
+                BROKER_MAX_CONCURRENT_SUBAGENTS_NUMERIC
+                    .spell(u64::from(settings.broker.max_concurrent_subagents))
+            },
+            chosen_at: Some(SettingChoiceSurface::Numeric(
+                BROKER_MAX_CONCURRENT_SUBAGENTS_NUMERIC,
+            )),
+        },
         reset: SettingMutation::BrokerMaxConcurrentSubagents { value: None },
         apply: |settings, value| {
-            apply_count(value, BROKER_MAX_CONCURRENT_SUBAGENTS_CHOICES, |count| {
-                settings.broker.max_concurrent_subagents = count;
-            })
+            let Some(count) = broker_cap(value) else {
+                return false;
+            };
+            settings.broker.max_concurrent_subagents = count;
+            true
         },
     },
 ];
@@ -2268,9 +2315,10 @@ mod tests {
                 "a port from 0 to 65535".to_owned(),
                 "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),
                 "one of true or false".to_owned(),
-                // A count is spelled bare, as the number a reader types.
-                "one of 1, 2, 3, 4, 5, or 6".to_owned(),
-                "one of 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12".to_owned(),
+                // A Broker cap names both ends of what it takes, the upper one
+                // being the most the count it is kept in can hold.
+                "an integer from 1 to 4294967295".to_owned(),
+                "an integer from 1 to 4294967295".to_owned(),
             ]
         );
     }
