@@ -264,16 +264,16 @@ Session, and you are sent its Subagent Report when that stretch settles, as \
 after a spawn. When it is still working on what it was delegated, the message \
 steers that work and reaches it there; nothing new begins and no row is \
 added. Work it took up of its own accord since it settled is stopped instead, \
-and it is resumed with the message. Answers once the message has been \
+and it is resumed with the message; so is one whose work ends as the message \
+arrives, once that work has settled. Answers once the message has been \
 delivered, with JSON of the shape {\"session_id\": \"...\", \"delivered\": \
 \"...\"}, where \"delivered\" is \"resumed\" or \"steered\". An id naming no \
 Subagent spawned with spawn_subagent by you or by a Subagent beneath you is \
 refused, as is an empty message. So is a resume that would pass the user's \
 limit on how many Subagents spawned this way work at once beneath the \
 top-level Session; it is never queued, and wait_subagents waits for one to \
-settle. A message the Subagent's work ended too soon to take is refused, \
-saying so; send it again once the Subagent has settled to resume it. A \
-refused message reaches no one.";
+settle. A message the Subagent is stopped before receiving is refused, saying \
+so. A refused message reaches no one.";
 
 const WAIT_SUBAGENTS_DESCRIPTION: &str = "\
 Wait until a Subagent spawned with spawn_subagent settles, when you need its \

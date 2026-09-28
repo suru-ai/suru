@@ -345,7 +345,8 @@ async fn sending_to_a_working_brokered_subagent_steers_its_turn_and_adds_no_row(
 }
 
 #[tokio::test]
-async fn a_steer_the_subagents_provider_refuses_is_refused_and_a_send_once_it_settles_resumes_it() {
+async fn a_steer_the_subagents_provider_refuses_is_held_and_resumes_the_subagent_once_its_turn_settles()
+ {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-send-steer-refused", None).await;
     let descriptor = delegating.descriptor.clone();
@@ -353,7 +354,162 @@ async fn a_steer_the_subagents_provider_refuses_is_refused_and_a_send_once_it_se
 
     // The Subagent's Turn ends at its Provider as the Delegation arrives, so
     // the Provider no longer takes a steer — and Suru hears of the end only
-    // afterwards.
+    // afterwards. Arriving once the work has finished, the Delegation begins
+    // a Turn of its own (CONTEXT.md: Delegation).
+    let (answer, ()) = tokio::join!(
+        delegating.client.send_to_subagent(child_id, FOLLOW_UP),
+        async {
+            timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+                .await
+                .expect("the Delegation is offered to the Subagent's working Turn")
+                .fail("no turn is running");
+            let child = read_session(&descriptor, child_id).await;
+            assert_eq!(
+                delegations(&child),
+                [(child.turns[0].id, DELEGATION.to_owned())],
+                "a steer never taken stands nowhere in the Turn that refused it"
+            );
+            child_provider
+                .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+                .await;
+            let resumed = next_turn(
+                &mut child_provider,
+                "the held Delegation resumes the Subagent once its Turn has settled",
+            )
+            .await;
+            assert_eq!(resumed.prompt(), followed_up_by(CALLER));
+            resumed.succeed();
+        }
+    );
+    assert_eq!(
+        answer,
+        json!({ "session_id": child_id, "delivered": "resumed" }),
+        "the call answers with how the message was delivered in the end"
+    );
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
+
+    let child = read_until(
+        &descriptor,
+        child_id,
+        "the resume works in the Subagent's own Session",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+    assert_eq!(
+        delegations(&child),
+        [
+            (child.turns[0].id, DELEGATION.to_owned()),
+            (child.turns[1].id, FOLLOW_UP.to_owned()),
+        ],
+        "the Delegation opens the resume's Turn"
+    );
+    let caller = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(
+        rows_for(&caller, child_id).len(),
+        2,
+        "and stands as a row of its own"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn delegations_held_behind_a_settling_turn_steer_the_resume_the_first_of_them_begins() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-send-held-steer", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, mut child_provider) = spawn_working_child(&mut delegating).await;
+    let mut second_client = McpClient::handed(&delegating.handoff);
+    second_client.initialize().await;
+    const SECOND: &str = "And list the tests that reach each seam.";
+
+    // Both reach the Subagent's Turn as it ends, and are held; each steer the
+    // double is offered shows its Delegation reached the actor in turn.
+    let (first, ()) = tokio::join!(
+        delegating.client.send_to_subagent(child_id, FOLLOW_UP),
+        async {
+            timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+                .await
+                .expect("the first Delegation is offered as a steer")
+                .fail("no turn is running");
+            let second =
+                tokio::spawn(async move { second_client.send_to_subagent(child_id, SECOND).await });
+            let steer = timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+                .await
+                .expect("the second Delegation is offered as a steer");
+            assert!(steer.prompt().ends_with(SECOND));
+            steer.fail("no turn is running");
+
+            child_provider
+                .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+                .await;
+            let resumed = next_turn(
+                &mut child_provider,
+                "the first held Delegation resumes the Subagent",
+            )
+            .await;
+            assert_eq!(resumed.prompt(), followed_up_by(CALLER));
+            resumed.succeed();
+            let steer = timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+                .await
+                .expect("the second steers the resume's Turn at once, not after it");
+            assert!(steer.prompt().ends_with(SECOND));
+            steer.succeed();
+            assert_eq!(
+                timeout(PROGRESS_DEADLINE, second)
+                    .await
+                    .expect("the second call answers once its Delegation is delivered")
+                    .expect("the second call runs to its answer"),
+                json!({ "session_id": child_id, "delivered": "steered" })
+            );
+        }
+    );
+    assert_eq!(
+        first,
+        json!({ "session_id": child_id, "delivered": "resumed" })
+    );
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
+
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(
+        delegations(&child),
+        [
+            (child.turns[0].id, DELEGATION.to_owned()),
+            (child.turns[1].id, FOLLOW_UP.to_owned()),
+            (child.turns[1].id, SECOND.to_owned()),
+        ],
+        "one resume, which the second Delegation steered"
+    );
+    assert_eq!(
+        rows_for(
+            &read_session(&descriptor, delegating.caller).await,
+            child_id
+        )
+        .len(),
+        2,
+        "the steer adds no row of its own"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_stop_reaching_the_subagent_while_a_refused_steer_is_held_withdraws_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-send-held-stopped", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, mut child_provider) = spawn_working_child(&mut delegating).await;
+
     let (refusal, ()) = tokio::join!(
         delegating.client.refusal(
             "send_to_subagent",
@@ -362,37 +518,123 @@ async fn a_steer_the_subagents_provider_refuses_is_refused_and_a_send_once_it_se
         async {
             timeout(PROGRESS_DEADLINE, child_provider.next_steer())
                 .await
-                .expect("the Delegation is offered to the Subagent's working Turn")
-                .fail("no turn is running");
+                .expect("the Delegation is offered as a steer")
+                .fail("the turn is busy");
+            // The user stops the Subagent while the Delegation is held.
+            let (_, ()) = tokio::join!(interrupt(&descriptor, child_id), async {
+                timeout(PROGRESS_DEADLINE, child_provider.next_interrupt())
+                    .await
+                    .expect("the stop reaches the Subagent's Provider")
+                    .succeed();
+            });
+            child_provider
+                .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+                .await;
         }
     );
     assert!(
-        refusal.contains("was not delivered") && refusal.contains("no turn is running"),
-        "the sending Agent is told honestly that nothing reached the Subagent, and why: {refusal}"
+        refusal.contains("stopped before the message reached it"),
+        "the held Delegation is withdrawn, and its Agent told so: {refusal}"
     );
-    assert!(
-        refusal.contains("send_to_subagent again"),
-        "and what to do instead: {refusal}"
+    let child = read_until(
+        &descriptor,
+        child_id,
+        "the Subagent's Turn settles as stopped",
+        |snapshot| snapshot.turns[0].status == TurnStatus::Interrupted,
+    )
+    .await;
+    assert_eq!(child.turns.len(), 1, "no resume begins behind the stop");
+    assert!(child_provider.try_next_turn().is_none());
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_delegation_held_behind_a_continuation_steers_the_resume_an_earlier_one_began() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-send-continuation-pair", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, mut child_provider) = spawn_working_child(&mut delegating).await;
+    settle_child(&mut delegating, child_id, &child_provider).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::ContinuationStarted {
+            selection: codex_selection("high"),
+        })
+        .await;
+    read_until(
+        &descriptor,
+        child_id,
+        "the Subagent works on in a Continuation",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+    let mut second_client = McpClient::handed(&delegating.handoff);
+    second_client.initialize().await;
+    const SECOND: &str = "And list the tests that reach each seam.";
+
+    let (first, ()) = tokio::join!(
+        delegating.client.send_to_subagent(child_id, FOLLOW_UP),
+        async {
+            // The first asks for the Continuation's Provider work to stop;
+            // the second is sent while that stop is under way.
+            let stop = timeout(PROGRESS_DEADLINE, child_provider.next_interrupt())
+                .await
+                .expect("the Continuation's Provider work is interrupted for the resume");
+            let second =
+                tokio::spawn(async move { second_client.send_to_subagent(child_id, SECOND).await });
+            stop.succeed();
+            // A read through the Server lets the second reach the actor
+            // before the Continuation settles, as it would were its Provider
+            // slower to say so.
+            read_session(&descriptor, child_id).await;
+            child_provider
+                .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
+                .await;
+            let resumed = next_turn(
+                &mut child_provider,
+                "the first Delegation resumes the Subagent once the Continuation settles",
+            )
+            .await;
+            assert_eq!(resumed.prompt(), followed_up_by(CALLER));
+            resumed.succeed();
+            let steer = timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+                .await
+                .expect("the second steers the resume's Turn at once, not after it");
+            assert!(steer.prompt().ends_with(SECOND));
+            steer.succeed();
+            assert_eq!(
+                timeout(PROGRESS_DEADLINE, second)
+                    .await
+                    .expect("the second call answers once its Delegation is delivered")
+                    .expect("the second call runs to its answer"),
+                json!({ "session_id": child_id, "delivered": "steered" })
+            );
+        }
+    );
+    assert_eq!(
+        first,
+        json!({ "session_id": child_id, "delivered": "resumed" })
     );
     let child = read_session(&descriptor, child_id).await;
     assert_eq!(
-        delegations(&child),
-        [(child.turns[0].id, DELEGATION.to_owned())],
-        "a Delegation never delivered stands nowhere"
+        child.turns.len(),
+        3,
+        "one resume, behind the settled Continuation"
     );
-
-    settle_child(&mut delegating, child_id, &child_provider).await;
     assert_eq!(
-        delegating
-            .client
-            .send_to_subagent(child_id, FOLLOW_UP)
-            .await,
-        json!({ "session_id": child_id, "delivered": "resumed" }),
-        "sent again once the Subagent has settled, it resumes it"
+        delegations(&child)
+            .into_iter()
+            .filter(|(turn_id, _)| *turn_id == child.turns[2].id)
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+        [FOLLOW_UP.to_owned(), SECOND.to_owned()],
+        "the second Delegation stands in the resume the first began"
     );
-    let resumed = next_turn(&mut child_provider, "the resume reaches the Subagent").await;
-    assert_eq!(resumed.prompt(), followed_up_by(CALLER));
-    resumed.succeed();
 
     delegating
         .hosted
@@ -753,6 +995,65 @@ async fn a_resume_past_the_concurrency_cap_is_refused_naming_it_and_goes_through
     next_turn(&mut settled_provider, "the resume reaches the Subagent")
         .await
         .succeed();
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_resume_past_the_cap_is_refused_before_anything_the_subagent_does_is_stopped() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = config_pinning(r#"{"broker": {"maxConcurrentSubagents": 1}}"#);
+    let mut delegating = delegating(
+        state_dir.path(),
+        "broker-send-capped-continuation",
+        Some(config_dir.path()),
+    )
+    .await;
+    let descriptor = delegating.descriptor.clone();
+    let (resumable_id, mut resumable_provider) = spawn_working_child(&mut delegating).await;
+    settle_child(&mut delegating, resumable_id, &resumable_provider).await;
+    let (_working_id, _working_provider) = spawn_working_child(&mut delegating).await;
+    // The settled Subagent's Provider takes up work of its own, which a
+    // resume of it would have to stop first.
+    resumable_provider
+        .emit_and_wait_until_observed(ProviderEvent::ContinuationStarted {
+            selection: codex_selection("high"),
+        })
+        .await;
+    read_until(
+        &descriptor,
+        resumable_id,
+        "the Subagent works on in a Continuation",
+        |snapshot| snapshot.turns.len() == 2,
+    )
+    .await;
+
+    let refusal = delegating
+        .client
+        .refusal(
+            "send_to_subagent",
+            json!({ "id": resumable_id, "message": FOLLOW_UP }),
+        )
+        .await;
+    assert!(
+        refusal.contains("`broker.maxConcurrentSubagents`")
+            && refusal.contains("so the Subagent was not resumed"),
+        "the resume is refused naming the cap: {refusal}"
+    );
+    assert!(
+        resumable_provider.try_next_interrupt().is_none(),
+        "and nothing the Subagent was doing was stopped for it"
+    );
+    assert_eq!(
+        read_session(&descriptor, resumable_id).await.turns[1].status,
+        TurnStatus::Active,
+        "its Continuation works on"
+    );
 
     delegating
         .hosted

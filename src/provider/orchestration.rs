@@ -6,8 +6,8 @@ mod watch_outcomes;
 use approvals::{DecisionDeliveries, LiveApprovals};
 pub(crate) use delegations::{BrokeredDelivery, BrokeredSendRefusal};
 use delegations::{
-    PendingDelegation, open_resume, refuse_while_stopping, refuse_withdrawn, run_delegated_turn,
-    steer_with_delegation,
+    PendingDelegation, SteerOutcome, open_resume, refuse_while_stopping, refuse_withdrawn,
+    resume_refusal, run_delegated_turn, steer_with_delegation,
 };
 use questionnaires::{LiveQuestionnaires, QuestionnaireDeliveries};
 use watch_outcomes::{HeldWatchOutcomes, WatchOutcome};
@@ -2143,6 +2143,9 @@ async fn run_provider_session(
     'actor: loop {
         questionnaire_deliveries.reconcile(&sessions);
         decision_deliveries.reconcile(&sessions);
+        // A held Delegation is delivered for as long as its call waits, and
+        // for no one once that call has gone.
+        pending_delegations.retain(|pending| !pending.is_abandoned());
         if shutdown.requested() {
             break;
         }
@@ -2875,6 +2878,14 @@ async fn run_provider_session(
                 .as_ref()
                 .is_some_and(|turn| turn.continuation.is_some() && !turn.interruption_acknowledged)
                 && (!pending_turn_starts.is_empty() || deferred_prompt_id.is_some());
+            // A held Delegation the Turn now active can take: the resume an
+            // earlier one began, a Continuation to settle for its own resume,
+            // or any Turn but the one whose steer it waits out.
+            let deliverable = active.as_ref().and_then(|turn| {
+                pending_delegations
+                    .iter()
+                    .position(|pending| pending.may_reach(turn))
+            });
             let events = &mut provider
                 .as_mut()
                 .expect("an active Provider Turn has a Provider Session")
@@ -2896,6 +2907,12 @@ async fn run_provider_session(
                             .or_else(|| deferred_prompt_id.take()).expect("pending Prompt");
                         ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                     }
+                }
+                _ = std::future::ready(()), if deliverable.is_some() => {
+                    let pending = deliverable
+                        .and_then(|index| pending_delegations.remove(index))
+                        .expect("a held Delegation the active Turn can take");
+                    ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending)))
                 }
                 command = commands.recv() => ActorInput::Command(command),
             }
@@ -2933,6 +2950,11 @@ async fn run_provider_session(
                         && !turn.interruption_acknowledged
                 }) =>
             {
+                // A resume bound to be refused stops nothing.
+                if let Some(refusal) = resume_refusal(&connector, &pending) {
+                    pending.answer(Err(refusal));
+                    continue;
+                }
                 pending_delegations.push_back(pending);
                 let (response, _) = oneshot::channel();
                 ActorInput::Command(Some(ProviderCommand::InterruptSession { response }))
@@ -3044,36 +3066,44 @@ async fn run_provider_session(
             }
 
             // A Delegation sent after the spawn reaches the Turn at work here
-            // as a steer when a Delegation began it (ADR 0032). A Continuation
-            // is no Delegation's to steer: one Suru opened for late output
-            // settles at once, as worked, and one whose stop is under way
-            // settles when its Provider says, and the resume begins after
-            // either — while a Delegation's Turn already being stopped is
-            // steered by nothing, the Provider stopping it first.
+            // as a steer when a Delegation began it (ADR 0032); one its
+            // Provider will not take is held until that Turn settles, and
+            // resumes the Subagent then. A Continuation is no Delegation's to
+            // steer: one Suru opened for late output settles at once, as
+            // worked, and one whose stop is under way settles when its
+            // Provider says, and the resume begins after either.
             ActorInput::Command(Some(ProviderCommand::DeliverDelegation(pending))) => {
                 let current = active
                     .as_mut()
                     .expect("Provider input is handled while a Turn is active");
                 match current.continuation {
+                    // A stop reached this Delegation's Turn first, and ends
+                    // it: the Delegation is refused, where one arriving while
+                    // a Continuation is stopped is held and resumes after.
                     None if current.interruption_acknowledged => refuse_while_stopping(pending),
-                    None => {
-                        let steered = steer_with_delegation(
-                            &sessions,
-                            &updates,
-                            provider_session.as_ref(),
-                            &mut shutdown,
-                            session_id,
-                            current.turn_id,
-                            pending,
-                        )
-                        .await;
-                        if steered.is_break() {
-                            break 'actor;
-                        }
-                    }
+                    None => match steer_with_delegation(
+                        &sessions,
+                        &updates,
+                        provider_session.as_ref(),
+                        &mut shutdown,
+                        session_id,
+                        current.turn_id,
+                        pending,
+                    )
+                    .await
+                    {
+                        SteerOutcome::Answered => {}
+                        SteerOutcome::Held(pending) => pending_delegations.push_back(pending),
+                        SteerOutcome::Stopping => break 'actor,
+                    },
                     Some(ContinuationExecution::LateOutput)
                         if !current.interruption_acknowledged =>
                     {
+                        // A resume bound to be refused settles nothing.
+                        if let Some(refusal) = resume_refusal(&connector, &pending) {
+                            pending.answer(Err(refusal));
+                            continue;
+                        }
                         let trailing_output = current.take_trailing_output();
                         let Some(_) = updates.apply(|| {
                             sessions.finish_provider_turn(

@@ -281,14 +281,7 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        state
-            .reach_brokered_subagent(caller, subagent)
-            .map_err(BrokeredResumeError::Unreachable)?;
-        if let Some(cap) =
-            state.brokered_concurrency_cap(subagent, Some(subagent), &settings.broker)
-        {
-            return Err(BrokeredResumeError::Capped(cap));
-        }
+        state.resume_refusal(caller, subagent, &settings.broker)?;
         let delegating = state.delegating_agent(caller);
         let title = &state.sessions[&subagent].snapshot.title;
         // The name the spawn's row carries, which every later row repeats.
@@ -332,6 +325,24 @@ impl SessionStore {
             turn_id,
             delegator: delegating,
         })
+    }
+
+    /// Why a resume of the brokered Subagent `subagent` for the Agent of
+    /// `caller` would be refused now, for the reasons
+    /// [`Self::resume_brokered_subagent`] refuses one, without beginning
+    /// anything: asked before what the Subagent is doing is stopped for the
+    /// resume, so a resume bound to be refused stops nothing.
+    pub(crate) fn brokered_resume_refusal(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+    ) -> Option<BrokeredResumeError> {
+        let settings = self.settings.borrow().settings.clone();
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .resume_refusal(caller, subagent, &settings.broker)
+            .err()
     }
 
     /// Reads how the brokered Subagent `subagent` stands, for the Agent of
@@ -562,6 +573,24 @@ impl SessionStoreState {
             max_concurrent_subagents: broker.max_concurrent_subagents,
             working,
         })
+    }
+
+    /// Why a resume of `subagent` for the Agent of `caller` is refused, if it
+    /// is: a Subagent out of the caller's reach, or one more brokered Subagent
+    /// working than `broker` allows, counted as a spawn is but for `subagent`
+    /// itself, which the resume sets working again rather than adds.
+    fn resume_refusal(
+        &self,
+        caller: SessionId,
+        subagent: SessionId,
+        broker: &BrokerSettings,
+    ) -> Result<(), BrokeredResumeError> {
+        self.reach_brokered_subagent(caller, subagent)
+            .map_err(BrokeredResumeError::Unreachable)?;
+        match self.brokered_concurrency_cap(subagent, Some(subagent), broker) {
+            Some(cap) => Err(BrokeredResumeError::Capped(cap)),
+            None => Ok(()),
+        }
     }
 
     /// Stands the row a stretch of the brokered Subagent `child`'s work opens
