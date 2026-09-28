@@ -538,6 +538,15 @@ impl AttachmentPreviews {
         None
     }
 
+    /// Whether the cache still waits on `request`'s answer: one it dropped,
+    /// with the Session or the Setting it was asked under, or let go of with
+    /// the draft that bound it, is not worth fetching on.
+    pub(super) fn awaits(&self, request: ThumbnailRequest) -> bool {
+        self.thumbnails
+            .values()
+            .any(|entry| matches!(entry, Entry::Fetching(asked) if *asked == request))
+    }
+
     /// Takes a fetch's answer: the thumbnail, or `None` where the fetch or
     /// the decode failed. An answer nothing is still waiting on — one for a
     /// Session no longer open, a cell size no longer current, or a request
@@ -1034,6 +1043,36 @@ mod tests {
         assert!(
             previews.thumbnail(&id).is_some(),
             "and a stale one moves nothing"
+        );
+    }
+
+    #[test]
+    fn a_fetch_is_awaited_until_its_answer_lands_or_its_thumbnail_is_let_go() {
+        let mut previews = AttachmentPreviews::default();
+        previews.hold_for(PreviewScope::default(), STRIPS);
+        let strip = two_attachments(&previews);
+        let requests = fetches(&mut previews, &strip);
+        let ids = strip.shown().cloned().collect::<Vec<_>>();
+        assert!(requests.iter().all(|request| previews.awaits(*request)));
+
+        previews.receive(requests[0], ids[0].clone(), CELL, Some(square()));
+        assert!(!previews.awaits(requests[0]), "an answered fetch is not");
+        previews.retain_bound(&HashSet::from([ids[0].clone()]));
+        assert!(
+            !previews.awaits(requests[1]),
+            "nor one whose label went from the draft"
+        );
+
+        let asked_again = fetches(&mut previews, &strip);
+        assert_eq!(asked_again.len(), 1);
+        assert!(previews.awaits(asked_again[0]));
+        previews.hold_for(
+            PreviewScope::Landing(Outlook::Remote("studio".to_owned())),
+            STRIPS,
+        );
+        assert!(
+            !previews.awaits(asked_again[0]),
+            "nor one asked for the scope left"
         );
     }
 

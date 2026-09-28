@@ -113,7 +113,8 @@ enum Exit {
 }
 
 /// The Session-scoped work the run loop owns: the live event subscription and
-/// the tasks establishing it, attaching a Session, and filling the pickers.
+/// the tasks establishing it, attaching a Session, filling the pickers, and
+/// fetching the thumbnails its Attachments are drawn with.
 #[derive(Default)]
 struct SessionTasks {
     subscription: Option<SessionSubscription>,
@@ -134,6 +135,8 @@ struct SessionTasks {
     /// was asked through.
     subagent_tree: Option<(SessionReference, tokio::task::JoinHandle<()>)>,
     resolving_workspaces: HashMap<WorkspaceResolutionSurface, (u64, tokio::task::JoinHandle<()>)>,
+    /// Each thumbnail fetch in flight, by the request its answer names.
+    fetching_thumbnails: HashMap<crate::tui::ThumbnailRequest, tokio::task::JoinHandle<()>>,
 }
 
 impl SessionTasks {
@@ -212,6 +215,32 @@ impl SessionTasks {
         if let Some((_, task)) = self.listing_skills.take() {
             task.abort();
         }
+    }
+
+    fn fetch_thumbnail(
+        &mut self,
+        request: crate::tui::ThumbnailRequest,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        self.fetching_thumbnails.insert(request, task);
+    }
+
+    /// Aborts every thumbnail fetch whose answer `awaited` says nothing waits
+    /// on any longer — its Session left, its Outlook turned, the Setting or
+    /// the terminal changed, the label that bound it deleted — and forgets
+    /// those already answered. An answer sent before the abort is still
+    /// dropped by its request.
+    fn abort_unawaited_thumbnails(
+        &mut self,
+        awaited: impl Fn(crate::tui::ThumbnailRequest) -> bool,
+    ) {
+        self.fetching_thumbnails.retain(|request, task| {
+            let keep = awaited(*request);
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
     }
 
     fn reconcile_catalog_origins(
@@ -594,6 +623,7 @@ async fn run_loop(
     loop {
         run.sync_skill_catalog();
         run.sync_subagent_tree();
+        run.sync_thumbnail_fetches();
         if run.needs_redraw && run.application.first_frame_ready() {
             draw_frame(
                 terminal,
@@ -783,6 +813,12 @@ impl RunLoop {
             .follow_subagent_tree(&self.client, wanted, &self.channels.subagent_trees);
     }
 
+    fn sync_thumbnail_fetches(&mut self) {
+        let application = &self.application;
+        self.tasks
+            .abort_unawaited_thumbnails(|request| application.awaits_thumbnail(request));
+    }
+
     fn receive_attachment_answer(
         &mut self,
         answer: Option<ApplicationEvent>,
@@ -960,16 +996,19 @@ impl RunLoop {
                 attachment_id,
                 cell_size,
                 protocol,
-            } => spawn_thumbnail(
-                self.client.session_commands_for(origin),
-                ThumbnailAsked {
-                    request,
-                    attachment_id,
-                    cell_size,
-                    protocol,
-                },
-                self.channels.thumbnails.clone(),
-            ),
+            } => {
+                let task = spawn_thumbnail(
+                    self.client.session_commands_for(origin),
+                    ThumbnailAsked {
+                        request,
+                        attachment_id,
+                        cell_size,
+                        protocol,
+                    },
+                    self.channels.thumbnails.clone(),
+                );
+                self.tasks.fetch_thumbnail(request, task);
+            }
             ApplicationTransition::CreateSession(request) => {
                 let outlook = self.application.outlook().clone();
                 spawn_session_creation(
@@ -2452,12 +2491,12 @@ fn spawn_thumbnail(
     commands: SessionCommandClient,
     asked: ThumbnailAsked,
     answers: UnboundedSender<ApplicationEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let fetched = commands.fetch_attachment(&asked.attachment_id).await;
         let answer = thumbnail_answer(asked, fetched).await;
         let _ = answers.send(answer);
-    });
+    })
 }
 
 /// What a thumbnail fetch answers once its bytes are in, or are not: the
@@ -5430,12 +5469,16 @@ mod thumbnail_tests {
     use image::{DynamicImage, ImageFormat, RgbaImage};
 
     use crate::{
-        protocol::AttachmentId,
+        protocol::{AttachmentId, Outlook},
         terminal::{CellSize, GraphicsProtocol},
-        tui::{ApplicationEvent, ThumbnailRequest},
+        tui::{
+            ApplicationEvent, ThumbnailRequest,
+            attachment_preview::{AttachmentPreviews, AttachmentRows, PreviewMode, PreviewScope},
+            text_binding::TextBindings,
+        },
     };
 
-    use super::{ThumbnailAsked, thumbnail_answer};
+    use super::{SessionTasks, ThumbnailAsked, thumbnail_answer};
 
     const CELL: CellSize = CellSize {
         width: 10,
@@ -5505,5 +5548,59 @@ mod thumbnail_tests {
                 "{answer:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn switching_scope_aborts_the_fetch_asked_for_the_scope_left() {
+        let strips = PreviewMode::Strips {
+            cell_size: CELL,
+            protocol: GraphicsProtocol::Kitty,
+        };
+        let mut previews = AttachmentPreviews::default();
+        previews.hold_for(PreviewScope::default(), strips);
+        let mut bindings = TextBindings::default();
+        bindings.bind_attachment(
+            0..9,
+            AttachmentId::new("screenshot-hash"),
+            "[Image 1]".to_owned(),
+        );
+        let AttachmentRows::Strip(strip) = previews.rows(&bindings, |_| None) else {
+            panic!("previews on present a strip");
+        };
+        previews.begin_frame();
+        previews.want(&strip);
+        let (request, ..) = previews
+            .take_fetch()
+            .expect("a strip in view asks for its thumbnail");
+
+        // A fetch the Server never answers, which says when it is dropped.
+        let (held, mut dropped) = tokio::sync::oneshot::channel::<()>();
+        let mut tasks = SessionTasks::default();
+        tasks.fetch_thumbnail(
+            request,
+            tokio::spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            }),
+        );
+
+        tasks.abort_unawaited_thumbnails(|request| previews.awaits(request));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "a fetch the open Session still waits on runs on"
+        );
+
+        previews.hold_for(
+            PreviewScope::Landing(Outlook::Remote("studio".to_owned())),
+            strips,
+        );
+        tasks.abort_unawaited_thumbnails(|request| previews.awaits(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the aborted fetch is dropped")
+            .expect_err("dropped before it was answered");
+        assert!(tasks.fetching_thumbnails.is_empty());
     }
 }

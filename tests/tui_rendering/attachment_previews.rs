@@ -985,6 +985,37 @@ fn switching_sessions_drops_the_thumbnails_held() {
 }
 
 #[test]
+fn a_fetch_asked_for_a_session_left_is_waited_on_no_longer() {
+    let workspace = workspace_dir();
+    let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());
+    session_with_message(&mut application, TWO, &[screenshot(), diagram()]);
+    rendered_application_frame(&application, WIDTH, HEIGHT);
+    let asked = take_fetches(&mut application);
+    assert_eq!(asked.len(), 2);
+    assert!(
+        asked
+            .iter()
+            .all(|fetch| application.awaits_thumbnail(fetch.request))
+    );
+
+    let other = failed_session_snapshot(
+        SessionId::new(),
+        suru::protocol::PromptId::new(),
+        "Another Session",
+        workspace.path(),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(other))
+        .expect("open another Session");
+    assert!(
+        asked
+            .iter()
+            .all(|fetch| !application.awaits_thumbnail(fetch.request)),
+        "the run loop aborts the fetches of the Session left"
+    );
+}
+
+#[test]
 fn a_drafts_thumbnails_stand_through_the_session_its_prompt_begins() {
     let workspace = workspace_dir();
     let mut application = connected_application_with_terminal_facts(workspace.path(), kitty());

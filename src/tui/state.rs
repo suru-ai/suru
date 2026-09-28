@@ -4741,6 +4741,13 @@ impl Application {
         }
     }
 
+    /// Whether the thumbnail fetch `request` names is still waited on, which
+    /// stops being so once its answer lands or the thumbnails it would join
+    /// are dropped. A caller running fetches aborts those no longer waited on.
+    pub fn awaits_thumbnail(&self, request: ThumbnailRequest) -> bool {
+        self.state.attachment_previews.awaits(request)
+    }
+
     /// Presents the open Session's oldest Intervention when nothing stands in
     /// its way. This is read from state rather than driven by an arrival, so
     /// opening a Session that already owes the reader something, coming back

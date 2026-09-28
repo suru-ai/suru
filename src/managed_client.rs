@@ -52,6 +52,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_RECOVERY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
+const ATTACHMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct ManagedClientConfig {
@@ -64,6 +65,7 @@ pub struct ManagedClientConfig {
     max_readiness_interval: Duration,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
+    attachment_fetch_timeout: Duration,
 }
 
 impl ManagedClientConfig {
@@ -78,6 +80,7 @@ impl ManagedClientConfig {
             max_readiness_interval: Duration::from_millis(50),
             initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
             max_recovery_backoff: MAX_RECOVERY_BACKOFF,
+            attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
         })
     }
 
@@ -121,6 +124,16 @@ impl ManagedClientConfig {
     pub fn with_recovery_backoff(mut self, initial: Duration, max: Duration) -> Self {
         self.initial_recovery_backoff = initial;
         self.max_recovery_backoff = max;
+        self
+    }
+
+    /// Bounds each request that moves or checks an Attachment's bytes — its
+    /// upload, its fetch, and the check that it is still stored — from
+    /// sending it to reading the last of its body, so a Server that takes the
+    /// request and then stalls fails it rather than leaving it pending for
+    /// good; injectable so tests can meet the deadline in milliseconds.
+    pub fn with_attachment_fetch_timeout(mut self, timeout: Duration) -> Self {
+        self.attachment_fetch_timeout = timeout;
         self
     }
 
@@ -288,6 +301,7 @@ pub struct ManagedClient {
     descriptor: watch::Receiver<RuntimeDescriptor>,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
+    attachment_fetch_timeout: Duration,
     config_dir: Option<PathBuf>,
     task: JoinHandle<()>,
 }
@@ -299,6 +313,7 @@ pub(crate) struct SessionCommandClient {
     outlook: Outlook,
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
+    attachment_fetch_timeout: Duration,
 }
 
 /// Commands addressed to the one Server a Client's Outlook names. Remote
@@ -655,6 +670,7 @@ impl ManagedClient {
             outlook,
             initial_recovery_backoff: self.initial_recovery_backoff,
             max_recovery_backoff: self.max_recovery_backoff,
+            attachment_fetch_timeout: self.attachment_fetch_timeout,
         }
     }
 }
@@ -1033,26 +1049,44 @@ impl SessionCommandClient {
         .await
     }
 
+    /// Runs one Attachment request, `action` naming it, within the client's
+    /// Attachment deadline. The deadline covers the whole request — its
+    /// headers and all of its body — so a Server that takes it and then
+    /// stalls fails it rather than leaving it pending for good.
+    async fn within_attachment_deadline<T>(
+        &self,
+        action: &str,
+        request: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let deadline = self.attachment_fetch_timeout;
+        tokio::time::timeout(deadline, request)
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("{action} timed out after {deadline:?}")))
+    }
+
     /// Uploads an image's PNG bytes as an Attachment on the Server this
     /// client's Outlook names, answering with what it was stored as. A
     /// refusal is the Server's own `SessionError`, whose message a client can
     /// show as it stands.
     pub(crate) async fn upload_attachment(&self, png: Vec<u8>) -> Result<AttachmentDescriptor> {
-        let descriptor = self.descriptor.borrow().clone();
-        let response = self
-            .http
-            .post(server_url(
-                &descriptor.base_url,
-                &self.outlook,
-                "/v1/attachments",
-            )?)
-            .bearer_auth(&descriptor.token)
-            .header(reqwest::header::CONTENT_TYPE, "image/png")
-            .body(png)
-            .send()
-            .await
-            .context("send Attachment upload")?;
-        decode_api_response(response, "Attachment upload").await
+        self.within_attachment_deadline("Attachment upload", async {
+            let descriptor = self.descriptor.borrow().clone();
+            let response = self
+                .http
+                .post(server_url(
+                    &descriptor.base_url,
+                    &self.outlook,
+                    "/v1/attachments",
+                )?)
+                .bearer_auth(&descriptor.token)
+                .header(reqwest::header::CONTENT_TYPE, "image/png")
+                .body(png)
+                .send()
+                .await
+                .context("send Attachment upload")?;
+            decode_api_response(response, "Attachment upload").await
+        })
+        .await
     }
 
     /// Fetches a stored Attachment's bytes, with the type they were stored as.
@@ -1063,6 +1097,11 @@ impl SessionCommandClient {
         &self,
         attachment_id: &AttachmentId,
     ) -> Result<(String, Vec<u8>)> {
+        self.within_attachment_deadline("Attachment fetch", self.read_attachment(attachment_id))
+            .await
+    }
+
+    async fn read_attachment(&self, attachment_id: &AttachmentId) -> Result<(String, Vec<u8>)> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
@@ -1112,18 +1151,21 @@ impl SessionCommandClient {
     /// not stored there: any other refusal, a Remote this Server no longer
     /// knows among them, is an error, so the Attachment is not taken for gone.
     pub(crate) async fn attachment_exists(&self, attachment_id: &AttachmentId) -> Result<bool> {
-        let descriptor = self.descriptor.borrow().clone();
         let response = self
-            .http
-            .head(server_url(
-                &descriptor.base_url,
-                &self.outlook,
-                &format!("/v1/attachments/{attachment_id}"),
-            )?)
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .context("send Attachment check")?;
+            .within_attachment_deadline("Attachment check", async {
+                let descriptor = self.descriptor.borrow().clone();
+                self.http
+                    .head(server_url(
+                        &descriptor.base_url,
+                        &self.outlook,
+                        &format!("/v1/attachments/{attachment_id}"),
+                    )?)
+                    .bearer_auth(&descriptor.token)
+                    .send()
+                    .await
+                    .context("send Attachment check")
+            })
+            .await?;
         let status = response.status();
         if status.is_success() {
             return Ok(true);
@@ -1738,15 +1780,17 @@ mod tests {
             Router,
             body::Body,
             extract::Path,
-            http::header::CONTENT_TYPE,
+            http::{StatusCode, header::CONTENT_TYPE},
             response::{IntoResponse, Response},
-            routing::get,
+            routing::{get, head, post},
         };
+        use futures_util::StreamExt;
         use tokio::sync::watch;
 
         use super::SessionCommandClient;
         use crate::{
             attachments::MAX_ATTACHMENT_BYTES,
+            managed_client::ATTACHMENT_FETCH_TIMEOUT,
             protocol::{
                 AttachmentId, Outlook, PROTOCOL_VERSION, RuntimeDescriptor, ServerIdentity,
             },
@@ -1802,8 +1846,126 @@ mod tests {
                 outlook: Outlook::Local,
                 initial_recovery_backoff: Duration::from_millis(1),
                 max_recovery_backoff: Duration::from_millis(1),
+                attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
             };
             (client, server)
+        }
+
+        /// The deadline a stalled request is failed at.
+        const DEADLINE: Duration = Duration::from_millis(50);
+
+        /// A client of a fixture Server answering with `app`, whose Attachment
+        /// requests are failed at `deadline`.
+        async fn client_within(
+            app: Router,
+            deadline: Duration,
+        ) -> (SessionCommandClient, tokio::task::JoinHandle<()>) {
+            let (mut client, server) = fixture_client(app).await;
+            client.attachment_fetch_timeout = deadline;
+            (client, server)
+        }
+
+        /// Awaits `request`, which must end by itself: a guard long past any
+        /// deadline a test sets fails the test rather than letting it hang.
+        async fn ends_by_itself<T>(request: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .expect("the request ends at its own deadline")
+        }
+
+        /// Answers `/v1/attachments/{id}` and stalls where the id says:
+        /// `headers` before sending any, and `body` after its first chunk.
+        async fn stall(Path(id): Path<String>) -> Response {
+            if id == "headers" {
+                std::future::pending::<()>().await;
+            }
+            let first =
+                futures_util::stream::once(async { Ok::<_, std::io::Error>(vec![0_u8; 1024]) });
+            let body = Body::from_stream(first.chain(futures_util::stream::pending()));
+            ([(CONTENT_TYPE, "image/png")], body).into_response()
+        }
+
+        /// Answers `/v1/attachments/{id}` with its body in three chunks a few
+        /// milliseconds apart.
+        async fn trickle() -> Response {
+            let chunks = futures_util::stream::iter(0..3).then(|_| async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok::<_, std::io::Error>(vec![0_u8; 1024])
+            });
+            ([(CONTENT_TYPE, "image/png")], Body::from_stream(chunks)).into_response()
+        }
+
+        #[tokio::test]
+        async fn a_fetch_the_server_stalls_fails_at_its_deadline() {
+            let (client, server) = client_within(
+                Router::new().route("/v1/attachments/{id}", get(stall)),
+                DEADLINE,
+            )
+            .await;
+
+            for id in ["headers", "body"] {
+                let refused = ends_by_itself(client.fetch_attachment(&AttachmentId::new(id)))
+                    .await
+                    .expect_err("a stalled fetch fails");
+                assert!(
+                    refused
+                        .to_string()
+                        .contains("Attachment fetch timed out after 50ms"),
+                    "{id}: {refused:#}"
+                );
+            }
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_fetch_finished_within_its_deadline_is_taken() {
+            let (client, server) = client_within(
+                Router::new().route("/v1/attachments/{id}", get(trickle)),
+                Duration::from_millis(500),
+            )
+            .await;
+
+            let (mime_type, bytes) = client
+                .fetch_attachment(&AttachmentId::new("trickled"))
+                .await
+                .expect("a body read to its end in time is an Attachment");
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(bytes.len(), 3 * 1024);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn an_upload_or_a_check_the_server_stalls_fails_at_its_deadline() {
+            async fn stalled() -> StatusCode {
+                std::future::pending().await
+            }
+            let (client, server) = client_within(
+                Router::new()
+                    .route("/v1/attachments", post(stalled))
+                    .route("/v1/attachments/{id}", head(stalled)),
+                DEADLINE,
+            )
+            .await;
+
+            let upload = ends_by_itself(client.upload_attachment(vec![0_u8; 16]))
+                .await
+                .expect_err("a stalled upload fails");
+            assert!(
+                upload
+                    .to_string()
+                    .contains("Attachment upload timed out after 50ms"),
+                "{upload:#}"
+            );
+            let check = ends_by_itself(client.attachment_exists(&AttachmentId::new("stored")))
+                .await
+                .expect_err("a stalled check fails");
+            assert!(
+                check
+                    .to_string()
+                    .contains("Attachment check timed out after 50ms"),
+                "{check:#}"
+            );
+            server.abort();
         }
 
         #[tokio::test]
