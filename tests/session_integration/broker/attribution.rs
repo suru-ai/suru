@@ -620,6 +620,10 @@ async fn a_spawn_naming_no_native_subagent_of_the_tokens_own_connection_stays_th
             "the calling thread, whatever `sessionId` names",
         ),
         (json!({ "threadId": 7 }), "a thread id that is no string"),
+        (
+            json!({ "claudecode/toolUseId": "toolu_01X4Ei", "progressToken": 3 }),
+            "no thread, as Claude's and Copilot's calls name none",
+        ),
     ] {
         let mut client = McpClient::handed(&delegating.handoff).with_call_meta(meta.clone());
         client.initialize().await;

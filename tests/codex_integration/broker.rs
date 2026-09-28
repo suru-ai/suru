@@ -1099,15 +1099,23 @@ async fn a_report_to_a_settled_native_subagent_leaves_as_a_turn_start_on_its_thr
         "naming no Model, effort or Reasoning summary, so the Subagent goes on as its spawn set \
          it running: {turn_start}"
     );
-    assert!(
-        requests[..reporting]
-            .iter()
-            .filter(|request| request["method"] == "thread/resume")
-            .count()
-            == 2,
+    let attaches = requests[..reporting]
+        .iter()
+        .filter(|request| request["method"] == "thread/resume")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attaches.len(),
+        2,
         "the settled child's thread is attached again first, so the turn it begins streams \
          here: {:?}",
         native.codex.methods()
+    );
+    let reattach = &attaches[1]["params"];
+    assert_eq!(reattach["threadId"], "child-thread");
+    assert!(
+        reattach.get("config").is_none() && reattach.get("developerInstructions").is_none(),
+        "carrying neither the Broker nor its note, which the child inherits from its parent's \
+         thread and Codex ignores on a running one: {reattach}"
     );
     assert_eq!(woken.turns[1].prompt_id, None, "a Continuation");
     assert_eq!(
