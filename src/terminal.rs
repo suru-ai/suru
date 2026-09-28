@@ -464,6 +464,14 @@ impl TerminalInputParser {
                     self.state = RawInputState::Escape;
                 }
                 RawInputState::Ground => ordinary.push(byte),
+                // Pasted text may carry an escape of its own, and the one
+                // after it may begin the end marker, so that one is read
+                // afresh.
+                RawInputState::Escape if self.in_paste && byte == 0x1b => {
+                    ordinary.push(0x1b);
+                    self.parse_ordinary(&ordinary, true, &mut output);
+                    ordinary.clear();
+                }
                 RawInputState::Escape => {
                     self.state = match ControlString::introduced_by(byte) {
                         Some(kind) if !self.in_paste => RawInputState::ControlString {
@@ -479,6 +487,16 @@ impl TerminalInputParser {
                             RawInputState::Ground
                         }
                     };
+                }
+                // A CSI never carries an escape, so one arriving mid-sequence
+                // cuts it short and begins the next: what came before is
+                // released as an idle boundary would release it, and the
+                // escape is read afresh.
+                RawInputState::Csi { raw } if byte == 0x1b => {
+                    release_csi(raw, self.in_paste, &mut ordinary, &mut output);
+                    self.parse_ordinary(&ordinary, true, &mut output);
+                    ordinary.clear();
+                    self.state = RawInputState::Escape;
                 }
                 RawInputState::Csi { raw } => {
                     raw.push(byte);
@@ -579,18 +597,7 @@ impl TerminalInputParser {
                     if !paste_end_pending(raw)
                         && !(self.expecting_replies && is_awaited_csi_reply(raw)) =>
                 {
-                    // termina holds a bare introducer for more that is not
-                    // coming, so it is resolved here as the chord that sent it.
-                    if raw == b"\x1b[" {
-                        output.push(TerminalInput::Event(crossterm::event::Event::Key(
-                            crossterm::event::KeyEvent::new(
-                                crossterm::event::KeyCode::Char('['),
-                                crossterm::event::KeyModifiers::ALT,
-                            ),
-                        )));
-                    } else {
-                        ordinary.append(raw);
-                    }
+                    release_csi(raw, self.in_paste, &mut ordinary, &mut output);
                     self.state = RawInputState::Ground;
                 }
                 // Only an ambiguous Alt chord expires. Once a reply's prefix is
@@ -729,6 +736,29 @@ enum CsiReply {
     Complete(Option<TerminalInput>),
     /// No reply, so the bytes are the reader's input.
     Other,
+}
+
+/// Hands a CSI that will not complete to termina as reader input. termina
+/// holds a bare introducer for more that is not coming, so outside a paste
+/// that one is resolved here as the chord that sent it; inside a paste it is
+/// pasted text like any other.
+fn release_csi(
+    raw: &mut Vec<u8>,
+    in_paste: bool,
+    ordinary: &mut Vec<u8>,
+    output: &mut Vec<TerminalInput>,
+) {
+    if raw == b"\x1b[" && !in_paste {
+        raw.clear();
+        output.push(TerminalInput::Event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('['),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        )));
+    } else {
+        ordinary.append(raw);
+    }
 }
 
 /// Whether `raw` may still become the device attributes or the cell size,
@@ -2110,6 +2140,62 @@ mod tests {
             vec![TerminalInput::Event(InputEvent::Paste(
                 "a\x1b[b".to_owned()
             ))]
+        );
+    }
+
+    #[test]
+    fn an_escape_pasted_before_the_end_marker_still_lets_the_marker_end_the_paste() {
+        let mut parser = TerminalInputParser::default();
+
+        assert_eq!(parser.parse(b"\x1b[200~hello\x1b", false), vec![]);
+        assert_eq!(
+            parser.parse(b"\x1b[201~", false),
+            vec![TerminalInput::Event(InputEvent::Paste(
+                "hello\x1b".to_owned()
+            ))]
+        );
+        assert_eq!(
+            parser.parse(b"\x1b", false),
+            vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+            "an Escape after the paste is a key again"
+        );
+    }
+
+    #[test]
+    fn escapes_pasted_across_an_idle_gap_stay_in_the_pasted_text() {
+        let mut parser = TerminalInputParser::default();
+
+        assert_eq!(parser.parse(b"\x1b[200~a\x1b", false), vec![]);
+        assert_eq!(
+            parser.parse(b"\x1bb\x1b[201~", false),
+            vec![TerminalInput::Event(InputEvent::Paste(
+                "a\x1b\x1bb".to_owned()
+            ))]
+        );
+    }
+
+    #[test]
+    fn an_escape_cutting_a_held_csi_short_begins_the_next_sequence() {
+        let mut parser = TerminalInputParser::default();
+        assert_eq!(parser.parse(b"\x1b[200~a\x1b[20", false), vec![]);
+        assert_eq!(
+            parser.parse(b"\x1b[201~", false),
+            vec![TerminalInput::Event(InputEvent::Paste(
+                "a\x1b[20".to_owned()
+            ))],
+            "inside a paste, the end marker after a cut-short prefix still ends it"
+        );
+
+        let mut parser = TerminalInputParser::default();
+        parser.expect_replies();
+        assert_eq!(parser.parse(b"\x1b[", false), vec![]);
+        assert_eq!(
+            parser.parse(b"\x1b[A", false),
+            vec![
+                key(KeyCode::Char('['), KeyModifiers::ALT),
+                key(KeyCode::Up, KeyModifiers::NONE),
+            ],
+            "outside one, a held introducer is the chord and the escape begins the next key"
         );
     }
 
