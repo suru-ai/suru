@@ -81,8 +81,9 @@ use crate::{
     icon_catalog,
     model_catalog::ModelCatalogService,
     protocol::{
-        AgentSelection, DerivationErrand, Prompt, ProviderId, SessionCatalogChange, SessionChange,
-        SessionId, SessionSummary, SettingsSnapshot, SkillInvocation, Workspace,
+        AgentSelection, AttachmentBinding, DerivationErrand, Prompt, ProviderId,
+        SessionCatalogChange, SessionChange, SessionId, SessionSummary, SettingsSnapshot,
+        SkillInvocation, Workspace,
     },
     provider::ProviderErrand,
     source_control::{BranchRename, CreatedBranch, PreparationStore, SourceControlService, naming},
@@ -256,7 +257,12 @@ impl Derivation {
             return;
         };
         let asks_branch = created_branch.is_some();
-        let title_prompt = errand_prompt(&prompt.text, &prompt.skill_invocations, asks_branch);
+        let title_prompt = errand_prompt(
+            &prompt.text,
+            &prompt.skill_invocations,
+            &prompt.attachments,
+            asks_branch,
+        );
         let workspace_errand = workspace.icon.is_none().then(|| {
             (
                 workspace.id.clone(),
@@ -607,20 +613,38 @@ pub(crate) enum SetIconError {
 /// The Prompt one Title Errand carries: what to write, and the first Prompt to
 /// write it about. `asks_branch` adds the branch name a fresh Managed Worktree
 /// is renamed to.
-fn errand_prompt(prompt: &str, skill_invocations: &[SkillInvocation], asks_branch: bool) -> String {
-    let mut prompt = prompt.to_owned();
-    let mut marker_starts = skill_invocations
+fn errand_prompt(
+    prompt: &str,
+    skill_invocations: &[SkillInvocation],
+    attachments: &[AttachmentBinding],
+    asks_branch: bool,
+) -> String {
+    // Admission already proved each bound `$skill-name` begins at its span and
+    // each Attachment label reads as bound at its own. Removing only a Skill's
+    // sigil keeps its visible name useful to the title writer without letting
+    // a Provider interpret it as an invocation; a label such as `[Image 1]`
+    // names nothing of the work, so it goes whole.
+    let mut cuts = skill_invocations
         .iter()
         .map(|invocation| invocation.span.start as usize)
         .filter(|start| prompt.as_bytes().get(*start) == Some(&b'$'))
+        .map(|start| start..start + 1)
+        .chain(
+            attachments
+                .iter()
+                .filter(|binding| prompt.get(binding.span.range()) == Some(&*binding.label))
+                .map(|binding| binding.span.range()),
+        )
         .collect::<Vec<_>>();
-    marker_starts.sort_unstable();
-    marker_starts.dedup();
-    for start in marker_starts.into_iter().rev() {
-        // Admission already proved this byte begins a bound `$skill-name`.
-        // Removing only its sigil keeps the Skill's visible name useful to the
-        // title writer without letting a Provider interpret it as an invocation.
-        prompt.remove(start);
+    cuts.sort_unstable_by_key(|cut| (cut.start, cut.end));
+    cuts.dedup();
+    let mut prompt = prompt.to_owned();
+    let mut kept_from = prompt.len();
+    for cut in cuts.into_iter().rev() {
+        if cut.end <= kept_from {
+            kept_from = cut.start;
+            prompt.replace_range(cut, "");
+        }
     }
 
     let mut characters = prompt.chars();
@@ -865,7 +889,7 @@ mod tests {
         let without = reply_schema(false);
         assert!(without["properties"].get("branch").is_none());
         assert_eq!(without["required"], json!(["title", "icon"]));
-        assert!(!errand_prompt("Fix the flicker", &[], false).contains("branch"));
+        assert!(!errand_prompt("Fix the flicker", &[], &[], false).contains("branch"));
 
         let with = reply_schema(true);
         assert_eq!(with["properties"]["branch"]["type"], json!("string"));
@@ -875,7 +899,7 @@ mod tests {
             "strict mode requires every property the schema names"
         );
         assert_eq!(with["additionalProperties"], json!(false));
-        assert!(errand_prompt("Fix the flicker", &[], true).contains("branch name"));
+        assert!(errand_prompt("Fix the flicker", &[], &[], true).contains("branch name"));
     }
 
     #[test]
@@ -1048,8 +1072,37 @@ mod tests {
     #[test]
     fn an_errand_carries_only_the_opening_of_a_long_prompt() {
         let prompt = "x".repeat(MAX_ERRAND_PROMPT_CHARS + 500);
-        let carried = errand_prompt(&prompt, &[], false);
+        let carried = errand_prompt(&prompt, &[], &[], false);
         assert!(carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS)));
         assert!(!carried.contains(&"x".repeat(MAX_ERRAND_PROMPT_CHARS + 1)));
+    }
+
+    #[test]
+    fn an_errand_names_the_work_without_the_labels_of_its_attachments() {
+        let text = "$review [Image 1] against [Image 2]";
+        let skill = SkillInvocation {
+            skill_id: crate::protocol::SkillId::new("review"),
+            name: "review".to_owned(),
+            scope: None,
+            span: crate::protocol::TextSpan { start: 0, end: 7 },
+        };
+        let label = |label: &str| {
+            let start = text.find(label).expect("the label stands in the text");
+            AttachmentBinding {
+                attachment_id: crate::protocol::AttachmentId::new(label),
+                label: label.to_owned(),
+                span: crate::protocol::TextSpan::from(start..start + label.len()),
+            }
+        };
+        let carried = errand_prompt(
+            text,
+            &[skill],
+            &[label("[Image 2]"), label("[Image 1]")],
+            false,
+        );
+        assert!(
+            carried.ends_with("The request:\nreview  against "),
+            "the Skill keeps its name and each label goes whole: {carried}"
+        );
     }
 }
