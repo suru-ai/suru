@@ -75,6 +75,7 @@ impl Live {
                     id: PromptId::new(),
                     text: "Ask structured questions".into(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
             })
             .await

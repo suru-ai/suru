@@ -213,6 +213,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
                 id: PromptId::new(),
                 text: "Keep routing the Codex Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -294,6 +295,7 @@ async fn unsupported_elicitation_and_dynamic_tools_are_rejected_without_ending_t
                     id: PromptId::new(),
                     text: "Continue after unsupported callback".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -457,6 +459,7 @@ async fn assert_provider_failure(
                 id: PromptId::new(),
                 text: "Surface the Provider failure".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

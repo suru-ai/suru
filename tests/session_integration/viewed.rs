@@ -29,6 +29,7 @@ fn create_request(workspace: &std::path::Path) -> CreateSessionRequest {
             id: PromptId::new(),
             text: "Remember that I opened this".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }

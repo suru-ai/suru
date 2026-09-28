@@ -435,6 +435,7 @@ async fn the_next_delivered_prompt_settles_a_stale_continuation() {
                 id: prompt_id,
                 text: "Now try the harness".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -508,6 +509,7 @@ async fn a_prompt_begins_a_turn_while_an_earlier_turns_subagent_works_on() {
                 id: prompt_id,
                 text: "Keep going".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })

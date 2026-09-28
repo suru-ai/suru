@@ -144,6 +144,7 @@ async fn prompt_the_respawned_child(client: &ManagedClient, session_id: SessionI
                     id: PromptId::new(),
                     text: "Carry on under another Model".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

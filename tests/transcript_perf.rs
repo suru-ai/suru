@@ -83,6 +83,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -105,6 +106,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
                 status: MessageStatus::Completed,
                 content: format!("User question for section {section} with a bit of extra text"),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
                 truncated: false,
             },
             Message {
@@ -114,6 +116,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
                 status: MessageStatus::Completed,
                 content: agent_markdown(section),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
                 truncated: false,
             },
         ]);

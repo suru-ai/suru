@@ -9612,6 +9612,7 @@ fn the_session_left_behind_is_never_drawn_under_the_one_being_opened() {
                         content: "Still answering the reader".to_owned(),
                         truncated: false,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 }],
             },

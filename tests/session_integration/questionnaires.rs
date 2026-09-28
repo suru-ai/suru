@@ -1220,6 +1220,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
                 id: PromptId::new(),
                 text: "Start".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1329,6 +1330,7 @@ async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_
                     id: PromptId::new(),
                     text: "Resume".into(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

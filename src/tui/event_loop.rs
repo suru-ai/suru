@@ -4603,6 +4603,7 @@ mod tests {
                         status: MessageStatus::Completed,
                         content: "**chosen words**".into(),
                         skill_invocations: vec![],
+                        attachments: Vec::new(),
                         truncated: false,
                     }],
                     activities: vec![],

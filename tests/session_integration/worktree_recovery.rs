@@ -78,6 +78,7 @@ fn prompt(text: &str) -> InitialPrompt {
         id: PromptId::new(),
         text: text.to_owned(),
         skill_invocations: vec![],
+        attachments: Vec::new(),
     }
 }
 fn identity() -> AgentIdentity {

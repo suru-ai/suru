@@ -38,6 +38,7 @@ fn create_session_request(
             id: PromptId::new(),
             text: format!("Work on the {provider} Provider"),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -306,6 +307,7 @@ async fn a_fresh_landing_defaults_to_the_first_provider_in_the_built_in_order() 
                 id: PromptId::new(),
                 text: "Start from the built-in default".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
     )
@@ -384,6 +386,7 @@ async fn a_stored_session_on_an_unhosted_provider_fails_its_next_prompt_legibly(
                 id: PromptId::new(),
                 text: "Continue on a Provider this server no longer hosts".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Queue,
         })
@@ -490,6 +493,7 @@ async fn a_stale_landing_selection_on_an_unhosted_provider_yields_to_the_built_i
                 id: PromptId::new(),
                 text: "Start despite the stale Landing selection".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
     )
@@ -543,6 +547,7 @@ async fn the_landing_default_falls_to_the_next_provider_when_the_first_has_no_ca
                 id: PromptId::new(),
                 text: "Default past a Provider with no catalog".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
     )
@@ -731,6 +736,7 @@ async fn a_fresh_landing_default_skips_an_unavailable_provider() {
                 id: PromptId::new(),
                 text: "Start on a Provider that can actually work".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
     )

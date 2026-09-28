@@ -238,6 +238,7 @@ fn safe_skill_invocations_round_trip_beside_the_original_prompt_text() {
     let prompt = InitialPrompt {
         id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
         text: "$code-review check this".to_owned(),
+        attachments: Vec::new(),
         skill_invocations: vec![SkillInvocation {
             skill_id: SkillId::new("01J-safe-opaque-id"),
             name: "code-review".to_owned(),
@@ -476,6 +477,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Explain this workspace".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
@@ -522,6 +524,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             status: MessageStatus::Completed,
             content: "Explain this workspace".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         }],
         activities: vec![Activity::Error {
@@ -701,6 +704,7 @@ fn a_delegation_message_names_its_delegating_agent_apart_from_user_and_agent_mes
         status: MessageStatus::Completed,
         content: "Tighten the second paragraph.".to_owned(),
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
         truncated: false,
     };
     let from_sibling = delegation(Delegator {
@@ -772,6 +776,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     status: MessageStatus::Streaming,
                     content: String::new(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                     truncated: false,
                 },
             }],
@@ -1403,6 +1408,7 @@ fn initial_session_command_round_trips_through_json() {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Explain this workspace".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     };
     let expected = json!({
@@ -1507,6 +1513,7 @@ fn prompt_admission_command_round_trips_with_its_client_generated_identity() {
             id: PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9")),
             text: "Steer the current Session".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Queue,
     };

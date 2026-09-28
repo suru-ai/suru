@@ -116,6 +116,7 @@ fn prompt() -> InitialPrompt {
         id: PromptId::new(),
         text: "Measure context".to_owned(),
         skill_invocations: vec![],
+        attachments: Vec::new(),
     }
 }
 

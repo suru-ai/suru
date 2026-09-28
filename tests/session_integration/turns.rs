@@ -99,6 +99,7 @@ async fn provider_session_receives_safe_skill_invocations_and_history_keeps_them
                 id: PromptId::new(),
                 text: "$review $explain $review this change".to_owned(),
                 skill_invocations: historical_invocations.clone(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -192,6 +193,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                 id: prompt_id,
                 text: "Explain the provider seam".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -456,6 +458,7 @@ async fn provider_session_drives_initial_prompt_through_snapshot_first_sse_for_m
                     id: failing_prompt_id,
                     text: "Fail while a command is active".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -570,6 +573,7 @@ async fn provider_streams_store_only_printable_text_newlines_sgr_and_osc_8() {
                 id: PromptId::new(),
                 text: "Normalize provider output".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -809,6 +813,7 @@ async fn reasoning_streams_into_a_titled_transcript_activity_that_settles_with_a
                 id: PromptId::new(),
                 text: "Explain the Transcript".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -940,6 +945,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1061,6 +1067,7 @@ async fn a_provider_actor_ending_settles_the_command_it_left_in_flight() {
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1189,6 +1196,7 @@ async fn a_restart_settles_the_turn_it_cut_off_and_the_command_it_left_in_flight
                 id: PromptId::new(),
                 text: "Report progress".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1343,6 +1351,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                 id: PromptId::new(),
                 text: "Begin through the Provider seam".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1356,6 +1365,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                     id: preactive_prompt_id,
                     text: "Remain pending across Provider startup".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1398,6 +1408,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                     id: accepted_prompt_id,
                     text: "$review this steer".to_owned(),
                     skill_invocations: vec![steer_invocation.clone()],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1438,6 +1449,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                     id: rejected_prompt_id,
                     text: "Reject this steer".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1459,6 +1471,7 @@ async fn provider_session_steers_the_active_turn_only_after_provider_acceptance(
                     id: following_prompt_id,
                     text: "Accept the steer after rejection".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1572,6 +1585,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
                 id: initial_prompt_id,
                 text: "Fail during startup".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1621,6 +1635,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
                     id: execution_prompt_id,
                     text: "Fail while starting the Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1686,6 +1701,7 @@ async fn provider_failures_fail_only_the_affected_turn_and_leave_the_session_usa
                     id: recovery_prompt_id,
                     text: "Succeed after both failures".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1760,6 +1776,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
                 id: PromptId::new(),
                 text: "Complete this Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1813,6 +1830,7 @@ async fn turn_timing_spans_the_delivery_commit_and_every_settle_path() {
                             id: PromptId::new(),
                             text: prompt_text.to_owned(),
                             skill_invocations: Vec::new(),
+                            attachments: Vec::new(),
                         },
                         delivery: PromptDelivery::Steer,
                     },
@@ -1937,6 +1955,7 @@ async fn a_listed_summary_says_when_its_running_turn_began_and_stops_once_it_set
                 id: PromptId::new(),
                 text: "Work on this".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -2077,6 +2096,7 @@ async fn turn_liveness_is_announced_on_the_session_catalog_stream() {
                 id: PromptId::new(),
                 text: "Work on this".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -2197,6 +2217,7 @@ async fn events_attributed_to_an_unknown_subagent_leave_the_session_untouched() 
                 id: PromptId::new(),
                 text: "Work while a stranger speaks".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()

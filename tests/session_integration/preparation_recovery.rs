@@ -333,6 +333,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
                 id: PromptId::new(),
                 text: "Unrelated history".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         },
     )

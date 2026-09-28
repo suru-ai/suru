@@ -1023,6 +1023,7 @@ async fn a_child_session_refuses_prompts() {
                 id: PromptId::new(),
                 text: "Steer the Subagent".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -2026,6 +2027,7 @@ async fn a_resume_arriving_with_no_turn_active_and_nothing_owed_begins_a_continu
                 id: PromptId::new(),
                 text: "Summarise the map".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -2858,6 +2860,7 @@ async fn a_resume_after_a_restart_lands_in_the_subagents_original_session() {
                 id: PromptId::new(),
                 text: "Send the explorer back in".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -3047,6 +3050,7 @@ async fn a_resume_state_revised_mid_connection_is_what_the_next_start_resumes_fr
                 id: PromptId::new(),
                 text: "Carry on".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })

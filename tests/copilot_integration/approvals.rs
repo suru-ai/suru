@@ -112,6 +112,7 @@ async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
                 id: PromptId::new(),
                 text: "First".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -137,6 +138,7 @@ async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
                     id: PromptId::new(),
                     text: "Second".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },

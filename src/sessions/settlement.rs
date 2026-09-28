@@ -750,6 +750,7 @@ mod tests {
             status: MessageStatus::Streaming,
             content: String::new(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         let snapshot = settling_snapshot(
@@ -901,6 +902,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: "done".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         let user = Message {
@@ -910,6 +912,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: "report progress".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         let snapshot = settling_snapshot(
@@ -963,6 +966,7 @@ mod tests {
                     id: PromptId::new(),
                     text: "Plan the work".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .unwrap()

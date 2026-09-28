@@ -94,6 +94,7 @@ async fn create(descriptor: &RuntimeDescriptor, path: &Path) -> SessionSnapshot 
                 id: PromptId::new(),
                 text: "Retain this exact working directory".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         },
     )
@@ -331,6 +332,7 @@ async fn bare_root_is_grouping_only_while_missing_git_leaves_ordinary_session_cr
                 id: PromptId::new(),
                 text: "Never start here".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -540,6 +542,7 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
                 id: PromptId::new(),
                 text: "Do not mix directory contexts".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .send()

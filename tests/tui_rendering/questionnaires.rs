@@ -285,6 +285,7 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
         status: suru::protocol::MessageStatus::Completed,
         content: (0..70).map(|i| format!("Context line {i}\n")).collect(),
         skill_invocations: vec![],
+        attachments: Vec::new(),
         truncated: false,
     });
     snapshot

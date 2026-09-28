@@ -51,6 +51,7 @@ async fn authenticated_creation_returns_pending_before_async_provider_failure() 
                 id: prompt_id,
                 text: "Explain this workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -132,6 +133,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
             id: prompt_id,
             text: "Explain this workspace".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     };
 
@@ -176,6 +178,7 @@ async fn client_generated_prompt_ids_make_session_creation_retries_idempotent() 
                 id: prompt_id,
                 text: "Different content".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
         CreateSessionRequest {
@@ -253,6 +256,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -300,6 +304,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             id: prompt_id,
             text: "$smaller-interface use it".to_owned(),
             skill_invocations: vec![invocation.clone()],
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Steer,
     };
@@ -395,6 +400,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
                 id: prompt_id,
                 text: "Conflicting content".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -444,6 +450,7 @@ async fn admitted_steers_stream_once_and_exact_retries_do_not_duplicate_them() {
             prompt: InitialPrompt {
                 id: prompt_id,
                 text: command.prompt.text.clone(),
+                attachments: Vec::new(),
                 skill_invocations: vec![SkillInvocation {
                     skill_id: SkillId::new("different-safe-id"),
                     ..invocation
@@ -491,6 +498,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -518,6 +526,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -544,6 +553,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         content: "Long-running work".to_owned(),
                         truncated: false,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
             ],
@@ -574,6 +584,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                             admission_order: PromptOrder(3),
                             status: PromptStatus::Delivered,
                             skill_invocations: Vec::new(),
+                            attachments: Vec::new(),
                         },
                     },
                     SessionChange::TurnAdded {
@@ -616,6 +627,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     id: PromptId::new(),
                     text: "Run this later".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -630,6 +642,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     id: PromptId::new(),
                     text: "Run this after the first queue".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -644,6 +657,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                     id: PromptId::new(),
                     text: "Change direction now".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -777,6 +791,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                 id: PromptId::new(),
                 text: "Long-running work".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -807,6 +822,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                     id: PromptId::new(),
                     text: "Promote this Prompt".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -821,6 +837,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                     id: PromptId::new(),
                     text: "Cancel this Prompt".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -841,6 +858,7 @@ async fn pending_prompt_mutations_and_interruption_converge_across_clients() {
                     id: PromptId::new(),
                     text: "$review after interruption".to_owned(),
                     skill_invocations: vec![queued_invocation.clone()],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -1058,6 +1076,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
                 id: PromptId::new(),
                 text: "Initial Prompt".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1110,6 +1129,7 @@ async fn consecutive_prompt_admissions_and_failures_do_not_collapse_revisions() 
                         id: prompt_id,
                         text: format!("Consecutive steer {}", index + 1),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 })
@@ -1172,6 +1192,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1192,6 +1213,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
                 id: PromptId::new(),
                 text: " \n\t ".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1220,6 +1242,7 @@ async fn invalid_workspace_and_blank_prompt_are_rejected_before_session_creation
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()

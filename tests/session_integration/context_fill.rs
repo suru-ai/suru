@@ -262,6 +262,7 @@ async fn selection_preserves_working_measurement_but_a_new_model_invalidates_it(
                 id: suru::protocol::PromptId::new(),
                 text: "New model".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: suru::protocol::PromptDelivery::Queue,
         })
@@ -326,6 +327,7 @@ async fn selection_preserves_working_measurement_but_a_new_model_invalidates_it(
                 id: suru::protocol::PromptId::new(),
                 text: "Same model".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: suru::protocol::PromptDelivery::Queue,
         })

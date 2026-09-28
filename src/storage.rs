@@ -26,6 +26,7 @@ use crate::{
     runtime::protect_current_user_file,
 };
 
+mod attachment_table;
 mod rows;
 mod writer;
 
@@ -38,7 +39,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20260927000000";
+const CURRENT_SCHEMA_VERSION: &str = "20260928000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -60,6 +61,27 @@ diesel::table! {
         brokered -> Bool,
     }
 }
+
+diesel::table! {
+    attachments (id) {
+        id -> Text,
+        mime_type -> Text,
+        byte_length -> BigInt,
+        width -> Nullable<BigInt>,
+        height -> Nullable<BigInt>,
+        created_at -> BigInt,
+        bytes -> Binary,
+    }
+}
+
+diesel::table! {
+    session_attachments (session_id, attachment_id) {
+        session_id -> Text,
+        attachment_id -> Text,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(attachments, session_attachments);
 
 diesel::table! {
     landing_agent_selection (singleton) {
@@ -242,6 +264,7 @@ pub(crate) enum StorageError {
     WriteLandingAgentSelection(String),
     WriteModelCatalog(String),
     WriteWorkspaceIcon(String),
+    WriteAttachment(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -289,6 +312,7 @@ impl fmt::Display for StorageError {
             Self::WriteWorkspaceIcon(message) => {
                 write!(formatter, "save a Workspace Icon: {message}")
             }
+            Self::WriteAttachment(message) => write!(formatter, "save an Attachment: {message}"),
             Self::BlockingTask { operation, message } => write!(
                 formatter,
                 "Session repository {operation} task failed: {message}"
@@ -532,15 +556,21 @@ impl StorageRepository {
         Ok(())
     }
 
+    /// Deletes a Session's rows, and with them every Attachment no other
+    /// Session references.
     fn delete_session(&self, session_id: SessionId) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
-        diesel::delete(sessions::table.filter(sessions::id.eq(session_id.to_string())))
-            .execute(&mut connection)
+        let id = session_id.to_string();
+        connection
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                let joined = attachment_table::session_attachment_ids(connection, &id)?;
+                diesel::delete(sessions::table.filter(sessions::id.eq(&id))).execute(connection)?;
+                attachment_table::delete_unjoined_attachments(connection, &joined)
+            })
             .map_err(|error| StorageError::Write {
                 session_id,
                 message: error.to_string(),
-            })?;
-        Ok(())
+            })
     }
 
     fn save_landing_agent_selection(&self, selection: AgentSelection) -> Result<(), StorageError> {
@@ -846,6 +876,11 @@ fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), 
                     .values(&rows.activities)
                     .execute(connection)?;
             }
+            attachment_table::join_session_attachments(
+                connection,
+                &rows.session.id,
+                &rows.attachment_ids,
+            )?;
             if let Some(identity) = &rows.subagent_identity {
                 diesel::insert_into(provider_subagent_identities::table)
                     .values(identity)

@@ -86,6 +86,7 @@ async fn titled_session_with_timings(
                 id: PromptId::new(),
                 text: FIRST_PROMPT.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

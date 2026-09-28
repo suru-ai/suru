@@ -705,6 +705,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: "Found it.".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         let row = |turn: &Turn| {
@@ -834,6 +835,7 @@ mod tests {
                     id: PromptId::new(),
                     text: "Delegate the mapping".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .expect("create the parent Session")

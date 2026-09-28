@@ -155,6 +155,7 @@ async fn create_session(client: &ManagedClient, workspace: &std::path::Path) -> 
                 id: PromptId::new(),
                 text: FIRST_PROMPT.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -340,6 +341,7 @@ async fn a_bound_skill_marker_is_plain_text_in_a_codex_title_errand() {
                 id: PromptId::new(),
                 text: PROMPT.to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .await

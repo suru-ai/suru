@@ -446,6 +446,7 @@ pub fn enter_active_session(
         admission_order: PromptOrder(2),
         status: PromptStatus::Delivered,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     });
     snapshot.turns.push(Turn {
         id: turn_id,
@@ -468,6 +469,7 @@ pub fn enter_active_session(
         content: "Long-running work".to_owned(),
         truncated: false,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     });
     snapshot
         .transcript
@@ -629,6 +631,7 @@ pub fn navigable_session_snapshot(
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -652,6 +655,7 @@ pub fn navigable_session_snapshot(
                 content: format!("Prompt section {section}"),
                 truncated: false,
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             Message {
                 id: agent_message_id,
@@ -663,6 +667,7 @@ pub fn navigable_session_snapshot(
                 ),
                 truncated: false,
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         ]);
         snapshot.transcript.extend([
@@ -695,6 +700,7 @@ impl FailedTurnFixture {
                 admission_order,
                 status: PromptStatus::Delivered,
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             turn: Turn {
                 id: turn_id,
@@ -717,6 +723,7 @@ impl FailedTurnFixture {
                 content: text.to_owned(),
                 truncated: false,
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             activity: Activity::Error {
                 id: ActivityId::new(),

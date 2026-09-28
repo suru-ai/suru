@@ -10,10 +10,10 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityId, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-    CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session, SessionCatalogChange,
-    SessionChange, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-    SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
+    AttachmentBinding, CreateSessionRequest, Message, MessageId, MessageRole, MessageStatus,
+    ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, Session,
+    SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
 };
 
 use crate::storage::{PersistedSession, StorageSink};
@@ -91,6 +91,7 @@ pub(super) struct PromptOwner {
     pub(super) session_id: SessionId,
     pub(super) text: String,
     pub(super) skill_invocations: Vec<SkillInvocation>,
+    pub(super) attachments: Vec<AttachmentBinding>,
     pub(super) agent_selection: Option<AgentSelection>,
     pub(super) origin: PromptOrigin,
 }
@@ -304,6 +305,7 @@ impl SessionStore {
             };
             if owner.text != request.prompt.text
                 || owner.skill_invocations != request.prompt.skill_invocations
+                || owner.attachments != request.prompt.attachments
                 || matches!(retry, CreationRetry::Ordinary)
                     && owner.agent_selection != request.agent_selection
             {
@@ -434,6 +436,7 @@ impl SessionStore {
             id: request.prompt.id,
             text: request.prompt.text.clone(),
             skill_invocations: request.prompt.skill_invocations.clone(),
+            attachments: request.prompt.attachments.clone(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
@@ -498,6 +501,7 @@ impl SessionStore {
                 session_id,
                 text: request.prompt.text,
                 skill_invocations: request.prompt.skill_invocations,
+                attachments: request.prompt.attachments,
                 agent_selection: request.agent_selection,
                 origin: PromptOrigin::SessionCreation {
                     requested_execution_directory: request.execution_directory.path,
@@ -606,6 +610,7 @@ impl SessionStore {
             id: request.prompt.id,
             text: request.prompt.text.clone(),
             skill_invocations: request.prompt.skill_invocations.clone(),
+            attachments: request.prompt.attachments.clone(),
             delivery: request.delivery,
             admission_order,
             status: PromptStatus::Pending,
@@ -643,6 +648,7 @@ impl SessionStore {
                 session_id,
                 text: request.prompt.text,
                 skill_invocations: request.prompt.skill_invocations,
+                attachments: request.prompt.attachments,
                 agent_selection: None,
                 origin: PromptOrigin::Admission(request.delivery),
             },
@@ -859,6 +865,7 @@ impl SessionStore {
                         status: MessageStatus::Completed,
                         content: prompt.text,
                         skill_invocations: prompt.skill_invocations,
+                        attachments: prompt.attachments,
                         truncated: false,
                     },
                 },
@@ -930,6 +937,7 @@ impl SessionStore {
                         status: MessageStatus::Completed,
                         content: prompt.text.clone(),
                         skill_invocations: prompt.skill_invocations.clone(),
+                        attachments: prompt.attachments.clone(),
                         truncated: false,
                     },
                 },
@@ -1109,6 +1117,7 @@ pub(super) fn append_steer_delivery_changes(
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
                 truncated: false,
             },
         },
@@ -1151,6 +1160,7 @@ pub(super) fn prepare_prompt_delivery(
                 status: MessageStatus::Completed,
                 content: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
                 truncated: false,
             },
         },
@@ -1178,6 +1188,7 @@ impl PromptOwner {
     fn canonical_creation_directory(&self, request: &CreateSessionRequest) -> Option<PathBuf> {
         if self.text != request.prompt.text
             || self.skill_invocations != request.prompt.skill_invocations
+            || self.attachments != request.prompt.attachments
             || self.agent_selection != request.agent_selection
         {
             return None;
@@ -1200,6 +1211,7 @@ impl PromptOwner {
         self.session_id == session_id
             && self.text == request.prompt.text
             && self.skill_invocations == request.prompt.skill_invocations
+            && self.attachments == request.prompt.attachments
             && matches!(&self.origin, PromptOrigin::Admission(delivery) if *delivery == request.delivery)
     }
 }

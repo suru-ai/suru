@@ -33,6 +33,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
             id: PromptId::new(),
             text: prompt.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -264,6 +265,7 @@ async fn admitting_a_prompt_to_a_settled_session_makes_it_active_again() {
                 id: PromptId::new(),
                 text: "One more thing".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Queue,
         })

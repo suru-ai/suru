@@ -389,6 +389,7 @@ async fn metered_session_with_pricing(
                 id: PromptId::new(),
                 text: prompt.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -455,6 +456,7 @@ async fn codex_cumulative_readings_become_per_turn_deltas_priced_from_the_rate_t
                     id: PromptId::new(),
                     text: "Meter another Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -519,6 +521,7 @@ async fn a_reading_no_turn_is_waiting_on_sets_where_the_next_turn_measures_from(
                     id: PromptId::new(),
                     text: "Meter after the replay".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -818,6 +821,7 @@ async fn a_settled_turns_late_reading_does_not_truncate_the_turn_now_running() {
                     id: PromptId::new(),
                     text: "Meter through a straggler".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -895,6 +899,7 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
                 id: PromptId::new(),
                 text: "Meter before the restart".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -936,6 +941,7 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
                     id: PromptId::new(),
                     text: "Meter after the restart".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },

@@ -1085,6 +1085,7 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

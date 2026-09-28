@@ -88,6 +88,7 @@ async fn created_then_resumed(channel: &'static str, document: &str) -> CreatedT
                 id: PromptId::new(),
                 text: "Which Providers could you delegate to?".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -116,6 +117,7 @@ async fn created_then_resumed(channel: &'static str, document: &str) -> CreatedT
                     id: PromptId::new(),
                     text: "And now?".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

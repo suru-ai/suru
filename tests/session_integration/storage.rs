@@ -67,6 +67,7 @@ async fn safe_skill_invocations_are_readable_after_a_server_restart() {
                 id: PromptId::new(),
                 text: "$review persisted work".to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -171,6 +172,7 @@ async fn authenticated_clients_can_read_a_session_by_id() {
                 id: PromptId::new(),
                 text: "Explain this workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -257,6 +259,7 @@ async fn session_discovery_lists_newest_first_and_filters_by_canonical_workspace
             id: PromptId::new(),
             text: text.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     };
     let first = client
@@ -371,6 +374,7 @@ async fn session_metadata_remains_listed_after_a_server_restart() {
                 id: PromptId::new(),
                 text: "  Durable Session  ".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -491,6 +495,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
                 id: PromptId::new(),
                 text: "Persist this whole Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -791,6 +796,7 @@ async fn resume_after_summary_mutation(
                 id: PromptId::new(),
                 text: "Persist without Provider Resume State".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -901,6 +907,7 @@ async fn resume_after_summary_mutation(
                 id: PromptId::new(),
                 text: "Continue without Provider Resume State".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Steer,
         })
@@ -979,6 +986,7 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
                 id: PromptId::new(),
                 text: "Keep this damaged Session visible".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1139,6 +1147,7 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
                 id: PromptId::new(),
                 text: "Persist when this Turn worked".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1279,6 +1288,7 @@ async fn a_session_stored_before_a_repository_capability_existed_stays_readable(
                 id: PromptId::new(),
                 text: "Persist inside a Repository".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1365,6 +1375,7 @@ async fn turn_usage_survives_a_restart() {
                 id: PromptId::new(),
                 text: "Persist this Turn's Usage".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1485,6 +1496,7 @@ async fn a_restored_summary_reads_the_turn_it_cut_off_as_settled() {
                 id: PromptId::new(),
                 text: "Leave this Turn running".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()

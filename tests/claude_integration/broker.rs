@@ -197,6 +197,7 @@ async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
                 id: PromptId::new(),
                 text: "Open a conversation to come back to".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -224,6 +225,7 @@ async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
                     id: PromptId::new(),
                     text: "Carry on".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

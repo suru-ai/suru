@@ -111,6 +111,7 @@ async fn choosing_existing_detached_worktree_starts_multiple_agents_at_root_and_
                     id: PromptId::new(),
                     text: "Work in the selected checkout".to_owned(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
             },
         )

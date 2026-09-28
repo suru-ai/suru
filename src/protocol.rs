@@ -12,13 +12,15 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 65;
+pub const PROTOCOL_VERSION: u32 = 66;
+mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
     QuestionnaireSubmission,
 };
+pub use attachment::*;
 pub use source_control::*;
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
@@ -2703,6 +2705,8 @@ pub struct Prompt {
     pub id: PromptId,
     pub text: String,
     pub skill_invocations: Vec<SkillInvocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentBinding>,
     pub delivery: PromptDelivery,
     pub admission_order: PromptOrder,
     pub status: PromptStatus,
@@ -3163,6 +3167,11 @@ pub struct Message {
     /// Safe invocation records captured with a user Message. Agent Messages
     /// and Delegations always carry an empty list.
     pub skill_invocations: Vec<SkillInvocation>,
+    /// The Attachments bound to labels in a user Message's content, carried
+    /// from the Prompt it was delivered from. Agent Messages and Delegations
+    /// always carry an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentBinding>,
     /// Whether Suru's cap cut the stored content short of what the Provider
     /// sent, so a client can say so without reading it out of `content`.
     pub truncated: bool,
@@ -3520,6 +3529,9 @@ pub struct InitialPrompt {
     pub id: PromptId,
     pub text: String,
     pub skill_invocations: Vec<SkillInvocation>,
+    /// Each Attachment, already uploaded, bound to its label in `text`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3623,6 +3635,18 @@ pub enum SessionErrorCode {
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
     InvalidSkillInvocation,
+    /// An upload's bytes are not a PNG, JPEG, GIF, or WebP image whose
+    /// header can be read.
+    UnsupportedAttachment,
+    /// An upload's bytes exceed the per-image cap.
+    AttachmentTooLarge,
+    /// No stored Attachment has the named id.
+    AttachmentNotFound,
+    /// A Prompt's Attachment binding names a span outside its text, or a
+    /// label the text does not carry at that span.
+    InvalidAttachmentBinding,
+    /// A Prompt binds more Attachments than one Prompt may carry.
+    TooManyAttachments,
     ConfigRootUnavailable,
     ConfigDocumentNotEditable,
     ConfigDocumentWriteFailed,

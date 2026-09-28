@@ -14,13 +14,13 @@ use uuid::Uuid;
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost,
-        CostBasis, FileChange, Message, MessageId, MessageRole, MessageStatus, ModelDescriptor,
-        ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection, ModelOptionValue,
-        Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
-        SessionId, SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp,
-        SkillInvocation, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
-        Workspace, WorkspaceId,
+        Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection,
+        AttachmentBinding, Cost, CostBasis, FileChange, Message, MessageId, MessageRole,
+        MessageStatus, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, ProviderId, Session, SessionId, SessionRevision, SessionStandingInputs,
+        SessionSummary, SessionTimestamp, SkillInvocation, TranscriptItem, Turn, TurnId,
+        TurnStatus, UnreadableSessionSummary, Usage, Workspace, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
 };
@@ -261,6 +261,8 @@ pub(super) struct StoredRows {
     pub(super) messages: Vec<MessageRow>,
     pub(super) activities: Vec<ActivityRow>,
     pub(super) subagent_identity: Option<ProviderSubagentIdentityRow>,
+    /// Every Attachment the Session's Prompts and Messages bind, once each.
+    pub(super) attachment_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -304,6 +306,20 @@ impl StoredRows {
             .map(|(order, item)| (transcript_identity(*item), order))
             .collect::<HashMap<_, _>>();
         let session = SessionRow::from_parts(summary, snapshot.revision, brokered)?;
+        let attachment_ids = snapshot
+            .prompts
+            .iter()
+            .flat_map(|prompt| &prompt.attachments)
+            .chain(
+                snapshot
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.attachments),
+            )
+            .map(|binding| binding.attachment_id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let prompts = snapshot
             .prompts
             .into_iter()
@@ -364,6 +380,7 @@ impl StoredRows {
             messages,
             activities,
             subagent_identity,
+            attachment_ids,
         })
     }
 }
@@ -568,6 +585,7 @@ impl PromptRow {
                 &StoredPromptPayload {
                     text: prompt.text,
                     skill_invocations: prompt.skill_invocations,
+                    attachments: prompt.attachments,
                     delivery: prompt.delivery,
                     status: prompt.status,
                 },
@@ -582,6 +600,7 @@ impl PromptRow {
             id: parse_id(&self.id, "Prompt ID", PromptId::from_uuid)?,
             text: payload.text,
             skill_invocations: payload.skill_invocations,
+            attachments: payload.attachments,
             delivery: payload.delivery,
             admission_order: PromptOrder(i64_to_u64(
                 &session_id,
@@ -675,6 +694,7 @@ impl MessageRow {
                     status: message.status,
                     content: message.content,
                     skill_invocations: message.skill_invocations,
+                    attachments: message.attachments,
                     truncated: message.truncated,
                 },
             )?,
@@ -692,6 +712,7 @@ impl MessageRow {
                 status: payload.status,
                 content: payload.content,
                 skill_invocations: payload.skill_invocations,
+                attachments: payload.attachments,
                 truncated: payload.truncated,
             },
             self.transcript_order,
@@ -890,6 +911,9 @@ struct StoredPromptPayload {
     text: String,
     #[serde(default)]
     skill_invocations: Vec<SkillInvocation>,
+    /// Absent in every Prompt stored before Attachments existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<AttachmentBinding>,
     delivery: PromptDelivery,
     status: PromptStatus,
 }
@@ -925,6 +949,9 @@ struct StoredMessagePayload {
     content: String,
     #[serde(default)]
     skill_invocations: Vec<SkillInvocation>,
+    /// Absent in every Message stored before Attachments existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<AttachmentBinding>,
     truncated: bool,
 }
 

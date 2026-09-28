@@ -5477,6 +5477,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: "```\nfenced code\n".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: true,
         };
         let theme = Theme::system();
@@ -5560,6 +5561,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: format!("prose\n\n{}\n", CappedStream::Message.truncation_marker()),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         let theme = Theme::system();
@@ -5652,6 +5654,7 @@ mod tests {
             status: MessageStatus::Completed,
             content: content.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         }
     }

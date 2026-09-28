@@ -401,6 +401,7 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
                     id: PromptId::new(),
                     text: text.to_owned(),
                     skill_invocations: vec![invocation.clone()],
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -477,6 +478,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
                 id: PromptId::new(),
                 text: "Hold this Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -516,6 +518,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
                     id: PromptId::new(),
                     text: queued_text.to_owned(),
                     skill_invocations: vec![queued_invocation.clone()],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -539,6 +542,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
                     id: PromptId::new(),
                     text: steer_text.to_owned(),
                     skill_invocations: vec![steer_invocation.clone()],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -650,6 +654,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$review".to_owned(),
+                attachments: Vec::new(),
                 skill_invocations: vec![SkillInvocation {
                     skill_id: SkillId::new("copilot-forged"),
                     name: "review".to_owned(),
@@ -679,6 +684,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
                 id: PromptId::new(),
                 text: "Continue without a Skill".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -732,6 +738,7 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
                 id: PromptId::new(),
                 text: "$review this".to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .await
@@ -794,6 +801,7 @@ async fn copilot_rejects_two_distinct_skills_before_opening_or_invoking_a_user_s
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$review $explain".to_owned(),
+                attachments: Vec::new(),
                 skill_invocations: vec![
                     SkillInvocation {
                         skill_id: review.id.clone(),
@@ -875,6 +883,7 @@ async fn native_skill_changes_refresh_identity_and_nonsteer_commands_do_not_adve
                 id: PromptId::new(),
                 text: "Observe native Skill changes".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

@@ -613,6 +613,7 @@ impl LiveTurn {
                     id: PromptId::new(),
                     text: prompt.to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -717,6 +718,7 @@ pub async fn opened_session_on(
                 id: PromptId::new(),
                 text: prompt.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

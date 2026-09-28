@@ -2703,6 +2703,7 @@ async fn run_provider_session(
                     id: pending.id,
                     text: pending.text.clone(),
                     skill_invocations: pending.skill_invocations.clone(),
+                    attachments: pending.attachments.clone(),
                 };
                 let error = if error.is_none() {
                     skill_catalog.validate_prompt(provider_id.clone(), &execution_directory, &initial, skill_prompt_delivery(pending)).await.err().map(|e| format!("Destination Skills must be revalidated before native execution: {e:?}"))
@@ -4693,6 +4694,7 @@ async fn revalidate_prompt_skills(
         id: prompt.id,
         text: prompt.text.clone(),
         skill_invocations: prompt.skill_invocations.clone(),
+        attachments: prompt.attachments.clone(),
     };
     skill_catalog
         .validate_prompt(provider.clone(), execution_directory, &prompt, delivery)
@@ -4849,6 +4851,7 @@ fn project_provider_event(
                                     status: MessageStatus::Streaming,
                                     content: String::new(),
                                     skill_invocations: Vec::new(),
+                                    attachments: Vec::new(),
                                     truncated: false,
                                 },
                             },
@@ -5537,6 +5540,7 @@ mod tests {
                     id: PromptId::new(),
                     text: prompt.to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .expect("create Session");
@@ -6125,6 +6129,7 @@ running 1 test",
                         status: MessageStatus::Completed,
                         content: answer.to_owned(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                         truncated: false,
                     },
                 }],

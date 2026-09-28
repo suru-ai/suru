@@ -143,6 +143,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
                     id: PromptId::new(),
                     text: "Hold the active Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -168,6 +169,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
                         id: PromptId::new(),
                         text: "Queue $review safely".to_owned(),
                         skill_invocations: vec![invocation.clone()],
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Queue,
                 },
@@ -332,6 +334,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
                     id: PromptId::new(),
                     text: "$review before startup".to_owned(),
                     skill_invocations: vec![invocation.clone()],
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -453,6 +456,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
                     id: PromptId::new(),
                     text: "Hold native start".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -478,6 +482,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
                         id: PromptId::new(),
                         text: "Steer $review safely".to_owned(),
                         skill_invocations: vec![invocation.clone()],
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
@@ -621,6 +626,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
                 id: PromptId::new(),
                 text: "Hold the active Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -639,6 +645,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
                 prompt: InitialPrompt {
                     id: PromptId::new(),
                     text: "$review stale work".to_owned(),
+                    attachments: Vec::new(),
                     skill_invocations: vec![SkillInvocation {
                         skill_id: original.id.clone(),
                         name: original.name.clone(),
@@ -659,6 +666,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
                     id: PromptId::new(),
                     text: "Run the following plain Prompt".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -862,6 +870,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$review".to_owned(),
+                attachments: Vec::new(),
                 skill_invocations: vec![SkillInvocation {
                     skill_id: original.id,
                     name: original.name,
@@ -1184,6 +1193,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
                 id: prompt_id,
                 text: "$über".to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1226,6 +1236,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
             prompt: InitialPrompt {
                 id: PromptId::new(),
                 text: "$über".to_owned(),
+                attachments: Vec::new(),
                 skill_invocations: vec![SkillInvocation {
                     skill_id: SkillId::new("forged-id"),
                     name: "Über".to_owned(),
@@ -1344,6 +1355,7 @@ async fn disabled_providers_are_not_discovered_and_native_discovery_errors_are_r
                 id: PromptId::new(),
                 text: "Continue without an explicit Skill".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1429,6 +1441,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
                     id: PromptId::new(),
                     text: "Finish this Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -1472,6 +1485,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
                         id: PromptId::new(),
                         text: "Start $review now".to_owned(),
                         skill_invocations: vec![invocation.clone()],
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },

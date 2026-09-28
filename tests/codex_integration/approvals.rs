@@ -156,6 +156,7 @@ async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_tur
                 id: PromptId::new(),
                 text: "First".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -199,6 +200,7 @@ async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_tur
                     id: PromptId::new(),
                     text: "Second".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -265,6 +267,7 @@ async fn native_approvals_preserve_subjects_callback_identity_decisions_and_inte
                 id: PromptId::new(),
                 text: "Exercise native Approvals".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -481,6 +484,7 @@ async fn immediate_native_completion_waits_for_definitive_decision_history() {
                     id: PromptId::new(),
                     text: "Complete immediately".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -568,6 +572,7 @@ async fn permission_interrupt_rejection_and_timeout_remain_visible_after_deliver
                     id: PromptId::new(),
                     text: "Reject then interrupt".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await

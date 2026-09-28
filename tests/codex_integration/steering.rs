@@ -136,6 +136,7 @@ impl SteeringFixture {
                     id: PromptId::new(),
                     text: "Begin the steering fixture".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -272,6 +273,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
                 id: PromptId::new(),
                 text: "Run the initial Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -288,6 +290,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
             id: PromptId::new(),
             text: "Run the first queued Turn".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Queue,
     };
@@ -296,6 +299,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
             id: PromptId::new(),
             text: "Cancel this queued Turn".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Queue,
     };
@@ -304,6 +308,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
             id: PromptId::new(),
             text: "Run the second queued Turn".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Queue,
     };
@@ -480,6 +485,7 @@ async fn scripted_codex_accepts_one_idempotent_steer_before_delivering_its_promp
             id: prompt_id,
             text: "Change course".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Steer,
     };
@@ -568,6 +574,7 @@ async fn scripted_codex_rejection_keeps_the_steer_pending_and_reports_the_failur
                     id: prompt_id,
                     text: "Try a rejected course correction".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -619,6 +626,7 @@ async fn scripted_codex_transport_loss_during_steering_keeps_the_prompt_pending(
                     id: prompt_id,
                     text: "Steer across a broken transport".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -685,6 +693,7 @@ async fn scripted_codex_handles_pending_steers_before_starting_the_queued_turn()
                     id: PromptId::new(),
                     text: "Run after the terminal boundary".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -700,6 +709,7 @@ async fn scripted_codex_handles_pending_steers_before_starting_the_queued_turn()
                     id: PromptId::new(),
                     text: "Apply this steer before continuing".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -786,6 +796,7 @@ async fn assert_terminal_steering_race(
                     id: prompt_id,
                     text: "Race the terminal boundary".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

@@ -3187,6 +3187,7 @@ impl TuiState {
                 id: prompt.id,
                 text: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
             })
             .collect::<Vec<_>>();
         prompts.extend(admitted);
@@ -3463,6 +3464,7 @@ impl TuiState {
                 id: prompt.id,
                 text: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
             })
         else {
             return;

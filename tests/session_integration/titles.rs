@@ -42,6 +42,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
             id: PromptId::new(),
             text: prompt.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -692,6 +693,7 @@ async fn a_session_with_no_agent_selection_asks_for_no_errand_at_all() {
                 id: PromptId::new(),
                 text: "Explain the seam".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1086,6 +1088,7 @@ async fn a_pinned_selection_titles_a_session_that_has_selected_no_provider() {
                 id: PromptId::new(),
                 text: "Explain the seam".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

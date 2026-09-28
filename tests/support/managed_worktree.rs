@@ -57,6 +57,7 @@ pub fn creation(plan: &PreparedCheckout) -> CreateSessionRequest {
             id: PromptId::new(),
             text: "Work from this prepared root".to_owned(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
     }
 }
@@ -94,6 +95,7 @@ pub async fn recover(client: &ManagedClient, session: SessionId, checkout: &Path
                     id: PromptId::new(),
                     text: "Resume after Worktree recovery".to_owned(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

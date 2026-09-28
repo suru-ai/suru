@@ -213,6 +213,7 @@ async fn the_pinned_reasoning_summary_setting_is_what_a_turn_asks_codex_for() {
                 id: PromptId::new(),
                 text: "Explain the pinned Setting".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -273,6 +274,7 @@ async fn a_mutated_reasoning_summary_setting_governs_the_next_turn() {
                 id: PromptId::new(),
                 text: "Explain the changed Setting".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -324,6 +326,7 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
                 id: PromptId::new(),
                 text: "Explain the native harness".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -692,6 +695,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
                 id: PromptId::new(),
                 text: "Commit this Turn boundary".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -769,6 +773,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
                 id: PromptId::new(),
                 text: "Flush this streaming tail on idle".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -926,6 +931,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
                 id: PromptId::new(),
                 text: "Establish durable Codex context".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -971,6 +977,7 @@ async fn reopened_session_resumes_its_persisted_codex_thread_after_a_server_rest
                     id: PromptId::new(),
                     text: "Continue durable Codex context".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -1149,6 +1156,7 @@ async fn run_terminal_fixture(
                 id: PromptId::new(),
                 text: "Reach the requested terminal state".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

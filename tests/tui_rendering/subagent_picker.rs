@@ -161,6 +161,7 @@ fn child_with_working_subagent(
             content: "Delegating one level down".to_owned(),
             truncated: false,
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         }],
         activities: vec![Activity::Subagent {
             id: activity_id,

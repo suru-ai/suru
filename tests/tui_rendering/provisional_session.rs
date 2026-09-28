@@ -47,6 +47,7 @@ pub fn created_session_snapshot(
             id: prompt.id,
             text: prompt.text.clone(),
             skill_invocations: prompt.skill_invocations.clone(),
+            attachments: Vec::new(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
@@ -534,6 +535,7 @@ fn admitted_steer(text: &str, order: u64, id: PromptId) -> Prompt {
         id,
         text: text.to_owned(),
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(order),
         status: PromptStatus::Pending,
@@ -574,6 +576,7 @@ fn open_working_session(
             id: PromptId::new(),
             text: "Held Session".to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
         workspace,
         SessionTimestamp::now(),
@@ -776,6 +779,7 @@ fn a_session_carrying_another_prompt_neither_replaces_the_claim_nor_takes_its_in
         id: PromptId::new(),
         text: "Someone else's ask".to_owned(),
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     };
     let transition = application
         .handle_event(ApplicationEvent::SessionCreated(created_session_snapshot(

@@ -633,6 +633,7 @@ pub(super) fn delegation_message(
         status: MessageStatus::Completed,
         content: text.content,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
         truncated: text.truncated,
     }
 }

@@ -524,6 +524,7 @@ async fn a_derived_title_retitles_the_top_level_entry() {
                 id: PromptId::new(),
                 text: "the aside needs a tree".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         },
     )
@@ -1279,6 +1280,7 @@ async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again
                 id: PromptId::new(),
                 text: "Map the rest".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Queue,
         })

@@ -204,6 +204,7 @@ async fn claude_rejects_seven_distinct_skills_before_starting_native_input() {
                 id: PromptId::new(),
                 text,
                 skill_invocations: invocations,
+                attachments: Vec::new(),
             },
         })
         .await
@@ -274,6 +275,7 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
                 id: PromptId::new(),
                 text: initial_text.to_owned(),
                 skill_invocations: initial_invocations.clone(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -304,6 +306,7 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
                     id: PromptId::new(),
                     text: "$review".to_owned(),
                     skill_invocations: vec![invocation(review, 0, 7)],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -394,6 +397,7 @@ async fn claude_reports_native_skill_rejection_without_plain_text_retry() {
                 id: PromptId::new(),
                 text: "$review".to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .await
@@ -464,6 +468,7 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
                 id: PromptId::new(),
                 text: "Keep working".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -499,6 +504,7 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
                     id: PromptId::new(),
                     text: "$review improve this".to_owned(),
                     skill_invocations: vec![invocation(review, 0, 7)],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

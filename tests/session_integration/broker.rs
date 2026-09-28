@@ -352,6 +352,7 @@ fn session_request(
             id: PromptId::new(),
             text: text.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -403,6 +404,7 @@ async fn admit_prompt(descriptor: &RuntimeDescriptor, session_id: SessionId, tex
                 id: PromptId::new(),
                 text: text.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Queue,
         })

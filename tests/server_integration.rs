@@ -1256,6 +1256,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
                 id: PromptId::new(),
                 text: "Map the Remote workspace".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -1318,6 +1319,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
                 id: PromptId::new(),
                 text: "Continue on the Remote".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
             delivery: PromptDelivery::Queue,
         })
@@ -1386,6 +1388,7 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
                 id: PromptId::new(),
                 text: "Hold this Session stream open".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1537,6 +1540,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
                 id: PromptId::new(),
                 text: "Begin through the Outlook-aware Client".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1746,6 +1750,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
                 id: PromptId::new(),
                 text: "Keep the second catalog live".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1983,6 +1988,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
                 id: PromptId::new(),
                 text: "Hold only this Remote Session".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -2041,6 +2047,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
                 id: PromptId::new(),
                 text: "Recover this Remote Session".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -2148,6 +2155,7 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
                 id: PromptId::new(),
                 text: "Use selected Remote checkout".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .await
@@ -4662,6 +4670,7 @@ async fn the_subagent_tree_streams_through_a_remote_outlook() {
                 id: PromptId::new(),
                 text: "Delegate through the Remote".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

@@ -1,0 +1,850 @@
+//! Attachments: uploading an image's bytes, binding it to a label in a
+//! Prompt, and fetching the bytes back, all over the Server's HTTP API.
+
+use crate::server_support::PROGRESS_DEADLINE;
+use crate::{
+    failing_provider_support::spawn_with_failing_provider,
+    provider_support::ControlledProvider,
+    support::{
+        controlled_selection, create_session, read_session_at_least_revision, read_session_until,
+    },
+};
+use eventsource_stream::Eventsource;
+use futures_util::{Stream, StreamExt};
+use reqwest::{StatusCode, header::CONTENT_TYPE};
+use suru::{
+    protocol::{
+        AdmitPromptRequest, AgentId, AgentIdentity, AttachmentBinding, AttachmentDescriptor,
+        AttachmentId, AttachmentKind, CreateSessionRequest, InitialPrompt, Message, MessageRole,
+        Prompt, PromptDelivery, PromptId, RuntimeDescriptor, SESSION_SNAPSHOT_EVENT,
+        SESSION_UPDATED_EVENT, SessionChange, SessionError, SessionErrorCode, SessionId,
+        SessionRevision, SessionSnapshot, SessionUpdate, TextSpan,
+    },
+    provider::ProviderEvent,
+    server::{self, ServerConfig},
+};
+use tokio::time::timeout;
+
+const MEBIBYTE: usize = 1024 * 1024;
+
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend(13_u32.to_be_bytes());
+    bytes.extend(b"IHDR");
+    bytes.extend(width.to_be_bytes());
+    bytes.extend(height.to_be_bytes());
+    bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    bytes
+}
+
+fn jpeg(width: u16, height: u16) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8];
+    bytes.extend(height.to_be_bytes());
+    bytes.extend(width.to_be_bytes());
+    bytes.extend([1, 1, 0x11, 0]);
+    bytes.extend([0xFF, 0xD9]);
+    bytes
+}
+
+fn gif(width: u16, height: u16) -> Vec<u8> {
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.extend(width.to_le_bytes());
+    bytes.extend(height.to_le_bytes());
+    bytes.extend([0, 0, 0, 0x3B]);
+    bytes
+}
+
+/// An extended WebP, whose canvas stores each dimension less one.
+fn webp(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = b"RIFF\x16\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+    bytes.extend(&(width - 1).to_le_bytes()[..3]);
+    bytes.extend(&(height - 1).to_le_bytes()[..3]);
+    bytes
+}
+
+fn content_hash(bytes: &[u8]) -> AttachmentId {
+    AttachmentId::new(blake3::hash(bytes).to_hex().to_string())
+}
+
+async fn upload(
+    descriptor: &RuntimeDescriptor,
+    declared_type: &str,
+    bytes: Vec<u8>,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/attachments", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .header(CONTENT_TYPE, declared_type)
+        .body(bytes)
+        .send()
+        .await
+        .expect("send upload")
+}
+
+async fn uploaded(descriptor: &RuntimeDescriptor, bytes: Vec<u8>) -> AttachmentDescriptor {
+    upload(descriptor, "application/octet-stream", bytes)
+        .await
+        .error_for_status()
+        .expect("upload succeeds")
+        .json()
+        .await
+        .expect("decode Attachment descriptor")
+}
+
+async fn fetch(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{}/v1/attachments/{id}", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send fetch")
+}
+
+async fn fetched(descriptor: &RuntimeDescriptor, id: &AttachmentId) -> (String, Vec<u8>) {
+    let response = fetch(descriptor, id)
+        .await
+        .error_for_status()
+        .expect("fetch succeeds");
+    let mime_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .expect("fetched bytes name their type")
+        .to_str()
+        .expect("type is text")
+        .to_owned();
+    let bytes = response.bytes().await.expect("read fetched bytes").to_vec();
+    (mime_type, bytes)
+}
+
+async fn refusal(response: reqwest::Response) -> (StatusCode, SessionError) {
+    let status = response.status();
+    let error = response
+        .json::<SessionError>()
+        .await
+        .expect("decode the refusal");
+    (status, error)
+}
+
+/// Binds `label`, found in `text`, to the uploaded Attachment.
+fn bound(attachment: &AttachmentDescriptor, text: &str, label: &str) -> AttachmentBinding {
+    let start = text.find(label).expect("label stands in the text");
+    AttachmentBinding {
+        attachment_id: attachment.id.clone(),
+        label: label.to_owned(),
+        span: TextSpan::from(start..start + label.len()),
+    }
+}
+
+fn creation(
+    workspace: &std::path::Path,
+    text: &str,
+    attachments: Vec<AttachmentBinding>,
+) -> CreateSessionRequest {
+    CreateSessionRequest {
+        preparation_id: None,
+        agent_selection: None,
+        execution_directory: suru::protocol::ExecutionDirectory {
+            path: workspace.to_owned(),
+        },
+        prompt: InitialPrompt {
+            id: PromptId::new(),
+            text: text.to_owned(),
+            skill_invocations: Vec::new(),
+            attachments,
+        },
+    }
+}
+
+async fn admit(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    text: &str,
+    attachments: Vec<AttachmentBinding>,
+    delivery: PromptDelivery,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session_id}/prompts",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: text.to_owned(),
+                skill_invocations: Vec::new(),
+                attachments,
+            },
+            delivery,
+        })
+        .send()
+        .await
+        .expect("send Prompt admission")
+}
+
+async fn admitted(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    text: &str,
+    attachments: Vec<AttachmentBinding>,
+    delivery: PromptDelivery,
+) -> Prompt {
+    admit(descriptor, session_id, text, attachments, delivery)
+        .await
+        .error_for_status()
+        .expect("Prompt admission succeeds")
+        .json()
+        .await
+        .expect("decode admitted Prompt")
+}
+
+fn user_message<'a>(snapshot: &'a SessionSnapshot, content: &str) -> Option<&'a Message> {
+    snapshot
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::User && message.content == content)
+}
+
+/// A second client's view of the Session: its stream, opened on a client of
+/// its own, answering with the snapshot it leads with.
+async fn watch_session(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> (SessionSnapshot, impl Stream<Item = SessionUpdate> + Unpin) {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{session_id}/events",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open the Session stream")
+        .error_for_status()
+        .expect("the Session stream authenticates");
+    let mut events = Box::pin(response.bytes_stream().eventsource());
+    let snapshot = loop {
+        let event = timeout(PROGRESS_DEADLINE, events.next())
+            .await
+            .expect("the Session snapshot arrives")
+            .expect("the Session stream stays open")
+            .expect("the Session stream stays readable");
+        if event.event == SESSION_SNAPSHOT_EVENT {
+            break serde_json::from_str::<SessionSnapshot>(&event.data)
+                .expect("decode the Session snapshot");
+        }
+    };
+    let updates = events.filter_map(|event| async move {
+        let event = event.expect("the Session stream stays readable");
+        (event.event == SESSION_UPDATED_EVENT).then(|| {
+            serde_json::from_str::<SessionUpdate>(&event.data).expect("decode a Session update")
+        })
+    });
+    (snapshot, Box::pin(updates))
+}
+
+/// Reads the stream until a change it carries satisfies `found`, answering
+/// with that change.
+async fn next_change(
+    updates: &mut (impl Stream<Item = SessionUpdate> + Unpin),
+    described: &str,
+    found: impl Fn(&SessionChange) -> bool,
+) -> SessionChange {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let update = updates.next().await.expect("the Session stream stays open");
+            if let Some(change) = update.changes.into_iter().find(|change| found(change)) {
+                return change;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the Session stream carries {described}"))
+}
+
+#[tokio::test]
+async fn each_admitted_format_is_described_by_what_its_bytes_are_whatever_was_declared() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-formats-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    for (bytes, mime_type, width, height) in [
+        (png(640, 480), "image/png", 640, 480),
+        (jpeg(1920, 1080), "image/jpeg", 1920, 1080),
+        (gif(320, 200), "image/gif", 320, 200),
+        (webp(800, 600), "image/webp", 800, 600),
+    ] {
+        // Every upload claims to be a PDF; only its bytes say what it is.
+        let response = upload(&descriptor, "application/pdf", bytes.clone()).await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{mime_type}");
+        assert_eq!(
+            response
+                .json::<AttachmentDescriptor>()
+                .await
+                .expect("decode Attachment descriptor"),
+            AttachmentDescriptor {
+                id: content_hash(&bytes),
+                kind: AttachmentKind::Image { width, height },
+                mime_type: mime_type.to_owned(),
+                byte_length: bytes.len() as u64,
+            }
+        );
+    }
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_upload_of_another_format_or_over_five_mebibytes_is_refused_with_a_reason() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-refusal-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+
+    let bitmap = b"BM\x3a\0\0\0\0\0\0\0\x36\0\0\0\x28\0\0\0\x01\0\0\0\x01\0\0\0".to_vec();
+    let (status, error) = refusal(upload(&descriptor, "image/png", bitmap.clone()).await).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        error,
+        SessionError {
+            code: SessionErrorCode::UnsupportedAttachment,
+            message: "Only PNG, JPEG, GIF, and WebP images can be attached".to_owned(),
+        }
+    );
+
+    let mut oversized = png(8000, 6000);
+    oversized.resize(5 * MEBIBYTE + 1, 0);
+    let (status, error) = refusal(upload(&descriptor, "image/png", oversized.clone()).await).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        error,
+        SessionError {
+            code: SessionErrorCode::AttachmentTooLarge,
+            message: "An image may be at most 5 MiB, and this one is 5.1 MiB".to_owned(),
+        }
+    );
+
+    for refused in [&bitmap, &oversized] {
+        assert_eq!(
+            fetch(&descriptor, &content_hash(refused)).await.status(),
+            StatusCode::NOT_FOUND,
+            "a refused upload is not stored"
+        );
+    }
+    let mut at_the_cap = png(8000, 6000);
+    at_the_cap.resize(5 * MEBIBYTE, 0);
+    assert_eq!(
+        upload(&descriptor, "image/png", at_the_cap).await.status(),
+        StatusCode::CREATED,
+        "an image of exactly five mebibytes is stored"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn the_same_bytes_uploaded_twice_are_one_attachment() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-dedup-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let bytes = gif(16, 9);
+
+    let first = upload(&descriptor, "image/gif", bytes.clone()).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first = first.json::<AttachmentDescriptor>().await.unwrap();
+    let second = upload(&descriptor, "image/png", bytes.clone()).await;
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "the second upload finds the bytes already stored"
+    );
+    assert_eq!(second.json::<AttachmentDescriptor>().await.unwrap(), first);
+    assert_eq!(
+        fetched(&descriptor, &first.id).await,
+        ("image/gif".to_owned(), bytes)
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_attachment_is_fetched_by_id_with_its_sniffed_type_and_an_unknown_id_is_not_found() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-fetch-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let bytes = webp(1200, 900);
+    let attachment = uploaded(&descriptor, bytes.clone()).await;
+
+    assert_eq!(
+        fetched(&descriptor, &attachment.id).await,
+        ("image/webp".to_owned(), bytes)
+    );
+    let (status, error) = refusal(fetch(&descriptor, &content_hash(b"never uploaded")).await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error.code, SessionErrorCode::AttachmentNotFound);
+    let unauthenticated = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/attachments/{}",
+            descriptor.base_url, attachment.id
+        ))
+        .send()
+        .await
+        .expect("send unauthenticated fetch");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn turn_beginning_and_steer_prompts_carry_their_bindings_to_every_client() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "attachment-binding-test").expect("configure server"),
+        runtime.clone(),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let screenshot = uploaded(&descriptor, png(640, 480)).await;
+    let diagram = uploaded(&descriptor, gif(320, 200)).await;
+
+    // A Prompt whose text is only a label is admitted, and begins the Turn.
+    let first = vec![bound(&screenshot, "[Image 1]", "[Image 1]")];
+    let created = create_session(
+        &descriptor,
+        &creation(workspace.path(), "[Image 1]", first.clone()),
+    )
+    .await;
+    let session_id = created.session.id;
+    assert_eq!(created.prompts[0].attachments, first);
+    let (watched, mut updates) = watch_session(&descriptor, session_id).await;
+    assert_eq!(
+        watched.prompts[0].attachments, first,
+        "a second client's snapshot carries the binding"
+    );
+
+    let mut provider_session = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-attachments", "high", "fast"),
+        });
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider")
+        .succeed();
+    let begun = read_session_until(
+        &client,
+        &descriptor,
+        session_id,
+        "the first user Message",
+        |snapshot| user_message(snapshot, "[Image 1]").is_some(),
+    )
+    .await;
+    assert_eq!(
+        user_message(&begun, "[Image 1]").unwrap().attachments,
+        first
+    );
+
+    // A steer binds both, one of them for the second time.
+    let steer_text = "Now compare [Image 1] with [Image 2]";
+    let steered = vec![
+        bound(&screenshot, steer_text, "[Image 1]"),
+        bound(&diagram, steer_text, "[Image 2]"),
+    ];
+    let steer = admitted(
+        &descriptor,
+        session_id,
+        steer_text,
+        steered.clone(),
+        PromptDelivery::Steer,
+    )
+    .await;
+    assert_eq!(steer.attachments, steered);
+    let SessionChange::PromptAdded { prompt } = next_change(
+        &mut updates,
+        "the steer Prompt",
+        |change| matches!(change, SessionChange::PromptAdded { prompt } if prompt.id == steer.id),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(prompt.attachments, steered);
+    timeout(PROGRESS_DEADLINE, provider_session.next_steer())
+        .await
+        .expect("the steer reaches the Provider")
+        .succeed();
+    let SessionChange::MessageAdded { message } =
+        next_change(&mut updates, "the steer's user Message", |change| {
+            matches!(change, SessionChange::MessageAdded { message } if message.content == steer_text)
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(message.attachments, steered);
+
+    // Once the Turn settles, a queued Prompt begins a Turn of its own.
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    read_session_until(&client, &descriptor, session_id, "idle", |snapshot| {
+        snapshot.session.working_since.is_none()
+    })
+    .await;
+    let queued_text = "Once more: [Image 2]";
+    let queued = vec![bound(&diagram, queued_text, "[Image 2]")];
+    admitted(
+        &descriptor,
+        session_id,
+        queued_text,
+        queued.clone(),
+        PromptDelivery::Queue,
+    )
+    .await;
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the queued Turn reaches the Provider")
+        .succeed();
+
+    let snapshot = read_session_until(
+        &client,
+        &descriptor,
+        session_id,
+        "three user Messages",
+        |snapshot| user_message(snapshot, queued_text).is_some(),
+    )
+    .await;
+    for (text, bindings) in [
+        ("[Image 1]", &first),
+        (steer_text, &steered),
+        (queued_text, &queued),
+    ] {
+        let prompt = snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.text == text)
+            .expect("the Prompt stands");
+        assert_eq!(&prompt.attachments, bindings, "{text}");
+        assert_eq!(
+            &user_message(&snapshot, text)
+                .expect("the user Message stands")
+                .attachments,
+            bindings,
+            "{text}"
+        );
+    }
+    let (rewatched, _) = watch_session(&descriptor, session_id).await;
+    assert_eq!(
+        rewatched.prompts, snapshot.prompts,
+        "a client arriving later sees every binding"
+    );
+    assert_eq!(rewatched.messages, snapshot.messages);
+
+    provider_session.emit(ProviderEvent::TurnCompleted);
+    drop(provider_session);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn prompts_whose_attachment_bindings_cannot_stand_are_refused() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-admission-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let screenshot = uploaded(&descriptor, png(640, 480)).await;
+    let created = create_session(
+        &descriptor,
+        &creation(workspace.path(), "Begin plainly", Vec::new()),
+    )
+    .await;
+    let session_id = created.session.id;
+    read_session_at_least_revision(
+        &reqwest::Client::new(),
+        &descriptor,
+        session_id,
+        SessionRevision(2),
+    )
+    .await;
+
+    let text = "Look at [Image 1]";
+    let unknown = AttachmentBinding {
+        attachment_id: content_hash(b"never uploaded"),
+        ..bound(&screenshot, text, "[Image 1]")
+    };
+    let outside = AttachmentBinding {
+        span: TextSpan { start: 8, end: 40 },
+        ..bound(&screenshot, text, "[Image 1]")
+    };
+    let mismatched = AttachmentBinding {
+        label: "[Image 2]".to_owned(),
+        ..bound(&screenshot, text, "[Image 1]")
+    };
+    let crowded = "[Image 1]".repeat(11);
+    let eleven = (0..11)
+        .map(|index| AttachmentBinding {
+            span: TextSpan {
+                start: index * 9,
+                end: index * 9 + 9,
+            },
+            ..bound(&screenshot, &crowded, "[Image 1]")
+        })
+        .collect::<Vec<_>>();
+    for (text, bindings, code) in [
+        (
+            text,
+            vec![unknown.clone()],
+            SessionErrorCode::AttachmentNotFound,
+        ),
+        (
+            text,
+            vec![outside],
+            SessionErrorCode::InvalidAttachmentBinding,
+        ),
+        (
+            text,
+            vec![mismatched],
+            SessionErrorCode::InvalidAttachmentBinding,
+        ),
+        (
+            crowded.as_str(),
+            eleven.clone(),
+            SessionErrorCode::TooManyAttachments,
+        ),
+    ] {
+        let (status, error) = refusal(
+            admit(
+                &descriptor,
+                session_id,
+                text,
+                bindings,
+                PromptDelivery::Queue,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{code:?}");
+        assert_eq!(error.code, code, "{}", error.message);
+        assert!(!error.message.is_empty());
+    }
+    let (status, error) = refusal(
+        reqwest::Client::new()
+            .post(format!("{}/v1/sessions", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&creation(workspace.path(), text, vec![unknown]))
+            .send()
+            .await
+            .expect("send Session creation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.code, SessionErrorCode::AttachmentNotFound);
+
+    assert_eq!(
+        crate::support::read_session(&descriptor, session_id)
+            .await
+            .prompts
+            .len(),
+        1,
+        "no refused Prompt was admitted"
+    );
+    let ten = admitted(
+        &descriptor,
+        session_id,
+        &crowded,
+        eleven[..10].to_vec(),
+        PromptDelivery::Queue,
+    )
+    .await;
+    assert_eq!(ten.attachments, eleven[..10]);
+
+    // A retry is the same Prompt only with the same bindings.
+    let retry = |attachments: Vec<AttachmentBinding>| {
+        reqwest::Client::new()
+            .post(format!(
+                "{}/v1/sessions/{session_id}/prompts",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(&AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: ten.id,
+                    text: crowded.clone(),
+                    skill_invocations: Vec::new(),
+                    attachments,
+                },
+                delivery: PromptDelivery::Queue,
+            })
+            .send()
+    };
+    let repeated = retry(eleven[..10].to_vec())
+        .await
+        .expect("send exact retry");
+    assert_eq!(repeated.status(), StatusCode::OK);
+    let repeated = repeated.json::<Prompt>().await.unwrap();
+    assert_eq!(
+        (repeated.id, repeated.attachments),
+        (ten.id, ten.attachments.clone()),
+        "an exact retry answers with the Prompt already admitted"
+    );
+    let (status, error) = refusal(
+        retry(eleven[..9].to_vec())
+            .await
+            .expect("send conflicting retry"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, SessionErrorCode::PromptConflict);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn bindings_and_bytes_survive_a_server_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "attachment-restart-test")
+        .expect("configure server")
+        .with_data_dir(data_dir.path());
+    let original = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn original server");
+    let bytes = jpeg(1024, 768);
+    let photo = uploaded(original.descriptor(), bytes.clone()).await;
+    let text = "What is in [Image 1]?";
+    let bindings = vec![bound(&photo, text, "[Image 1]")];
+    let created = create_session(
+        original.descriptor(),
+        &creation(workspace.path(), text, bindings.clone()),
+    )
+    .await;
+    let before_restart = read_session_at_least_revision(
+        &reqwest::Client::new(),
+        original.descriptor(),
+        created.session.id,
+        SessionRevision(2),
+    )
+    .await;
+    assert_eq!(
+        user_message(&before_restart, text)
+            .expect("the failed Turn keeps its user Message")
+            .attachments,
+        bindings
+    );
+    original.shutdown().await.expect("stop original server");
+
+    let replacement = spawn_with_failing_provider(config)
+        .await
+        .expect("spawn replacement server");
+    let restored = crate::support::read_session(replacement.descriptor(), created.session.id).await;
+    assert_eq!(restored, before_restart);
+    assert_eq!(restored.prompts[0].attachments, bindings);
+    assert_eq!(
+        fetched(replacement.descriptor(), &photo.id).await,
+        ("image/jpeg".to_owned(), bytes)
+    );
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+#[tokio::test]
+async fn deleting_a_session_removes_the_attachments_only_it_references() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-deletion-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    let own = uploaded(&descriptor, png(10, 10)).await;
+    let shared = uploaded(&descriptor, gif(20, 20)).await;
+    let unbound = uploaded(&descriptor, webp(30, 30)).await;
+
+    let text = "[Image 1] beside [Image 2]";
+    let deleted = create_session(
+        &descriptor,
+        &creation(
+            workspace.path(),
+            text,
+            vec![
+                bound(&own, text, "[Image 1]"),
+                bound(&shared, text, "[Image 2]"),
+            ],
+        ),
+    )
+    .await;
+    let kept = create_session(
+        &descriptor,
+        &creation(
+            workspace.path(),
+            "[Image 1]",
+            vec![bound(&shared, "[Image 1]", "[Image 1]")],
+        ),
+    )
+    .await;
+    for session_id in [deleted.session.id, kept.session.id] {
+        read_session_until(&client, &descriptor, session_id, "settled", |snapshot| {
+            snapshot.session.working_since.is_none()
+        })
+        .await;
+    }
+
+    let response = client
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            descriptor.base_url, deleted.session.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send Session deletion");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        fetch(&descriptor, &own.id).await.status(),
+        StatusCode::NOT_FOUND,
+        "an Attachment only the deleted Session bound goes with it"
+    );
+    assert_eq!(
+        fetch(&descriptor, &shared.id).await.status(),
+        StatusCode::OK,
+        "an Attachment another Session binds stays"
+    );
+    assert_eq!(
+        fetch(&descriptor, &unbound.id).await.status(),
+        StatusCode::OK,
+        "an upload no Session has bound yet stays"
+    );
+    let remaining = crate::support::read_session(&descriptor, kept.session.id).await;
+    assert_eq!(remaining.prompts[0].attachments[0].attachment_id, shared.id);
+
+    server.shutdown().await.expect("shut down server");
+}

@@ -1,5 +1,6 @@
 mod ansi;
 pub mod approval;
+mod attachments;
 mod broker;
 pub mod build_identity;
 mod errands;

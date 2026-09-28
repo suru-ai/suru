@@ -37,6 +37,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
             id: PromptId::new(),
             text: prompt.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -52,6 +53,7 @@ fn errand_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
             id: PromptId::new(),
             text: prompt.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }

@@ -215,6 +215,7 @@ pub async fn working_turn_with_timings(
                 id: PromptId::new(),
                 text: "Delegate the mapping".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()

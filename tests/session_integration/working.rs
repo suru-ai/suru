@@ -41,6 +41,7 @@ fn creation(workspace: &std::path::Path, prompt: PromptId, text: &str) -> Create
             id: prompt,
             text: text.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     }
 }
@@ -358,6 +359,7 @@ async fn a_follow_up_prompt_on_an_idle_session_is_working_and_withdrawable() {
                 id: follow_up,
                 text: "Try that again".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()

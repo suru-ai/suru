@@ -354,6 +354,7 @@ async fn a_turn_reaching_an_unavailable_claude_fails_with_the_condition_leading_
                 id: PromptId::new(),
                 text: "Say hello".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

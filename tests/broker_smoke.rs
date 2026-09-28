@@ -517,6 +517,7 @@ impl Live {
                     id: prompt_id,
                     text: prompt.to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await

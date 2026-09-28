@@ -111,6 +111,7 @@ fn creation(preparation: &PreparedCheckout, text: &str) -> CreateSessionRequest 
             id: PromptId::new(),
             text: text.to_owned(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
     }
 }

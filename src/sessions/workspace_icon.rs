@@ -465,6 +465,7 @@ mod tests {
                     id: PromptId::new(),
                     text: "Explain the seam".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .expect("create Session");
@@ -530,6 +531,7 @@ mod tests {
                     id: PromptId::new(),
                     text: "Explain the seam".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .expect("create Session");

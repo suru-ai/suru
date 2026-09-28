@@ -83,6 +83,7 @@ impl RestartedSession {
                     id: PromptId::new(),
                     text: "Establish durable Copilot context".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -128,6 +129,7 @@ impl RestartedSession {
                         id: PromptId::new(),
                         text: prompt.to_owned(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
@@ -336,6 +338,7 @@ async fn resumed_copilot_sessions_register_and_answer_native_questionnaires() {
                     id: PromptId::new(),
                     text: "Ask me".into(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

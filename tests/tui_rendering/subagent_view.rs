@@ -139,6 +139,7 @@ fn child_session_snapshot(
             content: "Mapping the provider seams".to_owned(),
             truncated: false,
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         }],
         activities: Vec::new(),
         transcript: vec![TranscriptItem::Message { message_id }],
@@ -453,6 +454,7 @@ fn a_subagent_session_streams_live_while_attached() {
                         content: "Found the orchestration seam".to_owned(),
                         truncated: false,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 }],
             },
@@ -776,6 +778,7 @@ fn delegation(turn_id: TurnId, sender: SessionId, name: Option<&str>, content: &
         content: content.to_owned(),
         truncated: false,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 
@@ -893,6 +896,7 @@ fn a_folded_turn_in_a_subagent_session_keeps_its_delegation_visible() {
         content: "Two seams: the runtime and the projection.".to_owned(),
         truncated: false,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     };
     child.transcript = vec![
         TranscriptItem::Message {

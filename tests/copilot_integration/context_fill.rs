@@ -42,6 +42,7 @@ async fn ephemeral_context_is_live_independent_replaceable_and_durable() {
                 id: PromptId::new(),
                 text: "Measure context".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -167,6 +168,7 @@ async fn context_tracks_a_continuation_and_its_post_idle_snapshot() {
                 id: PromptId::new(),
                 text: "Delegate".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -277,6 +279,7 @@ async fn failed_start_keeps_context_invalidated(reject_send: bool) {
                 id: PromptId::new(),
                 text: "Delegate".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -330,6 +333,7 @@ async fn failed_start_keeps_context_invalidated(reject_send: bool) {
                     id: PromptId::new(),
                     text: "Use the other Model".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },

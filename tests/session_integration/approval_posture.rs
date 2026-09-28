@@ -48,6 +48,7 @@ async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_an
                 id: PromptId::new(),
                 text: "work".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -131,6 +132,7 @@ async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_an
                     id: PromptId::new(),
                     text: "next".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -188,6 +190,7 @@ async fn an_unpinned_active_session_adopts_server_posture_without_losing_its_del
                 id: PromptId::new(),
                 text: "work".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -275,6 +278,7 @@ async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_ap
             id: PromptId::new(),
             text: text.into(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
         },
     };
     let first = turn_client.create_session(create("first")).await.unwrap();
@@ -322,6 +326,7 @@ async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_ap
                         id: PromptId::new(),
                         text: "apply now".into(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Queue,
                 },
@@ -412,6 +417,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
                 id: PromptId::new(),
                 text: "first".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -500,6 +506,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
                     id: PromptId::new(),
                     text: "second".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -581,6 +588,7 @@ async fn an_override_for_another_provider_is_rejected() {
                 id: PromptId::new(),
                 text: "work".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -635,6 +643,7 @@ async fn a_pinned_approval_posture_survives_server_restart() {
                 id: PromptId::new(),
                 text: "persist".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -712,6 +721,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
                 id: PromptId::new(),
                 text: "delegate".into(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

@@ -39,6 +39,7 @@ async fn create(client: &OutlookClient, path: &Path) -> SessionId {
                 id: PromptId::new(),
                 text: "Checkout observation".into(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .await
@@ -400,6 +401,7 @@ async fn checkout_observation_is_shared_and_stops_when_catalog_interest_ends() {
                     id: PromptId::new(),
                     text: "Observe shared checkout".into(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
             })
             .send()
@@ -569,6 +571,7 @@ async fn discovery_persists_branch_and_detached_recovery_before_any_catalog_inte
                     id: PromptId::new(),
                     text: "Retain discovered checkout".into(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
             })
             .send()
@@ -734,6 +737,7 @@ async fn remote_concurrent_prompts_recover_one_checkout_on_the_owning_server() {
             id: PromptId::new(),
             text: "Recover remotely".into(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
         delivery: PromptDelivery::Steer,
     };

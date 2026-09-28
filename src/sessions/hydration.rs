@@ -413,6 +413,7 @@ pub(super) fn restored_record(
                 session_id: persisted.snapshot.session.id,
                 text: prompt.text.clone(),
                 skill_invocations: prompt.skill_invocations.clone(),
+                attachments: prompt.attachments.clone(),
                 agent_selection: None,
                 origin: PromptOrigin::Admission(prompt.delivery),
             },

@@ -127,6 +127,7 @@ impl ResumedThread {
                     id: PromptId::new(),
                     text: "Which Providers could you delegate to?".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -143,6 +144,7 @@ impl ResumedThread {
                         id: PromptId::new(),
                         text: "And now?".to_owned(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Queue,
                 },
@@ -459,6 +461,7 @@ async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_i
                 id: PromptId::new(),
                 text: "Hand the Codex seam to a Codex Agent".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -586,6 +589,7 @@ async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
                 id: PromptId::new(),
                 text: "Delegate the survey".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -729,6 +733,7 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
                 id: PromptId::new(),
                 text: "Delegate the survey".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -959,6 +964,7 @@ impl NativeCodexChild {
                     id: PromptId::new(),
                     text: "Map the crates".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .await

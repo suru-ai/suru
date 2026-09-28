@@ -38,6 +38,7 @@ impl History {
                         id: suru::protocol::PromptId::new(),
                         text: format!("Keep durable history {index}"),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
             )
@@ -264,6 +265,7 @@ async fn prompt_identity_in_an_unopened_session_cannot_be_reused_by_creation_or_
         id: owner.prompts[0].id,
         text: "Different work using an existing Prompt identity".to_owned(),
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     };
     let server = history.start().await;
     let denied = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")

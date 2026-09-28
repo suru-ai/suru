@@ -153,6 +153,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
                 id: PromptId::new(),
                 text: "Keep working until Suru shuts down".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -256,6 +257,7 @@ async fn server_shutdown_interrupts_a_turn_whose_start_response_is_pending() {
                 id: PromptId::new(),
                 text: "Shut down while Codex accepts this Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -312,6 +314,7 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
                 id: PromptId::new(),
                 text: "Remain unresponsive during shutdown".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -365,6 +368,7 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
                 id: PromptId::new(),
                 text: "Shut down during Codex initialization".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

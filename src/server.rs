@@ -59,6 +59,7 @@ use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
+mod attachments;
 mod reclaim;
 
 pub type ServerConfig = RuntimeConfig;
@@ -209,6 +210,7 @@ impl AgentOutputSink {
                     status: MessageStatus::Streaming,
                     content: String::new(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                     truncated: false,
                 },
             },
@@ -455,6 +457,8 @@ struct AppState {
     serving: ServingController,
     shutdown: ShutdownController,
     timings: ServerTimings,
+    /// The Attachments uploaded to this server, stored beside its Sessions.
+    attachments: crate::attachments::AttachmentStore,
 }
 
 impl AppState {
@@ -625,6 +629,7 @@ pub async fn spawn_with_source_control(
         provider_updates: provider_updates.clone(),
         shutdown_grace: timings.shutdown_grace,
     };
+    let attachment_store = crate::attachments::AttachmentStore::new(repository.clone());
     let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
     let preparations = crate::source_control::PreparationStore::new(config.data_dir());
     let sessions = SessionStore::new(
@@ -745,6 +750,7 @@ pub async fn spawn_with_source_control(
         serving: serving.clone(),
         shutdown: shutdown.clone(),
         timings,
+        attachments: attachment_store,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -785,6 +791,11 @@ pub async fn spawn_with_source_control(
             post(preview_checkout_removal),
         )
         .route("/v1/checkouts/remove", post(remove_checkout))
+        .route("/v1/attachments", post(attachments::upload_attachment))
+        .route(
+            "/v1/attachments/{attachment_id}",
+            get(attachments::fetch_attachment),
+        )
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .merge(
             Router::new()
@@ -1837,6 +1848,7 @@ async fn rejoin_preparation(
             id: prompt.id,
             text: prompt.text.clone(),
             skill_invocations: prompt.skill_invocations.clone(),
+            attachments: prompt.attachments.clone(),
         };
         if !initial.skill_invocations.is_empty() {
             let provider =
@@ -2019,6 +2031,9 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Ok(request) => request,
             Err(response) => return response,
         };
+    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+        return response;
+    }
 
     let _preparation_serial = if request.preparation_id.is_some() {
         Some(state.preparations.serial.lock().await)
@@ -2513,6 +2528,9 @@ async fn admit_prompt(
             Ok(request) => request,
             Err(response) => return response,
         };
+    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+        return response;
+    }
 
     if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
         tracing::warn!("Prompt owner hydration failed: {error}");

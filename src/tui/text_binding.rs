@@ -104,6 +104,7 @@ impl TextBindings {
             id,
             text,
             skill_invocations: self.skill_invocations(),
+            attachments: Vec::new(),
         }
     }
 
@@ -216,6 +217,7 @@ mod tests {
             id: PromptId::new(),
             text: text.to_owned(),
             skill_invocations,
+            attachments: Vec::new(),
         }
     }
 

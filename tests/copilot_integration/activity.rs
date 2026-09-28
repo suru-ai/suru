@@ -63,6 +63,7 @@ async fn worked_session(
                 id: PromptId::new(),
                 text: text.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await

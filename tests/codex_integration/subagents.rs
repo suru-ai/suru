@@ -58,6 +58,7 @@ async fn opened_session(codex: &ScriptedCodex, name: &'static str, prompt: &str)
                 id: PromptId::new(),
                 text: prompt.to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -795,6 +796,7 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
                         id: prompt_id,
                         text: "Continue new work".into(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
@@ -812,6 +814,7 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
                         id: second_id,
                         text: "Then more work".into(),
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
@@ -905,6 +908,7 @@ async fn a_continuation_selection_failure_preserves_the_error_and_delivers_queue
                     id: PromptId::new(),
                     text: "Continue new work".into(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -2606,6 +2610,7 @@ async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into
                 id: PromptId::new(),
                 text: "Delegate the audit".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -2638,6 +2643,7 @@ async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into
                     id: PromptId::new(),
                     text: "Send the auditor back".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },

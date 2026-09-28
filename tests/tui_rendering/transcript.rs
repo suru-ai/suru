@@ -623,6 +623,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                 text: "Explain the stream\nwhile keeping this deliberately long user Message elevated across every wrapped continuation of the transcript block, including its semantic left accent"
                     .to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -652,6 +653,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
                 SessionChange::TurnAdded {
@@ -678,6 +680,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         content: "Continue with an active Agent".to_owned(),
                         truncated: false,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
             ],
@@ -1533,6 +1536,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                         admission_order: PromptOrder(9),
                         status: PromptStatus::Pending,
                         skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 }],
             },
@@ -1581,6 +1585,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             admission_order: PromptOrder(10),
                             status: PromptStatus::Delivered,
                             skill_invocations: Vec::new(),
+                            attachments: Vec::new(),
                         },
                     },
                     SessionChange::TurnAdded {
@@ -1607,6 +1612,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             content: request.prompt.text.clone(),
                             truncated: false,
                             skill_invocations: Vec::new(),
+                            attachments: Vec::new(),
                         },
                     },
                 ],
@@ -4210,6 +4216,7 @@ fn command_run_snapshot(
                     content: (*content).to_owned(),
                     truncated: false,
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 };
                 snapshot.transcript.push(TranscriptItem::Message {
                     message_id: message.id,
@@ -6231,6 +6238,7 @@ fn append_settled_turn(
             status: MessageStatus::Completed,
             content: content.to_owned(),
             skill_invocations: Vec::new(),
+            attachments: Vec::new(),
             truncated: false,
         };
         if message.role == MessageRole::Agent {
@@ -6542,6 +6550,7 @@ fn newer_turn_begins(
                     admission_order: PromptOrder(2),
                     status: PromptStatus::Delivered,
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             },
             SessionChange::TurnAdded {
@@ -6568,6 +6577,7 @@ fn newer_turn_begins(
                     content: prompt.to_owned(),
                     truncated: false,
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             },
         ],
@@ -6833,6 +6843,7 @@ fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
         admission_order: PromptOrder(99),
         status: PromptStatus::Pending,
         skill_invocations: Vec::new(),
+        attachments: Vec::new(),
     });
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))

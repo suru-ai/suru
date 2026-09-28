@@ -325,6 +325,7 @@ impl Fixture {
                     id: PromptId::new(),
                     text: "Please fix the reasoning flicker in $review".to_owned(),
                     skill_invocations: vec![],
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -423,6 +424,7 @@ impl Fixture {
                         id: PromptId::new(),
                         text: "Carry on".to_owned(),
                         skill_invocations: vec![],
+                        attachments: Vec::new(),
                     },
                     delivery: PromptDelivery::Steer,
                 },
@@ -1018,6 +1020,7 @@ async fn a_restart_after_admission_attempts_no_rename() {
                 id: PromptId::new(),
                 text: "Explain the seam".to_owned(),
                 skill_invocations: vec![],
+                attachments: Vec::new(),
             },
         })
         .await

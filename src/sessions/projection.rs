@@ -1323,6 +1323,7 @@ mod tests {
                     id: first,
                     text: "Map the provider seams".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
             })
             .expect("create Session")
@@ -1356,6 +1357,7 @@ mod tests {
                                 id: prompt_id,
                                 text: "And again".to_owned(),
                                 skill_invocations: Vec::new(),
+                                attachments: Vec::new(),
                             },
                         },
                     )

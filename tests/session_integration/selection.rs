@@ -55,6 +55,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
                 id: PromptId::new(),
                 text: "Keep this Turn on its effective Agent".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -201,6 +202,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
                 id: PromptId::new(),
                 text: "Use the existing default".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -269,6 +271,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
                 id: PromptId::new(),
                 text: "Reuse my remembered selection".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .send()
@@ -328,6 +331,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
                 id: PromptId::new(),
                 text: "Wait for a selected Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -538,6 +542,7 @@ async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients()
                 id: PromptId::new(),
                 text: "Cycle Reasoning Effort rapidly".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -754,6 +759,7 @@ async fn concurrent_clients_converge_in_server_acceptance_order() {
                 id: PromptId::new(),
                 text: "Wait while clients select concurrently".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -867,6 +873,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
                 id: PromptId::new(),
                 text: "Begin on A".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -903,6 +910,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
                     id: PromptId::new(),
                     text: "Steer the A Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -920,6 +928,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
                     id: PromptId::new(),
                     text: "Queue a new Turn".to_owned(),
                     skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -1009,6 +1018,7 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
                 id: PromptId::new(),
                 text: "Use the selected Model".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -1144,6 +1154,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
                 id: original_prompt_id,
                 text: "$retry deliberately".to_owned(),
                 skill_invocations: vec![invocation.clone()],
+                attachments: Vec::new(),
             },
         })
         .await

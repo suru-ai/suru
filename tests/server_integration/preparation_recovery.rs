@@ -105,6 +105,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
             id: PromptId::new(),
             text: "First request".into(),
             skill_invocations: vec![],
+            attachments: Vec::new(),
         },
     };
     let (one, two) = tokio::join!(

@@ -214,6 +214,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
                 id: PromptId::new(),
                 text: "Notice native Skill changes".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -340,6 +341,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
                 id: PromptId::new(),
                 text: visible_prompt.to_owned(),
                 skill_invocations: invocations.clone(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -448,6 +450,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
                 id: PromptId::new(),
                 text: "Hold the active Turn".to_owned(),
                 skill_invocations: Vec::new(),
+                attachments: Vec::new(),
             },
         })
         .await
@@ -482,6 +485,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
                     id: PromptId::new(),
                     text: queued_text.to_owned(),
                     skill_invocations: queued_invocations.clone(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Queue,
             },
@@ -504,6 +508,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
                     id: PromptId::new(),
                     text: steer_text.to_owned(),
                     skill_invocations: steer_invocations.clone(),
+                    attachments: Vec::new(),
                 },
                 delivery: PromptDelivery::Steer,
             },
@@ -651,6 +656,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
                 id: PromptId::new(),
                 text: visible_prompt.to_owned(),
                 skill_invocations: invocations.clone(),
+                attachments: Vec::new(),
             },
         })
         .await

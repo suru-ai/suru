@@ -180,7 +180,11 @@ impl StorageWriter {
                         session_id,
                         durability,
                     }) => {
-                        let result = repository.delete_session(session_id);
+                        // Every Session's joins to its Attachments land first,
+                        // so the deletion keeps an Attachment another Session
+                        // has bound but not yet flushed.
+                        let result = flush_sessions(&repository, &mut sessions, None)
+                            .and_then(|()| repository.delete_session(session_id));
                         if result.is_ok() {
                             sessions.remove(&session_id);
                         }
