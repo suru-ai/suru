@@ -19,6 +19,8 @@ pub struct McpClient {
     http: reqwest::Client,
     endpoint: String,
     authorization: Option<String>,
+    /// What every Tool call carries as its `_meta`, if anything.
+    call_meta: Option<Value>,
     next_id: u64,
 }
 
@@ -32,8 +34,18 @@ impl McpClient {
             http: reqwest::Client::new(),
             endpoint: endpoint.to_owned(),
             authorization,
+            call_meta: None,
             next_id: 0,
         }
+    }
+
+    /// This client, carrying `meta` as the `_meta` of every Tool call it
+    /// makes from here on — as each Codex thread names itself in every call
+    /// it makes, `{"threadId": ...}`, a native Subagent's own thread included,
+    /// under the token its parent's start carried.
+    pub fn with_call_meta(mut self, meta: Value) -> Self {
+        self.call_meta = Some(meta);
+        self
     }
 
     async fn post(&self, message: &Value) -> reqwest::Response {
@@ -91,11 +103,11 @@ impl McpClient {
     }
 
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.request(
-            "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-        )
-        .await
+        let mut params = json!({ "name": name, "arguments": arguments });
+        if let Some(meta) = &self.call_meta {
+            params["_meta"] = meta.clone();
+        }
+        self.request("tools/call", params).await
     }
 
     /// `list_providers`' answer, read from the structured content the call
