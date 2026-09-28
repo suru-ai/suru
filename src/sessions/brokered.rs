@@ -90,18 +90,10 @@ impl fmt::Display for BrokeredSpawnError {
         match self {
             Self::CallerNotFound => formatter
                 .write_str("the Session calling the Broker no longer exists on this Suru server"),
-            Self::Capped(BrokeredSpawnCap::Depth { max_depth, .. }) => write!(
-                formatter,
-                "it would stand deeper than the {max_depth} Sessions `broker.maxDepth` allows"
-            ),
-            Self::Capped(BrokeredSpawnCap::Concurrency {
-                max_concurrent_subagents,
-                ..
-            }) => write!(
-                formatter,
-                "{max_concurrent_subagents} brokered Subagents already work beneath its \
-                 top-level Session, as many as `broker.maxConcurrentSubagents` allows"
-            ),
+            // The Broker words a cap for the delegating Agent itself, from the
+            // cap carried here; this says only what kind of refusal it is.
+            Self::Capped(_) => formatter
+                .write_str("it would pass a cap the Broker's Settings put on brokered Subagents"),
             Self::Storage(message) => write!(formatter, "Suru could not record it: {message}"),
         }
     }
@@ -114,13 +106,13 @@ impl fmt::Display for BrokeredSpawnError {
 pub(crate) enum BrokeredSpawnCap {
     /// The Subagent would stand `depth` Sessions deep — its top-level Session
     /// counting as the first — deeper than `broker.maxDepth` allows.
-    Depth { max_depth: u32, depth: usize },
+    Depth { max_depth: u32, depth: u32 },
     /// `working` brokered Subagents already work beneath the caller's
     /// top-level Session: as many as `broker.maxConcurrentSubagents` allows,
     /// or more where the cap was lowered after they were spawned.
     Concurrency {
         max_concurrent_subagents: u32,
-        working: usize,
+        working: u32,
     },
 }
 
@@ -379,8 +371,8 @@ impl SessionStoreState {
             .ancestors(caller)
             .map(|(session_id, _)| session_id)
             .collect::<Vec<_>>();
-        let depth = line.len() + 1;
-        if depth > broker.max_depth as usize {
+        let depth = cap_count(line.len()).saturating_add(1);
+        if depth > broker.max_depth {
             return Some(BrokeredSpawnCap::Depth {
                 max_depth: broker.max_depth,
                 depth,
@@ -389,21 +381,20 @@ impl SessionStoreState {
         // The line's last Session heads the tree: the top-level Session, or
         // — for a line restoration left broken — the highest Session held.
         let top_level = *line.last()?;
-        let working = self
-            .actor_owners_beneath(top_level)
-            .into_iter()
-            .filter(|session_id| {
-                self.sessions.get(session_id).is_some_and(|record| {
-                    record.is_brokered_subagent() && record.is_at_work_itself()
+        let working = cap_count(
+            self.actor_owners_beneath(top_level)
+                .into_iter()
+                .filter(|session_id| {
+                    self.sessions.get(session_id).is_some_and(|record| {
+                        record.is_brokered_subagent() && record.is_at_work_itself()
+                    })
                 })
-            })
-            .count();
-        (working >= broker.max_concurrent_subagents as usize).then_some(
-            BrokeredSpawnCap::Concurrency {
-                max_concurrent_subagents: broker.max_concurrent_subagents,
-                working,
-            },
-        )
+                .count(),
+        );
+        (working >= broker.max_concurrent_subagents).then_some(BrokeredSpawnCap::Concurrency {
+            max_concurrent_subagents: broker.max_concurrent_subagents,
+            working,
+        })
     }
 
     /// Carries what a commit to a brokered Subagent's Session did to one of
@@ -639,6 +630,12 @@ impl SessionStoreState {
             _ => turn.worked_ms(),
         }
     }
+}
+
+/// `count` in the width the Broker's caps are pinned in. A count past what that
+/// width holds passes every cap there is, so it saturates rather than wraps.
+fn cap_count(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 impl SessionRecord {
