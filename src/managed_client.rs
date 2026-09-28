@@ -1045,6 +1045,9 @@ impl SessionCommandClient {
     }
 
     /// Fetches a stored Attachment's bytes, with the type they were stored as.
+    /// A body past the 5 MiB an Attachment may be is refused as it arrives,
+    /// rather than read to its end: nothing the Server admitted is that large,
+    /// so nothing that large is taken for an Attachment.
     pub(crate) async fn fetch_attachment(
         &self,
         attachment_id: &AttachmentId,
@@ -1070,11 +1073,26 @@ impl SessionCommandClient {
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| anyhow!("Attachment fetch answered without a content type"))?
             .to_owned();
-        let bytes = response
-            .bytes()
+        let limit = crate::attachments::MAX_ATTACHMENT_BYTES;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            bail!("the fetched Attachment is larger than an Attachment may be");
+        }
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("read the fetched Attachment")?;
-        Ok((mime_type, bytes.to_vec()))
+            .context("read the fetched Attachment")?
+        {
+            if bytes.len() + chunk.len() > limit {
+                bail!("the fetched Attachment is larger than an Attachment may be");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((mime_type, bytes))
     }
 
     pub(crate) async fn update_agent_selection(
@@ -1662,8 +1680,104 @@ impl Drop for ManagedClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_probe_url, remote_removal_url, server_url};
+    use super::{SessionCommandClient, remote_probe_url, remote_removal_url, server_url};
     use crate::protocol::Outlook;
+
+    mod attachment_fetch {
+        use std::time::Duration;
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::Path,
+            http::header::CONTENT_TYPE,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::sync::watch;
+
+        use super::SessionCommandClient;
+        use crate::{
+            attachments::MAX_ATTACHMENT_BYTES,
+            protocol::{
+                AttachmentId, Outlook, PROTOCOL_VERSION, RuntimeDescriptor, ServerIdentity,
+            },
+        };
+
+        /// Answers `/v1/attachments/{id}` with a PNG's worth of bytes of a
+        /// length the id names: `exact` is the cap, `over` one byte past it
+        /// and saying so, and `streamed-over` one byte past it without saying
+        /// so up front.
+        async fn answer(Path(id): Path<String>) -> Response {
+            let png = [(CONTENT_TYPE, "image/png")];
+            match id.as_str() {
+                "exact" => (png, vec![0_u8; MAX_ATTACHMENT_BYTES]).into_response(),
+                "over" => (png, vec![0_u8; MAX_ATTACHMENT_BYTES + 1]).into_response(),
+                _ => {
+                    let chunks = (0..=MAX_ATTACHMENT_BYTES / 65_536)
+                        .map(|_| Ok::<_, std::io::Error>(vec![0_u8; 65_536]));
+                    (png, Body::from_stream(futures_util::stream::iter(chunks))).into_response()
+                }
+            }
+        }
+
+        async fn client() -> (SessionCommandClient, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind the Attachment fixture");
+            let address = listener.local_addr().expect("read the fixture address");
+            let app = Router::new().route("/v1/attachments/{id}", get(answer));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve the Attachment fixture");
+            });
+            let (_, descriptor) = watch::channel(RuntimeDescriptor::new(
+                format!("http://{address}"),
+                "attachment-fixture-token".to_owned(),
+                ServerIdentity {
+                    instance_id: uuid::Uuid::new_v4(),
+                    pid: std::process::id(),
+                    protocol_version: PROTOCOL_VERSION,
+                    build_identity: "attachment-fixture".to_owned(),
+                },
+            ));
+            let client = SessionCommandClient {
+                http: reqwest::Client::new(),
+                descriptor,
+                outlook: Outlook::Local,
+                initial_recovery_backoff: Duration::from_millis(1),
+                max_recovery_backoff: Duration::from_millis(1),
+            };
+            (client, server)
+        }
+
+        #[tokio::test]
+        async fn a_fetch_over_the_attachment_cap_is_refused_and_one_at_it_is_taken() {
+            let (client, server) = client().await;
+
+            let (mime_type, bytes) = client
+                .fetch_attachment(&AttachmentId::new("exact"))
+                .await
+                .expect("a body at the cap is an Attachment");
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(bytes.len(), MAX_ATTACHMENT_BYTES);
+
+            for id in ["over", "streamed-over"] {
+                let refused = client
+                    .fetch_attachment(&AttachmentId::new(id))
+                    .await
+                    .expect_err("a body past the cap is refused");
+                assert!(
+                    refused
+                        .to_string()
+                        .contains("larger than an Attachment may be"),
+                    "{id}: {refused:#}"
+                );
+            }
+            server.abort();
+        }
+    }
 
     #[test]
     fn remote_probe_url_encodes_a_freely_editable_name_as_one_path_segment() {
