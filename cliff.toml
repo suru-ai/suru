@@ -1,0 +1,30 @@
+# Renders a release's notes from the Conventional Commits since the previous release.
+# `release.yml` passes the range; see https://git-cliff.org/docs/configuration.
+
+[changelog]
+# The release title already names the version, so the notes are the grouped commits alone.
+body = """
+{% set repository = get_env(name="GITHUB_SERVER_URL", default="https://github.com") ~ "/" ~ get_env(name="GITHUB_REPOSITORY", default="jake-tucker/suru") -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}]({{ repository }}/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+# A breaking change is shown whatever its type, so no skip rule may drop it.
+protect_breaking_commits = true
+# Groups sort by name; the comment prefixes fix their order and are stripped when rendered.
+commit_parsers = [
+    { message = "^[a-z]+(\\(.*\\))?!:", group = "<!-- 0 -->Breaking Changes" },
+    { body = "BREAKING[ -]CHANGE:", group = "<!-- 0 -->Breaking Changes" },
+    { message = "^feat", group = "<!-- 1 -->Features" },
+    { message = "^fix", group = "<!-- 2 -->Fixes" },
+    { message = "^perf", group = "<!-- 3 -->Performance" },
+    { message = ".*", skip = true },
+]

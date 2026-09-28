@@ -1,0 +1,131 @@
+name: Release
+
+# Cuts the next release from main: bumps the version in Cargo.toml, pushes a `chore(release): vX.Y.Z` commit with
+# its tag, opens a draft release noting the Conventional Commits since the previous one, and builds every target
+# into it. Publishing the draft is left to a person; once published, the release is immutable.
+#
+# Re-running failed jobs is safe throughout: a re-run resumes the version its first attempt pushed rather than
+# cutting another, and the build only rebuilds targets the draft is still missing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increment
+        type: choice
+        options: [patch, minor, major]
+        required: true
+
+# One release at a time, and never cancelled partway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Refuse anything but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are cut from main, not $GITHUB_REF."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main as it is now rather than the dispatched commit, so a re-run sees the release commit it pushed.
+          ref: main
+          fetch-depth: 0
+
+      - run: rustup toolchain install
+
+      - name: Commit and tag the release
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          RUN_MARKER: "Release-Run: ${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          resumed=$(git log -1 --format=%H --fixed-strings --grep "$RUN_MARKER")
+          if [ -n "$resumed" ]; then
+            tag=$(git log -1 --format=%s "$resumed" | sed -n 's/^chore(release): //p')
+            echo "Resuming $tag, which an earlier attempt of this run committed as $resumed"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -n "$previous" ] && [ -z "$(git rev-list "$previous..HEAD")" ]; then
+            echo "::error::Nothing to release: main has no commits since $previous."
+            exit 1
+          fi
+
+          current=$(awk -F'"' '/^\[/ { in_package = ($0 == "[package]") } in_package && /^version *=/ { print $2; exit }' Cargo.toml)
+          IFS=. read -r major minor patch <<< "$current"
+          case "$BUMP" in
+            major) next="$((major + 1)).0.0" ;;
+            minor) next="$major.$((minor + 1)).0" ;;
+            patch) next="$major.$minor.$((patch + 1))" ;;
+          esac
+          tag="v$next"
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::$tag already exists."
+            exit 1
+          fi
+          echo "Releasing $tag ($BUMP bump from $current)"
+
+          awk -v next_version="$next" '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { $0 = "version = \"" next_version "\""; in_package = 0 }
+            { print }
+          ' Cargo.toml > Cargo.toml.next
+          mv Cargo.toml.next Cargo.toml
+          # Carries the new version into Cargo.lock without touching any dependency.
+          cargo update --workspace
+
+          git commit --all --message "chore(release): $tag" --message "$RUN_MARKER"
+          git tag --annotate "$tag" --message "$tag"
+          # Atomic, so main never carries a release commit without its tag.
+          git push --atomic origin HEAD:main "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: git-cliff
+
+      - name: Open the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "The release for $TAG already exists"
+            exit 0
+          fi
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG^" 2>/dev/null || true)
+          if [ -z "$previous" ]; then
+            echo "Initial release" > notes.md
+          else
+            git cliff --strip all "$previous..$TAG" > notes.md
+            [ -s notes.md ] || echo "No user-facing changes." > notes.md
+          fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file notes.md
+
+  build:
+    name: Build
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    permissions:
+      contents: write

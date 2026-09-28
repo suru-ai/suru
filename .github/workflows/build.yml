@@ -1,0 +1,193 @@
+name: Build
+
+# Checks and builds Suru for every platform it ships for. A PR or a plain manual run checks formatting, lints,
+# tests, and keeps the archives as short-lived workflow artifacts. Given a tag, it attaches the archives to that
+# tag's draft release instead, one per target as each finishes; a target already attached is not rebuilt, so
+# re-running failed jobs (or dispatching again with the same tag) finishes a partial release.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release to attach the archives to, e.g. v1.2.3. Leave empty for a plain build.
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: Draft release to attach the archives to.
+        type: string
+        required: true
+
+concurrency:
+  # A new push supersedes a PR's build; anything else, a release above all, runs to the end.
+  group: ${{ github.event_name == 'pull_request' && format('build-pr-{0}', github.event.pull_request.number) || format('build-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  fmt:
+    name: Format
+    if: ${{ !inputs.tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, archive: tar.gz, exe: "" }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, archive: tar.gz, exe: "" }
+          - { target: aarch64-apple-darwin, runner: macos-15, archive: tar.gz, exe: "" }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, archive: zip, exe: .exe }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, archive: zip, exe: .exe }
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Name the archive
+        id: archive
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_TAG" ]; then
+            if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::'$RELEASE_TAG' is not a release tag like v1.2.3."
+              exit 1
+            fi
+            label=$RELEASE_TAG
+          else
+            label=${COMMIT_SHA::7}
+          fi
+          echo "stem=suru-$label-$TARGET" >> "$GITHUB_OUTPUT"
+          echo "file=suru-$label-$TARGET.$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Check the release for this archive
+        id: existing
+        if: env.RELEASE_TAG != ''
+        env:
+          FILE: ${{ steps.archive.outputs.file }}
+        run: |
+          set -euo pipefail
+          listing=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq "
+            .[] | select(.tag_name == \"$RELEASE_TAG\")
+            | \"release\t\(.draft)\", (.assets[] | select(.name == \"$FILE\") | \"asset\t\(.id)\t\(.state)\")")
+          draft=$(awk -F'\t' '$1 == "release" { print $2 }' <<< "$listing")
+          asset_id=$(awk -F'\t' '$1 == "asset" { print $2 }' <<< "$listing")
+          asset_state=$(awk -F'\t' '$1 == "asset" { print $3 }' <<< "$listing")
+          if [ -z "$draft" ]; then
+            echo "::error::No release exists for $RELEASE_TAG."
+            exit 1
+          fi
+          if [ "$asset_state" = uploaded ]; then
+            echo "::notice::$FILE is already attached to $RELEASE_TAG; not rebuilding it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$draft" != true ]; then
+            echo "::error::$RELEASE_TAG is published, and a published release is immutable: $FILE can no longer be attached."
+            exit 1
+          fi
+          if [ -n "$asset_id" ]; then
+            # An interrupted upload leaves an unfinished asset holding the name; clear it for the new one.
+            echo "Deleting unfinished $FILE ($asset_state)"
+            gh api -X DELETE "repos/$GH_REPO/releases/assets/$asset_id"
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.existing.outputs.skip != 'true'
+        with:
+          # A release builds its tag, not the commit the run was dispatched from.
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Install the toolchain
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+
+      - name: Install musl
+        if: steps.existing.outputs.skip != 'true' && contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # C dependencies (SQLite, ring) must compile against musl too, not the host's glibc.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.existing.outputs.skip != 'true'
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        if: env.RELEASE_TAG == ''
+        with:
+          tool: cargo-nextest
+
+      # A release builds a commit its PR has already checked, so only non-release runs lint and test.
+      - name: Clippy
+        if: env.RELEASE_TAG == ''
+        run: cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
+
+      - name: Test
+        if: env.RELEASE_TAG == ''
+        run: cargo nextest run --locked --target "$TARGET"
+
+      - name: Build
+        if: steps.existing.outputs.skip != 'true'
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          STEM: ${{ steps.archive.outputs.stem }}
+          FILE: ${{ steps.archive.outputs.file }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$STEM"
+          cp "target/$TARGET/release/suru$EXE" README.md "dist/$STEM/"
+          cd dist
+          if [ "$ARCHIVE" = zip ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '$STEM' -DestinationPath '$FILE'"
+          else
+            tar -czf "$FILE" "$STEM"
+          fi
+
+      - name: Attach to the release
+        if: env.RELEASE_TAG != '' && steps.existing.outputs.skip != 'true'
+        env:
+          FILE: ${{ steps.archive.outputs.file }}
+        run: gh release upload "$RELEASE_TAG" "dist/$FILE"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: env.RELEASE_TAG == ''
+        with:
+          path: dist/${{ steps.archive.outputs.file }}
+          # The archive is uploaded as-is rather than zipped again, keeping the Unix binary's executable bit.
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
