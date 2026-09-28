@@ -563,15 +563,21 @@ impl TerminalInputParser {
             }
         }
         if !maybe_more {
+            // Inside a paste every byte is the paste's until its end marker,
+            // so a marker split at the boundary waits for the rest of itself
+            // and nothing in it is ever taken for a key.
+            let paste_end_pending =
+                |raw: &[u8]| self.in_paste && BRACKETED_PASTE_END.starts_with(raw);
             match &mut self.state {
-                RawInputState::Escape => {
+                RawInputState::Escape if !paste_end_pending(b"\x1b") => {
                     ordinary.push(0x1b);
                     self.state = RawInputState::Ground;
                 }
                 // A reply the probe awaits survives the boundary until it can
                 // no longer be one or the reply window closes.
                 RawInputState::Csi { raw }
-                    if !(self.expecting_replies && is_awaited_csi_reply(raw)) =>
+                    if !paste_end_pending(raw)
+                        && !(self.expecting_replies && is_awaited_csi_reply(raw)) =>
                 {
                     // termina holds a bare introducer for more that is not
                     // coming, so it is resolved here as the chord that sent it.
@@ -597,6 +603,7 @@ impl TerminalInputParser {
                     self.state = RawInputState::Ground;
                 }
                 RawInputState::Ground
+                | RawInputState::Escape
                 | RawInputState::Csi { .. }
                 | RawInputState::ControlString { .. }
                 | RawInputState::DiscardControlString { .. } => {}
@@ -2062,6 +2069,48 @@ mod tests {
                 String::from_utf8_lossy(first).escape_debug()
             );
         }
+    }
+
+    #[test]
+    fn a_paste_end_marker_split_at_an_idle_gap_still_ends_the_paste() {
+        for (first, rest) in [
+            (b"\x1b[200~hello\x1b[".as_slice(), b"201~".as_slice()),
+            (b"\x1b[200~hello\x1b".as_slice(), b"[201~".as_slice()),
+            (b"\x1b[200~hello\x1b[20".as_slice(), b"1~".as_slice()),
+        ] {
+            for expecting in [false, true] {
+                let mut parser = TerminalInputParser::default();
+                if expecting {
+                    parser.expect_replies();
+                }
+
+                assert_eq!(parser.parse(first, false), vec![]);
+                assert_eq!(
+                    parser.parse(rest, false),
+                    vec![TerminalInput::Event(InputEvent::Paste("hello".to_owned()))],
+                    "{} while expecting replies: {expecting}",
+                    String::from_utf8_lossy(first).escape_debug()
+                );
+                assert_eq!(
+                    parser.parse(b"x", false),
+                    vec![key(KeyCode::Char('x'), KeyModifiers::NONE)],
+                    "typing after the paste is typing again"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_escape_bracket_pasted_across_an_idle_gap_stays_in_the_pasted_text() {
+        let mut parser = TerminalInputParser::default();
+
+        assert_eq!(parser.parse(b"\x1b[200~a\x1b[", false), vec![]);
+        assert_eq!(
+            parser.parse(b"b\x1b[201~", false),
+            vec![TerminalInput::Event(InputEvent::Paste(
+                "a\x1b[b".to_owned()
+            ))]
+        );
     }
 
     #[test]
