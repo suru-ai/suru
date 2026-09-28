@@ -12,7 +12,7 @@ use super::*;
 impl McpClient {
     /// `stop_subagent`'s answer for `subagent`, read from the structured
     /// content the call carries.
-    async fn stop_subagent(&mut self, subagent: SessionId) -> Value {
+    pub(super) async fn stop_subagent(&mut self, subagent: SessionId) -> Value {
         let result = self
             .call_tool("stop_subagent", json!({ "id": subagent }))
             .await;
