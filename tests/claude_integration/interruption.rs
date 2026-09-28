@@ -198,7 +198,10 @@ const STEERED_THEN_STOPPED: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
 /// afterwards as a stretch of its own — output belonging to a Turn that has already Settled. A live
 /// 2.1.283 CLI answers no such steer: asked to cancel what was queued, it reports the steer
 /// `cancelled` and lists it in the receipt (docs/validation/0407-claude-folded-steer.md, case F).
-/// The stretch stands for a CLI that answers one anyway, whose output must still land nowhere.
+/// The stretch stands for a CLI that answers one anyway, and what it pins is narrow: a stretch that
+/// opens no message of its own — it sends no `message_start` — joins neither the interrupted Turn
+/// nor the one after it, and lands on no Turn at all. A stretch that did open one would begin a
+/// native Continuation, as any loop the CLI runs after a Turn has Settled does.
 const ABORTED_WITH_A_SURVIVING_STEER: &str = r#"      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"terminal_reason":"aborted_tools","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Bonjour"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -293,6 +296,129 @@ async fn an_interrupted_turn_takes_its_steer_with_it_and_keeps_nothing_that_land
             .collect::<Vec<_>>(),
         ["Halfway", "Starting over"],
         "what the CLI answered the surviving steer with lands on no Turn at all"
+    );
+
+    live.shutdown().await;
+}
+
+/// A steered Turn caught between its loops (docs/validation/0407-claude-folded-steer.md, cases D
+/// and F). The Prompt's loop ends with its `result` while the steer is only `queued`, and the
+/// steer has yet to begin the loop of its own that would answer it — the stand-in never starts it,
+/// so a test can interrupt in that window. The interrupt then runs no loop: asked to cancel what
+/// was queued, the CLI reports the steer `cancelled` and lists it in the receipt, and no aborted
+/// `result` follows.
+const STEER_LEFT_QUEUED_BETWEEN_LOOPS: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
+      if [ "$prompts" -eq 1 ]; then
+        prompt=$uuid
+        lifecycle "$prompt" queued
+        lifecycle "$prompt" started
+        emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+        emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Hello"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      else
+        steer=$uuid
+        lifecycle "$steer" queued
+        emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+        emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5}}'
+        lifecycle "$prompt" completed
+      fi
+"#;
+
+/// The interrupt as the CLI answers it with no loop running: the queued steer is cancelled, and
+/// the receipt says so.
+const CANCELLING_THE_QUEUED_STEER: &str = r#"    *'"subtype":"interrupt"'*)
+      lifecycle "$steer" cancelled
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"still_queued":[],"cancelled":["'"$steer"'"]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn an_interrupt_between_a_steered_turns_loops_settles_it_interrupted() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(STEER_LEFT_QUEUED_BETWEEN_LOOPS),
+        CANCELLING_THE_QUEUED_STEER,
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(claude.executable()),
+        "claude-interrupt-between-loops",
+        "Say hello",
+    )
+    .await;
+    live.wait_for("the answer starts streaming", |snapshot| {
+        !agent_messages(snapshot).is_empty()
+    })
+    .await;
+    let steer = live
+        .client
+        .admit_prompt(
+            live.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Answer in French instead".to_owned(),
+                    skill_invocations: Vec::new(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("steer the running Turn");
+    let between = live
+        .wait_for(
+            "the Prompt's loop ends while the steer waits for a loop of its own",
+            |snapshot| {
+                snapshot
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.id == steer.id && prompt.status == PromptStatus::Delivered)
+                    && snapshot.turns[0].usage.is_some()
+            },
+        )
+        .await;
+    assert_eq!(
+        between.turns[0].status,
+        TurnStatus::Active,
+        "the loop the steer never joined ended without ending the Turn"
+    );
+
+    live.client
+        .interrupt_session(live.session_id)
+        .await
+        .expect("Claude acknowledges the interrupt");
+    let stopped = live
+        .wait_for("the interrupted Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+
+    assert_eq!(
+        stopped.turns[0].status,
+        TurnStatus::Interrupted,
+        "the user stopped the Turn, though no loop was running to abort"
+    );
+    assert_eq!(stopped.turns.len(), 1, "no Continuation began");
+    assert_eq!(
+        agent_messages(&stopped)
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Hello"]
+    );
+    let interrupt = claude
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .pointer("/request/subtype")
+                .and_then(|subtype| subtype.as_str())
+                == Some("interrupt")
+        })
+        .expect("the interrupt reached the CLI");
+    assert_eq!(
+        interrupt.pointer("/request/cancel_queued"),
+        Some(&serde_json::Value::Bool(true)),
+        "the interrupt asks for the queued steer to be dropped with it"
     );
 
     live.shutdown().await;

@@ -584,9 +584,12 @@ impl ClaudeProjection {
     /// What the CLI reports of a user message written into the Turn — its Prompt, or a steer —
     /// under the uuid it was written with: when a loop takes it up, which is what tells the result
     /// that answers the Turn from one ending a loop the message never joined. A message a loop
-    /// never took up and never will — dropped, or refused — once the result ending the Turn's last
-    /// loop was left waiting on it, leaves nothing else to Settle the Turn, so it Settles here, as
-    /// the completed loop it last ran.
+    /// never took up and never will, once the result ending the Turn's last loop was left waiting
+    /// on it, leaves nothing else to Settle the Turn, so it Settles here. One `cancelled` there was
+    /// swept by the interrupt the user asked for — Suru withdraws no message of its own, and with
+    /// no loop running that interrupt aborts none, so no aborted result will follow — and the Turn
+    /// Settles as interrupted. One the CLI discarded or refused leaves the Turn as the completed
+    /// loop it last ran.
     fn project_command_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(lifecycle) = serde_json::from_value::<CommandLifecycle>(message) else {
             return Vec::new();
@@ -594,22 +597,22 @@ impl ClaudeProjection {
         let settled = match lifecycle.state {
             CommandLifecycleState::Queued | CommandLifecycleState::Other => {
                 self.turn.message_queued();
-                false
+                return Vec::new();
             }
             CommandLifecycleState::Started => {
                 self.turn.message_started(&lifecycle.command_uuid);
-                false
+                return Vec::new();
             }
+            CommandLifecycleState::Cancelled => ProviderEvent::TurnInterrupted,
             CommandLifecycleState::Completed
-            | CommandLifecycleState::Cancelled
             | CommandLifecycleState::Discarded
-            | CommandLifecycleState::Refused => self.turn.message_ended(&lifecycle.command_uuid),
+            | CommandLifecycleState::Refused => ProviderEvent::TurnCompleted,
         };
-        if !settled {
+        if !self.turn.message_ended(&lifecycle.command_uuid) {
             return Vec::new();
         }
         self.turn_metering = None;
-        vec![ProviderEvent::TurnCompleted.into()]
+        vec![settled.into()]
     }
 
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
@@ -3452,8 +3455,37 @@ mod tests {
     }
 
     #[test]
-    fn a_steer_dropped_after_the_turns_last_loop_ended_settles_the_turn_as_completed() {
-        let (mut projection, _prompt) = prompted_projection();
+    fn a_steer_the_cli_drops_after_the_turns_last_loop_ended_settles_the_turn_as_completed() {
+        for dropped in ["discarded", "refused"] {
+            let (mut projection, _prompt) = prompted_projection();
+            let steer = projection
+                .turn
+                .accept_steer()
+                .expect("the running Turn takes the steer");
+            let ended = project(
+                &mut projection,
+                &[
+                    lifecycle(&steer, "queued"),
+                    result_costing("result-1", "conversation-1", 0.02),
+                ],
+            );
+            assert!(boundaries(&ended).is_empty());
+            let settled = project(&mut projection, &[lifecycle(&steer, dropped)]);
+            assert_eq!(
+                boundaries(&settled),
+                ["turn completed"],
+                "no loop will ever answer a {dropped} steer, so its end is the Turn's"
+            );
+            assert!(!projection.turn.is_running());
+        }
+    }
+
+    #[test]
+    fn an_interrupt_between_the_turns_loops_settles_it_interrupted_as_its_steer_is_cancelled() {
+        // The loop has ended with its result, and the steer it never took up has yet to start a
+        // loop of its own when the user interrupts: `cancel_queued` sweeps the steer, and with no
+        // loop running there is no aborted result to follow.
+        let (mut projection, prompt) = prompted_projection();
         let steer = projection
             .turn
             .accept_steer()
@@ -3463,16 +3495,46 @@ mod tests {
             &[
                 lifecycle(&steer, "queued"),
                 result_costing("result-1", "conversation-1", 0.02),
+                lifecycle(&prompt, "completed"),
             ],
         );
         assert!(boundaries(&ended).is_empty());
-        let dropped = project(&mut projection, &[lifecycle(&steer, "cancelled")]);
+        let interrupted = project(&mut projection, &[lifecycle(&steer, "cancelled")]);
         assert_eq!(
-            boundaries(&dropped),
-            ["turn completed"],
-            "no loop will ever answer the steer, so its end is the Turn's"
+            boundaries(&interrupted),
+            ["turn interrupted"],
+            "the user stopped the Turn, and the steer's cancellation is where it ends"
         );
         assert!(!projection.turn.is_running());
+    }
+
+    #[test]
+    fn a_cancellation_after_an_aborted_result_settles_nothing_more() {
+        let (mut projection, prompt) = prompted_projection();
+        let steer = projection
+            .turn
+            .accept_steer()
+            .expect("the running Turn takes the steer");
+        let aborted = project(
+            &mut projection,
+            &[
+                lifecycle(&steer, "queued"),
+                lifecycle(&steer, "cancelled"),
+                json!({
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": true,
+                    "terminal_reason": "aborted_tools",
+                    "errors": [],
+                }),
+                lifecycle(&prompt, "cancelled"),
+            ],
+        );
+        assert_eq!(
+            boundaries(&aborted),
+            ["turn interrupted"],
+            "the aborted result alone settles the Turn the interrupt stopped (case F)"
+        );
     }
 
     #[test]

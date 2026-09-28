@@ -177,8 +177,12 @@ gives the same moment without a flag, and adds the terminal states
     background task, is not answered by that loop's `result` either.
 - **A message that will never run:** a message not yet `started` may end
   instead, `cancelled`, `discarded` or `refused`, after the `result` of the
-  Turn's last loop has left the Turn waiting on it. Then the Turn Settles
-  Completed at that frame, since nothing else will Settle it.
+  Turn's last loop has left the Turn waiting on it. Then the Turn Settles at
+  that frame, since nothing else will Settle it.
+  - `cancelled` there means the user's interrupt swept the message: Suru
+    withdraws none itself, and with no loop running no aborted `result`
+    follows. So the Turn Settles interrupted.
+  - `discarded` and `refused` leave it completed, as the loop it last ran.
 - **A CLI that reports no lifecycle:** one older than the frame, or a later one
   that drops it, gives no account. There every successful `result` Settles the
   Turn. A loop that a still-queued steer begins afterwards opens a native
@@ -204,8 +208,10 @@ settle (`0421-broker-smoke.md`).
 Not verified live:
 
 - **A steer that ends untaken after the `result`** (`cancelled`, `discarded`
-  or `refused` with the Turn waiting). No capture produced one; it is pinned
-  only in unit tests.
+  or `refused` with the Turn waiting). No capture produced one. An interrupt in
+  that window is pinned by a unit test and a scripted test
+  (`an_interrupt_between_a_steered_turns_loops_settles_it_interrupted`); the
+  other two by unit tests only.
 - **Versions before 2.1.280.** When the frame first shipped was not checked.
 - **A user's steer Prompt through Suru end to end.** It was not driven against
   the live CLI; case A drove the same message against the raw CLI.
