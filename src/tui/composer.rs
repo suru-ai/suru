@@ -9,6 +9,7 @@ use std::{
 use ratatui::layout::{Position, Rect};
 
 use super::{
+    attachment_preview::{AttachmentPreviews, AttachmentRows},
     text_binding::{SkillIssue, TextBinding, TextBindings, UnitEdge, image_label},
     text_layout::{CursorTarget, RowDirection, TextLayout},
 };
@@ -276,15 +277,18 @@ impl ComposerMemory {
         self.attachments.insert(descriptor.id.clone(), descriptor);
     }
 
-    /// One line per Attachment the draft binds, in text order, describing
-    /// what its label stands for.
-    pub(super) fn attachment_lines(&self, key: ComposerKey) -> Vec<String> {
+    /// How the Attachments the draft binds present beside its text: one line
+    /// per Attachment, in text order, describing what its label stands for,
+    /// or a strip of their thumbnails where `previews` may draw one.
+    pub(super) fn attachment_rows(
+        &self,
+        key: ComposerKey,
+        previews: &AttachmentPreviews,
+    ) -> AttachmentRows {
         let Some(composer) = self.composers.get(&key) else {
-            return Vec::new();
+            return AttachmentRows::Lines(Vec::new());
         };
-        composer
-            .bindings
-            .attachment_lines(|id| self.attachments.get(id))
+        previews.rows(&composer.bindings, |id| self.attachments.get(id))
     }
 
     /// What each Attachment `bindings` name was stored as, where this client

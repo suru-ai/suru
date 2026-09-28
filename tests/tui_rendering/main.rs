@@ -13,6 +13,7 @@ mod approval_posture;
 mod approvals;
 mod aside;
 mod aside_neighbours;
+mod attachment_previews;
 mod commands;
 mod composer;
 mod connecting;

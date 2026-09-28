@@ -26,6 +26,7 @@ use crate::{
 use super::{
     approval_posture_picker::ApprovalPostureChoice,
     aside::AsidePresentation,
+    attachment_preview::{AttachmentPreviews, AttachmentRows, ReservedStrip},
     completion::CompletionRow,
     composer::{ComposerBindings, ComposerKey, ComposerMemory},
     icon_picker,
@@ -151,6 +152,9 @@ pub(super) fn render_with_slots(
     state.aside.forget_frame();
     // A frame without an editable composer must leave no pointer target.
     state.composers.forget_frame();
+    // Strips are reserved, covered, and drawn anew by every frame, and a
+    // thumbnail's click target is wherever the last frame drew it.
+    state.attachment_previews.begin_frame();
     // The Subagent Picker's rows are pointable, so its record of where they
     // were drawn starts over with the frame as well.
     state.subagent_picker.forget_frame();
@@ -181,6 +185,11 @@ pub(super) fn render_with_slots(
         Some(state.sidebar.column()),
         state.aside_is_present().then(|| state.aside.column()),
     );
+    // Neither column is drawn over the main view, but a strip beneath one
+    // would be covered by it all the same.
+    for column in [columns.left, columns.right].into_iter().flatten() {
+        state.attachment_previews.cover(column);
+    }
     if let Some(area) = columns.left {
         render_sidebar(frame, state, area, theme, truecolor);
     }
@@ -226,11 +235,12 @@ pub(super) fn render_with_slots(
     let pending_approvals: Vec<_> = state.pending_approvals().collect();
     let pending: Vec<_> = state.pending_questionnaires().collect();
     if let Some(approval) = state.open_approval() {
-        state
+        let panel = state
             .approvals
             .render(frame, composer.area, approval, theme);
+        state.attachment_previews.cover(panel);
     } else if let Some(questionnaire) = state.open_questionnaire() {
-        state.questionnaires.render(
+        let panel = state.questionnaires.render(
             frame,
             composer.area,
             questionnaire,
@@ -244,6 +254,7 @@ pub(super) fn render_with_slots(
                 pending.len(),
             ),
         );
+        state.attachment_previews.cover(panel);
     } else {
         // Allocate every intervention notice as one stack so a descendant
         // notice cannot paint over the owning Session's controls.
@@ -286,14 +297,16 @@ pub(super) fn render_with_slots(
         let visible = &intervention_notices[first_visible..];
         let first_y = notice_floor.saturating_sub(visible.len() as u16);
         for (offset, notice) in visible.iter().enumerate() {
+            let row = Rect::new(
+                composer.area.x,
+                first_y.saturating_add(offset as u16),
+                composer.area.width,
+                1,
+            );
+            state.attachment_previews.cover(row);
             frame.render_widget(
                 Paragraph::new(notice.as_str()).style(theme.feedback.warning),
-                Rect::new(
-                    composer.area.x,
-                    first_y.saturating_add(offset as u16),
-                    composer.area.width,
-                    1,
-                ),
+                row,
             );
         }
     }
@@ -364,6 +377,8 @@ pub(super) fn render_with_slots(
     }
     if state.reconnect_overlay_visible() {
         state.selection_frames.borrow_mut().clear();
+        // The modal dims the whole frame, so it covers every strip.
+        state.attachment_previews.cover(frame.area());
         render_reconnect_overlay(frame, theme);
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
@@ -396,6 +411,9 @@ pub(super) fn render_with_slots(
             state.text_selection.set(None);
         }
     }
+    // Last, over everything else the frame drew: a thumbnail goes only where
+    // nothing did, since a cell written over an image corrupts it.
+    state.attachment_previews.draw(frame.buffer_mut(), theme);
 }
 
 /// Draws configuration and runtime fallback Notices above whichever view is
@@ -910,7 +928,7 @@ fn render_session_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     } else {
         " Sessions ".to_owned()
     };
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -1203,7 +1221,7 @@ fn render_workspace_picker_menu(frame: &mut Frame<'_>, state: &TuiState, theme: 
         width,
         height,
     };
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(Line::styled(
             pad_to_width(
@@ -1439,7 +1457,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             theme.text.subdued,
         ));
     }
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -1488,7 +1506,7 @@ fn render_approval_posture_picker(
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -1558,7 +1576,7 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             theme.text.subdued,
         ));
     }
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -2008,6 +2026,14 @@ fn record_overlay_selection(
     ));
 }
 
+/// Clears `area` for a picker, dialog, or menu drawn over the frame, and
+/// records it as covering whatever strip of thumbnails lies beneath, so that
+/// strip is left blank rather than drawn over it (ADR 0038).
+fn clear_over(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    state.attachment_previews.cover(area);
+    frame.render_widget(Clear, area);
+}
+
 fn render_overlay_box(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -2017,7 +2043,7 @@ fn render_overlay_box(
     title: &str,
     theme: &Theme,
 ) {
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -2398,7 +2424,7 @@ fn render_composer_completion(
     } else {
         Paragraph::new(rows).style(theme.surface.overlay)
     };
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(paragraph, area);
     record_overlay_selection(frame, state, area, SelectionSurface::Completions, bordered);
 }
@@ -2543,7 +2569,7 @@ fn render_subagent_picker(
     } else {
         Paragraph::new(lines).style(theme.surface.overlay)
     };
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(paragraph, area);
     record_overlay_selection(frame, state, area, SelectionSurface::Subagents, bordered);
 }
@@ -2782,7 +2808,7 @@ fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Clear, area);
+    clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -3721,13 +3747,15 @@ fn render_landing(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
-    let attachments = state.composers.attachment_lines(key.clone());
+    let attachments = state
+        .composers
+        .attachment_rows(key.clone(), &state.attachment_previews);
     let composer_height = composer_block_height(
         area.height,
         72_u16.min(content.width),
         composer_text,
         composer_cursor,
-        attachments.len(),
+        attachments.row_count(),
     );
     let error = state
         .submission_error
@@ -3787,6 +3815,7 @@ fn render_landing(
             cursor: composer_cursor,
             bindings: &bindings,
             attachments: &attachments,
+            previews: &state.attachment_previews,
         },
         state.composer_border_style(theme),
         theme,
@@ -3848,13 +3877,15 @@ fn render_opening_session(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
-    let attachments = state.composers.attachment_lines(key.clone());
+    let attachments = state
+        .composers
+        .attachment_rows(key.clone(), &state.attachment_previews);
     let desired_composer_height = composer_block_height(
         area.height,
         content_width,
         composer_text,
         composer_cursor,
-        attachments.len(),
+        attachments.row_count(),
     );
     // What the Session view keeps below its Transcript and above its composer:
     // the footer's row and the Transcript's bottom margin, plus the one row of
@@ -3906,6 +3937,7 @@ fn render_opening_session(
             cursor: composer_cursor,
             bindings: &bindings,
             attachments: &attachments,
+            previews: &state.attachment_previews,
         },
         state.composer_border_style(theme),
         theme,
@@ -4164,7 +4196,9 @@ fn render_session_surface(
     let composer_text = state.composers.text(key.clone());
     let composer_cursor = state.composers.cursor(key.clone());
     let bindings = state.composers.bindings(key.clone());
-    let attachments = state.composers.attachment_lines(key.clone());
+    let attachments = state
+        .composers
+        .attachment_rows(key.clone(), &state.attachment_previews);
     let desired_composer_height = if subagent_view {
         1
     } else {
@@ -4173,7 +4207,7 @@ fn render_session_surface(
             content_width,
             composer_text,
             composer_cursor,
-            attachments.len(),
+            attachments.row_count(),
         )
     };
     let composer_top = slots.session_composer_top(&SessionComposerTopSlotContext {
@@ -4420,6 +4454,27 @@ fn render_session_surface(
             row,
         );
     }
+    // A strip's reserved rows were drawn blank with the rest; whether its
+    // thumbnails go over them waits on what else the frame draws over them.
+    let viewport = Rect::new(
+        transcript_area.x,
+        content_top,
+        transcript_area.width,
+        u16::try_from(visible_rows).unwrap_or(u16::MAX),
+    );
+    for strip in &window.strips {
+        state.attachment_previews.want(&strip.strip);
+        if strip.strip.is_ready() {
+            state.attachment_previews.reserve(ReservedStrip {
+                top: i32::from(content_top)
+                    .saturating_add(i32::try_from(strip.top).unwrap_or(i32::MIN)),
+                left: transcript_area.x.saturating_add(strip.left),
+                width: strip.width,
+                viewport,
+                attachments: strip.strip.attachments().to_vec(),
+            });
+        }
+    }
     if let Some(selection) = state.text_selection.get()
         && selection.surface == super::selection::SelectionSurface::Transcript
         && !state.overlay_owns_input()
@@ -4519,6 +4574,7 @@ fn render_session_surface(
                 cursor: composer_cursor,
                 bindings: &bindings,
                 attachments: &attachments,
+                previews: &state.attachment_previews,
             },
             state.composer_border_style(theme),
             theme,
@@ -4933,8 +4989,10 @@ struct ComposerContent<'a> {
     text: &'a str,
     cursor: usize,
     bindings: &'a ComposerBindings,
-    /// One line per Attachment the draft binds, drawn beneath its text.
-    attachments: &'a [String],
+    /// How the Attachments the draft binds present: one line each beneath its
+    /// text, or a strip of thumbnails above it.
+    attachments: &'a AttachmentRows,
+    previews: &'a AttachmentPreviews,
 }
 
 fn render_composer(
@@ -4951,6 +5009,7 @@ fn render_composer(
         cursor,
         bindings,
         attachments,
+        previews,
     } = content;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4958,19 +5017,37 @@ fn render_composer(
         .border_style(style);
     let content_area = block.inner(area);
     let content_width = composer_content_width(area.width);
-    // The Attachment lines stand still beneath the text as it scrolls, and
-    // give way before the text's last row does.
-    let attachment_rows = u16::try_from(attachments.len())
+    // The Attachments stand still beside the text as it scrolls — their
+    // lines beneath it, or their strip above it — and give way before the
+    // text's last row does.
+    let attachment_rows = u16::try_from(attachments.row_count())
         .unwrap_or(u16::MAX)
         .min(content_area.height.saturating_sub(1));
-    let text_area = Rect {
-        height: content_area.height.saturating_sub(attachment_rows),
-        ..content_area
-    };
-    let attachment_area = Rect {
-        y: text_area.bottom(),
-        height: attachment_rows,
-        ..content_area
+    let (text_area, attachment_area) = match attachments {
+        AttachmentRows::Lines(_) => {
+            let text_area = Rect {
+                height: content_area.height.saturating_sub(attachment_rows),
+                ..content_area
+            };
+            let attachment_area = Rect {
+                y: text_area.bottom(),
+                height: attachment_rows,
+                ..content_area
+            };
+            (text_area, attachment_area)
+        }
+        AttachmentRows::Strip(_) => {
+            let attachment_area = Rect {
+                height: attachment_rows,
+                ..content_area
+            };
+            let text_area = Rect {
+                y: attachment_area.bottom(),
+                height: content_area.height.saturating_sub(attachment_rows),
+                ..content_area
+            };
+            (text_area, attachment_area)
+        }
     };
     let content_height = area
         .height
@@ -5003,9 +5080,27 @@ fn render_composer(
         area,
     );
     frame.render_widget(paragraph.style(text_style).scroll((scroll, 0)), text_area);
+    let lines = match attachments {
+        AttachmentRows::Lines(lines) => lines.as_slice(),
+        AttachmentRows::Strip(strip) => {
+            previews.want(strip);
+            if strip.is_ready() {
+                previews.reserve(ReservedStrip {
+                    top: i32::from(attachment_area.y),
+                    left: attachment_area.x,
+                    width: attachment_area.width,
+                    viewport: attachment_area,
+                    attachments: strip.attachments().to_vec(),
+                });
+                &[]
+            } else {
+                strip.lines()
+            }
+        }
+    };
     frame.render_widget(
         Paragraph::new(
-            attachments
+            lines
                 .iter()
                 .map(|line| Line::from(line.as_str()))
                 .collect::<Vec<_>>(),
@@ -5018,8 +5113,8 @@ fn render_composer(
             .saturating_add(1)
             .saturating_add(COMPOSER_TEXT_MARGIN)
             .saturating_add(cursor_column),
-        area.y
-            .saturating_add(1)
+        text_area
+            .y
             .saturating_add(cursor_row.saturating_sub(scroll)),
     )
 }
@@ -5116,6 +5211,9 @@ fn render_unreachable_banner(
         return 0;
     }
     let row = composer.y.saturating_sub(1);
+    state
+        .attachment_previews
+        .cover(Rect::new(composer.x, row, composer.width, 1));
     let lead = format!(
         "{remote} is unreachable · retrying in {} (attempt {}) · ",
         retry_countdown(status.retry_in),
@@ -5170,7 +5268,7 @@ fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
 }
 
 /// The rows a composer block asks for: its text's rows up to a third of the
-/// terminal, one row per Attachment line beneath them, and its two borders.
+/// terminal, the rows its Attachments take beside them, and its two borders.
 fn composer_block_height(
     terminal_height: u16,
     width: u16,

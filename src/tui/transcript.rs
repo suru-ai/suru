@@ -52,6 +52,7 @@ use crate::{
 };
 
 use super::{
+    attachment_preview::{AttachmentPreviews, AttachmentRows, AttachmentStrip, STRIP_ROWS},
     markdown,
     slots::{SlotText, truncate_slot_text},
     spinner,
@@ -616,6 +617,7 @@ impl TranscriptCache {
             snapshot,
             provisional,
             disclosure,
+            &AttachmentPreviews::default(),
             theme,
             width,
             false,
@@ -631,11 +633,13 @@ impl TranscriptCache {
         snapshot: &SessionSnapshot,
         provisional: &[&InitialPrompt],
         disclosure: TranscriptDisclosure<'_>,
+        previews: &AttachmentPreviews,
         theme: &Theme,
         width: u16,
         hyperlinks: bool,
     ) -> Ref<'_, TranscriptView> {
         let key = ViewKey {
+            previews: previews.fingerprint(),
             generation,
             session_id: snapshot.session.id,
             revision: snapshot.revision,
@@ -672,6 +676,7 @@ impl TranscriptCache {
                 snapshot,
                 provisional,
                 disclosure,
+                previews,
                 theme,
                 width,
             );
@@ -728,6 +733,10 @@ struct ViewKey {
     /// Turn Fold state is the same kind of input again, and the one that
     /// decides which entries are projected at all.
     turns_fingerprint: u64,
+    /// Whether Attachments present as lines or strips, and which thumbnails
+    /// are ready, are inputs outside the snapshot too: a thumbnail arriving
+    /// turns its Message's dimmed lines into the strip they stood in for.
+    previews: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1256,12 +1265,14 @@ impl TranscriptView {
                 rows,
                 spinner_rows,
                 hyperlinks,
+                strips: Vec::new(),
             };
         }
         let first_unit = self
             .units
             .partition_point(|unit| unit.start_row <= scroll_position)
             .saturating_sub(1);
+        let strips = self.strips_in(first_unit, scroll_position, viewport_rows);
         'units: for unit in &self.units[first_unit..] {
             let mut skip = scroll_position.saturating_sub(unit.start_row);
             if unit.leading_separator {
@@ -1298,7 +1309,39 @@ impl TranscriptView {
             rows,
             spinner_rows,
             hyperlinks,
+            strips,
         }
+    }
+
+    /// Every strip with any of its reserved rows inside the window, from the
+    /// unit the window opens in: whole or not, since one partly in view is
+    /// still one whose thumbnails are worth fetching.
+    fn strips_in(
+        &self,
+        first_unit: usize,
+        scroll_position: usize,
+        viewport_rows: usize,
+    ) -> Vec<WindowStrip> {
+        let end = scroll_position.saturating_add(viewport_rows);
+        let mut strips = Vec::new();
+        for unit in &self.units[first_unit..] {
+            let first_row = unit.start_row + usize::from(unit.leading_separator);
+            if unit.start_row >= end {
+                break;
+            }
+            for strip in &unit.strips {
+                let top = first_row + strip.start;
+                if top + usize::from(STRIP_ROWS) > scroll_position && top < end {
+                    strips.push(WindowStrip {
+                        top: top as isize - scroll_position as isize,
+                        left: strip.left,
+                        width: strip.width,
+                        strip: strip.strip.clone(),
+                    });
+                }
+            }
+        }
+        strips
     }
 
     /// Draws the memoized Transcript followed by transient, one-row tail
@@ -1322,6 +1365,7 @@ impl TranscriptView {
                 rows: Vec::new(),
                 spinner_rows: Vec::new(),
                 hyperlinks: Vec::new(),
+                strips: Vec::new(),
             }
         };
         let first_tail = scroll_position.saturating_sub(self.row_count);
@@ -1341,6 +1385,18 @@ pub(super) struct TranscriptWindow {
     /// Indices into `rows` whose Marker cell holds a Spinner.
     pub(super) spinner_rows: Vec<usize>,
     pub(super) hyperlinks: Vec<VisibleHyperlink>,
+    /// The strips of thumbnails with any reserved row in the window.
+    pub(super) strips: Vec<WindowStrip>,
+}
+
+/// A strip of thumbnails as a window sees it: the window row its reserved
+/// rows begin on — above the window where it has scrolled part way off — and
+/// the columns it stands across.
+pub(super) struct WindowStrip {
+    pub(super) top: isize,
+    pub(super) left: u16,
+    pub(super) width: u16,
+    pub(super) strip: AttachmentStrip,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1400,9 +1456,8 @@ fn hyperlink_ranges(
 enum RenderUnit<'a> {
     /// A Message, with the parent of the Session whose Transcript holds it —
     /// a Delegation names its sender to the reader against that parent — and
-    /// the descriptors that Session carries, which a user Message lists its
-    /// Attachments beneath its text by.
-    Message(&'a Message, Option<SessionId>, &'a [AttachmentDescriptor]),
+    /// how a user Message presents its Attachments beneath its text.
+    Message(&'a Message, Option<SessionId>, AttachmentRows),
     Activity(&'a Activity),
     /// A Group: a run of two or more adjacent Activities of one groupable
     /// kind. Collapsed it is the run's single row; expanded it is the header
@@ -1432,8 +1487,8 @@ enum RenderUnit<'a> {
     /// stay outside a fold whose hidden work surrounds them.
     TurnFold(TurnMarker),
     /// A prompt this client sent that the Session has not echoed back yet,
-    /// with the descriptors the Session carries, as its Message will have.
-    Provisional(&'a InitialPrompt, &'a [AttachmentDescriptor]),
+    /// presenting its Attachments as its Message will.
+    Provisional(&'a InitialPrompt, AttachmentRows),
 }
 
 impl RenderUnit<'_> {
@@ -1464,7 +1519,7 @@ impl RenderUnit<'_> {
     /// any entry it holds changes and reuses its lines when none did.
     fn fingerprint(&self, folds: &TranscriptFolds) -> u64 {
         match self {
-            Self::Message(message, _, described) => message_fingerprint(message, described),
+            Self::Message(message, _, attachments) => message_fingerprint(message, attachments),
             Self::Activity(activity) => {
                 activity_fingerprint(activity, resolved_fold_step(folds, activity))
             }
@@ -1504,12 +1559,12 @@ impl RenderUnit<'_> {
                 hasher.finish()
             }
             // A provisional prompt's text only grows and carries no Fold, so
-            // its length and the lines beneath it are the whole of its
-            // rendering input.
-            Self::Provisional(prompt, described) => {
+            // its length and its Attachments' presentation are the whole of
+            // its rendering input.
+            Self::Provisional(prompt, attachments) => {
                 let mut hasher = std::hash::DefaultHasher::new();
                 prompt.text.len().hash(&mut hasher);
-                attachment_lines(&TextBindings::from_prompt(prompt), described).hash(&mut hasher);
+                attachments.hash(&mut hasher);
                 hasher.finish()
             }
         }
@@ -1581,16 +1636,17 @@ impl RenderUnit<'_> {
         workspace: &Path,
     ) -> Option<UnitAnchor> {
         match self {
-            Self::Message(message, parent, described) => {
-                render_message(
+            Self::Message(message, parent, attachments) => {
+                let strip = render_message(
                     projection.lines,
                     message,
                     *parent,
-                    described,
+                    attachments,
                     theme,
                     width,
                     hyperlinks,
                 );
+                project_strip(projection, strip, attachments, width);
                 None
             }
             Self::Activity(activity) => render_activity(
@@ -1631,6 +1687,7 @@ impl RenderUnit<'_> {
             }
             Self::TurnMember(unit) => {
                 let start = projection.lines.len();
+                let strips = projection.strips.len();
                 let anchor = unit.render(
                     projection,
                     folds,
@@ -1640,23 +1697,47 @@ impl RenderUnit<'_> {
                     workspace,
                 );
                 indent_members(&mut projection.lines[start..]);
+                for strip in &mut projection.strips[strips..] {
+                    strip.left = strip.left.saturating_add(MEMBER_INDENT.len() as u16);
+                }
                 anchor
             }
             Self::TurnFold(marker) => Some(render_turn_fold(projection.lines, *marker, theme)),
-            Self::Provisional(prompt, described) => {
-                let bindings = TextBindings::from_prompt(prompt);
-                push_user_message(
+            Self::Provisional(prompt, attachments) => {
+                let strip = push_user_message(
                     projection.lines,
                     &prompt.text,
-                    &bindings,
-                    &attachment_lines(&bindings, described),
+                    &TextBindings::from_prompt(prompt),
+                    attachments,
                     theme,
                     width,
                 );
+                project_strip(projection, strip, attachments, width);
                 None
             }
         }
     }
+}
+
+/// Records where a user Message's strip stands among the lines it projected,
+/// so the frame can find its reserved rows: past the gutter, and short of the
+/// air at the block's right edge.
+fn project_strip(
+    projection: &mut ActivityProjection<'_>,
+    line: Option<usize>,
+    attachments: &AttachmentRows,
+    width: u16,
+) {
+    let (Some(line), AttachmentRows::Strip(strip)) = (line, attachments) else {
+        return;
+    };
+    let gutter = USER_MESSAGE_GUTTER.width() as u16;
+    projection.strips.push(ProjectedStrip {
+        start: line,
+        left: gutter,
+        width: width.saturating_sub(gutter + USER_MESSAGE_RIGHT_MARGIN as u16),
+        strip: strip.clone(),
+    });
 }
 
 /// Seats a member's lines in the gutter beneath the header they fold into.
@@ -2273,6 +2354,7 @@ fn plan_units<'a>(
     groups: &TranscriptGroups,
     turns: &TranscriptTurnFolds,
     reasoning_visibility: ReasoningVisibility,
+    previews: &AttachmentPreviews,
 ) -> Vec<RenderUnit<'a>> {
     let content = TranscriptContent::of(snapshot, reasoning_visibility);
     let folding = TurnFolding::plan(snapshot, &content, turns);
@@ -2303,8 +2385,13 @@ fn plan_units<'a>(
         match entry {
             TranscriptEntry::Message(message) => {
                 close_run(&mut units, &mut run, groups);
+                let attachments = attachment_rows(
+                    &TextBindings::from_message(message),
+                    &snapshot.attachments,
+                    previews,
+                );
                 units.push(in_turn_gutter(
-                    RenderUnit::Message(message, snapshot.session.parent, &snapshot.attachments),
+                    RenderUnit::Message(message, snapshot.session.parent, attachments),
                     disclosed,
                 ));
             }
@@ -2329,11 +2416,14 @@ fn plan_units<'a>(
         }
     }
     close_run(&mut units, &mut run, groups);
-    units.extend(
-        provisional
-            .iter()
-            .map(|prompt| RenderUnit::Provisional(prompt, &snapshot.attachments)),
-    );
+    units.extend(provisional.iter().map(|prompt| {
+        let attachments = attachment_rows(
+            &TextBindings::from_prompt(prompt),
+            &snapshot.attachments,
+            previews,
+        );
+        RenderUnit::Provisional(prompt, attachments)
+    }));
     units
 }
 
@@ -2463,6 +2553,9 @@ struct UnitView {
     /// draw-time overlay (ADR 0009) can patch the current frame without the
     /// projection ever depending on it.
     spinner_rows: Vec<usize>,
+    /// The strips of thumbnails the unit reserved rows for, each by the
+    /// unit-local row its reserved rows begin on.
+    strips: Vec<ProjectedStrip>,
     message_id: Option<MessageId>,
     anchor: Option<LaidOutAnchor>,
 }
@@ -2486,12 +2579,15 @@ struct LaidOutAnchor {
     marker_line: Option<usize>,
 }
 
+// One parameter per input a rebuild reads, as `view_with_hyperlinks` has.
+#[allow(clippy::too_many_arguments)]
 fn rebuild(
     previous: Option<TranscriptView>,
     key: ViewKey,
     snapshot: &SessionSnapshot,
     provisional: &[&InitialPrompt],
     disclosure: TranscriptDisclosure<'_>,
+    previews: &AttachmentPreviews,
     theme: &Theme,
     width: u16,
 ) -> TranscriptView {
@@ -2516,6 +2612,7 @@ fn rebuild(
         disclosure.groups,
         disclosure.turns,
         disclosure.reasoning_visibility,
+        previews,
     );
     let mut units = planned
         .iter()
@@ -2633,10 +2730,12 @@ fn reuse_or_render(
     }
     let mut rendered = Vec::new();
     let mut links = Vec::new();
+    let mut strips = Vec::new();
     let rendered_anchor = unit.render(
         &mut ActivityProjection {
             lines: &mut rendered,
             links: &mut links,
+            strips: &mut strips,
         },
         folds,
         theme,
@@ -2674,6 +2773,16 @@ fn reuse_or_render(
         .into_iter()
         .filter_map(|line| first_row_of_source_line.get(line).copied())
         .collect();
+    let strips = strips
+        .into_iter()
+        .filter_map(|strip| {
+            let row = *first_row_of_source_line.get(strip.start)?;
+            Some(ProjectedStrip {
+                start: row,
+                ..strip
+            })
+        })
+        .collect();
     UnitView {
         key,
         fingerprint,
@@ -2686,6 +2795,7 @@ fn reuse_or_render(
         start_line: 0,
         start_row: 0,
         spinner_rows,
+        strips,
         message_id: unit.message_id(),
         anchor: rendered_anchor.map(|anchor| LaidOutAnchor {
             header_lines,
@@ -2726,22 +2836,28 @@ impl UnitAnchor {
 
 /// Message content is append-only, so its length identifies it within a
 /// Session once the truncation signal, which flips without lengthening the
-/// content, is folded in, beside its bindings and the lines describing its
-/// Attachments, which change when a descriptor arrives after the Message.
-fn message_fingerprint(message: &Message, described: &[AttachmentDescriptor]) -> u64 {
+/// content, is folded in, beside its bindings and how its Attachments
+/// present, which changes when a descriptor or a thumbnail arrives after the
+/// Message.
+fn message_fingerprint(message: &Message, attachments: &AttachmentRows) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     message.content.len().hash(&mut hasher);
     message.truncated.hash(&mut hasher);
-    let bindings = TextBindings::from_message(message);
-    attachment_lines(&bindings, described).hash(&mut hasher);
-    bindings.hash(&mut hasher);
+    attachments.hash(&mut hasher);
+    TextBindings::from_message(message).hash(&mut hasher);
     hasher.finish()
 }
 
-/// One line per Attachment `bindings` bind, describing it by what the Session
-/// carries for it.
-fn attachment_lines(bindings: &TextBindings, described: &[AttachmentDescriptor]) -> Vec<String> {
-    bindings.attachment_lines(|id| described.iter().find(|descriptor| &descriptor.id == id))
+/// How the Attachments `bindings` bind present beneath the text, describing
+/// each by what the Session carries for it.
+fn attachment_rows(
+    bindings: &TextBindings,
+    described: &[AttachmentDescriptor],
+    previews: &AttachmentPreviews,
+) -> AttachmentRows {
+    previews.rows(bindings, |id| {
+        described.iter().find(|descriptor| &descriptor.id == id)
+    })
 }
 
 /// The step an Activity's Fold rests at before the reader touches it. A
@@ -2952,43 +3068,48 @@ fn sanitize_content(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Projects one Message. `parent` is the parent of the Session whose
 /// Transcript holds it, which is what a Delegation names its sender against.
+/// Projects a Message by its role, answering where a user Message's strip of
+/// thumbnails begins among `lines`, where it has one.
 fn render_message(
     lines: &mut Vec<StyledLine>,
     message: &Message,
     parent: Option<SessionId>,
-    described: &[AttachmentDescriptor],
+    attachments: &AttachmentRows,
     theme: &Theme,
     width: u16,
     hyperlinks: bool,
-) {
+) -> Option<usize> {
     match &message.role {
-        MessageRole::User => {
-            let bindings = TextBindings::from_message(message);
-            push_user_message(
+        MessageRole::User => push_user_message(
+            lines,
+            &message.content,
+            &TextBindings::from_message(message),
+            attachments,
+            theme,
+            width,
+        ),
+        MessageRole::Agent => {
+            push_agent_message(
                 lines,
                 &message.content,
-                &bindings,
-                &attachment_lines(&bindings, described),
+                message.truncated,
+                theme,
+                width,
+                hyperlinks,
+            );
+            None
+        }
+        MessageRole::Delegation(delegator) => {
+            push_delegation(
+                lines,
+                &message.content,
+                message.truncated,
+                &delegation_sender(delegator, parent),
                 theme,
                 width,
             );
+            None
         }
-        MessageRole::Agent => push_agent_message(
-            lines,
-            &message.content,
-            message.truncated,
-            theme,
-            width,
-            hyperlinks,
-        ),
-        MessageRole::Delegation(delegator) => push_delegation(
-            lines,
-            &message.content,
-            message.truncated,
-            &delegation_sender(delegator, parent),
-            theme,
-            width,
-        ),
     }
 }
 
@@ -3249,6 +3370,7 @@ pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>
     let mut projection = ActivityProjection {
         lines: &mut lines,
         links: &mut links,
+        strips: &mut Vec::new(),
     };
     push_styled_prefixed_lines(
         &mut projection,
@@ -3500,6 +3622,22 @@ fn render_turn_fold(lines: &mut Vec<StyledLine>, marker: TurnMarker, theme: &The
 struct ActivityProjection<'a> {
     lines: &'a mut Vec<StyledLine>,
     links: &'a mut Vec<TranscriptLink>,
+    /// The strips of thumbnails the unit's user Messages reserved rows for.
+    strips: &'a mut Vec<ProjectedStrip>,
+}
+
+/// A strip of thumbnails as a unit projected it: where its reserved rows
+/// begin, and the columns of those rows it stands across.
+#[derive(Clone, Debug)]
+struct ProjectedStrip {
+    /// The unit's line its reserved rows begin on while the unit is being
+    /// projected, and the unit's row once it is laid out. A reserved row is
+    /// one line that never wraps, so the one becomes the other unchanged in
+    /// kind.
+    start: usize,
+    left: u16,
+    width: u16,
+    strip: AttachmentStrip,
 }
 
 /// What a command Activity contributes to the transcript, gathered so the
@@ -3552,6 +3690,7 @@ fn push_command_activity(
             &mut ActivityProjection {
                 lines: &mut output_lines,
                 links: projection.links,
+                strips: projection.strips,
             },
             ContentGutter {
                 lead: COMMAND_DETAIL_INDENT,
@@ -4266,16 +4405,17 @@ pub(super) fn humanized_duration(duration_ms: u64) -> String {
 }
 
 /// Projects a user Message, or a Prompt drawn as the one it will become: its
-/// text with each binding in its kind's style, then one dimmed line per
-/// Attachment it binds, in the same block and wrapped as its text is.
+/// text with each binding in its kind's style, then its Attachments in the
+/// same block — one dimmed line per Attachment, wrapped as its text is, or a
+/// strip's reserved rows, which answer where they begin.
 fn push_user_message(
     lines: &mut Vec<StyledLine>,
     content: &str,
     bindings: &TextBindings,
-    attachments: &[String],
+    attachments: &AttachmentRows,
     theme: &Theme,
     available_width: u16,
-) {
+) -> Option<usize> {
     let content = sanitize_content(content);
     let surface = theme.surface.elevated.patch(theme.text.primary);
     let subdued = theme.surface.elevated.patch(theme.text.subdued);
@@ -4309,14 +4449,41 @@ fn push_user_message(
         },
         available_width,
     );
-    for line in attachments {
-        push_message_block(
-            lines,
-            &sanitize_content(line),
-            block,
-            |_| subdued,
-            available_width,
-        );
+    match attachments {
+        AttachmentRows::Lines(attachments) => {
+            for line in attachments {
+                push_message_block(
+                    lines,
+                    &sanitize_content(line),
+                    block,
+                    |_| subdued,
+                    available_width,
+                );
+            }
+            None
+        }
+        AttachmentRows::Strip(strip) => {
+            let start = lines.len();
+            // Until the thumbnails are ready their lines fill the strip's
+            // first rows, cut to its height, and blank rows the rest; once
+            // they are, every row is blank and the frame draws over them.
+            if !strip.is_ready() {
+                for line in strip.lines() {
+                    push_message_block(
+                        lines,
+                        &sanitize_content(line),
+                        block,
+                        |_| subdued,
+                        available_width,
+                    );
+                }
+                lines.truncate(start + usize::from(STRIP_ROWS));
+            }
+            while lines.len() < start + usize::from(STRIP_ROWS) {
+                push_reserved_row(lines, available_width, block);
+            }
+            Some(start)
+        }
     }
 }
 
@@ -4401,6 +4568,16 @@ fn push_message_block(
         }
         previous_end = row.start + row.text.len();
     }
+}
+
+/// One row a strip reserves: the block's gutter and surface, and nothing a
+/// copy would take.
+fn push_reserved_row(lines: &mut Vec<StyledLine>, available_width: usize, block: MessageBlock) {
+    let padding = available_width.saturating_sub(block.gutter.width());
+    lines.push(StyledLine::from(vec![
+        StyledSpan::chrome(block.gutter, block.gutter_style),
+        StyledSpan::chrome(" ".repeat(padding), block.surface),
+    ]));
 }
 
 fn push_message_block_row(
@@ -4889,10 +5066,11 @@ mod tests {
     };
 
     use super::{
-        ActivityProjection, CappedStream, FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine,
-        StyledSpan, TextBindings, TextPosition, TranscriptCache, TranscriptDisclosure,
-        TranscriptFolds, TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart,
-        layout_line, push_user_message, render_activity, render_message, split_oversized_line,
+        ActivityProjection, AttachmentPreviews, AttachmentRows, CappedStream, FoldStep,
+        MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings, TextPosition,
+        TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
+        TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
+        render_activity, render_message, split_oversized_line,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -5063,6 +5241,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Expanded,
@@ -5116,6 +5295,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Expanded,
@@ -5412,6 +5592,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Peek,
@@ -5449,6 +5630,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut Vec::new(),
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Expanded,
@@ -5490,6 +5672,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Expanded,
@@ -5536,7 +5719,15 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &[], &theme, 80, false);
+        render_message(
+            &mut lines,
+            &message,
+            None,
+            &no_attachments(),
+            &theme,
+            80,
+            false,
+        );
 
         let marker = lines
             .iter()
@@ -5580,6 +5771,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Peek,
@@ -5620,7 +5812,15 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &[], &theme, 80, false);
+        render_message(
+            &mut lines,
+            &message,
+            None,
+            &no_attachments(),
+            &theme,
+            80,
+            false,
+        );
 
         let marker_lines = lines
             .iter()
@@ -5658,6 +5858,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Expanded,
@@ -5697,6 +5898,11 @@ mod tests {
     enum Entry {
         Message(Message),
         Activity(Activity),
+    }
+
+    /// A Message presenting no Attachments, as one binding none does.
+    fn no_attachments() -> AttachmentRows {
+        AttachmentRows::Lines(Vec::new())
     }
 
     fn user_message(content: &str) -> Message {
@@ -6088,7 +6294,7 @@ mod tests {
             &mut lines,
             "aaaa bbbbbb",
             &TextBindings::default(),
-            &[],
+            &no_attachments(),
             &Theme::system(),
             12,
         );
@@ -6106,7 +6312,7 @@ mod tests {
             &mut lines,
             "aaaaaaaaaaaa",
             &TextBindings::default(),
-            &[],
+            &no_attachments(),
             &Theme::system(),
             12,
         );
@@ -6900,8 +7106,16 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Shown,
         };
 
-        let fallback =
-            cache.view_with_hyperlinks(0, &snapshot, &[], disclosure(), &Theme::system(), 8, false);
+        let fallback = cache.view_with_hyperlinks(
+            0,
+            &snapshot,
+            &[],
+            disclosure(),
+            &AttachmentPreviews::default(),
+            &Theme::system(),
+            8,
+            false,
+        );
         let fallback_rows = row_text(&fallback.window(0, fallback.row_count()).rows);
         assert!(
             fallback_rows
@@ -6913,8 +7127,16 @@ mod tests {
         let old_epoch = cache.selection_epoch();
         drop(fallback);
 
-        let supported =
-            cache.view_with_hyperlinks(0, &snapshot, &[], disclosure(), &Theme::system(), 8, true);
+        let supported = cache.view_with_hyperlinks(
+            0,
+            &snapshot,
+            &[],
+            disclosure(),
+            &AttachmentPreviews::default(),
+            &Theme::system(),
+            8,
+            true,
+        );
         let window = supported.window(0, supported.row_count());
         assert_eq!(row_text(&window.rows), ["  界wide", "  label"]);
         assert!(window.hyperlinks.len() >= 2, "wrapped link lost a target");
@@ -7251,6 +7473,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &activity,
             FoldStep::Peek,
@@ -7302,6 +7525,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &command("cargo build --release --workspace --all-targets", ""),
             FoldStep::Folded,
@@ -7330,7 +7554,15 @@ mod tests {
                 ..user_message("Map the seams.")
             };
             let mut lines = Vec::new();
-            render_message(&mut lines, &message, Some(parent), &[], &theme, 40, false);
+            render_message(
+                &mut lines,
+                &message,
+                Some(parent),
+                &no_attachments(),
+                &theme,
+                40,
+                false,
+            );
             assert_eq!(
                 span_marks(&lines[1])[..2],
                 [(true, "│ "), (false, "Map the seams.")],
@@ -7367,7 +7599,15 @@ mod tests {
         };
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &[], &Theme::system(), 40, false);
+        render_message(
+            &mut lines,
+            &message,
+            None,
+            &no_attachments(),
+            &Theme::system(),
+            40,
+            false,
+        );
 
         assert_eq!(
             lines.last().map(projected_text).as_deref(),
@@ -7383,7 +7623,7 @@ mod tests {
             &mut lines,
             &user_message("hello there"),
             None,
-            &[],
+            &no_attachments(),
             &theme,
             20,
             false,
@@ -7399,7 +7639,7 @@ mod tests {
             &mut lines,
             &agent_message("- item one\n\n```rust\nlet x = 1;\n```"),
             None,
-            &[],
+            &no_attachments(),
             &theme,
             40,
             false,
@@ -7432,7 +7672,7 @@ mod tests {
             &mut agent_lines,
             &agent_message(table),
             None,
-            &[],
+            &no_attachments(),
             &theme,
             24,
             false,
@@ -7445,6 +7685,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut reasoning_lines,
                 links: &mut Vec::new(),
+                strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, None, table),
             FoldStep::Expanded,
@@ -7470,6 +7711,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
             FoldStep::Folded,
@@ -7493,6 +7735,7 @@ mod tests {
             &mut ActivityProjection {
                 lines: &mut lines,
                 links: &mut links,
+                strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
             FoldStep::Expanded,
@@ -7771,6 +8014,7 @@ mod tests {
                 &mut ActivityProjection {
                     lines: &mut lines,
                     links: &mut links,
+                    strips: &mut Vec::new(),
                 },
                 &activity,
                 FoldStep::Folded,

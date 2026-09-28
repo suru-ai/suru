@@ -3,6 +3,7 @@
 mod approval;
 mod approval_posture_picker;
 mod aside;
+mod attachment_preview;
 mod clipboard;
 mod clipboard_paste;
 mod commands;
@@ -44,6 +45,7 @@ mod worktree_picker;
 pub use crate::terminal::{
     CellSize, GraphicsProtocol, TerminalColor, TerminalColorProbe, TerminalFacts,
 };
+pub use attachment_preview::Thumbnail;
 pub use clipboard::{ClipboardContent, ClipboardRead, PasteId};
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;

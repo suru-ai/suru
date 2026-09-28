@@ -474,6 +474,7 @@ impl QuestionnairePanels {
         }
         None
     }
+    /// Draws the panel over the composer, answering the area it covers.
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
@@ -481,9 +482,9 @@ impl QuestionnairePanels {
         questionnaire: &Questionnaire,
         theme: &Theme,
         position: (usize, usize),
-    ) {
+    ) -> Rect {
         let Some(panel) = self.visible.as_ref().and_then(|key| self.drafts.get(key)) else {
-            return;
+            return Rect::default();
         };
         let question = &questionnaire.questions[panel.current];
         let draft = &panel.questions[panel.current];
@@ -653,6 +654,7 @@ impl QuestionnairePanels {
             Paragraph::new(footer).style(theme.text.primary),
             footer_area,
         );
+        area
     }
 }
 

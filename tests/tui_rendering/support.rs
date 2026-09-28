@@ -128,6 +128,19 @@ pub fn rendered_application_buffer(application: &Application, width: u16, height
     terminal.backend().buffer().clone()
 }
 
+/// The frame an Application draws, as it stood before ratatui diffed it for
+/// the terminal: a cell an image is drawn over still says it is skipped,
+/// which the terminal's own buffer never learns.
+pub fn rendered_application_frame(application: &Application, width: u16, height: u16) -> Buffer {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("create test terminal");
+    terminal
+        .draw(|frame| application.render(frame))
+        .expect("render headless TUI application")
+        .buffer
+        .clone()
+}
+
 pub fn rendered_application_cursor_at(
     application: &Application,
     width: u16,

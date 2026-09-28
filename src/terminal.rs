@@ -85,7 +85,7 @@ impl TerminalColorProbe {
 
 /// A terminal graphics protocol an image may be drawn with, in the order Suru
 /// prefers them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GraphicsProtocol {
     /// The Kitty graphics protocol, confirmed by the terminal's own reply to
     /// its query.
@@ -108,7 +108,7 @@ impl fmt::Display for GraphicsProtocol {
 }
 
 /// The size of one terminal cell in pixels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CellSize {
     pub width: u16,
     pub height: u16,

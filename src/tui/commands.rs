@@ -6,7 +6,7 @@ use ratatui::layout::Position;
 use super::text_layout::CursorTarget;
 
 use crate::protocol::{
-    ApprovalId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
+    ApprovalId, AttachmentId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
 };
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
@@ -53,6 +53,9 @@ pub enum SemanticCommandId {
     PointerClick,
     PointerDrag,
     HyperlinkOpen,
+    /// Opens an Attachment at full size from its thumbnail. Reserved, and
+    /// bound to a thumbnail's click target, but it does nothing yet.
+    AttachmentOpen,
     TextSelectionCopy,
     TextSelectionClear,
     TextSelectionWord,
@@ -249,6 +252,8 @@ pub(super) enum SemanticSubject {
     ComposerCursor(CursorTarget),
     ScreenPosition(Position),
     Hyperlink(String),
+    /// One Attachment, named by the thumbnail a reader pressed.
+    Attachment(AttachmentId),
     /// Typed text a command carries as its own payload rather than acting
     /// on anything already in view state — the Icon Picker's search insert is
     /// the first of these.
@@ -346,6 +351,15 @@ impl SemanticCommandId {
         }
     }
 
+    /// This command invoked against one Attachment, which is what a reader
+    /// names by pressing its thumbnail.
+    pub(super) fn on_attachment(self, attachment_id: AttachmentId) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Attachment(attachment_id),
+        }
+    }
+
     pub(super) fn on_hyperlink(self, target: String) -> SemanticInvocation {
         SemanticInvocation {
             id: self,
@@ -397,6 +411,7 @@ impl SemanticCommandId {
             Self::PointerClick => "pointer.click",
             Self::PointerDrag => "pointer.drag",
             Self::HyperlinkOpen => "hyperlink.open",
+            Self::AttachmentOpen => "attachment.open",
             Self::TextSelectionCopy => "text_selection.copy",
             Self::TextSelectionClear => "text_selection.clear",
             Self::TextSelectionWord => "text_selection.word",
@@ -1517,6 +1532,14 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Open Hyperlink",
         reach: SemanticReach::Client,
         description: "Open the hyperlink named by a rendered Transcript cell",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::AttachmentOpen,
+        title: "Open Attachment",
+        reach: SemanticReach::Client,
+        description: "Open the Attachment a thumbnail shows (reserved: does nothing yet)",
         slash: None,
         keybinding: None,
     },

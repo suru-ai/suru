@@ -159,13 +159,14 @@ impl ApprovalPanel {
         Some((id, decision))
     }
 
+    /// Draws the panel over the composer, answering the area it covers.
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
         composer: Rect,
         activity: &Activity,
         theme: &Theme,
-    ) {
+    ) -> Rect {
         let Activity::Approval {
             approval,
             tool_activity_id,
@@ -174,7 +175,7 @@ impl ApprovalPanel {
             ..
         } = activity
         else {
-            return;
+            return Rect::default();
         };
         let mut detail = detail_lines(approval, *tool_activity_id)
             .into_iter()
@@ -248,6 +249,7 @@ impl ApprovalPanel {
         let controls_area = Rect::new(inner.x, detail_area.bottom(), inner.width, controls_height);
         frame.render_widget(detail, detail_area);
         frame.render_widget(Paragraph::new(controls), controls_area);
+        area
     }
 }
 

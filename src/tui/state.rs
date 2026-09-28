@@ -22,22 +22,24 @@ use crate::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
-        AgentSelectionOperationId, ApprovalId, CreateSessionRequest, EffectiveSettings,
-        FoldPosture, InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery, PromptId,
-        PromptStatus, QuestionnaireId, ResolveWorkspaceRequest, ServerIdentity, SessionChange,
-        SessionErrorCode, SessionId, SessionListItem, SessionReference, SessionSnapshot,
-        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        TextSelectionCopy, TurnId, TurnStatus, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        AgentSelectionOperationId, ApprovalId, AttachmentId, CreateSessionRequest,
+        EffectiveSettings, FoldPosture, InitialPrompt, MessageId, ModelCatalog, Outlook,
+        PromptDelivery, PromptId, PromptStatus, QuestionnaireId, ResolveWorkspaceRequest,
+        ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
+        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
+        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
+        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
-    terminal::TerminalFacts,
+    terminal::{CellSize, GraphicsProtocol, TerminalFacts},
     theme::{Theme, ThemeCatalog},
 };
 
 use super::{
     approval_posture_picker::ApprovalPosturePicker,
     aside::{Aside, AsidePresentation, AsidePress},
+    attachment_preview::{AttachmentPreviews, PreviewMode, Thumbnail},
     clipboard::{ClipboardRead, PasteId},
     clipboard_paste::ClipboardPastes,
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
@@ -540,6 +542,9 @@ pub struct TuiState {
     /// interaction takes it away for good.
     application_notice: ApplicationNotice,
     pub(super) transcript_cache: TranscriptCache,
+    /// Thumbnails of the open Session's Attachments, and what each frame
+    /// wanted, reserved, and drew of them (ADR 0038).
+    pub(super) attachment_previews: AttachmentPreviews,
     /// Bumped whenever the Session projection is replaced wholesale, so the
     /// transcript cache never trusts a revision across snapshot swaps.
     pub(super) transcript_generation: u64,
@@ -873,6 +878,7 @@ impl TuiState {
             pinned_settings: Vec::new(),
             application_notice: ApplicationNotice::default(),
             transcript_cache: TranscriptCache::default(),
+            attachment_previews: AttachmentPreviews::default(),
             transcript_generation: 0,
             spinner_frame: 0,
             shimmer_clock: super::shimmer::Clock::default(),
@@ -2533,6 +2539,7 @@ impl TuiState {
                 turns: &interaction.turns.borrow(),
                 reasoning_visibility: self.settings().transcript.reasoning_visibility,
             },
+            &self.attachment_previews,
             theme,
             width,
             self.hyperlinks,
@@ -3256,6 +3263,8 @@ impl TuiState {
         // The Aside answers for the claim at once, from what it says.
         self.aside
             .stand_in_for(reference, prompt.text.trim().to_owned(), true);
+        // The draft's thumbnails are the claim's own Prompt's.
+        self.attachment_previews.carry_to(Some(session_id));
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.creation_transition(prompt)
     }
@@ -3443,6 +3452,7 @@ impl TuiState {
                 turns: &turns,
                 reasoning_visibility: self.settings().transcript.reasoning_visibility,
             },
+            &self.attachment_previews,
             theme,
             width,
             self.hyperlinks,
@@ -4020,6 +4030,19 @@ pub enum ApplicationEvent {
         paste: PasteId,
         reason: String,
     },
+    /// The thumbnail a [`ApplicationTransition::FetchAttachment`] asked for,
+    /// made at `cell_size`.
+    AttachmentThumbnail {
+        attachment_id: AttachmentId,
+        cell_size: CellSize,
+        thumbnail: Thumbnail,
+    },
+    /// The fetch or the decode behind a thumbnail failed, so the Attachment's
+    /// dimmed line stands in its place for as long as the Session is open.
+    AttachmentThumbnailFailed {
+        attachment_id: AttachmentId,
+        cell_size: CellSize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4278,6 +4301,16 @@ pub enum ApplicationTransition {
         origin: Outlook,
         png: Vec<u8>,
     },
+    /// Fetch an Attachment's bytes from `origin` and make its thumbnail at
+    /// `cell_size` for `protocol`, off the UI thread, answering with
+    /// [`ApplicationEvent::AttachmentThumbnail`] or
+    /// [`ApplicationEvent::AttachmentThumbnailFailed`].
+    FetchAttachment {
+        origin: Outlook,
+        attachment_id: AttachmentId,
+        cell_size: CellSize,
+        protocol: GraphicsProtocol,
+    },
     OpenHyperlink(String),
     RemovePeer(String),
     /// End the Pairing with the named Remote, which the reader confirmed by
@@ -4328,6 +4361,7 @@ impl Application {
             theme_catalog: ThemeCatalog::default(),
         };
         application.resolve_theme();
+        application.hold_attachment_previews();
         application
     }
 
@@ -4367,6 +4401,7 @@ impl Application {
         self.terminal_facts = terminal_facts;
         self.state.hyperlinks = terminal_facts.hyperlinks;
         self.resolve_theme();
+        self.hold_attachment_previews();
     }
 
     fn resolve_theme(&mut self) {
@@ -4490,7 +4525,54 @@ impl Application {
         }
         self.state.remember_agent_selection_presentation();
         self.present_intervention();
+        self.hold_attachment_previews();
         Ok(transition)
+    }
+
+    /// Keeps the thumbnails held to the open Session's, presented as the
+    /// Setting and the terminal allow. Read from state after every event
+    /// rather than at each place a Session opens, so no route into another
+    /// Session can keep the last one's thumbnails.
+    fn hold_attachment_previews(&mut self) {
+        let scope = self
+            .state
+            .route
+            .as_ref()
+            .map(|route| route.session_id)
+            .or_else(|| {
+                self.state
+                    .provisional
+                    .as_ref()
+                    .map(|provisional| provisional.session_id)
+            });
+        let mode = PreviewMode::of(
+            self.state.settings().transcript.image_previews,
+            self.terminal_facts.graphics,
+            self.terminal_facts.cell_size,
+        );
+        self.state.attachment_previews.hold_for(scope, mode);
+    }
+
+    /// The next thumbnail the last frame drew a strip for and none is held or
+    /// coming for, as the fetch that makes it; `Continue` once there is none.
+    /// A caller that draws frames drains this after each one.
+    pub fn take_attachment_fetch(&mut self) -> ApplicationTransition {
+        let Some((attachment_id, cell_size, protocol)) =
+            self.state.attachment_previews.take_fetch()
+        else {
+            return ApplicationTransition::Continue;
+        };
+        let origin = self
+            .state
+            .route
+            .as_ref()
+            .map_or_else(|| self.state.outlook.clone(), |route| route.origin.clone());
+        ApplicationTransition::FetchAttachment {
+            origin,
+            attachment_id,
+            cell_size,
+            protocol,
+        }
     }
 
     /// Presents the open Session's oldest Intervention when nothing stands in
@@ -4565,6 +4647,25 @@ impl Application {
                 if self.state.clipboard_pastes.finish(paste).is_some() {
                     self.paste_failed(paste, super::clipboard_paste::refused(reason));
                 }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AttachmentThumbnail {
+                attachment_id,
+                cell_size,
+                thumbnail,
+            } => {
+                self.state
+                    .attachment_previews
+                    .receive(attachment_id, cell_size, Some(thumbnail));
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::AttachmentThumbnailFailed {
+                attachment_id,
+                cell_size,
+            } => {
+                self.state
+                    .attachment_previews
+                    .receive(attachment_id, cell_size, None);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::Managed(event) => self.handle_managed_event(event),
@@ -5842,6 +5943,11 @@ impl Application {
             let outlook = self.state.outlook.clone();
             return self.invoke_semantic(SemanticCommandId::RemoteRetry.on_origin(outlook));
         }
+        // A thumbnail is drawn over the rows of the composer or Transcript it
+        // stands in, so it answers before either of them.
+        if let Some(invocation) = self.state.attachment_previews.press_at(position) {
+            return self.invoke_semantic(invocation);
+        }
         if let Some(target) = self
             .state
             .composers
@@ -6884,7 +6990,11 @@ impl Application {
         // stood in, until the per-tree subscription's tree replaces it in
         // place, so the Aside neither blanks nor says Loading between them.
         if answered && let Some(session) = self.state.session_reference.clone() {
-            self.state.aside.stand_in_for(session, title, true);
+            self.state.aside.stand_in_for(session.clone(), title, true);
+            // So does it carry on the thumbnails the claim held.
+            self.state
+                .attachment_previews
+                .carry_to(Some(session.session_id));
         }
         if let Some(claim) = claim.filter(ProvisionalSession::interrupt_intent)
             && let Some(session) = self.state.session_reference.clone()
@@ -7714,6 +7824,10 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            // Reserved for opening an Attachment at full size, which is a later
+            // change: a thumbnail's click target reaches it, and it does
+            // nothing yet.
+            SemanticCommandId::AttachmentOpen => Ok(ApplicationTransition::Continue),
             SemanticCommandId::HyperlinkOpen => {
                 let SemanticSubject::Hyperlink(target) = invocation.subject else {
                     return Ok(ApplicationTransition::Continue);
@@ -8245,6 +8359,7 @@ impl Application {
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
@@ -8262,6 +8377,7 @@ impl Application {
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Origin(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
@@ -8303,6 +8419,7 @@ impl Application {
                     | SemanticSubject::Questionnaire(_)
                     | SemanticSubject::Origin(_)
                     | SemanticSubject::Hyperlink(_)
+                    | SemanticSubject::Attachment(_)
                     | SemanticSubject::Workspace { .. }
                     | SemanticSubject::Text(_) => self.session_reference(),
                 };
@@ -8468,6 +8585,7 @@ impl Application {
                 | SemanticSubject::Approval(_)
                 | SemanticSubject::Questionnaire(_)
                 | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),

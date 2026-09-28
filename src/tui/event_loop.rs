@@ -505,6 +505,8 @@ struct TaskChannels {
     subagent_trees: UnboundedSender<SubagentTreeDelivery>,
     /// What each paste's clipboard read and image upload answered.
     pastes: UnboundedSender<ApplicationEvent>,
+    /// The thumbnail each Attachment fetch made, or its failure.
+    thumbnails: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -554,6 +556,7 @@ async fn run_loop(
     let (origin_catalog, mut origin_catalog_rx) = tokio::sync::mpsc::unbounded_channel();
     let (subagent_trees, mut subagent_tree_rx) = tokio::sync::mpsc::unbounded_channel();
     let (pastes, mut paste_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -577,6 +580,7 @@ async fn run_loop(
             origin_catalog,
             subagent_trees,
             pastes,
+            thumbnails,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -596,6 +600,8 @@ async fn run_loop(
                 |frame| run.application.render(frame),
             )?;
             run.needs_redraw = false;
+            // A frame is what learns which thumbnails a strip in view needs.
+            run.fetch_wanted_thumbnails();
         }
         // Rendering records which animation is actually visible, including a
         // Working Indicator that may have scrolled out of the viewport.
@@ -638,6 +644,7 @@ async fn run_loop(
             catalog = origin_catalog_rx.recv() => run.receive_origin_catalog(catalog)?,
             tree = subagent_tree_rx.recv() => run.receive_subagent_tree(tree)?,
             paste = paste_rx.recv() => run.receive_paste(paste)?,
+            thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -782,6 +789,25 @@ impl RunLoop {
         Ok(self.dispatch_transition(transition))
     }
 
+    fn receive_thumbnail(&mut self, answer: Option<ApplicationEvent>) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("thumbnail task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    /// Fetches every thumbnail the frame just drawn wanted and none is held
+    /// or coming for.
+    fn fetch_wanted_thumbnails(&mut self) {
+        loop {
+            let transition = self.application.take_attachment_fetch();
+            if transition == ApplicationTransition::Continue {
+                return;
+            }
+            let _ = self.dispatch_transition(transition);
+        }
+    }
+
     fn receive_subagent_tree(
         &mut self,
         delivery: Option<SubagentTreeDelivery>,
@@ -912,6 +938,18 @@ impl RunLoop {
                     self.channels.pastes.clone(),
                 );
             }
+            ApplicationTransition::FetchAttachment {
+                origin,
+                attachment_id,
+                cell_size,
+                protocol,
+            } => spawn_thumbnail(
+                self.client.session_commands_for(origin),
+                attachment_id,
+                cell_size,
+                protocol,
+                self.channels.thumbnails.clone(),
+            ),
             ApplicationTransition::CreateSession(request) => {
                 let outlook = self.application.outlook().clone();
                 spawn_session_creation(
@@ -1355,6 +1393,7 @@ impl RunLoop {
             | ApplicationTransition::CopyToClipboard(_)
             | ApplicationTransition::ReadClipboard(_)
             | ApplicationTransition::UploadAttachment { .. }
+            | ApplicationTransition::FetchAttachment { .. }
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::RemoveRemote(_)
@@ -2375,6 +2414,57 @@ fn spawn_attachment_upload(
         };
         let _ = answers.send(answer);
     });
+}
+
+/// Fetches an Attachment's bytes and makes its thumbnail, answering with it or
+/// with the failure that leaves the Attachment's dimmed line standing.
+fn spawn_thumbnail(
+    commands: SessionCommandClient,
+    attachment_id: crate::protocol::AttachmentId,
+    cell_size: crate::terminal::CellSize,
+    protocol: crate::terminal::GraphicsProtocol,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let fetched = commands.fetch_attachment(&attachment_id).await;
+        let answer = thumbnail_answer(attachment_id, cell_size, protocol, fetched).await;
+        let _ = answers.send(answer);
+    });
+}
+
+/// What a thumbnail fetch answers once its bytes are in, or are not: the
+/// thumbnail, decoded and encoded on a blocking worker rather than the run
+/// loop's thread, or its failure, which is the Log's to record and no Notice's
+/// (ADR 0038).
+async fn thumbnail_answer(
+    attachment_id: crate::protocol::AttachmentId,
+    cell_size: crate::terminal::CellSize,
+    protocol: crate::terminal::GraphicsProtocol,
+    fetched: Result<(String, Vec<u8>)>,
+) -> ApplicationEvent {
+    let made = match fetched {
+        Ok((_, bytes)) => tokio::task::spawn_blocking(move || {
+            crate::tui::Thumbnail::decode(&bytes, cell_size, protocol)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|made| made),
+        Err(error) => Err(error),
+    };
+    match made {
+        Ok(thumbnail) => ApplicationEvent::AttachmentThumbnail {
+            attachment_id,
+            cell_size,
+            thumbnail,
+        },
+        Err(error) => {
+            tracing::warn!("could not make a thumbnail of Attachment {attachment_id}: {error:#}");
+            ApplicationEvent::AttachmentThumbnailFailed {
+                attachment_id,
+                cell_size,
+            }
+        }
+    }
 }
 
 /// The words a failed upload is shown in: the Server's own when it refused,
@@ -5266,5 +5356,77 @@ mod attachment_upload_tests {
             upload_failure_reason(&unreachable),
             "Could not upload the image"
         );
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageFormat, RgbaImage};
+
+    use crate::{
+        protocol::AttachmentId,
+        terminal::{CellSize, GraphicsProtocol},
+        tui::ApplicationEvent,
+    };
+
+    use super::thumbnail_answer;
+
+    const CELL: CellSize = CellSize {
+        width: 10,
+        height: 20,
+    };
+
+    fn png() -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(RgbaImage::new(30, 30))
+            .write_to(&mut bytes, ImageFormat::Png)
+            .expect("encode the fixture PNG");
+        bytes.into_inner()
+    }
+
+    #[tokio::test]
+    async fn fetched_bytes_become_a_thumbnail_and_a_refused_or_undecodable_fetch_a_failure() {
+        let id = AttachmentId::new("screenshot-hash");
+        let made = thumbnail_answer(
+            id.clone(),
+            CELL,
+            GraphicsProtocol::Kitty,
+            Ok(("image/png".to_owned(), png())),
+        )
+        .await;
+        let ApplicationEvent::AttachmentThumbnail {
+            attachment_id,
+            cell_size,
+            thumbnail,
+        } = made
+        else {
+            panic!("a PNG makes a thumbnail: {made:?}");
+        };
+        assert_eq!((attachment_id, cell_size), (id.clone(), CELL));
+        assert_eq!((thumbnail.columns(), thumbnail.rows()), (12, 6));
+
+        // Refused for its size by the fetch itself, or unreadable once in:
+        // either way the dimmed line stands, and no Notice says so.
+        for fetched in [
+            Err(anyhow::anyhow!(
+                "the fetched Attachment is larger than an Attachment may be"
+            )),
+            Ok((
+                "image/png".to_owned(),
+                b"\x89PNG\r\n\x1a\ntruncated".to_vec(),
+            )),
+        ] {
+            let answer = thumbnail_answer(id.clone(), CELL, GraphicsProtocol::Kitty, fetched).await;
+            assert!(
+                matches!(
+                    &answer,
+                    ApplicationEvent::AttachmentThumbnailFailed { attachment_id, cell_size }
+                        if *attachment_id == id && *cell_size == CELL
+                ),
+                "{answer:?}"
+            );
+        }
     }
 }
