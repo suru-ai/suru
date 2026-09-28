@@ -1,16 +1,19 @@
 -- Attachments: media a user places on a Prompt beside its text, stored once
 -- under the blake3 hash of its bytes (ADR 0037). A row is written when its
--- bytes are uploaded and never rewritten; an image's width and height are
--- read from its header alone, and a kind without pixels leaves them empty.
--- created_at is when the bytes were first uploaded, which is what tells an
--- abandoned upload from one a Prompt is about to bind.
+-- bytes are first uploaded and its bytes never change; an image's width and
+-- height are read from its header alone, and a kind without pixels leaves
+-- them empty. uploaded_at is when the bytes were last uploaded, first or
+-- again: every client uploads an image right before binding it, so an
+-- Attachment uploaded within the grace period may be about to be bound, and
+-- neither a Session's deletion nor the orphan sweep reclaims it until that
+-- period has passed.
 CREATE TABLE attachments (
     id TEXT PRIMARY KEY NOT NULL,
     mime_type TEXT NOT NULL,
     byte_length BIGINT NOT NULL,
     width BIGINT,
     height BIGINT,
-    created_at BIGINT NOT NULL,
+    uploaded_at BIGINT NOT NULL,
     bytes BLOB NOT NULL
 );
 

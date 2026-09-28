@@ -103,6 +103,10 @@ pub struct ServerTimings {
     /// How often a Broker wait still waiting reports progress, keeping the
     /// idle window of the harness that called it open (ADR 0034).
     pub broker_wait_progress_interval: Duration,
+    /// How long after its last upload an Attachment is left in place even
+    /// once no Session references it, since a Prompt still in admission may
+    /// be about to bind it (ADR 0037).
+    pub attachment_grace: Duration,
 }
 
 impl Default for ServerTimings {
@@ -122,6 +126,7 @@ impl Default for ServerTimings {
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
+            attachment_grace: crate::attachments::ATTACHMENT_GRACE,
         }
     }
 }
@@ -169,6 +174,13 @@ impl ServerTimings {
     /// Sets how often a Broker wait still waiting reports progress.
     pub fn with_broker_wait_progress_interval(mut self, interval: Duration) -> Self {
         self.broker_wait_progress_interval = interval;
+        self
+    }
+
+    /// Sets how long after its last upload an Attachment outlives the
+    /// deletion of the last Session referencing it.
+    pub fn with_attachment_grace(mut self, grace: Duration) -> Self {
+        self.attachment_grace = grace;
         self
     }
 }
@@ -567,7 +579,8 @@ pub async fn spawn_with_source_control(
 
     let repository = StorageRepository::open(config.data_dir())
         .await
-        .context("initialize Session repository")?;
+        .context("initialize Session repository")?
+        .with_attachment_grace(timings.attachment_grace);
     let persisted_sessions = repository
         .load_sessions()
         .await
@@ -2199,6 +2212,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         };
     }
 
+    // Checked again after every await above: the first check refuses a bad
+    // binding before any checkout work, and this one narrows the window in
+    // which a Session's deletion could reclaim a bound Attachment to this one
+    // read. The grace after an upload closes what remains of it (ADR 0037).
+    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+        return response;
+    }
+
     let admission = if let Some(plan) = &preparation {
         state
             .sessions
@@ -2632,6 +2653,14 @@ async fn admit_prompt(
         {
             return response;
         }
+    }
+
+    // Checked again after every await above: the first check refuses a bad
+    // binding before any checkout work, and this one narrows the window in
+    // which a Session's deletion could reclaim a bound Attachment to this one
+    // read. The grace after an upload closes what remains of it (ADR 0037).
+    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
+        return response;
     }
 
     // Recovery and catalog refresh await external work. Admission must use the

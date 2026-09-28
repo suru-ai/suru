@@ -3,7 +3,7 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
-    failing_provider_support::spawn_with_failing_provider,
+    failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     provider_support::ControlledProvider,
     support::{
         controlled_selection, create_session, read_session_at_least_revision, read_session_until,
@@ -12,6 +12,7 @@ use crate::{
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use reqwest::{StatusCode, header::CONTENT_TYPE};
+use std::sync::Arc;
 use suru::{
     protocol::{
         AdmitPromptRequest, AgentId, AgentIdentity, AttachmentBinding, AttachmentDescriptor,
@@ -21,9 +22,9 @@ use suru::{
         SessionRevision, SessionSnapshot, SessionUpdate, TextSpan,
     },
     provider::ProviderEvent,
-    server::{self, ServerConfig},
+    server::{self, ServerConfig, ServerTimings},
 };
-use tokio::time::timeout;
+use tokio::time::{Duration, timeout};
 
 const MEBIBYTE: usize = 1024 * 1024;
 
@@ -773,60 +774,86 @@ async fn bindings_and_bytes_survive_a_server_restart() {
         .expect("stop replacement server");
 }
 
-#[tokio::test]
-async fn deleting_a_session_removes_the_attachments_only_it_references() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = spawn_with_failing_provider(
-        ServerConfig::new(state_dir.path(), "attachment-deletion-test").expect("configure server"),
+/// A server whose Attachments outlive the deletion of the last Session
+/// referencing them for `grace` after their last upload.
+async fn spawn_with_attachment_grace(
+    state_dir: &std::path::Path,
+    channel: &str,
+    grace: Duration,
+) -> server::RunningServer {
+    server::spawn_with_provider_and_timings(
+        ServerConfig::new(state_dir, channel).expect("configure server"),
+        Arc::new(FailingProviderRuntime),
+        ServerTimings::default().with_attachment_grace(grace),
     )
     .await
-    .expect("spawn server");
-    let descriptor = server.descriptor().clone();
-    let client = reqwest::Client::new();
-    let own = uploaded(&descriptor, png(10, 10)).await;
-    let shared = uploaded(&descriptor, gif(20, 20)).await;
-    let unbound = uploaded(&descriptor, webp(30, 30)).await;
+    .expect("spawn server")
+}
 
-    let text = "[Image 1] beside [Image 2]";
-    let deleted = create_session(
-        &descriptor,
-        &creation(
-            workspace.path(),
-            text,
-            vec![
-                bound(&own, text, "[Image 1]"),
-                bound(&shared, text, "[Image 2]"),
-            ],
-        ),
+/// Creates a Session whose first Prompt binds `bindings`, and waits for its
+/// failed first Turn to leave it deletable.
+async fn settled_session(
+    descriptor: &RuntimeDescriptor,
+    workspace: &std::path::Path,
+    text: &str,
+    bindings: Vec<AttachmentBinding>,
+) -> SessionId {
+    let session_id = create_session(descriptor, &creation(workspace, text, bindings))
+        .await
+        .session
+        .id;
+    read_session_until(
+        &reqwest::Client::new(),
+        descriptor,
+        session_id,
+        "settled",
+        |snapshot| snapshot.session.working_since.is_none(),
     )
     .await;
-    let kept = create_session(
-        &descriptor,
-        &creation(
-            workspace.path(),
-            "[Image 1]",
-            vec![bound(&shared, "[Image 1]", "[Image 1]")],
-        ),
-    )
-    .await;
-    for session_id in [deleted.session.id, kept.session.id] {
-        read_session_until(&client, &descriptor, session_id, "settled", |snapshot| {
-            snapshot.session.working_since.is_none()
-        })
-        .await;
-    }
+    session_id
+}
 
-    let response = client
-        .delete(format!(
-            "{}/v1/sessions/{}",
-            descriptor.base_url, deleted.session.id
-        ))
+async fn delete_session(descriptor: &RuntimeDescriptor, session_id: SessionId) {
+    let response = reqwest::Client::new()
+        .delete(format!("{}/v1/sessions/{session_id}", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .send()
         .await
         .expect("send Session deletion");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_it_references() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server =
+        spawn_with_attachment_grace(state_dir.path(), "attachment-deletion-test", Duration::ZERO)
+            .await;
+    let descriptor = server.descriptor().clone();
+    let own = uploaded(&descriptor, png(10, 10)).await;
+    let shared = uploaded(&descriptor, gif(20, 20)).await;
+    let unbound = uploaded(&descriptor, webp(30, 30)).await;
+
+    let text = "[Image 1] beside [Image 2]";
+    let deleted = settled_session(
+        &descriptor,
+        workspace.path(),
+        text,
+        vec![
+            bound(&own, text, "[Image 1]"),
+            bound(&shared, text, "[Image 2]"),
+        ],
+    )
+    .await;
+    let kept = settled_session(
+        &descriptor,
+        workspace.path(),
+        "[Image 1]",
+        vec![bound(&shared, "[Image 1]", "[Image 1]")],
+    )
+    .await;
+    delete_session(&descriptor, deleted).await;
 
     assert_eq!(
         fetch(&descriptor, &own.id).await.status(),
@@ -843,8 +870,106 @@ async fn deleting_a_session_removes_the_attachments_only_it_references() {
         StatusCode::OK,
         "an upload no Session has bound yet stays"
     );
-    let remaining = crate::support::read_session(&descriptor, kept.session.id).await;
+    let remaining = crate::support::read_session(&descriptor, kept).await;
     assert_eq!(remaining.prompts[0].attachments[0].attachment_id, shared.id);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn deleting_a_session_within_the_grace_period_leaves_its_attachments_for_the_sweep() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "attachment-grace-test").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let own = uploaded(&descriptor, png(10, 10)).await;
+    let shared = uploaded(&descriptor, gif(20, 20)).await;
+
+    let text = "[Image 1] beside [Image 2]";
+    let deleted = settled_session(
+        &descriptor,
+        workspace.path(),
+        text,
+        vec![
+            bound(&own, text, "[Image 1]"),
+            bound(&shared, text, "[Image 2]"),
+        ],
+    )
+    .await;
+    settled_session(
+        &descriptor,
+        workspace.path(),
+        "[Image 1]",
+        vec![bound(&shared, "[Image 1]", "[Image 1]")],
+    )
+    .await;
+    delete_session(&descriptor, deleted).await;
+
+    assert_eq!(
+        fetched(&descriptor, &own.id).await,
+        ("image/png".to_owned(), png(10, 10)),
+        "an Attachment uploaded within the grace period is the sweep's to reclaim"
+    );
+    assert_eq!(
+        fetch(&descriptor, &shared.id).await.status(),
+        StatusCode::OK,
+        "an Attachment another Session binds stays"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn uploading_an_attachment_again_restarts_its_grace_period() {
+    let grace = Duration::from_millis(500);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server =
+        spawn_with_attachment_grace(state_dir.path(), "attachment-reupload-test", grace).await;
+    let descriptor = server.descriptor().clone();
+    let again = uploaded(&descriptor, png(10, 10)).await;
+    let once = uploaded(&descriptor, gif(20, 20)).await;
+    let text = "[Image 1] beside [Image 2]";
+    let session_id = settled_session(
+        &descriptor,
+        workspace.path(),
+        text,
+        vec![
+            bound(&again, text, "[Image 1]"),
+            bound(&once, text, "[Image 2]"),
+        ],
+    )
+    .await;
+
+    // Both are past their grace period once this much has passed since
+    // their upload; only one is uploaded again, as a client binding it anew
+    // would.
+    tokio::time::sleep(grace + Duration::from_millis(100)).await;
+    let reuploaded = upload(&descriptor, "image/png", png(10, 10)).await;
+    assert_eq!(reuploaded.status(), StatusCode::OK);
+    assert_eq!(
+        reuploaded
+            .json::<AttachmentDescriptor>()
+            .await
+            .expect("decode Attachment descriptor"),
+        again
+    );
+    delete_session(&descriptor, session_id).await;
+
+    assert_eq!(
+        fetch(&descriptor, &again.id).await.status(),
+        StatusCode::OK,
+        "the Attachment uploaded again is within its grace period"
+    );
+    assert_eq!(
+        fetch(&descriptor, &once.id).await.status(),
+        StatusCode::NOT_FOUND,
+        "the Attachment not uploaded again is past its grace period"
+    );
 
     server.shutdown().await.expect("shut down server");
 }

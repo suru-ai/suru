@@ -3,10 +3,17 @@
 //! the Session database (ADR 0037). This module decides what an upload is and
 //! whether a Prompt's bindings may stand; storing and serving the bytes is the
 //! storage repository's.
+//!
+//! Nothing counts references to an Attachment. An Attachment's age is measured
+//! from its last upload — uploading bytes already stored uploads them again —
+//! and one younger than [`ATTACHMENT_GRACE`] is never reclaimed, neither by a
+//! Session's deletion nor by the orphan sweep. Every client uploads an image
+//! right before binding it, so an Attachment a Prompt still in admission binds
+//! is always that young.
 
 mod image_header;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
     protocol::{AttachmentBinding, AttachmentDescriptor, AttachmentId, AttachmentKind},
@@ -21,6 +28,10 @@ pub(crate) const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 
 /// The most Attachments one Prompt may bind.
 pub(crate) const MAX_ATTACHMENTS_PER_PROMPT: usize = 10;
+
+/// How long after its last upload an Attachment is left alone, whether or
+/// not any Session still references it.
+pub(crate) const ATTACHMENT_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// The most bytes the upload route reads: the per-image cap with headroom, so
 /// an image a little over it is refused for its size, measured, rather than

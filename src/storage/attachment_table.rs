@@ -1,10 +1,12 @@
-//! Attachment rows: written once when their bytes are uploaded, joined to
-//! the Sessions whose stored Prompts and Messages bind them, and read back
-//! only when something asks for the bytes (ADR 0037).
+//! Attachment rows: written when their bytes are first uploaded and stamped
+//! again on every later upload of the same bytes, joined to the Sessions whose
+//! stored Prompts and Messages bind them, and read back only when something
+//! asks for the bytes (ADR 0037). An Attachment's age, which decides whether
+//! it may be reclaimed, is measured from its last upload.
 
 use std::collections::HashSet;
 
-use diesel::{SqliteConnection, dsl::exists, prelude::*, sql_types::Text};
+use diesel::{SqliteConnection, dsl::exists, prelude::*};
 
 use crate::protocol::{AttachmentDescriptor, AttachmentId, AttachmentKind, SessionTimestamp};
 
@@ -18,13 +20,19 @@ struct AttachmentRow {
     byte_length: i64,
     width: Option<i64>,
     height: Option<i64>,
-    created_at: i64,
+    uploaded_at: i64,
     bytes: Vec<u8>,
 }
 
+/// A moment as the `uploaded_at` column stores it.
+pub(super) fn millis(moment: SessionTimestamp) -> i64 {
+    i64::try_from(moment.0).unwrap_or(i64::MAX)
+}
+
 impl StorageRepository {
-    /// Stores an upload's bytes under its descriptor unless the same bytes
-    /// already are, answering whether this call stored them.
+    /// Stores an upload's bytes under its descriptor, or where the same bytes
+    /// already are, stamps them uploaded again now; answers whether this call
+    /// stored them.
     pub(crate) async fn store_attachment(
         &self,
         descriptor: AttachmentDescriptor,
@@ -40,17 +48,25 @@ impl StorageRepository {
                     .map_err(|error| StorageError::WriteAttachment(error.to_string()))?,
                 width: Some(width.into()),
                 height: Some(height.into()),
-                created_at: i64::try_from(SessionTimestamp::now().0).unwrap_or(i64::MAX),
+                uploaded_at: millis(SessionTimestamp::now()),
                 bytes,
             };
             let mut connection = super::connect(&path)?;
-            let inserted = diesel::insert_into(attachments::table)
-                .values(&row)
-                .on_conflict(attachments::id)
-                .do_nothing()
-                .execute(&mut connection)
-                .map_err(|error| StorageError::WriteAttachment(error.to_string()))?;
-            Ok(inserted == 1)
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    let inserted = diesel::insert_into(attachments::table)
+                        .values(&row)
+                        .on_conflict(attachments::id)
+                        .do_nothing()
+                        .execute(connection)?;
+                    if inserted == 0 {
+                        diesel::update(attachments::table.filter(attachments::id.eq(&row.id)))
+                            .set(attachments::uploaded_at.eq(row.uploaded_at))
+                            .execute(connection)?;
+                    }
+                    Ok(inserted == 1)
+                })
+                .map_err(|error| StorageError::WriteAttachment(error.to_string()))
         })
         .await
     }
@@ -95,21 +111,38 @@ impl StorageRepository {
 }
 
 /// Joins a Session to every Attachment its stored Prompts and Messages bind,
-/// inside the transaction that writes those rows. An Attachment no longer
-/// stored is passed over rather than failing the Session's own write.
+/// inside the transaction that writes those rows. A binding whose Attachment
+/// is no longer stored is reported to the Log and passed over rather than
+/// failing the Session's own write.
 pub(super) fn join_session_attachments(
     connection: &mut SqliteConnection,
     session_id: &str,
     attachment_ids: &[String],
 ) -> Result<(), diesel::result::Error> {
+    if attachment_ids.is_empty() {
+        return Ok(());
+    }
+    let stored = attachments::table
+        .filter(attachments::id.eq_any(attachment_ids))
+        .select(attachments::id)
+        .load::<String>(connection)?
+        .into_iter()
+        .collect::<HashSet<_>>();
     for attachment_id in attachment_ids {
-        diesel::sql_query(
-            "INSERT OR IGNORE INTO session_attachments (session_id, attachment_id) \
-             SELECT ?, id FROM attachments WHERE id = ?",
-        )
-        .bind::<Text, _>(session_id)
-        .bind::<Text, _>(attachment_id)
-        .execute(connection)?;
+        if !stored.contains(attachment_id) {
+            tracing::warn!(
+                session_id,
+                attachment_id,
+                "a Session binds an Attachment that is no longer stored"
+            );
+            continue;
+        }
+        diesel::insert_or_ignore_into(session_attachments::table)
+            .values((
+                session_attachments::session_id.eq(session_id),
+                session_attachments::attachment_id.eq(attachment_id),
+            ))
+            .execute(connection)?;
     }
     Ok(())
 }
@@ -127,10 +160,12 @@ pub(super) fn session_attachment_ids(
 }
 
 /// Deletes those of the given Attachments that no Session is joined to any
-/// longer. An upload no Session has bound yet is never among them.
+/// longer and that were last uploaded no later than `uploaded_before`. An
+/// upload no Session has bound yet is never among them.
 pub(super) fn delete_unjoined_attachments(
     connection: &mut SqliteConnection,
     attachment_ids: &[String],
+    uploaded_before: i64,
 ) -> Result<(), diesel::result::Error> {
     if attachment_ids.is_empty() {
         return Ok(());
@@ -138,6 +173,7 @@ pub(super) fn delete_unjoined_attachments(
     diesel::delete(
         attachments::table
             .filter(attachments::id.eq_any(attachment_ids))
+            .filter(attachments::uploaded_at.le(uploaded_before))
             .filter(diesel::dsl::not(exists(session_attachments::table.filter(
                 session_attachments::attachment_id.eq(attachments::id),
             )))),
