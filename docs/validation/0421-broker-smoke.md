@@ -1,6 +1,6 @@
 # The Broker smoke with the installed CLIs (#421)
 
-Last passed 2026-09-28 against Claude Code **2.1.283** (`/usr/bin/claude`, a
+Last passed 2026-09-28 (run 7, on #407's fix) against Claude Code **2.1.283** (`/usr/bin/claude`, a
 wrapper that sets `DISABLE_UPDATES=1` and runs `/opt/claude-code/bin/claude`,
 signed in with a claude.ai account) and Codex CLI **0.157.1** (`/usr/bin/codex`,
 signed in with a ChatGPT account). The delegating Agent ran Claude's `haiku`
@@ -15,7 +15,8 @@ smokes, a Claude Session's Agent spawns a Codex Subagent through the Broker.
 - **Report smoke:** the Subagent's Turn settles, and its Subagent Report wakes
   the Claude Agent into a Continuation, where it answers.
 - **Wait smoke:** the Claude Agent holds a `wait_subagents` call open for the
-  335 s the Subagent works, and answers from what the wait returns.
+  335 s the Subagent works and answers from what the wait returns, and the Turn
+  that waited settles.
 
 ## Running it
 
@@ -152,26 +153,29 @@ Activities:
    failed or interrupted.
 3. **Only once the Subagent had slept:** the answer arrives at least 330 s
    after the spawn, and the child's row has settled `Completed`.
-4. **The child slept it out:** the child's Turn settled `Completed` with
+4. **The Turn that waited settles:** past the answer, the Session comes to rest.
+   The Turn that waited is `Completed`, and it is the parent's only Turn: the
+   Report steered it rather than waking a Continuation.
+5. **The child slept it out:** the child's Turn settled `Completed` with
    `PONG`, after working at least 330 s. So the call that answered was that
    long.
-5. **The settled tree and shutdown:** as items 8–9 of the Report smoke.
+6. **The settled tree and shutdown:** as items 8–9 of the Report smoke.
 
-It waits for the answer rather than for the Turn that waited to settle. The
-Subagent's Report steers that Turn as the wait answers, and the Turn does not
-settle then, because of the second finding below.
+Until #407's fix, in runs 5 and 6, it waited for the answer alone, since the
+Turn that waited never settled (the second finding below).
 
 ## The live runs
 
 Every run used Claude Code 2.1.283 and Codex CLI 0.157.1. Runs 1–4 ran the
 Report smoke on this branch before it was rebased. Runs 5 and 6 ran on the
 branch rebased onto #419's `send_to_subagent` and `wait_subagents` (`main` at
-`5a475ad`). The runs were launched from inside a Claude Code session, so every
+`5a475ad`). Run 7 ran on #407's fix, on `main` at `dd68cb7`. The runs were
+launched from inside a Claude Code session, so every
 inherited `CLAUDE*` variable was removed first; a user's own terminal carries
 none. Runs 1–3 and 5 went through transparent capture wrappers, named by
 `SURU_CLAUDE_PATH` and `SURU_CODEX_PATH`. Each wrapper saved every launch's
 arguments, stdin and stdout. The Claude wrapper added `--debug-file`, and the
-Codex wrapper set `RUST_LOG` for Codex's stderr. Runs 4 and 6 used the
+Codex wrapper set `RUST_LOG` for Codex's stderr. Runs 4, 6 and 7 used the
 installed binaries directly.
 
 | Run | Smoke | Outcome |
@@ -181,7 +185,8 @@ installed binaries directly.
 | 3 | Report | Passed in 41.3 s, with capture. |
 | 4 | Report | Passed in 34.8 s, without capture. |
 | 5 | Wait | The wait call survived, but the smoke failed at its 600 s deadline, with capture. The Agent answered `DONE PONG` 335 s into its `wait_subagents` call, and the Subagent's row settled `Completed`. Then the Turn that waited never settled. See the second finding below. |
-| 6 | Both | Both passed without capture: the Report smoke in 46.0 s, the wait smoke in 359.4 s. The wait smoke now asserts the answer rather than the Turn's settling. |
+| 6 | Both | Both passed without capture: the Report smoke in 46.0 s, the wait smoke in 359.4 s. The wait smoke asserted the answer rather than the Turn's settling. |
+| 7 | Both | Both passed without capture, on #407's fix: the Report smoke in 36.8 s, the wait smoke in 360.3 s. The answer came 343.1 s after the spawn, and the Turn that waited had settled `Completed` by the time the smoke read it. It was the parent's only Turn. Claude's transcript shows the Report folded in as in run 5, under the `uuid` Suru wrote it with. |
 
 Run 4's milestones:
 
@@ -227,7 +232,7 @@ the Tools and reported the server `ready`. A protocol test now runs the
 2026-07-28 lifecycle against the Broker:
 `a_harness_speaking_the_2026_07_28_revision_is_answered_a_tool_list_it_can_register`.
 
-### The wait smoke: a 335 s Broker call at 2026-07-28 (runs 5 and 6)
+### The wait smoke: a 335 s Broker call at 2026-07-28 (runs 5–7)
 
 Claude negotiated 2026-07-28 with the Broker in run 5, as in run 3. The Agent
 loaded `mcp__suru__spawn_subagent` and `mcp__suru__wait_subagents` with
@@ -250,7 +255,9 @@ called `wait_subagents` with
   and 521 output tokens. The Claude side cost $0.044.
 
 Run 6 repeated it without capture: the answer came 341.1 s after the spawn,
-and the Subagent worked 338.4 s.
+and the Subagent worked 338.4 s. Run 7 repeated it on #407's fix: the answer
+came 343.1 s after the spawn, the Subagent worked 340.5 s, and the Turn that
+waited settled.
 
 This settles the question #408 left open. At the 2026-07-28 revision, under the
 Broker's configuration, a Broker call stays open past Claude's 60 s request
@@ -261,7 +268,7 @@ marked `heartbeat: true`, and neither Claude's debug log nor Suru's trace shows
 whether an MCP progress notification arrived. At 2025-11-25, #408's run 5 showed
 the per-server `timeout` alone raising the idle window.
 
-### Finding: a Report steering a Claude Turn in a Broker call leaves the Turn open
+### Finding: a Report steering a Claude Turn in a Broker call left the Turn open (fixed in #407)
 
 In run 5 the Subagent's Report was written to Claude's stdin as a steer of the
 Turn that waited. It was written in the same millisecond that the
@@ -287,12 +294,35 @@ every user message queued into a running loop with a `result` of its own". It
 counted two `result`s owed and received one, so the Turn stayed `Active`. The
 Session read Working until the smoke's deadline and the Server's shutdown.
 
-**Scope:** every Claude `wait_subagents` that answers because a Subagent
-settled hits this, since its Report is always queued at that same moment. By
-the same mechanism, a user's steer Prompt that reaches a Claude Turn mid-tool
-call probably does too; that was not run live. A Report to an idle Claude Agent
-(the Report smoke) is unaffected. This is larger than a smoke fix, so it is
-left as the first follow-up below.
+**Scope:** every Claude `wait_subagents` that answered because a Subagent
+settled hit this, since its Report is always queued at that same moment. A
+user's steer Prompt that reaches a Claude Turn mid-tool call is folded the same
+way (`0407-claude-folded-steer.md`, case A). A Report to an idle Claude Agent
+(the Report smoke) was unaffected.
+
+**Fixed** in #407 (`0407-claude-folded-steer.md`):
+
+- **The CLI's account:** Claude reports a queued message's fate as a
+  `command_lifecycle` frame, but only for a message sent with a `uuid`, and
+  Suru sent none. Suru now writes every Prompt and steer with a `uuid` of its
+  own. The frame says `started` when a loop takes the message up, whether
+  folded in at a tool round or as a loop of its own.
+- **The accounting:** `src/provider/claude/turn_in_flight.rs` no longer counts
+  a `result` per steer. A successful `result` Settles the Turn unless a message
+  written into it has not yet been `started`.
+- **A CLI that reports no lifecycle:** every `result` Settles the Turn, and a
+  loop a steer begins afterwards is a native Continuation.
+
+Run 7 is the wait smoke passing with the Turn settled. Claude's transcript
+shows the same fold as in run 5:
+
+```
+04:59:33.467 queue-operation enqueue
+04:59:33.474 user: tool_result {"settled": … "PONG" …}
+04:59:33.467 attachment queued_command {"prompt": [… "Subagent Report from Suru: …"], "source_uuid": "<the uuid Suru wrote>"}
+04:59:33.483 queue-operation remove
+04:59:36.059 assistant: DONE PONG
+```
 
 ### The Claude side (run 3)
 
@@ -380,8 +410,8 @@ left as the first follow-up below.
 | Codex accepts `tool_timeout_sec: 900.0` as a float (#411) | **Confirmed.** `thread/start` was answered and the server reported `ready`. |
 | Codex honours `developer_instructions` on `thread/start` (#414) | **Confirmed** by the rollout's `developer` message. The same on `thread/resume` is **not exercised**. |
 | A Report to an idle Claude Agent, sent as a stdin user message, starts a Turn with an extra `result` (#418) | **Confirmed.** A new `init`, the answer, and a second `result` came on the same process, and Suru recorded a `Completed` Continuation. |
-| Claude's 60 s request timer and 300 s idle window do not cut a long Broker call short (#408, #419) | **Confirmed at 2026-07-28** for a 335 s `wait_subagents` (runs 5 and 6). The per-server `timeout` and the Broker's progress are not told apart. |
-| The CLI answers every message queued into a running loop with a `result` of its own (#129, relied on by #418's steers) | **Contradicted** for a message queued while a tool call is running. The CLI folds it into the loop's next request as a `queued_command` and answers both with one `result` (run 5). |
+| Claude's 60 s request timer and 300 s idle window do not cut a long Broker call short (#408, #419) | **Confirmed at 2026-07-28** for a 335 s `wait_subagents` (runs 5–7). The per-server `timeout` and the Broker's progress are not told apart. |
+| The CLI answers every message queued into a running loop with a `result` of its own (#129, relied on by #418's steers) | **Contradicted** for a message queued while a tool call is running. The CLI folds it into the loop's next request as a `queued_command` and answers both with one `result` (run 5). It holds only for a message still queued when the loop ends (`0407-claude-folded-steer.md`). Suru now settles by the message's `command_lifecycle` instead (run 7). |
 | A Codex child under a Claude `default` parent runs `untrusted` and may raise Approvals (#417) | **Not exercised.** The smoke pins `bypassPermissions`, and the child ran `never` with `danger-full-access`, unasked. |
 | Windows: the owner-only ACL on the MCP config file (#411) | Out of reach on this Linux machine. |
 
@@ -396,7 +426,9 @@ its Turn. The Report wakes the settled Claude Agent into a Continuation on the
 same process, where the Agent acts on it.
 
 The wait smoke proves that a Broker call held open 335 s survives Claude's
-timers and answers the Agent in the Turn that waited.
+timers and answers the Agent in the Turn that waited. Since #407 it also proves
+that the Turn then settles, although the Report it was steered with was folded
+into its loop (run 7).
 
 **The Broker speaks MCP 2026-07-28 to Claude 2.1.283, and stays there.** That is
 the newest revision rmcp 3.4.1 offers in its `server/discover` answer, and
@@ -407,7 +439,7 @@ Claude negotiates the newest. The Broker does not pin a lower revision:
   the Broker's Tools (run 1).
 - **The timers do not bite.** The long-call concern, #408's timers measured at
   2025-11-25, does not reproduce at 2026-07-28: a 335 s `wait_subagents`
-  answered normally (runs 5 and 6).
+  answered normally (runs 5–7).
 - **Codex is unaffected.** It still initializes at 2025-06-18 and passes over
   the two extra fields.
 
@@ -418,18 +450,16 @@ keeping the `ttlMs`/`cacheScope` fields.
 
 Follow-ups:
 
-- **Claude steer accounting (a real defect, not a smoke gap).** A Report
-  steering a Claude Turn still in a Broker call leaves that Turn `Active` and
-  the Session Working indefinitely. This happens after every Claude
-  `wait_subagents` that answers because its Subagent settled. See the second
-  finding. Possible directions:
-  - Learn when the CLI folds a queued message into the running loop, for
-    example through `--replay-user-messages`, which needs a capture first.
-    This would also fix a user's steer that lands mid-tool call.
-  - Stop counting a `result` per steer, and let a second loop become a native
-    Continuation.
-  - Do not deliver a Report for a Subagent a wait has just answered with.
-    That reverses #419's recorded choice that a Report still arrives.
+- **Claude steer accounting: fixed in #407.** A Report steering a Claude Turn
+  still in a Broker call left that Turn `Active` and the Session Working
+  indefinitely.
+  - **The capture:** it found the signal, `command_lifecycle`, keyed by a
+    `uuid` on each message, with no need for `--replay-user-messages`
+    (`0407-claude-folded-steer.md`).
+  - **The accounting:** it settles by that signal, and falls back to a native
+    Continuation for a CLI that gives none.
+  - **Unchanged:** a Report still arrives after a wait has answered with its
+    Subagent, as #419 chose.
 - **Which mechanism keeps a long call alive at 2026-07-28.** A capture that
   records the Broker's progress notifications would tell the per-server
   `timeout` from progress apart.
