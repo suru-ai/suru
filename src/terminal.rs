@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     future::Future,
     io,
     pin::Pin,
@@ -12,8 +13,29 @@ use std::{
 use futures_util::Stream;
 
 const TERMINAL_COLOR_QUERY_SUFFIX: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+/// Asks whether the terminal speaks the Kitty graphics protocol by querying
+/// support for a one-pixel image it never stores.
+const KITTY_GRAPHICS_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+/// How the Kitty reply to that query begins: the image id it asked about.
+const KITTY_GRAPHICS_REPLY_PREFIX: &[u8] = b"Gi=31";
+/// XTVERSION, which asks the terminal for its name and version.
+const XTVERSION_QUERY: &[u8] = b"\x1b[>0q";
+const XTVERSION_REPLY_PREFIX: &[u8] = b">|";
+/// Asks for the size of one cell in pixels, answered as `CSI 6 ; height ;
+/// width t`.
+const CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
+/// Primary device attributes, which every terminal answers. Sent last, its
+/// reply says the terminal has answered everything it is going to, since a
+/// terminal answers in the order it was asked.
+const PRIMARY_DEVICE_ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
+/// The terminals that draw iTerm2 inline images, as XTVERSION names them.
+/// iTerm2's protocol has no query, so a terminal's name is all there is to go
+/// on.
+const ITERM2_IMAGE_TERMINALS: &[&str] = &["iterm2", "wezterm", "vscode", "rio", "mintty"];
+/// The multiplexers under which no image is drawn, as XTVERSION names them.
+const MULTIPLEXERS: &[&str] = &["tmux", "screen"];
 const DEFAULT_TERMINAL_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
-const DEFAULT_COLOR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -57,6 +79,92 @@ impl TerminalColorProbe {
     }
 }
 
+/// A terminal graphics protocol an image may be drawn with, in the order Suru
+/// prefers them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphicsProtocol {
+    /// The Kitty graphics protocol, confirmed by the terminal's own reply to
+    /// its query.
+    Kitty,
+    /// iTerm2 inline images. The protocol has no query, so a terminal speaks
+    /// it only where XTVERSION names one known to.
+    Iterm2,
+    /// Sixel, reported as attribute 4 of the primary device attributes.
+    Sixel,
+}
+
+impl fmt::Display for GraphicsProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Kitty => "Kitty",
+            Self::Iterm2 => "iTerm2",
+            Self::Sixel => "Sixel",
+        })
+    }
+}
+
+/// The size of one terminal cell in pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CellSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl CellSize {
+    /// A cell's size, read off a window's size in pixels and in cells, or
+    /// `None` where the window reports no pixels, as many do.
+    pub(crate) fn from_window(window: ratatui::backend::WindowSize) -> Option<Self> {
+        let width = window.pixels.width.checked_div(window.columns_rows.width)?;
+        let height = window
+            .pixels
+            .height
+            .checked_div(window.columns_rows.height)?;
+        (width > 0 && height > 0).then_some(Self { width, height })
+    }
+}
+
+/// Why no graphics protocol is selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoGraphics {
+    /// Suru runs under tmux or screen, which stand between it and the
+    /// terminal that would draw.
+    Multiplexed,
+    /// The terminal answered for no protocol.
+    NoProtocol,
+    /// A protocol answered, but nothing said how many pixels a cell covers,
+    /// so no image could be sized to the cells it occupies.
+    UnknownCellSize,
+}
+
+impl fmt::Display for NoGraphics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Multiplexed => "running under tmux or screen",
+            Self::NoProtocol => "the terminal answered for no graphics protocol",
+            Self::UnknownCellSize => "the cell pixel size is unknown",
+        })
+    }
+}
+
+/// What the terminal and its environment said about drawing images, which is
+/// everything graphics selection reads beside the cell size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphicsAnswers {
+    multiplexed: bool,
+    kitty: bool,
+    iterm2: bool,
+    sixel: bool,
+}
+
+impl GraphicsAnswers {
+    const NONE: Self = Self {
+        multiplexed: false,
+        kitty: false,
+        iterm2: false,
+        sixel: false,
+    };
+}
+
 /// Everything Suru knows about terminal presentation capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalFacts {
@@ -64,6 +172,15 @@ pub struct TerminalFacts {
     pub truecolor: bool,
     /// Whether cells may safely carry OSC 8 hyperlink attributes.
     pub hyperlinks: bool,
+    /// The protocol an image may be drawn with, or `None` where none may be:
+    /// under tmux or screen, where the terminal answered for no protocol, or
+    /// where the cell pixel size is unknown.
+    pub graphics: Option<GraphicsProtocol>,
+    /// The size of one cell in pixels, where the terminal's window or its
+    /// reply said.
+    pub cell_size: Option<CellSize>,
+    /// What `graphics` is selected from.
+    graphics_answers: GraphicsAnswers,
 }
 
 impl TerminalFacts {
@@ -72,6 +189,9 @@ impl TerminalFacts {
             probe,
             truecolor,
             hyperlinks: false,
+            graphics: None,
+            cell_size: None,
+            graphics_answers: GraphicsAnswers::NONE,
         }
     }
 
@@ -84,6 +204,22 @@ impl TerminalFacts {
         self
     }
 
+    /// Records whether Suru runs under tmux or screen, where no image is
+    /// drawn.
+    pub(crate) fn with_multiplexer(mut self, multiplexed: bool) -> Self {
+        self.graphics_answers.multiplexed = multiplexed;
+        self.select_graphics();
+        self
+    }
+
+    /// Records the cell size the terminal's window reports, if it reports
+    /// one.
+    pub(crate) fn with_cell_size(mut self, cell_size: Option<CellSize>) -> Self {
+        self.cell_size = cell_size;
+        self.select_graphics();
+        self
+    }
+
     /// Conservatively enables OSC 8 only for terminals whose own identifying
     /// environment is known to support it. Multiplexers are excluded because
     /// an inherited TERM_PROGRAM describes the terminal outside the session,
@@ -92,8 +228,14 @@ impl TerminalFacts {
         let term_program = std::env::var("TERM_PROGRAM").ok();
         Self::supports_hyperlinks(
             term_program.as_deref(),
-            std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some(),
+            Self::multiplexed_from_environment(),
         )
+    }
+
+    /// Whether Suru runs under tmux or screen, as each announces itself to
+    /// the processes it hosts.
+    pub(crate) fn multiplexed_from_environment() -> bool {
+        std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some()
     }
 
     fn supports_hyperlinks(term_program: Option<&str>, multiplexed: bool) -> bool {
@@ -122,6 +264,74 @@ impl TerminalFacts {
             probe.background = update.background;
         }
     }
+
+    /// Takes in one answer to the graphics probe and selects afresh from
+    /// everything answered so far, so the answers may arrive in any order.
+    pub(crate) fn merge_graphics(&mut self, reply: &GraphicsReply) {
+        let answers = &mut self.graphics_answers;
+        match reply {
+            GraphicsReply::Kitty => answers.kitty = true,
+            GraphicsReply::Version(version) => {
+                let name = terminal_name(version);
+                answers.iterm2 = ITERM2_IMAGE_TERMINALS.contains(&name.as_str());
+                answers.multiplexed |= MULTIPLEXERS.contains(&name.as_str());
+            }
+            GraphicsReply::CellSize(cell_size) => self.cell_size = Some(*cell_size),
+            GraphicsReply::DeviceAttributes { sixel } => answers.sixel = *sixel,
+            GraphicsReply::Expired => {}
+        }
+        self.select_graphics();
+    }
+
+    /// The protocol an image may be drawn with and the cell size it is drawn
+    /// at, or why none may be: Kitty, then iTerm2, then Sixel, but none under
+    /// a multiplexer or without a known cell size.
+    pub(crate) fn graphics_selection(&self) -> Result<(GraphicsProtocol, CellSize), NoGraphics> {
+        let answers = self.graphics_answers;
+        if answers.multiplexed {
+            return Err(NoGraphics::Multiplexed);
+        }
+        let protocol = if answers.kitty {
+            GraphicsProtocol::Kitty
+        } else if answers.iterm2 {
+            GraphicsProtocol::Iterm2
+        } else if answers.sixel {
+            GraphicsProtocol::Sixel
+        } else {
+            return Err(NoGraphics::NoProtocol);
+        };
+        let cell_size = self.cell_size.ok_or(NoGraphics::UnknownCellSize)?;
+        Ok((protocol, cell_size))
+    }
+
+    fn select_graphics(&mut self) {
+        self.graphics = self.graphics_selection().ok().map(|(protocol, _)| protocol);
+    }
+
+    /// Records the graphics selection in the Log, for an operator asking why
+    /// images are or are not drawn.
+    pub(crate) fn log_graphics_selection(&self) {
+        match self.graphics_selection() {
+            Ok((protocol, cell_size)) => tracing::info!(
+                "selected the {protocol} graphics protocol with {}x{} pixel cells",
+                cell_size.width,
+                cell_size.height,
+            ),
+            Err(reason) => tracing::info!("selected no graphics protocol: {reason}"),
+        }
+    }
+}
+
+/// The name a terminal gave itself in its XTVERSION reply, lowercased and
+/// without the version each terminal spells after it: `iTerm2 3.5.0`,
+/// `XTerm(390)`.
+fn terminal_name(version: &str) -> String {
+    version
+        .trim_start()
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 impl Default for TerminalFacts {
@@ -138,7 +348,32 @@ impl Default for TerminalFacts {
 pub(crate) enum TerminalInput {
     Event(crossterm::event::Event),
     Colors(TerminalColorProbe),
+    Graphics(GraphicsReply),
     Reprobe,
+}
+
+/// One answer to the startup graphics probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GraphicsReply {
+    /// The terminal accepted the Kitty graphics query.
+    Kitty,
+    /// The name and version XTVERSION reported, as the terminal spelled them.
+    Version(String),
+    /// The size of one cell in pixels, answering the pixel-size query.
+    CellSize(CellSize),
+    /// The primary device attributes. Asked for last, so every other answer
+    /// the terminal will give has arrived before them.
+    DeviceAttributes { sixel: bool },
+    /// The response window closed without the device attributes: the
+    /// terminal is answering nothing more.
+    Expired,
+}
+
+impl GraphicsReply {
+    /// Whether the probe has nothing more to hear once this arrives.
+    pub(crate) fn settles_probe(&self) -> bool {
+        matches!(self, Self::DeviceAttributes { .. } | Self::Expired)
+    }
 }
 
 /// Incrementally turns the terminal's raw byte stream into semantic input.
@@ -148,12 +383,12 @@ pub(crate) struct TerminalInputParser {
     parser: termina::Parser,
     state: RawInputState,
     in_paste: bool,
-    expecting_colors: bool,
+    expecting_replies: bool,
 }
 
 impl TerminalInputParser {
     pub(crate) fn parse(&mut self, bytes: &[u8], maybe_more: bool) -> Vec<TerminalInput> {
-        const MAX_OSC_BYTES: usize = 64 * 1024;
+        const MAX_CONTROL_STRING_BYTES: usize = 64 * 1024;
 
         let mut output = Vec::new();
         let mut ordinary = Vec::new();
@@ -165,76 +400,85 @@ impl TerminalInputParser {
                     self.state = RawInputState::Escape;
                 }
                 RawInputState::Ground => ordinary.push(byte),
-                RawInputState::Escape if byte == b']' && !self.in_paste => {
-                    self.state = RawInputState::Osc {
-                        raw: b"\x1b]".to_vec(),
-                        payload: Vec::new(),
-                        escape_terminator: false,
-                    };
-                }
-                RawInputState::Escape if byte == b'[' => {
-                    self.state = RawInputState::Csi {
-                        raw: b"\x1b[".to_vec(),
-                    };
-                }
                 RawInputState::Escape => {
-                    ordinary.extend_from_slice(&[0x1b, byte]);
-                    self.state = RawInputState::Ground;
+                    self.state = match ControlString::introduced_by(byte) {
+                        Some(kind) if !self.in_paste => RawInputState::ControlString {
+                            kind,
+                            payload: Vec::new(),
+                            escape_terminator: false,
+                        },
+                        _ if byte == b'[' => RawInputState::Csi {
+                            raw: b"\x1b[".to_vec(),
+                        },
+                        _ => {
+                            ordinary.extend_from_slice(&[0x1b, byte]);
+                            RawInputState::Ground
+                        }
+                    };
                 }
                 RawInputState::Csi { raw } => {
                     raw.push(byte);
-                    let paste_start = BRACKETED_PASTE_START.starts_with(raw);
-                    let paste_end = BRACKETED_PASTE_END.starts_with(raw);
                     if raw == BRACKETED_PASTE_START || raw == BRACKETED_PASTE_END {
                         self.in_paste = raw == BRACKETED_PASTE_START;
                         ordinary.append(raw);
                         self.state = RawInputState::Ground;
-                    } else if !paste_start && !paste_end {
-                        ordinary.append(raw);
-                        self.state = RawInputState::Ground;
+                    } else {
+                        // Pasted text is the reader's, however much of it looks
+                        // like a reply.
+                        let reply = if self.in_paste {
+                            CsiReply::Other
+                        } else {
+                            csi_reply(raw)
+                        };
+                        match reply {
+                            CsiReply::Complete(input) => {
+                                output.extend(input);
+                                self.state = RawInputState::Ground;
+                            }
+                            CsiReply::Partial => {}
+                            CsiReply::Other
+                                if BRACKETED_PASTE_START.starts_with(raw)
+                                    || BRACKETED_PASTE_END.starts_with(raw) => {}
+                            CsiReply::Other => {
+                                ordinary.append(raw);
+                                self.state = RawInputState::Ground;
+                            }
+                        }
                     }
                 }
-                RawInputState::Osc {
-                    raw,
+                RawInputState::ControlString {
+                    kind,
                     payload,
                     escape_terminator,
                 } => {
-                    raw.push(byte);
+                    let kind = *kind;
                     if *escape_terminator {
                         if byte == b'\\' {
-                            let payload = std::str::from_utf8(payload).ok();
-                            if let Some(colors) = payload.and_then(parse_color_reply) {
-                                output.push(TerminalInput::Colors(colors));
-                            }
+                            output.extend(kind.reply(payload));
                             self.state = RawInputState::Ground;
                         } else {
                             payload.extend_from_slice(&[0x1b, byte]);
                             *escape_terminator = false;
                         }
                     } else if byte == 0x07 {
-                        let payload = std::str::from_utf8(payload).ok();
-                        if let Some(colors) = payload.and_then(parse_color_reply) {
-                            output.push(TerminalInput::Colors(colors));
-                        }
+                        output.extend(kind.reply(payload));
                         self.state = RawInputState::Ground;
                     } else if byte == 0x1b {
                         *escape_terminator = true;
                     } else {
                         payload.push(byte);
-                        let candidate = std::str::from_utf8(payload)
-                            .is_ok_and(could_be_terminal_color_response);
-                        if raw.len() > MAX_OSC_BYTES {
-                            self.state = RawInputState::DiscardOsc {
+                        if payload.len() > MAX_CONTROL_STRING_BYTES {
+                            self.state = RawInputState::DiscardControlString {
                                 escape_terminator: false,
                             };
-                        } else if !candidate {
-                            push_alt_bracket(&mut output);
+                        } else if !kind.could_be_reply(payload) {
+                            output.push(kind.alt_chord());
                             ordinary.extend_from_slice(payload);
                             self.state = RawInputState::Ground;
                         }
                     }
                 }
-                RawInputState::DiscardOsc { escape_terminator } => {
+                RawInputState::DiscardControlString { escape_terminator } => {
                     if *escape_terminator && byte == b'\\' || byte == 0x07 {
                         self.state = RawInputState::Ground;
                     } else {
@@ -253,18 +497,18 @@ impl TerminalInputParser {
                     ordinary.append(raw);
                     self.state = RawInputState::Ground;
                 }
-                // Only ambiguous Alt-] input expires. Once an OSC color prefix
-                // is recognized, read through its terminator even if it is late.
-                RawInputState::Osc { payload, .. }
-                    if !self.expecting_colors && !is_confirmed_color_response(payload) =>
+                // Only an ambiguous Alt chord expires. Once a reply's prefix is
+                // recognized, read through its terminator even if it is late.
+                RawInputState::ControlString { kind, payload, .. }
+                    if !self.expecting_replies && !kind.is_confirmed_reply(payload) =>
                 {
-                    push_alt_bracket(&mut output);
+                    output.push(kind.alt_chord());
                     ordinary.extend_from_slice(payload);
                     self.state = RawInputState::Ground;
                 }
                 RawInputState::Ground
-                | RawInputState::Osc { .. }
-                | RawInputState::DiscardOsc { .. } => {}
+                | RawInputState::ControlString { .. }
+                | RawInputState::DiscardControlString { .. } => {}
             }
         }
         self.parse_ordinary(&ordinary, maybe_more, &mut output);
@@ -278,30 +522,169 @@ impl TerminalInputParser {
         );
     }
 
-    fn expect_colors(&mut self) {
-        self.expecting_colors = true;
+    fn expect_replies(&mut self) {
+        self.expecting_replies = true;
     }
 
-    fn stop_expecting_colors(&mut self) {
+    fn stop_expecting_replies(&mut self) {
         // The query window only governs ambiguous prefixes. A recognized
-        // reply may still finish later and must retain its accumulated colors.
-        self.expecting_colors = false;
+        // reply may still finish later and must retain what it accumulated.
+        self.expecting_replies = false;
     }
 }
 
-fn push_alt_bracket(output: &mut Vec<TerminalInput>) {
-    output.push(TerminalInput::Event(crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(']'),
-            crossterm::event::KeyModifiers::ALT,
-        ),
-    )));
+/// The control strings a terminal answers Suru's queries with. Each opens
+/// with an escape the reader's own Alt chord also sends, so a string that
+/// turns out to begin no reply is handed back as that chord.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlString {
+    /// OSC, which carries the color replies.
+    Osc,
+    /// DCS, which carries the XTVERSION reply.
+    Dcs,
+    /// APC, which carries the Kitty graphics reply.
+    Apc,
 }
 
-fn is_confirmed_color_response(payload: &[u8]) -> bool {
-    [b"4;".as_slice(), b"10;".as_slice(), b"11;".as_slice()]
-        .iter()
-        .any(|prefix| payload.starts_with(prefix))
+impl ControlString {
+    fn introduced_by(byte: u8) -> Option<Self> {
+        match byte {
+            b']' => Some(Self::Osc),
+            b'P' => Some(Self::Dcs),
+            b'_' => Some(Self::Apc),
+            _ => None,
+        }
+    }
+
+    /// The Alt chord the reader pressed, when the bytes begin no reply.
+    fn alt_chord(self) -> TerminalInput {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let (character, modifiers) = match self {
+            Self::Osc => (']', KeyModifiers::ALT),
+            Self::Dcs => ('P', KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Self::Apc => ('_', KeyModifiers::ALT),
+        };
+        TerminalInput::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            modifiers,
+        )))
+    }
+
+    fn reply_prefixes(self) -> &'static [&'static [u8]] {
+        match self {
+            Self::Osc => &[b"4;", b"10;", b"11;"],
+            Self::Dcs => &[XTVERSION_REPLY_PREFIX],
+            Self::Apc => &[KITTY_GRAPHICS_REPLY_PREFIX],
+        }
+    }
+
+    /// Whether `payload` may still grow into a reply to one of Suru's queries.
+    fn could_be_reply(self, payload: &[u8]) -> bool {
+        self.reply_prefixes()
+            .iter()
+            .any(|prefix| prefix.starts_with(payload) || payload.starts_with(prefix))
+    }
+
+    /// Whether `payload` is certainly a reply, however late its terminator.
+    fn is_confirmed_reply(self, payload: &[u8]) -> bool {
+        self.reply_prefixes()
+            .iter()
+            .any(|prefix| payload.starts_with(prefix))
+    }
+
+    /// What a complete string says, if it is a reply Suru understands. Any
+    /// other string is swallowed, since a reply is never the reader's input.
+    fn reply(self, payload: &[u8]) -> Option<TerminalInput> {
+        match self {
+            Self::Osc => std::str::from_utf8(payload)
+                .ok()
+                .and_then(parse_color_reply)
+                .map(TerminalInput::Colors),
+            Self::Dcs => payload.strip_prefix(XTVERSION_REPLY_PREFIX).map(|version| {
+                TerminalInput::Graphics(GraphicsReply::Version(
+                    String::from_utf8_lossy(version).trim().to_owned(),
+                ))
+            }),
+            Self::Apc => parse_kitty_graphics_reply(payload),
+        }
+    }
+}
+
+/// A Kitty graphics reply, `G<keys>;<message>`, confirms the protocol only
+/// when it answers the probe's image id with `OK`: an error message says the
+/// terminal parsed the query but will not draw.
+fn parse_kitty_graphics_reply(payload: &[u8]) -> Option<TerminalInput> {
+    let reply = payload.strip_prefix(b"G")?;
+    let separator = reply.iter().position(|byte| *byte == b';')?;
+    let (keys, message) = (&reply[..separator], &reply[separator + 1..]);
+    (keys.split(|byte| *byte == b',').any(|key| key == b"i=31") && message == b"OK")
+        .then_some(TerminalInput::Graphics(GraphicsReply::Kitty))
+}
+
+/// Where the CSI bytes read so far stand against the CSI replies Suru asks
+/// for.
+enum CsiReply {
+    /// Still a prefix of a reply.
+    Partial,
+    /// A whole reply, carrying what it says if Suru understands it.
+    Complete(Option<TerminalInput>),
+    /// No reply, so the bytes are the reader's input.
+    Other,
+}
+
+/// Recognizes the primary device attributes, `CSI ? Ps ; … c`, and the cell
+/// size, `CSI 6 ; height ; width t`, in `raw`, which begins `ESC [`.
+fn csi_reply(raw: &[u8]) -> CsiReply {
+    fn is_parameters(bytes: &[u8]) -> bool {
+        bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    }
+
+    let body = &raw[2..];
+    if let Some(parameters) = body.strip_prefix(b"?") {
+        return match parameters.split_last() {
+            Some((b'c', parameters)) if is_parameters(parameters) => {
+                // The first parameter is the terminal's class; the attributes
+                // follow it, and attribute 4 is Sixel.
+                let sixel = parameters
+                    .split(|byte| *byte == b';')
+                    .skip(1)
+                    .any(|attribute| attribute == b"4");
+                CsiReply::Complete(Some(TerminalInput::Graphics(
+                    GraphicsReply::DeviceAttributes { sixel },
+                )))
+            }
+            _ if is_parameters(parameters) => CsiReply::Partial,
+            _ => CsiReply::Other,
+        };
+    }
+    if b"6;".starts_with(body) {
+        return CsiReply::Partial;
+    }
+    let Some(sizes) = body.strip_prefix(b"6;") else {
+        return CsiReply::Other;
+    };
+    match sizes.split_last() {
+        Some((b't', sizes)) if is_parameters(sizes) => {
+            let size = std::str::from_utf8(sizes).ok().and_then(|sizes| {
+                let (height, width) = sizes.split_once(';')?;
+                let size = CellSize {
+                    width: width.parse().ok()?,
+                    height: height.parse().ok()?,
+                };
+                (size.width > 0 && size.height > 0).then_some(size)
+            });
+            CsiReply::Complete(
+                size.map(|size| TerminalInput::Graphics(GraphicsReply::CellSize(size))),
+            )
+        }
+        _ if is_parameters(sizes) && sizes.iter().filter(|byte| **byte == b';').count() <= 1 => {
+            CsiReply::Partial
+        }
+        _ => CsiReply::Other,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -312,12 +695,12 @@ enum RawInputState {
     Csi {
         raw: Vec<u8>,
     },
-    Osc {
-        raw: Vec<u8>,
+    ControlString {
+        kind: ControlString,
         payload: Vec<u8>,
         escape_terminator: bool,
     },
-    DiscardOsc {
+    DiscardControlString {
         escape_terminator: bool,
     },
 }
@@ -552,8 +935,12 @@ pub(crate) struct TerminalEvents {
     source_done: bool,
     sequence_timeout: Duration,
     sequence_idle: Option<Pin<Box<tokio::time::Sleep>>>,
-    color_response_timeout: Duration,
-    color_response_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    reply_timeout: Duration,
+    /// When the terminal is taken to have answered every outstanding query.
+    reply_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Whether the graphics probe has yet to settle, either with the device
+    /// attributes it ends with or with the reply deadline passing.
+    awaiting_graphics: bool,
     #[cfg(unix)]
     resize: tokio::signal::unix::Signal,
 }
@@ -566,7 +953,7 @@ impl TerminalEvents {
             source,
             Some(reader),
             DEFAULT_TERMINAL_SEQUENCE_TIMEOUT,
-            DEFAULT_COLOR_RESPONSE_TIMEOUT,
+            DEFAULT_REPLY_TIMEOUT,
         )
     }
 
@@ -586,7 +973,7 @@ impl TerminalEvents {
         source: tokio::sync::mpsc::UnboundedReceiver<TerminalSourceInput>,
         reader: Option<TerminalReaderGuard>,
         sequence_timeout: Duration,
-        color_response_timeout: Duration,
+        reply_timeout: Duration,
     ) -> io::Result<Self> {
         Ok(Self {
             _reader: reader,
@@ -596,45 +983,83 @@ impl TerminalEvents {
             source_done: false,
             sequence_timeout,
             sequence_idle: None,
-            color_response_timeout,
-            color_response_deadline: None,
+            reply_timeout,
+            reply_deadline: None,
+            awaiting_graphics: false,
             #[cfg(unix)]
             resize: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?,
         })
     }
 
-    /// Issue the startup query without consuming input or delaying the first
+    /// Issue the startup probe without consuming input or delaying the first
     /// frame. Replies and reader input stay ordered in the normal event stream.
-    pub(crate) fn request_colors(&mut self, output: &mut impl io::Write) -> io::Result<()> {
-        self.expect_color_responses();
-        request_terminal_colors(output)
+    pub(crate) fn request_probe(
+        &mut self,
+        output: &mut impl io::Write,
+        facts: &TerminalFacts,
+    ) -> io::Result<()> {
+        self.expect_replies();
+        self.awaiting_graphics = true;
+        request_terminal_probe(output, facts)
     }
 
-    fn expect_color_responses(&mut self) {
-        self.parser.expect_colors();
-        self.color_response_deadline =
-            Some(Box::pin(tokio::time::sleep(self.color_response_timeout)));
+    fn expect_replies(&mut self) {
+        self.parser.expect_replies();
+        self.reply_deadline = Some(Box::pin(tokio::time::sleep(self.reply_timeout)));
     }
 
     fn queue_parsed(&mut self, parsed: Vec<TerminalInput>) {
         let refresh_expectation = parsed.iter().any(|input| {
             matches!(input, TerminalInput::Reprobe)
-                || (self.color_response_deadline.is_some()
-                    && matches!(input, TerminalInput::Colors(_)))
+                || (self.reply_deadline.is_some() && matches!(input, TerminalInput::Colors(_)))
         });
+        if parsed.iter().any(|input| {
+            matches!(
+                input,
+                TerminalInput::Graphics(GraphicsReply::DeviceAttributes { .. })
+            )
+        }) {
+            self.awaiting_graphics = false;
+        }
         self.ready.extend(parsed.into_iter().map(Ok));
         if refresh_expectation {
-            self.expect_color_responses();
+            self.expect_replies();
         }
     }
 }
 
+/// Writes the startup probe as one burst: the color queries, then the
+/// graphics queries whose answers the facts do not already hold, ending with
+/// the primary device attributes, which every terminal answers. A terminal
+/// that ignores everything else still answers those, so the probe settles;
+/// under a multiplexer they are all that is asked, since no image will be
+/// drawn there and screen would take a Kitty query for a status line.
+pub(crate) fn request_terminal_probe(
+    output: &mut impl io::Write,
+    facts: &TerminalFacts,
+) -> io::Result<()> {
+    write_color_queries(output)?;
+    if !facts.graphics_answers.multiplexed {
+        output.write_all(KITTY_GRAPHICS_QUERY)?;
+        output.write_all(XTVERSION_QUERY)?;
+        if facts.cell_size.is_none() {
+            output.write_all(CELL_SIZE_QUERY)?;
+        }
+    }
+    output.write_all(PRIMARY_DEVICE_ATTRIBUTES_QUERY)?;
+    output.flush()
+}
+
 pub(crate) fn request_terminal_colors(output: &mut impl io::Write) -> io::Result<()> {
+    write_color_queries(output)?;
+    output.flush()
+}
+
+fn write_color_queries(output: &mut impl io::Write) -> io::Result<()> {
     for index in 0..16 {
         write!(output, "\x1b]4;{index};?\x1b\\")?;
     }
-    output.write_all(TERMINAL_COLOR_QUERY_SUFFIX)?;
-    output.flush()
+    output.write_all(TERMINAL_COLOR_QUERY_SUFFIX)
 }
 
 impl Stream for TerminalEvents {
@@ -666,8 +1091,8 @@ impl Stream for TerminalEvents {
                 Poll::Ready(None) if !this.source_done => {
                     this.source_done = true;
                     this.sequence_idle = None;
-                    this.color_response_deadline = None;
-                    this.parser.stop_expecting_colors();
+                    this.reply_deadline = None;
+                    this.parser.stop_expecting_replies();
                     let parsed = this.parser.parse(&[], false);
                     this.queue_parsed(parsed);
                     continue;
@@ -688,14 +1113,18 @@ impl Stream for TerminalEvents {
             }
 
             if this
-                .color_response_deadline
+                .reply_deadline
                 .as_mut()
                 .is_some_and(|timeout| timeout.as_mut().poll(context).is_ready())
             {
-                this.color_response_deadline = None;
-                this.parser.stop_expecting_colors();
+                this.reply_deadline = None;
+                this.parser.stop_expecting_replies();
                 let parsed = this.parser.parse(&[], false);
                 this.queue_parsed(parsed);
+                if std::mem::take(&mut this.awaiting_graphics) {
+                    this.ready
+                        .push_back(Ok(TerminalInput::Graphics(GraphicsReply::Expired)));
+                }
                 continue;
             }
 
@@ -980,12 +1409,6 @@ fn apply_osc_color(
     }
 }
 
-pub(crate) fn could_be_terminal_color_response(payload: &str) -> bool {
-    ["4;", "10;", "11;"]
-        .iter()
-        .any(|prefix| prefix.starts_with(payload) || payload.starts_with(prefix))
-}
-
 fn parse_osc_rgb(value: &str) -> Option<TerminalColor> {
     let (format, components) = value.trim().split_once(':')?;
     if !format.eq_ignore_ascii_case("rgb") {
@@ -1015,13 +1438,411 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        TerminalColor, TerminalColorProbe, TerminalEvents, TerminalInput, TerminalInputParser,
-        TerminalSourceInput, request_terminal_colors,
+        CellSize, GraphicsProtocol, GraphicsReply, NoGraphics, TerminalColor, TerminalColorProbe,
+        TerminalEvents, TerminalFacts, TerminalInput, TerminalInputParser, TerminalSourceInput,
+        request_terminal_colors, request_terminal_probe,
     };
     use crossterm::event::{
         Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
+
+    /// The Kitty graphics reply accepting the probe's query.
+    const KITTY_OK: &[u8] = b"\x1b_Gi=31;OK\x1b\\";
+    /// XTVERSION naming a terminal that draws iTerm2 inline images.
+    const WEZTERM_VERSION: &[u8] = b"\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\";
+    /// Primary device attributes carrying attribute 4, Sixel.
+    const SIXEL_ATTRIBUTES: &[u8] = b"\x1b[?62;4;22c";
+    /// Primary device attributes without Sixel, which every probe ends with.
+    const PLAIN_ATTRIBUTES: &[u8] = b"\x1b[?62;22c";
+    const CELL: CellSize = CellSize {
+        width: 10,
+        height: 20,
+    };
+
+    /// A terminal whose window reported its pixels, so its cell size is known.
+    fn measured() -> TerminalFacts {
+        TerminalFacts::unprobed(true).with_cell_size(Some(CELL))
+    }
+
+    /// What `facts` become once the parser has read the terminal's `replies`,
+    /// every one of which must be a graphics reply rather than reader input.
+    fn facts_after(mut facts: TerminalFacts, replies: &[u8]) -> TerminalFacts {
+        for input in TerminalInputParser::default().parse(replies, false) {
+            match input {
+                TerminalInput::Graphics(reply) => facts.merge_graphics(&reply),
+                other => panic!("a probe reply leaked into reader input as {other:?}"),
+            }
+        }
+        facts
+    }
+
+    fn joined(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> TerminalInput {
+        TerminalInput::Event(InputEvent::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    fn record_log(action: impl FnOnce()) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::sync::Arc::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn a_kitty_reply_selects_kitty() {
+        let facts = facts_after(measured(), &joined(&[KITTY_OK, PLAIN_ATTRIBUTES]));
+
+        assert_eq!(facts.graphics, Some(GraphicsProtocol::Kitty));
+        assert_eq!(facts.cell_size, Some(CELL));
+    }
+
+    #[test]
+    fn a_kitty_reply_refusing_the_query_selects_nothing_and_never_becomes_keys() {
+        let facts = facts_after(
+            measured(),
+            &joined(&[
+                b"\x1b_Gi=31;EINVAL:unsupported format\x1b\\",
+                PLAIN_ATTRIBUTES,
+            ]),
+        );
+
+        assert_eq!(facts.graphics, None);
+    }
+
+    #[test]
+    fn device_attributes_select_sixel_only_when_an_attribute_is_four() {
+        for (reply, expected) in [
+            (SIXEL_ATTRIBUTES, Some(GraphicsProtocol::Sixel)),
+            (
+                b"\x1b[?64;1;2;4;6;9;15;18;21;22c".as_slice(),
+                Some(GraphicsProtocol::Sixel),
+            ),
+            (PLAIN_ATTRIBUTES, None),
+            (b"\x1b[?1;2c".as_slice(), None),
+            // The first parameter is the terminal's class rather than an
+            // attribute, and class 4 is a VT132, which draws no Sixel.
+            (b"\x1b[?4;6c".as_slice(), None),
+        ] {
+            assert_eq!(
+                facts_after(measured(), reply).graphics,
+                expected,
+                "{}",
+                String::from_utf8_lossy(reply).escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn xtversion_selects_iterm2_for_each_terminal_known_to_draw_its_inline_images() {
+        for name in [
+            "iTerm2 3.5.0",
+            "WezTerm 20240203-110809-5046fc22",
+            "VSCode 1.90",
+            "rio 0.1.0",
+            "mintty 3.7.0",
+        ] {
+            let version = format!("\x1bP>|{name}\x1b\\");
+
+            let facts = facts_after(measured(), &joined(&[version.as_bytes(), PLAIN_ATTRIBUTES]));
+
+            assert_eq!(facts.graphics, Some(GraphicsProtocol::Iterm2), "{name}");
+        }
+    }
+
+    #[test]
+    fn xtversion_naming_any_other_terminal_selects_nothing() {
+        for name in [
+            "XTerm(390)",
+            "foot(1.16.2)",
+            "riot 1.0",
+            "Apple_Terminal",
+            "",
+        ] {
+            let version = format!("\x1bP>|{name}\x1b\\");
+
+            let facts = facts_after(measured(), &joined(&[version.as_bytes(), PLAIN_ATTRIBUTES]));
+
+            assert_eq!(facts.graphics, None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_pixel_size_reply_gives_the_cell_size_the_window_did_not() {
+        let facts = facts_after(
+            TerminalFacts::unprobed(true),
+            &joined(&[KITTY_OK, b"\x1b[6;20;10t", PLAIN_ATTRIBUTES]),
+        );
+
+        assert_eq!(
+            facts.cell_size,
+            Some(CELL),
+            "the reply is height then width"
+        );
+        assert_eq!(facts.graphics, Some(GraphicsProtocol::Kitty));
+    }
+
+    #[test]
+    fn a_window_reporting_its_pixels_gives_the_cell_size_and_one_reporting_none_gives_nothing() {
+        use ratatui::{backend::WindowSize, layout::Size};
+
+        let window = |pixels: Size| WindowSize {
+            columns_rows: Size::new(100, 40),
+            pixels,
+        };
+
+        assert_eq!(
+            CellSize::from_window(window(Size::new(1000, 800))),
+            Some(CELL)
+        );
+        assert_eq!(CellSize::from_window(window(Size::new(0, 0))), None);
+        assert_eq!(
+            CellSize::from_window(WindowSize {
+                columns_rows: Size::new(0, 0),
+                pixels: Size::new(1000, 800),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn several_answers_select_kitty_then_iterm2_then_sixel() {
+        assert_eq!(
+            facts_after(
+                measured(),
+                &joined(&[KITTY_OK, WEZTERM_VERSION, SIXEL_ATTRIBUTES])
+            )
+            .graphics,
+            Some(GraphicsProtocol::Kitty)
+        );
+        assert_eq!(
+            facts_after(measured(), &joined(&[WEZTERM_VERSION, SIXEL_ATTRIBUTES])).graphics,
+            Some(GraphicsProtocol::Iterm2)
+        );
+        assert_eq!(
+            facts_after(measured(), SIXEL_ATTRIBUTES).graphics,
+            Some(GraphicsProtocol::Sixel)
+        );
+    }
+
+    #[test]
+    fn tmux_and_screen_select_nothing_whatever_the_terminal_answers() {
+        let every_answer = joined(&[KITTY_OK, WEZTERM_VERSION, SIXEL_ATTRIBUTES]);
+
+        let multiplexed = facts_after(measured().with_multiplexer(true), &every_answer);
+        assert_eq!(multiplexed.graphics, None);
+        assert_eq!(
+            multiplexed.graphics_selection(),
+            Err(NoGraphics::Multiplexed)
+        );
+
+        // A multiplexer reached where its environment is not inherited, over
+        // ssh say, still names itself when asked.
+        for name in ["tmux 3.4", "screen 4.09"] {
+            let version = format!("\x1bP>|{name}\x1b\\");
+            let facts = facts_after(
+                measured(),
+                &joined(&[KITTY_OK, version.as_bytes(), SIXEL_ATTRIBUTES]),
+            );
+            assert_eq!(facts.graphics, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_cell_size_selects_nothing_until_the_terminal_reports_one() {
+        let facts = facts_after(
+            TerminalFacts::unprobed(true),
+            &joined(&[KITTY_OK, PLAIN_ATTRIBUTES]),
+        );
+
+        assert_eq!(facts.graphics, None);
+        assert_eq!(facts.graphics_selection(), Err(NoGraphics::UnknownCellSize));
+        assert_eq!(
+            facts_after(facts, b"\x1b[6;20;10t").graphics,
+            Some(GraphicsProtocol::Kitty),
+            "a late cell size completes the selection"
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_ignores_the_probe_keeps_its_input_and_selects_nothing() {
+        let mut parser = TerminalInputParser::default();
+        parser.expect_replies();
+
+        let observed = parser.parse(b"hi\x1b[A", false);
+
+        assert_eq!(
+            observed,
+            vec![
+                key(KeyCode::Char('h'), KeyModifiers::NONE),
+                key(KeyCode::Char('i'), KeyModifiers::NONE),
+                key(KeyCode::Up, KeyModifiers::NONE),
+            ]
+        );
+        let facts = measured();
+        assert_eq!(facts.graphics, None);
+        assert_eq!(facts.graphics_selection(), Err(NoGraphics::NoProtocol));
+    }
+
+    #[test]
+    fn split_graphics_replies_are_routed_away_from_key_events() {
+        let mut parser = TerminalInputParser::default();
+        let replies = joined(&[
+            KITTY_OK,
+            WEZTERM_VERSION,
+            b"\x1b[6;20;10t",
+            SIXEL_ATTRIBUTES,
+        ]);
+        let mut observed = Vec::new();
+
+        for byte in &replies {
+            observed.extend(parser.parse(&[*byte], true));
+        }
+        observed.extend(parser.parse(&[], false));
+
+        assert_eq!(
+            observed,
+            vec![
+                TerminalInput::Graphics(GraphicsReply::Kitty),
+                TerminalInput::Graphics(GraphicsReply::Version(
+                    "WezTerm 20240203-110809-5046fc22".to_owned()
+                )),
+                TerminalInput::Graphics(GraphicsReply::CellSize(CELL)),
+                TerminalInput::Graphics(GraphicsReply::DeviceAttributes { sixel: true }),
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_chords_that_begin_no_graphics_reply_remain_reader_input() {
+        let mut parser = TerminalInputParser::default();
+
+        assert_eq!(
+            parser.parse(b"\x1b_x", false),
+            vec![
+                key(KeyCode::Char('_'), KeyModifiers::ALT),
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+            ]
+        );
+        assert_eq!(
+            parser.parse(b"\x1bPx", false),
+            vec![
+                key(KeyCode::Char('P'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+            ]
+        );
+        assert_eq!(
+            parser.parse(b"\x1b_", false),
+            vec![key(KeyCode::Char('_'), KeyModifiers::ALT)],
+            "a standalone chord resolves at the input boundary"
+        );
+    }
+
+    #[test]
+    fn keys_sharing_a_prefix_with_the_graphics_replies_remain_keys() {
+        let mut parser = TerminalInputParser::default();
+        let mut observed = Vec::new();
+
+        for byte in b"\x1b[6~\x1b[6;5~\x1b[?997;1n" {
+            observed.extend(parser.parse(&[*byte], true));
+        }
+        observed.extend(parser.parse(&[], false));
+
+        assert_eq!(
+            observed,
+            vec![
+                key(KeyCode::PageDown, KeyModifiers::NONE),
+                key(KeyCode::PageDown, KeyModifiers::CONTROL),
+                TerminalInput::Reprobe,
+            ]
+        );
+    }
+
+    #[test]
+    fn graphics_shaped_bytes_inside_bracketed_paste_remain_pasted_text() {
+        let mut parser = TerminalInputParser::default();
+        let text = "a\x1b_Gi=31;OK\x1b\\b\x1b[?62;4;22cc\x1b[6;20;10td";
+        let bytes = format!("\x1b[200~{text}\x1b[201~");
+        let mut observed = Vec::new();
+
+        for byte in bytes.bytes() {
+            observed.extend(parser.parse(&[byte], true));
+        }
+        observed.extend(parser.parse(&[], false));
+
+        assert_eq!(
+            observed,
+            vec![TerminalInput::Event(InputEvent::Paste(text.to_owned()))]
+        );
+    }
+
+    #[test]
+    fn the_log_records_the_selected_protocol_and_cell_size_or_why_none_was_selected() {
+        let selected = facts_after(measured(), &joined(&[KITTY_OK, PLAIN_ATTRIBUTES]));
+        let log = record_log(|| selected.log_graphics_selection());
+        assert!(log.contains("INFO"), "{log}");
+        assert!(log.contains("Kitty"), "{log}");
+        assert!(log.contains("10x20"), "{log}");
+
+        for (facts, reason) in [
+            (measured().with_multiplexer(true), "tmux or screen"),
+            (measured(), "no graphics protocol"),
+            (
+                facts_after(TerminalFacts::unprobed(true), KITTY_OK),
+                "cell pixel size",
+            ),
+        ] {
+            let log = record_log(|| facts.log_graphics_selection());
+            assert!(log.contains("INFO"), "{log}");
+            assert!(log.contains(reason), "{log}");
+        }
+    }
+
+    #[test]
+    fn probe_writes_the_color_queries_then_the_graphics_queries_ending_with_device_attributes() {
+        let mut output = Vec::new();
+
+        request_terminal_probe(&mut output, &TerminalFacts::unprobed(true)).unwrap();
+
+        let mut expected = Vec::new();
+        request_terminal_colors(&mut expected).unwrap();
+        expected
+            .extend_from_slice(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>0q\x1b[16t\x1b[c");
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn a_probe_whose_window_reported_its_pixels_does_not_ask_for_the_cell_size() {
+        let mut output = Vec::new();
+
+        request_terminal_probe(&mut output, &measured()).unwrap();
+
+        let mut expected = Vec::new();
+        request_terminal_colors(&mut expected).unwrap();
+        expected.extend_from_slice(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>0q\x1b[c");
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn a_probe_under_a_multiplexer_asks_for_device_attributes_alone() {
+        let mut output = Vec::new();
+
+        request_terminal_probe(&mut output, &measured().with_multiplexer(true)).unwrap();
+
+        let mut expected = Vec::new();
+        request_terminal_colors(&mut expected).unwrap();
+        expected.extend_from_slice(b"\x1b[c");
+        assert_eq!(output, expected);
+    }
 
     #[cfg(windows)]
     fn windows_key(
@@ -1140,7 +1961,7 @@ mod tests {
     #[test]
     fn oversized_color_response_is_discarded_instead_of_becoming_keys() {
         let mut parser = TerminalInputParser::default();
-        parser.expect_colors();
+        parser.expect_replies();
         let mut response = b"\x1b]11;".to_vec();
         response.extend(std::iter::repeat_n(b'x', 70 * 1024));
         response.extend_from_slice(b"\x07z");
@@ -1349,8 +2170,13 @@ mod tests {
         let mut output = Vec::new();
         // Returning synchronously with the sender still open proves that no
         // input, EOF, or probe timeout is needed to proceed to the first frame.
-        events.request_colors(&mut output).unwrap();
-        assert!(output.ends_with(super::TERMINAL_COLOR_QUERY_SUFFIX));
+        events
+            .request_probe(&mut output, &TerminalFacts::default())
+            .unwrap();
+        let mut colors = Vec::new();
+        request_terminal_colors(&mut colors).unwrap();
+        assert!(output.starts_with(&colors));
+        assert!(output.ends_with(super::PRIMARY_DEVICE_ATTRIBUTES_QUERY));
 
         let workspace = tempfile::tempdir().unwrap();
         let mut application =
@@ -1390,7 +2216,9 @@ mod tests {
         let mut events = TerminalEvents::from_source(source).unwrap();
         let mut output = Vec::new();
 
-        events.request_colors(&mut output).unwrap();
+        events
+            .request_probe(&mut output, &TerminalFacts::default())
+            .unwrap();
 
         assert_eq!(
             events.next().await.unwrap().unwrap(),
@@ -1429,7 +2257,9 @@ mod tests {
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         let mut events = TerminalEvents::from_source(source).unwrap();
 
-        events.request_colors(&mut Vec::new()).unwrap();
+        events
+            .request_probe(&mut Vec::new(), &TerminalFacts::default())
+            .unwrap();
         sender
             .send(TerminalSourceInput::Bytes(
                 b"\x1b]11;rgb:ffff/ffff/ffff\x07".to_vec(),
@@ -1544,18 +2374,23 @@ mod tests {
 
         let (sender, source) = tokio::sync::mpsc::unbounded_channel();
         let mut events = TerminalEvents::from_source(source).unwrap();
-        events.request_colors(&mut Vec::new()).unwrap();
+        events
+            .request_probe(&mut Vec::new(), &TerminalFacts::default())
+            .unwrap();
         sender
             .send(TerminalSourceInput::Bytes(
                 b"\x1b]11;rgb:ffff/ffff".to_vec(),
             ))
             .unwrap();
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), events.next())
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), events.next())
                 .await
-                .is_err(),
-            "an incomplete protocol reply became reader input"
+                .expect("the response window closes")
+                .unwrap()
+                .unwrap(),
+            TerminalInput::Graphics(GraphicsReply::Expired),
+            "the window closed on the probe rather than turning an incomplete reply into reader input"
         );
         sender
             .send(TerminalSourceInput::Bytes(b"/ffff\x07x".to_vec()))
@@ -1591,7 +2426,7 @@ mod tests {
             ))
             .unwrap();
         let mut events = TerminalEvents::from_source(source).unwrap();
-        events.expect_color_responses();
+        events.expect_replies();
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), events.next())
@@ -1609,6 +2444,113 @@ mod tests {
                 KeyModifiers::NONE,
             )))
         );
+    }
+
+    #[tokio::test]
+    async fn startup_graphics_replies_and_reader_input_keep_stream_order() {
+        use futures_util::StreamExt as _;
+
+        let (sender, source) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(TerminalSourceInput::Bytes(joined(&[
+                b"x",
+                KITTY_OK,
+                WEZTERM_VERSION,
+                b"\x1b[6;20;10t",
+                SIXEL_ATTRIBUTES,
+                b"y",
+            ])))
+            .unwrap();
+        drop(sender);
+        let mut events = TerminalEvents::from_source(source).unwrap();
+        events
+            .request_probe(&mut Vec::new(), &TerminalFacts::default())
+            .unwrap();
+
+        let mut observed = Vec::new();
+        while let Some(input) = events.next().await {
+            observed.push(input.unwrap());
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                TerminalInput::Graphics(GraphicsReply::Kitty),
+                TerminalInput::Graphics(GraphicsReply::Version(
+                    "WezTerm 20240203-110809-5046fc22".to_owned()
+                )),
+                TerminalInput::Graphics(GraphicsReply::CellSize(CELL)),
+                TerminalInput::Graphics(GraphicsReply::DeviceAttributes { sixel: true }),
+                key(KeyCode::Char('y'), KeyModifiers::NONE),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_the_terminal_ignores_expires_after_the_readers_own_input() {
+        use futures_util::StreamExt as _;
+
+        let (sender, source) = tokio::sync::mpsc::unbounded_channel();
+        let mut events = TerminalEvents::from_source(source).unwrap();
+        events
+            .request_probe(&mut Vec::new(), &TerminalFacts::default())
+            .unwrap();
+        sender
+            .send(TerminalSourceInput::Bytes(b"hi\x1b[A".to_vec()))
+            .unwrap();
+
+        let mut facts = measured();
+        let mut observed = Vec::new();
+        while observed.len() < 4 {
+            let input = tokio::time::timeout(Duration::from_millis(100), events.next())
+                .await
+                .expect("the response window closes")
+                .unwrap()
+                .unwrap();
+            if let TerminalInput::Graphics(reply) = &input {
+                facts.merge_graphics(reply);
+            }
+            observed.push(input);
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                key(KeyCode::Char('h'), KeyModifiers::NONE),
+                key(KeyCode::Char('i'), KeyModifiers::NONE),
+                key(KeyCode::Up, KeyModifiers::NONE),
+                TerminalInput::Graphics(GraphicsReply::Expired),
+            ]
+        );
+        assert_eq!(facts.graphics, None);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn device_attributes_settle_the_probe_so_it_never_expires() {
+        use futures_util::StreamExt as _;
+
+        let (sender, source) = tokio::sync::mpsc::unbounded_channel();
+        let mut events = TerminalEvents::from_source(source).unwrap();
+        events
+            .request_probe(&mut Vec::new(), &TerminalFacts::default())
+            .unwrap();
+        sender
+            .send(TerminalSourceInput::Bytes(PLAIN_ATTRIBUTES.to_vec()))
+            .unwrap();
+
+        assert_eq!(
+            events.next().await.unwrap().unwrap(),
+            TerminalInput::Graphics(GraphicsReply::DeviceAttributes { sixel: false })
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), events.next())
+                .await
+                .is_err(),
+            "a settled probe has nothing left to expire"
+        );
+        drop(sender);
     }
 
     #[cfg(windows)]

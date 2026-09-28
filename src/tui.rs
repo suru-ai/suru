@@ -40,7 +40,9 @@ mod usage;
 mod workspace_picker;
 mod worktree_picker;
 
-pub use crate::terminal::{TerminalColor, TerminalColorProbe, TerminalFacts};
+pub use crate::terminal::{
+    CellSize, GraphicsProtocol, TerminalColor, TerminalColorProbe, TerminalFacts,
+};
 pub use clipboard::ClipboardContent;
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;
