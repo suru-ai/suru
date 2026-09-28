@@ -4,9 +4,10 @@
 //! naming the endpoint, the bearer token as a static header, a tool timeout above the Broker's
 //! longest call, and approve-by-default for its Tools so no call waits on a reviewer or an
 //! elicitation. Nothing of the server is kept with the thread, so every `thread/resume` carries it
-//! again — with the token its own launch was handed. The thread also starts with a note in its
-//! developer instructions saying the Broker is there, which Codex keeps in the thread's history, so
-//! a resume carries none. With the Broker turned off neither request carries anything of it.
+//! again — with the token its own launch was handed. Both also carry a note in the thread's
+//! developer instructions saying the Broker is there: a resumed thread reads its developer
+//! instructions from the configuration it is resumed under, and a compaction rebuilds the thread's
+//! opening context from them. With the Broker turned off neither request carries anything of it.
 //!
 //! A Codex Subagent a Session on another Provider spawns through the Broker starts its thread under
 //! the Codex value ADR 0036's table gives for that Session's posture.
@@ -220,37 +221,34 @@ async fn thread_start_and_thread_resume_carry_the_server_headers_timeout_and_app
 }
 
 #[tokio::test]
-async fn thread_start_carries_the_broker_note_in_its_developer_instructions() {
+async fn thread_start_and_thread_resume_carry_the_broker_note_in_their_developer_instructions() {
     let resumed = ResumedThread::run("codex-broker-note", "{}").await;
 
-    let start = resumed.params_of("thread/start");
-    let note = start["developerInstructions"]
-        .as_str()
-        .unwrap_or_else(|| panic!("thread/start carries developer instructions: {start}"));
-    for tool in [
-        "mcp__suru__list_providers",
-        "mcp__suru__spawn_subagent",
-        "mcp__suru__read_subagent",
-        "mcp__suru__stop_subagent",
-    ] {
+    for method in ["thread/start", "thread/resume"] {
+        let params = resumed.params_of(method);
+        let note = params["developerInstructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{method} carries developer instructions: {params}"));
+        for tool in [
+            "mcp__suru__list_providers",
+            "mcp__suru__spawn_subagent",
+            "mcp__suru__read_subagent",
+            "mcp__suru__stop_subagent",
+        ] {
+            assert!(
+                note.contains(tool),
+                "{method}'s note names {tool} as Codex names an MCP server's Tools: {note:?}"
+            );
+        }
         assert!(
-            note.contains(tool),
-            "the note names {tool} as Codex names an MCP server's Tools: {note:?}"
+            note.contains("when the user names another Provider or Model"),
+            "{method}'s note says when to prefer the Broker: {note:?}"
+        );
+        assert!(
+            note.contains("Suru never re-routes them"),
+            "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
         );
     }
-    assert!(
-        note.contains("when the user names another Provider or Model"),
-        "the note says when to prefer the Broker: {note:?}"
-    );
-    assert!(
-        note.contains("Suru never re-routes them"),
-        "the note leaves the Agent's own subagent tools in place: {note:?}"
-    );
-    let resume = resumed.params_of("thread/resume");
-    assert!(
-        resume.get("developerInstructions").is_none(),
-        "the resumed thread keeps the note its start put in its history: {resume}"
-    );
 
     resumed.shutdown().await;
 }

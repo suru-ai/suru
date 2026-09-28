@@ -974,6 +974,7 @@ impl ChildThreadAttachment {
                         approval_policy: posture.approval_policy(),
                         sandbox: posture.sandbox(),
                         config: None,
+                        developer_instructions: None,
                     },
                 )
                 .await

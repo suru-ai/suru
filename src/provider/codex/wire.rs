@@ -372,8 +372,7 @@ pub(super) struct ThreadStartParams<'a> {
     pub(super) ephemeral: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) config: Option<&'a ThreadConfig>,
-    /// What the thread's Agent is told beyond Codex's own instructions, which Codex keeps in the
-    /// thread's history — so a resume has no need of it again.
+    /// What the thread's Agent is told beyond Codex's own instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) developer_instructions: Option<&'a str>,
 }
@@ -387,6 +386,12 @@ pub(super) struct ThreadResumeParams<'a> {
     pub(super) sandbox: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) config: Option<&'a ThreadConfig>,
+    /// What the resumed thread's Agent is told beyond Codex's own instructions. A resumed thread
+    /// reads them from the configuration it is resumed under rather than from its history, and a
+    /// compaction rebuilds its opening context from them, so a resume that carried none would lose
+    /// what the start said at the thread's first compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) developer_instructions: Option<&'a str>,
 }
 
 /// The Codex configuration a thread is started or resumed under beyond the user's own: each entry
@@ -415,11 +420,13 @@ pub(super) fn broker_thread_config(handoff: &BrokerHandoff) -> ThreadConfig {
     )])
 }
 
-/// The developer instructions a thread handed the Broker starts with: the Broker's note, naming
-/// each Tool as Codex names an MCP server's Tools to its Agent — `mcp__suru__spawn_subagent`.
+/// The developer instructions a thread handed the Broker is started and resumed with: the Broker's
+/// note, naming each Tool as Codex names an MCP server's Tools to its Agent —
+/// `mcp__suru__spawn_subagent`.
 ///
 /// Codex takes a thread's developer instructions in place of any the user's own configuration
-/// sets, rather than beside them, so a Session handed the Broker is started with the note alone.
+/// sets, rather than beside them, so a Session handed the Broker is started and resumed with the
+/// note alone.
 pub(super) fn broker_developer_instructions() -> String {
     instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"))
 }
@@ -1441,8 +1448,10 @@ mod tests {
             approval_policy: "on-request",
             sandbox: "workspace-write",
             config: None,
+            developer_instructions: None,
         })
         .expect("thread/resume serializes");
         assert!(resume.get("config").is_none(), "{resume}");
+        assert!(resume.get("developerInstructions").is_none(), "{resume}");
     }
 }

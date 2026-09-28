@@ -383,8 +383,8 @@ async fn start_codex_thread(
         .map_err(|error| codex_error(format!("Codex Resume State is invalid: {error}")))?
         .map(|state| state.thread_id);
     // The Broker goes on the thread's start and on every resume alike, carrying the token this
-    // launch was handed, because Codex keeps nothing of an MCP server with the thread. Its note
-    // goes on the start alone: Codex keeps that in the thread's history.
+    // launch was handed, because Codex keeps nothing of an MCP server with the thread; and so does
+    // its note, which a resumed thread reads from the configuration it is resumed under.
     let config = request.broker.as_ref().map(broker_thread_config);
     let note = request.broker.is_some().then(broker_developer_instructions);
     let (method, result) = if let Some(thread_id) = known_thread_id.as_ref() {
@@ -401,6 +401,7 @@ async fn start_codex_thread(
                     approval_policy: posture.approval_policy(),
                     sandbox: posture.sandbox(),
                     config: config.as_ref(),
+                    developer_instructions: note.as_deref(),
                 },
             )
             .await
