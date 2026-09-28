@@ -653,10 +653,12 @@ fn styled_symbols(line: &StyledLine) -> Vec<StyledSymbol> {
         .collect()
 }
 
-/// The whitespace repeated before every wrapped continuation of a projected
+/// The prefix repeated before every wrapped continuation of a projected
 /// line. Ordinary leading whitespace repeats verbatim. Markdown structural
-/// markers become same-width spaces as well, giving list items and quotes a
-/// hanging indent beneath the text rather than beneath the marker.
+/// markers become same-width spaces, giving list items a hanging indent
+/// beneath the text rather than beneath the marker; the one exception is the
+/// quote rail, which is Chrome that runs down the whole quote and so repeats
+/// as itself on every row the quote wraps onto.
 fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol> {
     let leading_end = symbols
         .iter()
@@ -680,7 +682,7 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
         }
         used += symbol_width;
         prefix.push(StyledSymbol {
-            symbol: if symbol.is_whitespace() {
+            symbol: if symbol.is_whitespace() || symbol.symbol == QUOTE_RAIL {
                 symbol.symbol.clone()
             } else {
                 " ".repeat(symbol_width)
@@ -692,9 +694,12 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
     prefix
 }
 
+/// The bar Markdown paints down the left of a quote.
+const QUOTE_RAIL: &str = "│";
+
 fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
     let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol.as_str());
-    if matches!(symbol(start), Some("•" | "│" | "✓" | "×" | "⠋"))
+    if matches!(symbol(start), Some("•" | QUOTE_RAIL | "✓" | "×" | "⠋"))
         && symbols
             .get(start + 1)
             .is_some_and(StyledSymbol::is_whitespace)
@@ -1058,6 +1063,41 @@ mod tests {
         assert_eq!(
             rows[2].offset_at(&line, 12, 2),
             first_wide + "\u{5b57}".len()
+        );
+    }
+
+    #[test]
+    fn a_quote_rail_runs_down_every_wrapped_row() {
+        let line = styled(
+            "│ Suru is a cross-platform Rust application for agentic coding, built around a terminal UI and a provider-agnostic design. It integrates Codex, GitHub Copilot, and Claude through a shared provider/runtime interface while using each provider's native harness or protocol. The executable starts the TUI by default and also exposes commands to start, inspect, and stop Suru's server.",
+        );
+        let layout = StyledLayout::new(&line, 80);
+        let rows = layout.rows();
+        assert!(
+            rows.len() > 1,
+            "the quote must wrap for the rail to continue"
+        );
+        for row in rows {
+            assert!(
+                drawn_text(&row.line).starts_with("│ "),
+                "row lost its rail: {:?}",
+                drawn_text(&row.line)
+            );
+        }
+        assert_eq!(rows[1].indent, 2);
+    }
+
+    #[test]
+    fn a_bullet_inside_a_quote_hangs_beneath_its_text_while_the_rail_continues() {
+        let line = styled("│ • quoted item that wraps onto another row");
+        let layout = StyledLayout::new(&line, 22);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| drawn_text(&row.line))
+                .collect::<Vec<_>>(),
+            vec!["│ • quoted item that", "│   wraps onto another", "│   row"]
         );
     }
 

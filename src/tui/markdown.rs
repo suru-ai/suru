@@ -2144,8 +2144,8 @@ mod tests {
                 0,
                 vec![
                     (0, "│ quoted words that".to_owned()),
-                    (2, "  wrap onto another".to_owned()),
-                    (2, "  row".to_owned()),
+                    (2, "│ wrap onto another".to_owned()),
+                    (2, "│ row".to_owned()),
                 ],
             ),
             (
@@ -2153,8 +2153,8 @@ mod tests {
                 0,
                 vec![
                     (0, "│ │ nested quoted".to_owned()),
-                    (4, "    words that wrap".to_owned()),
-                    (4, "    onto another row".to_owned()),
+                    (4, "│ │ words that wrap".to_owned()),
+                    (4, "│ │ onto another row".to_owned()),
                 ],
             ),
         ];
