@@ -173,7 +173,16 @@ pub(crate) struct StorageRepository {
     /// of the last Session referencing it nor the orphan sweep reclaims it
     /// sooner.
     attachment_grace: std::time::Duration,
-    /// Where the time an Attachment's grace is measured by is read.
+    /// How long the writer, idle and with no Session work to flush, waits
+    /// between sweeps of orphaned Attachments.
+    attachment_sweep_interval: std::time::Duration,
+    /// When orphaned Attachments were last swept, by the clock, in the
+    /// milliseconds `referenced_at` is stored in; zero before the first
+    /// sweep. Shared by every handle on this repository, so a sweep at start
+    /// and one in the writer both count.
+    attachments_swept_at: Arc<std::sync::atomic::AtomicI64>,
+    /// Where the time an Attachment's grace and the sweep interval are
+    /// measured by is read.
     clock: crate::clock::ServerClock,
 }
 
@@ -338,6 +347,8 @@ impl StorageRepository {
         let repository = Self {
             database_path: Arc::new(data_root.join(DATABASE_FILE)),
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
+            attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
+            attachments_swept_at: Arc::default(),
             clock: crate::clock::ServerClock::default(),
         };
         let database_path = repository.database_path.as_ref().clone();
@@ -352,7 +363,14 @@ impl StorageRepository {
         self
     }
 
-    /// Measures an Attachment's grace by `clock`.
+    /// Sweeps orphaned Attachments at least every `interval` while the
+    /// writer has no Session work to flush.
+    pub(crate) fn with_attachment_sweep_interval(mut self, interval: std::time::Duration) -> Self {
+        self.attachment_sweep_interval = interval;
+        self
+    }
+
+    /// Measures an Attachment's grace and the sweep interval by `clock`.
     pub(crate) fn with_clock(mut self, clock: crate::clock::ServerClock) -> Self {
         self.clock = clock;
         self

@@ -4,10 +4,21 @@
 //! Messages bind them, and described without their bytes to the Sessions that
 //! bind them. The bytes are read back only when something asks for them (ADR
 //! 0037). An Attachment's age, which decides whether it may be reclaimed, is
-//! measured from that last reference; one no Session is joined to is swept
-//! once that age passes the grace period.
+//! measured from that last reference.
+//!
+//! One no Session is joined to — bound by no stored Prompt or Message — is
+//! swept once that age passes the grace period. The Server sweeps once at
+//! start, after loading its Sessions; then at the idle flush ending each
+//! burst of the storage writer's work, once every Session it holds has
+//! landed its joins; and, since an upload alone never wakes the writer, at
+//! an idle tick whenever the sweep interval has passed since the last sweep
+//! of any kind, so a quiet Server still reclaims a paste whose label was
+//! deleted.
 
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::atomic::Ordering,
+};
 
 use diesel::{
     SqliteConnection,
@@ -161,6 +172,16 @@ impl StorageRepository {
         millis(self.clock.now())
             .saturating_sub(i64::try_from(self.attachment_grace.as_millis()).unwrap_or(i64::MAX))
     }
+
+    /// Whether the sweep interval has passed since orphaned Attachments were
+    /// last swept, or the clock has been set back behind that sweep.
+    pub(super) fn attachment_sweep_due(&self) -> bool {
+        let since = millis(self.clock.now())
+            .saturating_sub(self.attachments_swept_at.load(Ordering::SeqCst));
+        let interval =
+            i64::try_from(self.attachment_sweep_interval.as_millis()).unwrap_or(i64::MAX);
+        !(0..interval).contains(&since)
+    }
 }
 
 /// Deletes every Attachment no stored Prompt or Message binds — one no
@@ -168,10 +189,14 @@ impl StorageRepository {
 /// grace period ago, and answers how many it deleted. Run where every Session
 /// held in memory has landed its joins, it leaves only an upload whose Prompt
 /// is still in admission unjoined, and admission stamped that one referenced
-/// within the grace period.
+/// within the grace period. A sweep that fails still counts as the last one,
+/// so a failing database is not retried at every idle tick.
 pub(super) fn sweep_orphaned_attachments(
     repository: &StorageRepository,
 ) -> Result<usize, StorageError> {
+    repository
+        .attachments_swept_at
+        .store(millis(repository.clock.now()), Ordering::SeqCst);
     let referenced_before = repository.grace_cutoff();
     let mut connection = super::connect(&repository.database_path)?;
     let swept = delete_unjoined(referenced_before)
@@ -433,6 +458,35 @@ mod tests {
                 .await
                 .expect("sweep with nothing to reclaim"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_is_due_once_the_interval_passes_since_the_last_one() {
+        let interval = Duration::from_secs(5 * 60);
+        let directory = tempfile::tempdir().expect("create data directory");
+        let (clock, hand) = crate::clock::ServerClock::manual();
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("open repository")
+            .with_attachment_sweep_interval(interval)
+            .with_clock(clock);
+        assert!(
+            repository.attachment_sweep_due(),
+            "a repository never swept is due a sweep"
+        );
+
+        repository
+            .sweep_orphaned_attachments()
+            .await
+            .expect("sweep");
+        assert!(!repository.attachment_sweep_due());
+        hand.advance(interval - Duration::from_millis(1));
+        assert!(!repository.attachment_sweep_due());
+        hand.advance(Duration::from_millis(1));
+        assert!(
+            repository.clone().attachment_sweep_due(),
+            "every handle on the repository shares when it was last swept"
         );
     }
 }

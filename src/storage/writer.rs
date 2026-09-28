@@ -2,7 +2,8 @@
 //!
 //! Streaming paths hand work to [`StorageSink`] and move on. The writer thread owns the projected
 //! copy of each accessed or newly created Session, marks it dirty, and flushes on Turn boundaries and idle ticks so SQLite
-//! I/O never sits in the path of a Provider stream.
+//! I/O never sits in the path of a Provider stream. An idle tick that follows work, or that finds the sweep interval
+//! passed, also sweeps orphaned Attachments once the flush has landed every Session's joins.
 
 use std::{
     collections::HashMap,
@@ -102,7 +103,8 @@ impl StorageWriter {
         let task = thread::spawn(move || {
             // Whether a command arrived since the writer last went idle: the
             // idle flush ending each burst of work sweeps orphaned
-            // Attachments once, and a quiet tick after it sweeps nothing.
+            // Attachments once, and a quiet tick after it sweeps only once
+            // the sweep interval has passed.
             let mut worked = false;
             loop {
                 let received = receiver.recv_timeout(IDLE_FLUSH_DELAY);
@@ -251,9 +253,10 @@ impl StorageWriter {
                         flush_sessions(&repository, &mut sessions, None)?;
                         // Every Session held here has landed its joins, so an
                         // Attachment none is joined to is bound by no stored
-                        // Prompt or Message. A failed sweep leaves its
-                        // orphans for the next one.
-                        if std::mem::take(&mut worked)
+                        // Prompt or Message. An upload alone never reaches the
+                        // writer, so a quiet Server sweeps by the interval. A
+                        // failed sweep leaves its orphans for the next one.
+                        if (std::mem::take(&mut worked) || repository.attachment_sweep_due())
                             && let Err(error) =
                                 super::attachment_table::sweep_orphaned_attachments(&repository)
                         {

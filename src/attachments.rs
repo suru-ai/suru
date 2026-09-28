@@ -36,6 +36,10 @@ pub(crate) const MAX_ATTACHMENTS_PER_PROMPT: usize = 10;
 /// whether or not any Session still references it.
 pub(crate) const ATTACHMENT_GRACE: Duration = Duration::from_secs(60 * 60);
 
+/// How long a Server with no Session work to flush waits between sweeps of
+/// orphaned Attachments.
+pub(crate) const ATTACHMENT_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// The most bytes the upload route reads: the per-image cap with headroom, so
 /// an image a little over it is refused for its size, measured, rather than
 /// cut off mid-read.

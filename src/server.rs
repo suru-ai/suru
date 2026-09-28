@@ -109,7 +109,12 @@ pub struct ServerTimings {
     /// Attachment is left in place even once no Session references it, since
     /// a Prompt still in admission may be about to bind it (ADR 0037).
     pub attachment_grace: Duration,
-    /// Where the Server reads the time an Attachment's grace is measured by.
+    /// How long a Server that has had no Session work to flush waits between
+    /// sweeps of orphaned Attachments, since an upload alone never wakes the
+    /// storage writer.
+    pub attachment_sweep_interval: Duration,
+    /// Where the Server reads the time an Attachment's grace and the sweep
+    /// interval are measured by.
     pub clock: ServerClock,
 }
 
@@ -131,6 +136,7 @@ impl Default for ServerTimings {
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
+            attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             clock: ServerClock::default(),
         }
     }
@@ -190,7 +196,15 @@ impl ServerTimings {
         self
     }
 
-    /// Sets the clock an Attachment's grace is measured by.
+    /// Sets how long a quiet Server waits between sweeps of orphaned
+    /// Attachments.
+    pub fn with_attachment_sweep_interval(mut self, interval: Duration) -> Self {
+        self.attachment_sweep_interval = interval;
+        self
+    }
+
+    /// Sets the clock an Attachment's grace and the sweep interval are
+    /// measured by.
     pub fn with_clock(mut self, clock: ServerClock) -> Self {
         self.clock = clock;
         self
@@ -593,6 +607,7 @@ pub async fn spawn_with_source_control(
         .await
         .context("initialize Session repository")?
         .with_attachment_grace(timings.attachment_grace)
+        .with_attachment_sweep_interval(timings.attachment_sweep_interval)
         .with_clock(timings.clock.clone());
     let persisted_sessions = repository
         .load_sessions()

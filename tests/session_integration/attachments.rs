@@ -1360,6 +1360,38 @@ async fn a_sweep_never_reclaims_an_attachment_a_stored_prompt_binds_however_old(
 }
 
 #[tokio::test]
+async fn a_quiet_server_sweeps_uploads_no_prompt_binds_once_a_sweep_interval_passes() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (clock, hand) = ServerClock::manual();
+    let server = spawn_with_timings(
+        state_dir.path(),
+        "attachment-quiet-sweep-test",
+        ServerTimings::default()
+            .with_attachment_grace(HOUR)
+            .with_attachment_sweep_interval(5 * MINUTE)
+            .with_clock(clock),
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let orphan = uploaded(&descriptor, png(10, 10)).await;
+    hand.advance(2 * MINUTE);
+    let young = uploaded(&descriptor, gif(20, 20)).await;
+
+    // No Session is created or touched: uploads alone never reach the
+    // writer, so only the passing of the sweep interval can sweep. By now the
+    // first upload is past its grace period and the second is not.
+    hand.advance(HOUR - MINUTE);
+    wait_until_swept(&descriptor, &orphan).await;
+    assert_eq!(
+        fetched(&descriptor, &young.id).await,
+        ("image/gif".to_owned(), gif(20, 20)),
+        "an upload within its grace period survives the sweep"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn server_start_sweeps_uploads_no_stored_prompt_binds_once_past_their_grace_period() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
