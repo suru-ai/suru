@@ -44,6 +44,7 @@ mod selection;
 mod settled;
 mod settlement;
 mod subagent_tree;
+mod subagent_waits;
 mod subagents;
 mod title;
 mod viewed;
@@ -179,6 +180,11 @@ struct SessionRecord {
     /// Provider process that runs it, so a Session read back from storage has
     /// none, and the Monitoring derived from them starts over with it.
     watches: HashMap<ProviderWatchId, watches::LiveWatch>,
+    /// The `wait_subagents` calls attributed to this Session that are waiting
+    /// now, in the order they began, from which the Session's
+    /// [`SessionSnapshot::waiting_on_subagents`] is read. Never stored: no
+    /// call outlives the process answering it.
+    subagent_waits: Vec<subagent_waits::OpenWait>,
     /// When an interrupt last reached the work this Session's own Provider
     /// actor runs — its Turn, or the Subagents outliving one, whether the
     /// interrupt was this Session's or carried down from one above — which

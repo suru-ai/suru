@@ -437,6 +437,7 @@ pub(super) fn restored_record(
         viewed_operations: Default::default(),
         selection_retry_prompt: None,
         watches: Default::default(),
+        subagent_waits: Vec::new(),
         work_interrupted_at: None,
         stopped_by_ancestor: None,
         held_reports: Default::default(),

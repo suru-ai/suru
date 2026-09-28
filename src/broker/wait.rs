@@ -9,6 +9,15 @@
 //! is what keeps Claude's idle window open (ADR 0034). A wait answering with a
 //! settle takes nothing from the Subagent Report of it, which reaches the
 //! delegating Agent as ever, so the same settle may reach one Turn twice.
+//!
+//! While it waits, the Session its call is attributed to reads as waiting on
+//! its Subagents in the Turn it is working, so a reader whose Working
+//! Indicator finds nothing else at work in that Turn says the Agent waits
+//! rather than works. Every harness's calls come through here, so this holds
+//! whichever Provider the Agent runs on. A wait answering at once never
+//! reads as waiting, and one ending any other way — answered, timed out,
+//! refused, or dropped with a call cancelled by its client going or the
+//! Server stopping — stops reading as waiting as it ends.
 
 use std::time::Duration;
 
@@ -88,8 +97,9 @@ pub(super) struct Unreachable {
 /// until `timeout_seconds` of `timings`' seconds have passed, reporting
 /// progress through `progress` every `timings.progress_every` meanwhile, and
 /// once as soon as it begins to wait, which opens the answer's stream at once.
-/// Each Subagent must be a brokered Subagent beneath `caller`, as for a read;
-/// the first that is not is refused.
+/// `caller` reads as waiting on its Subagents from then until this returns or
+/// is dropped. Each Subagent must be a brokered Subagent beneath `caller`, as
+/// for a read; the first that is not is refused.
 pub(super) async fn until_one_settles(
     sessions: &SessionStore,
     timings: WaitTimings,
@@ -126,19 +136,25 @@ pub(super) async fn until_one_settles(
         timeout_seconds,
         sent: 0,
     };
+    let settled = settled_among(sessions, caller, waited_on)?;
+    if !settled.is_empty() {
+        return Ok(WaitOutcome::Settled(settled));
+    }
+    // Taken only once the wait finds it must wait, so a wait answering at
+    // once never shows its caller waiting, and dropped however the wait ends:
+    // answered, refused, or cancelled with its call.
+    let _waiting = sessions.begin_subagent_wait(caller);
+    reports.send().await;
     loop {
-        let settled = settled_among(sessions, caller, waited_on)?;
-        if !settled.is_empty() {
-            return Ok(WaitOutcome::Settled(settled));
-        }
-        if reports.sent == 0 {
-            reports.send().await;
-        }
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline) => return Ok(WaitOutcome::TimedOut),
             _ = ticks.tick(), if reports.reporter.is_some() => reports.send().await,
             () = next_turn_moving(sessions, &mut feeds) => {}
+        }
+        let settled = settled_among(sessions, caller, waited_on)?;
+        if !settled.is_empty() {
+            return Ok(WaitOutcome::Settled(settled));
         }
     }
 }

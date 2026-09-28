@@ -240,7 +240,7 @@ The ordered, user-visible history of a Session: its Messages and Activities in p
 _Avoid_: History, log, conversation
 
 **Working Indicator**:
-The transient presentation immediately after a Session's latest Transcript row while that Session is Working or Monitoring. It distinguishes work belonging to the current Turn from waiting on surviving Subagents and from Monitoring, and carries the work's elapsed time and interruption guidance without becoming a Message or Activity. While Monitoring it names the Watch it waits on, or counts them where there are several, and only the word Monitoring shimmers.
+The transient presentation immediately after a Session's latest Transcript row while that Session is Working or Monitoring. It distinguishes the Agent's own work in the current Turn from waiting on Subagents — those surviving a Turn that has Settled, or those the Agent waits on through the Broker while nothing else of its Turn is in progress — and from Monitoring. It carries the work's elapsed time and interruption guidance without becoming a Message or Activity; waiting on Subagents is still Working, so moving between the two changes only the words, never the time or the guidance. While Monitoring it names the Watch it waits on, or counts them where there are several, and only the word Monitoring shimmers.
 _Avoid_: Active text, status text, loading row
 
 **Session Content Column**:

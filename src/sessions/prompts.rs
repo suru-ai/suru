@@ -487,6 +487,7 @@ impl SessionStore {
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
             watches: Vec::new(),
+            waiting_on_subagents: None,
             subagent_usage: None,
             total_cost: None,
             attachments,
@@ -539,6 +540,7 @@ impl SessionStore {
                 // A top-level Session owns its actor by having no parent.
                 brokered: false,
                 watches: HashMap::new(),
+                subagent_waits: Vec::new(),
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),

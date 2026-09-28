@@ -704,6 +704,7 @@ mod tests {
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
             watches: Vec::new(),
+            waiting_on_subagents: None,
             subagent_usage: None,
             total_cost: None,
             transcript: messages

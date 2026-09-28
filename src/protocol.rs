@@ -3286,6 +3286,18 @@ pub struct SessionSnapshot {
     /// Never the bytes: a client that wants those fetches them by id.
     #[serde(default)]
     pub attachments: Vec<AttachmentDescriptor>,
+    /// The Turn in which this Session's Agent is waiting on its Subagents
+    /// through the Broker's `wait_subagents`, while any such call is open —
+    /// the latest Turn to have opened one where calls from several Turns are
+    /// still open, since a call from a Turn that has settled lingers only
+    /// until the Server learns its client has gone. Set and cleared by the
+    /// Server, which sees every Provider's calls to the Broker, and never
+    /// stored, since no call outlives the process answering it. It moves
+    /// neither Working nor Monitoring: read through
+    /// [`Self::only_waiting_on_subagents`], it only says what the Working
+    /// Indicator's Working is spent on.
+    #[serde(default)]
+    pub waiting_on_subagents: Option<TurnId>,
 }
 
 impl SessionSnapshot {
@@ -3337,6 +3349,30 @@ impl SessionSnapshot {
     /// carried by the Session itself.
     pub const fn monitoring_since(&self) -> Option<SessionTimestamp> {
         self.session.monitoring_since
+    }
+
+    /// Whether the only work open in this Session's current Turn is its
+    /// Agent waiting on Subagents: a `wait_subagents` call is open in that
+    /// Turn, the Turn still works, and nothing of its own — no Activity and
+    /// no streaming Message — is in progress beside the Subagents it waits
+    /// on. The Subagent rows are left out because they are what it waits on,
+    /// whether spawned through the Broker or by its own Provider.
+    pub fn only_waiting_on_subagents(&self) -> bool {
+        let Some(turn_id) = self.waiting_on_subagents else {
+            return false;
+        };
+        let turn_works = self
+            .turns
+            .iter()
+            .any(|turn| turn.id == turn_id && turn.status == TurnStatus::Active);
+        let own_work = self.activities.iter().any(|activity| {
+            activity.turn_id() == turn_id
+                && !matches!(activity, Activity::Subagent { .. })
+                && activity.status() == Some(ActivityStatus::Active)
+        }) || self.messages.iter().any(|message| {
+            message.turn_id == turn_id && message.status == MessageStatus::Streaming
+        });
+        turn_works && !own_work
     }
 
     /// Everything this Session has consumed: its own Turns — failed and
@@ -3468,6 +3504,13 @@ pub enum SessionChange {
     /// see start.
     SessionWatchesChanged {
         watches: Vec<WatchSummary>,
+    },
+    /// The Turn in which the Session's Agent now waits on its Subagents, or
+    /// `None` once no such wait is open: set by the server as a
+    /// `wait_subagents` call begins waiting and cleared however it ends.
+    /// Like the Watches, it moves without any Turn moving.
+    SessionWaitingOnSubagentsChanged {
+        waiting_on_subagents: Option<TurnId>,
     },
     MessageAdded {
         message: Message,

@@ -92,15 +92,16 @@ impl SessionStoreState {
         {
             record.turn_start_admissions.insert(prompt_id, updated_at);
         }
-        // Working and Monitoring are server derivations. Callers can describe
-        // the Turn transition that changes them, but cannot inject a
-        // competing clock.
+        // Working and Monitoring are server derivations, and a wait on
+        // Subagents is the Broker's to say. Callers can describe the Turn
+        // transition that changes them, but cannot inject a competing clock.
         changes.retain(|change| {
             !matches!(
                 change,
                 SessionChange::SessionWorkingChanged { .. }
                     | SessionChange::SessionMonitoringChanged { .. }
                     | SessionChange::SessionWatchesChanged { .. }
+                    | SessionChange::SessionWaitingOnSubagentsChanged { .. }
             )
         });
         let repaired = super::brokered::repaired_settlements(&changes);
@@ -1074,6 +1075,18 @@ impl SessionRecord {
             .ok_or_else(|| anyhow!("Prompt admission order space is exhausted"))?;
         self.steer_targets
             .retain(|_, turn_id| !terminal_turns.contains(turn_id));
+        // A wait on Subagents that reached the Broker before its Turn did is
+        // spent in the Turn this revision begins, told in the same revision.
+        if let Some(waiting_on_subagents) = self.attach_subagent_waits(&next)
+            && next.waiting_on_subagents != waiting_on_subagents
+        {
+            next.waiting_on_subagents = waiting_on_subagents;
+            update
+                .changes
+                .push(SessionChange::SessionWaitingOnSubagentsChanged {
+                    waiting_on_subagents,
+                });
+        }
         self.snapshot = next;
         self.summary.session = self.snapshot.session.clone();
         self.summary.title.clone_from(&self.snapshot.title);

@@ -1469,3 +1469,180 @@ async fn a_wait_naming_no_brokered_subagent_beneath_the_caller_or_malformed_is_r
         .await
         .expect("shut down server");
 }
+
+#[tokio::test]
+async fn the_caller_reads_as_waiting_on_its_subagents_only_while_a_wait_waits() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-wait-reading", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, child_provider) = spawn_working_child(&mut delegating).await;
+    let reader = reqwest::Client::new();
+    let before = read_session(&descriptor, delegating.caller).await;
+    assert_eq!(before.waiting_on_subagents, None, "spawning is no waiting");
+    let working_since = before.working_since();
+    let (progress_seen, mut progress) = mpsc::unbounded_channel();
+
+    let (observed, ()) = tokio::join!(
+        delegating.client.wait_subagents_observing(
+            json!({ "ids": [child_id], "timeout_seconds": 600 }),
+            "wait-reading",
+            &progress_seen,
+        ),
+        async {
+            timeout(PROGRESS_DEADLINE, progress.recv())
+                .await
+                .expect("the wait says at once that it is waiting")
+                .expect("the wait is still being answered");
+            let waiting = read_session_until(
+                &reader,
+                &descriptor,
+                delegating.caller,
+                "the caller waits on its Subagent",
+                SessionSnapshot::only_waiting_on_subagents,
+            )
+            .await;
+            assert_eq!(
+                waiting.waiting_on_subagents,
+                before.turns.last().map(|turn| turn.id),
+                "the caller waits in the Turn it spawned from"
+            );
+            assert_eq!(
+                waiting.working_since(),
+                working_since,
+                "waiting is the caller's Working spent, not a new stretch of it"
+            );
+            say(&descriptor, child_id, &child_provider, ANSWER).await;
+            child_provider
+                .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+                .await;
+        }
+    );
+    assert_eq!(observed.answer("wait_subagents")["timed_out"], json!(false));
+    read_session_until(
+        &reader,
+        &descriptor,
+        delegating.caller,
+        "a wait answered with a settle leaves the caller waiting on nothing",
+        |snapshot| snapshot.waiting_on_subagents.is_none(),
+    )
+    .await;
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_wait_timing_out_or_refused_leaves_the_caller_waiting_on_nothing() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    // Each of the wait's seconds lasts a millisecond, so its bound of ten is
+    // waited out in ten.
+    let mut delegating = delegating_timed(
+        state_dir.path(),
+        "broker-wait-reading-timeout",
+        None,
+        Duration::from_millis(1),
+    )
+    .await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, _child_provider) = spawn_working_child(&mut delegating).await;
+    let reader = reqwest::Client::new();
+
+    assert_eq!(
+        delegating
+            .client
+            .wait_subagents(json!({ "ids": [child_id], "timeout_seconds": 10 }))
+            .await["timed_out"],
+        json!(true)
+    );
+    read_session_until(
+        &reader,
+        &descriptor,
+        delegating.caller,
+        "a wait that timed out leaves the caller waiting on nothing",
+        |snapshot| snapshot.waiting_on_subagents.is_none(),
+    )
+    .await;
+
+    let refusal = delegating
+        .client
+        .refusal(
+            "wait_subagents",
+            json!({ "ids": [child_id, SessionId::new()] }),
+        )
+        .await;
+    assert!(refusal.contains("Suru holds no Session"), "{refusal}");
+    assert_eq!(
+        read_session(&descriptor, delegating.caller)
+            .await
+            .waiting_on_subagents,
+        None,
+        "a refused wait never waited"
+    );
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_wait_whose_client_has_gone_leaves_the_caller_waiting_on_nothing() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    // A wait of 600 seconds lasts a minute here, far past the deadline for
+    // the caller to stop reading as waiting.
+    let mut delegating = delegating(state_dir.path(), "broker-wait-reading-gone", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, _child_provider) = spawn_working_child(&mut delegating).await;
+    let reader = reqwest::Client::new();
+
+    // A harness that gives up on a wait closes its connection; the wait learns
+    // so at the next progress it writes, and stops waiting with it.
+    let mut leaving = McpClient::handed(&delegating.handoff);
+    leaving.initialize().await;
+    let (progress_seen, mut progress) = mpsc::unbounded_channel();
+    let abandoned = tokio::spawn(async move {
+        leaving
+            .wait_subagents_observing(
+                json!({ "ids": [child_id], "timeout_seconds": 600 }),
+                "wait-abandoned",
+                &progress_seen,
+            )
+            .await
+    });
+    timeout(PROGRESS_DEADLINE, progress.recv())
+        .await
+        .expect("the wait says at once that it is waiting")
+        .expect("the wait is still being answered");
+    read_session_until(
+        &reader,
+        &descriptor,
+        delegating.caller,
+        "the caller waits on its Subagent",
+        SessionSnapshot::only_waiting_on_subagents,
+    )
+    .await;
+    abandoned.abort();
+    let _ = abandoned.await;
+    read_session_until(
+        &reader,
+        &descriptor,
+        delegating.caller,
+        "a wait whose client has gone leaves the caller waiting on nothing",
+        |snapshot| snapshot.waiting_on_subagents.is_none(),
+    )
+    .await;
+
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}

@@ -3567,6 +3567,7 @@ impl TuiState {
             pending_approvals_revision: crate::protocol::SessionRevision(0),
             watches: Vec::new(),
             attachments: self.composers.uploaded(&provisional.prompt.attachments),
+            waiting_on_subagents: None,
         })
     }
 

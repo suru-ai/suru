@@ -37,6 +37,7 @@ mod shell;
 mod sidebar;
 mod subagent_picker;
 mod subagent_view;
+mod subagent_wait;
 mod support;
 mod theme;
 mod transcript;

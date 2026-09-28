@@ -4119,8 +4119,13 @@ fn render_session(
     // stops as it does anywhere (ADR 0030).
     let subagent_view = snapshot.session.parent.is_some();
     let tail = if let Some(since) = snapshot.working_since() {
+        // Working is waiting on Subagents once the Turn has settled with them
+        // still at work, and while the Turn's only work is its Agent's wait on
+        // them; the time counted and the interrupt offered stay Working's.
         SessionTail::Working {
-            state: if snapshot.session.status == SessionStatus::Active {
+            state: if snapshot.session.status == SessionStatus::Active
+                && !snapshot.only_waiting_on_subagents()
+            {
                 WorkingIndicatorState::Working
             } else {
                 WorkingIndicatorState::WaitingForSubagents
@@ -5618,6 +5623,7 @@ mod tests {
                 submitting_approvals: Vec::new(),
                 pending_approvals_revision: crate::protocol::SessionRevision(0),
                 watches: Vec::new(),
+                waiting_on_subagents: None,
                 subagent_usage: Some(UsageTotal {
                     cost: Cost::from_usd(0.42),
                     ..UsageTotal::default()
@@ -5880,6 +5886,7 @@ mod tests {
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),
                     watches: Vec::new(),
+                    waiting_on_subagents: None,
                     subagent_usage: None,
                     total_cost: None,
                     attachments: Vec::new(),
@@ -5963,6 +5970,7 @@ mod tests {
                     submitting_approvals: Vec::new(),
                     pending_approvals_revision: crate::protocol::SessionRevision(0),
                     watches: Vec::new(),
+                    waiting_on_subagents: None,
                     subagent_usage: None,
                     total_cost: None,
                     attachments: Vec::new(),

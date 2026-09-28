@@ -62,6 +62,9 @@ pub(super) struct PromptFooterSlotContext {
 pub(super) enum WorkingIndicatorState {
     CreatingWorktree,
     Working,
+    /// Working spent on Subagents rather than the Agent's own work: its Turn
+    /// has settled with Subagents still working, or the Turn's only work is
+    /// the Agent waiting on them through the Broker.
     WaitingForSubagents,
     /// Nothing is Working, but Watches the Agent left running may still wake
     /// it (ADR 0030). Interrupting stops them rather than any Turn.

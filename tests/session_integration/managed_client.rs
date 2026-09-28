@@ -965,6 +965,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         submitting_approvals: Vec::new(),
         pending_approvals_revision: suru::protocol::SessionRevision(0),
         watches: Vec::new(),
+        waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
         transcript: vec![
