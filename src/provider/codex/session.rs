@@ -608,14 +608,7 @@ impl CodexSession {
             .map_err(|error| {
                 codex_error_context("Codex did not take the Subagent's input", error)
             })?;
-        let started: TurnStartResult = serde_json::from_value(result)
-            .map_err(|_| codex_error("Codex returned an invalid turn/start response"))?;
-        if started.turn.id.is_empty() {
-            return Err(codex_error(
-                "Codex returned an invalid turn/start response: Turn ID was empty",
-            ));
-        }
-        Ok(started.turn.id)
+        turn_id_from(result)
     }
 }
 
@@ -1019,6 +1012,19 @@ async fn lower_input(
         .await
 }
 
+/// The native turn a `turn/start` answer names: the one Codex began, or the
+/// one it steered the input into.
+fn turn_id_from(result: serde_json::Value) -> Result<String, ProviderError> {
+    let started: TurnStartResult = serde_json::from_value(result)
+        .map_err(|_| codex_error("Codex returned an invalid turn/start response"))?;
+    if started.turn.id.is_empty() {
+        return Err(codex_error(
+            "Codex returned an invalid turn/start response: Turn ID was empty",
+        ));
+    }
+    Ok(started.turn.id)
+}
+
 async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), ProviderError> {
     let NativeTurnStartRequest {
         thread_id,
@@ -1051,14 +1057,7 @@ async fn start_native_turn(request: NativeTurnStartRequest) -> Result<(), Provid
             )
             .await
             .map_err(|error| codex_error_context("Codex Turn startup failed", error))?;
-        let started: TurnStartResult = serde_json::from_value(result)
-            .map_err(|_| codex_error("Codex returned an invalid turn/start response"))?;
-        if started.turn.id.is_empty() {
-            return Err(codex_error(
-                "Codex returned an invalid turn/start response: Turn ID was empty",
-            ));
-        }
-        Ok(started.turn.id)
+        turn_id_from(result)
     }
     .await;
 
