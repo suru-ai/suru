@@ -440,13 +440,11 @@ impl BrokerTools {
                     .send_to_brokered_subagent(call.caller.session_id(), send.id, &send.message)
                     .await
                     .map_err(|refusal| send_refusal(refusal, send.id))?;
-                Ok(json!({
-                    "session_id": send.id,
-                    "delivered": match delivered {
-                        BrokeredDelivery::Resumed => "resumed",
-                        BrokeredDelivery::Steered => "steered",
-                    },
-                }))
+                Ok(serde_json::to_value(SendAnswer {
+                    session_id: send.id,
+                    delivered: Delivered::from(delivered),
+                })
+                .expect("a send's answer always serializes"))
             }
             BrokerTool::WaitSubagents => self.wait_subagents(call).await,
             BrokerTool::StopSubagent => {
@@ -579,6 +577,7 @@ fn send_refusal(refusal: BrokeredSendRefusal, subagent: SessionId) -> ToolRefusa
             unreachable_refusal(BrokerTool::SendToSubagent, error, subagent)
         }
         BrokeredSendRefusal::Capped(cap) => cap_refusal(cap, "the Subagent was not resumed"),
+        BrokeredSendRefusal::EmptyMessage => ToolRefusal::new(EMPTY_MESSAGE),
         BrokeredSendRefusal::Refused(reason) => ToolRefusal(reason),
     }
 }
@@ -712,6 +711,37 @@ fn stop_answer(subagent: SessionId, stop: BrokeredStop) -> Value {
     json!({ "session_id": subagent, "stopped": false, "reason": reason })
 }
 
+/// What `send_to_subagent` is refused with for a message that says nothing.
+const EMPTY_MESSAGE: &str =
+    "send_to_subagent's `message` is empty; say what the Subagent is to do.";
+
+/// What `send_to_subagent` answers.
+#[derive(Debug, Serialize)]
+struct SendAnswer {
+    session_id: SessionId,
+    delivered: Delivered,
+}
+
+/// How a message `send_to_subagent` sent was delivered, spelled as its
+/// description spells it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Delivered {
+    /// It began a new stretch of the Subagent's work.
+    Resumed,
+    /// It reached the work the Subagent was doing.
+    Steered,
+}
+
+impl From<BrokeredDelivery> for Delivered {
+    fn from(delivery: BrokeredDelivery) -> Self {
+        match delivery {
+            BrokeredDelivery::Resumed => Self::Resumed,
+            BrokeredDelivery::Steered => Self::Steered,
+        }
+    }
+}
+
 /// What `stop_subagent` takes: the one Subagent to stop.
 const STOP_TAKES: [&str; 1] = ["id"];
 
@@ -742,9 +772,7 @@ impl SendArguments {
             }
         };
         if message.trim().is_empty() {
-            return Err(ToolRefusal::new(
-                "send_to_subagent's `message` is empty; say what the Subagent is to do.",
-            ));
+            return Err(ToolRefusal::new(EMPTY_MESSAGE));
         }
         Ok(Self { id, message })
     }
@@ -1898,7 +1926,7 @@ mod tests {
                 BrokerTool::SendToSubagent,
                 SEND_TO_SUBAGENT_DESCRIPTION,
                 &SendArguments::TAKES[..],
-                &["session_id", "delivered", "resumed", "steered"][..],
+                &["session_id", "delivered"][..],
             ),
             (
                 BrokerTool::WaitSubagents,
@@ -1939,6 +1967,15 @@ mod tests {
                 );
             }
             assert_eq!(schema["additionalProperties"], json!(false));
+        }
+        for delivered in [Delivered::Resumed, Delivered::Steered] {
+            let spelled = serde_json::to_value(delivered)
+                .expect("a delivery serializes")
+                .to_string();
+            assert!(
+                SEND_TO_SUBAGENT_DESCRIPTION.contains(&spelled),
+                "send_to_subagent's description names {spelled}"
+            );
         }
         assert_eq!(
             BrokerTool::SendToSubagent.input_schema()["required"],

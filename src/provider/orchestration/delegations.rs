@@ -55,6 +55,8 @@ pub(crate) enum BrokeredSendRefusal {
     /// A resume would set more brokered Subagents working than the Broker's
     /// Settings allow. Nothing of it was begun, and nothing waits for room.
     Capped(BrokeredSpawnCap),
+    /// The message says nothing for the Subagent to do.
+    EmptyMessage,
     /// Any other reason, already in words the sending Agent reads.
     Refused(String),
 }
@@ -127,11 +129,7 @@ impl ProviderOrchestrator {
         self.sessions
             .reach_brokered_subagent(caller, subagent)
             .map_err(BrokeredSendRefusal::Unreachable)?;
-        let text = delegation_text(message).ok_or_else(|| {
-            BrokeredSendRefusal::Refused(
-                "send_to_subagent's `message` is empty; say what the Subagent is to do.".to_owned(),
-            )
-        })?;
+        let text = delegation_text(message).ok_or(BrokeredSendRefusal::EmptyMessage)?;
         let commands = match self.actor_commands(subagent) {
             Some(commands) => commands,
             None => {
