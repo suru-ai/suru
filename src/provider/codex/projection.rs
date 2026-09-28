@@ -17,9 +17,13 @@
 //! is a Delegation: the one its stretch began with already opens the stretch's Turn, and any later
 //! one stands in that Turn where it arrived, credited to the Agent whose `sendInput` carried that
 //! text. A steer changes nothing in the parent's Transcript, not even the Subagent row's
-//! description. Notifications that belong to no thread Suru follows are dropped, notifications
-//! that contradict the recorded state fail the Session, and everything else becomes the Provider
-//! events a Session consumes.
+//! description. Input Suru hands a child itself — a Subagent Report to a native Subagent that
+//! delegated through the Broker (ADR 0035) — steers a working child's turn, or begins a native turn
+//! on a settled child's thread that wakes it into a stretch no Delegation began: Suru opens that
+//! stretch's Continuation itself, so it is announced nowhere, and the input stands nowhere either.
+//! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
+//! the recorded state fail the Session, and everything else becomes the Provider events a Session
+//! consumes.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -35,7 +39,7 @@ use super::super::shell_wrapper::strip_launcher_wrapper;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     approval::{CodexApprovals, NativeApprovalIdentity, NativeApprovalKind},
-    codex_error,
+    codex_error, codex_error_context,
     transport::JsonRpcTransport,
     wire::{
         CodexPosture, NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus,
@@ -187,6 +191,31 @@ struct AttachedChild {
     /// The delegation waiting to resume this settled child once it starts a
     /// native turn.
     claim: Option<ResumeClaim>,
+    /// Input Suru handed this child itself, with a `turn/start` of its own on
+    /// the child's thread — Subagent Reports (ADR 0035) — as the `UserMessage`
+    /// it arrives as will read, until it arrives. A Report stands in no
+    /// Transcript, so that item is passed over rather than read as a
+    /// Delegation.
+    handed_input: Vec<String>,
+    /// Where Suru's own `turn/start` on this settled child stands, while that
+    /// input wakes it.
+    handed_wake: Option<HandedWake>,
+}
+
+/// Suru's own `turn/start` waking a settled child with input it hands the
+/// child itself (ADR 0035). The native turn that input runs in is a stretch
+/// of the child's no Delegation began: Suru opens the Continuation of the
+/// child's Session it works in once Codex takes the input, as a Watch would
+/// wake it, so the stretch opens here announcing nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HandedWake {
+    /// Sent and not yet answered: the next native turn the child begins that
+    /// no delegation claims is the one the input runs in.
+    Requested,
+    /// Answered, naming the native turn the input runs in — a new one, or one
+    /// still running that Suru had already seen settle, which Codex steered
+    /// the input into instead.
+    Took(String),
 }
 
 impl AttachedChild {
@@ -723,6 +752,7 @@ impl NativeCorrelation {
         child.in_flight = ThreadInFlight::default();
         child.opening = StretchOpening::Passed;
         child.sends.clear();
+        child.handed_input.clear();
         let stretch_turns = std::mem::take(&mut child.stretch_turns);
         child.past_turns.extend(stretch_turns);
         self.settled_children
@@ -747,6 +777,18 @@ impl NativeCorrelation {
         turn_id: &str,
         outcome: &NativeTurnOutcome,
     ) -> Vec<AttributedProviderEvent> {
+        // A turn Suru's own input was taken into, ending before anything of
+        // it streamed here, still ends the stretch that input woke the child
+        // into: Suru opened it, and nothing else would settle it.
+        if self
+            .settled_children
+            .get(child_thread_id)
+            .is_some_and(|child| child.handed_wake == Some(HandedWake::Took(turn_id.to_owned())))
+        {
+            let mut finished = self.wake_for_handed_input(child_thread_id, turn_id.to_owned());
+            finished.extend(self.finish_child_turn(child_thread_id, turn_id, outcome));
+            return finished;
+        }
         if let Some(child) = self.children.get_mut(child_thread_id) {
             if !child.admit_turn(turn_id) {
                 return Vec::new();
@@ -804,7 +846,9 @@ impl NativeCorrelation {
     /// A settled child naming a native turn — its `turn/started`, or any item
     /// the turn streams. A turn no earlier stretch ran in is a new one: where
     /// a delegation claims it, the child resumes into it; otherwise it waits
-    /// for the claim, and what it streams meanwhile lands nowhere.
+    /// for the claim, and what it streams meanwhile lands nowhere. The turn
+    /// input Suru handed the child itself runs in wakes it instead, whether
+    /// new or one Suru saw settle that Codex steered the input into.
     fn wake_settled_child(
         &mut self,
         child_thread_id: &str,
@@ -813,7 +857,20 @@ impl NativeCorrelation {
         let Some(child) = self.settled_children.get_mut(child_thread_id) else {
             return Vec::new();
         };
-        if turn_id.is_empty() || child.past_turns.contains(turn_id) {
+        if turn_id.is_empty() {
+            return Vec::new();
+        }
+        let handed = match &child.handed_wake {
+            Some(HandedWake::Took(taken)) => taken == turn_id,
+            Some(HandedWake::Requested) => {
+                child.claim.is_none() && !child.past_turns.contains(turn_id)
+            }
+            None => false,
+        };
+        if handed {
+            return self.wake_for_handed_input(child_thread_id, turn_id.to_owned());
+        }
+        if child.past_turns.contains(turn_id) {
             return Vec::new();
         }
         if child.claim.is_none() {
@@ -849,22 +906,9 @@ impl NativeCorrelation {
                 .insert(child_thread_id.to_owned(), child);
             return Vec::new();
         };
-        child.unclaimed_turn = None;
-        child.stretch_turns = HashSet::from([turn_id.clone()]);
-        child.latest_turn_id = Some(turn_id.clone());
-        child.resumed_turn = Some(turn_id.clone());
         child.delegator = Some(claim.delegator.clone());
         child.opening = StretchOpening::Awaited(claim.delegation.clone());
-        child.pricing_baseline = NativeCumulativeUsage::default();
-        child.unpriced_prefix = false;
-        child.estimate_blocked = false;
-        child.worked_here = true;
-        let model = child.model.clone();
-        self.children.insert(child_thread_id.to_owned(), child);
-        self.child_context_turns
-            .entry(child_thread_id.to_owned())
-            .or_default()
-            .observe(&turn_id);
+        let model = self.reopen_child(child_thread_id, child, turn_id);
         let delegated_while_idle = claim.delegator == ProviderEventAttribution::OwningSession
             && self.active_turn_id.is_none()
             && !self.turn_starting;
@@ -886,6 +930,142 @@ impl NativeCorrelation {
             resumed.push(ProviderEvent::TurnCompleted.into());
         }
         resumed
+    }
+
+    /// Wakes a settled child into native turn `turn_id`, which input Suru
+    /// handed the child itself runs in (see [`HandedWake`]). Suru opens the
+    /// Continuation the stretch works in, so nothing is announced: no
+    /// Delegation began it, no Transcript gains a row, and the input stands
+    /// nowhere. The thread is followed again, and the Model the child last
+    /// ran on follows it into the new Turn until fresher evidence arrives.
+    fn wake_for_handed_input(
+        &mut self,
+        child_thread_id: &str,
+        turn_id: String,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(mut child) = self.settled_children.remove(child_thread_id) else {
+            return Vec::new();
+        };
+        child.past_turns.remove(&turn_id);
+        child.delegator = None;
+        child.opening = StretchOpening::Passed;
+        let model = self.reopen_child(child_thread_id, child, turn_id);
+        model
+            .map(|model| AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(child_thread_id),
+                    model,
+                },
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Follows a settled child's thread again for the stretch native turn
+    /// `turn_id` begins — measured and priced from where the thread's total
+    /// stands — answering the Model it last ran on.
+    fn reopen_child(
+        &mut self,
+        child_thread_id: &str,
+        mut child: AttachedChild,
+        turn_id: String,
+    ) -> Option<ModelId> {
+        child.unclaimed_turn = None;
+        child.handed_wake = None;
+        child.stretch_turns = HashSet::from([turn_id.clone()]);
+        child.latest_turn_id = Some(turn_id.clone());
+        child.resumed_turn = Some(turn_id.clone());
+        child.pricing_baseline = NativeCumulativeUsage::default();
+        child.unpriced_prefix = false;
+        child.estimate_blocked = false;
+        child.worked_here = true;
+        let model = child.model.clone();
+        self.children.insert(child_thread_id.to_owned(), child);
+        self.child_context_turns
+            .entry(child_thread_id.to_owned())
+            .or_default()
+            .observe(&turn_id);
+        model
+    }
+
+    /// Readies this connection for input Suru is about to hand the child on
+    /// `child_thread_id` itself, with a `turn/start` of its own on the child's
+    /// thread — Subagent Reports (ADR 0035) — which reads `text` as the
+    /// `UserMessage` it arrives as. A working child's running turn takes it
+    /// as a steer; a settled child — or one this connection never followed,
+    /// spawned before a restart — begins a native turn with it, which wakes
+    /// the child into a stretch of its own (see [`HandedWake`]). Either way the
+    /// input stands nowhere. Answers whether the child's thread has to be
+    /// attached first, so the turn streams here: one with no stretch open may
+    /// have been reloaded since, as a delegation's resume allows for.
+    pub(super) fn expect_handed_input(
+        &mut self,
+        child_thread_id: &str,
+        text: String,
+    ) -> Result<bool, ProviderError> {
+        if child_thread_id == self.thread_id {
+            return Err(codex_error(
+                "Codex runs no Subagent on the Session's own thread",
+            ));
+        }
+        if let Some(child) = self.children.get_mut(child_thread_id) {
+            child.handed_input.push(text);
+            return Ok(false);
+        }
+        let child = self
+            .settled_children
+            .entry(child_thread_id.to_owned())
+            .or_default();
+        child.handed_input.push(text);
+        // A delegation already waiting on the child's next turn resumes it
+        // there, row and all, and the input rides that turn.
+        if child.claim.is_none() {
+            child.handed_wake = Some(HandedWake::Requested);
+        }
+        Ok(true)
+    }
+
+    /// Codex took the input Suru handed the child on `child_thread_id` into
+    /// native turn `turn_id`, which — for a settled child — is the stretch it
+    /// wakes into, even one Suru saw settle before Codex steered the input
+    /// into it.
+    pub(super) fn handed_input_taken(&mut self, child_thread_id: &str, turn_id: String) {
+        let Some(child) = self.settled_children.get_mut(child_thread_id) else {
+            return;
+        };
+        if child.handed_wake.is_none() {
+            return;
+        }
+        if child.unclaimed_turn.as_deref() == Some(turn_id.as_str()) {
+            child.unclaimed_turn = None;
+        }
+        child.handed_wake = Some(HandedWake::Took(turn_id));
+    }
+
+    /// Forgets input reading `text` that Suru meant to hand the child on
+    /// `child_thread_id`, which Codex never took.
+    pub(super) fn forget_handed_input(&mut self, child_thread_id: &str, text: &str) {
+        let settled = self.settled_children.get_mut(child_thread_id);
+        let is_settled = settled.is_some();
+        let Some(child) = settled.or_else(|| self.children.get_mut(child_thread_id)) else {
+            return;
+        };
+        if let Some(handed) = child.handed_input.iter().position(|handed| handed == text) {
+            child.handed_input.remove(handed);
+        }
+        if is_settled {
+            child.handed_wake = None;
+        }
+    }
+
+    /// Keeps the Model a settled child's thread runs on, as the attach made
+    /// before handing it input answered, for the stretch that input wakes it
+    /// into.
+    pub(super) fn note_settled_child_model(&mut self, child_thread_id: &str, model: ModelId) {
+        if let Some(child) = self.settled_children.get_mut(child_thread_id) {
+            child.model = Some(model);
+        }
     }
 }
 
@@ -938,8 +1118,11 @@ pub(super) fn provider_events(
     ))
 }
 
-/// What the event pump needs to attach a spawned child thread: the transport
-/// the Session speaks over, and the working directory its threads run under.
+/// What attaching a child thread takes: the transport the Session speaks
+/// over, and the working directory its threads run under. The event pump
+/// attaches each spawned child with it, and the Session each settled child it
+/// hands input to itself.
+#[derive(Clone)]
 pub(super) struct ChildThreadAttachment {
     pub(super) transport: JsonRpcTransport,
     pub(super) cwd: String,
@@ -958,37 +1141,50 @@ impl ChildThreadAttachment {
     /// Session sparse — settled by the lifecycle items the spawner's thread
     /// still carries — rather than failing the parent's.
     fn attach(&self, thread_id: String, results: mpsc::UnboundedSender<(String, ModelId)>) {
-        let transport = self.transport.clone();
-        let cwd = self.cwd.clone();
-        let posture = self.posture.clone();
+        let attachment = self.clone();
         tokio::spawn(async move {
-            let posture = *posture
-                .lock()
-                .expect("Codex Session posture lock is not poisoned");
-            let Ok(result) = transport
-                .request(
-                    "thread/resume",
-                    &ThreadResumeParams {
-                        thread_id: &thread_id,
-                        cwd: &cwd,
-                        approval_policy: posture.approval_policy(),
-                        sandbox: posture.sandbox(),
-                        config: None,
-                        developer_instructions: None,
-                    },
-                )
-                .await
-            else {
-                return;
-            };
-            let Ok(attached) = serde_json::from_value::<ThreadConnectionResult>(result) else {
-                return;
-            };
-            if attached.thread.id != thread_id || attached.model.is_empty() {
-                return;
+            if let Ok(Some(model)) = attachment.request_stream(&thread_id).await {
+                let _ = results.send((thread_id, model));
             }
-            let _ = results.send((thread_id, ModelId::new(attached.model)));
         });
+    }
+
+    /// Requests the child thread's stream, as [`Self::attach`] does, and waits
+    /// for Codex to hand it over, answering the Model the thread runs on where
+    /// Codex names one.
+    pub(super) async fn request_stream(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<ModelId>, ProviderError> {
+        let posture = *self
+            .posture
+            .lock()
+            .expect("Codex Session posture lock is not poisoned");
+        let result = self
+            .transport
+            .request(
+                "thread/resume",
+                &ThreadResumeParams {
+                    thread_id,
+                    cwd: &self.cwd,
+                    approval_policy: posture.approval_policy(),
+                    sandbox: posture.sandbox(),
+                    config: None,
+                    developer_instructions: None,
+                },
+            )
+            .await
+            .map_err(|error| {
+                codex_error_context("Codex did not attach the Subagent's thread", error)
+            })?;
+        let attached = serde_json::from_value::<ThreadConnectionResult>(result)
+            .map_err(|_| codex_error("Codex returned an invalid thread/resume response"))?;
+        if attached.thread.id != thread_id {
+            return Err(codex_error(
+                "Codex returned an invalid thread/resume response: thread ID did not match",
+            ));
+        }
+        Ok((!attached.model.is_empty()).then(|| ModelId::new(attached.model)))
     }
 }
 
@@ -1947,7 +2143,9 @@ fn project_collab_call_completed(
 /// after that — a steer (ADR 0032). A steer stands in the Turn the child is
 /// working in, at the point its item arrived, as a Delegation from the Agent
 /// whose `sendInput` carried it; it begins no Turn and adds nothing to any
-/// row. Input on a child with no stretch open lands nowhere, as its work does.
+/// row. Input Suru handed the child itself — a Subagent Report — is neither,
+/// and stands nowhere (ADR 0035). Input on a child with no stretch open lands
+/// nowhere, as its work does.
 fn project_user_message(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -1960,6 +2158,18 @@ fn project_user_message(
     let Some(child) = correlation.child_step(thread_id, turn_id) else {
         return Vec::new();
     };
+    if let Some(handed) = child
+        .handed_input
+        .iter()
+        .position(|handed| handed.trim() == text.trim())
+    {
+        // Input Suru handed the child itself — a Report — which stands in no
+        // Transcript. Arriving, it has passed whatever the stretch opened
+        // with, as any other work would.
+        child.handed_input.remove(handed);
+        child.opening = StretchOpening::Passed;
+        return Vec::new();
+    }
     if child.opening.receive(&text) || text.trim().is_empty() {
         return Vec::new();
     }
@@ -4475,5 +4685,137 @@ mod tests {
             &NativeTurnFailureKind::Other,
             &selection,
         ));
+    }
+
+    /// A Subagent Report as Suru hands a native child it, and as the
+    /// `UserMessage` it arrives as reads.
+    const REPORT: &str = "Subagent Report from Suru: the Subagent \"Researcher\" you delegated to \
+                          through the Broker completed.";
+
+    #[test]
+    fn a_report_handed_to_a_settled_child_wakes_it_into_the_turn_it_begins_announcing_nothing() {
+        let mut correlation = settled_child();
+
+        assert!(
+            correlation
+                .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+                .expect("a child thread takes handed input"),
+            "a child with no stretch open is attached again before the input is handed over"
+        );
+        correlation.note_settled_child_model(CHILD_THREAD, ModelId::new("gpt-child"));
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![AttributedProviderEvent {
+                attribution: ProviderEventAttribution::OwningSession,
+                event: ProviderEvent::SubagentModelChanged {
+                    subagent_id: ProviderSubagentId::new(CHILD_THREAD),
+                    model: ModelId::new("gpt-child"),
+                },
+            }],
+            "the turn the Report begins wakes the child with no resume, since nothing delegated \
+             it and its Continuation is Suru's to open, carrying on the Model it runs on"
+        );
+        correlation.handed_input_taken(CHILD_THREAD, RESUMED_TURN.to_owned());
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, RESUMED_TURN, REPORT)
+            ),
+            Vec::new(),
+            "the Report stands nowhere: it is no Delegation"
+        );
+        assert_eq!(
+            project_attributed(&mut correlation, child_message_started(RESUMED_TURN)),
+            vec![on_child(ProviderEvent::AgentMessageStarted)],
+            "what the woken child does lands in its own Session"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(RESUMED_TURN, NativeTurnOutcome::Completed),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "and the turn's end settles the stretch it woke into"
+        );
+    }
+
+    #[test]
+    fn a_report_codex_steers_into_a_turn_suru_saw_settle_still_ends_the_stretch_it_wakes() {
+        let mut correlation = settled_child();
+        correlation
+            .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+            .expect("a child thread takes handed input");
+
+        // The child's lifecycle report settled it while its native turn still
+        // ran, and Codex steered the Report into that turn.
+        correlation.handed_input_taken(CHILD_THREAD, CHILD_TURN.to_owned());
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+            ),
+            vec![child_settled(ProviderSubagentStatus::Completed)],
+            "the turn's end settles the stretch the Report woke the child into, which nothing \
+             else would"
+        );
+    }
+
+    #[test]
+    fn a_report_codex_never_took_wakes_nothing() {
+        let mut correlation = settled_child();
+        correlation
+            .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+            .expect("a child thread takes handed input");
+        correlation.forget_handed_input(CHILD_THREAD, REPORT);
+
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            Vec::new(),
+            "a turn the child begins is left for a delegation to claim"
+        );
+    }
+
+    #[test]
+    fn a_report_steered_into_a_working_childs_turn_stands_nowhere() {
+        let mut correlation = working_child();
+
+        assert!(
+            !correlation
+                .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+                .expect("a child thread takes handed input"),
+            "a working child streams here already"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, CHILD_TURN, REPORT)
+            ),
+            Vec::new(),
+            "the Report its running turn drains is no steer Delegation"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, CHILD_TURN, "Also list the binaries.")
+            ),
+            vec![steered(
+                ProviderEventAttribution::OwningSession,
+                CHILD_THREAD,
+                "Also list the binaries."
+            )],
+            "while a steer an Agent sent still stands"
+        );
+    }
+
+    #[test]
+    fn no_report_is_handed_to_the_sessions_own_thread() {
+        let mut correlation = reasoning_turn();
+
+        assert!(
+            correlation
+                .expect_handed_input(THREAD, REPORT.to_owned())
+                .is_err()
+        );
     }
 }

@@ -28,10 +28,11 @@ use super::{
     skills::CodexSkills,
     transport::{CodexConnection, JsonRpcTransport},
     wire::{
-        CodexPosture, ModelListParams, NativeField, NativeModelList, ThreadConnectionResult,
-        ThreadResumeParams, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-        TurnStartResult, TurnSteerParams, TurnSteerResult, broker_developer_instructions,
-        broker_thread_config, lower_reasoning_summary, lower_turn_options,
+        CodexPosture, ModelListParams, NativeField, NativeModelList, SubagentTurnStartParams,
+        ThreadConnectionResult, ThreadResumeParams, ThreadStartParams, TurnInterruptParams,
+        TurnStartParams, TurnStartResult, TurnSteerParams, TurnSteerResult,
+        broker_developer_instructions, broker_thread_config, lower_reasoning_summary,
+        lower_turn_options, user_input_text,
     },
 };
 use crate::{
@@ -494,6 +495,7 @@ async fn start_codex_thread(
         thread_id: started.thread.id,
         context,
         transport,
+        child_attachment: attachment.clone(),
         correlation: correlation.clone(),
         turn_start_changed,
         process: process.clone(),
@@ -527,6 +529,9 @@ struct CodexSession {
     thread_id: String,
     context: SessionContext,
     transport: JsonRpcTransport,
+    /// Attaches a child thread before input is handed to it (see
+    /// [`ProviderSession::deliver_to_subagent`]).
+    child_attachment: ChildThreadAttachment,
     correlation: Arc<StdMutex<NativeCorrelation>>,
     turn_start_changed: Arc<Notify>,
     process: Arc<ProcessGuard>,
@@ -566,6 +571,51 @@ impl CodexSession {
             })
         });
         futures_util::future::join_all(interrupts).await;
+    }
+
+    /// Sends `input` to child thread `thread_id` as a `turn/start` of its own,
+    /// having attached the thread first where `attach` asks it, and answers
+    /// the native turn Codex took the input into.
+    async fn start_subagent_turn(
+        &self,
+        thread_id: &str,
+        input: &[super::wire::UserInput],
+        attach: bool,
+    ) -> Result<String, ProviderError> {
+        if attach && let Some(model) = self.child_attachment.request_stream(thread_id).await? {
+            self.correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .note_settled_child_model(thread_id, model);
+        }
+        let posture = *self
+            .context
+            .posture
+            .lock()
+            .expect("Codex Session posture lock is not poisoned");
+        let result = self
+            .transport
+            .request(
+                "turn/start",
+                &SubagentTurnStartParams {
+                    thread_id,
+                    input,
+                    approval_policy: posture.approval_policy(),
+                    sandbox_policy: posture.sandbox_policy(),
+                },
+            )
+            .await
+            .map_err(|error| {
+                codex_error_context("Codex did not take the Subagent's input", error)
+            })?;
+        let started: TurnStartResult = serde_json::from_value(result)
+            .map_err(|_| codex_error("Codex returned an invalid turn/start response"))?;
+        if started.turn.id.is_empty() {
+            return Err(codex_error(
+                "Codex returned an invalid turn/start response: Turn ID was empty",
+            ));
+        }
+        Ok(started.turn.id)
     }
 }
 
@@ -821,6 +871,63 @@ impl ProviderSession for CodexSession {
                 .await
                 .map_err(|error| codex_error_context("Codex Subagent stop failed", error))?;
             Ok(())
+        })
+    }
+
+    /// Hands `input` to the native Subagent on child thread `subagent_id` as
+    /// the thread's own input: a `turn/start` on that thread, which Codex
+    /// takes on a collab (v1) child's thread and refuses a multi-agent v2
+    /// sub-agent's. A settled child begins a native turn with it, which the
+    /// projection routes into the stretch Suru wakes the child into, and a
+    /// working one's running turn is steered with it; either way the input —
+    /// a Subagent Report — arrives on the thread as nothing the projection
+    /// shows (ADR 0035). It goes as `turn/start` even to a working child,
+    /// rather than the `turn/steer` a working Turn of the Session's own
+    /// takes: a Report a native Subagent's Provider refuses is dropped, not
+    /// held, and a steer pinned to a child turn that has just ended would be
+    /// refused where `turn/start` begins another. A child with no stretch
+    /// open is attached again first, so the turn it begins streams here.
+    fn deliver_to_subagent(
+        &self,
+        subagent_id: ProviderSubagentId,
+        input: ProviderInput,
+    ) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            let thread_id = subagent_id.as_str();
+            let native_input = lower_input(
+                &self.context.skills,
+                &self.context.execution_directory,
+                input,
+            )
+            .await?;
+            let handed = user_input_text(&native_input);
+            let attach = {
+                let mut correlation = self
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned");
+                if self.shutdown_started.load(Ordering::Acquire) {
+                    return Err(codex_error("Codex Session is shutting down"));
+                }
+                correlation.expect_handed_input(thread_id, handed.clone())?
+            };
+            let taken = self
+                .start_subagent_turn(thread_id, &native_input, attach)
+                .await;
+            let mut correlation = self
+                .correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned");
+            match taken {
+                Ok(turn_id) => {
+                    correlation.handed_input_taken(thread_id, turn_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    correlation.forget_handed_input(thread_id, &handed);
+                    Err(error)
+                }
+            }
         })
     }
 

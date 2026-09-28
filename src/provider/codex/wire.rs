@@ -528,6 +528,25 @@ pub(super) struct TurnStartParams<'a> {
     pub(super) service_tier: NativeServiceTierOverride<'a>,
 }
 
+/// `turn/start` on a native Subagent's own thread, carrying input Suru hands
+/// that Subagent itself — Subagent Reports (ADR 0035). Codex begins a turn
+/// with it on a thread with none running and steers the one running
+/// otherwise, answering that turn either way; it refuses a multi-agent v2
+/// sub-agent's thread any direct input, and takes it on a collab (v1) child's.
+/// It names no Model, effort, service tier or Reasoning summary, so the
+/// Subagent goes on as its spawn set it running whether the input begins a
+/// turn or steers one, and restates only the posture its thread was attached
+/// under, since a native Subagent acts under the posture of the Session that
+/// spawned it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SubagentTurnStartParams<'a> {
+    pub(super) thread_id: &'a str,
+    pub(super) input: &'a [UserInput],
+    pub(super) approval_policy: &'a str,
+    pub(super) sandbox_policy: NativeSandboxPolicy,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TurnSteerParams<'a> {
@@ -548,6 +567,20 @@ pub(super) struct TurnInterruptParams<'a> {
 pub(super) enum UserInput {
     Text { text: String },
     Skill { name: String, path: PathBuf },
+}
+
+/// The text the `UserMessage` item a turn's `input` arrives as reads as, as
+/// [`user_message_text`] reads it: each piece on a line of its own, a Skill
+/// as Codex previews it.
+pub(super) fn user_input_text(input: &[UserInput]) -> String {
+    input
+        .iter()
+        .map(|input| match input {
+            UserInput::Text { text } => text.clone(),
+            UserInput::Skill { name, path } => format!("[skill:${name}]({})", path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Deserialize)]
