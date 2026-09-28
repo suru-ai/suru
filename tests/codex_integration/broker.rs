@@ -15,6 +15,10 @@
 //! A Subagent Report that wakes an idle Codex Agent is the whole input of a `turn/start` on its
 //! thread, and one reaching a working Codex Turn is the harness's own `turn/steer` pinned to it
 //! (ADR 0035).
+//!
+//! A native Codex Subagent's thread calls the Broker under its parent thread's token, naming itself
+//! in the call's `_meta.threadId`, so its calls are its own Session's
+//! (docs/validation/0408-subagent-mcp-attribution.md).
 
 use std::sync::Arc;
 
@@ -27,7 +31,8 @@ use suru::{
     protocol::{
         Activity, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, ApprovalPosture,
         ClaudePermissionMode, CreateSessionRequest, InitialPrompt, ModelAvailability,
-        ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
+        ModelDescriptor, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
+        TurnStatus,
     },
     provider::{CodexRuntime, SubagentReport, SubagentReportOutcome},
     server::{self, RunningServer, ServerConfig},
@@ -705,4 +710,228 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+/// An app-server whose Session's Turn spawns a native Subagent on a thread of its own, through a
+/// collab spawn, and leaves both working: neither the parent thread's Turn nor the child thread
+/// Suru attaches ever completes. Every request is answered by the id it came with, since the Model
+/// Catalog's discovery runs a process of its own.
+const NATIVE_CHILD_WORKING: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{}}'
+      ;;
+    *'"method":"model/list"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"data":[{"id":"gpt-fixture","displayName":"GPT Fixture","description":"Fixture model","hidden":false,"supportedReasoningEfforts":[],"defaultReasoningEffort":"medium","serviceTiers":[],"defaultServiceTier":null,"isDefault":true}],"nextCursor":null}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"inProgress","senderThreadId":"root-thread","receiverThreadIds":[],"agentsStates":{}}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"collabAgentToolCall","id":"call-spawn","tool":"spawnAgent","status":"completed","senderThreadId":"root-thread","receiverThreadIds":["child-thread"],"prompt":"Map the crate layout","agentsStates":{"child-thread":{"status":"running"}}}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-child"}}'
+      ;;
+  esac
+done
+"#;
+
+/// The Session once `predicate` holds of it.
+async fn session_where(
+    client: &ManagedClient,
+    session_id: SessionId,
+    what: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let snapshot = client.read_session(session_id).await.expect("read Session");
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"))
+}
+
+#[tokio::test]
+async fn a_native_subagents_thread_calling_the_broker_is_attributed_to_the_subagents_session() {
+    let codex = ScriptedCodex::new(NATIVE_CHILD_WORKING);
+    let opus = AgentSelection {
+        provider: ProviderId::new("claude"),
+        model: ModelId::new("opus"),
+        options: Vec::new(),
+    };
+    let (claude_runtime, mut claude) = ControlledProvider::with_provider(
+        ProviderId::new("claude"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("claude"),
+            id: ModelId::new("opus"),
+            display_name: "Opus".to_owned(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let channel = "codex-broker-native-attribution";
+    let server = server::spawn_with_providers(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        vec![
+            Arc::new(CodexRuntime::new(codex.executable())),
+            claude_runtime,
+        ],
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let session_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: Some(AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("gpt-fixture"),
+                options: Vec::new(),
+            }),
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Map the crates".to_owned(),
+                skill_invocations: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Codex Session")
+        .session
+        .id;
+    let parent = session_where(
+        &client,
+        session_id,
+        "the collab spawn opens the native Subagent's row",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Subagent { .. }))
+        },
+    )
+    .await;
+    let Some(Activity::Subagent {
+        session_id: native_id,
+        name: native_name,
+        ..
+    }) = parent
+        .activities
+        .iter()
+        .find(|activity| matches!(activity, Activity::Subagent { .. }))
+    else {
+        unreachable!()
+    };
+    let native_id = *native_id;
+    let delegator = format!("the Subagent \"{native_name}\"");
+    codex.wait_for_method("thread/resume").await;
+
+    // Both threads reach the Broker the parent thread was handed, under its token.
+    let thread_start = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/start")
+        .expect("Suru starts the parent's thread")["params"]
+        .clone();
+    let broker = broker_server(&thread_start, "thread/start");
+    let endpoint = broker["url"].as_str().expect("the Broker's endpoint");
+    let authorization = broker["http_headers"]["Authorization"]
+        .as_str()
+        .expect("the parent thread's token")
+        .to_owned();
+    let mut child_thread = McpClient::presenting(endpoint, Some(authorization.clone()))
+        .with_call_meta(json!({ "threadId": "child-thread", "sessionId": "root-thread" }));
+    child_thread.initialize().await;
+    let mut root_thread = McpClient::presenting(endpoint, Some(authorization))
+        .with_call_meta(json!({ "threadId": "root-thread", "sessionId": "root-thread" }));
+    root_thread.initialize().await;
+    let researcher = |name: &str| {
+        json!({
+            "provider": "claude",
+            "model": "opus",
+            "name": name,
+            "description": "Survey the Claude seam",
+            "prompt": "Find where Claude plugs into Suru.",
+        })
+    };
+
+    let childs = child_thread.spawn_subagent(researcher("Researcher")).await;
+    assert_eq!(
+        client
+            .read_session(childs)
+            .await
+            .expect("read the brokered Subagent")
+            .session
+            .parent,
+        Some(native_id),
+        "the child thread's spawn is recorded beneath the native Subagent's Session"
+    );
+    let native = client
+        .read_session(native_id)
+        .await
+        .expect("read the native Subagent");
+    assert!(
+        native.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Subagent { session_id, .. } if *session_id == childs
+        )),
+        "whose Transcript holds its row: {:?}",
+        native.activities
+    );
+    let start = timeout(PROGRESS_DEADLINE, claude.next_start())
+        .await
+        .expect("the brokered Subagent's Provider is asked to start");
+    let mut provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: opus,
+    });
+    let turn = timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the Delegation reaches the brokered Subagent's Provider");
+    assert_eq!(
+        turn.prompt(),
+        format!(
+            "Delegated to you through Suru by {delegator}.\n\nFind where Claude plugs into Suru."
+        ),
+        "the Delegation names the native Subagent as the Agent that sent it"
+    );
+    turn.succeed();
+
+    let parents = root_thread.spawn_subagent(researcher("Scout")).await;
+    assert_eq!(
+        client
+            .read_session(parents)
+            .await
+            .expect("read the brokered Subagent")
+            .session
+            .parent,
+        Some(session_id),
+        "while the parent thread's own spawn is the Session's"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    drop(provider);
 }
