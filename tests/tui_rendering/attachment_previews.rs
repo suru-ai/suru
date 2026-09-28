@@ -465,42 +465,43 @@ fn a_messages_thumbnails_stand_in_six_rows_beneath_its_text_inside_the_gutter(
     assert!(!readable_rows(&buffer).join("\n").contains("Image 1 ·"));
 }
 
+/// A frame with every cell of a thumbnail's area -- whichever mark
+/// ratatui-image left there for its protocol -- replaced by a plain `#`, and
+/// every other cell kept whole, its style with it.
+fn with_images_marked(mut frame: Buffer) -> Buffer {
+    for cell in &mut frame.content {
+        if mark_of(cell) != Mark::Unmarked {
+            cell.reset();
+            cell.set_symbol("#");
+        }
+    }
+    frame
+}
+
 /// Every frame a strip of two thumbnails passes through, drawn in a terminal
-/// that speaks `protocol`, with each cell of a thumbnail's area read as `#`:
-/// waiting on its thumbnails, drawn, scrolled part way off at every height,
-/// covered by a dialog, and with the Setting turned off.
+/// that speaks `protocol`, with its images marked alike: waiting on its
+/// thumbnails, drawn, scrolled part way off at every height, covered by a
+/// dialog, and with the Setting turned off.
 fn frames_through_every_state(
     workspace: &std::path::Path,
     protocol: GraphicsProtocol,
-) -> Vec<Vec<String>> {
+) -> Vec<Buffer> {
     let mut application =
         connected_application_with_terminal_facts(workspace, answering(&[protocol]));
     session_in_with_message(&mut application, workspace, TWO, &[screenshot(), diagram()]);
-    let mut frames = vec![readable_rows(&rendered_application_frame(
-        &application,
-        WIDTH,
-        HEIGHT,
-    ))];
+    let frame = |application: &Application, height: u16| {
+        with_images_marked(rendered_application_frame(application, WIDTH, height))
+    };
+    let mut frames = vec![frame(&application, HEIGHT)];
     answer_fetches(&mut application);
-    frames.extend(
-        (8..=HEIGHT)
-            .map(|height| readable_rows(&rendered_application_frame(&application, WIDTH, height))),
-    );
+    frames.extend((8..=HEIGHT).map(|height| frame(&application, height)));
     invoke(&mut application, SemanticCommandId::SettingsOpen);
-    frames.push(readable_rows(&rendered_application_frame(
-        &application,
-        WIDTH,
-        20,
-    )));
+    frames.push(frame(&application, 20));
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     let mut settings = EffectiveSettings::default();
     settings.transcript.image_previews = false;
     deliver_settings(&mut application, settings);
-    frames.push(readable_rows(&rendered_application_frame(
-        &application,
-        WIDTH,
-        HEIGHT,
-    )));
+    frames.push(frame(&application, HEIGHT));
     frames
 }
 
@@ -508,9 +509,16 @@ fn frames_through_every_state(
 fn iterm2_and_sixel_reserve_and_cover_the_same_cells_as_kitty_in_every_state() {
     let workspace = workspace_dir();
     let kitty = frames_through_every_state(workspace.path(), GraphicsProtocol::Kitty);
-    let strip = "#".repeat(usize::from(THUMBNAIL_COLUMNS));
+    let both = 2 * STRIP_ROWS * usize::from(THUMBNAIL_COLUMNS);
     assert!(
-        kitty.concat().iter().any(|row| row.contains(&strip)),
+        kitty.iter().any(|frame| {
+            frame
+                .content
+                .iter()
+                .filter(|cell| cell.symbol() == "#")
+                .count()
+                == both
+        }),
         "some frame draws the strip"
     );
     for protocol in [GraphicsProtocol::Iterm2, GraphicsProtocol::Sixel] {
