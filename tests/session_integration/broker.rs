@@ -16,17 +16,17 @@ use serde_json::{Value, json};
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-        ApprovalPosture, ContextFill, CreateSessionRequest, Delegator, InitialPrompt, MessageRole,
-        MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-        ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-        ModelOptionRole, ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId,
-        ProviderId, ProviderUnavailability, RuntimeDescriptor, SessionId, SessionSnapshot,
-        SessionStatus, SettingMutation, SubagentTreeChange, TranscriptItem, TurnStatus, Usage,
-        UsageTotal,
+        ApprovalPosture, ContextFill, Cost, CostBasis, CreateSessionRequest, Delegator,
+        InitialPrompt, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, PromptDelivery,
+        PromptId, ProviderId, ProviderUnavailability, RuntimeDescriptor, SessionId,
+        SessionSnapshot, SessionStatus, SettingMutation, SubagentTreeChange, TranscriptItem,
+        TurnStatus, Usage, UsageTotal,
     },
     provider::{
-        BrokerHandoff, ContextFillReport, ProviderErrand, ProviderEvent, ProviderSubagentId,
-        ProviderSubagentStatus,
+        BrokerHandoff, ContextFillReport, MeteredCost, ProviderErrand, ProviderEvent,
+        ProviderSubagentId, ProviderSubagentStatus,
     },
     server::{self, RunningServer, ServerConfig, ServerTimings},
 };
@@ -1529,7 +1529,7 @@ async fn the_model_a_brokered_subagents_provider_confirms_shows_on_its_row_and_i
 }
 
 #[tokio::test]
-async fn a_brokered_subagents_usage_is_its_own_and_rolls_into_its_callers_total() {
+async fn a_brokered_subagents_usage_and_cost_are_its_own_and_roll_into_its_callers_total() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-spawn-usage", None).await;
     let child_id = delegating
@@ -1543,43 +1543,62 @@ async fn a_brokered_subagents_usage_is_its_own_and_rolls_into_its_callers_total(
         output_tokens: Some(output),
         ..Usage::default()
     };
+    let usd = |usd| Cost::from_usd(usd).expect("a representable Cost");
 
     delegating
         .caller_provider
         .emit_and_wait_until_observed(ProviderEvent::Usage {
             usage: measured(4_000, 1_000),
-            cost: None,
+            cost: Some(MeteredCost::reported(usd(0.20))),
         })
         .await;
     child_provider
         .emit_and_wait_until_observed(ProviderEvent::Usage {
             usage: measured(2_000, 500),
-            cost: None,
+            cost: Some(MeteredCost::reported(usd(0.05))),
         })
         .await;
 
-    let tokens = |total: Option<UsageTotal>| {
-        total.map(|total| (total.fresh_input_tokens, total.output_tokens))
+    // The child's Turn still works, so every total over it is partial: its Cost may yet grow.
+    let metered = |total: Option<UsageTotal>| {
+        total.map(|total| {
+            (
+                total.fresh_input_tokens,
+                total.output_tokens,
+                total.cost,
+                total.cost_is_partial,
+            )
+        })
     };
     let caller = read_until(
         &delegating.descriptor,
         delegating.caller,
-        "the caller's total carries its Subagent's Usage",
-        |snapshot| tokens(snapshot.total_usage()) == Some((Some(6_000), Some(1_500))),
+        "the caller's total carries its Subagent's Usage and Cost",
+        |snapshot| {
+            metered(snapshot.total_usage())
+                == Some((Some(6_000), Some(1_500), Some(usd(0.25)), true))
+        },
     )
     .await;
     assert_eq!(
-        tokens(caller.subagent_usage),
-        Some((Some(2_000), Some(500))),
+        metered(caller.subagent_usage),
+        Some((Some(2_000), Some(500), Some(usd(0.05)), true)),
         "the roll-up stands apart from the caller's own Turns"
+    );
+    assert_eq!(
+        caller.turns[0].cost,
+        Some(usd(0.20)),
+        "the caller's own Turn keeps only its own Cost"
     );
     let child = read_session(&delegating.descriptor, child_id).await;
     assert_eq!(
-        tokens(child.total_usage()),
-        Some((Some(2_000), Some(500))),
-        "the Subagent's Session keeps its own Usage"
+        metered(child.total_usage()),
+        Some((Some(2_000), Some(500), Some(usd(0.05)), true)),
+        "the Subagent's Session keeps its own Usage and Cost"
     );
     assert_eq!(child.turns[0].usage, Some(measured(2_000, 500)));
+    assert_eq!(child.turns[0].cost, Some(usd(0.05)));
+    assert_eq!(child.turns[0].cost_basis, Some(CostBasis::Reported));
 
     delegating
         .hosted
