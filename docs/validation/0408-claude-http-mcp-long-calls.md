@@ -90,9 +90,9 @@ raised one:
   (id `server-discover-probe-1`). The endpoint answered `-32601`, and Claude
   fell back to `initialize` at protocol `2025-11-25`. It then opened the
   optional `GET` stream; a 405 was accepted. The Broker itself, served by
-  rmcp, answers the probe, and Claude speaks `2026-07-28` to it instead, a
-  revision these timers were not measured at
-  (`0421-broker-smoke.md`).
+  rmcp, answers the probe, and Claude speaks `2026-07-28` to it instead. These
+  timers were not measured at that revision, but a 335 s `wait_subagents` call
+  to the Broker survived at it (`0421-broker-smoke.md`).
 - **Server status:** `system` `init` listed the server as
   `{"name": "capture", "status": "connected", "source": "dynamic"}`.
 - **Deferred Tools:** in 2.1.283 the server's Tools sit behind `ToolSearch`.

@@ -9,10 +9,13 @@ signed in with a ChatGPT account). The delegating Agent ran Claude's `haiku`
 effort, `medium`.
 
 `tests/broker_smoke.rs` hosts a real Server with the real `ClaudeRuntime` and
-`CodexRuntime` and drives it only through the client protocol. A Claude
-Session's Agent spawns a Codex Subagent through the Broker. The Subagent's Turn
-settles, and its Subagent Report wakes the Claude Agent into a Continuation,
-where it answers.
+`CodexRuntime` and drives it only through the client protocol. In both of its
+smokes, a Claude Session's Agent spawns a Codex Subagent through the Broker.
+
+- **Report smoke:** the Subagent's Turn settles, and its Subagent Report wakes
+  the Claude Agent into a Continuation, where it answers.
+- **Wait smoke:** the Claude Agent holds a `wait_subagents` call open for the
+  335 s the Subagent works, and answers from what the wait returns.
 
 ## Running it
 
@@ -20,32 +23,46 @@ where it answers.
 SURU_BROKER_SMOKE=1 cargo nextest run --test broker_smoke --run-ignored ignored-only --no-capture
 ```
 
-`cargo test --test broker_smoke -- --ignored --nocapture` runs it too. It is gated
-twice:
+`cargo test --test broker_smoke -- --ignored --nocapture` runs them too. The
+binary holds two tests, each gated twice:
 
-- **Ignore attribute:** `#[ignore = "set SURU_BROKER_SMOKE=1 to use the installed,
-  signed-in Claude and Codex binaries"]`. `cargo nextest run` skips it
-  (`0 tests run: 0 passed, 1 skipped` for this binary). `cargo nextest list
-  --message-format json` reports it `ignored: true`, and it is listed only with
-  `--run-ignored ignored-only` or `all`.
+- **The Report smoke,** `a_claude_agent_spawns_a_codex_subagent_through_the_broker_and_answers_its_report`:
+  the Claude Agent spawns a Codex Subagent and ends its Turn, and the
+  Subagent's Report wakes it into a Continuation.
+- **The wait smoke,** `a_claude_agents_wait_on_a_codex_subagent_outlasts_claudes_idle_window`:
+  the Claude Agent holds a `wait_subagents` call open on a Codex Subagent that
+  sleeps 330 s, longer than Claude's 300 s idle window for a silent HTTP MCP
+  call.
+
+Add `-E 'test(/answers_its_report/)'` or `-E 'test(/wait_on_a_codex/)'` to run
+one of them.
+
+- **Ignore attribute:** both carry `#[ignore = "set SURU_BROKER_SMOKE=1 to use the
+  installed, signed-in Claude and Codex binaries"]`. `cargo nextest run` skips
+  them (`0 tests run: 0 passed, 2 skipped` for this binary). Run alone,
+  `cargo nextest run --test broker_smoke` then prints `error: no tests to run`
+  and exits 4, unless `--no-tests=pass` is passed; the full suite's exit is
+  unaffected. `cargo nextest list --message-format json` reports both
+  `ignored: true`, and they are listed only with `--run-ignored ignored-only`
+  or `all`.
 - **Runtime check:** without `SURU_BROKER_SMOKE=1`, an ignored-only run prints
   `skipping: set SURU_BROKER_SMOKE=1 to opt in` and returns.
 
-Once opted in, the smoke refreshes the Model Catalog and skips, printing the
+Once opted in, each smoke refreshes the Model Catalog and skips, printing the
 reason, when Suru finds either CLI not installed or not signed in. It fails if a
 Provider's catalog fails or reports an incompatible version.
 
 `SURU_CLAUDE_PATH` and `SURU_CODEX_PATH` name other binaries, as they do for
 Suru itself. `SURU_LOG` (for example `warn,suru=info,rmcp=debug`) writes the
-Server's tracing to stderr. The smoke prints both CLIs' `--version` first, then
-the elapsed time at each milestone.
+Server's tracing to stderr. Each smoke prints both CLIs' `--version` first,
+then the elapsed time at each milestone.
 
 Using the real CLIs leaves their own records behind: Claude's under
 `~/.claude/projects/` and Codex's rollouts under `~/.codex/sessions/`. A passing
-run costs about $0.03 of Claude usage. The Codex Subagent used about 31,000
-input tokens, of which 24,000 were cached, and 33 output tokens.
+Report smoke costs about $0.03 of Claude usage. Its Codex Subagent used about
+31,000 input tokens, of which 24,000 were cached, and 33 output tokens.
 
-## What it sets up and sends
+## What they set up and send
 
 - **Config Document:** `provider.claude.permissionMode` is pinned to
   `bypassPermissions`, so nothing in the tree asks. `derivation.errand` is
@@ -53,7 +70,10 @@ input tokens, of which 24,000 were cached, and 33 output tokens.
 - **Execution Directory:** a scratch Git repository with one commit.
 - **Session:** a Claude Session on `haiku`, or on Claude's default Model where
   `haiku` is not offered.
-- **Prompt:** it names the Broker but none of its Tools.
+- **Prompts:** they name the Broker but none of its Tools. The Report smoke
+  names none at all; the wait smoke names `wait_subagents`.
+
+The Report smoke's Prompt:
 
 > Using Suru's Broker, spawn one Subagent on the codex Provider, on that
 > Provider's default Model, named echo. Tell it to run the shell command
@@ -65,15 +85,43 @@ input tokens, of which 24,000 were cached, and 33 output tokens.
 
 The `sleep 8` makes the Subagent outlast the Agent's first Turn. Its Report then
 reaches an idle Agent and begins a Continuation, rather than steering the Turn
-that spawned it. Each live stretch is bounded at 300 s. A wait fails at once, printing
-the Session's Turns, Messages and Activities, when a Turn fails, an Approval or
-Questionnaire is raised, or the Agent's first Turn settles with no spawn.
+that spawned it.
 
-## What it asserts
+The wait smoke's Prompt:
+
+> Using Suru's Broker, spawn one Subagent on the codex Provider, on that
+> Provider's default Model, named echo. Tell it to run the shell command
+> `sleep 330`, which takes over five minutes, to wait for that command to
+> finish, and only then to reply with exactly the word PONG and nothing else.
+> Do not do its task yourself. Once it is spawned, call wait_subagents on it
+> with timeout_seconds 400 and wait for that call to answer, calling nothing
+> else meanwhile. When it answers with the Subagent settled, reply with the
+> single word DONE followed by the Subagent's reply, and end your turn. If the
+> call fails or times out instead, reply with WAIT FAILED followed by the error
+> it gave, and end your turn without calling it again.
+
+The `WAIT FAILED` branch tells a call Claude cut short apart from one that
+answered, and records Claude's error at the moment it happened.
+
+Each live stretch of the Report smoke is bounded at 300 s, and the whole wait
+smoke at 600 s. A wait fails early, printing the Session's Turns, Messages and
+Activities:
+
+- **At once** when a Turn fails, an Approval or Questionnaire is raised, or the
+  Agent's first Turn settles with no spawn. In the wait smoke, also when the
+  Agent says `WAIT FAILED`.
+- **After 30 s** when the Session has stood at rest, unchanged: nothing Working
+  and every Turn settled, and the state waited for not reached. A Session
+  passes through rest for a moment on its way to a Continuation, between the
+  commit that settles its Subagent's row and the one that opens the Turn the
+  Report wakes. So rest counts only once it has lasted.
+
+## What the Report smoke asserts
 
 1. **The Claude Session:** it starts at `bypassPermissions`.
 2. **The row:** the Turn the Prompt began holds exactly one Subagent row. The
-   row is `brokered`, is named `echo`, and leads to the child Session.
+   row is `brokered`, carries `echo` in its name (compared case-insensitively),
+   and leads to the child Session.
 3. **The tree:** the Subagent tree stream's snapshot lists the child under the
    parent. The Session listing does not list it.
 4. **The child Session:** its parent is the Claude Session and it runs on
@@ -96,22 +144,44 @@ Questionnaire is raised, or the Agent's first Turn settles with no spawn.
    the child's Provider confirmed.
 9. **Shutdown:** the Server shuts down within 60 s.
 
+## What the wait smoke asserts
+
+1. **Spawn and child:** as items 1–4 of the Report smoke.
+2. **The wait answered:** the Agent's Messages in the Turn that waited come to
+   contain `DONE` and `PONG`, and never `WAIT FAILED`. That Turn is never
+   failed or interrupted.
+3. **Only once the Subagent had slept:** the answer arrives at least 330 s
+   after the spawn, and the child's row has settled `Completed`.
+4. **The child slept it out:** the child's Turn settled `Completed` with
+   `PONG`, after working at least 330 s. So the call that answered was that
+   long.
+5. **The settled tree and shutdown:** as items 8–9 of the Report smoke.
+
+It waits for the answer rather than for the Turn that waited to settle. The
+Subagent's Report steers that Turn as the wait answers, and the Turn does not
+settle then, because of the second finding below.
+
 ## The live runs
 
-All four runs used the same build and CLIs. The runs were launched from inside
-a Claude Code session, so every inherited `CLAUDE*` variable was removed first;
-a user's own terminal carries none. Runs 1–3 went through transparent capture
-wrappers, named by `SURU_CLAUDE_PATH` and `SURU_CODEX_PATH`. Each wrapper saved
-every launch's arguments, stdin and stdout. The Claude wrapper added
-`--debug-file`, and the Codex wrapper set `RUST_LOG` for Codex's stderr. Run 4
-used the installed binaries directly.
+Every run used Claude Code 2.1.283 and Codex CLI 0.157.1. Runs 1–4 ran the
+Report smoke on this branch before it was rebased. Runs 5 and 6 ran on the
+branch rebased onto #419's `send_to_subagent` and `wait_subagents` (`main` at
+`5a475ad`). The runs were launched from inside a Claude Code session, so every
+inherited `CLAUDE*` variable was removed first; a user's own terminal carries
+none. Runs 1–3 and 5 went through transparent capture wrappers, named by
+`SURU_CLAUDE_PATH` and `SURU_CODEX_PATH`. Each wrapper saved every launch's
+arguments, stdin and stdout. The Claude wrapper added `--debug-file`, and the
+Codex wrapper set `RUST_LOG` for Codex's stderr. Runs 4 and 6 used the
+installed binaries directly.
 
-| Run | Outcome |
-| --- | --- |
-| 1 | Failed at the spawn deadline, 304.9 s. Claude listed `suru` as `connected` but registered none of its Tools. The Agent searched with `ToolSearch` five times and called `mcp__suru__list_providers` once, getting "No such tool available". It gave up after 26 s. See the finding below; fixed in `f4be4bc`. |
-| 2 | Failed at 4.4 s, before any Model call. The smoke's own check that the Agent had given up held before the first Turn was recorded. Fixed in the smoke. |
-| 3 | Passed in 41.3 s, with capture. |
-| 4 | Passed in 34.8 s, without capture. |
+| Run | Smoke | Outcome |
+| --- | --- | --- |
+| 1 | Report | Failed at the spawn deadline, 304.9 s. Claude listed `suru` as `connected` but registered none of its Tools. The Agent searched with `ToolSearch` five times and called `mcp__suru__list_providers` once, getting "No such tool available". It gave up after 26 s. See the first finding below; fixed in the branch's `fix(broker)` commit. |
+| 2 | Report | Failed at 4.4 s, before any Model call. The smoke's own check that the Agent had given up held before the first Turn was recorded. Fixed in the smoke. |
+| 3 | Report | Passed in 41.3 s, with capture. |
+| 4 | Report | Passed in 34.8 s, without capture. |
+| 5 | Wait | The wait call survived, but the smoke failed at its 600 s deadline, with capture. The Agent answered `DONE PONG` 335 s into its `wait_subagents` call, and the Subagent's row settled `Completed`. Then the Turn that waited never settled. See the second finding below. |
+| 6 | Both | Both passed without capture: the Report smoke in 46.0 s, the wait smoke in 359.4 s. The wait smoke now asserts the answer rather than the Turn's settling. |
 
 Run 4's milestones:
 
@@ -149,13 +219,80 @@ retries, 250 ms to 1 s apart), then gave up:
    {"values":["public","private"],"path":["cacheScope"], …}]"
 ```
 
-`f4be4bc` sets both fields on the Broker's `tools/list`: `ttlMs: 0` and
+The branch's `fix(broker)` commit sets both fields on the Broker's `tools/list`: `ttlMs: 0` and
 `cacheScope: "private"`. The list is stale at once and private to the token that
 asked, the same as rmcp's own answer to `server/discover`. Clients on earlier
 revisions ignore the extra fields: the Codex Subagent, at 2025-06-18, listed
 the Tools and reported the server `ready`. A protocol test now runs the
 2026-07-28 lifecycle against the Broker:
 `a_harness_speaking_the_2026_07_28_revision_is_answered_a_tool_list_it_can_register`.
+
+### The wait smoke: a 335 s Broker call at 2026-07-28 (runs 5 and 6)
+
+Claude negotiated 2026-07-28 with the Broker in run 5, as in run 3. The Agent
+loaded `mcp__suru__spawn_subagent` and `mcp__suru__wait_subagents` with
+`ToolSearch`, then called `list_providers` and spawned the Subagent. It then
+called `wait_subagents` with
+`{"ids": ["<child>"], "timeout_seconds": 400}` at 03:48:26:
+
+- **Debug log:** Claude logged `Tool 'wait_subagents' still running (Ns elapsed)`
+  every 30 s from 30 s to 330 s, then `completed successfully in 5m 35s`
+  (`tool_dispatch_end … outcome=ok durationMs=335410`). Nothing aborted at
+  60 s, at 300 s, or at the Subagent's 330 s.
+- **Stdout:** Claude emitted a `tool_progress` heartbeat with
+  `elapsed_time_seconds` every 30 s, eleven in all.
+- **The answer:**
+  `{"settled":[{"duration_ms":337645,"message":"PONG","session_id":"<child>","status":"completed"}],"timed_out":false,"timeout_seconds":400}`.
+  The Agent replied `DONE PONG`.
+- **The Subagent:** it ran `/usr/bin/zsh -lc 'sleep 330'` (exit 0, 329.9 s),
+  polling the command six times with a short message each time, then wrote
+  `PONG`. It used about 208,000 input tokens, of which 197,000 were cached,
+  and 521 output tokens. The Claude side cost $0.044.
+
+Run 6 repeated it without capture: the answer came 341.1 s after the spawn,
+and the Subagent worked 338.4 s.
+
+This settles the question #408 left open. At the 2026-07-28 revision, under the
+Broker's configuration, a Broker call stays open past Claude's 60 s request
+timer and 300 s idle window. The per-server `timeout` is 900 s, and the
+Broker sends progress every 30 s while it waits. The run does not isolate
+which of the two keeps the idle window open. The `tool_progress` lines are
+marked `heartbeat: true`, and neither Claude's debug log nor Suru's trace shows
+whether an MCP progress notification arrived. At 2025-11-25, #408's run 5 showed
+the per-server `timeout` alone raising the idle window.
+
+### Finding: a Report steering a Claude Turn in a Broker call leaves the Turn open
+
+In run 5 the Subagent's Report was written to Claude's stdin as a steer of the
+Turn that waited. It was written in the same millisecond that the
+`wait_subagents` answer arrived, since the settling that answers a wait also
+builds the Report. Claude's own transcript
+(`~/.claude/projects/<cwd>/<session>.jsonl`) records what it did:
+
+```
+03:54:01.899 queue-operation enqueue
+03:54:01.901 user: tool_result {"settled": … "PONG" …}
+03:54:01.899 attachment queued_command {"prompt": [{"type": "text", "text": "Subagent Report from Suru: …"}]}
+03:54:01.905 queue-operation remove
+03:54:04.070 assistant: DONE PONG
+```
+
+The CLI folded the queued Report into the loop's next request as a
+`queued_command` attachment, and answered both with one `result`
+(`num_turns: 6`). Its stdout carries nothing to say a queued message was taken
+in: no user echo, and only `status: requesting` between the tool result and
+the next message. Suru's Claude steer accounting
+(`src/provider/claude/turn_in_flight.rs`, from #129) assumes "the CLI answers
+every user message queued into a running loop with a `result` of its own". It
+counted two `result`s owed and received one, so the Turn stayed `Active`. The
+Session read Working until the smoke's deadline and the Server's shutdown.
+
+**Scope:** every Claude `wait_subagents` that answers because a Subagent
+settled hits this, since its Report is always queued at that same moment. By
+the same mechanism, a user's steer Prompt that reaches a Claude Turn mid-tool
+call probably does too; that was not run live. A Report to an idle Claude Agent
+(the Report smoke) is unaffected. This is larger than a smoke fix, so it is
+left as the first follow-up below.
 
 ### The Claude side (run 3)
 
@@ -243,37 +380,65 @@ the Tools and reported the server `ready`. A protocol test now runs the
 | Codex accepts `tool_timeout_sec: 900.0` as a float (#411) | **Confirmed.** `thread/start` was answered and the server reported `ready`. |
 | Codex honours `developer_instructions` on `thread/start` (#414) | **Confirmed** by the rollout's `developer` message. The same on `thread/resume` is **not exercised**. |
 | A Report to an idle Claude Agent, sent as a stdin user message, starts a Turn with an extra `result` (#418) | **Confirmed.** A new `init`, the answer, and a second `result` came on the same process, and Suru recorded a `Completed` Continuation. |
+| Claude's 60 s request timer and 300 s idle window do not cut a long Broker call short (#408, #419) | **Confirmed at 2026-07-28** for a 335 s `wait_subagents` (runs 5 and 6). The per-server `timeout` and the Broker's progress are not told apart. |
+| The CLI answers every message queued into a running loop with a `result` of its own (#129, relied on by #418's steers) | **Contradicted** for a message queued while a tool call is running. The CLI folds it into the loop's next request as a `queued_command` and answers both with one `result` (run 5). |
 | A Codex child under a Claude `default` parent runs `untrusted` and may raise Approvals (#417) | **Not exercised.** The smoke pins `bypassPermissions`, and the child ran `never` with `danger-full-access`, unasked. |
 | Windows: the owner-only ACL on the MCP config file (#411) | Out of reach on this Linux machine. |
 
 ## Decision
 
-The smoke proves the Claude→Codex path end to end against the real CLIs. A
-Claude Agent finds the Broker's Tools from the appended note and calls them
-without an Approval. Suru spawns a brokered Codex Subagent in its own Session,
-in the parent's Execution Directory, at the posture derived for it, and opens
-its Transcript with the Delegation. The Subagent's row settles with its Turn.
-The Report wakes the settled Claude Agent into a Continuation on the same
-process, where the Agent acts on it. The run also found a real defect, now
-fixed: Claude registered no Broker Tools at all, because the Broker answered a
-revision it had offered without the fields that revision requires.
+The Report smoke proves the Claude→Codex path end to end against the real
+CLIs. A Claude Agent finds the Broker's Tools from the appended note and calls
+them without an Approval. Suru spawns a brokered Codex Subagent in its own
+Session, in the parent's Execution Directory, at the posture derived for it,
+and opens its Transcript with the Delegation. The Subagent's row settles with
+its Turn. The Report wakes the settled Claude Agent into a Continuation on the
+same process, where the Agent acts on it.
 
-Follow-ups, none blocking:
+The wait smoke proves that a Broker call held open 335 s survives Claude's
+timers and answers the Agent in the Turn that waited.
 
-- **Long calls under 2026-07-28.** #408's request, idle and call timers, and
-  progress resetting the 300 s idle window, were measured at 2025-11-25.
-  Claude now speaks 2026-07-28 to the Broker. Before `wait_subagents` (#419)
-  relies on those timers, repeat that capture against the Broker's revision.
-  The alternative is to stop advertising 2026-07-28.
-- **Copilot as parent or child.** Not hosted by the smoke. Whether Copilot
+**The Broker speaks MCP 2026-07-28 to Claude 2.1.283, and stays there.** That is
+the newest revision rmcp 3.4.1 offers in its `server/discover` answer, and
+Claude negotiates the newest. The Broker does not pin a lower revision:
+
+- **It is compliant there.** Its `tools/list` now carries the `ttlMs` and
+  `cacheScope` that 2026-07-28 requires. Without them Claude registered none of
+  the Broker's Tools (run 1).
+- **The timers do not bite.** The long-call concern, #408's timers measured at
+  2025-11-25, does not reproduce at 2026-07-28: a 335 s `wait_subagents`
+  answered normally (runs 5 and 6).
+- **Codex is unaffected.** It still initializes at 2025-06-18 and passes over
+  the two extra fields.
+
+The fallback, if a later Claude cuts long calls at 2026-07-28, is to override
+`supported_protocol_versions` on `BrokerServer` in `src/broker/mcp.rs` with
+`Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))`,
+keeping the `ttlMs`/`cacheScope` fields.
+
+Follow-ups:
+
+- **Claude steer accounting (a real defect, not a smoke gap).** A Report
+  steering a Claude Turn still in a Broker call leaves that Turn `Active` and
+  the Session Working indefinitely. This happens after every Claude
+  `wait_subagents` that answers because its Subagent settled. See the second
+  finding. Possible directions:
+  - Learn when the CLI folds a queued message into the running loop, for
+    example through `--replay-user-messages`, which needs a capture first.
+    This would also fix a user's steer that lands mid-tool call.
+  - Stop counting a `result` per steer, and let a second loop become a native
+    Continuation.
+  - Do not deliver a Report for a Subagent a wait has just answered with.
+    That reverses #419's recorded choice that a Report still arrives.
+- **Which mechanism keeps a long call alive at 2026-07-28.** A capture that
+  records the Broker's progress notifications would tell the per-server
+  `timeout` from progress apart.
+- **Copilot as parent or child.** Not hosted by the smokes. Whether Copilot
   merges `mcp_servers` with the user's own servers (#411) is still open.
-- **Windows.** The file ACL, and the smoke itself, which is `cfg(unix)`.
-- **Steer races.** A Report reaching a Claude Agent whose Turn still works is
-  avoided by design, since the `sleep 8` keeps the Subagent working past the
-  Agent's first Turn.
+- **Windows.** The file ACL, and the smokes themselves, which are `cfg(unix)`.
 - **Resume after restart.** A brokered Subagent resumed through its Resume
   State, and `developer_instructions` on `thread/resume`.
+- **`send_to_subagent` live.** Neither smoke sends to a Subagent.
 - **Asking postures.** A Claude `default` parent with an `untrusted` Codex
   Subagent answering its Approvals, which would also isolate the `--allowedTools`
   allowlist.
-- **Send and wait (#419).** Outside this slice.
