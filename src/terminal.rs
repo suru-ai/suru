@@ -156,9 +156,10 @@ impl fmt::Display for NoGraphics {
 struct GraphicsAnswers {
     multiplexed: bool,
     kitty: bool,
-    /// XTVERSION named a terminal that draws iTerm2 inline images.
-    iterm2: bool,
-    /// `TERM_PROGRAM` named one.
+    /// Whether the terminal XTVERSION named draws iTerm2 inline images, once
+    /// it named one.
+    iterm2_named: Option<bool>,
+    /// Whether `TERM_PROGRAM` names such a terminal.
     iterm2_program: bool,
     sixel: bool,
     /// The probe has heard all it will: the device attributes arrived, or
@@ -170,7 +171,7 @@ impl GraphicsAnswers {
     const NONE: Self = Self {
         multiplexed: false,
         kitty: false,
-        iterm2: false,
+        iterm2_named: None,
         iterm2_program: false,
         sixel: false,
         settled: false,
@@ -234,7 +235,13 @@ impl TerminalFacts {
 
     /// Records the terminal's name as `TERM_PROGRAM` gives it, which counts
     /// only toward iTerm2 inline images: that protocol has no query, so a
-    /// terminal known to draw them is taken at its name.
+    /// terminal known to draw them is taken at its name. It is the fallback
+    /// to the name the terminal gives XTVERSION, consulted only once the
+    /// probe has settled without an XTVERSION reply, because a terminal
+    /// launched from inside another inherits that one's `TERM_PROGRAM` and
+    /// must not be taken for it after saying what it is. Until the probe
+    /// settles it is not consulted either, so selection never flips when the
+    /// reply lands.
     pub fn with_terminal_program(mut self, program: Option<&str>) -> Self {
         self.graphics_answers.iterm2_program = program.is_some_and(|program| {
             ITERM2_IMAGE_PROGRAMS
@@ -253,7 +260,7 @@ impl TerminalFacts {
         let answers = &mut self.graphics_answers;
         match protocol {
             GraphicsProtocol::Kitty => answers.kitty = true,
-            GraphicsProtocol::Iterm2 => answers.iterm2 = true,
+            GraphicsProtocol::Iterm2 => answers.iterm2_named = Some(true),
             GraphicsProtocol::Sixel => answers.sixel = true,
         }
         self.select_graphics();
@@ -312,24 +319,25 @@ impl TerminalFacts {
     pub(crate) fn merge_graphics(&mut self, reply: &GraphicsReply) {
         let before = self.graphics_selection().ok();
         let answers = &mut self.graphics_answers;
+        let settles = !answers.settled && reply.settles_probe();
         match reply {
             GraphicsReply::Kitty => answers.kitty = true,
             GraphicsReply::Version(version) => {
                 let name = terminal_name(version);
-                answers.iterm2 = ITERM2_IMAGE_TERMINALS.contains(&name.as_str());
+                answers.iterm2_named = Some(ITERM2_IMAGE_TERMINALS.contains(&name.as_str()));
                 answers.multiplexed |= MULTIPLEXERS.contains(&name.as_str());
             }
             GraphicsReply::CellSize(cell_size) => self.cell_size = Some(*cell_size),
             GraphicsReply::DeviceAttributes { sixel } => answers.sixel = *sixel,
             GraphicsReply::Expired => {}
         }
+        // Settled before selecting, so the reply that settles the probe is
+        // the one that lets TERM_PROGRAM stand in for a missing XTVERSION.
+        answers.settled |= settles;
         self.select_graphics();
-        if !self.graphics_answers.settled {
-            if reply.settles_probe() {
-                self.graphics_answers.settled = true;
-                tracing::info!("{}", self.describe_graphics_selection());
-            }
-        } else if self.graphics_selection().ok() != before {
+        if settles {
+            tracing::info!("{}", self.describe_graphics_selection());
+        } else if self.graphics_answers.settled && self.graphics_selection().ok() != before {
             tracing::info!(
                 "graphics protocol changed after the probe settled: {}",
                 self.describe_graphics_selection()
@@ -347,7 +355,10 @@ impl TerminalFacts {
         }
         let protocol = if answers.kitty {
             GraphicsProtocol::Kitty
-        } else if answers.iterm2 || answers.iterm2_program {
+        } else if answers
+            .iterm2_named
+            .unwrap_or(answers.settled && answers.iterm2_program)
+        {
             GraphicsProtocol::Iterm2
         } else if answers.sixel {
             GraphicsProtocol::Sixel
@@ -2080,13 +2091,45 @@ mod tests {
 
             assert_eq!(facts.graphics, Some(GraphicsProtocol::Iterm2), "{program}");
         }
+
+        let unsettled = measured().with_terminal_program(Some("vscode"));
         assert_eq!(
-            TerminalFacts::unprobed(true)
-                .with_terminal_program(Some("vscode"))
-                .graphics,
+            unsettled.graphics, None,
+            "the name is consulted only once the probe says no XTVERSION reply is coming"
+        );
+        let mut expired = unsettled;
+        expired.merge_graphics(&GraphicsReply::Expired);
+        assert_eq!(expired.graphics, Some(GraphicsProtocol::Iterm2));
+        assert_eq!(
+            facts_after(
+                TerminalFacts::unprobed(true).with_terminal_program(Some("vscode")),
+                PLAIN_ATTRIBUTES,
+            )
+            .graphics,
             None,
             "not without a cell size"
         );
+    }
+
+    /// A terminal launched from inside another inherits its TERM_PROGRAM, so
+    /// the name a terminal gives XTVERSION for itself decides.
+    #[test]
+    fn an_xtversion_name_decides_over_an_inherited_terminal_program() {
+        let foot = facts_after(
+            measured().with_terminal_program(Some("vscode")),
+            b"\x1bP>|foot 1.16\x1b\\\x1b[?62;22c",
+        );
+        assert_eq!(foot.graphics, None);
+        assert_eq!(foot.graphics_selection(), Err(NoGraphics::NoProtocol));
+
+        let wezterm = facts_after(
+            measured().with_terminal_program(Some("Apple_Terminal")),
+            &joined(&[
+                b"\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\",
+                PLAIN_ATTRIBUTES,
+            ]),
+        );
+        assert_eq!(wezterm.graphics, Some(GraphicsProtocol::Iterm2));
     }
 
     #[test]
