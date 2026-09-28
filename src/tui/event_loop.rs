@@ -89,6 +89,7 @@ pub async fn run(client: ManagedClient) -> Result<()> {
     let terminal_facts = TerminalFacts::unprobed(available_color_count() == u16::MAX)
         .with_hyperlinks(TerminalFacts::hyperlinks_from_environment())
         .with_multiplexer(TerminalFacts::multiplexed_from_environment())
+        .with_terminal_program(std::env::var("TERM_PROGRAM").ok().as_deref())
         .with_cell_size(cell_size);
     input.request_probe(session.terminal.backend_mut(), &terminal_facts)?;
     run_loop(
@@ -727,9 +728,6 @@ impl RunLoop {
                 }
                 let mut facts = self.application.terminal_facts;
                 facts.merge_graphics(&reply);
-                if reply.settles_probe() {
-                    facts.log_graphics_selection();
-                }
                 if facts != self.application.terminal_facts {
                     self.application.set_terminal_facts(facts);
                     self.needs_redraw = true;
