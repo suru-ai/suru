@@ -3373,7 +3373,9 @@ impl TuiState {
 
     /// The Session the Provisional Session draws as, built from what this
     /// client knows and held nowhere: a claim it renders from rather than a
-    /// Session anything may act on.
+    /// Session anything may act on. It describes the Attachments its Prompt
+    /// binds by what this client uploaded, as the Session will once it
+    /// arrives.
     pub(super) fn provisional_snapshot(&self) -> Option<SessionSnapshot> {
         let provisional = self.provisional.as_ref()?;
         Some(SessionSnapshot {
@@ -3411,7 +3413,7 @@ impl TuiState {
             submitting_approvals: Vec::new(),
             pending_approvals_revision: crate::protocol::SessionRevision(0),
             watches: Vec::new(),
-            attachments: Vec::new(),
+            attachments: self.composers.uploaded(&provisional.prompt.attachments),
         })
     }
 

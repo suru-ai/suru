@@ -75,6 +75,23 @@ impl TextBindings {
         self.0.iter().filter_map(TextBinding::attachment)
     }
 
+    /// One line per Attachment bound beside the text, in text order: the line
+    /// describing it where `describe` knows what it was stored as, and its
+    /// label alone until then.
+    pub(in crate::tui) fn attachment_lines<'a>(
+        &self,
+        describe: impl Fn(&AttachmentId) -> Option<&'a AttachmentDescriptor>,
+    ) -> Vec<String> {
+        self.attachments()
+            .map(|(_, attachment)| {
+                describe(attachment.attachment_id()).map_or_else(
+                    || attachment.label().to_owned(),
+                    |descriptor| attachment_line(attachment.label(), descriptor),
+                )
+            })
+            .collect()
+    }
+
     /// The highest `N` among the `[Image N]` labels bound beside the text, or
     /// zero with none.
     pub(in crate::tui) fn highest_image_number(&self) -> u32 {
@@ -101,7 +118,7 @@ fn image_label_number(label: &str) -> Option<u32> {
 /// The one line that describes an Attachment beneath the text its label
 /// stands in: the label without its brackets, the format, the dimensions, and
 /// the size, as in `Image 1 · PNG · 1280×720 · 312 KiB`.
-pub(in crate::tui) fn attachment_line(label: &str, descriptor: &AttachmentDescriptor) -> String {
+fn attachment_line(label: &str, descriptor: &AttachmentDescriptor) -> String {
     let name = label
         .strip_prefix('[')
         .and_then(|label| label.strip_suffix(']'))

@@ -11,7 +11,8 @@ use suru::{
     managed_client::SessionEvent,
     protocol::{
         Activity, ApprovalOutcome, ApprovalSubject, AttachmentBinding, AttachmentDescriptor,
-        AttachmentId, AttachmentKind, Outlook, PromptDelivery, TextSpan,
+        AttachmentId, AttachmentKind, Outlook, PromptDelivery, SessionId, SessionTimestamp,
+        TextSpan,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, ClipboardRead, CommandId, PasteId,
@@ -159,6 +160,57 @@ fn a_pasted_image_is_uploaded_and_labelled_with_numbers_a_draft_never_reuses() {
             .join("\n")
             .contains("[Image 1]")
     );
+}
+
+/// The rows of the user Message block in the Transcript reading `first`.
+fn transcript_block(application: &Application, first: &str) -> Vec<String> {
+    let rows = rendered_application_rows(application);
+    let start = rows
+        .iter()
+        .position(|row| row.contains(&format!("┃ {first}")))
+        .unwrap_or_else(|| panic!("the Message is drawn: {rows:#?}"));
+    rows[start..]
+        .iter()
+        .take_while(|row| row.trim_start().starts_with('┃'))
+        .map(|row| row.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_submitted_prompt_lists_its_attachments_before_and_after_its_session_arrives() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "What is ");
+    let stored = descriptor("wide", 1280, 720, 312 * 1024);
+    paste_image(&mut application, "wide", stored.clone());
+    let ApplicationTransition::CreateSession(request) =
+        submit(&mut application, CommandId::SubmitSteer)
+    else {
+        panic!("the Landing's Prompt begins a Session");
+    };
+
+    // The Provisional Session describes what this client uploaded.
+    let claimed = transcript_block(&application, "What is");
+    assert_eq!(
+        claimed,
+        vec![
+            "┃ What is [Image 1]",
+            "┃ Image 1 · PNG · 1280×720 · 312 KiB"
+        ]
+    );
+
+    // The Session arrives describing what it binds, and the row stands.
+    let mut created = crate::provisional_session::created_session_snapshot(
+        SessionId::new(),
+        &request.prompt,
+        workspace.path(),
+        SessionTimestamp::now(),
+    );
+    created.attachments = vec![stored];
+    application
+        .handle_event(ApplicationEvent::SessionCreated(created))
+        .expect("take the created Session");
+    assert_eq!(transcript_block(&application, "What is"), claimed);
 }
 
 #[test]

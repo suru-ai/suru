@@ -44,9 +44,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, Delegator, FileChange, FoldPosture, InitialPrompt, Message,
-        MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId, SessionRevision,
-        SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
+        Activity, ActivityId, AttachmentDescriptor, Delegator, FileChange, FoldPosture,
+        InitialPrompt, Message, MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId,
+        SessionRevision, SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -1398,9 +1398,11 @@ fn hyperlink_ranges(
 /// for all three itself, so rendering, memoization, and hit-testing address
 /// the unit rather than what it holds.
 enum RenderUnit<'a> {
-    /// A Message, with the parent of the Session whose Transcript holds it:
-    /// a Delegation names its sender to the reader against that parent.
-    Message(&'a Message, Option<SessionId>),
+    /// A Message, with the parent of the Session whose Transcript holds it —
+    /// a Delegation names its sender to the reader against that parent — and
+    /// the descriptors that Session carries, which a user Message lists its
+    /// Attachments beneath its text by.
+    Message(&'a Message, Option<SessionId>, &'a [AttachmentDescriptor]),
     Activity(&'a Activity),
     /// A Group: a run of two or more adjacent Activities of one groupable
     /// kind. Collapsed it is the run's single row; expanded it is the header
@@ -1429,21 +1431,22 @@ enum RenderUnit<'a> {
     /// that are not adjacent — a steer Message and the final agent Message
     /// stay outside a fold whose hidden work surrounds them.
     TurnFold(TurnMarker),
-    /// A prompt this client sent that the Session has not echoed back yet.
-    Provisional(&'a InitialPrompt),
+    /// A prompt this client sent that the Session has not echoed back yet,
+    /// with the descriptors the Session carries, as its Message will have.
+    Provisional(&'a InitialPrompt, &'a [AttachmentDescriptor]),
 }
 
 impl RenderUnit<'_> {
     fn key(&self) -> UnitKey {
         match self {
-            Self::Message(message, _) => UnitKey::Message(message.id),
+            Self::Message(message, ..) => UnitKey::Message(message.id),
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 Self::activity_unit_key(activity)
             }
             Self::Group { members, .. } => UnitKey::Group(members[0].id()),
             Self::TurnMember(unit) => unit.key(),
             Self::TurnFold(marker) => UnitKey::TurnFold(marker.turn_id),
-            Self::Provisional(prompt) => UnitKey::Provisional(prompt.id),
+            Self::Provisional(prompt, _) => UnitKey::Provisional(prompt.id),
         }
     }
 
@@ -1461,7 +1464,7 @@ impl RenderUnit<'_> {
     /// any entry it holds changes and reuses its lines when none did.
     fn fingerprint(&self, folds: &TranscriptFolds) -> u64 {
         match self {
-            Self::Message(message, _) => message_fingerprint(message),
+            Self::Message(message, _, described) => message_fingerprint(message, described),
             Self::Activity(activity) => {
                 activity_fingerprint(activity, resolved_fold_step(folds, activity))
             }
@@ -1501,8 +1504,14 @@ impl RenderUnit<'_> {
                 hasher.finish()
             }
             // A provisional prompt's text only grows and carries no Fold, so
-            // its length is the whole of its rendering input.
-            Self::Provisional(prompt) => prompt.text.len() as u64,
+            // its length and the lines beneath it are the whole of its
+            // rendering input.
+            Self::Provisional(prompt, described) => {
+                let mut hasher = std::hash::DefaultHasher::new();
+                prompt.text.len().hash(&mut hasher);
+                attachment_lines(&TextBindings::from_prompt(prompt), described).hash(&mut hasher);
+                hasher.finish()
+            }
         }
     }
 
@@ -1519,7 +1528,7 @@ impl RenderUnit<'_> {
                 kind.header_spinner_line(members).into_iter().collect()
             }
             Self::TurnMember(unit) => unit.spinner_lines(folds),
-            Self::Message(..) | Self::TurnFold(_) | Self::Provisional(_) => Vec::new(),
+            Self::Message(..) | Self::TurnFold(_) | Self::Provisional(..) => Vec::new(),
         }
     }
 
@@ -1527,20 +1536,20 @@ impl RenderUnit<'_> {
     /// Anchoring tracks conversation, so only a unit holding one answers.
     fn message_id(&self) -> Option<MessageId> {
         match self {
-            Self::Message(message, _) => Some(message.id),
+            Self::Message(message, ..) => Some(message.id),
             Self::TurnMember(unit) => unit.message_id(),
             Self::Activity(_)
             | Self::Group { .. }
             | Self::GroupMember(_)
             | Self::TurnFold(_)
-            | Self::Provisional(_) => None,
+            | Self::Provisional(..) => None,
         }
     }
 
     fn spacing_kind(&self) -> SpacingKind {
         match self {
             Self::TurnMember(unit) => unit.spacing_kind(),
-            Self::Message(..) | Self::Provisional(_) => SpacingKind::Message,
+            Self::Message(..) | Self::Provisional(..) => SpacingKind::Message,
             Self::Activity(activity) | Self::GroupMember(activity) => match activity {
                 Activity::Error { .. } => SpacingKind::Error,
                 _ => SpacingKind::Activity,
@@ -1572,8 +1581,16 @@ impl RenderUnit<'_> {
         workspace: &Path,
     ) -> Option<UnitAnchor> {
         match self {
-            Self::Message(message, parent) => {
-                render_message(projection.lines, message, *parent, theme, width, hyperlinks);
+            Self::Message(message, parent, described) => {
+                render_message(
+                    projection.lines,
+                    message,
+                    *parent,
+                    described,
+                    theme,
+                    width,
+                    hyperlinks,
+                );
                 None
             }
             Self::Activity(activity) => render_activity(
@@ -1626,11 +1643,13 @@ impl RenderUnit<'_> {
                 anchor
             }
             Self::TurnFold(marker) => Some(render_turn_fold(projection.lines, *marker, theme)),
-            Self::Provisional(prompt) => {
+            Self::Provisional(prompt, described) => {
+                let bindings = TextBindings::from_prompt(prompt);
                 push_user_message(
                     projection.lines,
                     &prompt.text,
-                    &TextBindings::from_prompt(prompt),
+                    &bindings,
+                    &attachment_lines(&bindings, described),
                     theme,
                     width,
                 );
@@ -2285,7 +2304,7 @@ fn plan_units<'a>(
             TranscriptEntry::Message(message) => {
                 close_run(&mut units, &mut run, groups);
                 units.push(in_turn_gutter(
-                    RenderUnit::Message(message, snapshot.session.parent),
+                    RenderUnit::Message(message, snapshot.session.parent, &snapshot.attachments),
                     disclosed,
                 ));
             }
@@ -2310,7 +2329,11 @@ fn plan_units<'a>(
         }
     }
     close_run(&mut units, &mut run, groups);
-    units.extend(provisional.iter().copied().map(RenderUnit::Provisional));
+    units.extend(
+        provisional
+            .iter()
+            .map(|prompt| RenderUnit::Provisional(prompt, &snapshot.attachments)),
+    );
     units
 }
 
@@ -2703,13 +2726,22 @@ impl UnitAnchor {
 
 /// Message content is append-only, so its length identifies it within a
 /// Session once the truncation signal, which flips without lengthening the
-/// content, is folded in.
-fn message_fingerprint(message: &Message) -> u64 {
+/// content, is folded in, beside its bindings and the lines describing its
+/// Attachments, which change when a descriptor arrives after the Message.
+fn message_fingerprint(message: &Message, described: &[AttachmentDescriptor]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     message.content.len().hash(&mut hasher);
     message.truncated.hash(&mut hasher);
-    TextBindings::from_message(message).hash(&mut hasher);
+    let bindings = TextBindings::from_message(message);
+    attachment_lines(&bindings, described).hash(&mut hasher);
+    bindings.hash(&mut hasher);
     hasher.finish()
+}
+
+/// One line per Attachment `bindings` bind, describing it by what the Session
+/// carries for it.
+fn attachment_lines(bindings: &TextBindings, described: &[AttachmentDescriptor]) -> Vec<String> {
+    bindings.attachment_lines(|id| described.iter().find(|descriptor| &descriptor.id == id))
 }
 
 /// The step an Activity's Fold rests at before the reader touches it. A
@@ -2924,18 +2956,23 @@ fn render_message(
     lines: &mut Vec<StyledLine>,
     message: &Message,
     parent: Option<SessionId>,
+    described: &[AttachmentDescriptor],
     theme: &Theme,
     width: u16,
     hyperlinks: bool,
 ) {
     match &message.role {
-        MessageRole::User => push_user_message(
-            lines,
-            &message.content,
-            &TextBindings::from_message(message),
-            theme,
-            width,
-        ),
+        MessageRole::User => {
+            let bindings = TextBindings::from_message(message);
+            push_user_message(
+                lines,
+                &message.content,
+                &bindings,
+                &attachment_lines(&bindings, described),
+                theme,
+                width,
+            );
+        }
         MessageRole::Agent => push_agent_message(
             lines,
             &message.content,
@@ -4228,15 +4265,20 @@ pub(super) fn humanized_duration(duration_ms: u64) -> String {
     }
 }
 
+/// Projects a user Message, or a Prompt drawn as the one it will become: its
+/// text with each binding in its kind's style, then one dimmed line per
+/// Attachment it binds, in the same block and wrapped as its text is.
 fn push_user_message(
     lines: &mut Vec<StyledLine>,
     content: &str,
     bindings: &TextBindings,
+    attachments: &[String],
     theme: &Theme,
     available_width: u16,
 ) {
     let content = sanitize_content(content);
     let surface = theme.surface.elevated.patch(theme.text.primary);
+    let subdued = theme.surface.elevated.patch(theme.text.subdued);
     let accent = theme.surface.elevated.patch(theme.accent.primary);
     let bound = matches!(&content, std::borrow::Cow::Borrowed(_))
         .then(|| {
@@ -4249,22 +4291,33 @@ fn push_user_message(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let block = MessageBlock {
+        gutter: USER_MESSAGE_GUTTER,
+        gutter_style: accent,
+        surface,
+    };
+    let available_width = usize::from(available_width);
     push_message_block(
         lines,
         &content,
-        MessageBlock {
-            gutter: USER_MESSAGE_GUTTER,
-            gutter_style: accent,
-            surface,
-        },
+        block,
         |byte| {
             bound
                 .iter()
                 .find(|(span, _)| span.contains(&byte))
                 .map_or(surface, |(_, style)| *style)
         },
-        usize::from(available_width),
+        available_width,
     );
+    for line in attachments {
+        push_message_block(
+            lines,
+            &sanitize_content(line),
+            block,
+            |_| subdued,
+            available_width,
+        );
+    }
 }
 
 /// Projects a Delegation: the instruction an Agent gave the Subagent whose
@@ -5483,7 +5536,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &theme, 80, false);
+        render_message(&mut lines, &message, None, &[], &theme, 80, false);
 
         let marker = lines
             .iter()
@@ -5567,7 +5620,7 @@ mod tests {
         let theme = Theme::system();
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &theme, 80, false);
+        render_message(&mut lines, &message, None, &[], &theme, 80, false);
 
         let marker_lines = lines
             .iter()
@@ -6035,6 +6088,7 @@ mod tests {
             &mut lines,
             "aaaa bbbbbb",
             &TextBindings::default(),
+            &[],
             &Theme::system(),
             12,
         );
@@ -6052,6 +6106,7 @@ mod tests {
             &mut lines,
             "aaaaaaaaaaaa",
             &TextBindings::default(),
+            &[],
             &Theme::system(),
             12,
         );
@@ -7275,7 +7330,7 @@ mod tests {
                 ..user_message("Map the seams.")
             };
             let mut lines = Vec::new();
-            render_message(&mut lines, &message, Some(parent), &theme, 40, false);
+            render_message(&mut lines, &message, Some(parent), &[], &theme, 40, false);
             assert_eq!(
                 span_marks(&lines[1])[..2],
                 [(true, "│ "), (false, "Map the seams.")],
@@ -7312,7 +7367,7 @@ mod tests {
         };
         let mut lines = Vec::new();
 
-        render_message(&mut lines, &message, None, &Theme::system(), 40, false);
+        render_message(&mut lines, &message, None, &[], &Theme::system(), 40, false);
 
         assert_eq!(
             lines.last().map(projected_text).as_deref(),
@@ -7328,6 +7383,7 @@ mod tests {
             &mut lines,
             &user_message("hello there"),
             None,
+            &[],
             &theme,
             20,
             false,
@@ -7343,6 +7399,7 @@ mod tests {
             &mut lines,
             &agent_message("- item one\n\n```rust\nlet x = 1;\n```"),
             None,
+            &[],
             &theme,
             40,
             false,
@@ -7375,6 +7432,7 @@ mod tests {
             &mut agent_lines,
             &agent_message(table),
             None,
+            &[],
             &theme,
             24,
             false,

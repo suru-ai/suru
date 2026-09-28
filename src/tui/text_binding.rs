@@ -23,7 +23,7 @@ use crate::{
     theme::Theme,
 };
 
-pub(super) use attachment::{attachment_line, image_label};
+pub(super) use attachment::image_label;
 pub(super) use skill::{SkillIssue, skill_invocation_can_start};
 
 /// One typed thing bound to the span of text that stands for it.

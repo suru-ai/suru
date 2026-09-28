@@ -9,12 +9,13 @@ use std::{
 use ratatui::layout::{Position, Rect};
 
 use super::{
-    text_binding::{SkillIssue, TextBinding, TextBindings, UnitEdge, attachment_line, image_label},
+    text_binding::{SkillIssue, TextBinding, TextBindings, UnitEdge, image_label},
     text_layout::{CursorTarget, RowDirection, TextLayout},
 };
 
 use crate::protocol::{
-    AttachmentDescriptor, AttachmentId, InitialPrompt, PromptId, SessionReference, SkillDescriptor,
+    AttachmentBinding, AttachmentDescriptor, AttachmentId, InitialPrompt, PromptId,
+    SessionReference, SkillDescriptor,
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -283,16 +284,22 @@ impl ComposerMemory {
         };
         composer
             .bindings
-            .attachments()
-            .map(|(_, attachment)| {
-                self.attachments
-                    .get(attachment.attachment_id())
-                    .map_or_else(
-                        || attachment.label().to_owned(),
-                        |descriptor| attachment_line(attachment.label(), descriptor),
-                    )
-            })
-            .collect()
+            .attachment_lines(|id| self.attachments.get(id))
+    }
+
+    /// What each Attachment `bindings` name was stored as, where this client
+    /// uploaded it, once each and in id order: all a Session this client has
+    /// only claimed knows to describe its Prompt's Attachments with.
+    pub(super) fn uploaded(&self, bindings: &[AttachmentBinding]) -> Vec<AttachmentDescriptor> {
+        let mut uploaded = Vec::with_capacity(bindings.len());
+        crate::session_projection::describe_attachments(
+            &mut uploaded,
+            bindings
+                .iter()
+                .filter_map(|binding| self.attachments.get(&binding.attachment_id))
+                .cloned(),
+        );
+        uploaded
     }
 
     pub(super) fn insert(&mut self, key: ComposerKey, text: &str) {

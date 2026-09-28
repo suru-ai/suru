@@ -47,7 +47,7 @@ pub fn created_session_snapshot(
             id: prompt.id,
             text: prompt.text.clone(),
             skill_invocations: prompt.skill_invocations.clone(),
-            attachments: Vec::new(),
+            attachments: prompt.attachments.clone(),
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
