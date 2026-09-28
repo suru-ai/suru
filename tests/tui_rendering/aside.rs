@@ -364,6 +364,103 @@ fn a_model_confirmed_after_the_snapshot_updates_its_entry_in_place() {
     );
 }
 
+/// A brokered Subagent — its row in the delegating Transcript the Broker's —
+/// reaches the Section as the protocol reports one: spawned with no Model
+/// known, told the Model its own Provider confirmed once that Provider takes
+/// its first Turn, and settled. At each step its entry reads as a native
+/// Subagent's does.
+#[test]
+fn a_brokered_subagents_entry_shows_the_model_its_provider_confirmed_and_its_outcome() {
+    let workspace = workspace_dir();
+    let mut application = client(workspace.path());
+    let (mut parent, child) = parent_with_working_subagent(workspace.path());
+    let Activity::Subagent {
+        name,
+        description,
+        brokered,
+        ..
+    } = &mut parent.activities[0]
+    else {
+        unreachable!("the fixture's row is a Subagent's")
+    };
+    *name = "Scout".to_owned();
+    *description = "Survey the Claude seam".to_owned();
+    *brokered = true;
+    let top = parent.session.id;
+    application
+        .handle_event(ApplicationEvent::SessionAttached(parent))
+        .expect("open the delegating Session");
+    deliver_tree(
+        &mut application,
+        top,
+        SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
+            revision: SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: top,
+                title: "Delegate the mapping".to_owned(),
+                working_since: None,
+                monitoring_since: None,
+                needs_intervention: false,
+            },
+            subagents: Vec::new(),
+        }),
+    );
+
+    change(
+        &mut application,
+        top,
+        SubagentTreeChange::SubagentSpawned {
+            entry: entry(
+                child,
+                top,
+                0,
+                ("Scout", "Survey the Claude seam"),
+                ActivityStatus::Active,
+                None,
+            ),
+        },
+    );
+    assert_eq!(
+        entry_lines(&application, "Scout"),
+        ["└ ⠋ Survey the Claude seam", "    Scout"],
+        "until its Provider confirms a Model, the entry says its name alone"
+    );
+
+    change(
+        &mut application,
+        top,
+        SubagentTreeChange::SubagentModelChanged {
+            session_id: child,
+            model: ModelId::new("gpt-5"),
+        },
+    );
+    assert_eq!(
+        entry_lines(&application, "Scout"),
+        ["└ ⠋ Survey the Claude seam", "    Scout · gpt-5"],
+        "the Model its own Provider confirmed follows its name"
+    );
+
+    change(
+        &mut application,
+        top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: child,
+            status: ActivityStatus::Failed,
+            worked_ms: Some(3_000),
+            working_since: None,
+            monitoring_since: None,
+        },
+    );
+    assert_eq!(
+        entry_lines(&application, "Scout"),
+        [
+            "└ × Survey the Claude seam",
+            "    Scout · gpt-5 · Failed 3s"
+        ],
+        "once settled it wears its outcome, named after the Model, and its final time"
+    );
+}
+
 #[test]
 fn at_the_launch_width_the_model_is_dropped_whole_before_the_name_gives_way() {
     let workspace = workspace_dir();
