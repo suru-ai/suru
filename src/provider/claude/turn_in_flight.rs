@@ -17,7 +17,10 @@
 //! inside the one Turn the steer joined. A CLI that has never reported a message's fate gives no
 //! such account: there every `result` Settles the Turn, and a loop a message still queued begins
 //! afterwards is a native Continuation — never a Turn left waiting on a `result` that a message
-//! folded into the loop before it will not get.
+//! folded into the loop before it will not get. That fallback is the CLI's, not each message's:
+//! once a CLI has reported any message's lifecycle it is trusted to report every message written
+//! with a uuid, as its schema promises, so one that dropped a single message's `started` would
+//! hold that message's Turn open until it is interrupted.
 //!
 //! The roster of background work outlives any one Turn, as the CLI's own does; it is only ever read
 //! while a Turn is in flight, because stopping that work is something only an interrupt does. It

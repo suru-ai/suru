@@ -501,3 +501,25 @@ pub(super) struct NativeModel {
     #[serde(default)]
     pub(super) supported_effort_levels: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::UserMessageEnvelope;
+
+    #[test]
+    fn a_user_message_names_its_uuid_once_whatever_its_text_holds() {
+        let text = r#"a Prompt quoting {"uuid":"decoy"}"#;
+        let line = serde_json::to_string(&UserMessageEnvelope::text("message-uuid", text))
+            .expect("a user message serializes");
+        assert_eq!(
+            line.matches(r#""uuid":""#).count(),
+            1,
+            "the envelope's own uuid is the only one the line carries unescaped: {line}"
+        );
+        let message: Value = serde_json::from_str(&line).expect("the line is JSON");
+        assert_eq!(message["uuid"], "message-uuid");
+        assert_eq!(message["message"]["content"][0]["text"], text);
+    }
+}

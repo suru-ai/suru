@@ -112,11 +112,15 @@ lifecycle() {
 /// Reads one newline-delimited message at a time, records it, and dispatches it to the test's
 /// arms with the control envelope's `request_id` extracted for their replies, and a user message's
 /// `uuid` — the one the CLI reports the message's `lifecycle` under — as `$uuid`.
-/// Suru writes the `uuid` last in the envelope, which is the occurrence the pattern finds.
+///
+/// The `uuid` is found wherever it stands in the envelope: a message's text is JSON-escaped, so
+/// `"uuid":"` appears unescaped only as the envelope's own field, which Suru writes exactly once
+/// (pinned by `a_user_message_names_its_uuid_once_whatever_its_text_holds` in the wire module). A
+/// line carrying two would leave `$uuid` holding both, which no lifecycle frame matches.
 const SCRIPT_LOOP: &str = r#"while IFS= read -r line; do
   printf '%s\n' "$line" >> "$CLAUDE_FIXTURE_LOG"
   request_id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
-  uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+  uuid=$(printf '%s' "$line" | grep -o '"uuid":"[^"]*"' | sed 's/^"uuid":"\(.*\)"$/\1/')
   case "$line" in
 "#;
 
