@@ -462,6 +462,37 @@ fn every_failed_paste_says_why_and_leaves_the_draft_as_it_was() {
 }
 
 #[test]
+fn a_windows_clipboard_powershell_could_not_read_raises_the_read_failure_notice() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    type_terminal_text(&mut application, "Keep this");
+    let paste = read_clipboard(&mut application);
+    assert_eq!(
+        answer_read(
+            &mut application,
+            paste,
+            ClipboardRead::Failed {
+                reason: "powershell.exe timed out on the Windows clipboard after 5s".to_owned(),
+            },
+        ),
+        ApplicationTransition::Continue
+    );
+
+    let rows = rendered_application_rows_at(&application, 120, 30);
+    let shown = rows
+        .iter()
+        .find(|row| {
+            row.contains(
+                "Could not read the clipboard: powershell.exe timed out on the Windows clipboard",
+            )
+        })
+        .unwrap_or_else(|| panic!("the read failure is a Notice: {rows:#?}"));
+    assert!(shown.contains("see the Log"), "{shown}");
+    assert!(rows.iter().any(|row| row.contains("Keep this")));
+    assert!(!rows.join("\n").contains("[Image"));
+}
+
+#[test]
 fn an_eleventh_image_is_refused_before_it_is_uploaded() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());

@@ -322,7 +322,9 @@ mod wsl {
     }
 
     /// A source whose image, when it has none, is asked of `fallback` instead.
-    /// Text is always the primary source's.
+    /// Text is always the primary source's. A fallback that cannot be read
+    /// answers for the image, so the read fails with its reason unless the
+    /// primary source's text pastes instead.
     pub(super) struct ImageFallback<P, F> {
         primary: P,
         fallback: F,
@@ -346,10 +348,11 @@ mod wsl {
                 Ok(Some(image)) => Ok(Some(image)),
                 Ok(None) => primary,
                 Err(error) => {
-                    // The fallback is a guess about the host; its failing
-                    // must not stand in the way of the text pasting.
-                    tracing::debug!(%error, "the Windows clipboard could not be read");
-                    primary
+                    tracing::warn!(%error, "the Windows clipboard could not be read");
+                    if let Err(primary) = primary {
+                        tracing::debug!(error = %primary, "the native clipboard had no image either");
+                    }
+                    Err(error)
                 }
             }
         }
@@ -392,6 +395,9 @@ mod wsl {
             self
         }
 
+        /// The Windows clipboard's image bytes, none where it holds no image,
+        /// or why PowerShell could not hand them over, in words short enough
+        /// to show.
         fn run(&self) -> Result<Option<Vec<u8>>, String> {
             let program = self.program.to_string_lossy();
             let mut child = Command::new(&self.program)
@@ -400,7 +406,9 @@ mod wsl {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|error| format!("{program} could not start: {error}"))?;
+                .map_err(|error| {
+                    format!("{program} could not be started for the Windows clipboard: {error}")
+                })?;
             let mut stdout = child.stdout.take().expect("standard output is piped");
             // Drained beside the wait, so an image larger than the pipe's
             // buffer cannot stall the process that is writing it.
@@ -416,30 +424,37 @@ mod wsl {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(format!(
-                            "{program} did not answer within {:?}",
+                            "{program} timed out on the Windows clipboard after {:?}",
                             self.timeout
                         ));
                     }
                     Ok(None) => thread::sleep(Duration::from_millis(5)),
-                    Err(error) => return Err(format!("{program} could not be awaited: {error}")),
+                    Err(error) => {
+                        return Err(format!(
+                            "{program} could not be awaited for the Windows clipboard: {error}"
+                        ));
+                    }
                 }
             };
             if !status.success() {
                 return Ok(None);
             }
+            let unreadable =
+                || format!("{program}'s answer for the Windows clipboard could not be read");
             let output = output
                 .join()
-                .map_err(|_| format!("{program}'s output could not be read"))?
-                .map_err(|error| format!("{program}'s output could not be read: {error}"))?;
+                .map_err(|_| unreadable())?
+                .map_err(|error| format!("{}: {error}", unreadable()))?;
             let encoded = String::from_utf8_lossy(&output);
             let encoded = encoded.trim();
             if encoded.is_empty() {
                 return Ok(None);
             }
-            STANDARD
-                .decode(encoded)
-                .map(Some)
-                .map_err(|error| format!("{program}'s image could not be decoded: {error}"))
+            STANDARD.decode(encoded).map(Some).map_err(|error| {
+                format!(
+                    "{program} answered the Windows clipboard with an undecodable image: {error}"
+                )
+            })
         }
     }
 
@@ -501,17 +516,8 @@ mod wsl {
         }
 
         #[test]
-        fn a_windows_clipboard_without_an_image_or_unreadable_leaves_the_native_text() {
+        fn a_windows_clipboard_without_an_image_leaves_the_native_text_or_nothing() {
             let mut source = ImageFallback::new(Scripted::text("native text"), Scripted::empty());
-            assert_eq!(
-                read_clipboard(&mut source),
-                ClipboardRead::Text("native text".to_owned())
-            );
-
-            let mut source = ImageFallback::new(
-                Scripted::text("native text"),
-                Scripted::failing("powershell.exe could not start"),
-            );
             assert_eq!(
                 read_clipboard(&mut source),
                 ClipboardRead::Text("native text".to_owned())
@@ -519,6 +525,43 @@ mod wsl {
 
             let mut source = ImageFallback::new(Scripted::empty(), Scripted::empty());
             assert_eq!(read_clipboard(&mut source), ClipboardRead::Empty);
+        }
+
+        #[test]
+        fn an_unreadable_windows_clipboard_fails_the_read_when_there_is_nothing_else() {
+            let reason = "powershell.exe timed out on the Windows clipboard after 5s";
+            let mut source = ImageFallback::new(Scripted::empty(), Scripted::failing(reason));
+            assert_eq!(
+                read_clipboard(&mut source),
+                ClipboardRead::Failed {
+                    reason: reason.to_owned()
+                }
+            );
+
+            // A native clipboard that could not be read either does not hide
+            // why the Windows one could not.
+            let mut source = ImageFallback::new(
+                Scripted::failing("the native clipboard is not supported"),
+                Scripted::failing(reason),
+            );
+            assert_eq!(
+                read_clipboard(&mut source),
+                ClipboardRead::Failed {
+                    reason: reason.to_owned()
+                }
+            );
+        }
+
+        #[test]
+        fn an_unreadable_windows_clipboard_still_lets_the_native_text_paste() {
+            let mut source = ImageFallback::new(
+                Scripted::text("native text"),
+                Scripted::failing("powershell.exe could not be started for the Windows clipboard"),
+            );
+            assert_eq!(
+                read_clipboard(&mut source),
+                ClipboardRead::Text("native text".to_owned())
+            );
         }
 
         #[test]
@@ -532,7 +575,20 @@ mod wsl {
             assert_eq!(windows.image(), Ok(None));
 
             let mut windows = PowerShellClipboard::command("suru-no-such-powershell", &[]);
-            assert!(windows.image().is_err());
+            let error = windows.image().expect_err("a missing PowerShell fails");
+            assert!(
+                error.starts_with(
+                    "suru-no-such-powershell could not be started for the Windows clipboard"
+                ),
+                "{error}"
+            );
+
+            let mut windows = PowerShellClipboard::command("sh", &["-c", "printf 'not base64!'"]);
+            let error = windows.image().expect_err("an undecodable answer fails");
+            assert!(
+                error.starts_with("sh answered the Windows clipboard with an undecodable image"),
+                "{error}"
+            );
         }
 
         #[test]
@@ -541,7 +597,10 @@ mod wsl {
             let mut windows = PowerShellClipboard::command("sh", &["-c", "sleep 5"])
                 .with_timeout(Duration::from_millis(50));
             let error = windows.image().expect_err("the read times out");
-            assert!(error.contains("did not answer"), "{error}");
+            assert!(
+                error.starts_with("sh timed out on the Windows clipboard"),
+                "{error}"
+            );
             assert!(
                 began.elapsed() < Duration::from_secs(2),
                 "{:?}",
